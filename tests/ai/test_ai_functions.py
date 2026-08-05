@@ -19,15 +19,12 @@ import pyarrow as pa
 import pytest
 
 import vane
-from vane.ai.protocols import (
-    TextClassifierDescriptor,
-    TextEmbedderDescriptor,
-)
+from vane.ai.protocols import TextEmbedderDescriptor
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
-    from vane.ai.protocols import TextClassifier, TextEmbedder
+    from vane.ai.protocols import TextEmbedder
     from vane.ai.typing import Options
 
 
@@ -94,28 +91,6 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
         return MockTextEmbedder(dim=self.dim)
 
 
-class MockTextClassifier:
-    """Returns the first label for every input."""
-
-    def classify_text(self, text: list[str], labels: list[str]) -> list[str]:
-        return [labels[0] for _ in text]
-
-
-@dataclass
-class MockTextClassifierDescriptor(TextClassifierDescriptor):
-    def get_provider(self) -> str:
-        return "mock"
-
-    def get_model(self) -> str:
-        return "mock-classifier"
-
-    def get_options(self) -> Options:
-        return {"batch_size": 2}
-
-    def instantiate(self) -> TextClassifier:
-        return MockTextClassifier()
-
-
 class MockProvider(Provider):
     """Provider that returns mock descriptors."""
 
@@ -125,9 +100,6 @@ class MockProvider(Provider):
 
     def get_text_embedder(self, model=None, dimensions=None, *, options=None) -> TextEmbedderDescriptor:
         return MockTextEmbedderDescriptor(dim=dimensions or 4)
-
-    def get_text_classifier(self, model=None, **_options) -> TextClassifierDescriptor:
-        return MockTextClassifierDescriptor()
 
 
 # ---------------------------------------------------------------------------
@@ -209,43 +181,22 @@ class TestEmbed:
         assert rows[0][1] is None
 
 
-class TestClassifyText:
-    def test_classify_text_basic(self):
-        """classify_text produces a relation with label column."""
-        from vane.ai.functions import classify_text
+def test_legacy_classification_surface_is_removed():
+    import vane.ai as ai
+    from vane.ai import functions, protocols
+    from vane.ai import provider as provider_module
+    from vane.ai.providers import transformers
 
-        conn = vane.connect()
-        rel = conn.sql("SELECT 'great product' AS text UNION ALL SELECT 'terrible' AS text")
-
-        result = classify_text(
-            rel,
-            "text",
-            labels=["positive", "negative"],
-            provider=MockProvider(),
-        )
-
-        rows = result.fetchall()
-        assert len(rows) == 2
-        # MockTextClassifier always returns the first label
-        for row in rows:
-            assert row[0] == "positive"
-
-    def test_classify_text_custom_output(self):
-        from vane.ai.functions import classify_text
-
-        conn = vane.connect()
-        rel = conn.sql("SELECT 'test' AS text")
-
-        result = classify_text(
-            rel,
-            "text",
-            labels=["a", "b"],
-            provider=MockProvider(),
-            output_column="sentiment",
-        )
-
-        rows = result.fetchall()
-        assert len(rows) == 1
+    assert "classify_text" not in ai.__all__
+    assert not hasattr(ai, "classify_text")
+    assert not hasattr(functions, "classify_text")
+    assert not hasattr(functions, "_ClassifyTextBatch")
+    assert not hasattr(protocols, "TextClassifier")
+    assert not hasattr(protocols, "TextClassifierDescriptor")
+    assert not hasattr(provider_module.Provider, "get_text_classifier")
+    assert not hasattr(transformers.TransformersProvider, "get_text_classifier")
+    assert not hasattr(transformers, "TransformersTextClassifier")
+    assert not hasattr(transformers, "TransformersTextClassifierDescriptor")
 
 
 class TestMockDescriptorPickle:
@@ -258,13 +209,6 @@ class TestMockDescriptorPickle:
         result = embedder.embed_text(["hello"])
         assert len(result) == 1
         assert len(result[0]) == 16
-
-    def test_classifier_descriptor_pickle(self):
-        desc = MockTextClassifierDescriptor()
-        restored = pickle.loads(pickle.dumps(desc))
-        classifier = restored.instantiate()
-        result = classifier.classify_text(["test"], ["a", "b"])
-        assert result == ["a"]
 
 
 class TestWrapperPickle:
@@ -279,16 +223,6 @@ class TestWrapperPickle:
         result = _drive(restored, table)
         assert result.num_rows == 2
         assert result.column_names == ["emb"]
-
-    def test_classify_wrapper_pickle(self):
-        from vane.ai.functions import _ClassifyTextBatch
-
-        wrapper = _ClassifyTextBatch(MockTextClassifierDescriptor(), "text", "label", ["a", "b"])
-        restored = pickle.loads(pickle.dumps(wrapper))
-        table = pa.table({"text": ["hello"]})
-        result = restored(table)
-        assert result.num_rows == 1
-        assert result.column("label").to_pylist() == ["a"]
 
 
 # ---------------------------------------------------------------------------
@@ -2156,38 +2090,54 @@ class TestRetryCall:
         assert result == "ok"
         assert len(calls) == 1
 
-    def test_retry_then_success(self):
+    def test_retry_then_success(self, monkeypatch):
         from vane.ai.functions import _retry_call
 
+        monkeypatch.setattr("vane.ai.functions.time.sleep", lambda _seconds: None)
         calls = []
+
+        class ServiceUnavailableError(ValueError):
+            status_code = 503
 
         def fn():
             calls.append(1)
             if len(calls) < 3:
-                raise ValueError("transient")
+                raise ServiceUnavailableError("transient")
             return "recovered"
 
         result = _retry_call(fn, max_retries=3, on_error="raise")
         assert result == "recovered"
         assert len(calls) == 3
 
-    def test_retry_exhausted_raises(self):
+    def test_retry_exhausted_raises(self, monkeypatch):
         from vane.ai.functions import _retry_call
 
-        def fn():
-            raise RuntimeError("permanent")
+        monkeypatch.setattr("vane.ai.functions.time.sleep", lambda _seconds: None)
+        calls = []
 
-        with pytest.raises(RuntimeError, match="permanent"):
+        class ServiceUnavailableError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            calls.append(1)
+            raise ServiceUnavailableError("unavailable")
+
+        with pytest.raises(ServiceUnavailableError, match="unavailable"):
             _retry_call(fn, max_retries=1, on_error="raise")
+        assert len(calls) == 2
 
-    def test_on_error_log_returns_default(self):
+    def test_nontransient_error_is_not_retried(self):
         from vane.ai.functions import _retry_call
 
-        def fn():
-            raise RuntimeError("fail")
+        calls = []
 
-        result = _retry_call(fn, max_retries=0, on_error="log", default="fallback")
-        assert result == "fallback"
+        def fn():
+            calls.append(1)
+            raise ValueError("invalid request")
+
+        with pytest.raises(ValueError, match="invalid request"):
+            _retry_call(fn, max_retries=3, on_error="raise")
+        assert len(calls) == 1
 
     def test_on_error_ignore_returns_default(self):
         from vane.ai.functions import _retry_call
@@ -2206,6 +2156,19 @@ class TestRetryCall:
 
         result = _retry_call(fn, max_retries=0, on_error="ignore")
         assert result is None
+
+    @pytest.mark.parametrize("on_error", ["log", None, ["ignore"]])
+    def test_invalid_on_error_is_rejected_before_call(self, on_error):
+        from vane.ai.functions import _retry_call
+
+        calls = []
+
+        def fn():
+            calls.append(1)
+
+        with pytest.raises(ValueError, match="on_error must be 'raise' or 'ignore'"):
+            _retry_call(fn, on_error=on_error)
+        assert calls == []
 
     def test_awaitable_result_handled(self):
         """_retry_call drives awaitables through the provided run_async."""
@@ -2233,7 +2196,53 @@ class TestRetryCall:
         with pytest.raises(RuntimeError, match="bind_async_runtime"):
             _retry_call(async_fn, max_retries=0, on_error="ignore")
 
-    def test_retry_call_async(self):
+    def test_retry_call_async(self, monkeypatch):
+        import asyncio
+
+        from vane.ai.functions import _retry_call_async
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+        calls = []
+
+        class ServiceUnavailableError(ValueError):
+            status_code = 503
+
+        async def fn():
+            calls.append(1)
+            if len(calls) < 2:
+                raise ServiceUnavailableError("transient")
+            return "ok"
+
+        result = asyncio.run(_retry_call_async(fn, max_retries=2, on_error="raise"))
+        assert result == "ok"
+        assert len(calls) == 2
+
+    def test_retry_call_async_exhausted_raises(self, monkeypatch):
+        import asyncio
+
+        from vane.ai.functions import _retry_call_async
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+        calls = []
+
+        class ServiceUnavailableError(RuntimeError):
+            status_code = 503
+
+        async def fn():
+            calls.append(1)
+            raise ServiceUnavailableError("boom")
+
+        with pytest.raises(ServiceUnavailableError, match="boom"):
+            asyncio.run(_retry_call_async(fn, max_retries=1, on_error="raise"))
+        assert len(calls) == 2
+
+    def test_retry_call_async_nontransient_error_is_not_retried(self):
         import asyncio
 
         from vane.ai.functions import _retry_call_async
@@ -2242,39 +2251,38 @@ class TestRetryCall:
 
         async def fn():
             calls.append(1)
-            if len(calls) < 2:
-                raise ValueError("transient")
-            return "ok"
+            raise ValueError("invalid request")
 
-        result = asyncio.run(_retry_call_async(fn, max_retries=2, on_error="raise"))
-        assert result == "ok"
-        assert len(calls) == 2
+        with pytest.raises(ValueError, match="invalid request"):
+            asyncio.run(_retry_call_async(fn, max_retries=3, on_error="raise"))
+        assert len(calls) == 1
 
-    def test_retry_call_async_exhausted_raises(self):
+    @pytest.mark.parametrize("on_error", ["log", None, ["ignore"]])
+    def test_retry_call_async_rejects_invalid_on_error_before_call(self, on_error):
         import asyncio
 
         from vane.ai.functions import _retry_call_async
 
-        async def fn():
-            raise RuntimeError("boom")
-
-        with pytest.raises(RuntimeError, match="boom"):
-            asyncio.run(_retry_call_async(fn, max_retries=1, on_error="raise"))
-
-    def test_retry_call_async_on_error_log(self):
-        import asyncio
-
-        from vane.ai.functions import _retry_call_async
+        calls = []
 
         async def fn():
-            raise RuntimeError("fail")
+            calls.append(1)
 
-        result = asyncio.run(_retry_call_async(fn, max_retries=0, on_error="log", default="safe"))
-        assert result == "safe"
+        with pytest.raises(ValueError, match="on_error must be 'raise' or 'ignore'"):
+            asyncio.run(_retry_call_async(fn, on_error=on_error))
+        assert calls == []
 
 
 class TestWrapperRetry:
     """Tests that wrapper classes use retry/on_error correctly."""
+
+    def test_wrappers_reject_invalid_on_error(self):
+        from vane.ai.functions import _EmbedTextBatch, _PromptBatch
+
+        with pytest.raises(ValueError, match="on_error must be 'raise' or 'ignore'"):
+            _EmbedTextBatch(object(), "text", "embedding", 3, on_error="log")
+        with pytest.raises(ValueError, match="on_error must be 'raise' or 'ignore'"):
+            _PromptBatch(object(), ["message"], "response", on_error="log")
 
     def _make_embed_descriptor(self, embed_fn):
         """Create a minimal descriptor + embedder for testing."""
@@ -2371,21 +2379,6 @@ class TestWrapperRetry:
         table = pa.table({"text": ["hello"]})
         result = _drive(wrapper, table)
         assert result.column("emb").to_pylist() == [None]
-
-    def test_classify_on_error_log(self):
-        from vane.ai.functions import _ClassifyTextBatch
-
-        def classify(_texts, _labels):
-            raise RuntimeError("fail")
-
-        desc = MagicMock(spec=[])
-        classifier = MagicMock(spec=[])
-        classifier.classify_text = classify
-        desc.instantiate = MagicMock(return_value=classifier)
-        wrapper = _ClassifyTextBatch(desc, "text", "label", ["a", "b"], max_retries=0, on_error="log")
-        table = pa.table({"text": ["hello"]})
-        result = wrapper(table)
-        assert result.column("label").to_pylist() == [None]
 
 
 # ---------------------------------------------------------------------------

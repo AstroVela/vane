@@ -75,15 +75,6 @@ def _transformers_embedder_descriptor():
     )
 
 
-def _transformers_classifier_descriptor():
-    from vane.ai.providers.transformers import TransformersTextClassifierDescriptor
-
-    return TransformersTextClassifierDescriptor(
-        model="facebook/bart-large-mnli",
-        classify_options={"batch_size": 4, "token": HUB_TOKEN},
-    )
-
-
 def _openai_prompt_descriptor(options):
     from vane.ai.providers.openai import OpenAIPrompterDescriptor
 
@@ -117,7 +108,6 @@ def _vllm_prompt_plan(options):
 ALL_DESCRIPTOR_FACTORIES = [
     pytest.param(_openai_embedder_descriptor, id="openai-embedder"),
     pytest.param(_google_embedder_descriptor, id="google-embedder"),
-    pytest.param(_transformers_classifier_descriptor, id="transformers-classifier"),
 ]
 
 
@@ -422,22 +412,6 @@ class TestOptionsAtExecutionBoundary:
                     "revision": "pinned",
                     "device": "cpu",
                 },
-            )
-        ]
-
-    def test_transformers_classifier_pipeline_receives_plaintext_token(self, monkeypatch):
-        pipeline_calls = []
-
-        def fake_pipeline(task, **options):
-            pipeline_calls.append((task, options))
-            return object()
-
-        monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(pipeline=fake_pipeline))
-        _transformers_classifier_descriptor().instantiate()
-        assert pipeline_calls == [
-            (
-                "zero-shot-classification",
-                {"model": "facebook/bart-large-mnli", "trust_remote_code": False, "token": HUB_TOKEN},
             )
         ]
 

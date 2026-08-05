@@ -15,14 +15,13 @@ import duckdb
 import vane
 from vane.ai.protocols import (
     PrompterDescriptor,
-    TextClassifierDescriptor,
     TextEmbedderDescriptor,
 )
 from vane.ai.provider import Provider
 from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
-    from vane.ai.protocols import Prompter, TextClassifier, TextEmbedder
+    from vane.ai.protocols import Prompter, TextEmbedder
     from vane.ai.typing import Options
 
 # ---------------------------------------------------------------------------
@@ -58,26 +57,6 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
         return MockTextEmbedder(dim=self.dim)
 
 
-class MockTextClassifier:
-    def classify_text(self, text: list[str], labels: list[str]) -> list[str]:
-        return [labels[0] for _ in text]
-
-
-@dataclass
-class MockTextClassifierDescriptor(TextClassifierDescriptor):
-    def get_provider(self) -> str:
-        return "mock"
-
-    def get_model(self) -> str:
-        return "mock-classifier"
-
-    def get_options(self) -> Options:
-        return {"batch_size": 2}
-
-    def instantiate(self) -> TextClassifier:
-        return MockTextClassifier()
-
-
 class MockPrompter:
     async def prompt(self, messages: tuple[object, ...]) -> str:
         return "prompt:" + ":".join(part if isinstance(part, str) else bytes(part).hex() for part in messages)
@@ -105,9 +84,6 @@ class MockProvider(Provider):
 
     def get_text_embedder(self, model=None, dimensions=None, *, options=None):
         return MockTextEmbedderDescriptor(dim=dimensions or 4)
-
-    def get_text_classifier(self, model=None, **options):
-        return MockTextClassifierDescriptor()
 
     def get_prompter(
         self,
@@ -150,17 +126,6 @@ class TestRelationPatch:
         assert result.columns == ["text", "embedding"]
         assert result.fetchone() == ("hello", (5.0, 5.0, 5.0, 5.0))
 
-    def test_classify_text_on_relation(self):
-        """rel.classify_text() produces labels."""
-        conn = duckdb.connect()
-        rel = conn.sql("SELECT 'great' AS text UNION ALL SELECT 'bad' AS text")
-
-        result = rel.classify_text("text", labels=["positive", "negative"], provider=MockProvider())
-        rows = result.fetchall()
-        assert len(rows) == 2
-        for row in rows:
-            assert row[0] == "positive"
-
     def test_prompt_on_relation(self):
         conn = vane.connect()
         rel = conn.sql("SELECT 1 AS id, 'hello' AS text, from_hex('89504e47') AS image")
@@ -196,7 +161,7 @@ class TestRelationPatch:
         """DuckDBPyRelation has the patched methods."""
         assert hasattr(duckdb.DuckDBPyRelation, "embed")
         assert not hasattr(duckdb.DuckDBPyRelation, "embed_text")
-        assert hasattr(duckdb.DuckDBPyRelation, "classify_text")
+        assert not hasattr(duckdb.DuckDBPyRelation, "classify_text")
         assert hasattr(duckdb.DuckDBPyRelation, "prompt")
 
     def test_patch_is_idempotent(self):

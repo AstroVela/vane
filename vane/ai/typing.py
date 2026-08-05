@@ -20,7 +20,6 @@ else:
 
 Options = dict[str, Any]
 JSONSchema: TypeAlias = dict[str, Any]
-Label = str
 
 T = TypeVar("T")
 
@@ -85,6 +84,6 @@ class UDFOptions:
     actor_number: int | None = None
     num_gpus: int | None = None
     max_retries: int = 3
-    on_error: Literal["raise", "log", "ignore"] = "raise"
+    on_error: Literal["raise", "ignore"] = "raise"
     batch_size: int | None = None
     max_concurrency_per_actor: int | None = None

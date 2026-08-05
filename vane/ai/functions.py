@@ -11,7 +11,7 @@ These functions create stateful wrapper classes that:
 Usage::
 
     import vane
-    from vane.ai.functions import classify_text, embed
+    from vane.ai.functions import embed
 
     conn = vane.connect()
     rel = conn.sql("SELECT text FROM documents")
@@ -24,13 +24,6 @@ Usage::
         model="sentence-transformers/all-MiniLM-L6-v2",
     )
 
-    # Text classification — returns relation with 'label' column
-    classified = classify_text(
-        rel,
-        "text",
-        labels=["positive", "negative"],
-        provider="transformers",
-    )
 """
 
 from __future__ import annotations
@@ -81,10 +74,8 @@ else:
     BaseModel = Any
 
 
-def _resolve_provider(provider: str | Provider | None, default: str = "transformers") -> Provider:
+def _resolve_provider(provider: str | Provider) -> Provider:
     """Resolve a provider argument to a Provider instance."""
-    if provider is None:
-        return load_provider(default)
     if isinstance(provider, str):
         return load_provider(provider)
     return provider
@@ -136,7 +127,12 @@ def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
 # Retry / on_error helpers
 # ---------------------------------------------------------------------------
 
-_OnError = Literal["raise", "log", "ignore"]
+_OnError = Literal["raise", "ignore"]
+
+
+def _validate_on_error(on_error: object) -> None:
+    if not isinstance(on_error, str) or on_error not in ("raise", "ignore"):
+        raise ValueError("on_error must be 'raise' or 'ignore'")
 
 
 class RetryAfterError(Exception):
@@ -220,7 +216,6 @@ def _retry_call(
     default: Any = None,
     run_async: Any = None,
     on_awaitable: Any = None,
-    retry_if: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Call *fn* with exponential-backoff retry and on_error handling.
@@ -228,8 +223,8 @@ def _retry_call(
     Args:
         fn: Callable (sync or async) to invoke.
         max_retries: Number of retry attempts after the first failure (0 = no retries).
-        on_error: ``"raise"`` re-raises on final failure; ``"log"`` and
-            ``"ignore"`` return *default*.
+        on_error: ``"raise"`` re-raises on final failure; ``"ignore"``
+            returns *default*.
         default: Value to return when on_error is not ``"raise"``.
         run_async: Callable used to drive awaitable results. Batch wrappers
             pass their executor-bound runtime so cached SDK clients see one
@@ -238,10 +233,8 @@ def _retry_call(
             returns an awaitable — lets a wrapper learn its provider is
             loop-bound even when static inspection cannot tell (a plain
             ``def`` that returns an awaitable), so ``close()`` releases it.
-        retry_if: Optional predicate that must accept an exception and return
-            true for retryable failures. By default, ordinary exceptions keep
-            the historical retry behavior.
     """
+    _validate_on_error(on_error)
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
         wait: float | None = None
@@ -266,7 +259,7 @@ def _retry_call(
                 (ProviderCapabilityError, _ProviderResultError, OutputValidationError, RawResponseSerializationError),
             ):
                 break
-            if retry_if is not None and not retry_if(exc):
+            if not _is_transient_provider_error(exc):
                 break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
@@ -292,7 +285,6 @@ async def _retry_call_async(
     on_error: _OnError = "raise",
     default: Any = None,
     on_awaitable: Any = None,
-    retry_if: Any = None,
     **kwargs: Any,
 ) -> Any:
     """Async variant of :func:`_retry_call`.
@@ -302,6 +294,7 @@ async def _retry_call_async(
     method is a plain ``def`` returning an awaitable (which
     ``iscoroutinefunction`` cannot classify).
     """
+    _validate_on_error(on_error)
     last_exc: Exception | None = None
     for attempt in range(1 + max(0, max_retries)):
         wait: float | None = None
@@ -317,7 +310,7 @@ async def _retry_call_async(
                 (ProviderCapabilityError, _ProviderResultError, OutputValidationError, RawResponseSerializationError),
             ):
                 break
-            if retry_if is not None and not retry_if(exc):
+            if not _is_transient_provider_error(exc):
                 break
             if attempt < max_retries:
                 if isinstance(exc, RetryAfterError):
@@ -424,10 +417,9 @@ def _prepare_embed_call(
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("model must be a non-empty string or None")
     explicit_dimensions = _validate_embedding_dimension(dimensions)
-    if on_error not in {"raise", "ignore"}:
-        raise ValueError("on_error must be 'raise' or 'ignore'")
+    _validate_on_error(on_error)
 
-    resolved_provider = _resolve_provider(provider, "openai")
+    resolved_provider = _resolve_provider(provider)
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
     family = _embedding_provider_family(resolved_provider)
@@ -633,6 +625,7 @@ class _EmbedTextBatch:
         on_error: _OnError = "raise",
         normalize: bool = False,
     ) -> None:
+        _validate_on_error(on_error)
         self._descriptor = descriptor
         self._column = column
         self._output_column = output_column
@@ -740,7 +733,6 @@ class _EmbedTextBatch:
                 on_error="raise",
                 run_async=self._require_run_async(),
                 on_awaitable=self._mark_loop_bound,
-                retry_if=_is_transient_provider_error,
             )
         except _MissingAsyncRuntimeError:
             raise
@@ -851,56 +843,6 @@ class _EmbedTextBatch:
         return results
 
 
-class _ClassifyTextBatch:
-    """Stateful wrapper for text classification."""
-
-    def __init__(
-        self,
-        descriptor: Any,
-        column: str,
-        output_column: str,
-        labels: list[str],
-        max_retries: int = 3,
-        on_error: _OnError = "raise",
-    ) -> None:
-        self._descriptor = descriptor
-        self._column = column
-        self._output_column = output_column
-        self._labels = labels
-        self._max_retries = max_retries
-        self._on_error: _OnError = on_error
-        self._classifier = None  # lazy: instantiate on first __call__
-
-    def __call__(self, table: pa.Table) -> pa.Table:
-        capability_error: ProviderCapabilityError | None = None
-        provider_error: Exception | None = None
-        try:
-            if self._classifier is None:
-                self._classifier = self._descriptor.instantiate()
-            texts = table.column(self._column).to_pylist()
-            texts = [t if t is not None else "" for t in texts]
-            results = _retry_call(
-                self._classifier.classify_text,
-                texts,
-                self._labels,
-                max_retries=self._max_retries,
-                on_error=self._on_error,
-            )
-        except ProviderCapabilityError as exc:
-            capability_error = exc
-        except Exception as exc:
-            provider_error = exc
-        if capability_error is not None:
-            raise _safe_provider_capability_error(capability_error) from None
-        if provider_error is not None:
-            provider, model = _descriptor_identity(self._descriptor)
-            raise _safe_provider_execution_error(provider, model, "classification", provider_error) from None
-        if results is None:
-            results = [None] * len(texts)
-
-        return pa.table({self._output_column: results})
-
-
 class _PromptBatch:
     """Stateful row-preserving wrapper for ordered text/image Prompt parts."""
 
@@ -918,6 +860,7 @@ class _PromptBatch:
     ) -> None:
         if not message_columns:
             raise ValueError("Prompt message_columns cannot be empty")
+        _validate_on_error(on_error)
         self._descriptor = descriptor
         self._message_columns = list(message_columns)
         self._output_column = output_column
@@ -1095,7 +1038,6 @@ class _PromptBatch:
                     max_retries=max_retries,
                     on_error=on_error,
                     on_awaitable=self._mark_loop_bound,
-                    retry_if=_is_transient_provider_error,
                 )
             except ProviderCapabilityError as exc:
                 capability_error = exc
@@ -1454,60 +1396,6 @@ def embed(
 
 
 # ---------------------------------------------------------------------------
-# classify_text
-# ---------------------------------------------------------------------------
-
-
-def classify_text(
-    rel: Any,
-    column: str,
-    *,
-    labels: list[str],
-    provider: str | Provider | None = None,
-    model: str | None = None,
-    output_column: str = "label",
-    execution_backend: str | None = None,
-    **options: Any,
-) -> Any:
-    """Classify a text column using zero-shot classification.
-
-    Args:
-        rel: A DuckDB relation containing the source data.
-        column: Name of the text column to classify.
-        labels: List of candidate labels.
-        provider: Provider name or instance (default: ``"transformers"``).
-        model: Model identifier (provider-specific default if ``None``).
-        output_column: Name of the output column (default: ``"label"``).
-        execution_backend: Optional UDF backend. If omitted, the relation API infers task backend
-            from the active runner.
-        **options: Forwarded to the provider's ``get_text_classifier``.
-
-    Returns:
-        A new relation with the ``output_column`` appended.
-    """
-    prov = _resolve_provider(provider, "transformers")
-    descriptor = prov.get_text_classifier(model=model, **options)
-    udf_opts = descriptor.get_udf_options()
-
-    wrapper = _ClassifyTextBatch(
-        descriptor,
-        column,
-        output_column,
-        labels,
-        max_retries=udf_opts.max_retries,
-        on_error=udf_opts.on_error,
-    )
-    kwargs = _map_batches_kwargs(udf_opts, execution_backend)
-    kwargs["schema"] = {output_column: "VARCHAR"}
-    udf = _adapt_batch_wrapper_for_backend(
-        wrapper,
-        kwargs.get("execution_backend"),
-        force_actor="actor_number" in kwargs,
-    )
-    return rel.map_batches(udf, **kwargs)
-
-
-# ---------------------------------------------------------------------------
 # prompt
 # ---------------------------------------------------------------------------
 
@@ -1549,11 +1437,10 @@ def _prepare_prompt_call(
         raise TypeError("system_message must be a string or None")
     if not isinstance(return_raw_response, bool):
         raise TypeError("return_raw_response must be a bool")
-    if on_error not in {"raise", "ignore"}:
-        raise ValueError("on_error must be 'raise' or 'ignore'")
+    _validate_on_error(on_error)
     structured_output = compile_return_format(return_format)
 
-    resolved_provider = _resolve_provider(provider, "openai")
+    resolved_provider = _resolve_provider(provider)
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
     family = _prompt_provider_family(resolved_provider)

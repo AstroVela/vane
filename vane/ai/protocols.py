@@ -14,12 +14,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from vane.ai.typing import Descriptor, UDFOptions
+from vane.ai.typing import Descriptor
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
-    from vane.ai.typing import Embedding, EmbeddingDimensions, Label
+    from vane.ai.typing import Embedding, EmbeddingDimensions
 
 
 # ---------------------------------------------------------------------------
@@ -45,33 +45,6 @@ class TextEmbedderDescriptor(Descriptor["TextEmbedder"]):
     def is_async(self) -> bool:
         """Whether ``embed_text`` returns an awaitable."""
         return False
-
-
-# ---------------------------------------------------------------------------
-# Text classification
-# ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class TextClassifier(Protocol):
-    """Classifies a batch of text strings."""
-
-    def classify_text(self, text: list[str], labels: Label | list[Label]) -> list[Label]: ...
-
-
-class TextClassifierDescriptor(Descriptor["TextClassifier"]):
-    """Serializable factory for a :class:`TextClassifier`."""
-
-    def get_udf_options(self) -> UDFOptions:
-        """Preserve the legacy Classify execution-option contract."""
-        options = self.get_options()
-        return UDFOptions(
-            actor_number=options.get("actor_number"),
-            num_gpus=options.get("num_gpus"),
-            max_retries=options.get("max_retries", 3),
-            on_error=options.get("on_error", "raise"),
-            batch_size=options.get("batch_size"),
-        )
 
 
 # ---------------------------------------------------------------------------

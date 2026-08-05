@@ -4,7 +4,7 @@
 """Token usage metrics for AI providers.
 
 Provides a lightweight, thread-safe mechanism for recording and querying
-token usage across all AI provider calls (prompt, embed, classify).
+token usage across all AI provider calls (Prompt and Embed).
 
 Usage::
 
@@ -74,7 +74,7 @@ def record_token_metrics(
     """Record token usage from a single API response.
 
     Args:
-        protocol: The AI protocol (``"prompt"``, ``"embed"``, ``"classify"``).
+        protocol: The AI protocol (``"prompt"`` or ``"embed"``).
         model: The model name (e.g. ``"gpt-4o"``).
         provider: The provider name (e.g. ``"openai"``).
         input_tokens: Number of input/prompt tokens consumed.

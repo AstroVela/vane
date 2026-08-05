@@ -3,8 +3,8 @@
 
 """Monkey-patch AI convenience methods onto DuckDBPyRelation.
 
-This module adds ``.embed()``, ``.classify_text()``, and ``.prompt()``
-directly to :class:`duckdb.DuckDBPyRelation` so users can write::
+This module adds ``.embed()`` and ``.prompt()`` directly to
+:class:`duckdb.DuckDBPyRelation` so users can write::
 
     rel.embed(vane.col("text_col"), provider="transformers")
 
@@ -60,32 +60,6 @@ def _embed(
     )
 
 
-def _classify_text(
-    self: DuckDBPyRelation,
-    column: str,
-    *,
-    labels: list[str],
-    provider: Any = None,
-    model: str | None = None,
-    output_column: str = "label",
-    execution_backend: str | None = None,
-    **options: Any,
-) -> DuckDBPyRelation:
-    """Classify a text column. See :func:`vane.ai.classify_text` for details."""
-    from vane.ai.functions import classify_text
-
-    return classify_text(
-        self,
-        column,
-        labels=labels,
-        provider=provider,
-        model=model,
-        output_column=output_column,
-        execution_backend=execution_backend,
-        **options,
-    )
-
-
 def _prompt(
     self: DuckDBPyRelation,
     messages: Expression | list[Expression],
@@ -120,8 +94,6 @@ def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
     if not hasattr(DuckDBPyRelation, "embed"):
         DuckDBPyRelation.embed = _embed  # type: ignore[attr-defined]
-    if not hasattr(DuckDBPyRelation, "classify_text"):
-        DuckDBPyRelation.classify_text = _classify_text  # type: ignore[attr-defined]
     if not hasattr(DuckDBPyRelation, "prompt"):
         DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
 

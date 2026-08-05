@@ -24,6 +24,10 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 - Positioned the current project as the Vane Data developer preview.
 - Prompt uses ordered `messages`, first-class call parameters, and the closed
   `PromptOptions` keyword surface. OpenAI Responses is the default endpoint.
+- Removed the legacy Python-only zero-shot classification API, Provider
+  protocol, and Transformers runtime. Prompt and Embed are now the complete AI
+  surface, and their shared retry layer retries only classified transient
+  failures.
 - Defined `DuckDBPyRelation.map` exclusively as a row-wise scalar UDF with a
   required `return_type`; batch transforms use `map_batches` with an explicit
   output `schema`. The inherited pandas DataFrame-style DuckDB `map` contract

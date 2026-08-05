@@ -418,9 +418,10 @@ def test_ai_embed_rejects_invalid_dimensions(dimensions):
         vane.ai.embed(vane.col("text"), provider=MockProvider(), dimensions=dimensions)
 
 
-def test_ai_embed_rejects_nonfinal_on_error_value():
+@pytest.mark.parametrize("on_error", ["log", ["ignore"]])
+def test_ai_embed_rejects_nonfinal_on_error_value(on_error):
     with pytest.raises(ValueError, match="on_error"):
-        vane.ai.embed(vane.col("text"), provider=MockProvider(), on_error="log")
+        vane.ai.embed(vane.col("text"), provider=MockProvider(), on_error=on_error)
 
 
 def test_ai_embed_expression_rejects_relation_only_options():
