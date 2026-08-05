@@ -164,6 +164,7 @@ class _CleanupTicket:
         self.wait_response: RayStreamCleanupWait | None = None
         self.retry_call: RayControlScheduledCall | None = None
         self.wait_timeout: RayControlScheduledCall | None = None
+        self.deadline_call: RayControlScheduledCall | None = None
         self._done = False
         self._error: BaseException | None = None
         self._on_complete = on_complete
@@ -248,6 +249,10 @@ class UDFStreamResultCollector:
         self._shutdown_timeout_s = float(os.environ.get("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S", "5"))
         if not math.isfinite(self._shutdown_timeout_s) or self._shutdown_timeout_s <= 0:
             raise ValueError("VANE_UDF_STREAM_SHUTDOWN_TIMEOUT_S must be positive")
+        cleanup_timeout = os.environ.get("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S")
+        self._cleanup_timeout_s = self._shutdown_timeout_s if cleanup_timeout is None else float(cleanup_timeout)
+        if not math.isfinite(self._cleanup_timeout_s) or self._cleanup_timeout_s <= 0:
+            raise ValueError("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S must be positive")
         # Cleanup ownership can outlive the asyncio loop, so its process-wide
         # deadline owner must exist before this collector accepts any stream.
         RAY_CONTROL_DEADLINE_SCHEDULER.ensure_started()
@@ -1175,6 +1180,10 @@ class UDFStreamResultCollector:
                 holder: list[_CleanupTicket] = ticket_holder,
             ) -> None:
                 callback_error: BaseException | None = None
+                deadline_call: RayControlScheduledCall | None = None
+                retry_call: RayControlScheduledCall | None = None
+                wait_timeout: RayControlScheduledCall | None = None
+                operation_future: Any | None = None
                 try:
                     if on_each_done is not None:
                         on_each_done(error)
@@ -1183,6 +1192,17 @@ class UDFStreamResultCollector:
                 finally:
                     ticket = holder[0]
                     with self._cv:
+                        deadline_call = ticket.deadline_call
+                        retry_call = ticket.retry_call
+                        wait_timeout = ticket.wait_timeout
+                        operation_future = ticket.operation_future
+                        ticket.deadline_call = None
+                        ticket.retry_call = None
+                        ticket.wait_timeout = None
+                        ticket.operation_future = None
+                        ticket.wait_future = None
+                        ticket.wait_response = None
+                        ticket.submitting = False
                         if store_error and error is not None:
                             self._terminal_cleanup_errors.append(error)
                         if callback_error is not None:
@@ -1198,6 +1218,11 @@ class UDFStreamResultCollector:
                                         None,
                                     )
                         self._cv.notify_all()
+                    for scheduled_call in (deadline_call, retry_call, wait_timeout):
+                        if scheduled_call is not None:
+                            scheduled_call.cancel()
+                    if operation_future is not None:
+                        operation_future.cancel()
                     self._notify_wakeup()
                     self._stop_loop_after_final_cleanup_ticket()
 
@@ -1220,8 +1245,64 @@ class UDFStreamResultCollector:
                     self._cleanup_tickets_by_slot[slot_id].update(tickets)
                 self._cv.notify_all()
             for ticket in tickets:
+                try:
+                    self._arm_cleanup_ticket_deadline(ticket)
+                except BaseException as exc:
+                    ticket.finish(exc)
+            for ticket in tickets:
                 self._drive_cleanup_ticket(ticket)
         return tuple(tickets)
+
+    def _arm_cleanup_ticket_deadline(self, ticket: _CleanupTicket) -> None:
+        deadline_call: RayControlScheduledCall
+
+        def deadline_elapsed() -> None:
+            self._expire_cleanup_ticket(ticket, deadline_call)
+
+        deadline_call = create_ray_control_deadline(
+            f"{ticket.operation.submission_scope}:cleanup-total-timeout",
+            deadline_elapsed,
+        )
+        with self._cv:
+            if ticket not in self._cleanup_tickets:
+                arm_deadline = False
+            else:
+                ticket.deadline_call = deadline_call
+                arm_deadline = True
+        if not arm_deadline:
+            deadline_call.cancel()
+            return
+        try:
+            RAY_CONTROL_DEADLINE_SCHEDULER.schedule(
+                deadline_call,
+                self._cleanup_timeout_s,
+            )
+        except BaseException as exc:
+            with self._cv:
+                if ticket.deadline_call is deadline_call:
+                    ticket.deadline_call = None
+                    active = ticket in self._cleanup_tickets
+                else:
+                    active = False
+            deadline_call.cancel()
+            if active:
+                ticket.finish(exc)
+
+    def _expire_cleanup_ticket(
+        self,
+        ticket: _CleanupTicket,
+        deadline_call: RayControlScheduledCall,
+    ) -> None:
+        with self._cv:
+            if ticket not in self._cleanup_tickets or ticket.deadline_call is not deadline_call:
+                return
+            ticket.deadline_call = None
+        ticket.finish(
+            TimeoutError(
+                "Ray UDF remote cleanup did not terminate within "
+                f"{self._cleanup_timeout_s:g}s: scope={ticket.operation.submission_scope}"
+            )
+        )
 
     @staticmethod
     def _cleanup_retry_delay(retry_count: int) -> float:
