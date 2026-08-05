@@ -356,6 +356,56 @@ struct VLLMOperatorState : public OperatorState {
 	std::deque<unique_ptr<DataChunk>> pending_outputs;
 };
 
+static bool PopPendingOutput(VLLMOperatorState &state, DataChunk &chunk) {
+	if (state.pending_outputs.empty()) {
+		return false;
+	}
+
+	auto output = std::move(state.pending_outputs.front());
+	state.pending_outputs.pop_front();
+	if (output->size() > STANDARD_VECTOR_SIZE) {
+		throw InternalException("vllm output chunk has %d rows, maximum allowed is %d", output->size(),
+		                        STANDARD_VECTOR_SIZE);
+	}
+	chunk.Move(*output);
+	return true;
+}
+
+static void ConsumeReadyResult(ExecutionContext &context, VLLMGlobalOperatorState &gstate, VLLMOperatorState &state,
+                               VLLMResult &result) {
+	auto &rows = *result.rows;
+	if (rows.size() != result.outputs.size()) {
+		throw InvalidInputException("vllm output count (%d) does not match input rows (%d)", result.outputs.size(),
+		                            rows.size());
+	}
+	if (!result.outputs_validity.empty() && result.outputs_validity.size() != result.outputs.size()) {
+		throw InvalidInputException("vllm output validity count (%d) does not match input rows (%d)",
+		                            result.outputs_validity.size(), rows.size());
+	}
+	gstate.inflight_prompts.RecordCompletion(rows.size());
+
+	if (rows.size() <= STANDARD_VECTOR_SIZE) {
+		state.pending_outputs.push_back(BuildOutputChunk(context, rows, result.outputs, result.outputs_validity));
+		return;
+	}
+
+	for (idx_t offset = 0; offset < rows.size(); offset += STANDARD_VECTOR_SIZE) {
+		const auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, rows.size() - offset);
+		SelectionVector selection(count);
+		for (idx_t i = 0; i < count; i++) {
+			selection.set_index(i, offset + i);
+		}
+		auto chunk_rows = SliceChunk(context.client, rows, selection, count);
+		vector<string> chunk_outputs(result.outputs.begin() + offset, result.outputs.begin() + offset + count);
+		vector<bool> chunk_validity;
+		if (!result.outputs_validity.empty()) {
+			chunk_validity.insert(chunk_validity.end(), result.outputs_validity.begin() + offset,
+			                      result.outputs_validity.begin() + offset + count);
+		}
+		state.pending_outputs.push_back(BuildOutputChunk(context, *chunk_rows, chunk_outputs, chunk_validity));
+	}
+}
+
 static void TakeReadyResultOnce(ExecutionContext &context, VLLMGlobalOperatorState &gstate, VLLMOperatorState &state,
                                 idx_t input_column_count);
 
@@ -429,9 +479,7 @@ static void TakeReadyResultOnce(ExecutionContext &context, VLLMGlobalOperatorSta
 		throw InvalidInputException("vllm executor returned %d columns, expected %d", result.second.rows->ColumnCount(),
 		                            input_column_count);
 	}
-	gstate.inflight_prompts.RecordCompletion(result.second.rows->size());
-	auto output = BuildOutputChunk(context, *result.second.rows, result.second.outputs, result.second.outputs_validity);
-	state.pending_outputs.push_back(std::move(output));
+	ConsumeReadyResult(context, gstate, state, result.second);
 }
 
 static void PopAndSubmitTasks(ExecutionContext &context, VLLMGlobalOperatorState &gstate, VLLMOperatorState &state,
@@ -603,10 +651,7 @@ OperatorResultType PhysicalVLLM::Execute(ExecutionContext &context, DataChunk &i
 	auto &gstate = gstate_p.Cast<VLLMGlobalOperatorState>();
 	auto &state = state_p.Cast<VLLMOperatorState>();
 
-	if (!state.pending_outputs.empty()) {
-		auto output = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		chunk.Move(*output);
+	if (PopPendingOutput(state, chunk)) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 
@@ -640,11 +685,7 @@ OperatorResultType PhysicalVLLM::Execute(ExecutionContext &context, DataChunk &i
 
 		TakeReadyResultOnce(context, gstate, state, input.ColumnCount());
 	}
-	if (!state.pending_outputs.empty()) {
-		auto output = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		chunk.Move(*output);
-	} else {
+	if (!PopPendingOutput(state, chunk)) {
 		chunk.SetCardinality(0);
 	}
 	return OperatorResultType::NEED_MORE_INPUT;
@@ -655,10 +696,7 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 	auto &gstate = gstate_p.Cast<VLLMGlobalOperatorState>();
 	auto &state = state_p.Cast<VLLMOperatorState>();
 
-	if (!state.pending_outputs.empty()) {
-		auto output = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		chunk.Move(*output);
+	if (PopPendingOutput(state, chunk)) {
 		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 	}
 
@@ -676,10 +714,7 @@ OperatorFinalizeResultType PhysicalVLLM::FinalExecute(ExecutionContext &context,
 	}
 
 	TakeReadyResultOnce(context, gstate, state, types.size() - 1);
-	if (!state.pending_outputs.empty()) {
-		auto output = std::move(state.pending_outputs.front());
-		state.pending_outputs.pop_front();
-		chunk.Move(*output);
+	if (PopPendingOutput(state, chunk)) {
 		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 	}
 
