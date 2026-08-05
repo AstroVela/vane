@@ -11,7 +11,7 @@ import _duckdb
 
 def test_vane_map_batches_runtime_and_stub_signatures_stay_in_sync():
     runtime_doc = _duckdb._VaneUDFMapBatchesExpression.__doc__ or ""
-    runtime_parameters = ("gpus", "actor_number", "stateful", "*args")
+    runtime_parameters = ("gpus", "actor_number", "stateful", "expression_id", "*args")
     assert all(parameter in runtime_doc for parameter in runtime_parameters)
     assert [runtime_doc.index(parameter) for parameter in runtime_parameters] == sorted(
         runtime_doc.index(parameter) for parameter in runtime_parameters
@@ -26,8 +26,10 @@ def test_vane_map_batches_runtime_and_stub_signatures_stay_in_sync():
     )
     parameters = [argument.arg for argument in function.args.args]
 
-    assert parameters[-3:] == ["gpus", "actor_number", "stateful"]
+    assert parameters[-4:] == ["gpus", "actor_number", "stateful", "expression_id"]
     assert function.args.vararg is not None
     assert function.args.vararg.arg == "args"
     actor_number = function.args.args[parameters.index("actor_number")]
     assert ast.unparse(actor_number.annotation) == "int | None"
+    expression_id = function.args.args[parameters.index("expression_id")]
+    assert ast.unparse(expression_id.annotation) == "str | None"

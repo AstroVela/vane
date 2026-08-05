@@ -465,21 +465,19 @@ def test_attach_function_replace_delegates_atomic_registration_errors():
 
 def test_vane_batch_function_registered_for_sql_projection():
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     conn = vane.connect()
 
-    def add_one_batch(table: pa.Table) -> pa.Table:
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32(), batch_size=2)
+    def add_one_batch(x):
+        return pc.add(x, 1)
 
     vane.attach_function(
         add_one_batch,
         connection=conn,
         alias="batch_add_one_sql",
-        input_names=["x"],
-        schema={"y": "INTEGER"},
         parameters=["INTEGER"],
-        batch_size=2,
     )
 
     rows = conn.sql("""
@@ -493,19 +491,18 @@ def test_vane_batch_function_registered_for_sql_projection():
 
 def test_vane_batch_function_sql_without_actor_number_keeps_task_backend():
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     conn = vane.connect()
 
-    def add_one_batch(table: pa.Table) -> pa.Table:
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32())
+    def add_one_batch(x):
+        return pc.add(x, 1)
 
     vane.attach_function(
         add_one_batch,
         connection=conn,
         alias="batch_add_one_task_sql",
-        input_names=["x"],
-        schema={"y": "INTEGER"},
         parameters=["INTEGER"],
     )
 
@@ -519,33 +516,61 @@ def test_vane_batch_function_sql_without_actor_number_keeps_task_backend():
     assert "ray_actor" not in text
 
 
-def test_vane_batch_function_sql_uses_declared_input_names():
+def test_vane_batch_function_sql_infers_signature_input_names():
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     conn = vane.connect()
 
-    def combine_batch(table: pa.Table) -> pa.Table:
-        left = table.column("left_value").to_pylist()
-        right = table.column("right_value").to_pylist()
-        return pa.table({"sum_value": [a + b for a, b in zip(left, right, strict=True)]})
+    @vane.func.batch(return_dtype=pa.int32(), batch_size=2)
+    def combine_batch(left_value, right_value):
+        return pc.add(left_value, right_value)
 
     vane.attach_function(
         combine_batch,
         connection=conn,
         alias="batch_sum_sql",
-        input_names=["left_value", "right_value"],
-        schema={"sum_value": "INTEGER"},
         parameters=["INTEGER", "INTEGER"],
-        batch_size=2,
     )
 
     rows = conn.sql("""
-        SELECT batch_sum_sql(i::INTEGER, (i * 10)::INTEGER) AS y
+        SELECT batch_sum_sql(right_value := (i * 10)::INTEGER, left_value := i::INTEGER) AS y
         FROM range(3) t(i)
         ORDER BY i
     """).fetchall()
 
     assert rows == [(0,), (11,), (22,)]
+
+
+def test_vane_batch_function_sql_struct_unnest_executes_each_call_once(tmp_path):
+    import pyarrow as pa
+
+    calls_path = tmp_path / "sql_struct_calls"
+    result_type = pa.struct([pa.field("value", pa.int32()), pa.field("next_value", pa.int32())])
+
+    @vane.func.batch(return_dtype=result_type)
+    def pair(values):
+        with calls_path.open("a", encoding="utf-8") as calls:
+            calls.write("batch\n")
+        python_values = values.to_pylist()
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(python_values, type=pa.int32()),
+                pa.array([value + 1 for value in python_values], type=pa.int32()),
+            ],
+            fields=list(result_type),
+        )
+
+    conn = vane.connect()
+    vane.attach_function(pair, connection=conn, alias="pair_sql", parameters=["INTEGER"])
+    relation = conn.sql(
+        "SELECT unnest(pair_sql(left_value)), unnest(pair_sql(right_value)) "
+        "FROM (VALUES (1::INTEGER, 10::INTEGER)) t(left_value, right_value)"
+    )
+
+    assert relation.explain().count("STREAMING_UDF") == 2
+    assert relation.fetchall() == [(1, 2, 10, 11)]
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["batch", "batch"]
 
 
 def test_vane_batch_sql_reorders_reversed_named_arguments():
@@ -875,7 +900,14 @@ def test_vane_cls_sql_batch_size_override_reaches_fresh_physical_payload_and_exe
     assert relation.fetchall() == [(1,), (2,), (3,), (4,), (5,)]
 
 
-def test_vane_cls_batch_sql_schema_and_batch_size_overrides_reach_payload_and_execute():
+@pytest.mark.parametrize(
+    ("option", "value", "error"),
+    [
+        ("schema", {"override_result": "BIGINT"}, r"schema is not valid.*@vane\.cls\.batch"),
+        ("batch_size", 3, r"batch_size cannot override.*@vane\.cls\.batch"),
+    ],
+)
+def test_vane_cls_batch_sql_rejects_metadata_overrides(option, value, error):
     import pyarrow as pa
 
     conn = vane.connect()
@@ -883,45 +915,23 @@ def test_vane_cls_batch_sql_schema_and_batch_size_overrides_reach_payload_and_ex
     @vane.cls.batch(
         actor_number=1,
         batch_size=17,
-        schema={"decorated_result": "INTEGER"},
+        return_dtype=pa.int32(),
         name="decorated_batch_result",
-        row_preserving=True,
     )
     class AddTwoBatch:
-        def __call__(self, table):
-            values = table.column("value").to_pylist()
-            return pa.table(
-                {
-                    "override_result": pa.array(
-                        [value + 2 for value in values],
-                        type=pa.int64(),
-                    )
-                }
-            )
+        def __call__(self, values):
+            return pa.array([item + 2 for item in values.to_pylist()], type=pa.int32())
 
-    vane.attach_function(
-        AddTwoBatch(),
-        connection=conn,
-        alias="batch_class_metadata_override_sql",
-        input_names=["value"],
-        parameters=["INTEGER"],
-        schema={"override_result": "BIGINT"},
-        batch_size=3,
-    )
-    relation = conn.sql("SELECT batch_class_metadata_override_sql(i::INTEGER) AS result FROM range(5) t(i) ORDER BY i")
+    with pytest.raises(vane.InvalidInputException, match=error):
+        vane.attach_function(
+            AddTwoBatch(),
+            connection=conn,
+            alias="batch_class_metadata_override_sql",
+            parameters=["INTEGER"],
+            **{option: value},
+        )
 
-    payload = _fresh_physical_udf_payload(relation)
-    assert payload["batch_size"] == 3
-    assert payload["output_schema"] == [
-        {
-            "name": "override_result",
-            "kind": "duckdb_type",
-            "type": "BIGINT",
-            "dtype": None,
-            "shape": None,
-        }
-    ]
-    assert relation.fetchall() == [(2,), (3,), (4,), (5,), (6,)]
+    _assert_sql_alias_absent(conn, "batch_class_metadata_override_sql")
 
 
 def test_raw_batch_actor_requires_callable_instances():

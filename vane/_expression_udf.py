@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -60,6 +61,13 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
     if pa.types.is_fixed_size_list(dtype):
         child_type = _arrow_to_duckdb_type(dtype.value_type, original=original)
         return duckdb.array_type(child_type, dtype.list_size)
+    if pa.types.is_struct(dtype):
+        field_names = [field.name for field in dtype]
+        if len(field_names) != len({name.casefold() for name in field_names}):
+            raise _invalid_input(
+                f"dtype {str(original)!r} is not supported; Struct field names must be unique case-insensitively"
+            )
+        return duckdb.struct_type({field.name: _arrow_to_duckdb_type(field.type, original=original) for field in dtype})
     if pa.types.is_timestamp(dtype):
         if dtype.tz is not None:
             raise _invalid_input(
@@ -117,6 +125,13 @@ def _duckdb_to_arrow_type(dtype: Any, *, original: Any) -> Any:
         return pa.list_(
             _duckdb_to_arrow_type(children["child"], original=original),
             int(children["size"]),
+        )
+    if type_id == "struct":
+        return pa.struct(
+            [
+                pa.field(name, _duckdb_to_arrow_type(child_type, original=original))
+                for name, child_type in dtype.children
+            ]
         )
     raise _unsupported_dtype(original)
 
@@ -228,6 +243,204 @@ def _call_or_build_expression(
     if has_expression:
         return build_expression()
     return call_immediately()
+
+
+@dataclass(frozen=True)
+class _BatchCallLayout:
+    positional_input_names: tuple[str, ...]
+    keyword_input_names: tuple[str, ...]
+
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        return self.positional_input_names + self.keyword_input_names
+
+
+def _batch_function_signature(fn: Callable[..., Any]) -> inspect.Signature:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError) as exc:
+        raise _invalid_input("batch UDF signature cannot be inspected") from exc
+    variadic = [
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    if variadic:
+        names = ", ".join(variadic)
+        raise _invalid_input(f"batch UDF signatures cannot use *args or **kwargs: {names}")
+    return signature
+
+
+def _batch_call_layout(
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    *,
+    context: str,
+) -> _BatchCallLayout:
+    try:
+        signature.bind(*args, **dict(kwargs))
+    except TypeError as exc:
+        raise _invalid_input(f"{context} does not match batch UDF signature: {exc}") from exc
+
+    positional_parameters = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    positional_input_names = tuple(parameter.name for parameter in positional_parameters[: len(args)])
+    keyword_input_names = tuple(kwargs)
+    input_names = positional_input_names + keyword_input_names
+    if not input_names:
+        raise _invalid_input("batch expression UDFs require at least one input column")
+    folded_names = [name.casefold() for name in input_names]
+    if len(folded_names) != len(set(folded_names)):
+        raise _invalid_input("batch UDF input names must be unique (case-insensitive)")
+    return _BatchCallLayout(positional_input_names, keyword_input_names)
+
+
+def _batch_input_mapping(
+    layout: _BatchCallLayout,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    inputs = dict(zip(layout.positional_input_names, args, strict=True))
+    inputs.update((name, kwargs[name]) for name in layout.keyword_input_names)
+    return inputs
+
+
+def _arrow_batch_column(table: Any, name: str) -> Any:
+    column = table.column(name)
+    if column.num_chunks == 1:
+        return column.chunk(0)
+    return column
+
+
+def _invoke_batch_callable(
+    fn: Callable[..., Any],
+    layout: _BatchCallLayout,
+    columns: list[Any],
+) -> Any:
+    positional_count = len(layout.positional_input_names)
+    positional = columns[:positional_count]
+    keyword = dict(zip(layout.keyword_input_names, columns[positional_count:], strict=True))
+    return fn(*positional, **keyword)
+
+
+def _normalize_batch_result(
+    result: Any,
+    *,
+    output_arrow_type: Any,
+    expected_length: int,
+    udf_name: str,
+) -> Any:
+    import pyarrow as pa
+
+    if not isinstance(result, (pa.Array, pa.ChunkedArray)):
+        raise _invalid_input(
+            f"batch UDF {udf_name!r} must return pyarrow.Array or pyarrow.ChunkedArray; got {type(result).__name__}"
+        )
+    if len(result) != expected_length:
+        raise _invalid_input(f"batch UDF {udf_name!r} returned {len(result)} rows for {expected_length} input rows")
+    if not result.type.equals(output_arrow_type):
+        try:
+            result = result.cast(output_arrow_type)
+        except Exception as exc:
+            raise _invalid_input(
+                f"batch UDF {udf_name!r} returned Arrow type {result.type}, "
+                f"which cannot be cast to declared return_dtype {output_arrow_type}"
+            ) from exc
+    return result
+
+
+def _execute_batch_callable(
+    fn: Callable[..., Any],
+    layout: _BatchCallLayout,
+    columns: list[Any],
+    *,
+    output_arrow_type: Any,
+    output_column: str,
+    udf_name: str,
+) -> Any:
+    import pyarrow as pa
+
+    expected_length = len(columns[0])
+    if any(len(column) != expected_length for column in columns[1:]):
+        raise _invalid_input(f"batch UDF {udf_name!r} input columns must have equal lengths")
+    result = _invoke_batch_callable(fn, layout, columns)
+    normalized = _normalize_batch_result(
+        result,
+        output_arrow_type=output_arrow_type,
+        expected_length=expected_length,
+        udf_name=udf_name,
+    )
+    return pa.table({output_column: normalized})
+
+
+def _call_batch_eager(
+    fn: Callable[..., Any],
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    *,
+    output_arrow_type: Any,
+    output_column: str,
+    udf_name: str,
+) -> Any:
+    import pyarrow as pa
+
+    layout = _batch_call_layout(signature, args, kwargs, context=f"batch UDF {udf_name!r} call")
+    inputs = _batch_input_mapping(layout, args, kwargs)
+    columns = list(inputs.values())
+    for index, column in enumerate(columns):
+        if not isinstance(column, (pa.Array, pa.ChunkedArray)):
+            raise _invalid_input(
+                f"eager batch UDF inputs must be pyarrow.Array or pyarrow.ChunkedArray; got {type(column).__name__}"
+            )
+        if isinstance(column, pa.ChunkedArray) and column.num_chunks == 1:
+            columns[index] = column.chunk(0)
+    result_table = _execute_batch_callable(
+        fn,
+        layout,
+        columns,
+        output_arrow_type=output_arrow_type,
+        output_column=output_column,
+        udf_name=udf_name,
+    )
+    result = result_table.column(output_column)
+    if result.num_chunks == 1:
+        return result.chunk(0)
+    return result
+
+
+def _build_batch_function_adapter(
+    fn: Callable[..., Any],
+    layout: _BatchCallLayout,
+    output_column: str,
+    output_arrow_type: Any,
+    udf_name: str,
+) -> Callable[[Any], Any]:
+    captured_input_names = tuple(layout.input_names)
+
+    @functools.wraps(fn)
+    def batch_adapter(table: Any) -> Any:
+        columns = [_arrow_batch_column(table, name) for name in captured_input_names]
+        return _execute_batch_callable(
+            fn,
+            layout,
+            columns,
+            output_arrow_type=output_arrow_type,
+            output_column=output_column,
+            udf_name=udf_name,
+        )
+
+    return batch_adapter
+
+
+def _expand_batch_expression(expression: duckdb.Expression, *, unnest: bool) -> duckdb.Expression:
+    if not unnest:
+        return expression
+    return duckdb.FunctionExpression("unnest", expression)
 
 
 def _build_map_expression(
@@ -392,6 +605,38 @@ def _sql_class_input_names(
     return [parameter.name for parameter in contract.positional_parameters[:arg_count]]
 
 
+def _sql_batch_function_input_names(
+    signature: inspect.Signature,
+    arg_count: int,
+    explicit_input_names: list[str] | None,
+) -> list[str]:
+    if arg_count == 0:
+        raise _invalid_input("zero-input vane.func.batch SQL UDFs are not supported")
+    parameters = list(signature.parameters.values())
+    required_keyword_only = [
+        parameter.name
+        for parameter in parameters
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default is inspect.Parameter.empty
+    ]
+    if required_keyword_only:
+        names = ", ".join(required_keyword_only)
+        raise _invalid_input(
+            f"SQL vane.func.batch registration cannot satisfy required keyword-only parameter(s): {names}"
+        )
+    try:
+        signature.bind(*([object()] * arg_count))
+    except TypeError as exc:
+        raise _invalid_input(f"SQL vane.func.batch registration does not match UDF signature: {exc}") from exc
+    if explicit_input_names is not None:
+        return explicit_input_names
+    positional_parameters = [
+        parameter
+        for parameter in parameters
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return [parameter.name for parameter in positional_parameters[:arg_count]]
+
+
 def _build_row_actor_class(
     user_class: type,
     init_args: tuple[Any, ...],
@@ -436,15 +681,28 @@ def _build_batch_actor_class(
     user_class: type,
     init_args: tuple[Any, ...],
     init_kwargs: Mapping[str, Any],
+    layout: _BatchCallLayout,
+    output_column: str,
+    output_arrow_type: Any,
+    udf_name: str,
 ) -> type:
     captured_init_kwargs = dict(init_kwargs)
+    captured_input_names = tuple(layout.input_names)
 
     class _VaneBatchActorAdapter:
         def __init__(self) -> None:
             self._instance = user_class(*init_args, **captured_init_kwargs)
 
         def __call__(self, table: Any) -> Any:
-            return self._instance(table)
+            columns = [_arrow_batch_column(table, name) for name in captured_input_names]
+            return _execute_batch_callable(
+                self._instance,
+                layout,
+                columns,
+                output_arrow_type=output_arrow_type,
+                output_column=output_column,
+                udf_name=udf_name,
+            )
 
     _VaneBatchActorAdapter.__name__ = f"_{_class_name(user_class)}BatchActor"
     _VaneBatchActorAdapter.__qualname__ = _VaneBatchActorAdapter.__name__
@@ -520,6 +778,130 @@ class VaneFunction:
             return self
         bound_fn = self._fn.__get__(instance, owner)
         return VaneFunction(bound_fn, return_dtype=self._return_dtype, name=self._name)
+
+
+class VaneBatchFunction:
+    """Decorator wrapper for row-preserving Arrow column batch UDFs."""
+
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        *,
+        return_dtype: Any,
+        name: str | None = None,
+        batch_size: int | None = None,
+        unnest: bool = False,
+        gpus: float | None = None,
+    ) -> None:
+        if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
+            raise TypeError("vane.func.batch requires a Python function")
+        if inspect.iscoroutinefunction(fn):
+            raise TypeError("vane.func.batch requires a synchronous Python function")
+        if return_dtype is None:
+            raise _invalid_input("return_dtype is required for vane.func.batch")
+        normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
+        if unnest:
+            import pyarrow as pa
+
+            if not pa.types.is_struct(return_arrow_dtype):
+                raise _invalid_input("unnest=True requires a Struct return_dtype")
+        self._fn = fn
+        self._signature = _batch_function_signature(fn)
+        self._return_dtype = normalized_return_dtype
+        self._return_arrow_dtype = return_arrow_dtype
+        self._name = _resolve_udf_name(name, _callable_name(fn))
+        self._batch_size = _normalize_batch_size(batch_size)
+        self._unnest = bool(unnest)
+        self._gpus = _normalize_gpus(gpus)
+        functools.update_wrapper(self, fn)
+
+    @property
+    def python_function(self) -> Callable[..., Any]:
+        return self._fn
+
+    @property
+    def signature(self) -> inspect.Signature:
+        return self._signature
+
+    @property
+    def return_dtype(self) -> Any:
+        return self._return_dtype
+
+    @property
+    def return_arrow_dtype(self) -> Any:
+        return self._return_arrow_dtype
+
+    @property
+    def sql_name(self) -> str:
+        return self._name
+
+    @property
+    def batch_size(self) -> int | None:
+        return self._batch_size
+
+    @property
+    def unnest(self) -> bool:
+        return self._unnest
+
+    @property
+    def gpus(self) -> float | None:
+        return self._gpus
+
+    def adapter(self, layout: _BatchCallLayout) -> Callable[[Any], Any]:
+        return _build_batch_function_adapter(
+            self.python_function,
+            layout,
+            self.sql_name,
+            self.return_arrow_dtype,
+            self.sql_name,
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return _call_or_build_expression(
+            has_expression=_has_expression(args) or _has_expression(kwargs.values()),
+            call_immediately=lambda: _call_batch_eager(
+                self.python_function,
+                self.signature,
+                args,
+                kwargs,
+                output_arrow_type=self.return_arrow_dtype,
+                output_column=self.sql_name,
+                udf_name=self.sql_name,
+            ),
+            build_expression=lambda: self._build_expression(args, kwargs),
+        )
+
+    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> duckdb.Expression:
+        layout = _batch_call_layout(
+            self.signature,
+            args,
+            kwargs,
+            context=f"vane.func.batch {self.sql_name!r} expression call",
+        )
+        expression = _build_map_batches_expression(
+            self.adapter(layout),
+            name=self.sql_name,
+            inputs=_batch_input_mapping(layout, args, kwargs),
+            schema={self.sql_name: self.return_dtype},
+            batch_size=self.batch_size,
+            row_preserving=True,
+            gpus=self.gpus,
+            expression_id=uuid.uuid4().hex,
+        )
+        return _expand_batch_expression(expression, unnest=self.unnest)
+
+    def __get__(self, instance: Any, owner: Any | None = None) -> Any:
+        if instance is None:
+            return self
+        bound_fn = self._fn.__get__(instance, owner)
+        return VaneBatchFunction(
+            bound_fn,
+            return_dtype=self.return_dtype,
+            name=self.sql_name,
+            batch_size=self.batch_size,
+            unnest=self.unnest,
+            gpus=self.gpus,
+        )
 
 
 class VaneClass:
@@ -656,21 +1038,40 @@ class VaneClassBatch:
         class_: type,
         *,
         actor_number: int | None,
-        schema: Mapping[str, Any] | None,
+        return_dtype: Any,
         name: str | None = None,
         batch_size: int | None = None,
-        row_preserving: bool = False,
+        unnest: bool = False,
         gpus: float | None = 0,
     ) -> None:
         if not inspect.isclass(class_):
             raise TypeError("vane.cls.batch requires a class")
-        self._schema = _normalize_schema(schema)
+        if return_dtype is None:
+            raise _invalid_input("return_dtype is required for vane.cls.batch")
+        normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
+        if unnest:
+            import pyarrow as pa
+
+            if not pa.types.is_struct(return_arrow_dtype):
+                raise _invalid_input("unnest=True requires a Struct return_dtype")
+        signature = _class_call_contract(class_).signature
+        variadic = [
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        ]
+        if variadic:
+            names = ", ".join(variadic)
+            raise _invalid_input(f"batch UDF signatures cannot use *args or **kwargs: {names}")
         self._class = class_
+        self._signature = signature
         self._actor_number = _validate_actor_number(actor_number)
+        self._return_dtype = normalized_return_dtype
+        self._return_arrow_dtype = return_arrow_dtype
         self._name = _resolve_udf_name(name, _class_name(class_))
-        self._batch_size = batch_size
-        self._row_preserving = bool(row_preserving)
-        self._gpus = 0 if gpus is None else gpus
+        self._batch_size = _normalize_batch_size(batch_size)
+        self._unnest = bool(unnest)
+        self._gpus = 0.0 if gpus is None else _normalize_gpus(gpus)
         functools.update_wrapper(self, class_, updated=())
 
     @property
@@ -682,8 +1083,16 @@ class VaneClassBatch:
         return self._actor_number
 
     @property
-    def schema(self) -> dict[str, Any]:
-        return dict(self._schema)
+    def signature(self) -> inspect.Signature:
+        return self._signature
+
+    @property
+    def return_dtype(self) -> Any:
+        return self._return_dtype
+
+    @property
+    def return_arrow_dtype(self) -> Any:
+        return self._return_arrow_dtype
 
     @property
     def sql_name(self) -> str:
@@ -694,8 +1103,8 @@ class VaneClassBatch:
         return self._batch_size
 
     @property
-    def row_preserving(self) -> bool:
-        return self._row_preserving
+    def unnest(self) -> bool:
+        return self._unnest
 
     @property
     def gpus(self) -> float | int | None:
@@ -721,16 +1130,24 @@ class VaneClassBatchInstance:
         return self._decorator.actor_number
 
     @property
-    def schema(self) -> dict[str, Any]:
-        return self._decorator.schema
+    def signature(self) -> inspect.Signature:
+        return self._decorator.signature
+
+    @property
+    def return_dtype(self) -> Any:
+        return self._decorator.return_dtype
+
+    @property
+    def return_arrow_dtype(self) -> Any:
+        return self._decorator.return_arrow_dtype
 
     @property
     def batch_size(self) -> int | None:
         return self._decorator.batch_size
 
     @property
-    def row_preserving(self) -> bool:
-        return self._decorator.row_preserving
+    def unnest(self) -> bool:
+        return self._decorator.unnest
 
     @property
     def gpus(self) -> float | int | None:
@@ -745,26 +1162,52 @@ class VaneClassBatchInstance:
             self._eager_instance = self.user_class(*self._init_args, **self._init_kwargs)
         return self._eager_instance
 
-    def actor_class(self) -> type:
-        return _build_batch_actor_class(self.user_class, self._init_args, self._init_kwargs)
-
-    def __call__(self, **inputs: Any) -> Any:
-        normalized_inputs = _normalize_input_mapping(inputs)
-        return _call_or_build_expression(
-            has_expression=_has_expression(normalized_inputs.values()),
-            call_immediately=lambda: _call_batch_immediately(self._instance(), normalized_inputs),
-            build_expression=lambda: _build_actor_map_batches_expression(
-                self.actor_class(),
-                name=self.sql_name,
-                inputs=normalized_inputs,
-                schema=self.schema,
-                batch_size=self.batch_size,
-                row_preserving=self.row_preserving,
-                actor_number=self.actor_number,
-                gpus=self.gpus,
-                stateful=True,
-            ),
+    def actor_class(self, layout: _BatchCallLayout) -> type:
+        return _build_batch_actor_class(
+            self.user_class,
+            self._init_args,
+            self._init_kwargs,
+            layout,
+            self.sql_name,
+            self.return_arrow_dtype,
+            self.sql_name,
         )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return _call_or_build_expression(
+            has_expression=_has_expression(args) or _has_expression(kwargs.values()),
+            call_immediately=lambda: _call_batch_eager(
+                self._instance(),
+                self.signature,
+                args,
+                kwargs,
+                output_arrow_type=self.return_arrow_dtype,
+                output_column=self.sql_name,
+                udf_name=self.sql_name,
+            ),
+            build_expression=lambda: self._build_expression(args, kwargs),
+        )
+
+    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> duckdb.Expression:
+        layout = _batch_call_layout(
+            self.signature,
+            args,
+            kwargs,
+            context=f"vane.cls.batch {self.sql_name!r} expression call",
+        )
+        expression = _build_actor_map_batches_expression(
+            self.actor_class(layout),
+            name=self.sql_name,
+            inputs=_batch_input_mapping(layout, args, kwargs),
+            schema={self.sql_name: self.return_dtype},
+            batch_size=self.batch_size,
+            row_preserving=True,
+            actor_number=self.actor_number,
+            gpus=self.gpus,
+            stateful=True,
+            expression_id=uuid.uuid4().hex,
+        )
+        return _expand_batch_expression(expression, unnest=self.unnest)
 
 
 def _normalize_schema(schema: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -874,12 +1317,6 @@ def _normalize_inputs(inputs: Mapping[str, Any]) -> tuple[list[str], tuple[duckd
     return names, tuple(exprs)
 
 
-def _call_batch_immediately(fn: Callable[[Any], Any], inputs: Mapping[str, Any]) -> Any:
-    import pyarrow as pa
-
-    return fn(pa.table(_normalize_input_mapping(inputs)))
-
-
 def _build_map_batches_expression(
     fn: Callable[[Any], Any],
     *,
@@ -892,6 +1329,7 @@ def _build_map_batches_expression(
     execution_backend: str | None = None,
     actor_number: int | None = None,
     stateful: bool = False,
+    expression_id: str | None = None,
 ) -> duckdb.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
@@ -907,6 +1345,7 @@ def _build_map_batches_expression(
         gpus,
         actor_number,
         stateful,
+        expression_id,
         *exprs,
     )
 
@@ -922,6 +1361,7 @@ def _build_actor_map_batches_expression(
     actor_number: int,
     gpus: float | None,
     stateful: bool = False,
+    expression_id: str | None = None,
 ) -> duckdb.Expression:
     normalized_actor_number = (
         _validate_actor_number(actor_number) if stateful else _validate_positive_actor_number(actor_number)
@@ -937,34 +1377,7 @@ def _build_actor_map_batches_expression(
         execution_backend=_runner_to_actor_backend(),
         actor_number=normalized_actor_number,
         stateful=stateful,
-    )
-
-
-def _map_batches(
-    fn: Callable[[Any], Any],
-    *,
-    inputs: Mapping[str, Any],
-    schema: Mapping[str, Any] | None = None,
-    name: str | None = None,
-    batch_size: int | None = None,
-    row_preserving: bool = False,
-    gpus: float | None = None,
-) -> Any:
-    if not callable(fn):
-        raise TypeError("vane.func.batch requires a callable")
-    normalized_inputs = _normalize_input_mapping(inputs)
-    return _call_or_build_expression(
-        has_expression=_has_expression(normalized_inputs.values()),
-        call_immediately=lambda: _call_batch_immediately(fn, normalized_inputs),
-        build_expression=lambda: _build_map_batches_expression(
-            fn,
-            name=name,
-            inputs=normalized_inputs,
-            schema=schema,
-            batch_size=batch_size,
-            row_preserving=row_preserving,
-            gpus=gpus,
-        ),
+        expression_id=expression_id,
     )
 
 
@@ -979,7 +1392,33 @@ def func(
     return VaneFunction(fn, return_dtype=return_dtype, name=name)
 
 
-func.batch = _map_batches  # type: ignore[attr-defined]
+def _func_batch(
+    *,
+    return_dtype: Any,
+    name: str | None = None,
+    batch_size: int | None = None,
+    unnest: bool = False,
+    gpus: float | None = None,
+) -> Callable[[Callable[..., Any]], VaneBatchFunction]:
+    """Decorate a row-preserving Arrow column batch function.
+
+    Each decorated input is delivered as ``pyarrow.Array`` or
+    ``pyarrow.ChunkedArray``. The function must return one of those column
+    types with the same row count. Use a Struct ``return_dtype`` for a logical
+    value with multiple fields and ``unnest=True`` to project those fields as
+    separate columns.
+    """
+    return lambda actual_fn: VaneBatchFunction(
+        actual_fn,
+        return_dtype=return_dtype,
+        name=name,
+        batch_size=batch_size,
+        unnest=unnest,
+        gpus=gpus,
+    )
+
+
+func.batch = _func_batch  # type: ignore[attr-defined]
 
 
 def _cls(
@@ -1002,32 +1441,22 @@ def _cls(
 
 
 def _cls_batch(
-    class_: type | None = None,
     *,
     actor_number: int | None = None,
-    schema: Mapping[str, Any] | None = None,
+    return_dtype: Any,
     name: str | None = None,
     batch_size: int | None = None,
-    row_preserving: bool = False,
+    unnest: bool = False,
     gpus: float | None = 0,
-) -> VaneClassBatch | Callable[[type], VaneClassBatch]:
-    if class_ is None:
-        return lambda actual_class: VaneClassBatch(
-            actual_class,
-            actor_number=actor_number,
-            schema=schema,
-            name=name,
-            batch_size=batch_size,
-            row_preserving=row_preserving,
-            gpus=gpus,
-        )
-    return VaneClassBatch(
-        class_,
+) -> Callable[[type], VaneClassBatch]:
+    """Decorate a stateful row-preserving Arrow column batch class."""
+    return lambda actual_class: VaneClassBatch(
+        actual_class,
         actor_number=actor_number,
-        schema=schema,
+        return_dtype=return_dtype,
         name=name,
         batch_size=batch_size,
-        row_preserving=row_preserving,
+        unnest=unnest,
         gpus=gpus,
     )
 
@@ -1173,33 +1602,101 @@ def _preflight_vane_class_batch_instance(
         kind="vane.cls.batch",
         decorator="vane.cls.batch",
     )
-    if not fn_or_instance.row_preserving:
+    if schema is not None:
         raise _invalid_input(
-            "row_preserving=False is supported by the expression API, but SQL attach v1 requires "
-            "row-preserving batch UDFs"
+            "schema is not valid for SQL vane.cls.batch registration; use return_dtype on @vane.cls.batch"
         )
+    _reject_attach_override(
+        "batch_size",
+        batch_size,
+        kind="vane.cls.batch",
+        decorator="vane.cls.batch",
+    )
     normalized_parameters = _require_sql_type_list(
         parameters,
         "parameters is required for SQL vane.cls.batch registration",
     )
-    if input_names is None:
-        raise _invalid_input("input_names is required for SQL vane.cls.batch registration")
-    normalized_input_names = _normalize_sql_input_names(input_names)
-    if len(normalized_input_names) != len(normalized_parameters):
+    explicit_input_names = None if input_names is None else _normalize_sql_input_names(input_names)
+    if explicit_input_names is not None and len(explicit_input_names) != len(normalized_parameters):
         raise _invalid_input("input_names count must match parameters count")
-    resolved_schema = _normalize_schema(schema) if schema is not None else fn_or_instance.schema
-    resolved_batch_size = batch_size if batch_size is not None else fn_or_instance.batch_size
+    normalized_input_names = _sql_class_input_names(
+        fn_or_instance.user_class,
+        len(normalized_parameters),
+        explicit_input_names,
+    )
+    layout = _BatchCallLayout(tuple(normalized_input_names), ())
     return _PreparedBatchSQLRegistration(
         alias=_resolve_alias(alias, fn_or_instance.sql_name),
-        udf=fn_or_instance.actor_class(),
+        udf=fn_or_instance.actor_class(layout),
         input_names=normalized_input_names,
-        schema=resolved_schema,
+        schema={fn_or_instance.sql_name: fn_or_instance.return_dtype},
         parameters=normalized_parameters,
-        batch_size=_normalize_batch_size(resolved_batch_size),
+        batch_size=fn_or_instance.batch_size,
         gpus=_normalize_gpus(fn_or_instance.gpus),
         actor_number=_validate_actor_number(fn_or_instance.actor_number),
         stateful=True,
-        row_preserving=fn_or_instance.row_preserving,
+        row_preserving=True,
+        replace=replace,
+    )
+
+
+def _preflight_vane_batch_function(
+    fn_or_function: VaneBatchFunction,
+    *,
+    alias: str | None,
+    parameters: Any,
+    return_dtype: Any,
+    input_names: Any,
+    schema: Any,
+    batch_size: Any,
+    gpus: Any,
+    actor_number: Any,
+    replace: bool,
+) -> _PreparedBatchSQLRegistration:
+    _reject_attach_override(
+        "return_dtype",
+        return_dtype,
+        kind="vane.func.batch",
+        decorator="vane.func.batch",
+    )
+    if schema is not None:
+        raise _invalid_input(
+            "schema is not valid for SQL vane.func.batch registration; use return_dtype on @vane.func.batch"
+        )
+    _reject_attach_override(
+        "batch_size",
+        batch_size,
+        kind="vane.func.batch",
+        decorator="vane.func.batch",
+    )
+    _reject_attach_override("gpus", gpus, kind="vane.func.batch", decorator="vane.func.batch")
+    if actor_number is not None:
+        raise _invalid_input("actor_number is not valid for SQL vane.func.batch registration; use vane.cls.batch")
+
+    normalized_parameters = _require_sql_type_list(
+        parameters,
+        "parameters is required for SQL vane.func.batch registration",
+    )
+    explicit_input_names = None if input_names is None else _normalize_sql_input_names(input_names)
+    if explicit_input_names is not None and len(explicit_input_names) != len(normalized_parameters):
+        raise _invalid_input("input_names count must match parameters count")
+    normalized_input_names = _sql_batch_function_input_names(
+        fn_or_function.signature,
+        len(normalized_parameters),
+        explicit_input_names,
+    )
+    layout = _BatchCallLayout(tuple(normalized_input_names), ())
+    return _PreparedBatchSQLRegistration(
+        alias=_resolve_alias(alias, fn_or_function.sql_name),
+        udf=fn_or_function.adapter(layout),
+        input_names=normalized_input_names,
+        schema={fn_or_function.sql_name: fn_or_function.return_dtype},
+        parameters=normalized_parameters,
+        batch_size=fn_or_function.batch_size,
+        gpus=_normalize_gpus(fn_or_function.gpus),
+        actor_number=None,
+        stateful=False,
+        row_preserving=True,
         replace=replace,
     )
 
@@ -1370,6 +1867,19 @@ def _preflight_attach_function(
             actor_number=actor_number,
             replace=replace,
         )
+    if isinstance(fn_or_function, VaneBatchFunction):
+        return _preflight_vane_batch_function(
+            fn_or_function,
+            alias=alias,
+            parameters=parameters,
+            return_dtype=return_dtype,
+            input_names=input_names,
+            schema=schema,
+            batch_size=batch_size,
+            gpus=gpus,
+            actor_number=actor_number,
+            replace=replace,
+        )
     if isinstance(fn_or_function, VaneFunction):
         return _preflight_vane_function(
             fn_or_function,
@@ -1413,23 +1923,15 @@ def attach_function(
 ) -> None:
     """Attach an expression UDF callable to a DuckDB connection.
 
-    ``VaneFunction`` and raw scalar callables require ``parameters`` and an
-    effective ``return_dtype``. Raw batch callables require ``parameters``,
-    ``input_names``, and ``schema``; they additionally accept ``batch_size``
-    and ``gpus``, while ``actor_number`` requires a zero-argument callable
-    class. Instantiated ``vane.cls`` requires ``parameters``, may infer
-    ``input_names``, and accepts a ``batch_size`` override. Instantiated
-    ``vane.cls.batch`` requires ``parameters`` and ``input_names`` and accepts
-    ``schema`` and ``batch_size`` overrides. Uninstantiated class decorator
-    wrappers are rejected.
+    Decorated UDFs require ``parameters`` and infer SQL argument names from
+    their Python signatures. Raw scalar callables additionally require an
+    effective ``return_dtype``. Raw batch callables retain the low-level
+    ``pa.Table`` protocol and require ``input_names`` plus ``schema``.
 
-    The row-class return type and all class GPU/actor settings belong to the
-    decorator/instance and cannot be overridden at attach time. Batch-class
-    ``schema`` and ``batch_size`` use the explicit override rules above. SQL
-    v1 rejects non-row-preserving class-batch registrations. Row-oriented
-    class expressions propagate SQL NULL without invoking user code and accept
-    only timezone-naive ``TIMESTAMP`` output; eager calls retain ordinary
-    Python semantics.
+    Decorator return types, batch sizes, and GPU/actor settings cannot be
+    overridden at attach time. Row-oriented class expressions propagate SQL
+    NULL without invoking user code and accept only timezone-naive
+    ``TIMESTAMP`` output; eager calls retain ordinary Python semantics.
 
     ``replace=True`` atomically replaces an existing Vane alias owned by the
     same connection. Builtins, aliases owned by another connection, and
@@ -1462,6 +1964,7 @@ __all__ = [
     "VaneClassBatch",
     "VaneClassBatchInstance",
     "VaneClassInstance",
+    "VaneBatchFunction",
     "VaneFunction",
     "_build_actor_map_batches_expression",
     "_build_batch_actor_class",

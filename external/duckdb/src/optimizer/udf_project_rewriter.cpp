@@ -13,6 +13,7 @@
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -111,6 +112,16 @@ static UDFMode GetUDFProjectMode(const Expression &expr) {
 	return ClassifyUDFMode(bind_data.payload);
 }
 
+static std::pair<bool, string> GetUDFExpressionId(const Expression &expr) {
+	D_ASSERT(IsUDFFunction(expr));
+	auto &bound_func = expr.Cast<BoundFunctionExpression>();
+	if (!bound_func.bind_info) {
+		throw InvalidInputException("udf expression is missing bind data");
+	}
+	auto &bind_data = bound_func.bind_info->Cast<UDFFunctionData>();
+	return UDFPayloadStringField(bind_data.payload, "expression_id");
+}
+
 static bool ContainsResultOnlyBatchUDF(const Expression &expr) {
 	if (IsUDFFunction(expr)) {
 		return GetUDFProjectMode(expr) == UDFMode::RESULT_ONLY_BATCH;
@@ -172,10 +183,19 @@ struct ScalarExtractionState {
 	Binder &binder;
 	LogicalProjection &projection;
 	unique_ptr<LogicalOperator> current_child;
+	unordered_map<string, ColumnBinding> extracted_expression_bindings;
 };
 
 static void ExtractScalarUDF(unique_ptr<Expression> &expr, ScalarExtractionState &state, const string &replacement_name,
                              UDFMode mode) {
+	auto expression_id = GetUDFExpressionId(*expr);
+	if (expression_id.first) {
+		auto existing = state.extracted_expression_bindings.find(expression_id.second);
+		if (existing != state.extracted_expression_bindings.end()) {
+			expr = make_uniq<BoundColumnRefExpression>(replacement_name, expr->return_type, existing->second);
+			return;
+		}
+	}
 	if (!state.current_child) {
 		D_ASSERT(state.projection.children.size() == 1);
 		state.current_child = std::move(state.projection.children[0]);
@@ -192,6 +212,9 @@ static void ExtractScalarUDF(unique_ptr<Expression> &expr, ScalarExtractionState
 	udf_project->is_row_preserving_batch = mode == UDFMode::ROW_PRESERVING_BATCH;
 	udf_project->children.push_back(std::move(state.current_child));
 	state.current_child = std::move(udf_project);
+	if (expression_id.first) {
+		state.extracted_expression_bindings.emplace(expression_id.second, output_binding);
+	}
 
 	expr = make_uniq<BoundColumnRefExpression>(replacement_name, output_type, output_binding);
 }

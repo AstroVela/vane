@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Expression-level batch UDF tests for ``vane.func.batch``."""
+"""Expression-level Arrow column batch UDF tests for ``vane.func.batch``."""
 
 from __future__ import annotations
 
@@ -10,246 +10,301 @@ import os
 import pytest
 
 
-def test_vane_function_batch_expression_local_single_output():
+def test_vane_function_batch_is_decorator_only():
     import pyarrow as pa
 
     import vane
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    def identity(values):
+        return values
+
+    with pytest.raises(TypeError, match="positional argument"):
+        vane.func.batch(identity, return_dtype=pa.int64())
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'inputs'"):
+        vane.func.batch(return_dtype=pa.int64(), inputs={"x": vane.col("x")})
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'schema'"):
+        vane.func.batch(schema={"x": "BIGINT"})
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'row_preserving'"):
+        vane.func.batch(return_dtype=pa.int64(), row_preserving=False)
+
+
+def test_vane_function_batch_requires_return_dtype():
+    import vane
+
+    with pytest.raises(TypeError, match="return_dtype"):
+        vane.func.batch()
+
+
+def test_vane_function_batch_eager_array_and_chunked_array_inputs():
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    import vane
+
+    seen_types = []
+
+    @vane.func.batch(return_dtype=pa.int64())
+    def add(left, right):
+        seen_types.append((type(left), type(right)))
+        return pc.add(left, right)
+
+    single_chunk = add(pa.array([1, 2]), pa.chunked_array([[10, 20]]))
+    multiple_chunks = add(pa.chunked_array([[1], [2]]), pa.chunked_array([[10], [20]]))
+
+    assert single_chunk.to_pylist() == [11, 22]
+    assert multiple_chunks.to_pylist() == [11, 22]
+    assert seen_types[0] == (pa.Int64Array, pa.Int64Array)
+    assert seen_types[1] == (pa.ChunkedArray, pa.ChunkedArray)
+
+
+def test_vane_function_batch_rejects_non_arrow_column_inputs():
+    import pyarrow as pa
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int64())
+    def identity(values):
+        return values
+
+    for value in ([1, 2], pa.table({"value": [1, 2]})):
+        with pytest.raises(vane.InvalidInputException, match="must be pyarrow.Array or pyarrow.ChunkedArray"):
+            identity(value)
+
+
+def test_vane_function_batch_expression_receives_arrow_columns():
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int32(), batch_size=2)
+    def add_one(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        return pc.add(values, 1)
 
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(5) t(i)")
 
-    expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        batch_size=2,
+    assert rel.select(vane.col("x"), add_one(vane.col("x")).alias("y")).fetchall() == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 5),
+    ]
+
+
+def test_vane_function_batch_expression_supports_keyword_columns():
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int32())
+    def subtract(left, *, right):
+        return pc.subtract(left, right)
+
+    con = vane.connect()
+    rel = con.sql("select 7::INTEGER as x, 2::INTEGER as y")
+
+    assert rel.select(subtract(vane.col("x"), right=vane.col("y")).alias("result")).fetchall() == [(5,)]
+
+
+def test_vane_function_batch_rejects_table_output():
+    import pyarrow as pa
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int64())
+    def identity(values):
+        return pa.table({"value": values})
+
+    with pytest.raises(vane.InvalidInputException, match="must return pyarrow.Array or pyarrow.ChunkedArray"):
+        identity(pa.array([1, 2]))
+
+
+def test_vane_function_batch_rejects_row_count_mismatch():
+    import pyarrow as pa
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int32())
+    def too_short(values):
+        return values.slice(0, max(0, len(values) - 1))
+
+    con = vane.connect()
+    rel = con.sql("select i::INTEGER as x from range(4) t(i)")
+
+    with pytest.raises(Exception, match=r"returned 3 rows for 4 input rows|row count"):
+        rel.select(too_short(vane.col("x")).alias("y")).fetchall()
+
+
+def test_vane_function_batch_casts_output_to_declared_arrow_type():
+    import pyarrow as pa
+
+    import vane
+
+    @vane.func.batch(return_dtype=pa.int32())
+    def as_int32(values):
+        return pa.array(values.to_pylist(), type=pa.int64())
+
+    result = as_int32(pa.array([1, 2], type=pa.int64()))
+
+    assert result.type == pa.int32()
+    assert result.to_pylist() == [1, 2]
+
+
+def test_vane_function_batch_struct_is_one_logical_output_column():
+    import pyarrow as pa
+
+    import vane
+
+    result_type = pa.struct(
+        [
+            pa.field("label", pa.string()),
+            pa.field("score", pa.float64()),
+            pa.field("reason", pa.string()),
+        ]
     )
-    out = rel.select(expr.alias("y"))
 
-    assert sorted(out.fetchall()) == [(1,), (2,), (3,), (4,), (5,)]
+    @vane.func.batch(return_dtype=result_type)
+    def analyze(text):
+        labels = pa.array(["positive" if value > 0 else "negative" for value in text.to_pylist()])
+        scores = pa.array([abs(value) / 10 for value in text.to_pylist()], type=pa.float64())
+        reasons = pa.array([f"value={value}" for value in text.to_pylist()])
+        return pa.StructArray.from_arrays([labels, scores, reasons], fields=list(result_type))
+
+    con = vane.connect()
+    rel = con.sql("select i::INTEGER as id, (i * 2 - 1)::INTEGER as value from range(2) t(i)")
+    rows = rel.select(vane.col("id"), analyze(vane.col("value")).alias("analysis")).fetchall()
+
+    assert rows == [
+        (0, {"label": "negative", "score": 0.1, "reason": "value=-1"}),
+        (1, {"label": "positive", "score": 0.1, "reason": "value=1"}),
+    ]
 
 
-def test_vane_function_batch_immediate_call_without_expression_inputs():
+def test_vane_function_batch_unnest_expands_struct_once(tmp_path):
     import pyarrow as pa
 
     import vane
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
-
-    result = vane.func.batch(
-        add_one_batch,
-        inputs={"x": [1, 2, 3]},
-        batch_size=2,
+    calls_path = tmp_path / "calls"
+    result_type = pa.struct(
+        [
+            pa.field("label", pa.string()),
+            pa.field("score", pa.float64()),
+            pa.field("reason", pa.string()),
+        ]
     )
 
-    assert result.to_pydict() == {"y": [2, 3, 4]}
-
-
-def test_vane_function_batch_requires_mapping_inputs():
-    import vane
-
-    def identity(table):
-        return table
-
-    with pytest.raises(vane.InvalidInputException, match="inputs must be a non-empty mapping"):
-        vane.func.batch(identity, inputs=[], schema={"x": "INTEGER"})
-
-
-def test_vane_function_batch_v1_requires_single_output_schema():
-    import vane
-
-    def identity(table):
-        return table
-
-    with pytest.raises(vane.InvalidInputException, match="exactly one output column"):
-        vane.func.batch(identity, inputs={"x": vane.col("x")}, schema={"x": "INTEGER", "y": "INTEGER"})
-
-
-def test_vane_function_batch_expression_requires_schema():
-    import vane
-
-    def identity(table):
-        return table
-
-    with pytest.raises(vane.InvalidInputException, match="schema must be a non-empty mapping"):
-        vane.func.batch(identity, inputs={"x": vane.col("x")})
-
-
-def test_vane_function_batch_v1_rejects_passthrough_projection_without_row_preserving():
-    import pyarrow as pa
-
-    import vane
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=result_type, unnest=True)
+    def analyze(text):
+        with calls_path.open("a", encoding="utf-8") as calls:
+            calls.write("batch\n")
+        values = text.to_pylist()
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(["ok"] * len(values)),
+                pa.array([float(value) for value in values]),
+                pa.array([f"value={value}" for value in values]),
+            ],
+            fields=list(result_type),
+        )
 
     con = vane.connect()
-    rel = con.sql("select 1::INTEGER as x")
-    expr = vane.func.batch(add_one_batch, inputs={"x": vane.col("x")}, schema={"y": "INTEGER"})
+    rel = con.sql("select i::INTEGER as id, i::INTEGER as value from range(3) t(i)")
+    selected = rel.select(vane.col("id"), analyze(vane.col("value")))
 
-    with pytest.raises(Exception, match=r"row_preserving=True|only output|unique output"):
-        rel.select(vane.col("x"), expr.alias("y")).fetchall()
+    assert selected.explain().count("STREAMING_UDF") == 1
+    assert selected.fetchall() == [
+        (0, "ok", 0.0, "value=0"),
+        (1, "ok", 1.0, "value=1"),
+        (2, "ok", 2.0, "value=2"),
+    ]
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["batch"]
 
 
-def test_vane_function_batch_v1_rejects_multiple_result_only_batch_udfs():
+def test_vane_function_batch_unnest_requires_struct_return_dtype():
     import pyarrow as pa
 
     import vane
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"a": [value + 1 for value in values]})
+    with pytest.raises(vane.InvalidInputException, match="unnest=True requires a Struct"):
 
-    def times_two_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"b": [value * 2 for value in values]})
+        @vane.func.batch(return_dtype=pa.int64(), unnest=True)
+        def identity(values):
+            return values
+
+
+def test_vane_function_batch_separate_calls_have_separate_expression_ids():
+    import pyarrow as pa
+
+    import vane
+
+    result_type = pa.struct([pa.field("value", pa.int32())])
+
+    @vane.func.batch(return_dtype=result_type, unnest=True)
+    def wrap(values):
+        return pa.StructArray.from_arrays([values], fields=list(result_type))
 
     con = vane.connect()
-    rel = con.sql("select 1::INTEGER as x")
-    a_expr = vane.func.batch(add_one_batch, inputs={"x": vane.col("x")}, schema={"a": "INTEGER"})
-    b_expr = vane.func.batch(times_two_batch, inputs={"x": vane.col("x")}, schema={"b": "INTEGER"})
+    rel = con.sql("select 1::INTEGER as left_value, 10::INTEGER as right_value")
+    selected = rel.select(wrap(vane.col("left_value")), wrap(vane.col("right_value")))
 
-    with pytest.raises(Exception, match=r"row_preserving=True|one batch UDF|only output"):
-        rel.select(a_expr.alias("a"), b_expr.alias("b")).fetchall()
+    assert selected.explain().count("STREAMING_UDF") == 2
+    assert selected.fetchall() == [(1, 10)]
 
 
-def test_vane_function_batch_v1_rejects_nested_result_only_batch_udfs():
+def test_vane_function_batch_allows_multiple_and_nested_udfs():
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     import vane
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"a": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32())
+    def add_one(values):
+        return pc.add(values, 1)
 
-    def times_two_batch(table):
-        values = table.column("a").to_pylist()
-        return pa.table({"b": [value * 2 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32())
+    def times_two(values):
+        return pc.multiply(values, 2)
 
-    con = vane.connect()
-    rel = con.sql("select 1::INTEGER as x")
-    a_expr = vane.func.batch(add_one_batch, inputs={"x": vane.col("x")}, schema={"a": "INTEGER"})
-    b_expr = vane.func.batch(times_two_batch, inputs={"a": a_expr}, schema={"b": "INTEGER"})
-
-    with pytest.raises(Exception, match=r"row_preserving=True|nested batch UDF|top-level"):
-        rel.select(b_expr.alias("b")).fetchall()
-
-
-def test_vane_function_batch_expression_ray_backend_explain():
-    import pyarrow as pa
-
-    import vane
-
-    old_runner = os.environ.get("VANE_RUNNER")
-    try:
-        vane.configure(runner="ray")
-
-        def add_one_batch(table):
-            values = table.column("x").to_pylist()
-            return pa.table({"y": [value + 1 for value in values]})
-
-        con = vane.connect()
-        rel = con.sql("select i::INTEGER as x from range(3) t(i)")
-        expr = vane.func.batch(add_one_batch, inputs={"x": vane.col("x")}, schema={"y": "INTEGER"})
-        plan = rel.select(expr.alias("y")).explain()
-
-        assert "execution_backend:" in plan
-        assert "ray_task" in plan
-        assert "ray_block_stream_output:" in plan
-        assert "direct_block_metadata_pair" in plan
-    finally:
-        if old_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = old_runner
-
-
-def test_vane_function_batch_uses_local_fast_runner_from_env(monkeypatch):
-    import pyarrow as pa
-
-    import vane
-
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
-
-    expr = vane.func.batch(add_one_batch, inputs={"x": vane.col("x")}, schema={"y": "INTEGER"})
     con = vane.connect()
     rel = con.sql("select i::INTEGER as x from range(3) t(i)")
-    plan = rel.select(expr.alias("y")).explain()
+    a = add_one(vane.col("x"))
+    b = times_two(vane.col("x"))
+    nested = times_two(a)
 
-    assert "execution_backend:" in plan
-    assert "subprocess_task" in plan
-    assert "local_shm_ref_bundle" in plan
-    assert "ray_task" not in plan
-    assert "direct_block_metadata_pair" not in plan
-
-
-@pytest.mark.parametrize("row_preserving", [False, True])
-def test_vane_function_batch_local_fast_runner_executes(monkeypatch, row_preserving):
-    import pyarrow as pa
-
-    import vane
-
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
-
-    expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=row_preserving,
-    )
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(3) t(i)")
-
-    if row_preserving:
-        result = rel.select(vane.col("x"), expr.alias("y")).fetchall()
-        assert result == [(0, 1), (1, 2), (2, 3)]
-    else:
-        result = rel.select(expr.alias("y")).fetchall()
-        assert result == [(1,), (2,), (3,)]
+    assert rel.select(a.alias("a"), b.alias("b"), nested.alias("nested")).fetchall() == [
+        (1, 0, 2),
+        (2, 2, 4),
+        (3, 4, 6),
+    ]
 
 
 def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monkeypatch):
     import uuid
 
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     import duckdb
     import vane
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32())
+    def add_one(values):
+        return pc.add(values, 1)
 
-    expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=True,
-    )
     con = vane.connect()
     try:
-        relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(expr.alias("y"))
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
-            relation,
-            str(uuid.uuid4()),
-        ).to_physical_plan(con)
+        relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(add_one(vane.col("x")))
+        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(con)
         nodes = plan.collect_udf_nodes(conn=con)
     finally:
         con.close()
@@ -260,181 +315,14 @@ def test_vane_function_batch_local_fast_runner_rewrites_streaming_contract(monke
     assert payload["produce_ray_block_stream"] is False
     assert payload["produce_ref_bundle_output"] is True
     assert payload["streaming_output_mode"] == "local_shm_ref_bundle"
+    assert payload["call_mode"] == "map_batches_rows"
+    assert payload["row_preserving"] is True
+    assert payload["expression_id"]
 
 
-def test_vane_internal_batch_actor_expression_uses_actor_backend(monkeypatch):
+def test_vane_function_batch_ray_backend_explain():
     import pyarrow as pa
-
-    import vane
-    from vane._expression_udf import _build_actor_map_batches_expression
-
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-
-    class AddOneActor:
-        def __call__(self, table) -> pa.Table:
-            values = table.column("x").to_pylist()
-            return pa.table({"y": [value + 1 for value in values]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(3) t(i)")
-    expr = _build_actor_map_batches_expression(
-        AddOneActor,
-        name="add_one_actor",
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        batch_size=2,
-        row_preserving=True,
-        actor_number=2,
-        gpus=0,
-    )
-
-    plan = rel.select(vane.col("x"), expr.alias("y")).explain()
-
-    assert "execution_backend:" in plan
-    assert "subprocess_actor" in plan
-    assert "actor_number:" in plan
-    assert "2" in plan
-
-
-def test_vane_function_batch_row_preserving_keeps_passthrough_columns():
-    import pyarrow as pa
-
-    import vane
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(4) t(i)")
-    expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=True,
-    )
-
-    assert rel.select(vane.col("x"), expr.alias("y")).fetchall() == [(0, 1), (1, 2), (2, 3), (3, 4)]
-
-
-def test_vane_function_batch_row_preserving_allows_multiple_udfs():
-    import pyarrow as pa
-
-    import vane
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"a": [value + 1 for value in values]})
-
-    def times_two_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"b": [value * 2 for value in values]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(4) t(i)")
-    a_expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"a": "INTEGER"},
-        row_preserving=True,
-    )
-    b_expr = vane.func.batch(
-        times_two_batch,
-        inputs={"x": vane.col("x")},
-        schema={"b": "INTEGER"},
-        row_preserving=True,
-    )
-
-    assert rel.select(vane.col("x"), a_expr.alias("a"), b_expr.alias("b")).fetchall() == [
-        (0, 1, 0),
-        (1, 2, 2),
-        (2, 3, 4),
-        (3, 4, 6),
-    ]
-
-
-def test_vane_function_batch_row_preserving_allows_nested_udfs():
-    import pyarrow as pa
-
-    import vane
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"a": [value + 1 for value in values]})
-
-    def times_two_batch(table):
-        values = table.column("a").to_pylist()
-        return pa.table({"b": [value * 2 for value in values]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(4) t(i)")
-    a_expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"a": "INTEGER"},
-        row_preserving=True,
-    )
-    b_expr = vane.func.batch(
-        times_two_batch,
-        inputs={"a": a_expr},
-        schema={"b": "INTEGER"},
-        row_preserving=True,
-    )
-
-    assert rel.select(vane.col("x"), b_expr.alias("b")).fetchall() == [(0, 2), (1, 4), (2, 6), (3, 8)]
-
-
-def test_vane_function_batch_row_preserving_rejects_row_count_mismatch():
-    import pyarrow as pa
-
-    import vane
-
-    def too_short_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values[:-1]]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(4) t(i)")
-    expr = vane.func.batch(
-        too_short_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=True,
-    )
-
-    with pytest.raises(Exception, match=r"row count|input rows|does not match"):
-        rel.select(vane.col("x"), expr.alias("y")).fetchall()
-
-
-def test_vane_function_batch_row_preserving_explain_uses_streaming_layout():
-    import pyarrow as pa
-
-    import vane
-
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
-
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(2) t(i)")
-    expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=True,
-    )
-    plan = rel.select(vane.col("x"), expr.alias("y")).explain()
-
-    assert "call_mode:" in plan
-    assert "map_batches_rows" in plan
-    assert "row_preserving:" in plan
-    assert "true" in plan
-    assert "STREAMING_UDF" in plan
-    assert "local_shm_ref_bundle" in plan
-
-
-def test_vane_function_batch_row_preserving_ray_block_stream_explain_when_gpu_requested():
-    import pyarrow as pa
+    import pyarrow.compute as pc
 
     import vane
 
@@ -442,28 +330,16 @@ def test_vane_function_batch_row_preserving_ray_block_stream_explain_when_gpu_re
     try:
         vane.configure(runner="ray")
 
-        def add_one_batch(table):
-            values = table.column("x").to_pylist()
-            return pa.table({"y": [value + 1 for value in values]})
+        @vane.func.batch(return_dtype=pa.int32())
+        def add_one(values):
+            return pc.add(values, 1)
 
         con = vane.connect()
-        rel = con.sql("select i::INTEGER as x, ('row-' || i::VARCHAR) as label from range(2) t(i)")
-        expr = vane.func.batch(
-            add_one_batch,
-            inputs={"x": vane.col("x")},
-            schema={"y": "INTEGER"},
-            row_preserving=True,
-            gpus=1.0,
-        )
-        plan = rel.select(vane.col("label"), expr.alias("y")).explain()
+        rel = con.sql("select i::INTEGER as x from range(3) t(i)")
+        plan = rel.select(add_one(vane.col("x"))).explain()
 
-        assert "STREAMING_UDF" in plan
         assert "execution_backend:" in plan
         assert "ray_task" in plan
-        assert "call_mode:" in plan
-        assert "map_batches_rows" in plan
-        assert "row_preserving:" in plan
-        assert "true" in plan
         assert "ray_block_stream_output:" in plan
         assert "direct_block_metadata_pair" in plan
     finally:
@@ -473,84 +349,7 @@ def test_vane_function_batch_row_preserving_ray_block_stream_explain_when_gpu_re
             os.environ["VANE_RUNNER"] = old_runner
 
 
-def test_vane_function_batch_row_preserving_gpu_zero_stays_streaming():
-    import pyarrow as pa
-
-    import vane
-
-    old_runner = os.environ.get("VANE_RUNNER")
-    try:
-        vane.configure(runner="ray")
-
-        def add_one_batch(table):
-            values = table.column("x").to_pylist()
-            return pa.table({"y": [value + 1 for value in values]})
-
-        con = vane.connect()
-        rel = con.sql("select i::INTEGER as x from range(2) t(i)")
-        expr = vane.func.batch(
-            add_one_batch,
-            inputs={"x": vane.col("x")},
-            schema={"y": "INTEGER"},
-            row_preserving=True,
-            gpus=0.0,
-        )
-        plan = rel.select(vane.col("x"), expr.alias("y")).explain()
-
-        assert "STREAMING_UDF" in plan
-        assert "ray_block_stream_output:" in plan
-    finally:
-        if old_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = old_runner
-
-
-def test_vane_function_batch_streaming_output_is_sliced_before_grouped_aggregate():
-    """Keep an oversized streaming batch from reaching fixed-size DuckDB vectors."""
-    import subprocess
-    import sys
-    import textwrap
-
-    script = textwrap.dedent(
-        """
-        import pyarrow as pa
-        import vane
-
-        def record_batch_size(table):
-            return pa.table({"seen": [table.num_rows] * table.num_rows})
-
-        vane.configure(runner="local")
-        con = vane.connect()
-        relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
-        expression = vane.func.batch(
-            record_batch_size,
-            inputs={"x": vane.col("x")},
-            schema={"seen": "BIGINT"},
-            batch_size=4096,
-        )
-        result = (
-            relation.select(expression.alias("seen"))
-            .aggregate("seen, count(*) AS n")
-            .order("seen")
-            .fetchall()
-        )
-        assert result == [(904, 904), (4096, 4096)], result
-        con.close()
-        """
-    )
-
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_vane_function_batch_row_preserving_batch_size_is_backend_independent():
+def test_vane_function_batch_batch_size_is_backend_independent():
     import pyarrow as pa
 
     import vane
@@ -560,20 +359,18 @@ def test_vane_function_batch_row_preserving_batch_size_is_backend_independent():
     try:
         vane.configure(runner="local")
 
-        def record_batch_size(table):
-            return pa.table({"seen": [table.num_rows] * table.num_rows})
+        @vane.func.batch(return_dtype=pa.int64(), batch_size=4096)
+        def record_batch_size(values):
+            return pa.array([len(values)] * len(values), type=pa.int64())
 
         con = vane.connect()
         relation = con.sql("SELECT i::INTEGER AS x FROM range(5000) t(i)")
-        expression = vane.func.batch(
-            record_batch_size,
-            inputs={"x": vane.col("x")},
-            schema={"seen": "BIGINT"},
-            batch_size=4096,
-            row_preserving=True,
+        result = (
+            relation.select(record_batch_size(vane.col("x")).alias("seen"))
+            .aggregate("seen, count(*) AS n")
+            .order("seen")
+            .fetchall()
         )
-
-        result = relation.select(expression.alias("seen")).aggregate("seen, count(*) AS n").order("seen").fetchall()
         assert result == [(904, 904), (4096, 4096)]
     finally:
         try:
@@ -586,7 +383,7 @@ def test_vane_function_batch_row_preserving_batch_size_is_backend_independent():
                 os.environ["VANE_RUNNER"] = old_runner
 
 
-def test_vane_function_batch_row_preserving_chain_promotes_ref_bundle_without_gpu():
+def test_vane_function_batch_gpu_zero_stays_streaming():
     import pyarrow as pa
 
     import vane
@@ -595,35 +392,16 @@ def test_vane_function_batch_row_preserving_chain_promotes_ref_bundle_without_gp
     try:
         vane.configure(runner="ray")
 
-        def add_one_batch(table):
-            values = table.column("x").to_pylist()
-            return pa.table({"a": [value + 1 for value in values]})
-
-        def times_two_batch(table):
-            values = table.column("a").to_pylist()
-            return pa.table({"b": [value * 2 for value in values]})
+        @vane.func.batch(return_dtype=pa.int32(), gpus=0)
+        def identity(values):
+            return values
 
         con = vane.connect()
         rel = con.sql("select i::INTEGER as x from range(2) t(i)")
-        a_expr = vane.func.batch(
-            add_one_batch,
-            inputs={"x": vane.col("x")},
-            schema={"a": "INTEGER"},
-            row_preserving=True,
-        )
-        b_expr = vane.func.batch(
-            times_two_batch,
-            inputs={"a": a_expr},
-            schema={"b": "INTEGER"},
-            row_preserving=True,
-        )
-        plan = rel.select(vane.col("x"), b_expr.alias("b")).explain()
+        plan = rel.select(vane.col("x"), identity(vane.col("x"))).explain()
 
-        assert plan.count("STREAMING_UDF") == 2
-        assert plan.count("ray_block_stream_output:") == 2
-        assert "direct_block_metadata_pair" in plan
-        assert plan.count("map_batches_rows") == 2
-        assert plan.count("row_preserving: true") == 2
+        assert "STREAMING_UDF" in plan
+        assert "ray_block_stream_output:" in plan
     finally:
         if old_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -631,38 +409,20 @@ def test_vane_function_batch_row_preserving_chain_promotes_ref_bundle_without_gp
             os.environ["VANE_RUNNER"] = old_runner
 
 
-def test_vane_function_batch_row_preserving_chain_promotion_uses_ray_runner(monkeypatch):
+def test_vane_function_batch_descriptor_binds_instance():
     import pyarrow as pa
+    import pyarrow.compute as pc
 
     import vane
 
-    monkeypatch.setenv("VANE_RUNNER", "ray")
+    class Scorer:
+        def __init__(self, offset):
+            self.offset = offset
 
-    def add_one_batch(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"a": [value + 1 for value in values]})
+        @vane.func.batch(return_dtype=pa.int64())
+        def score(self, values):
+            return pc.add(values, self.offset)
 
-    def times_two_batch(table):
-        values = table.column("a").to_pylist()
-        return pa.table({"b": [value * 2 for value in values]})
+    result = Scorer(3).score(pa.array([1, 2], type=pa.int64()))
 
-    a_expr = vane.func.batch(
-        add_one_batch,
-        inputs={"x": vane.col("x")},
-        schema={"a": "INTEGER"},
-        row_preserving=True,
-    )
-    b_expr = vane.func.batch(
-        times_two_batch,
-        inputs={"a": a_expr},
-        schema={"b": "INTEGER"},
-        row_preserving=True,
-    )
-    con = vane.connect()
-    rel = con.sql("select i::INTEGER as x from range(2) t(i)")
-    plan = rel.select(vane.col("x"), b_expr.alias("b")).explain()
-
-    assert plan.count("STREAMING_UDF") == 2
-    assert plan.count("ray_block_stream_output:") == 2
-    assert "ray_task" in plan
-    assert "direct_block_metadata_pair" in plan
+    assert result.to_pylist() == [4, 5]

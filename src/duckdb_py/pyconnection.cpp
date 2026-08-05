@@ -1164,7 +1164,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload = BuildExpressionMapBatchesUDFPayload(
 	    name, udf_function, normalized_schema, use_actor_backend ? "subprocess_actor" : "subprocess_task",
-	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, stateful);
+	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, stateful, py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
 	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,

@@ -1178,11 +1178,11 @@ def _VaneUDFMapBatchesExpression(
     execution_backend: str,
     input_names: typing.Sequence[str],
     batch_size: typing.SupportsInt | None = None,
-    streaming_output_mode: str = "local_shm_ref_bundle",
     row_preserving: bool = False,
     gpus: float | None = None,
     actor_number: int | None = None,
     stateful: bool = False,
+    expression_id: str | None = None,
     *args: Expression,
 ) -> Expression: ...
 def LambdaExpression(lhs: typing.Any, rhs: _ExpressionLike) -> Expression: ...

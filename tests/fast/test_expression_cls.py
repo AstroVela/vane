@@ -359,20 +359,13 @@ def test_vane_cls_return_dtype_pyarrow_int64_expression_round_trip():
     assert result.fetchall() == [(2**40 + 1,)]
 
 
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param("struct", id="struct"),
-        pytest.param("map", id="map"),
-    ],
-)
+@pytest.mark.parametrize("dtype", [pytest.param("map", id="map")])
 def test_unsupported_pyarrow_datatype_is_rejected_during_canonicalization(dtype):
     import pyarrow as pa
 
     import vane
 
     unsupported = {
-        "struct": pa.struct([("value", pa.int64())]),
         "map": pa.map_(pa.string(), pa.int64()),
     }[dtype]
 
@@ -385,6 +378,24 @@ def test_unsupported_pyarrow_datatype_is_rejected_during_canonicalization(dtype)
 
     assert str(unsupported) in str(exc_info.value)
     assert "not supported" in str(exc_info.value)
+
+
+def test_vane_cls_return_dtype_struct_expression_round_trip():
+    import pyarrow as pa
+
+    import vane
+
+    result_type = pa.struct([pa.field("value", pa.int64()), pa.field("label", pa.string())])
+
+    @vane.cls(actor_number=1, return_dtype=result_type)
+    class Describe:
+        def __call__(self, value):
+            return {"value": value, "label": f"value={value}"}
+
+    conn = vane.connect()
+    result = conn.sql("SELECT 42::BIGINT AS value").select(Describe()(vane.col("value")).alias("result"))
+
+    assert result.fetchall() == [({"value": 42, "label": "value=42"},)]
 
 
 def test_vane_cls_timestamp_naive_datetime_preserves_wall_clock_and_microseconds():

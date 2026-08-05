@@ -94,16 +94,12 @@ def test_batch_preprocessing_feeds_ai_embed_and_prompt() -> None:
         """
     )
 
-    def normalize_chunk(table: pa.Table) -> pa.Table:
-        chunks = [value.strip().lower() for value in table.column("text").to_pylist()]
-        return pa.table({"chunk": chunks})
+    @vane.func.batch(return_dtype=pa.string())
+    def normalize_chunk(text):
+        chunks = [value.strip().lower() for value in text.to_pylist()]
+        return pa.array(chunks)
 
-    chunk = vane.func.batch(
-        normalize_chunk,
-        inputs={"text": vane.col("text")},
-        schema={"chunk": "VARCHAR"},
-        row_preserving=True,
-    ).alias("chunk")
+    chunk = normalize_chunk(vane.col("text")).alias("chunk")
     filtered = rel.filter("length(trim(text)) > 20")
     with_chunks = filtered.select(vane.col("id"), chunk)
     out = with_chunks.select(

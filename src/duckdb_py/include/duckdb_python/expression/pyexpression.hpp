@@ -121,7 +121,7 @@ public:
 	                        const string &execution_backend, const vector<string> &input_names,
 	                        const Optional<py::object> &batch_size, bool row_preserving,
 	                        const Optional<py::object> &gpus, const Optional<py::object> &actor_number, bool stateful,
-	                        const py::args &args);
+	                        const Optional<py::object> &expression_id, const py::args &args);
 	static shared_ptr<DuckDBPyExpression> Coalesce(const py::args &args);
 	static shared_ptr<DuckDBPyExpression> SQLExpression(string sql);
 

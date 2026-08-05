@@ -90,20 +90,18 @@ def test_vane_cls_batch_registered_for_sql_projection():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"score": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class Scorer:
         def __init__(self, offset):
             self.offset = offset
 
-        def __call__(self, table: pa.Table) -> pa.Table:
-            values = table.column("value").to_pylist()
-            return pa.table({"score": [value + self.offset for value in values]})
+        def __call__(self, value):
+            return pa.array([item + self.offset for item in value.to_pylist()], type=pa.int32())
 
     vane.attach_function(
         Scorer(10),
         connection=conn,
         alias="score_sql",
-        input_names=["value"],
         parameters=["INTEGER"],
     )
 
@@ -114,75 +112,6 @@ def test_vane_cls_batch_registered_for_sql_projection():
     """).fetchall()
 
     assert rows == [(10,), (11,), (12,)]
-
-
-def test_vane_cls_batch_sql_rejects_non_row_preserving_before_registration():
-    import pyarrow as pa
-
-    import vane
-
-    conn = vane.connect()
-
-    @vane.cls.batch(actor_number=1, schema={"value": "INTEGER"}, row_preserving=False)
-    class ExpandingBatch:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            values = table.column("value").to_pylist()
-            return pa.table({"value": values + values})
-
-    with pytest.raises(
-        vane.InvalidInputException,
-        match=r"row_preserving=False.*expression API|SQL attach.*row-preserving",
-    ):
-        vane.attach_function(
-            ExpandingBatch(),
-            connection=conn,
-            alias="expanding_batch_sql",
-            input_names=["value"],
-            parameters=["INTEGER"],
-        )
-
-    with pytest.raises(Exception, match="expanding_batch_sql"):
-        conn.sql("SELECT expanding_batch_sql(1::INTEGER)").fetchall()
-
-
-def test_failed_non_row_preserving_attach_does_not_replace_existing_alias():
-    import pyarrow as pa
-
-    import vane
-
-    conn = vane.connect()
-
-    @vane.cls.batch(actor_number=1, schema={"value": "INTEGER"}, row_preserving=True)
-    class StableBatch:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            values = table.column("value").to_pylist()
-            return pa.table({"value": [value + 1 for value in values]})
-
-    @vane.cls.batch(actor_number=1, schema={"value": "INTEGER"}, row_preserving=False)
-    class UnsafeBatch:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            values = table.column("value").to_pylist()
-            return pa.table({"value": values + values})
-
-    vane.attach_function(
-        StableBatch(),
-        connection=conn,
-        alias="preserved_batch_sql",
-        input_names=["value"],
-        parameters=["INTEGER"],
-    )
-
-    with pytest.raises(vane.InvalidInputException, match="row_preserving=False"):
-        vane.attach_function(
-            UnsafeBatch(),
-            connection=conn,
-            alias="preserved_batch_sql",
-            input_names=["value"],
-            parameters=["INTEGER"],
-            replace=True,
-        )
-
-    assert conn.sql("SELECT preserved_batch_sql(1::INTEGER)").fetchall() == [(2,)]
 
 
 def test_vane_cls_replace_validation_failure_preserves_old_alias():
@@ -221,22 +150,20 @@ def test_vane_cls_batch_sql_reuses_state_across_batches():
 
     @vane.cls.batch(
         actor_number=1,
-        schema={"batch_call": "INTEGER"},
-        row_preserving=True,
+        return_dtype=pa.int32(),
     )
     class BatchCounter:
         def __init__(self) -> None:
             self.calls = 0
 
-        def __call__(self, table: pa.Table) -> pa.Table:
+        def __call__(self, value):
             self.calls += 1
-            return pa.table({"batch_call": [self.calls] * table.num_rows})
+            return pa.array([self.calls] * len(value), type=pa.int32())
 
     vane.attach_function(
         BatchCounter(),
         connection=conn,
         alias="stateful_batch_counter_sql",
-        input_names=["value"],
         parameters=["INTEGER"],
     )
 
@@ -302,16 +229,20 @@ def test_vane_cls_detach_removes_sql_function():
         conn.sql("SELECT actor_add_one(1::INTEGER)").fetchall()
 
 
-def test_vane_cls_batch_sql_requires_input_names():
+def test_vane_cls_batch_sql_infers_input_names():
+    import pyarrow as pa
+
     import vane
 
-    @vane.cls.batch(actor_number=1, schema={"x": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class Identity:
-        def __call__(self, table):
-            return table
+        def __call__(self, value):
+            return value
 
-    with pytest.raises(vane.InvalidInputException, match="input_names is required"):
-        vane.attach_function(Identity(), alias="bad_identity", parameters=["INTEGER"])
+    conn = vane.connect()
+    vane.attach_function(Identity(), connection=conn, alias="batch_identity", parameters=["INTEGER"])
+
+    assert conn.sql("SELECT batch_identity(value := 42::INTEGER)").fetchall() == [(42,)]
 
 
 def test_raw_actor_class_with_required_constructor_args_fails_at_attach():
@@ -370,16 +301,15 @@ def test_vane_cls_batch_sql_explain_resolves_actor_backend_from_current_runner(m
     monkeypatch.setenv("VANE_RUNNER", "ray")
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"score": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class Scorer:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            return pa.table({"score": table.column("value")})
+        def __call__(self, value):
+            return value
 
     vane.attach_function(
         Scorer(),
         connection=conn,
         alias="score_sql",
-        input_names=["value"],
         parameters=["INTEGER"],
     )
     plan = conn.execute("EXPLAIN SELECT score_sql(1::INTEGER)").fetchall()
@@ -443,10 +373,10 @@ def test_vane_cls_batch_attach_rejects_uninstantiated_decorator():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class IdentityBatch:
-        def __call__(self, table):
-            return pa.table({"result": table.column("value")})
+        def __call__(self, value):
+            return value
 
     alias = "uninstantiated_cls_batch_sql"
     with pytest.raises(
@@ -457,7 +387,6 @@ def test_vane_cls_batch_attach_rejects_uninstantiated_decorator():
             IdentityBatch,
             connection=conn,
             alias=alias,
-            input_names=["value"],
             parameters=["INTEGER"],
         )
 
@@ -491,10 +420,10 @@ def test_vane_cls_batch_attach_requires_parameters():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class IdentityBatch:
-        def __call__(self, table):
-            return pa.table({"result": table.column("value")})
+        def __call__(self, value):
+            return value
 
     alias = "cls_batch_requires_parameters_sql"
     with pytest.raises(
@@ -603,10 +532,10 @@ def test_vane_cls_batch_attach_rejects_return_dtype_argument():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype="INTEGER")
     class IdentityBatch:
-        def __call__(self, table):
-            return table
+        def __call__(self, value):
+            return value
 
     alias = "cls_batch_return_dtype_override_sql"
     with pytest.raises(
@@ -630,10 +559,10 @@ def test_vane_cls_batch_attach_rejects_gpus_override():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype="INTEGER")
     class IdentityBatch:
-        def __call__(self, table):
-            return table
+        def __call__(self, value):
+            return value
 
     alias = "cls_batch_gpus_override_sql"
     with pytest.raises(
@@ -657,10 +586,10 @@ def test_vane_cls_batch_attach_rejects_actor_number_override():
 
     conn = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype="INTEGER")
     class IdentityBatch:
-        def __call__(self, table):
-            return table
+        def __call__(self, value):
+            return value
 
     alias = "cls_batch_actor_number_override_sql"
     with pytest.raises(
@@ -945,14 +874,14 @@ def test_vane_cls_batch_replace_apply_phase_serialization_failure_preserves_old_
         def __reduce__(self):
             raise pickle.PicklingError("intentional vane.cls.batch replacement serialization failure")
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class AddOffsetBatch:
         def __init__(self, offset):
             self.offset = offset
 
-        def __call__(self, table):
-            values = table.column("value").to_pylist()
-            return pa.table({"result": [value + self.offset.value for value in values]})
+        def __call__(self, value):
+            values = value.to_pylist()
+            return pa.array([item + self.offset.value for item in values], type=pa.int32())
 
     conn = vane.connect()
     alias = "class_batch_apply_rollback_sql"
@@ -963,7 +892,6 @@ def test_vane_cls_batch_replace_apply_phase_serialization_failure_preserves_old_
         old_instance,
         connection=conn,
         alias=alias,
-        input_names=["value"],
         parameters=["INTEGER"],
     )
     before = _sql_function_contract(conn, alias)
@@ -973,7 +901,6 @@ def test_vane_cls_batch_replace_apply_phase_serialization_failure_preserves_old_
             AddOffsetBatch(UnpicklableConstructorArgument()),
             connection=conn,
             alias=alias,
-            input_names=["value"],
             parameters=["INTEGER"],
             replace=True,
         )
@@ -1052,23 +979,22 @@ def test_vane_cls_return_dtype_pyarrow_int64_sql_round_trip():
     ).fetchall() == [(2**40 + 1, "BIGINT")]
 
 
-def test_vane_cls_batch_schema_pyarrow_int64_sql_round_trip():
+def test_vane_cls_batch_return_dtype_pyarrow_int64_sql_round_trip():
     import pyarrow as pa
 
     import vane
 
-    @vane.cls.batch(actor_number=1, schema={"result": pa.int64()}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int64())
     class WidenBatch:
-        def __call__(self, table):
-            values = table.column("value").to_pylist()
-            return pa.table({"result": [value + 2**40 for value in values]})
+        def __call__(self, value):
+            values = value.to_pylist()
+            return pa.array([item + 2**40 for item in values], type=pa.int64())
 
     conn = vane.connect()
     vane.attach_function(
         WidenBatch(),
         connection=conn,
         alias="cls_batch_pyarrow_int64_sql",
-        input_names=["value"],
         parameters=["INTEGER"],
     )
 

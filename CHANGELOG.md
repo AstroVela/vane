@@ -28,6 +28,12 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   required `return_type`; batch transforms use `map_batches` with an explicit
   output `schema`. The inherited pandas DataFrame-style DuckDB `map` contract
   is no longer supported.
+- Changed `vane.func.batch` to a decorator-only, row-preserving expression UDF
+  and aligned it with `vane.cls.batch`: decorated callables receive one
+  `pyarrow.Array` or `pyarrow.ChunkedArray` per input and return one Arrow
+  column declared by `return_dtype`. Multi-field results use a Struct column
+  and can be expanded once with `unnest=True`; cardinality-changing transforms
+  remain on Relation `map_batches`.
 - Restricted source distributions to the DuckDB components required by Vane.
 - Imported the official DuckDB baseline as a squashed Git subtree and retained
   Vane engine customizations as monorepo commits, so normal clones no longer

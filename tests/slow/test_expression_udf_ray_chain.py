@@ -93,34 +93,26 @@ def collect_table(runner, relation):
     tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
     return pa.concat_tables(tables)
 
-def build_upstream_output(table):
-    ints = table.column("base_int").to_pylist()
-    texts = table.column("base_varchar").to_pylist()
-    return pa.table(
-        {
-            "upstream_output": pa.array(
-                [value + len(text) for value, text in zip(ints, texts, strict=True)],
-                type=pa.int64(),
-            )
-        }
+@vane.func.batch(return_dtype=pa.int64(), batch_size=1024)
+def build_upstream_output(base_int, base_varchar):
+    ints = base_int.to_pylist()
+    texts = base_varchar.to_pylist()
+    return pa.array(
+        [value + len(text) for value, text in zip(ints, texts, strict=True)],
+        type=pa.int64(),
     )
 
 @vane.cls.batch(
     actor_number=1,
-    schema={"downstream_output": "BIGINT"},
-    row_preserving=True,
+    return_dtype=pa.int64(),
     gpus=0,
 )
 class BuildDownstreamOutput:
-    def __call__(self, table):
-        values = table.column("upstream_output").to_pylist()
-        return pa.table(
-            {
-                "downstream_output": pa.array(
-                    [value * 2 for value in values],
-                    type=pa.int64(),
-                )
-            }
+    def __call__(self, upstream_output):
+        values = upstream_output.to_pylist()
+        return pa.array(
+            [value * 2 for value in values],
+            type=pa.int64(),
         )
 
 ray.init(address="local", num_cpus=4, include_dashboard=False, ignore_reinit_error=True)
@@ -143,15 +135,9 @@ try:
         rel = con.sql(
             f"SELECT base_int, base_varchar FROM read_parquet('{parquet_path}')"
         )
-        upstream_output = vane.func.batch(
-            build_upstream_output,
-            inputs={
-                "base_int": vane.col("base_int"),
-                "base_varchar": vane.col("base_varchar"),
-            },
-            schema={"upstream_output": "BIGINT"},
-            batch_size=1024,
-            row_preserving=True,
+        upstream_output = build_upstream_output(
+            vane.col("base_int"),
+            vane.col("base_varchar"),
         )
         downstream = BuildDownstreamOutput()
         downstream_output = downstream(
@@ -255,17 +241,16 @@ class ClassPlusThree:
 
 @vane.cls.batch(
     actor_number=1,
-    schema={"batch_call": "INTEGER"},
+    return_dtype=pa.int32(),
     name="stateful_batch_counter",
-    row_preserving=True,
 )
 class StatefulBatchCounter:
     def __init__(self):
         self.calls = 0
 
-    def __call__(self, table):
+    def __call__(self, value):
         self.calls += 1
-        return pa.table({"batch_call": [self.calls] * table.num_rows})
+        return pa.array([self.calls] * len(value), type=pa.int32())
 
 
 def collect_table(runner, relation):
@@ -312,7 +297,6 @@ try:
             StatefulBatchCounter(),
             connection=con,
             alias="stateful_batch_counter_sql",
-            input_names=["value"],
             parameters=["INTEGER"],
         )
 
@@ -525,9 +509,10 @@ from tests.ai.test_expression_ai_functions import MockProvider
 vane.configure(runner="ray")
 
 
-def normalize_chunk(table):
-    chunks = [value.strip().lower() for value in table.column("text").to_pylist()]
-    return pa.table({"chunk": chunks})
+@vane.func.batch(return_dtype=pa.string())
+def normalize_chunk(text):
+    chunks = [value.strip().lower() for value in text.to_pylist()]
+    return pa.array(chunks)
 
 
 ray.init(address="local", num_cpus=4, include_dashboard=False, ignore_reinit_error=True)
@@ -553,12 +538,7 @@ try:
             f"SELECT id::INTEGER AS id, text::VARCHAR AS text "
             f"FROM read_parquet('{parquet_path}')"
         ).filter("length(trim(text)) > 20")
-        chunk = vane.func.batch(
-            normalize_chunk,
-            inputs={"text": vane.col("text")},
-            schema={"chunk": "VARCHAR"},
-            row_preserving=True,
-        ).alias("chunk")
+        chunk = normalize_chunk(vane.col("text")).alias("chunk")
         with_chunks = filtered.select(vane.col("id"), chunk)
         relation = with_chunks.select(
             vane.col("id"),

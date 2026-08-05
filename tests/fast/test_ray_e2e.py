@@ -2809,17 +2809,12 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
         ) TO '{input_path}' (FORMAT PARQUET, PARTITION_BY (file_id))
     """)
 
-    def add_one(table):
-        values = table.column("x").to_pylist()
-        return pa.table({"y": [value + 1 for value in values]})
+    @vane.func.batch(return_dtype=pa.int32())
+    def add_one(values):
+        return pa.array([value + 1 for value in values.to_pylist()], type=pa.int32())
 
     base = duckdb_conn.sql(f"SELECT x FROM read_parquet('{input_path}/**/*.parquet')")
-    expression = vane.func.batch(
-        add_one,
-        inputs={"x": vane.col("x")},
-        schema={"y": "INTEGER"},
-        row_preserving=True,
-    )
+    expression = add_one(vane.col("x"))
     relation = base.select(vane.col("x"), expression.alias("y")).limit(5)
 
     ray_cxx = getattr(duckdb, "ray_cxx", None)
