@@ -3,36 +3,43 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from duckdb.runners.ray.admission_ledger import BoundedSet
-from duckdb.runners.ray.query_execution_graph import (
+from duckdb.runners.ray.query_resource_graph import (
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 
 _SOFT_TASK_BLOCK_REASONS = {
-    "stage_soft_cpu",
-    "stage_soft_gpu",
-    "stage_soft_heap_bytes",
-    "stage_soft_object_store_bytes",
-    "stage_soft_limit",
+    "query_soft_cpu",
+    "query_soft_gpu",
+    "query_soft_heap_bytes",
+    "query_soft_object_store_bytes",
+    "unit_soft_cpu",
+    "unit_soft_gpu",
+    "unit_soft_heap_bytes",
+    "unit_soft_object_store_bytes",
+    "unit_soft_limit",
 }
 _SOFT_OUTPUT_BLOCK_REASONS = {
-    "stage_soft_object_store_bytes",
-    "stage_soft_limit",
+    "query_soft_object_store_bytes",
+    "unit_soft_object_store_bytes",
+    "unit_soft_limit",
 }
 _OUTPUT_STATES = (
     "generator_pending",
-    "stage_queue",
+    "unit_queue",
     "downstream_input",
     "external_consumer",
     "released",
@@ -40,6 +47,9 @@ _OUTPUT_STATES = (
 _RESOURCE_FIELDS = ("cpu", "gpu", "heap_bytes", "object_store_bytes")
 _EPSILON = 1e-9
 _TERMINAL_IDENTITY_REPLAY_CAPACITY = 65_536
+_SOFT_RESERVATION_WARNING_DELAY_S = 60.0
+
+logger = logging.getLogger(__name__)
 
 
 def _resource_with_object_store(resources: ResourceVector, object_store_bytes: int) -> ResourceVector:
@@ -60,21 +70,10 @@ def _positive_difference(left: ResourceVector, right: ResourceVector) -> Resourc
     )
 
 
-def _component_max(resources: tuple[ResourceVector, ...]) -> ResourceVector:
-    if not resources:
-        return ResourceVector()
-    return ResourceVector(
-        cpu=max(item.cpu for item in resources),
-        gpu=max(item.gpu for item in resources),
-        heap_bytes=max(item.heap_bytes for item in resources),
-        object_store_bytes=max(item.object_store_bytes for item in resources),
-    )
-
-
 @dataclass(frozen=True)
 class TaskRequest:
     query_id: str
-    stage_id: str
+    resource_unit_id: str
     task_id: str
     attempt_id: str
     node_id: str | None
@@ -85,10 +84,10 @@ class TaskRequest:
 class TaskLease:
     lease_id: str
     query_id: str
-    stage_id: str
+    resource_unit_id: str
     task_id: str
     attempt_id: str
-    node_id: str
+    node_id: str | None
     execution_slot_id: str
     actor_index: int | None
     resources: ResourceVector
@@ -107,52 +106,12 @@ class TaskGrant:
     admission_epoch: int = 0
 
 
-@dataclass
-class _ContinuationCredit:
-    credit_id: str
-    parent_task_lease_id: str
-    parent_stage_id: str
-    eligible_stage_ids: tuple[str, ...]
-    reservation_stage_id: str
-    node_id: str
-    resources: ResourceVector
-    allocation_generation: int
-    borrowed_by_task_lease_id: str | None = None
-    parent_active: bool = True
-
-
-@dataclass(frozen=True)
-class _NewContinuationCreditPlan:
-    eligible_stage_ids: tuple[str, ...]
-    reservation_stage_id: str
-    node_id: str
-    resources: ResourceVector
-
-
 @dataclass(frozen=True)
 class _TaskAdmissionPlan:
     resources: ResourceVector = field(default_factory=ResourceVector)
     output_window_bytes: int = 0
-    node_id: str = ""
+    node_id: str | None = None
     actor_index: int | None = None
-    new_credit: _NewContinuationCreditPlan | None = None
-    borrowed_credit_id: str | None = None
-
-
-@dataclass(frozen=True)
-class _DownstreamReservation:
-    """One shared resource bundle that keeps a downstream path runnable.
-
-    Unlike a per-parent continuation credit, this reservation is not charged
-    once for every producer. Admission only proves that the bundle remains
-    placeable after granting the producer. The real downstream task consumes
-    that capacity through its normal task lease when it becomes runnable.
-    """
-
-    reservation_id: str
-    stage_ids: tuple[str, ...]
-    resources: ResourceVector
-    allowed_node_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -171,7 +130,7 @@ class _QueuedTaskEvaluation:
 @dataclass(frozen=True)
 class OutputBlockRequest:
     query_id: str
-    producer_stage_id: str
+    producer_unit_id: str
     task_lease_id: str
     attempt_id: str
     block_id: str
@@ -182,16 +141,15 @@ class OutputBlockRequest:
 class OutputBlockLease:
     lease_id: str
     query_id: str
-    producer_stage_id: str
+    producer_unit_id: str
     task_lease_id: str
     attempt_id: str
     block_id: str
-    node_id: str
+    node_id: str | None
     size_bytes: int
     state: str
     liveness: bool
     allocation_generation: int
-    continuation_credit_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,7 +164,7 @@ class OutputBlockGrant:
 class OutputBlockLeaseOwner:
     """Shared lifetime owner carried with one query-produced ObjectRef."""
 
-    def __init__(self, manager: QueryResourceManager, lease: OutputBlockLease) -> None:
+    def __init__(self, manager: RayQueryResourceManager, lease: OutputBlockLease) -> None:
         self._manager = manager
         self._lease_id = str(lease.lease_id)
         self._state = str(lease.state)
@@ -261,94 +219,74 @@ class OutputBlockLeaseOwner:
 
 
 @dataclass
-class _StageState:
-    spec: StageResourceSpec
+class _ResourceUnitState:
+    spec: ResourceUnitSpec
     runnable: bool = False
     actor_ready: bool = False
     queued_input_bytes: int = 0
     pending_task_count: int = 0
     queued_output_bytes: int = 0
     pending_output_count: int = 0
+    bytes_task_outputs_generated: int = 0
+    num_task_outputs_generated: int = 0
+    num_outputs_of_finished_tasks: int = 0
+    num_tasks_finished: int = 0
     completed: bool = False
 
 
-class QueryResourceManager:
-    """Own all task and streaming-output resources for one immutable query DAG."""
+class RayQueryResourceManager:
+    """Own Ray execution and streaming-output resources for one query DAG.
+
+    DuckDB owns native-fragment CPU, heap, scheduling, and spill. Native units
+    remain in this graph only so Ray-side object-store windows, task leases,
+    backpressure, and liveness can be coordinated across native/UDF edges.
+    """
 
     def __init__(
         self,
-        graph: QueryExecutionGraph,
+        graph: QueryResourceGraph,
         allocation: QueryAllocation,
         *,
+        admission_open: bool = True,
         reservation_ratio: float = 0.5,
         on_change: Callable[[], None] | None = None,
+        on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
     ) -> None:
         ratio = float(reservation_ratio)
         if not math.isfinite(ratio) or ratio <= 0 or ratio > 1:
             raise ValueError("reservation_ratio must be in (0, 1]")
-        graph.validate_allocation(allocation)
         self.graph = graph
         self.allocation = allocation
-        self._allocation_admission_open = True
+        self._allocation_admission_open = bool(admission_open)
         self.reservation_ratio = ratio
         self._on_change = on_change
+        self._on_eligible_units_change = on_eligible_units_change
         self._lock = threading.RLock()
         self._admission_epoch = 0
-        self._stages = {
-            stage.stage_id: _StageState(
-                spec=stage,
-                actor_ready=stage.backend != "ray_actor",
+        self._units = {
+            unit.resource_unit_id: _ResourceUnitState(
+                spec=unit,
+                actor_ready=unit.backend != "ray_actor",
             )
-            for stage in graph.stages
+            for unit in graph.units
         }
-        self._direct_downstream_stage_ids: dict[str, set[str]] = {stage.stage_id: set() for stage in graph.stages}
-        for stage in graph.stages:
-            for input_stage_id in stage.input_stage_ids:
-                self._direct_downstream_stage_ids[input_stage_id].add(stage.stage_id)
-        self._topological_stage_ids = graph.topological_stage_ids()
-        self._reverse_topological_stage_ids = graph.reverse_topological_stage_ids()
+        self._direct_downstream_unit_ids: dict[str, set[str]] = {unit.resource_unit_id: set() for unit in graph.units}
+        for unit in graph.units:
+            for input_unit_id in unit.input_unit_ids:
+                self._direct_downstream_unit_ids[input_unit_id].add(unit.resource_unit_id)
+        self._topological_unit_ids = graph.topological_unit_ids()
+        self._reverse_topological_unit_ids = graph.reverse_topological_unit_ids()
         self._reverse_topological_rank = {
-            stage_id: index for index, stage_id in enumerate(self._reverse_topological_stage_ids)
+            resource_unit_id: index for index, resource_unit_id in enumerate(self._reverse_topological_unit_ids)
         }
-        self._reachable_stage_ids: dict[str, tuple[str, ...]] = {}
-        self._reachable_udf_stage_ids: dict[str, tuple[str, ...]] = {}
-        self._downstream_fte_stage_ids_requiring_separate_slot = {
-            stage_id: graph.downstream_fte_stage_ids_requiring_separate_slot(stage_id)
-            for stage_id in self._topological_stage_ids
-        }
-        for source_stage_id in self._topological_stage_ids:
-            reachable: set[str] = set()
-            pending = list(self._direct_downstream_stage_ids[source_stage_id])
-            while pending:
-                stage_id = pending.pop()
-                if stage_id in reachable:
-                    continue
-                reachable.add(stage_id)
-                pending.extend(self._direct_downstream_stage_ids[stage_id])
-            ordered_reachable = tuple(stage_id for stage_id in self._topological_stage_ids if stage_id in reachable)
-            self._reachable_stage_ids[source_stage_id] = ordered_reachable
-            self._reachable_udf_stage_ids[source_stage_id] = tuple(
-                stage_id for stage_id in ordered_reachable if self._stages[stage_id].spec.stage_kind == "udf"
-            )
-        self._continuation_parent_stage_ids_by_ray_task: dict[str, tuple[str, ...]] = {}
-        for stage_id in self._topological_stage_ids:
-            stage = self._stages[stage_id].spec
-            if stage.backend != "ray_task":
-                continue
-            parent_stage_ids = tuple(
-                parent_stage_id
-                for parent_stage_id in self._topological_stage_ids
-                if self._stages[parent_stage_id].spec.backend == "ray_worker"
-                and stage_id in self._reachable_udf_stage_ids[parent_stage_id]
-            )
-            if parent_stage_ids:
-                self._continuation_parent_stage_ids_by_ray_task[stage_id] = parent_stage_ids
-        self._started_stage_ids: set[str] = set()
         self._task_leases: dict[str, TaskLease] = {}
-        self._continuation_credits: dict[str, _ContinuationCredit] = {}
-        self._continuation_credit_by_parent: dict[str, str] = {}
-        self._continuation_credit_by_borrower: dict[str, str] = {}
         self._active_attempt_leases: dict[tuple[str, str], str] = {}
+        # Submitted includes Ray Core PENDING actors as well as ready actors.
+        # Ray Data charges both states to logical operator usage because each
+        # handle already owns a real scheduling request even before placement.
+        self._submitted_actor_slots: set[tuple[str, int]] = set()
+        self._retiring_actor_unit_ids: set[str] = set()
+        self._actor_node_by_slot: dict[tuple[str, int], str] = {}
         self._active_actor_slots: dict[tuple[str, int], str] = {}
         self._queued_actor_slot_leases: dict[tuple[str, int], deque[str]] = {}
         self._terminal_attempts = BoundedSet[tuple[str, str]](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
@@ -356,12 +294,19 @@ class QueryResourceManager:
         self._waiting_output_blocks: dict[str, OutputBlockRequest] = {}
         self._output_leases: dict[str, OutputBlockLease] = {}
         self._output_lease_by_block: dict[str, str] = {}
+        self._observed_output_blocks = BoundedSet[str](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
+        self._generated_output_count_by_task_lease: dict[str, int] = {}
         self._terminal_output_blocks = BoundedSet[str](capacity=_TERMINAL_IDENTITY_REPLAY_CAPACITY)
         self._active_liveness_task_lease_id: str | None = None
         self._active_liveness_output_lease_id: str | None = None
         self._task_liveness_grants_total = 0
         self._output_liveness_grants_total = 0
+        self._completed_materialization_barrier_ids: set[str] = set()
         self._external_consumer_waiting = False
+        self._soft_allocation_debt_since: float | None = None
+        self._soft_allocation_warning_emitted = False
+        self._failed = False
+        self._failure_reason = ""
         self._cancelled = False
         self._cancel_reason = ""
 
@@ -387,77 +332,153 @@ class QueryResourceManager:
         with self._lock:
             return int(self._admission_epoch)
 
-    def update_stage_state(
+    def update_unit_state(
         self,
-        stage_id: str,
+        resource_unit_id: str,
         *,
         runnable: bool,
-        actor_ready: bool | None = None,
         completed: bool = False,
     ) -> None:
-        stage_key = str(stage_id)
+        unit_key = str(resource_unit_id)
+        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_unit_ids: tuple[str, ...] = ()
         with self._lock:
-            stage = self._stages.get(stage_key)
-            if stage is None:
-                raise KeyError(f"stage is not registered: {stage_key}")
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.completed and not bool(completed):
+                raise RuntimeError(f"completed resource unit cannot become incomplete: {unit_key}")
             before = (
-                stage.runnable,
-                stage.actor_ready,
-                stage.queued_input_bytes,
-                stage.pending_task_count,
-                stage.queued_output_bytes,
-                stage.pending_output_count,
-                stage.completed,
+                unit.runnable,
+                unit.actor_ready,
+                unit.queued_input_bytes,
+                unit.pending_task_count,
+                unit.queued_output_bytes,
+                unit.pending_output_count,
+                unit.completed,
             )
-            stage.runnable = bool(runnable) and not bool(completed)
-            if actor_ready is not None:
-                stage.actor_ready = bool(actor_ready)
-            self._recompute_stage_queued_input_locked(stage_key)
-            self._recompute_stage_queued_output_locked(stage_key)
-            stage.completed = bool(completed)
+            unit.runnable = bool(runnable) and not bool(completed)
+            self._recompute_unit_queued_input_locked(unit_key)
+            self._recompute_unit_queued_output_locked(unit_key)
+            unit.completed = bool(completed)
             after = (
-                stage.runnable,
-                stage.actor_ready,
-                stage.queued_input_bytes,
-                stage.pending_task_count,
-                stage.queued_output_bytes,
-                stage.pending_output_count,
-                stage.completed,
+                unit.runnable,
+                unit.actor_ready,
+                unit.queued_input_bytes,
+                unit.pending_task_count,
+                unit.queued_output_bytes,
+                unit.pending_output_count,
+                unit.completed,
             )
             if after != before:
+                if bool(completed) and not before[-1]:
+                    # Completion changes the eligible demand before the
+                    # coordinator can publish the corresponding allocation.
+                    # Preserve live leases, but fence every new grant from the
+                    # old generation during that handoff.
+                    self._allocation_admission_open = False
                 self._publish_change_locked()
+                if bool(completed) and not before[-1]:
+                    eligible_callback = self._on_eligible_units_change
+                    eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+        if eligible_callback is not None:
+            eligible_callback(eligible_unit_ids)
+
+    def mark_materialization_barrier_completed_for_node(self, physical_node_id: str) -> bool:
+        """Advance the execution phase after a true barrier completes."""
+
+        barrier = self.graph.barrier_for_physical_node(str(physical_node_id))
+        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_unit_ids: tuple[str, ...] = ()
+        with self._lock:
+            if barrier.barrier_id in self._completed_materialization_barrier_ids:
+                return False
+            self._completed_materialization_barrier_ids.add(barrier.barrier_id)
+            # The eligible set changes before the coordinator can publish the
+            # next phase allocation. Fence only new grants during that short
+            # handoff so downstream work cannot consume the previous phase's
+            # reservation; live tasks and output leases continue unchanged.
+            self._allocation_admission_open = False
+            self._publish_change_locked()
+            eligible_callback = self._on_eligible_units_change
+            eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+        if eligible_callback is not None:
+            eligible_callback(eligible_unit_ids)
+        return True
+
+    def current_eligible_resource_unit_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return self._eligible_resource_unit_ids_locked()
+
+    def _eligible_resource_unit_ids_locked(self) -> tuple[str, ...]:
+        if self._cancelled:
+            return ()
+        return tuple(
+            resource_unit_id
+            for resource_unit_id in self.graph.eligible_resource_unit_ids(self._completed_materialization_barrier_ids)
+            if not self._units[resource_unit_id].completed
+        )
+
+    def _frontier_materialization_barriers_locked(self) -> tuple[Any, ...]:
+        return self.graph.frontier_materialization_barriers(self._completed_materialization_barrier_ids)
+
+    def _materializing_object_store_unlimited_unit_ids_locked(self) -> tuple[str, ...]:
+        barriers = self._frontier_materialization_barriers_locked()
+        if not barriers:
+            return ()
+        eligible = set(self._eligible_resource_unit_ids_locked())
+        boundary: set[str] = set()
+        for barrier in barriers:
+            # A blocking materializer must be able to drain its complete input
+            # branch even after the direct input's accumulated bytes exceed the
+            # soft query budget.  Lifting the cap only on that direct input can
+            # deadlock a longer chain: the live materializer keeps a task lease
+            # while an upstream UDF needs another task to produce the remaining
+            # input, so the global-idle task escape cannot fire.  Follow only
+            # the explicitly materialized side upstream; deferred inputs such
+            # as a broadcast probe remain backpressured.
+            pending = list(barrier.materialized_input_unit_ids)
+            while pending:
+                resource_unit_id = pending.pop()
+                if resource_unit_id in boundary or resource_unit_id not in eligible:
+                    continue
+                boundary.add(resource_unit_id)
+                pending.extend(self._units[resource_unit_id].spec.input_unit_ids)
+            boundary.add(barrier.materializer_unit_id)
+        return tuple(
+            resource_unit_id for resource_unit_id in self._topological_unit_ids if resource_unit_id in boundary
+        )
 
     def note_task_waiting(self, request: TaskRequest) -> None:
         """Register real queued work before attempting admission."""
         with self._lock:
             if str(request.query_id) != self.graph.query_id:
                 raise ValueError("queued task query_id does not match resource manager")
-            stage_id = str(request.stage_id)
-            stage = self._stages.get(stage_id)
-            if stage is None:
-                raise KeyError(f"stage is not registered: {stage_id}")
+            resource_unit_id = str(request.resource_unit_id)
+            unit = self._units.get(resource_unit_id)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {resource_unit_id}")
             task_id = str(request.task_id).strip()
             attempt_id = str(request.attempt_id).strip()
             if not task_id or not attempt_id:
                 raise ValueError("queued task identity must be non-empty")
             retained = (
-                stage.spec.per_task.object_store_bytes
+                unit.spec.per_task.object_store_bytes
                 if request.retained_input_bytes is None
                 else int(request.retained_input_bytes)
             )
-            if retained < 0 or retained > stage.spec.per_task.object_store_bytes:
-                raise ValueError("queued task retained input is outside its stage resource spec")
+            if retained < 0:
+                raise ValueError("queued task retained input must be non-negative")
             key = (task_id, attempt_id)
             existing = self._waiting_task_inputs.get(key)
-            queued = max(1, retained)
-            value = (request, queued)
+            value = (request, retained)
             if existing is not None and existing != value:
                 raise ValueError("queued task identity was reused with different work")
             if existing is not None:
                 return
             self._waiting_task_inputs[key] = value
-            stage.runnable = not stage.completed
-            self._recompute_stage_queued_input_locked(stage_id)
+            unit.runnable = not unit.completed
+            self._recompute_unit_queued_input_locked(resource_unit_id)
             self._publish_change_locked()
 
     def remove_task_waiter(self, task_id: str, attempt_id: str) -> bool:
@@ -468,7 +489,7 @@ class QueryResourceManager:
             )
             if value is None:
                 return False
-            self._recompute_stage_queued_input_locked(str(value[0].stage_id))
+            self._recompute_unit_queued_input_locked(str(value[0].resource_unit_id))
             self._publish_change_locked()
             return True
 
@@ -481,40 +502,42 @@ class QueryResourceManager:
             self._terminal_attempts.add(key)
             self._publish_change_locked()
 
-    def _recompute_stage_queued_input_locked(self, stage_id: str) -> None:
-        stage = self._stages[stage_id]
+    def _recompute_unit_queued_input_locked(self, resource_unit_id: str) -> None:
+        unit = self._units[resource_unit_id]
         waiting = [
             queued_bytes
             for request, queued_bytes in self._waiting_task_inputs.values()
-            if str(request.stage_id) == stage_id
+            if str(request.resource_unit_id) == resource_unit_id
         ]
-        stage.pending_task_count = len(waiting)
-        stage.queued_input_bytes = sum(waiting)
+        unit.pending_task_count = len(waiting)
+        unit.queued_input_bytes = sum(waiting)
 
-    def note_output_waiting(self, request: OutputBlockRequest) -> None:
+    def note_output_waiting(self, request: OutputBlockRequest) -> str | None:
+        """Register one produced block, or return its fatal identity reason."""
+
         with self._lock:
-            if str(request.query_id) != self.graph.query_id:
-                raise ValueError("queued output query_id does not match resource manager")
-            stage_id = str(request.producer_stage_id)
-            if stage_id not in self._stages:
-                raise KeyError(f"stage is not registered: {stage_id}")
+            fatal_reason, _unit, _task, _size = self._output_request_identity_error_locked(request)
+            if fatal_reason is not None:
+                return fatal_reason
+            resource_unit_id = str(request.producer_unit_id)
             block_id = str(request.block_id).strip()
-            size_bytes = int(request.size_bytes)
-            if not block_id or size_bytes <= 0:
-                raise ValueError("queued output requires a non-empty block_id and positive size")
             existing = self._waiting_output_blocks.get(block_id)
             if existing is not None and existing != request:
                 raise ValueError("queued output block_id was reused with different work")
+            if existing is not None:
+                return None
+            self._record_output_observation_locked(request)
             self._waiting_output_blocks[block_id] = request
-            self._recompute_stage_queued_output_locked(stage_id)
+            self._recompute_unit_queued_output_locked(resource_unit_id)
             self._publish_change_locked()
+            return None
 
     def remove_output_waiter(self, block_id: str) -> bool:
         with self._lock:
             value = self._waiting_output_blocks.pop(str(block_id), None)
             if value is None:
                 return False
-            self._recompute_stage_queued_output_locked(str(value.producer_stage_id))
+            self._recompute_unit_queued_output_locked(str(value.producer_unit_id))
             self._publish_change_locked()
             return True
 
@@ -527,20 +550,80 @@ class QueryResourceManager:
             self._terminal_output_blocks.add(key)
             self._publish_change_locked()
 
-    def _recompute_stage_queued_output_locked(self, stage_id: str) -> None:
-        stage = self._stages[stage_id]
+    def _recompute_unit_queued_output_locked(self, resource_unit_id: str) -> None:
+        unit = self._units[resource_unit_id]
         waiting = [
             int(request.size_bytes)
             for request in self._waiting_output_blocks.values()
-            if str(request.producer_stage_id) == stage_id
+            if str(request.producer_unit_id) == resource_unit_id
         ]
         leased_queue_bytes = sum(
             lease.size_bytes
             for lease in self._output_leases.values()
-            if lease.producer_stage_id == stage_id and lease.state in {"generator_pending", "stage_queue"}
+            if lease.producer_unit_id == resource_unit_id and lease.state in {"generator_pending", "unit_queue"}
         )
-        stage.pending_output_count = len(waiting)
-        stage.queued_output_bytes = sum(waiting) + leased_queue_bytes
+        unit.pending_output_count = len(waiting)
+        unit.queued_output_bytes = sum(waiting) + leased_queue_bytes
+
+    def _output_request_identity_error_locked(
+        self,
+        request: OutputBlockRequest,
+    ) -> tuple[str | None, _ResourceUnitState | None, TaskLease | None, int]:
+        """Validate immutable output identity without applying resource policy."""
+
+        if self._cancelled:
+            return "query_cancelled", None, None, 0
+        if self._failed:
+            return "query_failed", None, None, 0
+        if str(request.query_id) != self.graph.query_id:
+            return "query_id_mismatch", None, None, 0
+        unit = self._units.get(str(request.producer_unit_id))
+        if unit is None:
+            return "unit_not_registered", None, None, 0
+        block_id = str(request.block_id).strip()
+        if not block_id:
+            return "invalid_block_id", unit, None, 0
+        if block_id in self._terminal_output_blocks:
+            return "output_block_terminal", unit, None, 0
+        task = self._task_leases.get(str(request.task_lease_id))
+        if task is None:
+            return "task_lease_not_active", unit, None, 0
+        if task.resource_unit_id != unit.spec.resource_unit_id:
+            return "task_unit_mismatch", unit, task, 0
+        if task.attempt_id != str(request.attempt_id):
+            return "task_attempt_mismatch", unit, task, 0
+        if block_id in self._output_lease_by_block:
+            return "output_block_already_leased", unit, task, 0
+        size = int(request.size_bytes)
+        if size <= 0:
+            return "invalid_output_block_size", unit, task, size
+        return None, unit, task, size
+
+    def _record_output_observation_locked(self, request: OutputBlockRequest) -> bool:
+        """Learn one generated block size exactly once for dynamic estimation."""
+
+        block_id = str(request.block_id)
+        if block_id in self._observed_output_blocks:
+            return False
+        unit = self._units[str(request.producer_unit_id)]
+        unit.num_task_outputs_generated += 1
+        unit.bytes_task_outputs_generated += int(request.size_bytes)
+        task_lease_id = str(request.task_lease_id)
+        self._generated_output_count_by_task_lease[task_lease_id] = (
+            self._generated_output_count_by_task_lease.get(task_lease_id, 0) + 1
+        )
+        self._observed_output_blocks.add(block_id)
+        return True
+
+    def _record_task_finished_locked(self, lease: TaskLease) -> None:
+        """Fold one terminal task into the Ray Data-style output averages."""
+
+        unit = self._units[lease.resource_unit_id]
+        unit.num_tasks_finished += 1
+        unit.num_outputs_of_finished_tasks += self._generated_output_count_by_task_lease.pop(
+            lease.lease_id,
+            0,
+        )
 
     def set_external_consumer_waiting(self, waiting: bool) -> None:
         with self._lock:
@@ -550,18 +633,251 @@ class QueryResourceManager:
             self._external_consumer_waiting = waiting
             self._publish_change_locked()
 
-    def set_stage_actor_ready(self, stage_id: str, ready: bool) -> None:
+    def set_submitted_actor_slots(
+        self,
+        resource_unit_id: str,
+        actor_indices: set[int] | tuple[int, ...] | list[int] | range,
+    ) -> None:
+        """Publish the fixed actor handles submitted to Ray Core.
+
+        Submitted slots are logical process usage whether Ray Core reports the
+        actor READY or PENDING. Removing a slot is only valid after its task
+        leases have drained, normally during an execution-phase transition.
+        """
+
+        unit_key = str(resource_unit_id)
+        normalized: set[int] = set()
         with self._lock:
-            stage = self._stages.get(str(stage_id))
-            if stage is None:
-                raise KeyError(f"stage is not registered: {stage_id}")
-            if stage.spec.backend != "ray_actor":
-                raise ValueError(f"stage is not a Ray actor stage: {stage_id}")
-            ready = bool(ready)
-            if stage.actor_ready == ready:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            for raw_actor_index in actor_indices:
+                if isinstance(raw_actor_index, bool):
+                    raise TypeError("actor index must be an integer")
+                actor_index = int(raw_actor_index)
+                if actor_index < 0 or actor_index >= unit.spec.actor_pool_size:
+                    raise ValueError(f"actor index is outside pool {unit_key}: {actor_index}")
+                normalized.add(actor_index)
+
+            before = {
+                actor_index
+                for candidate_unit_id, actor_index in self._submitted_actor_slots
+                if candidate_unit_id == unit_key
+            }
+            if normalized:
+                if self._cancelled:
+                    raise RuntimeError(f"cannot submit actor slots for a cancelled query: {unit_key}")
+                if self._failed:
+                    raise RuntimeError(f"cannot submit actor slots for a failed query: {unit_key}")
+                if unit_key not in self._eligible_resource_unit_ids_locked():
+                    raise RuntimeError(f"cannot submit actor slots outside the current execution phase: {unit_key}")
+            if before == normalized:
                 return
-            stage.actor_ready = ready
+            if unit_key in self._retiring_actor_unit_ids:
+                raise RuntimeError(f"cannot change submitted slots for a retiring actor pool: {unit_key}")
+            removed = before - normalized
+            for actor_index in removed:
+                slot_key = (unit_key, actor_index)
+                if self._actor_slot_lease_count_locked(slot_key) > 0:
+                    raise RuntimeError(f"cannot remove actor slot with live leases: {unit_key}/{actor_index}")
+            self._submitted_actor_slots = {slot for slot in self._submitted_actor_slots if slot[0] != unit_key}
+            self._submitted_actor_slots.update((unit_key, actor_index) for actor_index in normalized)
+            for slot_key in tuple(self._actor_node_by_slot):
+                if slot_key[0] == unit_key and slot_key[1] not in normalized:
+                    self._actor_node_by_slot.pop(slot_key, None)
+            unit.actor_ready = any(
+                candidate_unit_id == unit_key for candidate_unit_id, _actor_index in self._actor_node_by_slot
+            )
             self._publish_change_locked()
+
+    def set_ready_actor_slots(
+        self,
+        resource_unit_id: str,
+        actor_node_ids: dict[int, str],
+    ) -> None:
+        """Publish the subset of a Ray Core actor pool that is currently ready."""
+
+        unit_key = str(resource_unit_id)
+        normalized: dict[int, str] = {}
+        with self._lock:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            for raw_actor_index, raw_node_id in actor_node_ids.items():
+                if isinstance(raw_actor_index, bool):
+                    raise TypeError("actor index must be an integer")
+                actor_index = int(raw_actor_index)
+                node_id = str(raw_node_id or "").strip()
+                if actor_index < 0 or actor_index >= unit.spec.actor_pool_size:
+                    raise ValueError(f"actor index is outside pool {unit_key}: {actor_index}")
+                if not node_id:
+                    raise ValueError(f"actor {unit_key}/{actor_index} node_id must be non-empty")
+                normalized[actor_index] = node_id
+            if normalized:
+                if self._cancelled:
+                    raise RuntimeError(f"cannot publish ready actor slots for a cancelled query: {unit_key}")
+                if unit_key not in self._eligible_resource_unit_ids_locked():
+                    raise RuntimeError(
+                        f"cannot publish ready actor slots outside the current execution phase: {unit_key}"
+                    )
+            submitted = {
+                actor_index
+                for candidate_unit_id, actor_index in self._submitted_actor_slots
+                if candidate_unit_id == unit_key
+            }
+            unknown_ready = sorted(set(normalized) - submitted)
+            if unknown_ready:
+                raise ValueError(f"ready actor slot was not submitted for {unit_key}: {unknown_ready[0]}")
+            before = {
+                actor_index: node_id
+                for (candidate_unit_id, actor_index), node_id in self._actor_node_by_slot.items()
+                if candidate_unit_id == unit_key
+            }
+            if before == normalized:
+                return
+            if unit_key in self._retiring_actor_unit_ids:
+                raise RuntimeError(f"cannot change ready slots for a retiring actor pool: {unit_key}")
+            removed_ready = set(before) - set(normalized)
+            for actor_index in removed_ready:
+                slot_key = (unit_key, actor_index)
+                if self._actor_slot_lease_count_locked(slot_key) > 0:
+                    raise RuntimeError(f"cannot remove ready actor slot with live leases: {unit_key}/{actor_index}")
+            for slot_key in tuple(self._actor_node_by_slot):
+                if slot_key[0] == unit_key:
+                    self._actor_node_by_slot.pop(slot_key, None)
+            self._actor_node_by_slot.update(
+                {(unit_key, actor_index): node_id for actor_index, node_id in normalized.items()}
+            )
+            unit.actor_ready = bool(normalized)
+            self._publish_change_locked()
+
+    def reconcile_actor_runtime_node(
+        self,
+        resource_unit_id: str,
+        actor_index: int,
+        node_id: str,
+    ) -> tuple[str, ...]:
+        """Move one reconstructed actor slot and its live calls atomically.
+
+        Ray may reconstruct an unpinned actor on another node.  The actor
+        process is the execution slot, so every active or prefetched call on
+        that slot must follow its new physical node before it can publish more
+        output.  Existing output leases stay where they were produced.
+        """
+
+        unit_key = str(resource_unit_id)
+        if isinstance(actor_index, bool):
+            raise TypeError("actor index must be an integer")
+        slot_index = int(actor_index)
+        node_key = str(node_id or "").strip()
+        if not node_key:
+            raise ValueError("reconstructed actor node_id must be non-empty")
+        with self._lock:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            if slot_index < 0 or slot_index >= unit.spec.actor_pool_size:
+                raise ValueError(f"actor index is outside pool {unit_key}: {slot_index}")
+            slot_key = (unit_key, slot_index)
+            if slot_key not in self._submitted_actor_slots:
+                raise RuntimeError(f"reconstructed actor slot was not submitted: {unit_key}/{slot_index}")
+            if slot_key not in self._actor_node_by_slot:
+                raise RuntimeError(f"reconstructed actor slot was not ready: {unit_key}/{slot_index}")
+            if self._cancelled:
+                raise RuntimeError(f"cannot move an actor slot for a cancelled query: {unit_key}/{slot_index}")
+            if unit_key not in self._eligible_resource_unit_ids_locked():
+                raise RuntimeError(
+                    f"cannot move an actor slot outside the current execution phase: {unit_key}/{slot_index}"
+                )
+            if unit_key in self._retiring_actor_unit_ids:
+                raise RuntimeError(f"cannot move a retiring actor pool: {unit_key}")
+
+            moved_lease_ids: list[str] = []
+            for lease_id, lease in tuple(self._task_leases.items()):
+                if lease.resource_unit_id != unit_key or lease.actor_index != slot_index:
+                    continue
+                if lease.node_id != node_key:
+                    self._task_leases[lease_id] = replace(lease, node_id=node_key)
+                    moved_lease_ids.append(lease_id)
+
+            changed = self._actor_node_by_slot[slot_key] != node_key or bool(moved_lease_ids)
+            self._actor_node_by_slot[slot_key] = node_key
+            unit.actor_ready = True
+            if changed:
+                self._publish_change_locked()
+            return tuple(sorted(moved_lease_ids))
+
+    def begin_actor_pool_retirement(self, resource_unit_id: str) -> bool:
+        """Atomically fence and uncharge one completed-phase actor pool.
+
+        A stale phase callback must not tear down a pool that is eligible in
+        the manager's current frontier.  Conversely, a real phase transition
+        may only retire a fully drained pool; live or prefetched invocations
+        indicate a barrier/lifecycle ordering bug and keep their slot
+        ownership intact.
+        """
+
+        unit_key = str(resource_unit_id)
+        with self._lock:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            if unit_key in self._eligible_resource_unit_ids_locked():
+                return False
+
+            live_slots = sorted(
+                actor_index
+                for candidate_unit_id, actor_index in self._submitted_actor_slots
+                if candidate_unit_id == unit_key
+                and self._actor_slot_lease_count_locked((candidate_unit_id, actor_index)) > 0
+            )
+            if live_slots:
+                raise RuntimeError(f"cannot retire actor pool with live leases: {unit_key}/{live_slots[0]}")
+
+            if unit_key in self._retiring_actor_unit_ids:
+                return True
+            self._retiring_actor_unit_ids.add(unit_key)
+            for slot_key in tuple(self._actor_node_by_slot):
+                if slot_key[0] == unit_key:
+                    self._actor_node_by_slot.pop(slot_key, None)
+            unit.actor_ready = False
+            self._publish_change_locked()
+            return True
+
+    def complete_actor_pool_retirement(self, resource_unit_id: str) -> bool:
+        """Uncharge submitted actor processes after physical shutdown."""
+
+        unit_key = str(resource_unit_id)
+        with self._lock:
+            unit = self._units.get(unit_key)
+            if unit is None:
+                raise KeyError(f"unit is not registered: {unit_key}")
+            if unit.spec.backend != "ray_actor":
+                raise ValueError(f"unit is not a Ray actor unit: {unit_key}")
+            if unit_key not in self._retiring_actor_unit_ids:
+                return False
+            live_slots = sorted(
+                actor_index
+                for candidate_unit_id, actor_index in self._submitted_actor_slots
+                if candidate_unit_id == unit_key
+                and self._actor_slot_lease_count_locked((candidate_unit_id, actor_index)) > 0
+            )
+            if live_slots:
+                raise RuntimeError(
+                    f"cannot complete actor pool retirement with live leases: {unit_key}/{live_slots[0]}"
+                )
+            self._submitted_actor_slots = {slot for slot in self._submitted_actor_slots if slot[0] != unit_key}
+            self._retiring_actor_unit_ids.remove(unit_key)
+            self._publish_change_locked()
+            return True
 
     def update_allocation(
         self,
@@ -575,12 +891,8 @@ class QueryResourceManager:
                     "allocation generation must increase: "
                     f"current={self.allocation.generation} new={allocation.generation}"
                 )
-            self.graph.validate_allocation(
-                allocation,
-                require_full_minimum=False,
-            )
             self.allocation = allocation
-            self._allocation_admission_open = bool(admission_open)
+            self._allocation_admission_open = bool(admission_open) and not self._failed and not self._cancelled
             self._publish_change_locked()
 
     def close_admission(self) -> None:
@@ -590,79 +902,6 @@ class QueryResourceManager:
                 return
             self._allocation_admission_open = False
             self._publish_change_locked()
-
-    def task_eligible_node_ids(self, stage_id: str) -> tuple[str, ...]:
-        """Return statically feasible placement nodes for one registered stage."""
-        with self._lock:
-            if not self._allocation_admission_open:
-                return ()
-            stage = self._stages.get(str(stage_id))
-            if stage is None:
-                raise KeyError(f"stage is not registered: {stage_id}")
-            commitment = ResourceVector(
-                cpu=stage.spec.per_task.cpu,
-                gpu=stage.spec.per_task.gpu,
-                heap_bytes=stage.spec.per_task.heap_bytes,
-                object_store_bytes=(stage.spec.per_task.object_store_bytes + stage.spec.output_window_bytes),
-            )
-            allowed_actor_nodes = (
-                set(self.allocation.actor_node_ids_for_stage(stage.spec.stage_id))
-                if stage.spec.backend == "ray_actor"
-                else None
-            )
-            if self._continuation_parent_stage_ids_by_ray_task.get(stage.spec.stage_id):
-                return tuple(
-                    dict.fromkeys(
-                        credit.node_id
-                        for credit in self._continuation_credits.values()
-                        if credit.parent_active
-                        and credit.borrowed_by_task_lease_id is None
-                        and stage.spec.stage_id in credit.eligible_stage_ids
-                        and commitment.fits_within(credit.resources)
-                    )
-                )
-            credit_template = self._continuation_credit_template_locked(stage.spec)
-            credit_resources = ResourceVector() if credit_template is None else credit_template[2]
-            downstream_reservations = self._downstream_reservations_locked(stage.spec)
-            allocation_by_node = {
-                allocation.node_id: allocation.resources for allocation in self.allocation.node_allocations
-            }
-            base_remaining: dict[str, ResourceVector] = {}
-            for node_id, capacity in allocation_by_node.items():
-                resident = self._actor_resident_usage_locked(node_id=node_id)
-                if resident.fits_within(capacity):
-                    base_remaining[node_id] = capacity - resident
-
-            def preserves_registered_minimum(task_node_id: str) -> bool:
-                task_capacity = base_remaining.get(task_node_id)
-                if task_capacity is None or not commitment.fits_within(task_capacity):
-                    return False
-                after_task = dict(base_remaining)
-                after_task[task_node_id] = task_capacity - commitment
-                if credit_resources.is_zero():
-                    return self._remaining_preserves_downstream_locked(
-                        after_task,
-                        downstream_reservations,
-                    )
-                for credit_node_id in sorted(after_task):
-                    credit_capacity = after_task[credit_node_id]
-                    if not credit_resources.fits_within(credit_capacity):
-                        continue
-                    after_credit = dict(after_task)
-                    after_credit[credit_node_id] = credit_capacity - credit_resources
-                    if self._remaining_preserves_downstream_locked(
-                        after_credit,
-                        downstream_reservations,
-                    ):
-                        return True
-                return False
-
-            return tuple(
-                allocation.node_id
-                for allocation in self.allocation.node_allocations
-                if preserves_registered_minimum(allocation.node_id)
-                and (allowed_actor_nodes is None or allocation.node_id in allowed_actor_nodes)
-            )
 
     def try_acquire_task(self, request: TaskRequest) -> TaskGrant:
         with self._lock:
@@ -676,7 +915,10 @@ class QueryResourceManager:
             if fatal or blocked_reason not in _SOFT_TASK_BLOCK_REASONS:
                 return TaskGrant(False, blocked_reason=blocked_reason, fatal=fatal)
 
-            liveness_block = self._task_liveness_block_reason_locked(request)
+            liveness_block = self._task_liveness_block_reason_locked(
+                request,
+                plan,
+            )
             if liveness_block is not None:
                 return TaskGrant(False, blocked_reason=liveness_block)
             return self._grant_task_locked(
@@ -714,19 +956,19 @@ class QueryResourceManager:
                     admission_epoch=int(self._admission_epoch),
                 )
 
-            # A non-root FTE stage becomes runnable when its first real split
+            # A non-root native fragment unit becomes runnable when its first real split
             # descriptor arrives.  Persistent task waiters perform this same
             # transition in note_task_waiting(); descriptor-owned backlog must
             # preserve it even though no individual waiter is registered.
-            request_stage = self._stages.get(str(request.stage_id))
+            request_unit = self._units.get(str(request.resource_unit_id))
             if (
                 str(request.query_id) == self.graph.query_id
-                and request_stage is not None
-                and not request_stage.completed
-                and not request_stage.runnable
+                and request_unit is not None
+                and not request_unit.completed
+                and not request_unit.runnable
             ):
-                request_stage.runnable = True
-                self._recompute_stage_queued_input_locked(str(request.stage_id))
+                request_unit.runnable = True
+                self._recompute_unit_queued_input_locked(str(request.resource_unit_id))
                 self._publish_change_locked()
 
             key = (str(request.task_id), str(request.attempt_id))
@@ -859,16 +1101,9 @@ class QueryResourceManager:
                     liveness=False,
                 )
             request = selected.request
-            if self._active_liveness_task_lease_id is not None:
-                return request, TaskGrant(
-                    False,
-                    blocked_reason="liveness_task_active",
-                )
-            if self._task_leases and not self._external_consumer_waiting:
-                return request, TaskGrant(
-                    False,
-                    blocked_reason="liveness_not_needed",
-                )
+            liveness_block = self._queued_liveness_block_reason_locked(evaluations)
+            if liveness_block is not None:
+                return request, TaskGrant(False, blocked_reason=liveness_block)
             return request, self._grant_task_locked(
                 request,
                 selected.plan,
@@ -884,18 +1119,22 @@ class QueryResourceManager:
         empty_plan = _TaskAdmissionPlan()
         if self._cancelled:
             return "query_cancelled", True, empty_plan
-        if not self._allocation_admission_open:
-            return "allocation_pending", False, empty_plan
+        if self._failed:
+            return "query_failed", True, empty_plan
         if str(request.query_id) != self.graph.query_id:
             return "query_id_mismatch", True, empty_plan
-        stage = self._stages.get(str(request.stage_id))
-        if stage is None:
-            return "stage_not_registered", True, empty_plan
-        if stage.completed:
-            return "stage_completed", True, empty_plan
-        if not stage.runnable:
-            return "stage_not_runnable", False, empty_plan
-        if stage.spec.backend == "ray_actor" and not stage.actor_ready:
+        unit = self._units.get(str(request.resource_unit_id))
+        if unit is None:
+            return "unit_not_registered", True, empty_plan
+        if unit.completed:
+            return "unit_completed", True, empty_plan
+        if not self._allocation_admission_open:
+            return "allocation_pending", False, empty_plan
+        if unit.spec.resource_unit_id not in self._eligible_resource_unit_ids_locked():
+            return "materialization_barrier_pending", False, empty_plan
+        if not unit.runnable:
+            return "unit_not_runnable", False, empty_plan
+        if unit.spec.backend == "ray_actor" and not unit.actor_ready:
             return "actor_not_ready", False, empty_plan
 
         task_key = str(request.task_id).strip()
@@ -909,718 +1148,264 @@ class QueryResourceManager:
             if attempt in self._active_attempt_leases:
                 return "attempt_already_active", True, empty_plan
 
-        active_stage_tasks = self._active_task_count_for_stage_locked(stage.spec.stage_id)
-        concurrency_cap = self._stage_concurrency_cap(stage.spec)
-        if concurrency_cap is not None and active_stage_tasks >= concurrency_cap:
-            return "stage_concurrency", False, empty_plan
+        active_unit_tasks = self._active_task_count_for_unit_locked(unit.spec.resource_unit_id)
+        concurrency_cap = self._unit_concurrency_cap(unit.spec)
+        if concurrency_cap is not None and active_unit_tasks >= concurrency_cap:
+            return "unit_concurrency", False, empty_plan
 
-        free_actor_indices_by_node: dict[str, list[int]] | None = None
-        if stage.spec.backend == "ray_actor":
-            free_actor_indices_by_node = {}
-            for placement in self.allocation.actor_placements:
-                if placement.stage_id != stage.spec.stage_id:
-                    continue
-                slot_key = (stage.spec.stage_id, placement.actor_index)
-                if self._actor_slot_lease_count_locked(slot_key) >= stage.spec.actor_prefetch_depth:
-                    continue
-                free_actor_indices_by_node.setdefault(placement.node_id, []).append(placement.actor_index)
-            if not free_actor_indices_by_node:
+        node_id: str | None = None
+        actor_index: int | None = None
+        if unit.spec.backend == "ray_worker":
+            node_id = "" if request.node_id is None else str(request.node_id).strip()
+            if not node_id:
+                return "ray_worker_node_required", True, empty_plan
+        elif unit.spec.backend == "ray_task":
+            if request.node_id is not None and str(request.node_id).strip():
+                return "ray_task_node_must_be_unset", True, empty_plan
+        elif unit.spec.backend == "ray_actor":
+            requested_node_id = "" if request.node_id is None else str(request.node_id).strip()
+            candidates = [
+                (self._actor_slot_lease_count_locked(slot), slot[1], ready_node_id)
+                for slot, ready_node_id in self._actor_node_by_slot.items()
+                if slot[0] == unit.spec.resource_unit_id
+                and (not requested_node_id or ready_node_id == requested_node_id)
+                and self._actor_slot_lease_count_locked(slot) < unit.spec.actor_prefetch_depth
+            ]
+            if not candidates:
+                if requested_node_id:
+                    return "actor_node_unavailable", True, empty_plan
                 return "actor_slot", False, empty_plan
+            _lease_count, actor_index, node_id = min(candidates)
+        else:
+            return "unsupported_backend", True, empty_plan
 
         retained = (
-            stage.spec.per_task.object_store_bytes
+            unit.spec.per_task.object_store_bytes
             if request.retained_input_bytes is None
             else int(request.retained_input_bytes)
         )
         if retained < 0:
             return "invalid_retained_input_bytes", True, empty_plan
-        resources = _resource_with_object_store(stage.spec.per_task, retained)
-        output_window = stage.spec.output_window_bytes
-        commitment = _resource_with_object_store(resources, retained + output_window)
-        if commitment.exceeded_dimensions(self.allocation.resources):
-            return "task_exceeds_query_allocation", True, empty_plan
-
-        query_usage = self._query_usage_locked()
-        debt = _positive_difference(query_usage, self.allocation.resources)
-        if not debt.is_zero():
-            return "allocation_debt", False, empty_plan
-
-        borrowed_credit = self._available_continuation_credit_locked(
-            stage.spec,
-            requested_node_id=request.node_id,
-            resources=resources,
-            output_window_bytes=output_window,
-            query_usage=query_usage,
+        resources = _resource_with_object_store(unit.spec.per_task, retained)
+        pending_output_estimate = self._pending_output_estimate_per_task_locked(unit.spec)
+        commitment = _resource_with_object_store(
+            resources,
+            retained + pending_output_estimate,
         )
-        credit_template = self._continuation_credit_template_locked(stage.spec)
-        credit_resources = ResourceVector() if credit_template is None else credit_template[2]
-        admission_commitment = commitment + credit_resources
-        if borrowed_credit is not None:
-            # Query/node usage already contains the idle credit and any
-            # historical output bytes above its object-store window.  Predict
-            # the exact post-borrow task usage using the same aggregate-live-
-            # output formula as _task_usage_locked, then add only the delta.
-            # Comparing the new task in isolation can grant within the cap and
-            # become over-cap immediately after ownership transfer.
-            prospective_task_usage = self._borrowed_task_usage_locked(
-                resources,
-                output_window,
-                borrowed_credit,
-            )
-            idle_output_excess = self._idle_continuation_output_excess_locked(
-                borrowed_credit,
-            )
-            admission_commitment = _positive_difference(
-                prospective_task_usage,
-                idle_output_excess,
-            )
-
-        exceeded = (query_usage + admission_commitment).exceeded_dimensions(self.allocation.resources)
-        if exceeded:
-            reason = "continuation_capacity" if credit_template is not None else f"hard_{exceeded[0]}"
-            return reason, False, empty_plan
-        downstream_reservations = self._downstream_reservations_locked(stage.spec)
-        if downstream_reservations:
-            remaining = self.allocation.resources - (query_usage + admission_commitment)
-            reservation_total = self._downstream_reservation_total(downstream_reservations)
-            if not reservation_total.fits_within(remaining):
-                return "continuation_capacity", False, empty_plan
-
-        new_credit_plan: _NewContinuationCreditPlan | None = None
-        if credit_template is not None:
-            eligible_stage_ids, reservation_stage_id, credit_resources = credit_template
-            node_id, credit_node_id, node_blocked_reason, node_fatal = self._select_task_and_credit_nodes_locked(
-                request.node_id,
-                commitment,
-                credit_resources,
-                downstream_reservations=downstream_reservations,
-            )
-            if node_blocked_reason is None:
-                new_credit_plan = _NewContinuationCreditPlan(
-                    eligible_stage_ids=eligible_stage_ids,
-                    reservation_stage_id=reservation_stage_id,
-                    node_id=credit_node_id,
-                    resources=credit_resources,
-                )
-        else:
-            allowed_node_ids = (
-                {borrowed_credit.node_id}
-                if borrowed_credit is not None
-                else (set(free_actor_indices_by_node) if free_actor_indices_by_node is not None else None)
-            )
-            node_id, node_blocked_reason, node_fatal = self._select_task_node_locked(
-                request.node_id,
-                admission_commitment,
-                allowed_node_ids=allowed_node_ids,
-                downstream_reservations=downstream_reservations,
-            )
-        if node_blocked_reason is not None:
-            return node_blocked_reason, node_fatal, empty_plan
-
-        actor_index = None
-        if free_actor_indices_by_node is not None:
-            candidates = free_actor_indices_by_node.get(node_id, [])
-            if not candidates:
-                raise RuntimeError("selected actor node has no free concrete actor slot")
-            actor_index = min(
-                candidates,
-                key=lambda index: (
-                    self._actor_slot_lease_count_locked((stage.spec.stage_id, index)),
-                    index,
-                ),
-            )
         plan = _TaskAdmissionPlan(
             resources=resources,
-            output_window_bytes=output_window,
+            output_window_bytes=unit.spec.output_window_bytes,
             node_id=node_id,
             actor_index=actor_index,
-            new_credit=new_credit_plan,
-            borrowed_credit_id=(None if borrowed_credit is None else borrowed_credit.credit_id),
         )
-        if active_stage_tasks > 0 and any(
-            downstream_id not in self._started_stage_ids
-            and self._stages[downstream_id].runnable
-            and not self._stages[downstream_id].completed
-            for downstream_id in self._direct_downstream_stage_ids[stage.spec.stage_id]
-        ):
-            return "stage_soft_limit", False, plan
-        if borrowed_credit is None:
-            soft_reason = self._stage_soft_block_reason_locked(stage.spec.stage_id, commitment)
-            if soft_reason is not None:
-                return soft_reason, False, plan
-        return None, False, plan
 
-    def _select_task_node_locked(
-        self,
-        requested_node_id: str | None,
-        commitment: ResourceVector,
-        *,
-        allowed_node_ids: set[str] | None,
-        downstream_reservations: tuple[_DownstreamReservation, ...] = (),
-    ) -> tuple[str, str | None, bool]:
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
-        requested = "" if requested_node_id is None else str(requested_node_id).strip()
-        if requested and requested not in allocation_by_node:
-            return "", "node_not_allocated", True
-
-        static_candidates = [
-            node_id
-            for node_id, capacity in allocation_by_node.items()
-            if commitment.fits_within(capacity)
-            and (not requested or node_id == requested)
-            and (allowed_node_ids is None or node_id in allowed_node_ids)
-        ]
-        if not static_candidates:
-            return "", "task_does_not_fit_allocated_node", True
-
-        available_candidates: list[tuple[str, ResourceVector]] = []
-        debt_detected = False
-        for node_id in static_candidates:
-            capacity = allocation_by_node[node_id]
-            usage = self._node_usage_locked(node_id)
-            if not usage.fits_within(capacity):
-                debt_detected = True
+        query_usage = self._soft_allocation_usage_locked()
+        usage_after = query_usage + commitment
+        for field_name in ("cpu", "gpu", "heap_bytes"):
+            if getattr(commitment, field_name) <= 0:
                 continue
-            remaining = capacity - usage
-            if commitment.fits_within(remaining):
-                available_candidates.append((node_id, remaining))
-        if not available_candidates:
-            return "", "node_allocation_debt" if debt_detected else "node_capacity", False
+            if getattr(usage_after, field_name) > getattr(self.allocation.resources, field_name) + _EPSILON:
+                return f"query_soft_{field_name}", False, plan
 
-        if downstream_reservations:
-            safe_candidates = [
-                candidate
-                for candidate in available_candidates
-                if self._placement_preserves_downstream_locked(
-                    candidate[0],
-                    commitment,
-                    downstream_reservations,
-                    allocation_by_node,
-                )
-            ]
-            if not safe_candidates:
-                return "", "continuation_node_capacity", False
-            available_candidates = safe_candidates
-
-        node_id, _ = min(
-            available_candidates,
-            key=lambda item: (
-                item[1].gpu - commitment.gpu,
-                item[1].cpu - commitment.cpu,
-                item[1].heap_bytes - commitment.heap_bytes,
-                item[1].object_store_bytes - commitment.object_store_bytes,
-                item[0],
-            ),
+        object_store_backpressure_disabled = (
+            unit.spec.resource_unit_id in self._materializing_object_store_unlimited_unit_ids_locked()
         )
-        return node_id, None, False
+        if (
+            not object_store_backpressure_disabled
+            and commitment.object_store_bytes > 0
+            and usage_after.object_store_bytes > self.allocation.resources.object_store_bytes
+        ):
+            return "query_soft_object_store_bytes", False, plan
 
-    def _select_task_and_credit_nodes_locked(
-        self,
-        requested_node_id: str | None,
-        task_commitment: ResourceVector,
-        credit_resources: ResourceVector,
-        *,
-        downstream_reservations: tuple[_DownstreamReservation, ...],
-    ) -> tuple[str, str, str | None, bool]:
-        """Place one parent task and its continuation ownership atomically."""
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
-        requested = "" if requested_node_id is None else str(requested_node_id).strip()
-        if requested and requested not in allocation_by_node:
-            return "", "", "node_not_allocated", True
-
-        task_nodes = [
-            node_id
-            for node_id, capacity in allocation_by_node.items()
-            if task_commitment.fits_within(capacity) and (not requested or node_id == requested)
-        ]
-        if not task_nodes:
-            return "", "", "task_does_not_fit_allocated_node", True
-        credit_nodes = [
-            node_id for node_id, capacity in allocation_by_node.items() if credit_resources.fits_within(capacity)
-        ]
-        if not credit_nodes:
-            return "", "", "continuation_does_not_fit_allocated_node", True
-
-        candidates: list[tuple[str, str, dict[str, ResourceVector]]] = []
-        debt_detected = False
-        for task_node_id in task_nodes:
-            for credit_node_id in credit_nodes:
-                proposed: dict[str, ResourceVector] = {
-                    task_node_id: task_commitment,
-                }
-                proposed[credit_node_id] = proposed.get(credit_node_id, ResourceVector()) + credit_resources
-                remaining_by_node: dict[str, ResourceVector] = {}
-                feasible = True
-                for node_id, capacity in allocation_by_node.items():
-                    usage = self._node_usage_locked(node_id)
-                    if not usage.fits_within(capacity):
-                        if node_id in proposed:
-                            debt_detected = True
-                            feasible = False
-                            break
-                        continue
-                    usage_after = usage + proposed.get(node_id, ResourceVector())
-                    if not usage_after.fits_within(capacity):
-                        feasible = False
-                        break
-                    remaining_by_node[node_id] = capacity - usage_after
-                if not feasible:
-                    continue
-                if downstream_reservations and not self._remaining_preserves_downstream_locked(
-                    remaining_by_node,
-                    downstream_reservations,
-                ):
-                    continue
-                candidates.append((task_node_id, credit_node_id, remaining_by_node))
-
-        if not candidates:
-            reason = "node_allocation_debt" if debt_detected else "continuation_node_capacity"
-            return "", "", reason, False
-
-        task_node_id, credit_node_id, _ = min(
-            candidates,
-            key=lambda item: (
-                item[2][item[0]].gpu,
-                item[2][item[0]].cpu,
-                item[2][item[0]].heap_bytes,
-                item[2][item[0]].object_store_bytes,
-                item[0],
-                item[1],
-            ),
+        soft_reason = self._unit_soft_block_reason_locked(
+            unit.spec.resource_unit_id,
+            commitment,
+            ignore_object_store=object_store_backpressure_disabled,
         )
-        return task_node_id, credit_node_id, None, False
-
-    def _placement_preserves_downstream_locked(
-        self,
-        parent_node_id: str,
-        parent_commitment: ResourceVector,
-        reservations: tuple[_DownstreamReservation, ...],
-        allocation_by_node: dict[str, ResourceVector],
-    ) -> bool:
-        remaining_by_node: dict[str, ResourceVector] = {}
-        for node_id, capacity in allocation_by_node.items():
-            usage = self._node_usage_locked(node_id)
-            if node_id == parent_node_id:
-                usage = usage + parent_commitment
-            if usage.fits_within(capacity):
-                remaining_by_node[node_id] = capacity - usage
-
-        return self._remaining_preserves_downstream_locked(
-            remaining_by_node,
-            reservations,
-        )
-
-    def _remaining_preserves_downstream_locked(
-        self,
-        remaining_by_node: dict[str, ResourceVector],
-        reservations: tuple[_DownstreamReservation, ...],
-    ) -> bool:
-        if not reservations:
-            return True
-
-        node_ids = tuple(sorted(remaining_by_node))
-        node_index = {node_id: index for index, node_id in enumerate(node_ids)}
-        ordered = tuple(
-            sorted(
-                reservations,
-                key=lambda reservation: (
-                    len(reservation.allowed_node_ids),
-                    -reservation.resources.dominant_share(self.allocation.resources),
-                    reservation.reservation_id,
-                ),
-            )
-        )
-        initial = tuple(remaining_by_node[node_id] for node_id in node_ids)
-        failed_states: set[tuple[int, tuple[ResourceVector, ...]]] = set()
-
-        def place(index: int, remaining: tuple[ResourceVector, ...]) -> bool:
-            if index >= len(ordered):
-                return True
-            state = (index, remaining)
-            if state in failed_states:
-                return False
-            reservation = ordered[index]
-            candidates: list[tuple[int, ResourceVector]] = []
-            for node_id in reservation.allowed_node_ids:
-                position = node_index.get(node_id)
-                if position is None:
-                    continue
-                capacity = remaining[position]
-                if reservation.resources.fits_within(capacity):
-                    candidates.append((position, capacity - reservation.resources))
-            candidates.sort(
-                key=lambda item: (
-                    item[1].dominant_share(self.allocation.resources),
-                    item[1].gpu,
-                    item[1].cpu,
-                    item[1].heap_bytes,
-                    item[1].object_store_bytes,
-                    node_ids[item[0]],
-                )
-            )
-            for position, capacity_after in candidates:
-                updated = list(remaining)
-                updated[position] = capacity_after
-                if place(index + 1, tuple(updated)):
-                    return True
-            failed_states.add(state)
-            return False
-
-        return place(0, initial)
+        if soft_reason is not None:
+            return soft_reason, False, plan
+        return None, False, plan
 
     def _actor_slot_lease_count_locked(self, slot: tuple[str, int]) -> int:
         return int(slot in self._active_actor_slots) + len(self._queued_actor_slot_leases.get(slot, ()))
 
     @staticmethod
-    def _stage_concurrency_cap(spec: StageResourceSpec) -> int | None:
+    def _unit_concurrency_cap(spec: ResourceUnitSpec) -> int | None:
         return spec.max_concurrency
 
-    @staticmethod
-    def _task_commitment(spec: StageResourceSpec) -> ResourceVector:
-        return _resource_with_object_store(
-            spec.per_task,
-            spec.per_task.object_store_bytes + spec.output_window_bytes,
-        )
+    def _pending_output_estimate_per_task_locked(self, spec: ResourceUnitSpec) -> int:
+        """Estimate unseen streaming-generator bytes for one running task.
 
-    def _continuation_credit_template_locked(
-        self,
-        parent: StageResourceSpec,
-    ) -> tuple[tuple[str, ...], str, ResourceVector] | None:
-        if parent.backend != "ray_worker":
-            return None
-        eligible_specs = tuple(
-            self._stages[stage_id].spec
-            for stage_id in self._reachable_udf_stage_ids[parent.stage_id]
-            if self._stages[stage_id].spec.backend == "ray_task" and not self._stages[stage_id].completed
-        )
-        if not eligible_specs:
-            return None
-        commitments = tuple(self._task_commitment(spec) for spec in eligible_specs)
-        resources = _component_max(commitments)
-        reservation_spec = max(
-            eligible_specs,
-            key=lambda spec: (
-                self._task_commitment(spec).dominant_share(self.allocation.resources),
-                -self._topological_stage_ids.index(spec.stage_id),
-            ),
-        )
-        return (
-            tuple(spec.stage_id for spec in eligible_specs),
-            reservation_spec.stage_id,
-            resources,
-        )
-
-    def _available_continuation_credit_locked(
-        self,
-        stage: StageResourceSpec,
-        *,
-        requested_node_id: str | None,
-        resources: ResourceVector,
-        output_window_bytes: int,
-        query_usage: ResourceVector,
-    ) -> _ContinuationCredit | None:
-        if stage.backend != "ray_task":
-            return None
-        if not self._continuation_parent_stage_ids_by_ray_task.get(stage.stage_id):
-            return None
-        requested = "" if requested_node_id is None else str(requested_node_id).strip()
-        commitment = self._task_commitment(stage)
-        allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
-        candidates = [
-            credit
-            for credit in self._continuation_credits.values()
-            if credit.parent_active
-            and credit.borrowed_by_task_lease_id is None
-            and stage.stage_id in credit.eligible_stage_ids
-            and commitment.fits_within(credit.resources)
-            and (not requested or credit.node_id == requested)
-            and credit.node_id in allocation_by_node
-        ]
-        if not candidates:
-            return None
-
-        def candidate_rank(credit: _ContinuationCredit) -> tuple[Any, ...]:
-            prospective_task_usage = self._borrowed_task_usage_locked(
-                resources,
-                output_window_bytes,
-                credit,
-            )
-            idle_output_excess = self._idle_continuation_output_excess_locked(
-                credit,
-            )
-            incremental = _positive_difference(
-                prospective_task_usage,
-                idle_output_excess,
-            )
-            query_exceeded = (query_usage + incremental).exceeded_dimensions(self.allocation.resources)
-            node_usage = self._node_usage_locked(credit.node_id)
-            node_exceeded = (node_usage + incremental).exceeded_dimensions(allocation_by_node[credit.node_id])
-            feasible = not query_exceeded and not node_exceeded
-            return (
-                0 if feasible else 1,
-                len(query_exceeded) + len(node_exceeded),
-                incremental.dominant_share(self.allocation.resources),
-                incremental.gpu,
-                incremental.cpu,
-                incremental.heap_bytes,
-                incremental.object_store_bytes,
-                credit.credit_id,
-            )
-
-        # Historical outputs differ per credit, so selecting by insertion
-        # order can repeatedly choose an infeasible borrower while another
-        # idle credit is immediately grantable. Rank the full prospective
-        # query+node transition and use credit_id only as the stable tie-break.
-        return min(candidates, key=candidate_rank)
-
-    def _downstream_reservations_locked(
-        self,
-        parent: StageResourceSpec,
-    ) -> tuple[_DownstreamReservation, ...]:
-        """Return shared bundles required to keep this producer drainable.
-
-        Query demand owns one transferable FTE bundle, while nested Ray tasks
-        use the explicit per-parent continuation credit above. A streaming
-        actor boundary additionally needs one slot for every inactive
-        downstream Ray-task continuation: the actor input producer, actor call,
-        and downstream consumer can all remain live while generator output is
-        drained, so the transferable component-max credit alone is not enough.
-        Actor process resources are resident, but each downstream actor stage
-        also needs an invocation input/output window on one of its pinned nodes.
-
-        Reservations include latent stages: waiting for a stage to become
-        runnable is too late because an upstream producer may already have
-        consumed the last heap or object-store slot by then.
+        Native fragment results are materialized atomically, so their protocol
+        window is only the initial estimate until exact result bytes replace
+        it. Ray UDF streams instead learn the average generated block size at
+        runtime, matching Ray Data's treatment of pending generator outputs.
+        The declared window caps the unseen-output estimate; it is not a hard
+        cap on an actual block.
         """
-        reachable = tuple(
-            self._stages[stage_id]
-            for stage_id in self._reachable_stage_ids[parent.stage_id]
-            if not self._stages[stage_id].completed
-        )
-        reservations: list[_DownstreamReservation] = []
-        allocation_node_ids = tuple(sorted(allocation.node_id for allocation in self.allocation.node_allocations))
 
-        inactive_fte = tuple(
-            self._stages[stage_id].spec
-            for stage_id in self._downstream_fte_stage_ids_requiring_separate_slot[parent.stage_id]
-            if not self._stages[stage_id].completed and self._active_task_count_for_stage_locked(stage_id) == 0
-        )
-        if inactive_fte:
-            resources = _component_max(tuple(self._task_commitment(stage) for stage in inactive_fte))
-            if not resources.is_zero():
-                reservations.append(
-                    _DownstreamReservation(
-                        reservation_id=f"fte:{parent.stage_id}",
-                        stage_ids=tuple(stage.stage_id for stage in inactive_fte),
-                        resources=resources,
-                        allowed_node_ids=allocation_node_ids,
-                    )
-                )
+        if spec.target_output_block_bytes <= 0:
+            return 0
+        if spec.backend == "ray_worker":
+            return int(spec.output_window_bytes)
+        state = self._units[spec.resource_unit_id]
+        if state.num_task_outputs_generated <= 0:
+            return 0
+        pending_blocks = float(spec.generator_buffer_blocks)
+        if state.num_tasks_finished > 0:
+            pending_blocks = min(
+                pending_blocks,
+                state.num_outputs_of_finished_tasks / state.num_tasks_finished,
+            )
+        estimate = math.ceil(state.bytes_task_outputs_generated * pending_blocks / state.num_task_outputs_generated)
+        return min(int(spec.output_window_bytes), max(0, estimate))
 
-        def is_after_streaming_actor(stage_id: str) -> bool:
-            if parent.backend == "ray_actor":
-                return True
-            return any(
-                candidate.spec.backend == "ray_actor" and stage_id in self._reachable_stage_ids[candidate.spec.stage_id]
-                for candidate in reachable
-            )
-
-        actor_continuations = tuple(
-            stage.spec
-            for stage in reachable
-            if stage.spec.backend == "ray_task"
-            and is_after_streaming_actor(stage.spec.stage_id)
-            and self._active_task_count_for_stage_locked(stage.spec.stage_id) == 0
-        )
-        for spec in actor_continuations:
-            resources = self._task_commitment(spec)
-            if resources.is_zero():
-                continue
-            reservations.append(
-                _DownstreamReservation(
-                    reservation_id=f"actor_continuation:{parent.stage_id}:{spec.stage_id}",
-                    stage_ids=(spec.stage_id,),
-                    resources=resources,
-                    allowed_node_ids=allocation_node_ids,
-                )
-            )
-
-        for stage in reachable:
-            spec = stage.spec
-            if spec.backend != "ray_actor":
-                continue
-            if self._active_task_count_for_stage_locked(spec.stage_id) > 0:
-                continue
-            resources = self._task_commitment(spec)
-            if resources.is_zero():
-                continue
-            free_node_ids = tuple(
-                sorted(
-                    {
-                        placement.node_id
-                        for placement in self.allocation.actor_placements
-                        if placement.stage_id == spec.stage_id
-                        and (spec.stage_id, placement.actor_index) not in self._active_actor_slots
-                    }
-                )
-            )
-            reservations.append(
-                _DownstreamReservation(
-                    reservation_id=f"actor:{spec.stage_id}",
-                    stage_ids=(spec.stage_id,),
-                    resources=resources,
-                    allowed_node_ids=free_node_ids,
-                )
-            )
-        return tuple(reservations)
+    def _pending_output_estimate_for_lease_locked(self, lease: TaskLease) -> int:
+        spec = self._units[lease.resource_unit_id].spec
+        if spec.backend == "ray_actor" and lease.lease_id not in self._active_actor_slots.values():
+            # Prefetched actor calls retain their inputs, but only the active
+            # call can currently populate that actor's generator buffer.
+            return 0
+        return self._pending_output_estimate_per_task_locked(spec)
 
     @staticmethod
-    def _downstream_reservation_total(
-        reservations: tuple[_DownstreamReservation, ...],
-    ) -> ResourceVector:
-        total = ResourceVector()
-        for reservation in reservations:
-            total = total + reservation.resources
-        return total
-
-    def _dimension_live_demand_stage_ids_locked(
-        self,
-        field_name: str,
-        *,
-        requested_stage_id: str | None,
-    ) -> tuple[str, ...]:
-        stage_ids: list[str] = []
-        for stage_id, stage in self._stages.items():
-            if not stage.runnable or stage.completed:
-                continue
-            task_demand = (
-                (requested_stage_id is not None and stage_id == requested_stage_id)
-                or stage.pending_task_count > 0
-                or self._active_task_count_for_stage_locked(stage_id) > 0
-            )
-            output_demand = (
-                stage.pending_output_count > 0
-                or stage.queued_output_bytes > 0
-                or any(lease.producer_stage_id == stage_id for lease in self._output_leases.values())
-            )
-            if not task_demand and not (field_name == "object_store_bytes" and output_demand):
-                continue
-            if self._stage_dimension_commitment(stage.spec, field_name) > 0:
-                stage_ids.append(stage_id)
-        return tuple(stage_ids)
-
-    def _dimension_continuation_stage_ids_locked(
-        self,
-        field_name: str,
-        *,
-        live_stage_ids: tuple[str, ...],
-    ) -> tuple[str, ...]:
-        live = set(live_stage_ids)
-        continuation_ids: set[str] = set()
-        for source_stage_id in live_stage_ids:
-            if self._stages[source_stage_id].spec.backend != "ray_worker":
-                continue
-            for stage_id in self._reachable_udf_stage_ids[source_stage_id]:
-                stage = self._stages[stage_id]
-                if (
-                    stage_id not in live
-                    and not stage.completed
-                    and self._stage_dimension_commitment(stage.spec, field_name) > 0
-                ):
-                    continuation_ids.add(stage_id)
-        return tuple(stage_id for stage_id in self._topological_stage_ids if stage_id in continuation_ids)
-
-    def _dimension_reservation_stage_ids_locked(
-        self,
-        field_name: str,
-        *,
-        requested_stage_id: str | None,
-    ) -> tuple[str, ...]:
-        live_stage_ids = self._dimension_live_demand_stage_ids_locked(
-            field_name,
-            requested_stage_id=requested_stage_id,
+    def _task_commitment(spec: ResourceUnitSpec) -> ResourceVector:
+        """Return non-spillable process resources for one runnable task."""
+        return ResourceVector(
+            cpu=spec.per_task.cpu,
+            gpu=spec.per_task.gpu,
+            heap_bytes=spec.per_task.heap_bytes,
         )
-        if requested_stage_id is not None and self._stages[requested_stage_id].spec.backend != "ray_worker":
-            # A concrete downstream UDF borrows latent continuation reserves.
-            # It releases its own lease before a later continuation needs them.
-            return live_stage_ids
-        continuation_stage_ids = self._dimension_continuation_stage_ids_locked(
-            field_name,
-            live_stage_ids=live_stage_ids,
-        )
-        selected = set(live_stage_ids) | set(continuation_stage_ids)
-        return tuple(stage_id for stage_id in self._topological_stage_ids if stage_id in selected)
 
-    def _stage_soft_block_reason_locked(self, stage_id: str, request: ResourceVector) -> str | None:
-        usage_by_stage = {key: self._stage_usage_locked(key) for key in self._stages}
-        current = usage_by_stage[stage_id]
+    def _dimension_reservation_unit_ids_locked(
+        self,
+        field_name: str,
+        *,
+        requested_unit_id: str | None,
+    ) -> tuple[str, ...]:
+        """Return every resource-owning operator in the current phase.
+
+        Like Ray Data's reservation allocator, phase eligibility rather than
+        future node placement defines the reservation set. Operators may
+        temporarily receive less than one invocation's minimum; their real
+        requests can still enter Ray Core through the bounded liveness escape.
+        """
+
+        eligible = set(self._eligible_resource_unit_ids_locked())
+        selected = tuple(
+            resource_unit_id
+            for resource_unit_id in self._topological_unit_ids
+            if resource_unit_id in eligible
+            and not self._units[resource_unit_id].completed
+            and self._unit_uses_dimension(self._units[resource_unit_id].spec, field_name)
+        )
+        if requested_unit_id is not None and requested_unit_id not in selected:
+            raise RuntimeError(f"unit {requested_unit_id} requested undeclared {field_name} capacity")
+        return selected
+
+    def _unit_soft_block_reason_locked(
+        self,
+        resource_unit_id: str,
+        request: ResourceVector,
+        *,
+        ignore_object_store: bool = False,
+        excluded_waiting_block_id: str | None = None,
+    ) -> str | None:
+        """Enforce protected shares across current eligible resource units."""
+        usage_by_unit = {
+            key: self._unit_usage_locked(
+                key,
+                excluded_waiting_block_id=excluded_waiting_block_id,
+            )
+            for key in self._units
+        }
+        current = usage_by_unit[resource_unit_id]
         limits = self.allocation.resources
         for field_name in _RESOURCE_FIELDS:
+            if field_name == "object_store_bytes" and ignore_object_store:
+                continue
             amount = getattr(request, field_name)
             if amount <= 0:
                 continue
-            dimension_stage_ids = self._dimension_reservation_stage_ids_locked(
+            dimension_unit_ids = self._dimension_reservation_unit_ids_locked(
                 field_name,
-                requested_stage_id=stage_id,
+                requested_unit_id=resource_unit_id,
             )
-            if stage_id not in dimension_stage_ids:
-                raise RuntimeError(f"stage {stage_id} requested undeclared {field_name} capacity")
+            if resource_unit_id not in dimension_unit_ids:
+                raise RuntimeError(f"unit {resource_unit_id} requested undeclared {field_name} capacity")
             limit = getattr(limits, field_name)
-            minimum_by_stage = {
-                key: self._stage_dimension_commitment(self._stages[key].spec, field_name) for key in dimension_stage_ids
+            baseline_by_unit = {
+                key: self._unit_dimension_commitment(self._units[key].spec, field_name) for key in dimension_unit_ids
             }
-            minimum_total = sum(minimum_by_stage.values())
-            if minimum_total <= limit + _EPSILON:
-                bonus_pool = max(0.0, limit - minimum_total) * self.reservation_ratio
-                bonus = bonus_pool / len(dimension_stage_ids)
-                reserved_by_stage = {key: minimum + bonus for key, minimum in minimum_by_stage.items()}
+            baseline_total = sum(baseline_by_unit.values())
+            if baseline_total <= limit + _EPSILON:
+                bonus_pool = max(0.0, limit - baseline_total) * self.reservation_ratio
+                bonus = bonus_pool / len(dimension_unit_ids)
+                reserved_by_unit = {key: baseline + bonus for key, baseline in baseline_by_unit.items()}
             else:
                 reservation_pool = limit * self.reservation_ratio
-                reserved_by_stage = {
-                    key: reservation_pool * minimum / minimum_total for key, minimum in minimum_by_stage.items()
+                reserved_by_unit = {
+                    key: reservation_pool * baseline / baseline_total for key, baseline in baseline_by_unit.items()
                 }
-            maximum_by_stage = {
-                key: self._stage_dimension_maximum_locked(self._stages[key].spec, field_name)
-                for key in dimension_stage_ids
+            maximum_by_unit = {
+                key: self._unit_dimension_maximum_locked(self._units[key].spec, field_name)
+                for key in dimension_unit_ids
             }
-            reserved_by_stage = {
-                key: min(reserved, maximum_by_stage[key]) for key, reserved in reserved_by_stage.items()
-            }
+            reserved_by_unit = {key: min(reserved, maximum_by_unit[key]) for key, reserved in reserved_by_unit.items()}
             if field_name in {"heap_bytes", "object_store_bytes"}:
-                reserved_by_stage = {key: math.floor(reserved) for key, reserved in reserved_by_stage.items()}
-            reserved = reserved_by_stage[stage_id]
+                reserved_by_unit = {key: math.floor(reserved) for key, reserved in reserved_by_unit.items()}
+            reserved = reserved_by_unit[resource_unit_id]
             current_amount = getattr(current, field_name)
             if current_amount + amount <= reserved + _EPSILON:
                 continue
-            shared_pool = max(0.0, limit - sum(reserved_by_stage.values()))
+            shared_pool = max(0.0, limit - sum(reserved_by_unit.values()))
             shared_used = sum(
                 max(
                     0.0,
-                    getattr(usage_by_stage[key], field_name) - reserved_by_stage[key],
+                    getattr(usage_by_unit[key], field_name) - reserved_by_unit[key],
                 )
-                for key in dimension_stage_ids
+                for key in dimension_unit_ids
             )
             shared_need = amount - max(0.0, reserved - current_amount)
             if shared_used + shared_need > shared_pool + _EPSILON:
-                return f"stage_soft_{field_name}"
+                return f"unit_soft_{field_name}"
         return None
 
     @staticmethod
-    def _stage_dimension_commitment(spec: StageResourceSpec, field_name: str) -> int | float:
+    def _unit_uses_dimension(spec: ResourceUnitSpec, field_name: str) -> bool:
         if field_name == "object_store_bytes":
-            return int(spec.per_task.object_store_bytes) + int(spec.output_window_bytes)
+            return bool(spec.per_task.object_store_bytes or spec.target_output_block_bytes)
+        resources = spec.resident_per_actor if spec.backend == "ray_actor" else spec.per_task
+        return getattr(resources, field_name) > 0
+
+    def _unit_dimension_commitment(self, spec: ResourceUnitSpec, field_name: str) -> int | float:
+        if field_name == "object_store_bytes":
+            # Ray Data does not impose a per-task object-store hard minimum.
+            # Known inputs/outputs and the learned generator estimate are
+            # charged to runtime usage; the default per-unit reservation below
+            # supplies the protected progress share.
+            return 0
+        if spec.backend == "ray_actor":
+            return getattr(spec.resident_per_actor, field_name) * spec.actor_pool_size
         return getattr(spec.per_task, field_name)
 
-    def _stage_dimension_maximum_locked(
+    def _unit_dimension_maximum_locked(
         self,
-        spec: StageResourceSpec,
+        spec: ResourceUnitSpec,
         field_name: str,
     ) -> int | float:
-        """Cap a soft share by tasks that can coexist under every hard dimension."""
-        concurrency = self._stage_concurrency_cap(spec)
+        """Cap a soft share by concurrency and the aggregate budget dimensions."""
+        if field_name == "object_store_bytes":
+            # Output sizes are data-dependent. Match Ray Data's unbounded
+            # operator maximum and let the query-level soft budget, output
+            # backpressure, spill, and liveness escape control the dimension.
+            return self.allocation.resources.object_store_bytes
+        if spec.backend == "ray_actor" and field_name != "object_store_bytes":
+            return getattr(spec.resident_per_actor, field_name) * spec.actor_pool_size
+        concurrency = self._unit_concurrency_cap(spec)
         if spec.backend == "ray_actor":
             concurrency = spec.actor_pool_size
-        hard_bound = math.inf if concurrency is None else int(concurrency)
+        coexistence_bound = math.inf if concurrency is None else int(concurrency)
         commitment = self._task_commitment(spec)
         for resource_field in _RESOURCE_FIELDS:
             per_task = getattr(commitment, resource_field)
@@ -1631,64 +1416,52 @@ class QueryResourceManager:
                 dimension_bound = int(limit) // int(per_task)
             else:
                 dimension_bound = math.floor((float(limit) + _EPSILON) / float(per_task))
-            hard_bound = min(hard_bound, dimension_bound)
-        if math.isinf(hard_bound):
+            coexistence_bound = min(coexistence_bound, dimension_bound)
+        if math.isinf(coexistence_bound):
             return getattr(self.allocation.resources, field_name)
-        per_task_amount = self._stage_dimension_commitment(spec, field_name)
-        return per_task_amount * max(0, int(hard_bound))
+        per_task_amount = self._unit_dimension_commitment(spec, field_name)
+        return per_task_amount * max(0, int(coexistence_bound))
 
-    def _task_liveness_block_reason_locked(self, request: TaskRequest) -> str | None:
-        if self._active_liveness_task_lease_id is not None:
+    def _task_liveness_block_reason_locked(
+        self,
+        request: TaskRequest,
+        plan: _TaskAdmissionPlan,
+    ) -> str | None:
+        del plan
+        # Match Ray Data's global-idle escape: soft limits may be bypassed for
+        # one task only when no task is active anywhere in the current query.
+        if self._task_leases or self._active_liveness_task_lease_id is not None:
             return "liveness_task_active"
-        if self._task_leases and not self._external_consumer_waiting:
-            return "liveness_not_needed"
         if self._has_normal_task_candidate_locked():
             return "normal_candidate_available"
-        preferred = self._preferred_liveness_stage_locked()
-        if preferred is None:
-            return "no_liveness_candidate"
-        if preferred != str(request.stage_id):
-            return "liveness_candidate_not_selected"
+        if self._waiting_task_inputs:
+            evaluations = self._evaluate_waiting_tasks_locked(hypothetical=True)
+            selected = self._select_waiting_task_evaluation_locked(evaluations)
+            if selected is None:
+                return "no_liveness_candidate"
+            if selected.key != (str(request.task_id), str(request.attempt_id)):
+                return "liveness_candidate_not_selected"
         return None
 
     def _has_normal_task_candidate_locked(self) -> bool:
-        if self._waiting_task_inputs:
-            for waiting_request, _ in self._waiting_task_inputs.values():
-                reason, _, _ = self._normal_task_block_reason_locked(
-                    waiting_request,
-                    hypothetical=True,
-                )
-                if reason is None:
-                    return True
-            return False
-        for stage_id, stage in self._stages.items():
-            if not stage.runnable or stage.completed:
-                continue
-            request = TaskRequest(
-                query_id=self.graph.query_id,
-                stage_id=stage_id,
-                task_id=f"hypothetical:{stage_id}",
-                attempt_id="hypothetical",
-                node_id=None,
-                retained_input_bytes=stage.spec.per_task.object_store_bytes,
-            )
-            reason, _, _ = self._normal_task_block_reason_locked(
-                request,
-                hypothetical=True,
-            )
-            if reason is None:
-                return True
-        return False
+        # Liveness arbitration must consider real dispatchable work only. A
+        # structurally runnable operator can have no input bundle or descriptor
+        # at this instant; inventing a hypothetical task for it would suppress
+        # the one escape needed by the actual upstream request that can produce
+        # its next input. This matches Ray Data's dispatchable-operator check.
+        return any(
+            not item.fatal and item.reason is None for item in self._evaluate_waiting_tasks_locked(hypothetical=True)
+        )
 
     def _waiting_task_rank_locked(
         self,
         request: TaskRequest,
         registration_order: int,
     ) -> tuple[int, int, int]:
-        stage_id = str(request.stage_id)
+        resource_unit_id = str(request.resource_unit_id)
         return (
-            self._reverse_topological_rank[stage_id],
-            self._active_task_count_for_stage_locked(stage_id),
+            self._reverse_topological_rank[resource_unit_id],
+            self._active_task_count_for_unit_locked(resource_unit_id),
             int(registration_order),
         )
 
@@ -1724,16 +1497,21 @@ class QueryResourceManager:
         soft = [item for item in evaluations if not item.fatal and item.reason in _SOFT_TASK_BLOCK_REASONS]
         if not soft:
             return None
-        soft_stage_ids = {str(item.request.stage_id) for item in soft}
-        ordered_stage_ids = [stage_id for stage_id in self._reverse_topological_stage_ids if stage_id in soft_stage_ids]
-        starving_stage_ids = [
-            stage_id
-            for stage_id in ordered_stage_ids
-            if self._stages[stage_id].queued_input_bytes > 0 and self._active_task_count_for_stage_locked(stage_id) == 0
+        soft_unit_ids = {str(item.request.resource_unit_id) for item in soft}
+        ordered_unit_ids = [
+            resource_unit_id
+            for resource_unit_id in self._reverse_topological_unit_ids
+            if resource_unit_id in soft_unit_ids
         ]
-        preferred_stage_id = (starving_stage_ids or ordered_stage_ids)[0]
+        starving_unit_ids = [
+            resource_unit_id
+            for resource_unit_id in ordered_unit_ids
+            if self._units[resource_unit_id].pending_task_count > 0
+            and self._active_task_count_for_unit_locked(resource_unit_id) == 0
+        ]
+        preferred_unit_id = (starving_unit_ids or ordered_unit_ids)[0]
         return min(
-            (item for item in soft if str(item.request.stage_id) == preferred_stage_id),
+            (item for item in soft if str(item.request.resource_unit_id) == preferred_unit_id),
             key=lambda item: item.rank,
         )
 
@@ -1741,12 +1519,13 @@ class QueryResourceManager:
         self,
         evaluations: tuple[_QueuedTaskEvaluation, ...],
     ) -> str | None:
-        if self._active_liveness_task_lease_id is not None:
-            return "liveness_task_active"
-        if self._task_leases and not self._external_consumer_waiting:
-            return "liveness_not_needed"
         if any(not item.fatal and item.reason is None for item in evaluations):
             return "normal_candidate_available"
+        selected = self._select_waiting_task_evaluation_locked(evaluations)
+        if selected is None:
+            return "no_liveness_candidate"
+        if self._task_leases or self._active_liveness_task_lease_id is not None:
+            return "liveness_task_active"
         return None
 
     def _preferred_waiting_task_locked(self) -> tuple[TaskRequest | None, str]:
@@ -1757,57 +1536,6 @@ class QueryResourceManager:
             return selected.request, grant_class
         return None, ""
 
-    def _preferred_liveness_stage_locked(self) -> str | None:
-        if self._waiting_task_inputs:
-            waiting_candidates: list[str] = []
-            for stage_id in self.graph.reverse_topological_stage_ids():
-                for request, _ in self._waiting_task_inputs.values():
-                    if str(request.stage_id) != stage_id:
-                        continue
-                    reason, fatal, _ = self._normal_task_block_reason_locked(
-                        request,
-                        hypothetical=True,
-                    )
-                    if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
-                        waiting_candidates.append(stage_id)
-                        break
-            if not waiting_candidates:
-                return None
-            starving = [
-                stage_id
-                for stage_id in waiting_candidates
-                if self._stages[stage_id].queued_input_bytes > 0
-                and self._active_task_count_for_stage_locked(stage_id) == 0
-            ]
-            return (starving or waiting_candidates)[0]
-        runnable_candidates: list[str] = []
-        for stage_id in self.graph.reverse_topological_stage_ids():
-            stage = self._stages[stage_id]
-            if not stage.runnable or stage.completed:
-                continue
-            request = TaskRequest(
-                query_id=self.graph.query_id,
-                stage_id=stage_id,
-                task_id=f"hypothetical:{stage_id}",
-                attempt_id="hypothetical",
-                node_id=None,
-                retained_input_bytes=stage.spec.per_task.object_store_bytes,
-            )
-            reason, fatal, _ = self._normal_task_block_reason_locked(
-                request,
-                hypothetical=True,
-            )
-            if not fatal and reason in _SOFT_TASK_BLOCK_REASONS:
-                runnable_candidates.append(stage_id)
-        if not runnable_candidates:
-            return None
-        starving = [
-            stage_id
-            for stage_id in runnable_candidates
-            if self._stages[stage_id].queued_input_bytes > 0 and self._active_task_count_for_stage_locked(stage_id) == 0
-        ]
-        return (starving or runnable_candidates)[0]
-
     def _grant_task_locked(
         self,
         request: TaskRequest,
@@ -1815,30 +1543,34 @@ class QueryResourceManager:
         *,
         liveness: bool,
     ) -> TaskGrant:
-        if not str(plan.node_id).strip():
-            raise RuntimeError("cannot grant a query task lease without a concrete Ray node")
-        if plan.new_credit is not None and plan.borrowed_credit_id is not None:
-            raise RuntimeError("task admission cannot create and borrow a continuation credit")
-        stage = self._stages[str(request.stage_id)].spec
+        unit = self._units[str(request.resource_unit_id)].spec
+        if unit.backend == "ray_task":
+            if plan.node_id is not None:
+                raise RuntimeError("Ray task leases must leave placement to Ray Core")
+        elif not str(plan.node_id or "").strip():
+            raise RuntimeError(f"{unit.backend} task lease requires a concrete runtime node")
+        if liveness and (self._task_leases or self._active_liveness_task_lease_id is not None):
+            raise RuntimeError("task liveness state changed during atomic admission")
+
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
-        if stage.backend == "ray_actor":
+        if unit.backend == "ray_actor":
             if actor_index is None:
                 raise RuntimeError("Ray actor task admission requires a concrete actor slot")
-            actor_slot = (stage.stage_id, int(actor_index))
-            if self._actor_slot_lease_count_locked(actor_slot) >= stage.actor_prefetch_depth:
+            actor_slot = (unit.resource_unit_id, int(actor_index))
+            if self._actor_slot_lease_count_locked(actor_slot) >= unit.actor_prefetch_depth:
                 raise RuntimeError("Ray actor prefetch slot changed during atomic task admission")
-            execution_slot_id = f"ray_actor:{stage.stage_id}:{int(actor_index)}"
+            execution_slot_id = f"ray_actor:{unit.resource_unit_id}:{int(actor_index)}"
         else:
             actor_slot = None
-            execution_slot_id = f"{stage.backend}:{stage.stage_id}:{lease_id}"
+            execution_slot_id = f"{unit.backend}:{unit.resource_unit_id}:{lease_id}"
         lease = TaskLease(
             lease_id=lease_id,
             query_id=self.graph.query_id,
-            stage_id=str(request.stage_id),
+            resource_unit_id=str(request.resource_unit_id),
             task_id=str(request.task_id),
             attempt_id=str(request.attempt_id),
-            node_id=str(plan.node_id),
+            node_id=plan.node_id,
             execution_slot_id=execution_slot_id,
             actor_index=actor_index,
             resources=plan.resources,
@@ -1853,105 +1585,33 @@ class QueryResourceManager:
                 self._active_actor_slots[actor_slot] = lease.lease_id
             else:
                 self._queued_actor_slot_leases.setdefault(actor_slot, deque()).append(lease.lease_id)
-        if plan.new_credit is not None:
-            new_credit = _ContinuationCredit(
-                credit_id=uuid.uuid4().hex,
-                parent_task_lease_id=lease.lease_id,
-                parent_stage_id=lease.stage_id,
-                eligible_stage_ids=plan.new_credit.eligible_stage_ids,
-                reservation_stage_id=plan.new_credit.reservation_stage_id,
-                node_id=plan.new_credit.node_id,
-                resources=plan.new_credit.resources,
-                allocation_generation=self.allocation.generation,
-            )
-            self._continuation_credits[new_credit.credit_id] = new_credit
-            self._continuation_credit_by_parent[lease.lease_id] = new_credit.credit_id
-        elif plan.borrowed_credit_id is not None:
-            borrowed_credit = self._continuation_credits.get(plan.borrowed_credit_id)
-            if (
-                borrowed_credit is None
-                or not borrowed_credit.parent_active
-                or borrowed_credit.borrowed_by_task_lease_id is not None
-                or lease.stage_id not in borrowed_credit.eligible_stage_ids
-                or borrowed_credit.node_id != lease.node_id
-            ):
-                raise RuntimeError("continuation credit changed during atomic task admission")
-            borrowed_credit.borrowed_by_task_lease_id = lease.lease_id
-            self._continuation_credit_by_borrower[lease.lease_id] = borrowed_credit.credit_id
         self._waiting_task_inputs.pop((lease.task_id, lease.attempt_id), None)
-        self._recompute_stage_queued_input_locked(lease.stage_id)
-        self._started_stage_ids.add(lease.stage_id)
+        self._recompute_unit_queued_input_locked(lease.resource_unit_id)
         if liveness:
             self._active_liveness_task_lease_id = lease.lease_id
             self._task_liveness_grants_total += 1
         self._publish_change_locked()
         return TaskGrant(True, lease=lease, liveness=liveness)
 
-    def _delete_continuation_credit_locked(self, credit_id: str) -> None:
-        credit = self._continuation_credits.pop(str(credit_id), None)
-        if credit is None:
-            return
-        if self._continuation_credit_by_parent.get(credit.parent_task_lease_id) == credit.credit_id:
-            self._continuation_credit_by_parent.pop(credit.parent_task_lease_id, None)
-        borrower = credit.borrowed_by_task_lease_id
-        if borrower is not None:
-            self._continuation_credit_by_borrower.pop(borrower, None)
-
     def _on_task_lease_removed_locked(self, lease: TaskLease) -> None:
-        if lease.actor_index is not None:
-            actor_slot = (lease.stage_id, int(lease.actor_index))
-            owner = self._active_actor_slots.get(actor_slot)
-            queued = self._queued_actor_slot_leases.get(actor_slot)
-            if owner == lease.lease_id:
-                if queued:
-                    self._active_actor_slots[actor_slot] = queued.popleft()
-                    if not queued:
-                        self._queued_actor_slot_leases.pop(actor_slot, None)
-                else:
-                    self._active_actor_slots.pop(actor_slot, None)
-            elif queued and lease.lease_id in queued:
-                queued.remove(lease.lease_id)
+        if lease.actor_index is None:
+            return
+        actor_slot = (lease.resource_unit_id, int(lease.actor_index))
+        owner = self._active_actor_slots.get(actor_slot)
+        queued = self._queued_actor_slot_leases.get(actor_slot)
+        if owner == lease.lease_id:
+            if queued:
+                self._active_actor_slots[actor_slot] = queued.popleft()
                 if not queued:
                     self._queued_actor_slot_leases.pop(actor_slot, None)
             else:
-                raise RuntimeError("Ray actor slot ownership index is inconsistent")
-        self._maybe_return_continuation_credit_locked(lease.lease_id)
-
-        owned_credit_id = self._continuation_credit_by_parent.pop(
-            lease.lease_id,
-            None,
-        )
-        if owned_credit_id is not None:
-            credit = self._continuation_credits.get(owned_credit_id)
-            if credit is None or credit.parent_task_lease_id != lease.lease_id:
-                raise RuntimeError("continuation parent index is inconsistent")
-            credit.parent_active = False
-            if credit.borrowed_by_task_lease_id is None:
-                self._delete_continuation_credit_locked(credit.credit_id)
-
-    def _maybe_return_continuation_credit_locked(self, task_lease_id: str) -> None:
-        task_key = str(task_lease_id)
-        borrowed_credit_id = self._continuation_credit_by_borrower.get(task_key)
-        if borrowed_credit_id is None:
-            return
-        if task_key in self._task_leases or any(
-            output.task_lease_id == task_key and output.state not in {"downstream_input", "external_consumer"}
-            for output in self._output_leases.values()
-        ):
-            return
-        # Handoff is the continuation ownership boundary.  The physical output
-        # lease remains attached to borrowed_credit_id and therefore stays in
-        # the credit's aggregate object-store accounting, but the next child
-        # task may reuse the compute/heap reservation.  Holding the borrower
-        # until physical release deadlocks whenever downstream needs more than
-        # one upstream block to form its compute batch.
-        self._continuation_credit_by_borrower.pop(task_key, None)
-        credit = self._continuation_credits.get(borrowed_credit_id)
-        if credit is None or credit.borrowed_by_task_lease_id != task_key:
-            raise RuntimeError("continuation borrower index is inconsistent")
-        credit.borrowed_by_task_lease_id = None
-        if not credit.parent_active:
-            self._delete_continuation_credit_locked(credit.credit_id)
+                self._active_actor_slots.pop(actor_slot, None)
+        elif queued and lease.lease_id in queued:
+            queued.remove(lease.lease_id)
+            if not queued:
+                self._queued_actor_slot_leases.pop(actor_slot, None)
+        else:
+            raise RuntimeError("Ray actor slot ownership index is inconsistent")
 
     def release_task_lease(self, lease_id: str, *, attempt_id: str) -> bool:
         return self._release_task_lease(lease_id, attempt_id=attempt_id, terminal=True)
@@ -1981,21 +1641,18 @@ class QueryResourceManager:
                 raise RuntimeError(f"FTE task lease is not active: {lease_key}")
             if task.attempt_id != attempt_key:
                 raise RuntimeError(f"FTE task lease attempt mismatch: lease={task.attempt_id} result={attempt_key}")
-            stage = self._stages[task.stage_id]
-            total_output_bytes = sum(int(request.size_bytes) for request in requests)
-            if total_output_bytes > task.output_window_bytes:
+            unit = self._units[task.resource_unit_id]
+            if unit.spec.backend != "ray_worker":
                 raise RuntimeError(
-                    f"FTE output bytes {total_output_bytes} exceed task window {task.output_window_bytes}: "
-                    f"query={task.query_id} stage={task.stage_id} task_lease={task.lease_id} "
-                    f"attempt={task.attempt_id}"
+                    f"atomic FTE completion requires a native fragment lease: "
+                    f"{task.resource_unit_id} uses {unit.spec.backend}"
                 )
-
             seen_blocks: set[str] = set()
             for request in requests:
                 if str(request.query_id) != task.query_id:
                     raise RuntimeError("FTE output query_id does not match its task lease")
-                if str(request.producer_stage_id) != task.stage_id:
-                    raise RuntimeError("FTE output stage_id does not match its task lease")
+                if str(request.producer_unit_id) != task.resource_unit_id:
+                    raise RuntimeError("FTE output resource_unit_id does not match its task lease")
                 if str(request.task_lease_id) != task.lease_id:
                     raise RuntimeError("FTE output task_lease_id does not match its task lease")
                 if str(request.attempt_id) != task.attempt_id:
@@ -2009,40 +1666,36 @@ class QueryResourceManager:
                 size_bytes = int(request.size_bytes)
                 if size_bytes <= 0:
                     raise RuntimeError(f"FTE output block size must be positive: {block_id}")
-                target_bytes = int(stage.spec.target_output_block_bytes)
-                if target_bytes <= 0 or size_bytes > target_bytes:
-                    raise RuntimeError(
-                        f"FTE output block {block_id} size {size_bytes} exceeds stage target {target_bytes}"
-                    )
 
             output_leases = tuple(
                 OutputBlockLease(
                     lease_id=uuid.uuid4().hex,
                     query_id=task.query_id,
-                    producer_stage_id=task.stage_id,
+                    producer_unit_id=task.resource_unit_id,
                     task_lease_id=task.lease_id,
                     attempt_id=task.attempt_id,
                     block_id=str(request.block_id),
                     node_id=task.node_id,
                     size_bytes=int(request.size_bytes),
-                    state="stage_queue",
+                    state="unit_queue",
                     liveness=False,
                     allocation_generation=self.allocation.generation,
-                    continuation_credit_id=None,
                 )
                 for request in requests
             )
+            for request in requests:
+                self._record_output_observation_locked(request)
             for output_lease in output_leases:
                 self._output_leases[output_lease.lease_id] = output_lease
                 self._output_lease_by_block[output_lease.block_id] = output_lease.lease_id
-            self._recompute_stage_queued_output_locked(task.stage_id)
+            self._recompute_unit_queued_output_locked(task.resource_unit_id)
 
             self._task_leases.pop(task.lease_id, None)
+            self._record_task_finished_locked(task)
             self._on_task_lease_removed_locked(task)
             self._active_attempt_leases.pop((task.task_id, task.attempt_id), None)
             self._terminal_attempts.add((task.task_id, task.attempt_id))
-            if self._active_liveness_task_lease_id == task.lease_id:
-                self._active_liveness_task_lease_id = None
+            self._maybe_clear_task_liveness_locked(task.lease_id)
             self._publish_change_locked()
             return output_leases
 
@@ -2053,18 +1706,35 @@ class QueryResourceManager:
             if lease is None or lease.attempt_id != str(attempt_id):
                 return False
             self._task_leases.pop(lease_key, None)
+            if terminal:
+                self._record_task_finished_locked(lease)
+            else:
+                self._generated_output_count_by_task_lease.pop(lease.lease_id, None)
             self._on_task_lease_removed_locked(lease)
             self._active_attempt_leases.pop((lease.task_id, lease.attempt_id), None)
             if terminal:
                 self._terminal_attempts.add((lease.task_id, lease.attempt_id))
-            if self._active_liveness_task_lease_id == lease_key:
-                self._active_liveness_task_lease_id = None
+            self._maybe_clear_task_liveness_locked(lease_key)
             self._publish_change_locked()
             return True
 
+    def _maybe_clear_task_liveness_locked(self, task_lease_id: str) -> None:
+        """Return the single global-idle escape when its task terminates."""
+        task_key = str(task_lease_id)
+        if self._active_liveness_task_lease_id != task_key:
+            return
+        if task_key in self._task_leases:
+            return
+        self._active_liveness_task_lease_id = None
+
     def try_acquire_output_block(self, request: OutputBlockRequest) -> OutputBlockGrant:
         with self._lock:
-            blocked_reason, fatal, delta = self._normal_output_block_reason_locked(request)
+            fatal_reason, _unit, _task, _size = self._output_request_identity_error_locked(request)
+            if fatal_reason is not None:
+                return OutputBlockGrant(False, blocked_reason=fatal_reason, fatal=True)
+            if self._record_output_observation_locked(request):
+                self._publish_change_locked()
+            blocked_reason, fatal, _ = self._normal_output_block_reason_locked(request)
             if blocked_reason is None:
                 return self._grant_output_block_locked(request, liveness=False)
             if fatal or blocked_reason not in _SOFT_OUTPUT_BLOCK_REASONS:
@@ -2073,15 +1743,11 @@ class QueryResourceManager:
                 return OutputBlockGrant(False, blocked_reason="liveness_output_active")
             if self._has_normal_output_candidate_locked():
                 return OutputBlockGrant(False, blocked_reason="normal_output_candidate_available")
-            if not self._output_consumer_starving_locked(request.producer_stage_id):
+            if not self._output_consumer_starving_locked(request.producer_unit_id):
                 return OutputBlockGrant(False, blocked_reason="output_liveness_not_needed")
-            preferred = self._preferred_output_liveness_stage_locked(request)
-            if preferred != str(request.producer_stage_id):
+            preferred = self._preferred_output_liveness_unit_locked(request)
+            if preferred != str(request.producer_unit_id):
                 return OutputBlockGrant(False, blocked_reason="liveness_output_candidate_not_selected")
-            if delta > 0:
-                usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-                if not usage_after.fits_within(self.allocation.resources):
-                    return OutputBlockGrant(False, blocked_reason="hard_object_store_bytes")
             return self._grant_output_block_locked(request, liveness=True)
 
     def try_acquire_next_queued_output_block(
@@ -2099,7 +1765,7 @@ class QueryResourceManager:
                     continue
                 rank = (
                     self._reverse_topological_rank.get(
-                        str(request.producer_stage_id),
+                        str(request.producer_unit_id),
                         len(self._reverse_topological_rank),
                     ),
                     order,
@@ -2125,104 +1791,89 @@ class QueryResourceManager:
                 return request, self._grant_output_block_locked(
                     request,
                     liveness=False,
-                    initial_state="stage_queue",
+                    initial_state="unit_queue",
                 )
             if not soft_blocked:
                 return None, None
 
-            _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
             if self._active_liveness_output_lease_id is not None:
+                _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
                 return request, OutputBlockGrant(
                     False,
                     blocked_reason="liveness_output_active",
                 )
-            if not self._output_consumer_starving_locked(request.producer_stage_id):
+            liveness_candidates = [
+                item for item in soft_blocked if self._output_consumer_starving_locked(item[1].producer_unit_id)
+            ]
+            if not liveness_candidates:
+                _, request, _, _ = min(soft_blocked, key=lambda item: item[0])
                 return request, OutputBlockGrant(
                     False,
                     blocked_reason="output_liveness_not_needed",
                 )
+            _, request, _, _ = min(liveness_candidates, key=lambda item: item[0])
             return request, self._grant_output_block_locked(
                 request,
                 liveness=True,
-                initial_state="stage_queue",
+                initial_state="unit_queue",
             )
 
     def _normal_output_block_reason_locked(
         self,
         request: OutputBlockRequest,
     ) -> tuple[str | None, bool, int]:
-        if self._cancelled:
-            return "query_cancelled", True, 0
-        if str(request.query_id) != self.graph.query_id:
-            return "query_id_mismatch", True, 0
-        stage = self._stages.get(str(request.producer_stage_id))
-        if stage is None:
-            return "stage_not_registered", True, 0
+        fatal_reason, unit, task, size = self._output_request_identity_error_locked(request)
+        if fatal_reason is not None:
+            return fatal_reason, True, 0
+        assert unit is not None and task is not None
         block_id = str(request.block_id).strip()
-        if not block_id:
-            return "invalid_block_id", True, 0
-        if block_id in self._terminal_output_blocks:
-            return "output_block_terminal", True, 0
-        task = self._task_leases.get(str(request.task_lease_id))
-        if task is None:
-            return "task_lease_not_active", True, 0
-        if task.stage_id != stage.spec.stage_id:
-            return "task_stage_mismatch", True, 0
-        if task.attempt_id != str(request.attempt_id):
-            return "task_attempt_mismatch", True, 0
-        if block_id in self._output_lease_by_block:
-            return "output_block_already_leased", True, 0
-        size = int(request.size_bytes)
-        if size <= 0:
-            return "invalid_output_block_size", True, 0
+        excluded_waiter = block_id if self._waiting_output_blocks.get(block_id) == request else None
+        # Estimated objects still buffered inside a running generator are a
+        # separate Ray Data usage category from every managed ObjectRef that
+        # has already been exposed to the executor. Pulling this block adds its
+        # exact bytes; it does not replace the pending-generator estimate.
+        delta = size
         object_limit = self.allocation.resources.object_store_bytes
-        if size > object_limit:
-            return "output_block_exceeds_query_limit", True, 0
-
-        live = self._live_output_bytes_for_task_locked(task.lease_id)
-        before = max(task.output_window_bytes, live)
-        after = max(task.output_window_bytes, live + size)
-        delta = after - before
+        usage_after = self._query_usage_locked(
+            excluded_waiting_block_id=excluded_waiter,
+        ) + ResourceVector(object_store_bytes=delta)
+        object_store_backpressure_disabled = (
+            unit.spec.resource_unit_id in self._materializing_object_store_unlimited_unit_ids_locked()
+        )
+        if not object_store_backpressure_disabled and delta > 0 and usage_after.object_store_bytes > object_limit:
+            return "query_soft_object_store_bytes", False, delta
         if delta > 0:
-            usage_after = self._query_usage_locked() + ResourceVector(object_store_bytes=delta)
-            if not usage_after.fits_within(self.allocation.resources):
-                return "hard_object_store_bytes", False, delta
-            try:
-                node_capacity = self.allocation.resources_for_node(task.node_id)
-            except KeyError:
-                return "node_not_allocated", True, delta
-            node_usage_after = self._node_usage_locked(task.node_id) + ResourceVector(object_store_bytes=delta)
-            if not node_usage_after.fits_within(node_capacity):
-                return "node_capacity", False, delta
-            soft = self._stage_soft_block_reason_locked(
-                stage.spec.stage_id,
+            soft = self._unit_soft_block_reason_locked(
+                unit.spec.resource_unit_id,
                 ResourceVector(object_store_bytes=delta),
+                ignore_object_store=object_store_backpressure_disabled,
+                excluded_waiting_block_id=excluded_waiter,
             )
             if soft is not None:
                 return soft, False, delta
         return None, False, delta
 
     def _has_normal_output_candidate_locked(self) -> bool:
-        for stage_id in self.graph.reverse_topological_stage_ids():
-            stage = self._stages[stage_id]
-            if not stage.runnable or stage.completed or stage.queued_output_bytes <= 0:
+        for resource_unit_id in self.graph.reverse_topological_unit_ids():
+            unit = self._units[resource_unit_id]
+            if not unit.runnable or unit.completed or unit.queued_output_bytes <= 0:
                 continue
             task = next(
-                (lease for lease in self._task_leases.values() if lease.stage_id == stage_id),
+                (lease for lease in self._task_leases.values() if lease.resource_unit_id == resource_unit_id),
                 None,
             )
             if task is None:
                 continue
-            target = stage.spec.target_output_block_bytes
-            size = min(stage.queued_output_bytes, target if target > 0 else stage.queued_output_bytes)
+            target = unit.spec.target_output_block_bytes
+            size = min(unit.queued_output_bytes, target if target > 0 else unit.queued_output_bytes)
             if size <= 0:
                 continue
             request = OutputBlockRequest(
                 query_id=self.graph.query_id,
-                producer_stage_id=stage_id,
+                producer_unit_id=resource_unit_id,
                 task_lease_id=task.lease_id,
                 attempt_id=task.attempt_id,
-                block_id=f"hypothetical:{stage_id}:{task.lease_id}",
+                block_id=f"hypothetical:{resource_unit_id}:{task.lease_id}",
                 size_bytes=size,
             )
             reason, _, _ = self._normal_output_block_reason_locked(request)
@@ -2230,60 +1881,69 @@ class QueryResourceManager:
                 return True
         return False
 
-    def _preferred_output_liveness_stage_locked(
+    def _preferred_output_liveness_unit_locked(
         self,
         current_request: OutputBlockRequest,
     ) -> str | None:
         candidates: list[str] = []
-        for stage_id in self.graph.reverse_topological_stage_ids():
-            stage = self._stages[stage_id]
-            if not stage.runnable or stage.completed:
+        for resource_unit_id in self.graph.reverse_topological_unit_ids():
+            unit = self._units[resource_unit_id]
+            if not unit.runnable or unit.completed:
                 continue
-            if stage_id != str(current_request.producer_stage_id) and stage.queued_output_bytes <= 0:
+            if not self._output_consumer_starving_locked(resource_unit_id):
                 continue
-            if stage_id == str(current_request.producer_stage_id):
+            if resource_unit_id != str(current_request.producer_unit_id) and unit.queued_output_bytes <= 0:
+                continue
+            if resource_unit_id == str(current_request.producer_unit_id):
                 request = current_request
             else:
                 task = next(
-                    (lease for lease in self._task_leases.values() if lease.stage_id == stage_id),
+                    (lease for lease in self._task_leases.values() if lease.resource_unit_id == resource_unit_id),
                     None,
                 )
                 if task is None:
                     continue
-                target = stage.spec.target_output_block_bytes
+                target = unit.spec.target_output_block_bytes
                 size = min(
-                    stage.queued_output_bytes,
-                    target if target > 0 else stage.queued_output_bytes,
+                    unit.queued_output_bytes,
+                    target if target > 0 else unit.queued_output_bytes,
                 )
                 if size <= 0:
                     continue
                 request = OutputBlockRequest(
                     query_id=self.graph.query_id,
-                    producer_stage_id=stage_id,
+                    producer_unit_id=resource_unit_id,
                     task_lease_id=task.lease_id,
                     attempt_id=task.attempt_id,
-                    block_id=f"hypothetical-liveness:{stage_id}:{task.lease_id}",
+                    block_id=f"hypothetical-liveness:{resource_unit_id}:{task.lease_id}",
                     size_bytes=size,
                 )
             reason, fatal, _ = self._normal_output_block_reason_locked(request)
             if not fatal and reason in _SOFT_OUTPUT_BLOCK_REASONS:
-                candidates.append(stage_id)
+                candidates.append(resource_unit_id)
         return candidates[0] if candidates else None
 
-    def _output_consumer_starving_locked(self, producer_stage_id: str) -> bool:
+    def _output_consumer_starving_locked(self, producer_unit_id: str) -> bool:
         if self._external_consumer_waiting:
             return True
+        eligible_unit_ids = set(self._eligible_resource_unit_ids_locked())
         downstream_ids = [
-            stage.stage_id for stage in self.graph.stages if str(producer_stage_id) in stage.input_stage_ids
+            unit.resource_unit_id
+            for unit in self.graph.units
+            if str(producer_unit_id) in unit.input_unit_ids
+            and unit.resource_unit_id in eligible_unit_ids
+            and not self._units[unit.resource_unit_id].completed
         ]
         if not downstream_ids:
             return False
-        # A downstream stage with a partial input bundle and no active task is
+        # A downstream unit with a partial input bundle and no active task is
         # still starving: it needs another producer block before its compute
         # batch can be admitted.  Requiring queued_input_bytes == 0 creates a
         # cross-lease deadlock when the producer's sole liveness lease is the
         # partial bundle already waiting downstream.
-        return all(self._active_task_count_for_stage_locked(stage_id) == 0 for stage_id in downstream_ids)
+        return any(
+            self._active_task_count_for_unit_locked(resource_unit_id) == 0 for resource_unit_id in downstream_ids
+        )
 
     def _grant_output_block_locked(
         self,
@@ -2295,10 +1955,11 @@ class QueryResourceManager:
         task = self._task_leases.get(str(request.task_lease_id))
         if task is None:
             raise RuntimeError("cannot grant an output block without an active task lease")
+        self._record_output_observation_locked(request)
         lease = OutputBlockLease(
             lease_id=uuid.uuid4().hex,
             query_id=self.graph.query_id,
-            producer_stage_id=str(request.producer_stage_id),
+            producer_unit_id=str(request.producer_unit_id),
             task_lease_id=str(request.task_lease_id),
             attempt_id=str(request.attempt_id),
             block_id=str(request.block_id),
@@ -2307,12 +1968,11 @@ class QueryResourceManager:
             state=str(initial_state),
             liveness=liveness,
             allocation_generation=self.allocation.generation,
-            continuation_credit_id=self._continuation_credit_by_borrower.get(task.lease_id),
         )
         self._output_leases[lease.lease_id] = lease
         self._output_lease_by_block[lease.block_id] = lease.lease_id
         self._waiting_output_blocks.pop(lease.block_id, None)
-        self._recompute_stage_queued_output_locked(lease.producer_stage_id)
+        self._recompute_unit_queued_output_locked(lease.producer_unit_id)
         if liveness:
             self._active_liveness_output_lease_id = lease.lease_id
             self._output_liveness_grants_total += 1
@@ -2334,15 +1994,14 @@ class QueryResourceManager:
                 raise ValueError(f"invalid output lease transition: {lease.state} -> {target}")
             self._output_leases[lease_key] = OutputBlockLease(**{**asdict(lease), "state": target})
             if target == "downstream_input" and self._active_liveness_output_lease_id == lease_key:
-                # The object remains physically leased and fully charged, but
-                # it no longer occupies the producer-side liveness escape.
-                # This is the ownership boundary that permits another block
-                # to complete a downstream compute batch without weakening
-                # query/node object-store hard limits.
+                # A liveness escape limits producer-side progress to one full
+                # block at a time. The handed-off object stays charged, while
+                # returning the token lets a partial downstream batch request
+                # its next block.
                 self._active_liveness_output_lease_id = None
             if target == "downstream_input":
-                self._maybe_return_continuation_credit_locked(lease.task_lease_id)
-            self._recompute_stage_queued_output_locked(lease.producer_stage_id)
+                self._maybe_clear_task_liveness_locked(lease.task_lease_id)
+            self._recompute_unit_queued_output_locked(lease.producer_unit_id)
             self._publish_change_locked()
             return True
 
@@ -2356,8 +2015,8 @@ class QueryResourceManager:
             self._terminal_output_blocks.add(lease.block_id)
             if self._active_liveness_output_lease_id == lease_key:
                 self._active_liveness_output_lease_id = None
-            self._maybe_return_continuation_credit_locked(lease.task_lease_id)
-            self._recompute_stage_queued_output_locked(lease.producer_stage_id)
+            self._maybe_clear_task_liveness_locked(lease.task_lease_id)
+            self._recompute_unit_queued_output_locked(lease.producer_unit_id)
             self._publish_change_locked()
             return True
 
@@ -2370,285 +2029,308 @@ class QueryResourceManager:
             for lease in self._task_leases.values():
                 self._terminal_attempts.add((lease.task_id, lease.attempt_id))
             self._task_leases.clear()
-            self._continuation_credits.clear()
-            self._continuation_credit_by_parent.clear()
-            self._continuation_credit_by_borrower.clear()
             self._active_attempt_leases.clear()
+            self._submitted_actor_slots.clear()
+            self._retiring_actor_unit_ids.clear()
+            self._actor_node_by_slot.clear()
             self._active_actor_slots.clear()
             self._queued_actor_slot_leases.clear()
             self._waiting_task_inputs.clear()
-            for stage_id in self._stages:
-                self._recompute_stage_queued_input_locked(stage_id)
+            for resource_unit_id in self._units:
+                self._recompute_unit_queued_input_locked(resource_unit_id)
             self._output_leases.clear()
             self._output_lease_by_block.clear()
+            self._observed_output_blocks.clear()
+            self._generated_output_count_by_task_lease.clear()
             self._waiting_output_blocks.clear()
-            for stage_id in self._stages:
-                self._recompute_stage_queued_output_locked(stage_id)
+            for resource_unit_id in self._units:
+                self._recompute_unit_queued_output_locked(resource_unit_id)
             self._active_liveness_task_lease_id = None
             self._active_liveness_output_lease_id = None
+            for unit in self._units.values():
+                if unit.spec.backend == "ray_actor":
+                    unit.actor_ready = False
             self._allocation_admission_open = False
             self._cancelled = True
             self._cancel_reason = str(reason)
             self._publish_change_locked()
             return {"task_lease_count": task_count, "output_lease_count": output_count}
 
-    def _active_task_count_for_stage_locked(self, stage_id: str) -> int:
-        return sum(1 for lease in self._task_leases.values() if lease.stage_id == stage_id)
+    def fail(self, reason: str) -> dict[str, int]:
+        """Fence terminally failed work without releasing physical ownership.
+
+        A driver-side protocol or actor failure is not proof that already
+        submitted Ray work has stopped. Keep every task, output, and actor-
+        process lease charged until ordered query teardown supplies
+        that proof; only new task/output/actor submission becomes fatal.
+        """
+
+        failure_reason = str(reason or "query_failed")
+        with self._lock:
+            counts = {
+                "task_lease_count": len(self._task_leases),
+                "output_lease_count": len(self._output_leases),
+            }
+            if self._cancelled or self._failed:
+                return counts
+            self._failed = True
+            self._failure_reason = failure_reason
+            self._allocation_admission_open = False
+            self._publish_change_locked()
+            return counts
+
+    def _active_task_count_for_unit_locked(self, resource_unit_id: str) -> int:
+        return sum(1 for lease in self._task_leases.values() if lease.resource_unit_id == resource_unit_id)
 
     def _live_output_bytes_for_task_locked(self, task_lease_id: str) -> int:
         task_key = str(task_lease_id)
-        credit_id = self._continuation_credit_by_borrower.get(task_key)
-        if credit_id is not None:
-            # A continuation credit is a shared window for sequential nested
-            # tasks in one parent fragment.  Include objects handed off by
-            # earlier borrowers so the next output grant sees the aggregate
-            # physical footprint and charges any overflow exactly once.
-            return self._live_output_bytes_for_credit_locked(credit_id)
         return sum(lease.size_bytes for lease in self._output_leases.values() if lease.task_lease_id == task_key)
 
-    def _live_output_bytes_for_credit_locked(self, credit_id: str) -> int:
-        credit_key = str(credit_id)
+    def _scoped_output_bytes_for_task_locked(
+        self,
+        task_lease_id: str,
+        *,
+        states: set[str],
+        include_waiting: bool,
+        excluded_waiting_block_id: str | None = None,
+    ) -> int:
+        task_key = str(task_lease_id)
+        leased = sum(
+            lease.size_bytes
+            for lease in self._output_leases.values()
+            if lease.task_lease_id == task_key and lease.state in states
+        )
+        if not include_waiting:
+            return leased
+        waiting = sum(
+            int(request.size_bytes)
+            for block_id, request in self._waiting_output_blocks.items()
+            if block_id != excluded_waiting_block_id and str(request.task_lease_id) == task_key
+        )
+        return leased + waiting
+
+    def _producer_output_bytes_for_task_locked(
+        self,
+        task_lease_id: str,
+        *,
+        excluded_waiting_block_id: str | None = None,
+    ) -> int:
+        return self._scoped_output_bytes_for_task_locked(
+            task_lease_id,
+            states={"generator_pending", "unit_queue"},
+            include_waiting=True,
+            excluded_waiting_block_id=excluded_waiting_block_id,
+        )
+
+    def _downstream_output_bytes_for_task_locked(self, task_lease_id: str) -> int:
+        return self._scoped_output_bytes_for_task_locked(
+            task_lease_id,
+            states={"downstream_input", "external_consumer"},
+            include_waiting=False,
+        )
+
+    def _live_output_bytes_for_unit_locked(self, resource_unit_id: str) -> int:
         return sum(
-            lease.size_bytes for lease in self._output_leases.values() if lease.continuation_credit_id == credit_key
+            lease.size_bytes for lease in self._output_leases.values() if lease.producer_unit_id == resource_unit_id
         )
 
-    def _borrowed_task_usage_locked(
+    def _task_usage_locked(
         self,
-        resources: ResourceVector,
-        output_window_bytes: int,
-        credit: _ContinuationCredit,
+        lease: TaskLease,
+        *,
+        excluded_waiting_block_id: str | None = None,
     ) -> ResourceVector:
-        live_output = self._live_output_bytes_for_credit_locked(credit.credit_id)
-        combined_commitment = _resource_with_object_store(
-            resources,
-            resources.object_store_bytes + max(int(output_window_bytes), live_output),
+        output_estimate = self._pending_output_estimate_for_lease_locked(lease)
+        producer_output = self._producer_output_bytes_for_task_locked(
+            lease.lease_id,
+            excluded_waiting_block_id=excluded_waiting_block_id,
         )
-        return _positive_difference(combined_commitment, credit.resources)
-
-    def _idle_continuation_output_excess_locked(
-        self,
-        credit: _ContinuationCredit,
-    ) -> ResourceVector:
-        live_output = self._live_output_bytes_for_credit_locked(credit.credit_id)
-        return ResourceVector(
-            object_store_bytes=max(
-                0,
-                live_output - credit.resources.object_store_bytes,
-            )
-        )
-
-    def _live_output_bytes_for_stage_locked(self, stage_id: str) -> int:
-        return sum(lease.size_bytes for lease in self._output_leases.values() if lease.producer_stage_id == stage_id)
-
-    def _task_usage_locked(self, lease: TaskLease) -> ResourceVector:
-        credit_id = self._continuation_credit_by_borrower.get(lease.lease_id)
-        if credit_id is None:
-            live_output = self._live_output_bytes_for_task_locked(lease.lease_id)
-            return _resource_with_object_store(
-                lease.resources,
-                lease.resources.object_store_bytes + max(lease.output_window_bytes, live_output),
-            )
-        credit = self._continuation_credits.get(credit_id)
-        if credit is None or credit.borrowed_by_task_lease_id != lease.lease_id:
-            raise RuntimeError("continuation credit accounting index is inconsistent")
-        return self._borrowed_task_usage_locked(
+        downstream_output = self._downstream_output_bytes_for_task_locked(lease.lease_id)
+        return _resource_with_object_store(
             lease.resources,
-            lease.output_window_bytes,
-            credit,
+            lease.resources.object_store_bytes + downstream_output + producer_output + output_estimate,
         )
 
     def _uncovered_inactive_output_bytes_locked(
         self,
         active_task_ids: set[str],
         *,
-        node_id: str | None = None,
-        stage_id: str | None = None,
+        resource_unit_id: str | None = None,
     ) -> int:
-        if stage_id is not None:
-            uncovered = sum(
-                output.size_bytes
-                for output in self._output_leases.values()
-                if output.producer_stage_id == stage_id
-                and (
-                    output.continuation_credit_id is None
-                    or output.continuation_credit_id not in self._continuation_credits
-                )
-                and output.task_lease_id not in active_task_ids
-            )
-            return uncovered + self._continuation_output_excess_by_stage_locked().get(
-                stage_id,
-                0,
-            )
-        uncovered = 0
-        outputs_by_idle_credit: dict[str, int] = {}
-        for output in self._output_leases.values():
-            if node_id is not None and output.node_id != node_id:
-                continue
-            credit_id = output.continuation_credit_id
-            credit = self._continuation_credits.get(credit_id or "")
-            if credit is not None:
-                borrower = credit.borrowed_by_task_lease_id
-                if borrower is not None and borrower in self._task_leases:
-                    # The active borrower's task usage accounts the aggregate
-                    # output bytes for this credit, including prior borrowers.
-                    continue
-                outputs_by_idle_credit[credit.credit_id] = (
-                    outputs_by_idle_credit.get(credit.credit_id, 0) + output.size_bytes
-                )
-                continue
-            if output.task_lease_id not in active_task_ids:
-                uncovered += output.size_bytes
-        for credit_id, output_bytes in outputs_by_idle_credit.items():
-            credit = self._continuation_credits.get(credit_id)
-            if credit is None:
-                uncovered += output_bytes
-            else:
-                uncovered += max(0, output_bytes - credit.resources.object_store_bytes)
-        return uncovered
-
-    def _continuation_output_excess_by_stage_locked(self) -> dict[str, int]:
-        outputs_by_credit_and_stage: dict[str, dict[str, int]] = {}
-        for output in self._output_leases.values():
-            credit_id = output.continuation_credit_id
-            if credit_id is None or credit_id not in self._continuation_credits:
-                continue
-            credit = self._continuation_credits[credit_id]
-            borrower = credit.borrowed_by_task_lease_id
-            if borrower is not None and borrower in self._task_leases:
-                # Active borrower usage owns retained input plus aggregate
-                # outputs. Attribute that exact delta to the borrower stage;
-                # only idle-credit overflow needs cross-stage distribution.
-                continue
-            by_stage = outputs_by_credit_and_stage.setdefault(credit_id, {})
-            by_stage[output.producer_stage_id] = by_stage.get(output.producer_stage_id, 0) + output.size_bytes
-
-        topological_rank = {stage_id: index for index, stage_id in enumerate(self._topological_stage_ids)}
-        excess_by_stage: dict[str, int] = {}
-        for credit_id, bytes_by_stage in outputs_by_credit_and_stage.items():
-            credit = self._continuation_credits[credit_id]
-            remaining_covered = int(credit.resources.object_store_bytes)
-            for stage_id in sorted(
-                bytes_by_stage,
-                key=lambda key: (topological_rank.get(key, len(topological_rank)), key),
-            ):
-                output_bytes = bytes_by_stage[stage_id]
-                covered = min(output_bytes, remaining_covered)
-                remaining_covered -= covered
-                excess = output_bytes - covered
-                if excess > 0:
-                    excess_by_stage[stage_id] = excess_by_stage.get(stage_id, 0) + excess
-        return excess_by_stage
-
-    def _query_usage_locked(self) -> ResourceVector:
-        total = self._actor_resident_usage_locked()
-        active_task_ids = set(self._task_leases)
-        for credit in self._continuation_credits.values():
-            total = total + credit.resources
-        for lease in self._task_leases.values():
-            total = total + self._task_usage_locked(lease)
-        total = total + ResourceVector(object_store_bytes=self._uncovered_inactive_output_bytes_locked(active_task_ids))
-        return total
-
-    def _node_usage_locked(self, node_id: str) -> ResourceVector:
-        node_key = str(node_id)
-        total = self._actor_resident_usage_locked(node_id=node_key)
-        active_task_ids: set[str] = set()
-        for credit in self._continuation_credits.values():
-            if credit.node_id == node_key:
-                total = total + credit.resources
-        for lease in self._task_leases.values():
-            if lease.node_id != node_key:
-                continue
-            active_task_ids.add(lease.lease_id)
-            total = total + self._task_usage_locked(lease)
-        total = total + ResourceVector(
-            object_store_bytes=self._uncovered_inactive_output_bytes_locked(
-                active_task_ids,
-                node_id=node_key,
-            )
+        return sum(
+            output.size_bytes
+            for output in self._output_leases.values()
+            if output.task_lease_id not in active_task_ids
+            and (resource_unit_id is None or output.producer_unit_id == resource_unit_id)
         )
-        return total
 
-    def _stage_usage_locked(self, stage_id: str) -> ResourceVector:
-        total = self._actor_resident_usage_locked(stage_id=stage_id)
-        active_task_ids: set[str] = set()
-        for credit in self._continuation_credits.values():
-            if credit.reservation_stage_id == stage_id:
-                total = total + credit.resources
+    def _query_usage_locked(
+        self,
+        *,
+        excluded_waiting_block_id: str | None = None,
+    ) -> ResourceVector:
+        total = ResourceVector()
+        active_task_ids = set(self._task_leases)
         for lease in self._task_leases.values():
-            if lease.stage_id != stage_id:
+            total = total + self._task_usage_locked(
+                lease,
+                excluded_waiting_block_id=excluded_waiting_block_id,
+            )
+        return total + ResourceVector(object_store_bytes=self._uncovered_inactive_output_bytes_locked(active_task_ids))
+
+    def _soft_allocation_usage_locked(self) -> ResourceVector:
+        return self._query_usage_locked() + self._actor_resident_usage_locked()
+
+    def _update_soft_allocation_warning_locked(
+        self,
+        debt: ResourceVector,
+        *,
+        now: float,
+    ) -> None:
+        if debt.is_zero():
+            self._soft_allocation_debt_since = None
+            return
+        if self._soft_allocation_debt_since is None:
+            self._soft_allocation_debt_since = now
+            return
+        if self._soft_allocation_warning_emitted:
+            return
+        duration = max(0.0, now - self._soft_allocation_debt_since)
+        if duration < _SOFT_RESERVATION_WARNING_DELAY_S:
+            return
+        self._soft_allocation_warning_emitted = True
+        logger.warning(
+            "Ray query %s has exceeded its soft resource reservation for %.1fs "
+            "(debt=%s, allocation=%s). Existing work and fixed actor pools may "
+            "continue, but new work can be backpressured or remain pending in "
+            "Ray Core. Persistent CPU/GPU/heap debt usually requires more "
+            "cluster resources or lower UDF concurrency; object-store debt may "
+            "spill and reduce throughput.",
+            self.graph.query_id,
+            duration,
+            debt.to_dict(),
+            self.allocation.resources.to_dict(),
+        )
+
+    def _unit_usage_locked(
+        self,
+        resource_unit_id: str,
+        *,
+        excluded_waiting_block_id: str | None = None,
+    ) -> ResourceVector:
+        total = ResourceVector()
+        active_task_ids: set[str] = set()
+        for lease in self._task_leases.values():
+            if lease.resource_unit_id != resource_unit_id:
                 continue
             active_task_ids.add(lease.lease_id)
-            task_usage = self._task_usage_locked(lease)
+            task_usage = self._task_usage_locked(
+                lease,
+                excluded_waiting_block_id=excluded_waiting_block_id,
+            )
             total = total + task_usage
         total = total + ResourceVector(
             object_store_bytes=self._uncovered_inactive_output_bytes_locked(
                 active_task_ids,
-                stage_id=stage_id,
+                resource_unit_id=resource_unit_id,
             )
         )
+        if self._units[resource_unit_id].spec.backend == "ray_actor":
+            total = total + self._actor_resident_usage_locked(
+                resource_unit_id=resource_unit_id,
+            )
         return total
 
     def _actor_resident_usage_locked(
         self,
         *,
         node_id: str | None = None,
-        stage_id: str | None = None,
+        resource_unit_id: str | None = None,
     ) -> ResourceVector:
         total = ResourceVector()
-        for placement in self.allocation.actor_placements:
-            if node_id is not None and placement.node_id != node_id:
+        for candidate_unit_id, actor_index in self._submitted_actor_slots:
+            actor_node_id = self._actor_node_by_slot.get((candidate_unit_id, actor_index))
+            if node_id is not None and actor_node_id != node_id:
                 continue
-            if stage_id is not None and placement.stage_id != stage_id:
+            if resource_unit_id is not None and candidate_unit_id != resource_unit_id:
                 continue
-            stage = self._stages.get(placement.stage_id)
-            if stage is None:
-                raise RuntimeError("actor placement references an unknown query stage")
-            total = total + stage.spec.resident_per_actor
+            unit = self._units.get(candidate_unit_id)
+            if unit is None:
+                raise RuntimeError("submitted actor slot references an unknown query unit")
+            total = total + unit.spec.resident_per_actor
         return total
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             usage = self._query_usage_locked()
-            preferred_task, grant_class = self._preferred_waiting_task_locked()
-            allocation_by_node = {item.node_id: item.resources for item in self.allocation.node_allocations}
-            reservation_source_stage_ids = {lease.stage_id for lease in self._task_leases.values()} | {
-                str(request.stage_id) for request, _ in self._waiting_task_inputs.values()
-            }
-            downstream_reservations: dict[str, tuple[_DownstreamReservation, ...]] = {}
-            for stage_id in self._topological_stage_ids:
-                stage = self._stages[stage_id]
-                if stage_id not in reservation_source_stage_ids or stage.completed:
-                    continue
-                reservations = self._downstream_reservations_locked(stage.spec)
-                if reservations:
-                    downstream_reservations[stage_id] = reservations
-            node_ids = sorted(
-                set(allocation_by_node)
-                | {lease.node_id for lease in self._task_leases.values()}
-                | {lease.node_id for lease in self._output_leases.values()}
-                | {credit.node_id for credit in self._continuation_credits.values()}
+            soft_allocation_usage = self._soft_allocation_usage_locked()
+            soft_allocation_debt = _positive_difference(
+                soft_allocation_usage,
+                self.allocation.resources,
             )
-            node_usage = {node_id: self._node_usage_locked(node_id) for node_id in node_ids}
+            now = time.monotonic()
+            self._update_soft_allocation_warning_locked(
+                soft_allocation_debt,
+                now=now,
+            )
+            frontier_barriers = self._frontier_materialization_barriers_locked()
+            eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+            object_store_unlimited_unit_ids = self._materializing_object_store_unlimited_unit_ids_locked()
+            preferred_task, grant_class = self._preferred_waiting_task_locked()
+            actor_resident_usage_by_node = {
+                node_id: self._actor_resident_usage_locked(node_id=node_id)
+                for node_id in sorted(set(self._actor_node_by_slot.values()))
+            }
+            submitted_actor_slots = set(self._submitted_actor_slots)
+            ready_actor_slots = set(self._actor_node_by_slot)
             return {
                 "query_id": self.graph.query_id,
                 "graph": self.graph.to_dict(),
                 "allocation": self.allocation.to_dict(),
+                "ray_core_owns_placement": True,
                 "usage": usage.to_dict(),
-                "allocation_debt": _positive_difference(usage, self.allocation.resources).to_dict(),
+                "soft_allocation_usage": soft_allocation_usage.to_dict(),
+                "actor_process_usage": self._actor_resident_usage_locked().to_dict(),
+                "actor_process_usage_by_ready_node": {
+                    node_id: resources.to_dict() for node_id, resources in actor_resident_usage_by_node.items()
+                },
+                "submitted_actor_slots": [
+                    f"{resource_unit_id}:{actor_index}"
+                    for resource_unit_id, actor_index in sorted(submitted_actor_slots)
+                ],
+                "pending_actor_slots": [
+                    f"{resource_unit_id}:{actor_index}"
+                    for resource_unit_id, actor_index in sorted(submitted_actor_slots - ready_actor_slots)
+                ],
+                "ready_actor_slots": {
+                    f"{resource_unit_id}:{actor_index}": node_id
+                    for (resource_unit_id, actor_index), node_id in sorted(self._actor_node_by_slot.items())
+                },
+                "retiring_actor_unit_ids": sorted(self._retiring_actor_unit_ids),
+                "soft_allocation_debt": soft_allocation_debt.to_dict(),
+                "soft_allocation_debt_duration_s": (
+                    0.0
+                    if self._soft_allocation_debt_since is None
+                    else max(0.0, now - self._soft_allocation_debt_since)
+                ),
+                "soft_allocation_warning_emitted": self._soft_allocation_warning_emitted,
+                "soft_object_store_debt_bytes": max(
+                    0,
+                    soft_allocation_usage.object_store_bytes - self.allocation.resources.object_store_bytes,
+                ),
                 "allocation_admission_open": self._allocation_admission_open,
                 "admission_epoch": int(self._admission_epoch),
-                "node_usage": {node_id: resources.to_dict() for node_id, resources in node_usage.items()},
-                "node_allocation_debt": {
-                    node_id: _positive_difference(
-                        resources,
-                        allocation_by_node.get(node_id, ResourceVector()),
-                    ).to_dict()
-                    for node_id, resources in node_usage.items()
-                },
                 "reservation_ratio": self.reservation_ratio,
+                "execution_phase": {
+                    "frontier_barrier_ids": [barrier.barrier_id for barrier in frontier_barriers],
+                    "eligible_resource_unit_ids": list(eligible_unit_ids),
+                    "completed_barrier_ids": sorted(self._completed_materialization_barrier_ids),
+                    "object_store_unlimited_unit_ids": list(object_store_unlimited_unit_ids),
+                },
                 "cancelled": self._cancelled,
                 "cancel_reason": self._cancel_reason,
+                "failed": self._failed,
+                "failure_reason": self._failure_reason,
                 "external_consumer_waiting": self._external_consumer_waiting,
                 "liveness": {
                     "active_task_lease_id": self._active_liveness_task_lease_id,
@@ -2663,7 +2345,7 @@ class QueryResourceManager:
                         else {
                             "task_id": str(preferred_task.task_id),
                             "attempt_id": str(preferred_task.attempt_id),
-                            "stage_id": str(preferred_task.stage_id),
+                            "resource_unit_id": str(preferred_task.resource_unit_id),
                             "grant_class": grant_class,
                         }
                     ),
@@ -2671,66 +2353,53 @@ class QueryResourceManager:
                         {
                             "task_id": str(request.task_id),
                             "attempt_id": str(request.attempt_id),
-                            "stage_id": str(request.stage_id),
+                            "resource_unit_id": str(request.resource_unit_id),
                         }
                         for request, _ in self._waiting_task_inputs.values()
                     ],
-                    "live_demand_stage_ids": {
+                    "reservation_unit_ids": {
                         field_name: list(
-                            self._dimension_live_demand_stage_ids_locked(
+                            self._dimension_reservation_unit_ids_locked(
                                 field_name,
-                                requested_stage_id=None,
+                                requested_unit_id=None,
                             )
                         )
                         for field_name in _RESOURCE_FIELDS
-                    },
-                    "continuation_stage_ids": {
-                        field_name: list(
-                            self._dimension_continuation_stage_ids_locked(
-                                field_name,
-                                live_stage_ids=self._dimension_live_demand_stage_ids_locked(
-                                    field_name,
-                                    requested_stage_id=None,
-                                ),
-                            )
-                        )
-                        for field_name in _RESOURCE_FIELDS
-                    },
-                    "reservation_stage_ids": {
-                        field_name: list(
-                            self._dimension_reservation_stage_ids_locked(
-                                field_name,
-                                requested_stage_id=None,
-                            )
-                        )
-                        for field_name in _RESOURCE_FIELDS
-                    },
-                    "downstream_reservations": {
-                        stage_id: [
-                            {
-                                "reservation_id": reservation.reservation_id,
-                                "stage_ids": list(reservation.stage_ids),
-                                "resources": reservation.resources.to_dict(),
-                                "allowed_node_ids": list(reservation.allowed_node_ids),
-                            }
-                            for reservation in reservations
-                        ]
-                        for stage_id, reservations in downstream_reservations.items()
                     },
                 },
-                "stages": {
-                    stage_id: {
-                        "runnable": stage.runnable,
-                        "actor_ready": stage.actor_ready,
-                        "queued_input_bytes": stage.queued_input_bytes,
-                        "pending_task_count": stage.pending_task_count,
-                        "queued_output_bytes": stage.queued_output_bytes,
-                        "pending_output_count": stage.pending_output_count,
-                        "completed": stage.completed,
-                        "usage": self._stage_usage_locked(stage_id).to_dict(),
-                        "active_task_count": self._active_task_count_for_stage_locked(stage_id),
+                "units": {
+                    resource_unit_id: {
+                        "runnable": unit.runnable,
+                        "actor_ready": unit.actor_ready,
+                        "queued_input_bytes": unit.queued_input_bytes,
+                        "pending_task_count": unit.pending_task_count,
+                        "queued_output_bytes": unit.queued_output_bytes,
+                        "pending_output_count": unit.pending_output_count,
+                        "bytes_task_outputs_generated": unit.bytes_task_outputs_generated,
+                        "num_task_outputs_generated": unit.num_task_outputs_generated,
+                        "num_outputs_of_finished_tasks": unit.num_outputs_of_finished_tasks,
+                        "num_tasks_finished": unit.num_tasks_finished,
+                        "average_output_block_bytes": (
+                            None
+                            if unit.num_task_outputs_generated == 0
+                            else unit.bytes_task_outputs_generated / unit.num_task_outputs_generated
+                        ),
+                        "average_output_blocks_per_finished_task": (
+                            None
+                            if unit.num_tasks_finished == 0
+                            else unit.num_outputs_of_finished_tasks / unit.num_tasks_finished
+                        ),
+                        "pending_output_estimate_per_active_task_bytes": (
+                            self._pending_output_estimate_per_task_locked(unit.spec)
+                        ),
+                        "protocol_output_window_max_bytes": unit.spec.output_window_bytes,
+                        "completed": unit.completed,
+                        "phase_eligible": resource_unit_id in eligible_unit_ids,
+                        "object_store_backpressure_disabled": (resource_unit_id in object_store_unlimited_unit_ids),
+                        "usage": self._unit_usage_locked(resource_unit_id).to_dict(),
+                        "active_task_count": self._active_task_count_for_unit_locked(resource_unit_id),
                     }
-                    for stage_id, stage in self._stages.items()
+                    for resource_unit_id, unit in self._units.items()
                 },
                 "task_leases": {
                     lease_id: {
@@ -2740,19 +2409,12 @@ class QueryResourceManager:
                     for lease_id, lease in self._task_leases.items()
                 },
                 "active_actor_slots": {
-                    f"{stage_id}:{actor_index}": lease_id
-                    for (stage_id, actor_index), lease_id in self._active_actor_slots.items()
+                    f"{resource_unit_id}:{actor_index}": lease_id
+                    for (resource_unit_id, actor_index), lease_id in self._active_actor_slots.items()
                 },
                 "queued_actor_slots": {
-                    f"{stage_id}:{actor_index}": list(lease_ids)
-                    for (stage_id, actor_index), lease_ids in self._queued_actor_slot_leases.items()
-                },
-                "continuation_credits": {
-                    credit_id: {
-                        **asdict(credit),
-                        "resources": credit.resources.to_dict(),
-                    }
-                    for credit_id, credit in self._continuation_credits.items()
+                    f"{resource_unit_id}:{actor_index}": list(lease_ids)
+                    for (resource_unit_id, actor_index), lease_ids in self._queued_actor_slot_leases.items()
                 },
                 "output_leases": {lease_id: asdict(lease) for lease_id, lease in self._output_leases.items()},
             }
@@ -2763,7 +2425,7 @@ __all__ = [
     "OutputBlockLease",
     "OutputBlockLeaseOwner",
     "OutputBlockRequest",
-    "QueryResourceManager",
+    "RayQueryResourceManager",
     "TaskGrant",
     "TaskLease",
     "TaskRequest",

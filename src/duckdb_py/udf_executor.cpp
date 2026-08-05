@@ -599,7 +599,7 @@ static unique_ptr<LazyRefDataChunk> ConvertPythonRefBundleResult(const py::handl
 		block.metadata.num_rows = PyDictIdx(meta, "num_rows");
 		block.metadata.size_bytes = PyDictIdx(meta, "size_bytes");
 		block.metadata.query_id = PyDictString(meta, "query_id");
-		block.metadata.operator_id = PyDictString(meta, "producer_stage_id");
+		block.metadata.operator_id = PyDictString(meta, "producer_unit_id");
 		block.metadata.attempt_id = PyDictString(meta, "attempt_id");
 		if (PyDictContains(meta, "slice_start") && PyDictContains(meta, "slice_end")) {
 			block.has_slice = true;
@@ -1069,7 +1069,7 @@ struct ExecutorSlot {
 	std::deque<DispatcherCommand> cmd_queue;
 
 	// One scheduling lookahead for distributed Ray task admission. Active task
-	// concurrency is owned by QueryResourceManager task leases, not this slot.
+	// concurrency is owned by RayQueryResourceManager task leases, not this slot.
 	mutex task_admission_lock;
 	bool task_admission_request_pending = false;
 	bool task_admission_available = false;

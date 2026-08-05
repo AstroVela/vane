@@ -120,7 +120,7 @@ def test_node_local_flight_host_is_not_inherited_from_query_driver(monkeypatch):
 @pytest.mark.ray_cluster_owner
 def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
     import ray
-    from ray_test_profile import ray_test_object_store_bytes
+    from ray_test_profile import ray_test_object_store_options
 
     from duckdb.runners.ray.driver import RayQueryDriverClient
 
@@ -132,7 +132,7 @@ def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
             include_dashboard=False,
             log_to_driver=False,
             num_cpus=1,
-            object_store_memory=ray_test_object_store_bytes(),
+            **ray_test_object_store_options(),
             runtime_env={
                 "env_vars": {
                     "VANE_FLIGHT_ADVERTISE_HOST": "job-driver.example.internal",

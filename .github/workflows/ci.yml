@@ -203,10 +203,6 @@ jobs:
             "$GITHUB_WORKSPACE/tests/typing/ai_embed.py"
 
       - name: Verify the base installation Quickstart outside the checkout
-        env:
-          # Keep this distributed smoke test within a standard 16 GB runner.
-          VANE_FTE_TASK_HEAP_BYTES: "1073741824"
-          VANE_UDF_TASK_HEAP_BYTES: "1073741824"
         run: |
           cd "$RUNNER_TEMP"
           env -u VANE_RUNNER python "$GITHUB_WORKSPACE/scripts/verify_base_install.py"
@@ -329,17 +325,6 @@ jobs:
         env:
           FAST_TEST_PHASE: ${{ matrix.phase }}
         run: |
-          if [[ "$FAST_TEST_PHASE" != "non-ray" ]]; then
-            # A public ubuntu-24.04 runner has 16 GiB RAM and no GPU. Keep the
-            # Ray test topology below that physical limit while retaining the
-            # 2 GiB object store required by representative FTE plans. The
-            # tiny UDF fixtures keep multiple actor pools resident, so they do
-            # not need the production profile's 4 GiB heap per actor.
-            export VANE_TEST_RAY_OBJECT_STORE_BYTES=2147483648
-            export VANE_FTE_TASK_HEAP_BYTES=1073741824
-            export VANE_UDF_TASK_HEAP_BYTES=1073741824
-            export VANE_UDF_ACTOR_HEAP_BYTES=536870912
-          fi
           if [[ "$FAST_TEST_PHASE" == "owner-ray" ]]; then
             # This runner is dedicated to one shard, so Ray daemon cleanup can
             # happen outside pytest without risking an unrelated local cluster.

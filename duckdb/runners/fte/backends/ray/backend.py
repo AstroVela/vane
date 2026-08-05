@@ -247,6 +247,12 @@ class RayWorkerManagerBackend:
         for handle in self._adapt_handles(raw_handles or []):
             self._handles_by_query[str(query_id)].append(handle)
 
+    def materialization_barrier_completed(self, query_id: str, node_id: str) -> None:
+        _required_method(self._coordinator, "materialization_barrier_completed")(
+            str(query_id),
+            str(node_id),
+        )
+
     def fte_query_status(
         self,
         query_id: str,

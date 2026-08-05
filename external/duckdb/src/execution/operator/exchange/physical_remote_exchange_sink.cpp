@@ -340,7 +340,7 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	}
 	const auto &flight_config = flight_manager->config();
 	vector<string> local_dirs(flight_config.local_dirs.begin(), flight_config.local_dirs.end());
-	serializer.WriteProperty(103, "shuffle_stage_id", exchange_id_);
+	serializer.WriteProperty(103, "exchange_id", exchange_id_);
 	serializer.WriteProperty(104, "node_id", flight_config.node_id);
 	serializer.WriteProperty(105, "num_partitions", num_partitions_);
 	serializer.WriteProperty(106, "repartition_type", static_cast<uint8_t>(repartition_type_));

@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 import duckdb
 
@@ -31,17 +31,16 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     _stop_fte_status_watchers,
     ensure_fte_fragment_progress_topology,
 )
-from duckdb.runners.ray.query_execution_graph import (
-    NodeResourceAllocation,
+from duckdb.runners.ray.query_resource_graph import (
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
-from duckdb.runners.ray.query_graph_builder import fte_stage_id_for_fragment
+from duckdb.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
-    register_query_graph,
+    register_query_resource_graph,
 )
 from duckdb.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
 
@@ -65,7 +64,6 @@ class _ControlFaultRayWorkerActorHandle(RayWorkerActorHandle):
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -199,7 +197,7 @@ class _RayFteTask:
             "query_id": query_id,
             "node_id": node_id,
             "resource_query_id": query_id,
-            "resource_stage_id": fte_stage_id_for_fragment(query_id, fragment_id),
+            "resource_unit_id": native_fragment_unit_id_for_fragment(query_id, fragment_id),
         }
 
     def task_context(self):
@@ -243,7 +241,7 @@ class _NativeDynamicScanTask:
             "query_id": self.query_id,
             "node_id": self.fragment_node_id,
             "resource_query_id": self.query_id,
-            "resource_stage_id": fte_stage_id_for_fragment(self.query_id, fragment_id),
+            "resource_unit_id": native_fragment_unit_id_for_fragment(self.query_id, fragment_id),
         }
 
     def task_context(self):
@@ -290,17 +288,16 @@ def _register_fault_query(tasks) -> None:
         raise ValueError("fault query tasks must share one query_id")
     query_id = query_ids.pop()
     fragment_ids = sorted({f"{query_id}:node:{task.context()['node_id']}" for task in tasks})
-    heap_bytes = 64 * 1024 * 1024
     target_output_block_bytes = 1024 * 1024
-    stages = tuple(
-        StageResourceSpec(
+    units = tuple(
+        ResourceUnitSpec(
             query_id=query_id,
-            stage_id=fte_stage_id_for_fragment(query_id, fragment_id),
-            physical_node_id=f"node:{fragment_id.rsplit(':node:', 1)[1]}:fte",
-            stage_kind="fte",
+            resource_unit_id=native_fragment_unit_id_for_fragment(query_id, fragment_id),
+            physical_node_id=f"node:{fragment_id.rsplit(':node:', 1)[1]}:native-fragment",
+            unit_kind="native_fragment",
             backend="ray_worker",
-            input_stage_ids=(),
-            per_task=ResourceVector(cpu=1, heap_bytes=heap_bytes),
+            input_unit_ids=(),
+            per_task=ResourceVector(),
             target_output_block_bytes=target_output_block_bytes,
             generator_buffer_blocks=1,
             max_concurrency=max(1, len(tasks)),
@@ -309,30 +306,23 @@ def _register_fault_query(tasks) -> None:
     )
     allocation_resources = ResourceVector(
         cpu=max(1, len(tasks)),
-        heap_bytes=max(1, len(tasks)) * heap_bytes,
+        heap_bytes=max(1, len(tasks)) * 64 * 1024 * 1024,
         object_store_bytes=max(1, len(tasks)) * target_output_block_bytes,
     )
-    manager = register_query_graph(
-        QueryExecutionGraph(
+    manager = register_query_resource_graph(
+        QueryResourceGraph(
             query_id=query_id,
             plan_digest=f"sha256:fault:{query_id}",
-            stages=stages,
-            terminal_stage_ids=tuple(stage.stage_id for stage in stages),
+            units=units,
+            terminal_unit_ids=tuple(unit.resource_unit_id for unit in units),
         ),
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id=str(ray.get_runtime_context().get_node_id()),
-                    resources=allocation_resources,
-                ),
-            ),
-            actor_placements=(),
             generation=1,
         ),
     )
-    for stage in stages:
-        manager.update_stage_state(stage.stage_id, runnable=True)
+    for unit in units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=True)
 
 
 def _init_ray_for_fault_test(monkeypatch) -> None:
@@ -378,11 +368,19 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
     # during session finalization, before its JUnit report is written.
     cluster = Cluster(shutdown_at_exit=False)
     try:
+        from ray._private.resource_and_label_spec import ResourceAndLabelSpec
+
+        resources = ResourceAndLabelSpec().resolve(is_head=True)
+        object_store_options = ray_test_object_store_options()
+        object_store_options.setdefault(
+            "object_store_memory",
+            resources.object_store_memory,
+        )
         cluster.add_node(
             include_dashboard=False,
             num_cpus=int(os.environ.get("VANE_TEST_RAY_NUM_CPUS", "4")),
             num_gpus=0,
-            object_store_memory=ray_test_object_store_bytes(),
+            **object_store_options,
         )
         ray.init(
             address=cluster.address,
@@ -535,7 +533,7 @@ def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
         _clear_fte_state()
 
 
-def test_real_ray_actor_kill_without_replacement_fails_fte_stage(monkeypatch):
+def test_real_ray_actor_kill_without_replacement_fails_fte_fragment_execution(monkeypatch):
     monkeypatch.setenv("VANE_FTE_STATUS_WAIT_TIMEOUT_S", "5")
     monkeypatch.setenv("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0")
     _init_ray_for_fault_test(monkeypatch)

@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import threading
+    from collections import deque
+    from collections.abc import Callable
 
 from duckdb.execution.udf_ray_actor_state import (
     format_stateful_actor_loss as _format_stateful_actor_loss,
@@ -11,9 +16,25 @@ from duckdb.execution.udf_ray_actor_state import (
 
 
 class RemoteUDFActorReadinessMixin:
+    if TYPE_CHECKING:
+        _actor_init_errors: dict[int, BaseException | str]
+        _actor_node_ids: list[str]
+        _actors_obj: Any
+        _pending_ready_refs: dict[Any, int]
+        _ready_actor_indices: list[int]
+        _ready_actor_set: set[int]
+        _ready_probe_refs: deque[Any]
+        _ready_probe_ref_set: set[Any]
+        _ready_refs_cv: threading.Condition
+        _resolve_object_ref: Callable[[Any], Any]
+        actors: list[Any]
+        error_context: Callable[[], dict[str, Any] | None]
+
     def _mark_actor_ready(self, actor_idx: int) -> None:
         if actor_idx in self._ready_actor_set:
             return
+        if actor_idx >= len(self._actor_node_ids) or not self._actor_node_ids[actor_idx]:
+            raise RuntimeError(f"Ray actor {actor_idx} became ready without a runtime node identity")
         self._ready_actor_set.add(actor_idx)
         self._ready_actor_indices.append(actor_idx)
         self._actor_init_errors.pop(actor_idx, None)
@@ -118,10 +139,15 @@ class RemoteUDFActorReadinessMixin:
                 if actor_idx is not None:
                     ready_items.append((ready_ref, actor_idx))
         for ready_ref, actor_idx in ready_items:
-            if actor_idx is None:
-                continue
             try:
-                self._resolve_object_ref(ready_ref)
+                result = self._resolve_object_ref(ready_ref)
+                init_refs = self._actors_obj._init_refs
+                if actor_idx < len(init_refs) and ready_ref == init_refs[actor_idx]:
+                    node_id = str(result or "").strip()
+                    if not node_id:
+                        raise RuntimeError(f"Ray actor {actor_idx} initialization returned an empty node_id")
+                    self._actor_node_ids[actor_idx] = node_id
+                    self._actors_obj.actor_node_ids[actor_idx] = node_id
             except Exception as exc:
                 self._actor_init_errors[actor_idx] = exc
                 continue
@@ -148,19 +174,34 @@ class RemoteUDFActorReadinessMixin:
         )
 
     def _pick_ready_actor_on_node(self, node_id: str, actor_index: int) -> tuple[int, Any]:
+        self._refresh_actor_readiness()
         node_key = str(node_id).strip()
         if not node_key:
             raise RuntimeError("UDF actor invocation requires its leased Ray node_id")
         if not self._actor_node_ids:
-            raise RuntimeError("UDF actor pool is missing coordinator-confirmed node identities")
+            raise RuntimeError("UDF actor pool is missing runtime node identities")
         actor_idx = int(actor_index)
         if actor_idx < 0 or actor_idx >= len(self.actors):
             raise RuntimeError(f"UDF actor lease has invalid actor_index={actor_idx}")
+        if actor_idx not in self._ready_actor_set and actor_idx < len(self._actors_obj._init_refs):
+            # The driver only publishes a slot after this init ref resolves.
+            # Its callback and this executor's callback run independently, so
+            # close the small notification race before consuming the lease.
+            init_ref = self._actors_obj._init_refs[actor_idx]
+            future_method = getattr(init_ref, "future", None)
+            future = future_method() if callable(future_method) else None
+            if future is not None and future.done():
+                resolved_node_id = str(self._resolve_object_ref(init_ref) or "").strip()
+                self._actor_node_ids[actor_idx] = resolved_node_id
+                self._actors_obj.actor_node_ids[actor_idx] = resolved_node_id
+                self._mark_actor_ready(actor_idx)
         if self._actor_node_ids[actor_idx] != node_key:
-            raise RuntimeError(
-                "UDF actor lease slot/node mismatch: "
-                f"actor_index={actor_idx} expected_node={self._actor_node_ids[actor_idx]} leased_node={node_key}"
-            )
+            # The signed query lease is newer than this executor's immutable
+            # activation snapshot when Ray has reconstructed the actor on
+            # another node. The actor itself synchronously reconciles a stale
+            # prefetch lease before running user code.
+            self._actor_node_ids[actor_idx] = node_key
+            self._actors_obj.actor_node_ids[actor_idx] = node_key
         if actor_idx not in self._ready_actor_set:
             raise RuntimeError(f"UDF actor lease targets actor_index={actor_idx}, but that actor is not ready")
         return actor_idx, self.actors[actor_idx]

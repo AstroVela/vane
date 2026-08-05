@@ -759,7 +759,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("repr_ascii", &PyPhysicalPlanWrapper::repr_ascii)
 	    .def("repr_mermaid", &PyPhysicalPlanWrapper::repr_mermaid)
 	    .def("scan_task_descriptor_map", &PyPhysicalPlanWrapper::scan_task_descriptor_map)
-	    .def("collect_execution_stages", &PyPhysicalPlanWrapper::collect_execution_stages, py::arg("conn") = py::none())
+	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
+	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
 	    .def("collect_vllm_nodes", &PyPhysicalPlanWrapper::collect_vllm_nodes, py::arg("conn") = py::none())
 	    .def("set_udf_actor_handles", &PyPhysicalPlanWrapper::set_udf_actor_handles, py::arg("handles_map"),
@@ -2254,7 +2255,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 		    auto manifest_exists = [&](const ExchangeSinkInstanceHandle &instance, const std::string &node_id) {
 			    ShuffleCacheConfig cache_config;
-			    cache_config.shuffle_stage_id = instance.output_location;
+			    cache_config.exchange_id = instance.output_location;
 			    cache_config.node_id = node_id;
 			    cache_config.num_partitions = 1;
 			    cache_config.local_dirs = {local_dir};
@@ -2367,7 +2368,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 		    auto make_cache = [&](const std::string &output_location, const std::string &cache_node_id) {
 			    ShuffleCacheConfig cache_config;
-			    cache_config.shuffle_stage_id = output_location;
+			    cache_config.exchange_id = output_location;
 			    cache_config.node_id = cache_node_id;
 			    cache_config.num_partitions = 2;
 			    cache_config.local_dirs = {local_dir};
@@ -2443,12 +2444,12 @@ void register_ray_bindings(py::module_ &mod) {
 		    const string query_id = "query-cleanup";
 		    const string keep_query_id = "query-keep";
 		    const string node_id = "node-a";
-		    const string cleanup_stage = query_id + "_shuffle_1__sink_0__attempt_0";
-		    const string keep_stage = keep_query_id + "_shuffle_1__sink_0__attempt_0";
+		    const string cleanup_exchange = query_id + "_shuffle_1__sink_0__attempt_0";
+		    const string keep_exchange = keep_query_id + "_shuffle_1__sink_0__attempt_0";
 
-		    auto make_cache = [&](const string &stage_id) {
+		    auto make_cache = [&](const string &exchange_id) {
 			    ShuffleCacheConfig config;
-			    config.shuffle_stage_id = stage_id;
+			    config.exchange_id = exchange_id;
 			    config.node_id = node_id;
 			    config.num_partitions = 1;
 			    config.local_dirs = {local_dir};
@@ -2459,14 +2460,14 @@ void register_ray_bindings(py::module_ &mod) {
 		    ShuffleCacheRegistry::Instance().RemoveAndCleanupByPrefix(keep_query_id + "_");
 
 		    duckdb::LocalFileSystem fs;
-		    auto cleanup_node_dir = local_dir + "/shuffle_" + cleanup_stage + "/node_" + node_id;
+		    auto cleanup_node_dir = local_dir + "/shuffle_" + cleanup_exchange + "/node_" + node_id;
 		    auto cleanup_partition_dir = cleanup_node_dir + "/partition_0";
 		    fs.CreateDirectoriesRecursive(cleanup_partition_dir);
 		    {
 			    std::ofstream file(cleanup_partition_dir + "/batch.arrow", std::ios::out | std::ios::binary);
 			    file << "data";
 		    }
-		    auto keep_node_dir = local_dir + "/shuffle_" + keep_stage + "/node_" + node_id;
+		    auto keep_node_dir = local_dir + "/shuffle_" + keep_exchange + "/node_" + node_id;
 		    auto keep_partition_dir = keep_node_dir + "/partition_0";
 		    fs.CreateDirectoriesRecursive(keep_partition_dir);
 		    {
@@ -2474,15 +2475,16 @@ void register_ray_bindings(py::module_ &mod) {
 			    file << "keep";
 		    }
 
-		    auto cleanup_cache = make_cache(cleanup_stage);
-		    auto keep_cache = make_cache(keep_stage);
-		    auto cleanup_register = ShuffleCacheRegistry::Instance().Register(cleanup_stage, cleanup_cache, query_id);
-		    auto keep_register = ShuffleCacheRegistry::Instance().Register(keep_stage, keep_cache, keep_query_id);
+		    auto cleanup_cache = make_cache(cleanup_exchange);
+		    auto keep_cache = make_cache(keep_exchange);
+		    auto cleanup_register =
+		        ShuffleCacheRegistry::Instance().Register(cleanup_exchange, cleanup_cache, query_id);
+		    auto keep_register = ShuffleCacheRegistry::Instance().Register(keep_exchange, keep_cache, keep_query_id);
 		    if (cleanup_register.is_err() || keep_register.is_err()) {
 			    throw std::runtime_error("failed to register query cleanup test caches");
 		    }
-		    ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(cleanup_stage);
-		    auto cleanup_registry_after_defer = ShuffleCacheRegistry::Instance().Get(cleanup_stage) != nullptr;
+		    ShuffleCacheRegistry::Instance().RemoveForDeferredCleanup(cleanup_exchange);
+		    auto cleanup_registry_after_defer = ShuffleCacheRegistry::Instance().Get(cleanup_exchange) != nullptr;
 
 		    auto cleanup_result = ShuffleCacheRegistry::Instance().RemoveAndCleanupByPrefix(query_id + "_");
 		    py::dict out;
@@ -2490,8 +2492,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["storage_entries_removed"] = cleanup_result.storage_entries_removed;
 		    out["cleanup_errors"] = cleanup_result.cleanup_errors;
 		    out["cleanup_registry_after_defer"] = cleanup_registry_after_defer;
-		    out["cleanup_registry_after"] = ShuffleCacheRegistry::Instance().Get(cleanup_stage) != nullptr;
-		    out["keep_registry_after"] = ShuffleCacheRegistry::Instance().Get(keep_stage) != nullptr;
+		    out["cleanup_registry_after"] = ShuffleCacheRegistry::Instance().Get(cleanup_exchange) != nullptr;
+		    out["keep_registry_after"] = ShuffleCacheRegistry::Instance().Get(keep_exchange) != nullptr;
 		    out["cleanup_node_dir_exists_after"] = fs.DirectoryExists(cleanup_node_dir);
 		    out["keep_node_dir_exists_after"] = fs.DirectoryExists(keep_node_dir);
 
@@ -2505,7 +2507,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    [](const std::string &local_dir) {
 		    using namespace duckdb::distributed;
 		    ShuffleCacheConfig config;
-		    config.shuffle_stage_id = "shuffle_cache_manifest_test__sink_3__attempt_2";
+		    config.exchange_id = "shuffle_cache_manifest_test__sink_3__attempt_2";
 		    config.node_id = "node-a";
 		    config.num_partitions = 2;
 		    config.local_dirs = {local_dir};
@@ -2550,7 +2552,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    vector<string> names = {"value"};
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = "shuffle_cache_manifest_recovery_test__sink_0__attempt_1";
+		    write_config.exchange_id = "shuffle_cache_manifest_recovery_test__sink_0__attempt_1";
 		    write_config.node_id = "node-a";
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -2585,18 +2587,18 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
 		    auto register_res = ShuffleCacheRegistry::Instance().Register(
-		        write_config.shuffle_stage_id, reader, "shuffle-cache-manifest-recovery-query", "", 1);
+		        write_config.exchange_id, reader, "shuffle-cache-manifest-recovery-query", "", 1);
 		    if (register_res.is_err()) {
 			    throw std::runtime_error(register_res.error().what());
 		    }
-		    ScopedShuffleCacheRegistrationForTest registration(write_config.shuffle_stage_id);
+		    ScopedShuffleCacheRegistrationForTest registration(write_config.exchange_id);
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = write_config.node_id;
 		    ExchangeSourceHandle handle;
 		    handle.partition_id = 1;
 		    handle.attempt_id = 1;
 		    handle.node_id = write_config.node_id;
-		    handle.files.push_back(ExchangeSourceFile(write_config.shuffle_stage_id, 0));
+		    handle.files.push_back(ExchangeSourceFile(write_config.exchange_id, 0));
 		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
 
 		    py::dict out;
@@ -2622,7 +2624,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    vector<string> names = {"value"};
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = "shuffle_cache_uncommitted_invisible_test__sink_0__attempt_1";
+		    write_config.exchange_id = "shuffle_cache_uncommitted_invisible_test__sink_0__attempt_1";
 		    write_config.node_id = "node-a";
 		    write_config.num_partitions = 1;
 		    write_config.local_dirs = {local_dir};
@@ -2678,7 +2680,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    vector<LogicalType> types = {LogicalType::INTEGER};
 		    vector<string> names = {"value"};
 		    ShuffleCacheConfig config;
-		    config.shuffle_stage_id = "shuffle_cache_duckdb_fs_storage_test__sink_0__attempt_1";
+		    config.exchange_id = "shuffle_cache_duckdb_fs_storage_test__sink_0__attempt_1";
 		    config.node_id = "node-a";
 		    config.num_partitions = 1;
 		    config.local_dirs = {local_dir};
@@ -2710,18 +2712,18 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw std::runtime_error(manifest_files_res.error().what());
 		    }
 		    auto register_res = ShuffleCacheRegistry::Instance().Register(
-		        config.shuffle_stage_id, reader, "shuffle-cache-duckdb-fs-storage-query", "", 1);
+		        config.exchange_id, reader, "shuffle-cache-duckdb-fs-storage-query", "", 1);
 		    if (register_res.is_err()) {
 			    throw std::runtime_error(register_res.error().what());
 		    }
-		    ScopedShuffleCacheRegistrationForTest registration(config.shuffle_stage_id);
+		    ScopedShuffleCacheRegistrationForTest registration(config.exchange_id);
 		    FlightExchangeConfig source_config;
 		    source_config.node_id = config.node_id;
 		    ExchangeSourceHandle handle;
 		    handle.partition_id = 0;
 		    handle.attempt_id = 1;
 		    handle.node_id = config.node_id;
-		    handle.files.push_back(ExchangeSourceFile(config.shuffle_stage_id, 0));
+		    handle.files.push_back(ExchangeSourceFile(config.exchange_id, 0));
 		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
 
 		    py::dict out;
@@ -2756,7 +2758,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const auto run_id = UUID::ToString(UUID::GenerateRandomUUID());
 
 		    ShuffleCacheConfig config;
-		    config.shuffle_stage_id = "shuffle_cache_duckdb_fs_minio_storage_test_" + run_id + "__sink_0__attempt_1";
+		    config.exchange_id = "shuffle_cache_duckdb_fs_minio_storage_test_" + run_id + "__sink_0__attempt_1";
 		    config.node_id = "node-a";
 		    config.num_partitions = 1;
 		    config.local_dirs = {base_uri};
@@ -2802,7 +2804,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    handle.partition_id = 0;
 		    handle.attempt_id = 1;
 		    handle.node_id = config.node_id;
-		    handle.files.push_back(ExchangeSourceFile(config.shuffle_stage_id, 0));
+		    handle.files.push_back(ExchangeSourceFile(config.exchange_id, 0));
 		    auto values = ReadIntegerExchangeSourceForTest(context, source_config, std::move(handle));
 
 		    auto cleanup_res = reader.RemoveAttemptStorage();
@@ -2812,7 +2814,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 		    py::dict out;
 		    out["base_uri"] = base_uri;
-		    out["shuffle_stage_id"] = config.shuffle_stage_id;
+		    out["exchange_id"] = config.exchange_id;
 		    out["manifest_path"] = manifest_path;
 		    out["marker_path"] = marker_path;
 		    out["committed_manifest"] = committed_manifest_before_cleanup;
@@ -2858,7 +2860,7 @@ void register_ray_bindings(py::module_ &mod) {
 
 		    auto make_config = [&](const std::string &scenario) {
 			    ShuffleCacheConfig config;
-			    config.shuffle_stage_id =
+			    config.exchange_id =
 			        "shuffle_cache_duckdb_fs_minio_fault_matrix_" + run_id + "_" + scenario + "__sink_0__attempt_1";
 			    config.node_id = node_id;
 			    config.num_partitions = 1;
@@ -2942,7 +2944,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    handle.attempt_id = 1;
 			    handle.node_id = config.node_id;
 			    ExchangeSourceFile file;
-			    file.path = config.shuffle_stage_id;
+			    file.path = config.exchange_id;
 			    file.file_size = 0;
 			    handle.files.push_back(std::move(file));
 			    std::vector<ExchangeSourceHandle> handles;
@@ -3149,7 +3151,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    auto &verify_fs = FileSystem::GetFileSystem(verify_context);
 			    auto verify_storage = MakeDuckDBFileSystemShuffleStorage(verify_fs);
 			    ShuffleCacheConfig lost_config;
-			    lost_config.shuffle_stage_id = lost_instance.output_location;
+			    lost_config.exchange_id = lost_instance.output_location;
 			    lost_config.node_id = lost_node_id;
 			    lost_config.num_partitions = 1;
 			    lost_config.local_dirs = {base_uri};
@@ -3168,7 +3170,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto lost_manifest_after_cleanup_error = lost_manifest_error_fresh();
 
 		    ShuffleCacheConfig selected_config;
-		    selected_config.shuffle_stage_id = selected_instance.output_location;
+		    selected_config.exchange_id = selected_instance.output_location;
 		    selected_config.node_id = selected_node_id;
 		    selected_config.num_partitions = 1;
 		    selected_config.local_dirs = {base_uri};
@@ -3225,7 +3227,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    py::dict out;
 		    try {
 			    ShuffleCacheConfig config;
-			    config.shuffle_stage_id = "shuffle_cache_object_storage_reject_test__sink_0__attempt_1";
+			    config.exchange_id = "shuffle_cache_object_storage_reject_test__sink_0__attempt_1";
 			    config.node_id = "node-a";
 			    config.num_partitions = 1;
 			    config.local_dirs = {"s3://bucket/shuffle"};
@@ -3254,7 +3256,7 @@ void register_ray_bindings(py::module_ &mod) {
 			    auto storage = MakeDuckDBFileSystemShuffleStorage(fs);
 
 			    ShuffleCacheConfig config;
-			    config.shuffle_stage_id = "shuffle_cache_duckdb_fs_object_accept_test__sink_0__attempt_1";
+			    config.exchange_id = "shuffle_cache_duckdb_fs_object_accept_test__sink_0__attempt_1";
 			    config.node_id = "node-a";
 			    config.num_partitions = 1;
 			    config.local_dirs = {"s3://bucket/shuffle"};
@@ -3406,7 +3408,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 
 		    ShuffleCacheConfig config;
-		    config.shuffle_stage_id = "shuffle_cache_fake_object_manifest_test__sink_0__attempt_7";
+		    config.exchange_id = "shuffle_cache_fake_object_manifest_test__sink_0__attempt_7";
 		    config.node_id = "node-a";
 		    config.num_partitions = 1;
 		    config.local_dirs = {local_dir};
@@ -3466,7 +3468,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string server_epoch = "unpublished-local-manifest-epoch";
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = node_id;
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -3561,7 +3563,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string server_epoch = "unpublished-shared-manifest-epoch";
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = writer_node_id;
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -3657,7 +3659,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const idx_t output_partition_id = 1;
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = writer_node_id;
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -3836,7 +3838,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string output_location = "remote_exchange_source_local_dirs_roundtrip_test__sink_0__attempt_1";
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = current_node_id;
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -3964,7 +3966,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string node_id = "node-a";
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = node_id;
 		    write_config.num_partitions = 2;
 		    write_config.local_dirs = {local_dir};
@@ -4045,7 +4047,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string node_id = "node-a";
 
 		    ShuffleCacheConfig write_config;
-		    write_config.shuffle_stage_id = output_location;
+		    write_config.exchange_id = output_location;
 		    write_config.node_id = node_id;
 		    write_config.num_partitions = 1;
 		    write_config.local_dirs = {local_dir};

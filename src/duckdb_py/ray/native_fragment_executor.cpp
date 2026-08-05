@@ -177,14 +177,6 @@ static std::string PipelineSnapshotName(const duckdb::PipelineProgressSnapshot &
 	return result.empty() ? "Pipeline" : result;
 }
 
-static py::list StageIdsToPyList(const duckdb::vector<duckdb::idx_t> &stage_ids) {
-	py::list out;
-	for (auto stage_id : stage_ids) {
-		out.append(py::int_(stage_id));
-	}
-	return out;
-}
-
 static py::list OperatorsToPyList(const duckdb::vector<std::string> &operators) {
 	py::list out;
 	for (const auto &op : operators) {
@@ -541,7 +533,6 @@ static py::dict BuildNativeTaskStatsDict(
 		pipeline["name"] = PipelineSnapshotName(snapshot);
 		pipeline["operators"] = OperatorsToPyList(snapshot.operators);
 		pipeline["operator_details"] = OperatorDetailsToPyList(snapshot.operator_details);
-		pipeline["stage_ids"] = StageIdsToPyList(snapshot.stage_ids);
 		pipeline["input_rows"] = py::int_(snapshot.input_rows);
 		pipeline["input_bytes"] = py::int_(snapshot.input_bytes);
 		pipeline["output_rows"] = py::int_(snapshot.output_rows);
@@ -625,7 +616,6 @@ static py::dict BuildOutputOnlyTaskStatsDict(
 	pipeline["name"] = operators ? OperatorListName(*operators) : "Result";
 	pipeline["operators"] = operators ? OperatorsToPyList(*operators) : py::list();
 	pipeline["operator_details"] = operator_details ? OperatorDetailsToPyList(*operator_details) : py::list();
-	pipeline["stage_ids"] = py::list();
 	pipeline["input_rows"] = py::int_(rows);
 	pipeline["input_bytes"] = py::int_(bytes);
 	pipeline["output_rows"] = py::int_(rows);
@@ -844,7 +834,6 @@ static py::dict BuildNativePipelineTopology(const duckdb::vector<duckdb::Pipelin
 		pipeline["pipeline_id"] = py::int_(snapshot.pipeline_index);
 		pipeline["operators"] = OperatorsToPyList(snapshot.operators);
 		pipeline["operator_details"] = OperatorDetailsToPyList(snapshot.operator_details);
-		pipeline["stage_ids"] = StageIdsToPyList(snapshot.stage_ids);
 		pipelines.append(std::move(pipeline));
 	}
 	py::dict topology;

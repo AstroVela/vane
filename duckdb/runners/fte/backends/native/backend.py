@@ -1214,7 +1214,6 @@ class _NativeFteProgressRegistry:
                     "pipeline_id": raw_pipeline["pipeline_id"],
                     "operators": raw_pipeline["operators"],
                     "operator_details": operator_details,
-                    "stage_ids": raw_pipeline["stage_ids"],
                 }
             )
         return validate_pipeline_topology({"schema": "pipeline_topology", "pipelines": pipelines})
@@ -1235,10 +1234,7 @@ class _NativeFteProgressRegistry:
                 pipelines.append(copied)
                 pipelines_by_id[pipeline_id] = copied
                 continue
-            if (
-                current_pipeline["operators"] != incoming_pipeline["operators"]
-                or current_pipeline["stage_ids"] != incoming_pipeline["stage_ids"]
-            ):
+            if current_pipeline["operators"] != incoming_pipeline["operators"]:
                 return None
             for current_details, incoming_details in zip(
                 current_pipeline["operator_details"],
@@ -1543,6 +1539,13 @@ class NativeFteWorkerManagerBackend:
 
     def worker_snapshots(self) -> Sequence[Mapping[str, Any]]:
         return [worker.snapshot() for worker in self._workers]
+
+    def materialization_barrier_completed(self, query_id: str, node_id: str) -> None:
+        """Acknowledge the runner protocol; native resources stay DuckDB-owned."""
+        if not str(query_id or "").strip():
+            raise ValueError("materialization barrier completion requires non-empty query_id")
+        if not str(node_id or "").strip():
+            raise ValueError("materialization barrier completion requires non-empty node_id")
 
     def fragment_stats_by_worker(self) -> dict[str, dict[str, int]]:
         stats_by_worker: dict[str, dict[str, int]] = {}

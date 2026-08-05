@@ -480,18 +480,18 @@ TEST_CASE("Exchange: FlightExchangeTicket roundtrip", "[distributed][exchange]")
 }
 
 TEST_CASE("Exchange: FlightExchangeTicket parse errors", "[distributed][exchange]") {
-	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nstage\nnode\n1").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v2\nepoch\nstage\nnode\n1\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\n\nstage\nnode\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nexchange\nnode").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nexchange\nnode\n1").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v2\nepoch\nexchange\nnode\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\n\nexchange\nnode\n1\n2").is_err());
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\n\nnode\n1\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\n\n1\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n-1\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\n-2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\nnope\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\nnope").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1x\n2").is_err());
-	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nstage\nnode\n1\n2x").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\n\n1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n-1\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1\n-2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\nnope\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1\nnope").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1x\n2").is_err());
+	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1\n2x").is_err());
 }
 
 TEST_CASE("Exchange: Flight timeouts resolve from the worker environment", "[distributed][exchange]") {
@@ -529,43 +529,43 @@ TEST_CASE("Exchange: ShuffleCacheRegistry register/get/remove", "[distributed][e
 
 	// Create a ShuffleCache and register it
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "registry_test_stage";
+	config.exchange_id = "registry_test_exchange";
 	config.node_id = "node_1";
 	config.num_partitions = 2;
 	config.local_dirs = {TestCreatePath("registry_test")};
 
 	auto cache = std::make_shared<ShuffleCache>(std::move(config));
-	REQUIRE(registry.Register("registry_test_stage", cache, "registry-test-query").is_ok());
+	REQUIRE(registry.Register("registry_test_exchange", cache, "registry-test-query").is_ok());
 
 	// Get should return the same cache
-	auto retrieved = registry.Get("registry_test_stage");
+	auto retrieved = registry.Get("registry_test_exchange");
 	REQUIRE(retrieved != nullptr);
 	REQUIRE(retrieved.get() == cache.get());
 
 	// Get with unknown key returns nullptr
-	auto unknown = registry.Get("nonexistent_stage");
+	auto unknown = registry.Get("nonexistent_exchange");
 	REQUIRE(unknown == nullptr);
 
 	// Remove the cache
-	registry.Remove("registry_test_stage");
-	auto after_remove = registry.Get("registry_test_stage");
+	registry.Remove("registry_test_exchange");
+	auto after_remove = registry.Get("registry_test_exchange");
 	REQUIRE(after_remove == nullptr);
 
 	// Double remove is safe
-	registry.Remove("registry_test_stage");
+	registry.Remove("registry_test_exchange");
 }
 
 TEST_CASE("Exchange: ShuffleCacheRegistry multiple entries", "[distributed][exchange]") {
 	auto &registry = ShuffleCacheRegistry::Instance();
 
 	ShuffleCacheConfig config1;
-	config1.shuffle_stage_id = "multi_test_1";
+	config1.exchange_id = "multi_test_1";
 	config1.node_id = "node_1";
 	config1.num_partitions = 1;
 	config1.local_dirs = {TestCreatePath("registry_multi_1")};
 
 	ShuffleCacheConfig config2;
-	config2.shuffle_stage_id = "multi_test_2";
+	config2.exchange_id = "multi_test_2";
 	config2.node_id = "node_1";
 	config2.num_partitions = 1;
 	config2.local_dirs = {TestCreatePath("registry_multi_2")};
@@ -590,11 +590,11 @@ TEST_CASE("Exchange: ShuffleCacheRegistry multiple entries", "[distributed][exch
 TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descriptor identity",
           "[distributed][exchange]") {
 	auto &registry = ShuffleCacheRegistry::Instance();
-	const std::string exchange_id = "registry_identity_stage";
+	const std::string exchange_id = "registry_identity_exchange";
 	const std::string query_id = "registry-identity-query";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 2;
 	config.local_dirs = {TestCreatePath("registry_identity_a")};
@@ -614,7 +614,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry validates epoch, attempt, and descript
 	REQUIRE(registry.Get(exchange_id).get() == cache.get());
 
 	auto mismatched_config = config;
-	mismatched_config.shuffle_stage_id = "different-exchange";
+	mismatched_config.exchange_id = "different-exchange";
 	auto mismatched_cache = std::make_shared<ShuffleCache>(std::move(mismatched_config));
 	REQUIRE(registry.TrackPending(exchange_id, mismatched_cache, query_id, "epoch-a", 4).is_err());
 	REQUIRE(registry.Register(exchange_id, mismatched_cache, query_id, "epoch-a", 4).is_err());
@@ -630,11 +630,11 @@ TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases",
 	Connection conn(db);
 	auto &context = *conn.context;
 	auto &registry = ShuffleCacheRegistry::Instance();
-	const std::string exchange_id = "registry_lease_stage__sink_0__attempt_0";
+	const std::string exchange_id = "registry_lease_exchange__sink_0__attempt_0";
 	const std::string query_id = "registry-lease-query";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_lease")};
@@ -654,7 +654,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases",
 	auto lease = std::move(lease_result.value());
 	registry.RemoveForDeferredCleanup(exchange_id);
 
-	auto cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_stage");
+	auto cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_exchange");
 	REQUIRE(cleanup.registry_entries_removed == 0);
 	REQUIRE(cleanup.storage_entries_removed == 0);
 	REQUIRE(cleanup.cleanup_errors == 0);
@@ -663,7 +663,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry cleanup waits for active read leases",
 
 	lease.reset();
 	REQUIRE(cache->HasCommittedManifest());
-	cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_stage");
+	cleanup = registry.RemoveAndCleanupByPrefix("registry_lease_exchange");
 	REQUIRE(cleanup.cleanup_pending == 0);
 	REQUIRE(cleanup.cleanup_errors == 0);
 	REQUIRE(cleanup.storage_entries_removed > 0);
@@ -676,7 +676,7 @@ TEST_CASE("Exchange: ShuffleCacheRegistry retains and retries failed cleanup", "
 	const std::string exchange_id = "registry_cleanup_retry__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {"mock://shuffle"};
@@ -707,7 +707,7 @@ TEST_CASE("Exchange: object shuffle cleanup reconstructs storage without retaini
 	auto storage_root = TestCreatePath("registry_object_cleanup_context");
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {"mock://shuffle"};
@@ -754,7 +754,7 @@ TEST_CASE("Exchange: deferred cleanup retains exclusive attempt identity", "[dis
 	const std::string exchange_id = "registry_deferred_identity__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_deferred_identity")};
@@ -780,7 +780,7 @@ TEST_CASE("Exchange: unpublished sink attempts stay hidden and retain cleanup ow
 	const std::string exchange_id = "registry_pending_writer__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_pending_writer")};
@@ -831,7 +831,7 @@ TEST_CASE("Exchange: query close fences late cache publication until native exec
 	const std::string exchange_id = "registry_close_race__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_close_race")};
@@ -881,7 +881,7 @@ TEST_CASE("Exchange: late pending sink cannot delete a borrowed closed-query att
 	const std::string exchange_id = "registry_late_pending__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_late_pending")};
@@ -935,7 +935,7 @@ TEST_CASE("Exchange: query cleanup waits for native execution before deleting co
 	const std::string exchange_id = "registry_native_cleanup_fence__sink_0__attempt_0";
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = exchange_id;
+	config.exchange_id = exchange_id;
 	config.node_id = "node-a";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("registry_native_cleanup_fence")};
@@ -974,7 +974,7 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 	Connection conn(db);
 	auto &context = *conn.context;
 	auto &registry = ShuffleCacheRegistry::Instance();
-	const std::string prefix = "overlapping-stage";
+	const std::string prefix = "overlapping-exchange";
 	const std::string exchange_a = prefix + "__instance_a__sink_0__attempt_1";
 	const std::string exchange_b = prefix + "__instance_b__sink_0__attempt_1";
 	const std::string epoch = "catalog-isolation-epoch";
@@ -983,7 +983,7 @@ TEST_CASE("Exchange: Flight service isolates published attempts and rejects rele
 
 	auto make_committed_cache = [&](const std::string &exchange_id, const std::string &dir, int32_t value) {
 		ShuffleCacheConfig config;
-		config.shuffle_stage_id = exchange_id;
+		config.exchange_id = exchange_id;
 		config.node_id = node_id;
 		config.num_partitions = 1;
 		config.local_dirs = {dir};
@@ -1065,7 +1065,7 @@ TEST_CASE("Exchange: process-local Flight shutdown is bounded and releases its s
 	const std::string node_id = "stalled-flight-shutdown-node";
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.exchange_id = exchange_id;
 	cache_config.node_id = node_id;
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("stalled_flight_shutdown")};
@@ -1309,7 +1309,7 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_1";
+	config.exchange_id = "exchange_1";
 	config.node_id = "node_1";
 	config.num_partitions = 2;
 	config.local_dirs = {TestCreatePath("exchange_cache_basic")};
@@ -1339,12 +1339,12 @@ TEST_CASE("Exchange: ShuffleCache write/read", "[distributed][exchange]") {
 	REQUIRE(files.total_bytes >= file.bytes);
 
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_1", cache, "cache-basic-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_1");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_1", cache, "cache-basic-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_1");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_1", "node_1", 1)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_1", "node_1", 1)});
 	RequireTwoColumnRows(rows, ids, names);
 }
 
@@ -1356,7 +1356,7 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_large_blob";
+	config.exchange_id = "exchange_large_blob";
 	config.node_id = "node_blob";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_large_blob")};
@@ -1379,12 +1379,12 @@ TEST_CASE("Exchange: ShuffleCache flushes large BLOB buffers by actual allocatio
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::BLOB};
 	REQUIRE(cache->FlushAll(context, {"id", "payload"}).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_large_blob", cache, "cache-blob-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_large_blob");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_large_blob", cache, "cache-blob-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_large_blob");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_blob";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_large_blob", "node_blob", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_large_blob", "node_blob", 0)});
 	REQUIRE(rows.size() == ids.size());
 }
 
@@ -1399,7 +1399,7 @@ TEST_CASE("Exchange: ShuffleCache bounds aggregate buffers across partitions", "
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_aggregate_buffer_budget";
+	config.exchange_id = "exchange_aggregate_buffer_budget";
 	config.node_id = "node_budget";
 	config.num_partitions = PARTITION_COUNT;
 	config.local_dirs = {TestCreatePath("exchange_cache_aggregate_buffer_budget")};
@@ -1478,7 +1478,7 @@ TEST_CASE("Exchange: ShuffleCache bounds aggregate buffers across partitions", "
 TEST_CASE("Exchange: ShuffleCache validates buffer byte settings", "[distributed][exchange]") {
 	auto make_config = []() {
 		ShuffleCacheConfig config;
-		config.shuffle_stage_id = "stage_invalid_buffer_budget";
+		config.exchange_id = "exchange_invalid_buffer_budget";
 		config.node_id = "node_budget";
 		config.num_partitions = 1;
 		config.local_dirs = {TestCreatePath("exchange_cache_invalid_buffer_budget")};
@@ -1509,7 +1509,7 @@ TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage b
 	auto storage = std::make_shared<MockObjectShuffleStorage>(root);
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "object_stage";
+	config.exchange_id = "object_exchange";
 	config.node_id = "node_object";
 	config.num_partitions = 2;
 	config.local_dirs = {"mock://object-root"};
@@ -1529,7 +1529,7 @@ TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage b
 
 	ShuffleCache replay_cache(
 	    ShuffleCacheConfig {
-	        "object_stage",
+	        "object_exchange",
 	        "node_object",
 	        2,
 	        {"mock://object-root"},
@@ -1565,7 +1565,7 @@ TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exch
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_empty";
+	config.exchange_id = "exchange_empty";
 	config.node_id = "node_empty";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_empty")};
@@ -1580,12 +1580,12 @@ TEST_CASE("Exchange: ShuffleCache empty partition handling", "[distributed][exch
 	REQUIRE(cache->EnsureSchemaFile(context, types, {"id", "name"}).is_ok());
 	REQUIRE(cache->FlushAll(context, {"id", "name"}).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_empty", cache, "cache-empty-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_empty");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_empty", cache, "cache-empty-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_empty");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_empty";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_empty", "node_empty", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_empty", "node_empty", 0)});
 	REQUIRE(rows.empty());
 
 	vector<int32_t> ids = {9};
@@ -1603,7 +1603,7 @@ TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distribu
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_multi_chunk";
+	config.exchange_id = "exchange_multi_chunk";
 	config.node_id = "node_1";
 	config.num_partitions = 1;
 	config.local_dirs = {TestCreatePath("exchange_cache_multi_chunk")};
@@ -1627,12 +1627,13 @@ TEST_CASE("Exchange: ShuffleCache multiple chunks to same partition", "[distribu
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_chunk", cache, "cache-multi-chunk-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_multi_chunk");
+	REQUIRE(
+	    ShuffleCacheRegistry::Instance().Register("exchange_multi_chunk", cache, "cache-multi-chunk-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_multi_chunk");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_chunk", "node_1", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_chunk", "node_1", 0)});
 	REQUIRE(rows.size() == 5);
 
 	// All rows should be present
@@ -1647,7 +1648,7 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig config;
-	config.shuffle_stage_id = "stage_multi_part";
+	config.exchange_id = "exchange_multi_part";
 	config.node_id = "node_1";
 	config.num_partitions = 3;
 	config.local_dirs = {TestCreatePath("exchange_cache_multi_part")};
@@ -1671,22 +1672,22 @@ TEST_CASE("Exchange: ShuffleCache write to multiple partitions", "[distributed][
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("stage_multi_part", cache, "cache-multi-part-query").is_ok());
-	ScopedShuffleCacheRegistration registration("stage_multi_part");
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("exchange_multi_part", cache, "cache-multi-part-query").is_ok());
+	ScopedShuffleCacheRegistration registration("exchange_multi_part");
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
 
 	// Partition 0 should have 2 rows
-	auto rows0 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 0)});
+	auto rows0 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 0)});
 	RequireTwoColumnRows(rows0, ids0, names0);
 
 	// Partition 1 should be empty
-	auto rows1 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 1)});
+	auto rows1 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 1)});
 	REQUIRE(rows1.empty());
 
 	// Partition 2 should have 1 row
-	auto rows2 = ReadSourceRows(context, source_config, {MakeSourceHandle("stage_multi_part", "node_1", 2)});
+	auto rows2 = ReadSourceRows(context, source_config, {MakeSourceHandle("exchange_multi_part", "node_1", 2)});
 	RequireTwoColumnRows(rows2, ids2, names2);
 }
 
@@ -1713,7 +1714,7 @@ TEST_CASE("Exchange: local-disk sink starts and publishes the cluster-internal F
 	FlightExchangeManager manager(config, conn.context.get());
 	ExchangeContext exchange_context;
 	exchange_context.query_id = "process-local-default-query";
-	exchange_context.exchange_id = "process-local-default-stage";
+	exchange_context.exchange_id = "process-local-default-exchange";
 	auto exchange = manager.CreateExchange(exchange_context, 1);
 	auto instance = exchange->InstantiateSink(exchange->AddSink(0), 0);
 	auto sink = manager.CreateSink(instance);
@@ -2034,7 +2035,7 @@ TEST_CASE("Exchange: FlightExchange with no sinks has no unpublished source hand
 
 	ExchangeContext ctx;
 	ctx.query_id = "empty-query";
-	ctx.exchange_id = "empty-stage";
+	ctx.exchange_id = "empty-exchange";
 	auto exchange = manager.CreateExchange(ctx, 4);
 	exchange->AllRequiredSinksFinished();
 	REQUIRE(exchange->GetSourceHandles().empty());
@@ -2053,7 +2054,7 @@ TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected a
 
 	ExchangeContext ctx;
 	ctx.query_id = "mark-summary-query";
-	ctx.exchange_id = "mark-summary-stage";
+	ctx.exchange_id = "mark-summary-exchange";
 	auto exchange = manager.CreateExchange(ctx, 3);
 	auto first = exchange->InstantiateSink(exchange->AddSink(0), 0);
 	auto first_retry = exchange->InstantiateSink(exchange->AddSink(0), 1);
@@ -2088,7 +2089,7 @@ TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected a
 	exchange->Close();
 }
 
-TEST_CASE("Exchange: same logical stage has isolated exchange instances and directories", "[distributed][exchange]") {
+TEST_CASE("Exchange: same logical exchange has isolated instances and directories", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
 
@@ -2103,7 +2104,7 @@ TEST_CASE("Exchange: same logical stage has isolated exchange instances and dire
 
 	ExchangeContext ctx;
 	ctx.query_id = "same-query";
-	ctx.exchange_id = "same-stage";
+	ctx.exchange_id = "same-exchange";
 	auto exchange_a = manager_a.CreateExchange(ctx, 1);
 	auto exchange_b = manager_b.CreateExchange(ctx, 1);
 	auto instance_a = exchange_a->InstantiateSink(exchange_a->AddSink(0), 0);
@@ -2113,12 +2114,12 @@ TEST_CASE("Exchange: same logical stage has isolated exchange instances and dire
 	REQUIRE(instance_b.output_location.find(ctx.exchange_id) == string::npos);
 
 	ShuffleCacheConfig cache_config_a;
-	cache_config_a.shuffle_stage_id = instance_a.output_location;
+	cache_config_a.exchange_id = instance_a.output_location;
 	cache_config_a.node_id = "node-a";
 	cache_config_a.num_partitions = 1;
 	cache_config_a.local_dirs = config_a.local_dirs;
 	ShuffleCacheConfig cache_config_b;
-	cache_config_b.shuffle_stage_id = instance_b.output_location;
+	cache_config_b.exchange_id = instance_b.output_location;
 	cache_config_b.node_id = "node-a";
 	cache_config_b.num_partitions = 1;
 	cache_config_b.local_dirs = config_b.local_dirs;
@@ -2152,7 +2153,7 @@ TEST_CASE("Exchange: FlightExchange accepts validated dynamically derived retry 
 	FlightExchangeManager manager(config, conn.context.get());
 	ExchangeContext ctx;
 	ctx.query_id = "dynamic-retry-query";
-	ctx.exchange_id = "diagnostic-stage";
+	ctx.exchange_id = "diagnostic-exchange";
 	auto exchange = manager.CreateExchange(ctx, 1);
 	auto sink = exchange->AddSink(0);
 	auto initial = exchange->InstantiateSink(sink, 0);
@@ -2337,7 +2338,7 @@ TEST_CASE("Exchange: failed unselected-attempt cleanup releases its retry claim"
 
 	ExchangeContext ctx;
 	ctx.query_id = "unselected-cleanup-retry-query";
-	ctx.exchange_id = "unselected-cleanup-retry-stage";
+	ctx.exchange_id = "unselected-cleanup-retry-exchange";
 	auto exchange = manager.CreateExchange(ctx, 1);
 	auto sink = exchange->AddSink(0);
 	auto selected = exchange->InstantiateSink(sink, 0);
@@ -2370,7 +2371,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 
 	// Create a ShuffleCache
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = "sink_test_stage";
+	cache_config.exchange_id = "sink_test_exchange";
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 2;
 	cache_config.local_dirs = {TestCreatePath("exchange_sink_test")};
@@ -2381,7 +2382,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	handle.sink_handle.task_partition_id = 0;
 	handle.attempt_id = 0;
 	handle.query_id = "sink-test-query";
-	handle.output_location = "sink_test_stage";
+	handle.output_location = "sink_test_exchange";
 	handle.output_partition_count = 2;
 
 	FlightExchangeSink sink(cache, handle, &context);
@@ -2408,7 +2409,7 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	REQUIRE(sink.GetMemoryUsage() == 0);
 
 	// Verify ShuffleCacheRegistry has the cache
-	auto registered = ShuffleCacheRegistry::Instance().Get("sink_test_stage");
+	auto registered = ShuffleCacheRegistry::Instance().Get("sink_test_exchange");
 	REQUIRE(registered != nullptr);
 	REQUIRE(registered.get() == cache.get());
 
@@ -2419,6 +2420,8 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	REQUIRE(manifest.good());
 	std::string manifest_contents((std::istreambuf_iterator<char>(manifest)), std::istreambuf_iterator<char>());
 	REQUIRE(manifest_contents.find("version=1") != std::string::npos);
+	REQUIRE(manifest_contents.find("exchange_id=sink_test_exchange") != std::string::npos);
+	REQUIRE(manifest_contents.find("shuffle_stage_id=") == std::string::npos);
 	REQUIRE(manifest_contents.find("sink_partition_id=0") != std::string::npos);
 	REQUIRE(manifest_contents.find("attempt_id=0") != std::string::npos);
 	REQUIRE(manifest_contents.find("file=0") != std::string::npos);
@@ -2427,11 +2430,11 @@ TEST_CASE("Exchange: FlightExchangeSink write and flush", "[distributed][exchang
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
 	source_config.expected_types = types;
-	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("sink_test_stage", "node_1", 0)});
+	auto rows = ReadSourceRows(context, source_config, {MakeSourceHandle("sink_test_exchange", "node_1", 0)});
 	RequireTwoColumnRows(rows, ids, names);
 
 	// Cleanup
-	ShuffleCacheRegistry::Instance().Remove("sink_test_stage");
+	ShuffleCacheRegistry::Instance().Remove("sink_test_exchange");
 }
 
 TEST_CASE("Exchange: FlightExchangeSink memory usage", "[distributed][exchange]") {
@@ -2439,7 +2442,7 @@ TEST_CASE("Exchange: FlightExchangeSink memory usage", "[distributed][exchange]"
 	Connection conn(db);
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = "sink_mem_test";
+	cache_config.exchange_id = "sink_mem_test";
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("exchange_sink_mem")};
@@ -2478,7 +2481,7 @@ TEST_CASE("Exchange: FlightExchangeSink abort retains partially flushed attempt 
 	const std::string query_id = "sink-abort-query";
 	const std::string exchange_id = "sink_abort__sink_0__attempt_0";
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.exchange_id = exchange_id;
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("exchange_sink_abort")};
@@ -2526,7 +2529,7 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 
 	// Prepare: write data via ShuffleCache and register it
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = "source_test_stage";
+	cache_config.exchange_id = "source_test_exchange";
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 2;
 	cache_config.local_dirs = {TestCreatePath("exchange_source_test")};
@@ -2552,7 +2555,7 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
 
 	// Register the cache
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("source_test_stage", cache, "source-test-query").is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register("source_test_exchange", cache, "source-test-query").is_ok());
 
 	// Create source and read partition 0
 	FlightExchangeConfig source_config;
@@ -2565,7 +2568,7 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 	ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
 	handle0.node_id = "node_1";
-	handle0.files.push_back(ExchangeSourceFile("source_test_stage", 0));
+	handle0.files.push_back(ExchangeSourceFile("source_test_exchange", 0));
 	source.AddSourceHandles({handle0});
 
 	REQUIRE(source.IsFinished() == false);
@@ -2588,7 +2591,7 @@ TEST_CASE("Exchange: FlightExchangeSource read from registry", "[distributed][ex
 	REQUIRE(source.IsFinished() == true);
 
 	source.Close();
-	ShuffleCacheRegistry::Instance().Remove("source_test_stage");
+	ShuffleCacheRegistry::Instance().Remove("source_test_exchange");
 }
 
 TEST_CASE("Exchange: FlightExchangeSource accepts RecordBatches larger than a standard vector",
@@ -2620,7 +2623,7 @@ TEST_CASE("Exchange: FlightExchangeSource accepts RecordBatches larger than a st
 	REQUIRE(file_output->Close().ok());
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = output_location;
+	cache_config.exchange_id = output_location;
 	cache_config.node_id = node_id;
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("exchange_source_oversized_cache")};
@@ -2660,7 +2663,7 @@ TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][e
 	auto &context = *conn.context;
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = "source_multi_stage";
+	cache_config.exchange_id = "source_multi_exchange";
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 3;
 	cache_config.local_dirs = {TestCreatePath("exchange_source_multi")};
@@ -2679,7 +2682,8 @@ TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][e
 
 	REQUIRE(cache->FlushAll(context, cache->BufferedNames()).is_ok());
 	REQUIRE(cache->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register("source_multi_stage", cache, "source-multi-test-query").is_ok());
+	REQUIRE(
+	    ShuffleCacheRegistry::Instance().Register("source_multi_exchange", cache, "source-multi-test-query").is_ok());
 
 	// Source reads both partitions
 	FlightExchangeConfig source_config;
@@ -2689,10 +2693,10 @@ TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][e
 	ExchangeSourceHandle h0, h2;
 	h0.partition_id = 0;
 	h0.node_id = "node_1";
-	h0.files.push_back(ExchangeSourceFile("source_multi_stage", 0));
+	h0.files.push_back(ExchangeSourceFile("source_multi_exchange", 0));
 	h2.partition_id = 2;
 	h2.node_id = "node_1";
-	h2.files.push_back(ExchangeSourceFile("source_multi_stage", 0));
+	h2.files.push_back(ExchangeSourceFile("source_multi_exchange", 0));
 	source.AddSourceHandles({h0, h2});
 
 	vector<int32_t> read_ids;
@@ -2715,7 +2719,7 @@ TEST_CASE("Exchange: FlightExchangeSource multiple partitions", "[distributed][e
 	REQUIRE(read_ids[2] == 40);
 
 	source.Close();
-	ShuffleCacheRegistry::Instance().Remove("source_multi_stage");
+	ShuffleCacheRegistry::Instance().Remove("source_multi_exchange");
 }
 
 TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path", "[distributed][exchange]") {
@@ -2724,11 +2728,11 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	auto &context = *conn.context;
 
 	vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
-	const string stage0 = "source_switch_stage_0";
-	const string stage1 = "source_switch_stage_1";
+	const string exchange0 = "source_switch_exchange_0";
+	const string exchange1 = "source_switch_exchange_1";
 
 	ShuffleCacheConfig cache0_config;
-	cache0_config.shuffle_stage_id = stage0;
+	cache0_config.exchange_id = exchange0;
 	cache0_config.node_id = "node_1";
 	cache0_config.num_partitions = 1;
 	cache0_config.local_dirs = {TestCreatePath("exchange_source_switch_0")};
@@ -2739,10 +2743,10 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	REQUIRE(cache0->WriteChunk(context, chunk0, 0, {"id", "name"}).is_ok());
 	REQUIRE(cache0->FlushAll(context, cache0->BufferedNames()).is_ok());
 	REQUIRE(cache0->WriteAttemptManifest(0, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register(stage0, cache0, "source-switch-test-query").is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange0, cache0, "source-switch-test-query").is_ok());
 
 	ShuffleCacheConfig cache1_config;
-	cache1_config.shuffle_stage_id = stage1;
+	cache1_config.exchange_id = exchange1;
 	cache1_config.node_id = "node_1";
 	cache1_config.num_partitions = 1;
 	cache1_config.local_dirs = {TestCreatePath("exchange_source_switch_1")};
@@ -2753,7 +2757,7 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	REQUIRE(cache1->WriteChunk(context, chunk1, 0, {"id", "name"}).is_ok());
 	REQUIRE(cache1->FlushAll(context, cache1->BufferedNames()).is_ok());
 	REQUIRE(cache1->WriteAttemptManifest(1, 0).is_ok());
-	REQUIRE(ShuffleCacheRegistry::Instance().Register(stage1, cache1, "source-switch-test-query").is_ok());
+	REQUIRE(ShuffleCacheRegistry::Instance().Register(exchange1, cache1, "source-switch-test-query").is_ok());
 
 	FlightExchangeConfig source_config;
 	source_config.node_id = "node_1";
@@ -2762,12 +2766,12 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	ExchangeSourceHandle handle0;
 	handle0.partition_id = 0;
 	handle0.node_id = "node_1";
-	handle0.files.push_back(ExchangeSourceFile(stage0, 0));
+	handle0.files.push_back(ExchangeSourceFile(exchange0, 0));
 
 	ExchangeSourceHandle handle1;
 	handle1.partition_id = 0;
 	handle1.node_id = "node_1";
-	handle1.files.push_back(ExchangeSourceFile(stage1, 0));
+	handle1.files.push_back(ExchangeSourceFile(exchange1, 0));
 
 	source.AddSourceHandles({handle0, handle1});
 
@@ -2787,8 +2791,8 @@ TEST_CASE("Exchange: FlightExchangeSource switches local cache per handle path",
 	REQUIRE(read_names == vector<string>({"a", "b", "c", "d"}));
 
 	source.Close();
-	ShuffleCacheRegistry::Instance().Remove(stage0);
-	ShuffleCacheRegistry::Instance().Remove(stage1);
+	ShuffleCacheRegistry::Instance().Remove(exchange0);
+	ShuffleCacheRegistry::Instance().Remove(exchange1);
 }
 
 TEST_CASE("Exchange: FlightExchangeSource revalidates local handle attempt identity", "[distributed][exchange]") {
@@ -2799,7 +2803,7 @@ TEST_CASE("Exchange: FlightExchangeSource revalidates local handle attempt ident
 	const std::string query_id = "source-local-identity-query";
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.exchange_id = exchange_id;
 	cache_config.node_id = "node-local";
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("exchange_source_local_identity")};
@@ -2879,7 +2883,7 @@ TEST_CASE("Exchange: FlightExchangeSource close releases catalog borrow for quer
 	const std::string query_id = "source-close-cleanup-query";
 	const std::string exchange_id = "source_close_cleanup_attempt";
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.exchange_id = exchange_id;
 	cache_config.node_id = "node-1";
 	cache_config.num_partitions = 1;
 	cache_config.local_dirs = {TestCreatePath("exchange_source_close_cleanup")};
@@ -2926,12 +2930,12 @@ TEST_CASE("Exchange: End-to-end sink to source pipeline", "[distributed][exchang
 	Connection conn(db);
 	auto &context = *conn.context;
 
-	const std::string exchange_id = "e2e_test_stage";
+	const std::string exchange_id = "e2e_test_exchange";
 
 	// ─── Phase 1: Create exchange and write data via sink ───
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = exchange_id;
+	cache_config.exchange_id = exchange_id;
 	cache_config.node_id = "node_1";
 	cache_config.num_partitions = 2;
 	cache_config.local_dirs = {TestCreatePath("exchange_e2e")};
@@ -3023,7 +3027,7 @@ TEST_CASE("Exchange: Multiple sinks to same exchange", "[distributed][exchange]"
 	const std::string output1 = exchange_id + "__sink_1__attempt_0";
 	auto make_cache = [&](const std::string &output_location, const std::string &dir) {
 		ShuffleCacheConfig cache_config;
-		cache_config.shuffle_stage_id = output_location;
+		cache_config.exchange_id = output_location;
 		cache_config.node_id = "node_1";
 		cache_config.num_partitions = 2;
 		cache_config.local_dirs = {TestCreatePath(dir)};

@@ -57,7 +57,7 @@ void ValidateBroadcastJoinSide(JoinType join_type, BroadcastJoinSide broadcast_s
 }
 
 namespace {
-std::string MakeBroadcastShuffleStageId(const PipelineNodeContext &context) {
+std::string MakeBroadcastExchangeId(const PipelineNodeContext &context) {
 	std::string prefix = context.query_id().empty() ? std::string("query") : context.query_id();
 	return prefix + "_broadcast_shuffle_" + std::to_string(context.node_id());
 }
@@ -111,6 +111,10 @@ std::vector<PipelineNodeRef> BroadcastJoinNode::children() const {
 	if (receiver_)
 		result.push_back(receiver_->inner());
 	return result;
+}
+
+std::vector<NodeID> BroadcastJoinNode::materialized_input_node_ids() const {
+	return broadcaster_ ? std::vector<NodeID> {broadcaster_->node_id()} : std::vector<NodeID> {};
 }
 
 std::vector<std::string> BroadcastJoinNode::multiline_display(bool /*verbose*/) const {
@@ -291,7 +295,7 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		    "BroadcastJoinNode now requires flight_shuffle exchange algorithm. Legacy in-memory path is removed.");
 	}
 
-	auto shuffle_stage_id = MakeBroadcastShuffleStageId(context_);
+	auto exchange_id = MakeBroadcastExchangeId(context_);
 	auto num_partitions = static_cast<idx_t>(1);
 
 	static auto broadcast_exchange_impl = [](std::shared_ptr<PipelineNodeImpl> self_shared_impl,
@@ -299,7 +303,7 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 	                                         std::shared_ptr<SubmittableTaskStream<WorkerTask>> receiver_ptr,
 	                                         std::shared_ptr<Sender<SubmittableTask<WorkerTask>>> result_tx_ptr,
 	                                         std::shared_ptr<FteTaskSubmitter> fte_task_submitter,
-	                                         std::string shuffle_stage_id, idx_t num_partitions,
+	                                         std::string exchange_id, idx_t num_partitions,
 	                                         ::duckdb::ClientContext *client_context,
 	                                         std::shared_ptr<ExchangeManager> exchange_mgr) -> DuckDBResult<void> {
 		auto self_shared = std::static_pointer_cast<BroadcastJoinNode>(self_shared_impl);
@@ -327,7 +331,7 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		// Create Exchange coordinator via ExchangeManager SPI (1 partition = broadcast)
 		ExchangeContext exchange_ctx;
 		exchange_ctx.query_id = self_shared->context().query_id();
-		exchange_ctx.exchange_id = shuffle_stage_id;
+		exchange_ctx.exchange_id = exchange_id;
 		exchange_mgr->SetContext(client_context);
 		auto exchange = std::shared_ptr<Exchange>(exchange_mgr->CreateExchange(exchange_ctx, num_partitions).release());
 
@@ -335,13 +339,13 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		auto sink_task_counter = std::make_shared<std::atomic<idx_t>>(0);
 
 		// Build sink plan builder using AddRemoteExchangeSinkPlan (shared with repartition)
-		auto plan_builder = [shuffle_stage_id, num_partitions, exchange, exchange_mgr,
+		auto plan_builder = [exchange_id, num_partitions, exchange, exchange_mgr,
 		                     sink_task_counter](DuckPhysicalPlanRef plan) {
 			auto repartition_spec = RepartitionSpec::create_into_partitions(num_partitions);
 			auto task_partition_id = sink_task_counter->fetch_add(1);
 			auto sink_handle_obj = exchange->AddSink(task_partition_id);
 			auto sink_instance = exchange->InstantiateSink(sink_handle_obj, /*attempt_id=*/0);
-			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, shuffle_stage_id,
+			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, exchange_id,
 			                                 sink_instance, exchange_mgr);
 		};
 		auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
@@ -433,6 +437,13 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		exchange->AllRequiredSinksFinished();
 		auto broadcast_handles = exchange->GetSourceHandles();
 		auto source_nodes = CollectSourceNodes(broadcast_handles);
+		auto barrier_result = fte_task_submitter->materialization_barrier_completed(self_shared->context().query_id(),
+		                                                                            self_shared->node_id());
+		if (barrier_result.is_err()) {
+			result_tx_ptr->close();
+			exchange->Close();
+			return DuckDBResult<void>::err(barrier_result.error());
+		}
 
 		while (true) {
 			auto receiver_task = BroadcastJoinNode::PollNextWithWait(*receiver_ptr);
@@ -447,8 +458,8 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 			source_task.source_task_count = 1;
 			source_task.replicated = true;
 			auto broadcast_plan =
-			    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, shuffle_stage_id, {}, {},
-			                                 exchange_mgr, source_nodes, optional_idx(self_shared->node_id()));
+			    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, exchange_id, {}, {}, exchange_mgr,
+			                                 source_nodes, optional_idx(self_shared->node_id()));
 			if (!broadcast_plan || !broadcast_plan->HasRoot()) {
 				result_tx_ptr->close();
 				exchange->Close();
@@ -473,10 +484,10 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 	};
 
 	auto exchange_mgr_copy = exchange_mgr_;
-	plan_context.spawn([self_shared, broadcaster_ptr, receiver_ptr, result_tx_ptr, fte_task_submitter, shuffle_stage_id,
+	plan_context.spawn([self_shared, broadcaster_ptr, receiver_ptr, result_tx_ptr, fte_task_submitter, exchange_id,
 	                    num_partitions, client_context, exchange_mgr_copy]() mutable -> DuckDBResult<void> {
 		return broadcast_exchange_impl(self_shared, broadcaster_ptr, receiver_ptr, result_tx_ptr, fte_task_submitter,
-		                               shuffle_stage_id, num_partitions, client_context, exchange_mgr_copy);
+		                               exchange_id, num_partitions, client_context, exchange_mgr_copy);
 	});
 	return SubmittableTaskStream<WorkerTask>::from_receiver(std::move(result_rx));
 }

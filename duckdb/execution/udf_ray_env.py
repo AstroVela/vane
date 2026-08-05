@@ -49,26 +49,5 @@ def normalize_actor_pool_payload(
     return normalized
 
 
-def normalize_actor_node_ids(
-    value: Any | None,
-    *,
-    expected_count: int | None = None,
-) -> list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        node_ids = [value]
-    else:
-        try:
-            node_ids = [str(item) if item is not None else "" for item in value]
-        except TypeError as exc:
-            raise ValueError("actor node IDs must be a string or iterable of strings") from exc
-    if expected_count is not None and expected_count >= 0 and len(node_ids) != expected_count:
-        raise ValueError(f"actor node IDs count {len(node_ids)} does not match expected actor count {expected_count}")
-    if any(not node_id.strip() for node_id in node_ids):
-        raise ValueError("actor node IDs must be non-empty strings")
-    return node_ids
-
-
 def resolve_actor_num_cpus(payload: dict[str, Any]) -> float:
     return payload_num_cpus(payload)

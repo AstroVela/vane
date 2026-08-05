@@ -1178,7 +1178,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalPivot>(physical_plan, std::move(types), std::move(bound_pivot), estimated_cardinality);
 	}
 	case PhysicalOperatorType::EXCHANGE_SINK: {
-		auto exchange_id = deserializer.ReadProperty<string>(103, "shuffle_stage_id");
+		auto exchange_id = deserializer.ReadProperty<string>(103, "exchange_id");
 		auto node_id = deserializer.ReadProperty<string>(104, "node_id");
 		auto num_partitions = deserializer.ReadProperty<idx_t>(105, "num_partitions");
 		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(106, "repartition_type");
@@ -1219,7 +1219,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return unique_ptr<PhysicalOperator>(std::move(result));
 	}
 	case PhysicalOperatorType::EXCHANGE_SOURCE: {
-		auto exchange_id = deserializer.ReadProperty<string>(103, "shuffle_stage_id");
+		auto exchange_id = deserializer.ReadProperty<string>(103, "exchange_id");
 		auto partition_indices = deserializer.ReadProperty<vector<idx_t>>(104, "partition_indices");
 		auto source_nodes = deserializer.ReadProperty<vector<string>>(105, "source_nodes");
 		auto timeout_seconds = deserializer.ReadProperty<double>(106, "flight_timeout_seconds");

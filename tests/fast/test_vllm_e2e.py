@@ -5,7 +5,7 @@ import importlib
 import os
 
 import pytest
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner, pytest.mark.gpu]
 
@@ -36,7 +36,7 @@ def test_vllm_e2e_basic():
     ray.init(
         address="local",
         include_dashboard=False,
-        object_store_memory=ray_test_object_store_bytes(),
+        **ray_test_object_store_options(),
     )
 
     import duckdb

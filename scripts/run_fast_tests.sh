@@ -114,11 +114,6 @@ if [[ -n "$junit_dir" ]]; then
   junit_dir="$(cd "$junit_dir" && pwd)"
 fi
 
-ray_object_store_bytes="$(
-  PYTHONPATH="tests${PYTHONPATH:+:${PYTHONPATH}}" \
-    python -c "from ray_test_profile import ray_test_object_store_bytes; print(ray_test_object_store_bytes())"
-)"
-
 run_pytest() {
   if ((process_timeout_seconds > 0)); then
     timeout \
@@ -143,8 +138,7 @@ run_reported_pytest() {
 }
 
 run_ray_pytest() {
-  VANE_TEST_RAY_OBJECT_STORE_BYTES="${ray_object_store_bytes}" \
-    run_reported_pytest "$@"
+  run_reported_pytest "$@"
 }
 
 run_owner_ray_pytest() {

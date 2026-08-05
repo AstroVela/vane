@@ -85,17 +85,16 @@ python -m pytest tests/ai
 The fast-test launcher runs non-Ray tests, shared-cluster Ray tests, and
 test-owned Ray clusters in separate pytest processes. This keeps the real Ray
 runtime out of the long-lived non-Ray pytest process. Fast and release Ray test
-clusters use a 2 GiB object store by default;
-`VANE_TEST_RAY_OBJECT_STORE_BYTES` overrides this test-only profile and does
-not configure production clusters. Tests that call `ray.init()` directly must
-be marked `real_ray` and `ray_cluster_owner`.
+clusters let Ray size the object store from the node's available memory by
+default. `VANE_TEST_RAY_OBJECT_STORE_BYTES` pins the capacity for a specialized
+test; it does not configure production clusters. Tests that call `ray.init()`
+directly must be marked `real_ray` and `ray_cluster_owner`.
 
 CI further splits the non-Ray phase across CPU-only jobs. The jobs install the
-built wheel, use CPU-only PyTorch, cap Ray task heap requests at 1 GiB, and set
-hard pytest-process and job deadlines so the suite fits a standard 4-vCPU,
-16-GiB GitHub-hosted runner. Tests marked `gpu` are excluded there because
-standard runners do not provide CUDA hardware; run the default launcher on a
-GPU host to include them.
+built wheel, use CPU-only PyTorch, and set hard pytest-process and job deadlines
+so the suite fits a standard 4-vCPU, 16-GiB GitHub-hosted runner. Tests marked
+`gpu` are excluded there because standard runners do not provide CUDA hardware;
+run the default launcher on a GPU host to include them.
 
 Tests that require an externally provisioned service are excluded by default.
 Run them explicitly when the required service and credentials are available:

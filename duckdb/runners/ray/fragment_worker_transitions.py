@@ -24,6 +24,7 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     _fte_pressure_total_memory_bytes,
     _ordered_fte_fragment_execution_items_for_pending_drain,
     _required_fte_pressure_stats,
+    _sync_write_sink_unit_for_fragment,
     fte_registry_query_is_closing,
 )
 
@@ -131,6 +132,7 @@ class FteWorkerTransitionMixin:
             except FteWorkerControlFailure as exc:
                 self._handles_for_fte_worker_control_failure(exc)
                 fragment_execution_revoked = []
+            _sync_write_sink_unit_for_fragment(fragment_execution)
             revoked.extend(fragment_execution_revoked)
             if remaining is not None:
                 remaining -= len(fragment_execution_revoked)

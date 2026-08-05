@@ -71,11 +71,11 @@ def validate_pipeline_topology(
 
     pipeline_ids: set[int] = set()
     pipelines: list[dict[str, Any]] = []
-    required_fields = {"pipeline_id", "operators", "operator_details", "stage_ids"}
+    required_fields = {"pipeline_id", "operators", "operator_details"}
     for raw_pipeline in raw_pipelines:
         if type(raw_pipeline) is not dict or set(raw_pipeline) != required_fields:
             raise ValueError(
-                "pipeline topology entries must contain exactly pipeline_id, operators, operator_details, and stage_ids"
+                "pipeline topology entries must contain exactly pipeline_id, operators, and operator_details"
             )
         pipeline_id = raw_pipeline["pipeline_id"]
         if type(pipeline_id) is not int or pipeline_id <= 0 or pipeline_id in pipeline_ids:
@@ -90,15 +90,11 @@ def validate_pipeline_topology(
             raise ValueError("pipeline topology operator_details must align with operators")
         if any(type(details) is not dict for details in operator_details):
             raise TypeError("pipeline topology operator_details entries must be dicts")
-        stage_ids = raw_pipeline["stage_ids"]
-        if type(stage_ids) is not list or any(type(stage_id) is not int or stage_id < 0 for stage_id in stage_ids):
-            raise ValueError("pipeline topology stage_ids must be non-negative integers")
         pipelines.append(
             {
                 "pipeline_id": pipeline_id,
                 "operators": list(operators),
                 "operator_details": copy.deepcopy(operator_details),
-                "stage_ids": list(stage_ids),
             }
         )
     return {"schema": _PIPELINE_TOPOLOGY_SCHEMA, "pipelines": pipelines}

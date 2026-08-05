@@ -22,20 +22,17 @@ def resource_identity_from_context(
     if not context:
         raise ValueError("FTE task context is missing resource identity")
     resource_query_id = str(context.get("resource_query_id") or "").strip()
-    resource_stage_id = str(context.get("resource_stage_id") or "").strip()
-    if not resource_query_id or not resource_stage_id:
-        raise ValueError("FTE task context requires resource_query_id and resource_stage_id")
-    expected_prefix = f"stage:{resource_query_id}:node:"
-    if (
-        not resource_stage_id.startswith(expected_prefix)
-        or not resource_stage_id.endswith(":fte")
-        or not resource_stage_id[len(expected_prefix) : -len(":fte")]
-    ):
+    resource_unit_id = str(context.get("resource_unit_id") or "").strip()
+    if not resource_query_id or not resource_unit_id:
+        raise ValueError("FTE task context requires resource_query_id and resource_unit_id")
+    expected_prefix = f"resource:{resource_query_id}:fragment:node:"
+    node_id = resource_unit_id[len(expected_prefix) :] if resource_unit_id.startswith(expected_prefix) else ""
+    if not node_id or ":" in node_id:
         raise ValueError(
-            "FTE task resource_stage_id does not belong to resource_query_id: "
-            f"query={resource_query_id!r} stage={resource_stage_id!r}"
+            "FTE task resource_unit_id does not belong to resource_query_id: "
+            f"query={resource_query_id!r} resource_unit={resource_unit_id!r}"
         )
-    return resource_query_id, resource_stage_id
+    return resource_query_id, resource_unit_id
 
 
 def node_id_from_context(context: dict[str, str] | None) -> str | None:

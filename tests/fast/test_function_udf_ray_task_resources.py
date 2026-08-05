@@ -18,8 +18,7 @@ def _distributed_payload(**overrides):
     payload = {
         "execution_backend": "ray_task",
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
-        "node_id": _NODE_ID,
+        "resource_unit_id": "resource:q1:udf:node:1",
         "produce_ray_block_stream": True,
         "call_mode": "map_batches",
         "cpus": 1.0,
@@ -44,15 +43,13 @@ def _fixed_ray_runtime_node(monkeypatch):
     )
 
 
-def test_ray_udf_cpu_and_memory_defaults_are_nonzero(monkeypatch):
+def test_ray_udf_cpu_defaults_to_one_and_heap_is_unreserved_when_omitted():
     import duckdb.execution.udf_ray as fur
     from duckdb.execution.udf_task_admission import ray_udf_task_memory_bytes
 
-    monkeypatch.delenv("VANE_UDF_TASK_HEAP_BYTES", raising=False)
-    monkeypatch.delenv("VANE_UDF_ACTOR_HEAP_BYTES", raising=False)
     assert fur._payload_num_cpus({}) == 1.0
-    assert ray_udf_task_memory_bytes({"execution_backend": "ray_task"}) == 2 * _GIB
-    assert ray_udf_task_memory_bytes({"execution_backend": "ray_actor"}) == 4 * _GIB
+    assert ray_udf_task_memory_bytes({"execution_backend": "ray_task"}) == 0
+    assert ray_udf_task_memory_bytes({"execution_backend": "ray_actor"}) == 0
     with pytest.raises(ValueError, match="memory_bytes must be positive"):
         ray_udf_task_memory_bytes({"execution_backend": "ray_task", "memory_bytes": 0})
 
@@ -72,6 +69,20 @@ def test_ray_task_options_use_exact_logical_resources_and_fixed_pair_window():
     }
 
 
+def test_ray_task_options_omit_undeclared_heap_and_remove_runtime_override():
+    import duckdb.execution.udf_ray as fur
+
+    options = fur._task_remote_options(1.5, 0.25, 0, 2, {"name": "task", "memory": 3 * _GIB})
+
+    assert options == {
+        "name": "task",
+        "num_cpus": 1.5,
+        "num_gpus": 0.25,
+        "max_retries": 2,
+        "_generator_backpressure_num_objects": 4,
+    }
+
+
 def test_task_payload_accepts_registered_downstream_retention_window_multiple():
     from duckdb.execution.udf_ray_stream_protocol import task_payload_with_lease
 
@@ -82,10 +93,10 @@ def test_task_payload_accepts_registered_downstream_retention_window_multiple():
     lease = {
         "lease_id": "lease-retention",
         "query_id": payload["query_id"],
-        "stage_id": payload["stage_id"],
+        "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-retention",
-        "node_id": _NODE_ID,
-        "execution_slot_id": f"ray_task:{payload['stage_id']}:lease-retention",
+        "node_id": None,
+        "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-retention",
         "output_window_bytes": 64 * 1024,
     }
 
@@ -102,10 +113,10 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
     lease = {
         "lease_id": "lease-invalid-retention",
         "query_id": payload["query_id"],
-        "stage_id": payload["stage_id"],
+        "resource_unit_id": payload["resource_unit_id"],
         "attempt_id": "attempt-invalid-retention",
-        "node_id": _NODE_ID,
-        "execution_slot_id": f"ray_task:{payload['stage_id']}:lease-invalid-retention",
+        "node_id": None,
+        "execution_slot_id": f"ray_task:{payload['resource_unit_id']}:lease-invalid-retention",
         "output_window_bytes": window,
     }
 
@@ -113,9 +124,7 @@ def test_task_payload_rejects_invalid_registered_retention_window(window):
         task_payload_with_lease(payload, lease)
 
 
-def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
+def test_ray_task_remote_keeps_regular_ray_remote_options_available():
     import duckdb.execution.udf_ray as fur
     from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
 
@@ -124,12 +133,7 @@ def test_ray_task_remote_keeps_options_available_for_lease_node_affinity():
         fur._build_ref_bundle_stream_remote,
     ):
         remote_fn = builder(1.0, 0.0, 2 * _GIB, 2, {}, build_session_runtime_env_vars({}))
-        scheduled = remote_fn.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=_NODE_ID,
-                soft=False,
-            )
-        )
+        scheduled = remote_fn.options(name="test-ray-task")
         assert callable(scheduled.remote)
 
 
@@ -198,11 +202,11 @@ def test_actor_call_uses_fixed_four_raw_objects_for_two_logical_blocks():
     assert method.calls == [{"_generator_backpressure_num_objects": 4}]
 
 
-def test_distributed_payload_requires_registered_query_stage_and_new_protocol():
+def test_distributed_payload_requires_registered_resource_unit_and_new_protocol():
     import duckdb.execution.udf_ray as fur
 
     assert fur._ray_payload_requires_block_stream(_distributed_payload()) is True
-    for missing in ("query_id", "stage_id", "produce_ray_block_stream"):
+    for missing in ("query_id", "resource_unit_id", "produce_ray_block_stream"):
         payload = _distributed_payload()
         payload.pop(missing)
         with pytest.raises(RuntimeError):
@@ -239,8 +243,8 @@ def test_task_executor_consumes_pregranted_admission_with_exact_resources(monkey
         request_id="request-7",
         lease={
             "lease_id": "lease-7",
-            "node_id": _NODE_ID,
-            "execution_slot_id": "ray_task:stage:q1:node:1:udf:lease-7",
+            "node_id": None,
+            "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-7",
         },
     )
     monkeypatch.setattr(executor, "_take_task_admission", lambda: admission)
@@ -264,9 +268,7 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
 
     class _Remote:
         def options(self, **options):
-            assert options["scheduling_strategy"].node_id == _NODE_ID
-            assert options["scheduling_strategy"].soft is False
-            return self
+            raise AssertionError(f"Ray task submission must not override placement: {options}")
 
         def remote(self, *args, **kwargs):
             submitted.append((args, kwargs))
@@ -282,11 +284,11 @@ def test_task_submission_starts_immediately_from_pregranted_lease(monkeypatch):
     )
     lease = {
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "lease_id": "lease-8",
         "attempt_id": "attempt-8",
-        "node_id": _NODE_ID,
-        "execution_slot_id": "ray_task:stage:q1:node:1:udf:lease-8",
+        "node_id": None,
+        "execution_slot_id": "ray_task:resource:q1:udf:node:1:lease-8",
         "output_window_bytes": 2 * _DEFAULT_OUTPUT_TARGET,
     }
     admission = SimpleNamespace(driver=object(), request_id="request-8", lease=lease)
@@ -343,7 +345,7 @@ def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
     assert outputs[1] == {
         "protocol_version": 1,
         "query_id": "q1",
-        "producer_stage_id": "stage:q1:node:1:udf",
+        "producer_unit_id": "resource:q1:udf:node:1",
         "task_lease_id": "lease-1",
         "attempt_id": "attempt-1",
         "block_id": "block:lease-1:0",
@@ -410,7 +412,7 @@ def test_materialized_task_splits_every_block_before_generator_publication():
     assert all(item["size_bytes"] <= 20 for item in metadata)
 
 
-def test_materialized_task_rejects_unsplittable_row_before_first_yield():
+def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
     import duckdb.execution.udf_ray as fur
     from duckdb import pickle as duckdb_pickle
 
@@ -426,14 +428,16 @@ def test_materialized_task_rejects_unsplittable_row_before_first_yield():
         output_window_bytes=64,
     )
     oversized = pa.table({"value": ["x" * 1024]})
-    stream = fur._iter_materialized_task_outputs(payload, [oversized])
+    outputs = list(fur._iter_materialized_task_outputs(payload, [oversized]))
 
-    with pytest.raises(RuntimeError, match="single output row.*32"):
-        next(stream)
+    assert outputs[0].equals(oversized)
+    assert outputs[1]["size_bytes"] > 32
+    assert outputs[1]["block_id"] == "block:lease-oversized:0"
 
 
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):
     from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from duckdb.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
     init_calls = []
@@ -475,10 +479,6 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
                 "working_dir": "/tmp/actor-runtime",
             }
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -489,7 +489,6 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     assert actor_options[0]["num_cpus"] == 2.0
@@ -507,11 +506,61 @@ def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch)
         "VANE_TORCH_INTEROP_THREADS": "1",
         "VANE_RAY_ACTOR_THREAD_POLICY": "managed",
         "EXPLICIT_ACTOR_ENV": "yes",
+        RAY_ACTOR_INDEX_ENV: "0",
     }
-    assert actor_options[0]["scheduling_strategy"].node_id == _NODE_ID
-    assert actor_options[0]["scheduling_strategy"].soft is False
+    assert "scheduling_strategy" not in actor_options[0]
     assert len(init_calls) == 1
     assert len(init_calls[0]) == 1
+
+
+def test_actor_pool_omits_undeclared_heap_and_removes_runtime_override(monkeypatch):
+    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    actor_options = []
+
+    class _Init:
+        def remote(self, *_args):
+            return "ready"
+
+    class _ActorHandle:
+        init_payload = _Init()
+
+    class _ActorFactory:
+        @classmethod
+        def options(cls, **options):
+            actor_options.append(options)
+            return SimpleNamespace(remote=lambda: _ActorHandle())
+
+    class _Pool(UDFActorPoolBase):
+        @staticmethod
+        def _actor_class(*_args):
+            return _ActorFactory
+
+        @staticmethod
+        def _resolve_actor_num_cpus(_payload):
+            return 1.0
+
+        @staticmethod
+        def _resolve_actor_memory_bytes(_payload):
+            return 0
+
+        @staticmethod
+        def _build_actor_runtime_env(_options):
+            return {}
+
+    fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    _Pool(
+        payload={
+            "execution_backend": "ray_actor",
+            "cpus": 1.0,
+        },
+        concurrency=1,
+        gpus_per_actor=0.0,
+        ray_options={"memory": 3 * _GIB},
+    )
+
+    assert "memory" not in actor_options[0]
 
 
 def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
@@ -550,10 +599,6 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
         def _build_actor_runtime_env(_options):
             return {"env_vars": {"OMP_NUM_THREADS": "6"}}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -564,7 +609,6 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     env_vars = actor_options[0]["runtime_env"]["env_vars"]
@@ -581,6 +625,7 @@ def test_actor_pool_thread_env_uses_payload_cpu_allocation(monkeypatch):
 
 def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
     from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from duckdb.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV
 
     actor_options = []
 
@@ -615,10 +660,6 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
         def _build_actor_runtime_env(_options):
             return {"env_vars": {"EXPLICIT_ACTOR_ENV": "yes"}}
 
-        @staticmethod
-        def _normalize_actor_node_ids(node_ids, *, expected_count):
-            return node_ids
-
     fake_ray = SimpleNamespace(put=lambda value: ("payload-ref", value))
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     _Pool(
@@ -628,13 +669,13 @@ def test_actor_pool_default_thread_policy_defers_thread_env_to_ray(monkeypatch):
         },
         concurrency=1,
         gpus_per_actor=1.0,
-        actor_node_ids=[_NODE_ID],
     )
 
     env_vars = actor_options[0]["runtime_env"]["env_vars"]
     assert env_vars == {
         "EXPLICIT_ACTOR_ENV": "yes",
         "VANE_RAY_ACTOR_THREAD_POLICY": "ray_native",
+        RAY_ACTOR_INDEX_ENV: "0",
     }
 
 

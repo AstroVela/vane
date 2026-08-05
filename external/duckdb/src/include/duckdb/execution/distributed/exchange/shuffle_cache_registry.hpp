@@ -78,7 +78,7 @@ private:
 				result = RemoveShuffleAttemptStorage(config, *cleanup_storage);
 			} else {
 				result = DuckDBResult<idx_t>::err(DuckDBError::invalid_state_error(
-				    "shuffle cleanup requires a live filesystem context for " + config.shuffle_stage_id));
+				    "shuffle cleanup requires a live filesystem context for " + config.exchange_id));
 			}
 			if (result.is_ok()) {
 				cleanup_complete = true;
@@ -245,7 +245,7 @@ public:
 			return DuckDBResult<WriteLease>::err(
 			    DuckDBError::value_error("pending shuffle cache requires an exchange id, query id, and cache"));
 		}
-		if (cache->config().shuffle_stage_id != exchange_id) {
+		if (cache->config().exchange_id != exchange_id) {
 			return DuckDBResult<WriteLease>::err(DuckDBError::value_error(
 			    "pending shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
 		}
@@ -300,7 +300,7 @@ public:
 			return DuckDBResult<void>::err(
 			    DuckDBError::value_error("shuffle cache registration requires an exchange id, query id, and cache"));
 		}
-		if (cache->config().shuffle_stage_id != exchange_id) {
+		if (cache->config().exchange_id != exchange_id) {
 			return DuckDBResult<void>::err(DuckDBError::value_error(
 			    "shuffle cache exchange id does not match its storage descriptor: " + exchange_id));
 		}
@@ -385,7 +385,7 @@ public:
 			return DuckDBResult<std::shared_ptr<ShuffleCache>>::err(
 			    DuckDBError::invalid_state_error("flight ticket attempt id does not match the published attempt"));
 		}
-		if (config.shuffle_stage_id != exchange_id || config.node_id != node_id) {
+		if (config.exchange_id != exchange_id || config.node_id != node_id) {
 			return DuckDBResult<std::shared_ptr<ShuffleCache>>::err(
 			    DuckDBError::invalid_state_error("flight ticket exchange or node identity does not match"));
 		}
@@ -538,8 +538,7 @@ private:
 		}
 		const auto &left_config = left.state->config;
 		const auto &right_config = right_cache->config();
-		return left_config.shuffle_stage_id == right_config.shuffle_stage_id &&
-		       left_config.node_id == right_config.node_id &&
+		return left_config.exchange_id == right_config.exchange_id && left_config.node_id == right_config.node_id &&
 		       left_config.num_partitions == right_config.num_partitions &&
 		       left_config.local_dirs == right_config.local_dirs;
 	}

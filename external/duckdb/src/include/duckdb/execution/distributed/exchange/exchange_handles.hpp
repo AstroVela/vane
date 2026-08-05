@@ -23,10 +23,10 @@ namespace distributed {
 
 // ─── Context ─────────────────────────────────────────────
 
-/// Context for creating an Exchange instance (one per shuffle stage).
+/// Context for creating one logical Exchange instance.
 struct ExchangeContext {
 	std::string query_id;
-	std::string exchange_id; // typically shuffle_stage_id
+	std::string exchange_id;
 };
 
 // ─── Sink Handles ────────────────────────────────────────

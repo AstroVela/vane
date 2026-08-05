@@ -21,7 +21,7 @@ namespace distributed {
 
 namespace {
 
-std::string MakeShuffleStageId(const PipelineNodeContext &context) {
+std::string MakeExchangeId(const PipelineNodeContext &context) {
 	std::string prefix = context.query_id().empty() ? std::string("query") : context.query_id();
 	return prefix + "_shuffle_" + std::to_string(context.node_id());
 }
@@ -278,7 +278,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 	auto *client_context = plan_context.client_context();
 
 	auto exec_cfg = config_.execution_config();
-	auto shuffle_stage_id = MakeShuffleStageId(context_);
+	auto exchange_id = MakeExchangeId(context_);
 	if (!exec_cfg || exec_cfg->shuffle_algorithm() != "flight_shuffle") {
 		throw NotImplementedException("RepartitionNode requires shuffle_algorithm=flight_shuffle. "
 		                              "The legacy map_reduce materialize+transpose path has been removed.");
@@ -297,7 +297,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 	auto num_partitions = num_partitions_;
 	auto exchange_mgr = exchange_mgr_;
 
-	plan_context.spawn([self_shared, input_ptr, task_id_counter, result_tx_ptr, shuffle_stage_id, num_partitions,
+	plan_context.spawn([self_shared, input_ptr, task_id_counter, result_tx_ptr, exchange_id, num_partitions,
 	                    client_context, exchange_mgr, fte_task_submitter]() mutable -> DuckDBResult<void> {
 		auto repartition_profile_start = std::chrono::steady_clock::now();
 		// poll_next() is blocking (ChannelStream::recv() waits for data
@@ -332,7 +332,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		// Create the Exchange coordinator via ExchangeManager SPI
 		distributed::ExchangeContext exchange_ctx;
 		exchange_ctx.query_id = self_shared->context().query_id();
-		exchange_ctx.exchange_id = shuffle_stage_id;
+		exchange_ctx.exchange_id = exchange_id;
 		exchange_mgr->SetContext(client_context);
 		auto exchange = std::shared_ptr<distributed::Exchange>(
 		    exchange_mgr->CreateExchange(exchange_ctx, num_partitions).release());
@@ -342,13 +342,13 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 
 		// Build sink plan builder: RemoteExchangeSink
 		auto repartition_spec = self_shared->repartition_spec_;
-		auto plan_builder = [self_shared, repartition_spec, num_partitions, shuffle_stage_id, exchange, exchange_mgr,
+		auto plan_builder = [self_shared, repartition_spec, num_partitions, exchange_id, exchange, exchange_mgr,
 		                     sink_task_counter](DuckPhysicalPlanRef plan) {
 			// Each task gets its own sink handle via the Exchange SPI
 			auto task_partition_id = sink_task_counter->fetch_add(1);
 			auto sink_handle_obj = exchange->AddSink(task_partition_id);
 			auto sink_instance = exchange->InstantiateSink(sink_handle_obj, /*attempt_id=*/0);
-			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, shuffle_stage_id,
+			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, exchange_id,
 			                                 sink_instance, exchange_mgr, self_shared->collect_mark_join_build_summary_,
 			                                 CopyExpressions(self_shared->mark_join_build_expressions_));
 		};
@@ -432,7 +432,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		auto sink_stream = SubmittableTaskStream<WorkerTask>(boxed<SubmittableTask<WorkerTask>>(std::move(stream)));
 		idx_t target_tasks = ResolveExchangeSourceTaskCount(num_partitions, self_shared->config_.execution_config());
 		auto sent_source_handle_keys = std::make_shared<std::unordered_set<std::string>>();
-		auto make_source_update_tasks = [self_shared, task_id_counter, result_tx_ptr, exchange_mgr, shuffle_stage_id,
+		auto make_source_update_tasks = [self_shared, task_id_counter, result_tx_ptr, exchange_mgr, exchange_id,
 		                                 num_partitions, output_types, estimated_cardinality,
 		                                 target_tasks](const std::vector<distributed::ExchangeSourceHandle> &handles,
 		                                               const char *reason) -> DuckDBResult<void> {
@@ -486,8 +486,8 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 				source_task.source_task_count = target_tasks;
 				source_task.mark_join_build_summary = mark_join_build_summary;
 				auto plan =
-				    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, shuffle_stage_id, {}, {},
-				                                 exchange_mgr, source_nodes, optional_idx(self_shared->node_id()));
+				    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, exchange_id, {}, {}, exchange_mgr,
+				                                 source_nodes, optional_idx(self_shared->node_id()));
 				TaskContext task_context = TaskContext::from_node_context(
 				    self_shared->context().query_idx(), self_shared->node_id(), task_id_counter->next());
 				WorkerTask task(task_context, plan, self_shared->config_.execution_config(),
@@ -549,6 +549,15 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 
 		auto finish_profile_start = std::chrono::steady_clock::now();
 		exchange->AllRequiredSinksFinished();
+		if (self_shared->is_materialization_barrier()) {
+			auto barrier_result = fte_task_submitter->materialization_barrier_completed(
+			    self_shared->context().query_id(), self_shared->node_id());
+			if (barrier_result.is_err()) {
+				result_tx_ptr->close();
+				exchange->Close();
+				return DuckDBResult<void>::err(barrier_result.error());
+			}
+		}
 		auto send_res = send_new_source_handles("final");
 		if (send_res.is_err()) {
 			result_tx_ptr->close();

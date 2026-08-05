@@ -106,7 +106,7 @@ def _query_task_lease_heap_bytes(
         "lease_id": str(lease.get("lease_id") or "").strip(),
         "query_id": str(lease.get("query_id") or "").strip(),
         "execution_query_id": str(lease.get("execution_query_id") or "").strip(),
-        "stage_id": str(lease.get("stage_id") or "").strip(),
+        "resource_unit_id": str(lease.get("resource_unit_id") or "").strip(),
         "attempt_id": str(lease.get("attempt_id") or "").strip(),
     }
     missing = [name for name, value in required_identity.items() if not value]
@@ -120,8 +120,8 @@ def _query_task_lease_heap_bytes(
     if not isinstance(resources, Mapping):
         raise RuntimeError("Ray FTE query_task_lease resources must be a mapping")
     heap_bytes = int(resources.get("heap_bytes") or 0)
-    if heap_bytes <= 0:
-        raise RuntimeError("Ray FTE query_task_lease heap_bytes must be positive")
+    if heap_bytes < 0:
+        raise RuntimeError("Ray FTE query_task_lease heap_bytes must be non-negative")
     explicit = _memory_requirement_from_request(request, None) if _has_explicit_memory_requirement(request) else None
     if explicit is not None and int(explicit) != heap_bytes:
         raise RuntimeError(

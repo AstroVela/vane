@@ -7,6 +7,7 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,16 +58,15 @@ from duckdb.runners.ray.fte import (
 )
 from duckdb.runners.ray.fte_attempts import RunningAttempt
 from duckdb.runners.ray.fte_events import FteAddSplitsCommand
-from duckdb.runners.ray.query_execution_graph import (
-    NodeResourceAllocation,
+from duckdb.runners.ray.query_resource_graph import (
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
-    register_query_graph,
+    register_query_resource_graph,
 )
 
 
@@ -108,7 +108,7 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
         "_fte_fragment_resource_identity",
         lambda query_id, _fragment_id: (
             query_id,
-            f"stage:{query_id}:node:scan:fte",
+            f"resource:{query_id}:fragment:node:scan",
         ),
     )
     monkeypatch.setattr(
@@ -236,54 +236,47 @@ async def _wait_for_terminal_task_status(manager, task_id, initial_status):
 
 
 def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_slots: int):
-    stage_id = f"stage:{query_id}:node:{node_id}:fte"
-    graph = QueryExecutionGraph(
+    resource_unit_id = f"resource:{query_id}:fragment:node:{node_id}"
+    graph = QueryResourceGraph(
         query_id=query_id,
         plan_digest=f"sha256:{query_id}",
-        stages=(
-            StageResourceSpec(
+        units=(
+            ResourceUnitSpec(
                 query_id=query_id,
-                stage_id=stage_id,
-                physical_node_id=f"node:{node_id}:fte",
-                stage_kind="fte",
+                resource_unit_id=resource_unit_id,
+                physical_node_id=f"node:{node_id}:native-fragment",
+                unit_kind="native_fragment",
                 backend="ray_worker",
-                input_stage_ids=(),
-                per_task=ResourceVector(cpu=1, heap_bytes=2 * _GIB),
+                input_unit_ids=(),
+                per_task=ResourceVector(),
                 target_output_block_bytes=128 * _MIB,
                 generator_buffer_blocks=2,
                 max_concurrency=partitions,
             ),
         ),
-        terminal_stage_ids=(stage_id,),
+        terminal_unit_ids=(resource_unit_id,),
     )
     allocation_resources = ResourceVector(
         cpu=task_slots,
         heap_bytes=task_slots * 2 * _GIB,
         object_store_bytes=task_slots * 256 * _MIB,
     )
-    manager = register_query_graph(
+    manager = register_query_resource_graph(
         graph,
         QueryAllocation(
             resources=allocation_resources,
-            node_allocations=(
-                NodeResourceAllocation(
-                    node_id="node-a",
-                    resources=allocation_resources,
-                ),
-            ),
-            actor_placements=(),
             generation=1,
         ),
     )
-    manager.update_stage_state(stage_id, runnable=True)
-    return manager, stage_id
+    manager.update_unit_state(resource_unit_id, runnable=True)
+    return manager, resource_unit_id
 
 
 def _install_fte_fragment(query_id: str, node_id: str, *, partitions: int, context=None):
     fragment_id = f"{query_id}:node:{node_id}"
     stage_context = {
         "resource_query_id": query_id,
-        "resource_stage_id": f"stage:{query_id}:node:{node_id}:fte",
+        "resource_unit_id": f"resource:{query_id}:fragment:node:{node_id}",
         **dict(context or {}),
     }
     stage = _fte_fragment_execution(
@@ -306,7 +299,6 @@ def _install_fte_fragment(query_id: str, node_id: str, *, partitions: int, conte
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         },
@@ -324,10 +316,10 @@ def test_fte_failure_retryability_parses_boolean_strings():
     assert _failure_allows_retry({"retryable": "false"}) is False
 
 
-def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
-    query_id = "q-fte-stage-leases"
+def test_fte_fragment_execution_uses_one_global_lease_domain_for_all_36_partitions():
+    query_id = "q-fte-fragment-execution-leases"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "scan", partitions=36, task_slots=14)
+    manager, resource_unit_id = _register_fte_query(query_id, "scan", partitions=36, task_slots=14)
     _, fragment_id = _install_fte_fragment(query_id, "scan", partitions=36)
     worker = _PlacementWorker()
     placement = fte_fragment_scheduler.FteWorkerPlacementManager(_PlacementCoordinator(worker))
@@ -347,9 +339,9 @@ def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
 
         snapshot = manager.snapshot()
         assert len(reservations) == 14
-        assert {reservation.stage_id for reservation in reservations} == {stage_id}
+        assert {reservation.resource_unit_id for reservation in reservations} == {resource_unit_id}
         assert len({reservation.task_lease_id for reservation in reservations}) == 14
-        assert snapshot["stages"][stage_id]["active_task_count"] == 14
+        assert snapshot["units"][resource_unit_id]["active_task_count"] == 14
         assert snapshot["liveness"]["task_grants_total"] == 0
         assert len(snapshot["task_leases"]) == 14
     finally:
@@ -359,7 +351,7 @@ def test_fte_stage_uses_one_global_lease_domain_for_all_36_partitions():
 def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
     query_id = "q-fte-attempt-lease"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "scan", partitions=1, task_slots=1)
+    manager, resource_unit_id = _register_fte_query(query_id, "scan", partitions=1, task_slots=1)
     stage, fragment_id = _install_fte_fragment(query_id, "scan", partitions=1)
     worker = _PlacementWorker()
     placement = fte_fragment_scheduler.FteWorkerPlacementManager(_PlacementCoordinator(worker))
@@ -367,7 +359,7 @@ def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
         reservation = placement.acquire(query_id=query_id, fragment_id=fragment_id, partition_id=0)
         expected_attempt = FteTaskAttemptId(stage.partitions[0].task_id, 0)
 
-        assert reservation.stage_id == stage_id
+        assert reservation.resource_unit_id == resource_unit_id
         assert reservation.attempt_id == str(expected_attempt)
         lease = manager.snapshot()["task_leases"][reservation.task_lease_id]
         assert lease["task_id"] == str(stage.partitions[0].task_id)
@@ -384,10 +376,10 @@ def test_fte_task_lease_uses_attempt_identity_and_releases_once_at_terminal():
 
 def test_internal_fte_query_uses_outer_query_resource_identity():
     resource_query_id = "q-fte-resource-owner"
-    execution_query_id = f"{resource_query_id}_orderby_stage"
-    fragment_id = f"{execution_query_id}:orderby:2:stage:0"
+    execution_query_id = f"{resource_query_id}_orderby_execution"
+    fragment_id = f"{execution_query_id}:orderby:2:fragment:0"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(
+    manager, resource_unit_id = _register_fte_query(
         resource_query_id,
         "scan",
         partitions=1,
@@ -399,7 +391,7 @@ def test_internal_fte_query_uses_outer_query_resource_identity():
         fragment_id=fragment_id,
         context={
             "resource_query_id": resource_query_id,
-            "resource_stage_id": stage_id,
+            "resource_unit_id": resource_unit_id,
         },
     )
     stage.add_partition(0)
@@ -421,7 +413,7 @@ def test_internal_fte_query_uses_outer_query_resource_identity():
             reservation.attempt_id,
         )
 
-        assert reservation.stage_id == stage_id
+        assert reservation.resource_unit_id == resource_unit_id
         assert manager.snapshot()["task_leases"][reservation.task_lease_id]["query_id"] == resource_query_id
         assert payload["query_id"] == resource_query_id
         assert payload["execution_query_id"] == execution_query_id
@@ -474,11 +466,11 @@ def test_fte_worker_selection_or_reservation_failure_releases_task_lease(worker,
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_updates_registered_stage_state_instead_of_registering_an_operator():
-    query_id = "q-write-sink-stage"
+def test_fte_write_sink_updates_registered_unit_state_instead_of_registering_an_operator():
+    query_id = "q-write-sink-unit"
     clear_query_resource_managers()
-    manager, stage_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
-    stage, fragment_id = _install_fte_fragment(
+    manager, resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    fragment_execution, fragment_id = _install_fte_fragment(
         query_id,
         "sink",
         partitions=1,
@@ -490,22 +482,39 @@ def test_fte_write_sink_updates_registered_stage_state_instead_of_registering_an
         },
     )
     try:
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
-        assert manager.snapshot()["stages"][stage_id]["runnable"] is False
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["runnable"] is False
 
-        stage.partitions[0].mark_ready_for_execution()
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
-        assert manager.snapshot()["stages"][stage_id]["runnable"] is True
+        fragment_execution.partitions[0].mark_ready_for_execution()
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["runnable"] is True
         assert fragment_id == f"{query_id}:node:sink"
+
+        fragment_execution.partitions[0].finished = True
+        fragment_execution.partitions[0].ready_for_scheduling = False
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        unit_state = manager.snapshot()["units"][resource_unit_id]
+        assert unit_state["runnable"] is False
+        assert unit_state["completed"] is False
+
+        fragment_execution.no_more_partitions = True
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
+        assert manager.snapshot()["units"][resource_unit_id]["completed"] is True
     finally:
         _cleanup_fte_query(query_id)
 
 
-def test_fte_write_sink_stage_snapshot_owns_fragment_state_lock():
-    query_id = "q-write-sink-stage-lock"
+def test_fte_write_sink_treats_a_sealed_empty_partition_set_as_completed():
+    fragment_execution = SimpleNamespace(partitions={}, no_more_partitions=True)
+
+    assert fte_fragment_scheduler._write_sink_has_input(fragment_execution) == (False, True)
+
+
+def test_fte_write_sink_unit_snapshot_owns_fragment_state_lock():
+    query_id = "q-write-sink-unit-lock"
     clear_query_resource_managers()
-    _manager, _stage_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
-    stage, _fragment_id = _install_fte_fragment(
+    _manager, _resource_unit_id = _register_fte_query(query_id, "sink", partitions=1, task_slots=1)
+    fragment_execution, _fragment_id = _install_fte_fragment(
         query_id,
         "sink",
         partitions=1,
@@ -519,14 +528,14 @@ def test_fte_write_sink_stage_snapshot_owns_fragment_state_lock():
 
     class _LockCheckingPartitions(dict):
         def values(self):
-            assert stage._state_lock_owned_by_current_thread()
+            assert fragment_execution._state_lock_owned_by_current_thread()
             return super().values()
 
-    stage.partitions = _LockCheckingPartitions(stage.partitions)
+    fragment_execution.partitions = _LockCheckingPartitions(fragment_execution.partitions)
     try:
-        fte_fragment_scheduler._sync_write_sink_stage_for_fragment(stage)
+        fte_fragment_scheduler._sync_write_sink_unit_for_fragment(fragment_execution)
     finally:
-        stage.partitions = dict(stage.partitions)
+        fragment_execution.partitions = dict(fragment_execution.partitions)
         _cleanup_fte_query(query_id)
 
 
@@ -587,7 +596,7 @@ def test_registry_snapshot_is_observation_only(monkeypatch, snapshot_kind):
     _, fragment_id = _install_fte_fragment(query_id, "sink", partitions=1)
     monkeypatch.setattr(
         fte_fragment_scheduler,
-        "_sync_write_sink_stage_for_fragment",
+        "_sync_write_sink_unit_for_fragment",
         lambda _fragment: (_ for _ in ()).throw(AssertionError("progress collection must not mutate scheduler state")),
     )
     try:
@@ -611,7 +620,6 @@ def test_progress_registry_publishes_immutable_native_topology_before_fragment_e
                 "pipeline_id": 1,
                 "operators": ["TABLE_SCAN", "PROJECTION"],
                 "operator_details": [{}, {}],
-                "stage_ids": [],
             }
         ],
     }
@@ -674,7 +682,6 @@ def test_progress_topology_concurrent_registration_builds_exactly_once():
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -724,7 +731,6 @@ def test_progress_topology_failed_build_releases_ownership_for_retry():
                 "pipeline_id": 1,
                 "operators": ["TABLE_SCAN"],
                 "operator_details": [{}],
-                "stage_ids": [],
             }
         ],
     }
@@ -1702,7 +1708,7 @@ def test_task_descriptor_spooling_output_buffers_keep_partition_count_stable():
 
 
 def test_fte_exchange_tracker_selects_first_successful_attempt_only():
-    exchange = FteExchangeTracker("q", "stage-0")
+    exchange = FteExchangeTracker("q", "exchange-0")
     sink = exchange.add_sink(0)
 
     instance0 = exchange.instantiate_sink(sink, 0)
@@ -1717,7 +1723,7 @@ def test_fte_exchange_tracker_selects_first_successful_attempt_only():
         {
             "sink_handle": {
                 "query_id": "q",
-                "exchange_id": "stage-0",
+                "exchange_id": "exchange-0",
                 "partition_id": 0,
             },
             "attempt_id": 1,
@@ -1868,7 +1874,7 @@ def test_hash_exchange_selector_final_waits_for_all_sources():
 
 
 def test_fte_exchange_tracker_rejects_new_sinks_after_final():
-    exchange = FteExchangeTracker("q", "stage-final")
+    exchange = FteExchangeTracker("q", "exchange-final")
     sink = exchange.add_sink(0)
 
     exchange.sink_finished(sink, 0)
@@ -1885,7 +1891,7 @@ def test_fte_exchange_tracker_rejects_new_sinks_after_final():
 
 
 def test_fte_exchange_tracker_late_success_after_final_keeps_source_handles_stable():
-    exchange = FteExchangeTracker("q", "stage-late")
+    exchange = FteExchangeTracker("q", "exchange-late")
     sink0 = exchange.add_sink(0)
     sink1 = exchange.add_sink(1)
 
@@ -1906,7 +1912,7 @@ def test_fte_exchange_tracker_late_success_after_final_keeps_source_handles_stab
 
 
 def test_spooling_exchange_manager_late_success_after_final_does_not_replace_selected_files(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-late-spool")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-late-spool")
     sink = exchange.add_sink(0)
     selected = exchange.instantiate_sink(sink, 0)
     late = exchange.instantiate_sink(sink, 1)
@@ -1928,7 +1934,7 @@ def test_spooling_exchange_manager_late_success_after_final_does_not_replace_sel
 
 
 def test_spooling_exchange_manager_writes_markers_and_selected_source_handles(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
 
     attempt0 = exchange.instantiate_sink(sink, 0)
@@ -1947,13 +1953,13 @@ def test_spooling_exchange_manager_writes_markers_and_selected_source_handles(tm
     assert handles[0].attempt_id == 1
     assert handles[0].files == (path1,)
     assert handles[0].attempt_path == attempt1.attempt_path
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1" / "committed").exists()
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1" / "manifest.json").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1" / "committed").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1" / "manifest.json").exists()
     assert path0 != path1
 
 
 def test_collect_spooling_output_stats_from_attempt_path(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(1)
     attempt = exchange.instantiate_sink(sink, 3)
     path0 = exchange.record_output_file(attempt, 0, "a", b"aaa")
@@ -1976,7 +1982,7 @@ def test_collect_spooling_output_stats_from_attempt_path(tmp_path):
 
 
 def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(2)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -1987,8 +1993,8 @@ def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
     exchange.finish_attempt(attempt1)
     exchange.sink_finished(sink, 1)
 
-    attempt0_dir = tmp_path / "q" / "stage-0" / "sink_2" / "attempt_0"
-    attempt1_dir = tmp_path / "q" / "stage-0" / "sink_2" / "attempt_1"
+    attempt0_dir = tmp_path / "q" / "exchange-0" / "sink_2" / "attempt_0"
+    attempt1_dir = tmp_path / "q" / "exchange-0" / "sink_2" / "attempt_1"
     assert (attempt0_dir / "aborted").exists()
     assert attempt1_dir.exists()
 
@@ -2001,7 +2007,7 @@ def test_spooling_exchange_manager_abort_cleanup_and_destroy_query(tmp_path):
 
 
 def test_spooling_exchange_manager_removes_committed_but_unselected_attempt(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -2016,14 +2022,14 @@ def test_spooling_exchange_manager_removes_committed_but_unselected_attempt(tmp_
     assert len(handles) == 1
     assert handles[0].attempt_id == 1
     assert handles[0].files == (selected_path,)
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_0" / "committed").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_0" / "committed").exists()
     assert exchange.cleanup_unselected_attempts() == 1
-    assert not (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_0").exists()
-    assert (tmp_path / "q" / "stage-0" / "sink_0" / "attempt_1").exists()
+    assert not (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_0").exists()
+    assert (tmp_path / "q" / "exchange-0" / "sink_0" / "attempt_1").exists()
 
 
 def test_spooling_exchange_manager_duplicate_successful_attempts_select_one(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt0 = exchange.instantiate_sink(sink, 0)
     attempt1 = exchange.instantiate_sink(sink, 1)
@@ -2044,7 +2050,7 @@ def test_spooling_exchange_manager_duplicate_successful_attempts_select_one(tmp_
 
 
 def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-upstream")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-upstream")
     upstream = _fte_fragment_execution(
         "q",
         11,
@@ -2347,6 +2353,24 @@ def test_fte_worker_command_outbox_pop_owns_attempt_scheduling_lock():
     assert acquired_during_copy is False
     assert popped == ["first"]
     assert stage._worker_command_outbox == []
+
+
+def test_fte_fragment_without_native_heap_requirement_omits_request_memory():
+    fragment = FteFragmentExecution(
+        "query-duckdb-memory",
+        0,
+        fragment_id="query-duckdb-memory:node:1",
+        task_memory_bytes=None,
+    )
+    partition = fragment.add_partition(0)
+
+    scheduled = partition.start_attempt(
+        worker_id="worker-a",
+        worker_incarnation_id="incarnation-worker-a",
+    )
+
+    assert partition.memory_requirement_bytes is None
+    assert "memory_requirement_bytes" not in scheduled.request
 
 
 def test_fte_add_partition_owns_state_lock_and_is_idempotent_under_concurrency():
@@ -3841,7 +3865,7 @@ def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
 def test_fte_fragment_execution_finish_removes_descriptor_and_finalizes_exchange():
     worker = _FakeLiveWorker()
     storage = TaskDescriptorStorage()
-    exchange = FteExchangeTracker("q", "stage-5")
+    exchange = FteExchangeTracker("q", "exchange-5")
     stage = _fte_fragment_execution(
         "q",
         5,
@@ -3881,7 +3905,7 @@ def test_fte_fragment_execution_finish_cancels_unselected_running_attempts():
 
     winner_worker = _AccountingWorker("worker-winner")
     loser_worker = _AccountingWorker("worker-loser")
-    exchange = FteExchangeTracker("q", "stage-selected")
+    exchange = FteExchangeTracker("q", "exchange-selected")
     stage = _fte_fragment_execution(
         "q",
         61,
@@ -3949,7 +3973,7 @@ def test_fte_fragment_execution_handle_finished_status_marks_task_finished():
 def test_fte_fragment_execution_handle_finished_missing_stats_retries_exchange_attempt():
     worker = _FakeLiveWorker()
     storage = TaskDescriptorStorage()
-    exchange = FteExchangeTracker("q", "stage-missing-stats")
+    exchange = FteExchangeTracker("q", "exchange-missing-stats")
     stage = _fte_fragment_execution(
         "q",
         41,
@@ -4211,7 +4235,7 @@ def test_fte_fragment_execution_handle_failed_status_marks_stage_failed_when_att
 def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output(tmp_path):
     worker0 = _FakeLiveWorker("worker-a")
     worker1 = _FakeLiveWorker("worker-b")
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-fte-lost")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-fte-lost")
 
     def select_worker(partition):
         return worker0 if partition.next_attempt_number() == 0 else worker1
@@ -4396,7 +4420,7 @@ def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_
         "q",
         12,
         fragment_id="q:node:sample",
-        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:fte","node:sample"]',
+        logical_fragment_identity='["ray-fte-logical-fragment-v1","node:sample:native-fragment","node:sample"]',
         stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
             (stable_task_identity, identity_key)
         ),
@@ -5350,7 +5374,7 @@ def test_fte_worker_task_manager_fte_update_before_execution_updates_descriptor_
 
 
 def test_fte_worker_task_manager_returns_spooling_output_stats(tmp_path):
-    exchange = SpoolingExchangeManager(tmp_path, "q", "stage-0")
+    exchange = SpoolingExchangeManager(tmp_path, "q", "exchange-0")
     sink = exchange.add_sink(0)
     attempt = exchange.instantiate_sink(sink, 0)
 
@@ -6211,7 +6235,7 @@ def test_ray_fte_worker_requires_exact_query_lease_heap():
                 "lease_id": "lease-qlease",
                 "query_id": "qlease",
                 "execution_query_id": "qlease",
-                "stage_id": "stage:qlease:node:scan:fte",
+                "resource_unit_id": "resource:qlease:fragment:node:scan",
                 "task_id": "qlease.0.0",
                 "attempt_id": "qlease.0.0.0",
                 "resources": {
@@ -6234,6 +6258,57 @@ def test_ray_fte_worker_requires_exact_query_lease_heap():
         assert final["state"] == FteTaskState.FINISHED.value
 
         await manager.drop_query("qlease")
+
+    asyncio.run(run())
+
+
+def test_ray_fte_worker_accepts_native_task_with_zero_heap_lease():
+    async def execute_fn(request):
+        return {"ok": str(FteTaskAttemptId.coerce(request["task_id"]))}
+
+    async def run():
+        manager = _fte_worker_task_manager(
+            execute_fn,
+            admission_config=FteWorkerAdmissionConfig(
+                max_running_tasks=4,
+                mode="lease",
+                memory_budget_bytes=20,
+                task_memory_bytes=None,
+            ),
+            require_query_task_lease=True,
+        )
+        task_id = {
+            "query_id": "q-native-lease",
+            "fragment_execution_id": 0,
+            "partition_id": 0,
+            "attempt_id": 0,
+        }
+        status = await manager.create_task(
+            {
+                "task_id": task_id,
+                "fragment_id": "q-native-lease:node:scan",
+                "query_task_lease": {
+                    "lease_id": "lease-q-native",
+                    "query_id": "q-native-lease",
+                    "execution_query_id": "q-native-lease",
+                    "resource_unit_id": "resource:q-native-lease:fragment:node:scan",
+                    "task_id": "q-native-lease.0.0",
+                    "attempt_id": "q-native-lease.0.0.0",
+                    "resources": {
+                        "cpu": 0.0,
+                        "gpu": 0.0,
+                        "heap_bytes": 0,
+                        "object_store_bytes": 0,
+                    },
+                },
+            }
+        )
+
+        assert status["executor_task_memory_requirement_bytes"] == 0
+        final = await manager.wait_task_status(task_id, status["version"], timeout_s=1.0)
+        assert final["state"] == FteTaskState.FINISHED.value
+
+        await manager.drop_query("q-native-lease")
 
     asyncio.run(run())
 
@@ -6275,7 +6350,7 @@ def test_ray_fte_worker_rejects_lease_larger_than_node_capacity():
                 "lease_id": "lease-qoversize",
                 "query_id": "qoversize",
                 "execution_query_id": "qoversize",
-                "stage_id": "stage:qoversize:node:scan:fte",
+                "resource_unit_id": "resource:qoversize:fragment:node:scan",
                 "task_id": "qoversize.0.0",
                 "attempt_id": "qoversize.0.0.0",
                 "resources": {

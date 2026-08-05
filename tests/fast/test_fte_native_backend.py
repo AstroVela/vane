@@ -1922,7 +1922,6 @@ def test_native_backend_query_status_builds_local_progress_snapshot():
                             "pipeline_id": 1,
                             "operators": ["TABLE_SCAN"],
                             "operator_details": [{}],
-                            "stage_ids": [],
                             "input_rows": 5,
                             "input_bytes": 128,
                             "output_rows": 5,
@@ -1964,7 +1963,6 @@ def test_native_backend_query_status_builds_local_progress_snapshot():
                     "pipeline_id": 1,
                     "operators": ["TABLE_SCAN"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             ],
         }
@@ -2001,7 +1999,6 @@ def test_native_progress_topology_ignores_live_counters_and_merges_stable_identi
                 "pipeline_id": 1,
                 "operators": ["STREAMING_UDF"],
                 "operator_details": [udf_details],
-                "stage_ids": [],
             }
         ]
         if include_copy_pipeline:
@@ -2010,7 +2007,6 @@ def test_native_progress_topology_ignores_live_counters_and_merges_stable_identi
                     "pipeline_id": 2,
                     "operators": ["COPY_TO_FILE"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                 }
             )
         return {"running_attempts": [{"task_stats": {"pipelines": pipelines}}]}
@@ -2034,13 +2030,11 @@ def test_native_progress_topology_ignores_live_counters_and_merges_stable_identi
                 "pipeline_id": 1,
                 "operators": ["STREAMING_UDF"],
                 "operator_details": [{"pipeline_role": "source", "udf_name": "ai_prompt"}],
-                "stage_ids": [],
             },
             {
                 "pipeline_id": 2,
                 "operators": ["COPY_TO_FILE"],
                 "operator_details": [{}],
-                "stage_ids": [],
             },
         ],
     }
@@ -2059,7 +2053,6 @@ def test_native_progress_topology_ignores_live_counters_and_merges_stable_identi
                                     "pipeline_id": 1,
                                     "operators": ["STREAMING_UDF"],
                                     "operator_details": [{}],
-                                    "stage_ids": [],
                                 }
                             ]
                         }
@@ -2092,7 +2085,6 @@ def test_native_progress_topology_unavailable_does_not_break_query_status(bad_me
                             "pipeline_id": 1,
                             "operators": ["TABLE_SCAN"],
                             "operator_details": [{}],
-                            "stage_ids": [],
                         }
                     ]
                 }
@@ -2133,7 +2125,6 @@ def test_native_progress_snapshot_normalizes_stable_identity_across_attempts():
                     "pipeline_id": 1,
                     "operators": ["STREAMING_UDF"],
                     "operator_details": [operator_details],
-                    "stage_ids": [],
                     "input_rows": input_rows,
                     "total_pipeline_tasks": 1,
                     "running_pipeline_tasks": 1,

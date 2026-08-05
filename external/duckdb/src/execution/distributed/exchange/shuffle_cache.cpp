@@ -755,19 +755,19 @@ DuckDBResult<void> ShuffleCache::EnsurePartitionDirectory(idx_t partition_idx) c
 
 std::string ShuffleCache::NodeDirectory() const {
 	auto base_dir = config_.local_dirs.empty() ? std::string() : config_.local_dirs[0];
-	auto stage = ShuffleCacheSanitizePathComponent(config_.shuffle_stage_id);
+	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id);
 	auto node = ShuffleCacheSanitizePathComponent(config_.node_id);
 	std::ostringstream ss;
-	ss << base_dir << "/shuffle_" << stage << "/node_" << node;
+	ss << base_dir << "/shuffle_" << exchange << "/node_" << node;
 	return ss.str();
 }
 
 std::string ShuffleCache::PartitionDirectory(idx_t partition_idx) const {
 	auto base_dir = config_.local_dirs[partition_idx % config_.local_dirs.size()];
-	auto stage = ShuffleCacheSanitizePathComponent(config_.shuffle_stage_id);
+	auto exchange = ShuffleCacheSanitizePathComponent(config_.exchange_id);
 	auto node = ShuffleCacheSanitizePathComponent(config_.node_id);
 	std::ostringstream ss;
-	ss << base_dir << "/shuffle_" << stage << "/node_" << node << "/partition_" << partition_idx;
+	ss << base_dir << "/shuffle_" << exchange << "/node_" << node << "/partition_" << partition_idx;
 	return ss.str();
 }
 
@@ -809,7 +809,7 @@ DuckDBResult<void> ShuffleCache::WriteAttemptManifest(idx_t sink_partition_id, i
 	auto manifest_path = ManifestFilePath();
 	std::ostringstream manifest;
 	manifest << "version=1\n";
-	manifest << "shuffle_stage_id=" << config_.shuffle_stage_id << "\n";
+	manifest << "exchange_id=" << config_.exchange_id << "\n";
 	manifest << "node_id=" << config_.node_id << "\n";
 	manifest << "sink_partition_id=" << sink_partition_id << "\n";
 	manifest << "attempt_id=" << attempt_id << "\n";
@@ -866,7 +866,7 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 
 	ShuffleAttemptManifest manifest;
 	bool seen_version = false;
-	bool seen_shuffle_stage_id = false;
+	bool seen_exchange_id = false;
 	bool seen_node_id = false;
 	bool seen_sink_partition_id = false;
 	bool seen_attempt_id = false;
@@ -940,16 +940,16 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 				return DuckDBResult<ShuffleAttemptManifest>::err(
 				    DuckDBError::value_error("unsupported shuffle attempt manifest version: " + value));
 			}
-		} else if (key == "shuffle_stage_id") {
-			auto dup_res = CheckDuplicateManifestField(seen_shuffle_stage_id, key);
+		} else if (key == "exchange_id") {
+			auto dup_res = CheckDuplicateManifestField(seen_exchange_id, key);
 			if (dup_res.is_err()) {
 				return DuckDBResult<ShuffleAttemptManifest>::err(dup_res.error());
 			}
 			if (value.empty()) {
 				return DuckDBResult<ShuffleAttemptManifest>::err(
-				    DuckDBError::value_error("shuffle attempt manifest empty shuffle_stage_id"));
+				    DuckDBError::value_error("shuffle attempt manifest empty exchange_id"));
 			}
-			manifest.shuffle_stage_id = std::move(value);
+			manifest.exchange_id = std::move(value);
 		} else if (key == "node_id") {
 			auto dup_res = CheckDuplicateManifestField(seen_node_id, key);
 			if (dup_res.is_err()) {
@@ -995,7 +995,7 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 		return DuckDBResult<ShuffleAttemptManifest>::err(
 		    DuckDBError::io_error("failed to read shuffle attempt manifest: " + manifest_path));
 	}
-	if (!seen_version || !seen_shuffle_stage_id || !seen_node_id || !seen_sink_partition_id || !seen_attempt_id ||
+	if (!seen_version || !seen_exchange_id || !seen_node_id || !seen_sink_partition_id || !seen_attempt_id ||
 	    !seen_output_partition_count) {
 		return DuckDBResult<ShuffleAttemptManifest>::err(
 		    DuckDBError::value_error("shuffle attempt manifest missing required field: " + manifest_path));
@@ -1054,9 +1054,9 @@ DuckDBResult<ShufflePartitionFiles> ShuffleCache::GetPartitionFilesFromManifest(
 		return DuckDBResult<ShufflePartitionFiles>::err(manifest_res.error());
 	}
 	auto manifest = std::move(manifest_res.value());
-	if (manifest.shuffle_stage_id != config_.shuffle_stage_id) {
+	if (manifest.exchange_id != config_.exchange_id) {
 		return DuckDBResult<ShufflePartitionFiles>::err(
-		    DuckDBError::value_error("shuffle attempt manifest stage id mismatch"));
+		    DuckDBError::value_error("shuffle attempt manifest exchange id mismatch"));
 	}
 	if (!config_.node_id.empty() && manifest.node_id != config_.node_id) {
 		return DuckDBResult<ShufflePartitionFiles>::err(
@@ -1070,8 +1070,8 @@ DuckDBResult<idx_t> ShuffleCache::RemoveAttemptStorage() const {
 }
 
 DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config, const ShuffleStorage &storage) {
-	if (config.shuffle_stage_id.empty()) {
-		return DuckDBResult<idx_t>::err(DuckDBError::value_error("shuffle cache stage id is empty"));
+	if (config.exchange_id.empty()) {
+		return DuckDBResult<idx_t>::err(DuckDBError::value_error("shuffle cache exchange id is empty"));
 	}
 	if (config.node_id.empty()) {
 		return DuckDBResult<idx_t>::err(DuckDBError::value_error("shuffle cache node id is empty"));
@@ -1080,7 +1080,7 @@ DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config
 		return DuckDBResult<idx_t>::ok(0);
 	}
 
-	auto stage = ShuffleCacheSanitizePathComponent(config.shuffle_stage_id);
+	auto exchange = ShuffleCacheSanitizePathComponent(config.exchange_id);
 	auto node = ShuffleCacheSanitizePathComponent(config.node_id);
 	std::unordered_set<std::string> seen_attempt_dirs;
 	idx_t removed_total = 0;
@@ -1089,7 +1089,7 @@ DuckDBResult<idx_t> RemoveShuffleAttemptStorage(const ShuffleCacheConfig &config
 			continue;
 		}
 		std::ostringstream ss;
-		ss << base_dir << "/shuffle_" << stage << "/node_" << node;
+		ss << base_dir << "/shuffle_" << exchange << "/node_" << node;
 		auto attempt_dir = ss.str();
 		if (!seen_attempt_dirs.insert(attempt_dir).second) {
 			continue;

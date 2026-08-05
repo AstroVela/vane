@@ -26,11 +26,6 @@ pytest_args=(
   -o pythonpath=tests
 )
 
-ray_object_store_bytes="$(
-  PYTHONPATH="tests${PYTHONPATH:+:${PYTHONPATH}}" \
-    python -c "from ray_test_profile import ray_test_object_store_bytes; print(ray_test_object_store_bytes())"
-)"
-
 # Let the non-Ray process release all Python/native state before a fresh pytest
 # process starts the real Ray runtime.
 python -m pytest \
@@ -38,8 +33,7 @@ python -m pytest \
   -m "not external_service and not real_ray" \
   "${release_tests[@]}"
 
-VANE_TEST_RAY_OBJECT_STORE_BYTES="${ray_object_store_bytes}" \
-  python -m pytest \
+python -m pytest \
   "${pytest_args[@]}" \
   -m "not external_service and real_ray" \
   "${release_tests[@]}"

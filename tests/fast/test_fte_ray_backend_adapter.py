@@ -189,6 +189,9 @@ class _FakeCoordinator:
         self.calls.append(("task_input_stream_exhausted_for_query", (query_id, source_node_ids)))
         return self.exhaustion_handles
 
+    def materialization_barrier_completed(self, query_id, node_id):
+        self.calls.append(("materialization_barrier_completed", (query_id, node_id)))
+
     def wait_fte_query(self, query_id, timeout_s):
         self.calls.append(("wait_fte_query", (query_id, timeout_s)))
         return {"query_id": query_id, "finished": True, "failed": False}
@@ -226,6 +229,7 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
     assert submitted[0].poll().output == "submitted"
 
     backend.task_input_stream_exhausted("query-a", ("source-a",))
+    backend.materialization_barrier_completed("query-a", "7")
     handles = backend.wait_query("query-a", 2.0)
 
     assert [handle.poll().output for handle in handles] == ["submitted", "exhausted", "popped"]
@@ -237,6 +241,7 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
         ("worker_snapshots", ()),
         ("submit_tasks", (["task-a"],)),
         ("task_input_stream_exhausted_for_query", ("query-a", ["source-a"])),
+        ("materialization_barrier_completed", ("query-a", "7")),
         ("wait_fte_query", ("query-a", 2.0)),
         ("pop_fte_result_handles", ("query-a",)),
         ("fte_drop_query", ("query-a",)),

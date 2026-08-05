@@ -19,17 +19,16 @@ from duckdb.runners.progress import (
 )
 from duckdb.runners.ray.fte import FteTaskExecution
 from duckdb.runners.ray.progress import ProgressRenderer, build_progress_snapshot, format_progress_snapshot
-from duckdb.runners.ray.query_execution_graph import (
-    NodeResourceAllocation,
+from duckdb.runners.ray.query_resource_graph import (
     QueryAllocation,
-    QueryExecutionGraph,
+    QueryResourceGraph,
+    ResourceUnitSpec,
     ResourceVector,
-    StageResourceSpec,
 )
 from duckdb.runners.ray.query_resource_manager import TaskRequest
 from duckdb.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
-    register_query_graph,
+    register_query_resource_graph,
 )
 
 
@@ -43,7 +42,6 @@ def _topology(
                 "pipeline_id": pipeline_id,
                 "operators": operators,
                 "operator_details": (operator_details if operator_details is not None else [{} for _ in operators]),
-                "stage_ids": [],
             }
             for pipeline_id, operators, operator_details in pipelines
         ],
@@ -53,39 +51,34 @@ def _topology(
 def test_progress_snapshot_includes_query_resource_manager():
     clear_query_resource_managers()
     try:
-        stage = StageResourceSpec(
+        unit = ResourceUnitSpec(
             query_id="q-progress",
-            stage_id="stage:q-progress:node:1:fte",
-            physical_node_id="node:1:fte",
-            stage_kind="fte",
+            resource_unit_id="resource:q-progress:fragment:node:1",
+            physical_node_id="node:1:native-fragment",
+            unit_kind="native_fragment",
             backend="ray_worker",
-            input_stage_ids=(),
-            per_task=ResourceVector(cpu=1, heap_bytes=1),
+            input_unit_ids=(),
+            per_task=ResourceVector(),
             target_output_block_bytes=1,
             generator_buffer_blocks=1,
             max_concurrency=1,
         )
-        manager = register_query_graph(
-            QueryExecutionGraph(
+        manager = register_query_resource_graph(
+            QueryResourceGraph(
                 query_id="q-progress",
                 plan_digest="sha256:q-progress",
-                stages=(stage,),
-                terminal_stage_ids=(stage.stage_id,),
+                units=(unit,),
+                terminal_unit_ids=(unit.resource_unit_id,),
             ),
             QueryAllocation(
                 resources=ResourceVector(cpu=1, heap_bytes=2, object_store_bytes=1),
-                node_allocations=(
-                    NodeResourceAllocation(
-                        node_id="node-a",
-                        resources=ResourceVector(cpu=1, heap_bytes=2, object_store_bytes=1),
-                    ),
-                ),
-                actor_placements=(),
                 generation=1,
             ),
         )
-        manager.update_stage_state(stage.stage_id, runnable=True)
-        grant = manager.try_acquire_task(TaskRequest("q-progress", stage.stage_id, "task-1", "attempt-1", "node-a"))
+        manager.update_unit_state(unit.resource_unit_id, runnable=True)
+        grant = manager.try_acquire_task(
+            TaskRequest("q-progress", unit.resource_unit_id, "task-1", "attempt-1", "node-a")
+        )
         assert grant.granted
 
         snapshot = build_progress_snapshot(
@@ -93,7 +86,7 @@ def test_progress_snapshot_includes_query_resource_manager():
             "q-progress",
         )
 
-        assert snapshot["query"]["query_resource_manager"]["stages"][stage.stage_id]["active_task_count"] == 1
+        assert snapshot["query"]["query_resource_manager"]["units"][unit.resource_unit_id]["active_task_count"] == 1
     finally:
         clear_query_resource_managers()
 
@@ -362,13 +355,11 @@ def test_progress_snapshot_publishes_native_topology_before_first_partition_runs
                 "pipeline_id": 1,
                 "operators": ["RESULT_COLLECTOR"],
                 "operator_details": [{}],
-                "stage_ids": [],
             },
             {
                 "pipeline_id": 2,
                 "operators": ["TABLE_SCAN", "PROJECTION", "RESULT_COLLECTOR"],
                 "operator_details": [{}, {}, {}],
-                "stage_ids": [],
             },
         ],
     }
@@ -412,13 +403,11 @@ def test_progress_snapshot_overlays_only_live_counters_matching_planned_topology
                 "pipeline_id": 1,
                 "operators": ["RESULT_COLLECTOR"],
                 "operator_details": [{}],
-                "stage_ids": [],
             },
             {
                 "pipeline_id": 2,
                 "operators": ["TABLE_SCAN", "PROJECTION", "RESULT_COLLECTOR"],
                 "operator_details": [{}, {}, {}],
-                "stage_ids": [],
             },
         ],
     }
@@ -489,7 +478,6 @@ def test_fragment_does_not_mix_deferred_partitions_with_native_pipeline_tasks():
                 "name": "ExchangeSource->Transform",
                 "operators": ["EXCHANGE_SOURCE", "PROJECTION"],
                 "operator_details": [{}, {}],
-                "stage_ids": [],
                 "total_pipeline_tasks": 36,
                 "queued_pipeline_tasks": 0,
                 "running_pipeline_tasks": 0,
@@ -501,7 +489,6 @@ def test_fragment_does_not_mix_deferred_partitions_with_native_pipeline_tasks():
                     "name": f"Pipeline{pipeline_id}",
                     "operators": ["PROJECTION"],
                     "operator_details": [{}],
-                    "stage_ids": [],
                     "total_pipeline_tasks": 1,
                     "queued_pipeline_tasks": int(pipeline_id <= 2),
                     "running_pipeline_tasks": int(pipeline_id in {3, 4}),

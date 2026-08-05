@@ -934,7 +934,7 @@ bool FlightExchange::CleanupAttemptStorage(const SinkAttemptMetadata &attempt_me
 	}
 
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = attempt_metadata.output_location;
+	cache_config.exchange_id = attempt_metadata.output_location;
 	cache_config.node_id = attempt_metadata.node_id;
 	cache_config.num_partitions = output_partition_count_;
 	cache_config.local_dirs = config_.local_dirs;
@@ -1028,7 +1028,7 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 		}
 		try {
 			ShuffleCacheConfig cache_config;
-			cache_config.shuffle_stage_id = attempt_metadata.output_location;
+			cache_config.exchange_id = attempt_metadata.output_location;
 			cache_config.node_id = attempt_metadata.node_id;
 			cache_config.num_partitions = output_partition_count_;
 			cache_config.local_dirs = config_.local_dirs;
@@ -1296,7 +1296,7 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 			return;
 		}
 		ShuffleCacheConfig cache_config;
-		cache_config.shuffle_stage_id = output_location;
+		cache_config.exchange_id = output_location;
 		cache_config.node_id = source_node_id;
 		cache_config.num_partitions = std::max<idx_t>(partition_id + 1, 1);
 		cache_config.local_dirs = config_.local_dirs;
@@ -1627,7 +1627,7 @@ std::unique_ptr<ExchangeSink> FlightExchangeManager::CreateSink(const ExchangeSi
 	RefreshRuntimeNodeId();
 	// Create a ShuffleCache for this sink instance
 	ShuffleCacheConfig cache_config;
-	cache_config.shuffle_stage_id = handle.output_location;
+	cache_config.exchange_id = handle.output_location;
 	cache_config.node_id = config_.node_id;
 	cache_config.num_partitions = handle.output_partition_count;
 	cache_config.local_dirs = config_.local_dirs;

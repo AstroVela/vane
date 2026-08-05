@@ -95,6 +95,8 @@ class WorkerManagerBackend(Protocol):
         source_node_ids: Sequence[str],
     ) -> None: ...
 
+    def materialization_barrier_completed(self, query_id: str, node_id: str) -> None: ...
+
     def wait_query(
         self,
         query_id: str,

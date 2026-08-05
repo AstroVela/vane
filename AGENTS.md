@@ -52,8 +52,9 @@ The launcher runs non-Ray tests, shared-cluster Ray tests, and test-owned Ray
 clusters in separate pytest processes. Do not replace it with one long-lived
 `pytest tests/fast` process.
 
-The fast/release Ray shards use a 2 GiB object store by default. Override the
-test-only profile with `VANE_TEST_RAY_OBJECT_STORE_BYTES`; it does not configure
-production clusters. Tests that call `ray.init()` directly must be marked
-`real_ray` and `ray_cluster_owner`. Tests that require CUDA hardware must also
-be marked `gpu`; the standard CPU-only CI fast-test shards exclude that marker.
+The fast/release Ray shards let Ray size the object store from the node's
+available memory by default. Use `VANE_TEST_RAY_OBJECT_STORE_BYTES` only to pin
+the capacity for a specialized test; it does not configure production clusters.
+Tests that call `ray.init()` directly must be marked `real_ray` and
+`ray_cluster_owner`. Tests that require CUDA hardware must also be marked `gpu`;
+the standard CPU-only CI fast-test shards exclude that marker.

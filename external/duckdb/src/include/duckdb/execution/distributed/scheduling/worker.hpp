@@ -127,6 +127,13 @@ public:
 		    DuckDBError::invalid_state_error("worker manager does not support FTE source exhaustion"));
 	}
 
+	/// Notify the query resource controller that a true distributed
+	/// materialization boundary has finished and its downstream may start.
+	virtual DuckDBResult<void> materialization_barrier_completed(const std::string &query_id, NodeID node_id) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error("worker manager does not support materialization barriers"));
+	}
+
 	/// Submit task-stream events directly to the FTE task-update coordinator.
 	virtual DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) {
 		return DuckDBResult<void>::err(

@@ -19,6 +19,7 @@ from duckdb.execution.ray_stream_adapter import (
     RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
 )
+from duckdb.execution.udf_ray_stream_protocol import validate_stream_block_metadata
 from duckdb.execution.udf_stream_result_collector import (
     UDFStreamResultCollector,
     _OutputLeaseToken,
@@ -265,7 +266,7 @@ class _Driver:
             "lease": {
                 "lease_id": f"task-lease-{self.next_task}",
                 "query_id": request["query_id"],
-                "stage_id": request["stage_id"],
+                "resource_unit_id": request["resource_unit_id"],
                 "task_id": request["task_id"],
                 "attempt_id": request["attempt_id"],
                 "resources": {
@@ -290,12 +291,12 @@ class _Driver:
             "lease": {
                 "lease_id": f"output-lease-{self.next_output}",
                 "query_id": request["query_id"],
-                "producer_stage_id": request["producer_stage_id"],
+                "producer_unit_id": request["producer_unit_id"],
                 "task_lease_id": request["task_lease_id"],
                 "attempt_id": request["attempt_id"],
                 "block_id": request["block_id"],
                 "size_bytes": request["size_bytes"],
-                "state": "stage_queue",
+                "state": "unit_queue",
                 "liveness": False,
                 "allocation_generation": 1,
             },
@@ -309,7 +310,7 @@ def _metadata(lease, *, index=0, size_bytes=64, rows=1):
     return {
         "protocol_version": 1,
         "query_id": lease["query_id"],
-        "producer_stage_id": lease["stage_id"],
+        "producer_unit_id": lease["resource_unit_id"],
         "task_lease_id": lease["lease_id"],
         "attempt_id": lease["attempt_id"],
         "block_id": f"block:{lease['lease_id']}:{index}",
@@ -319,11 +320,26 @@ def _metadata(lease, *, index=0, size_bytes=64, rows=1):
     }
 
 
+def test_v1_stream_metadata_rejects_the_removed_producer_stage_field():
+    metadata = _metadata(
+        {
+            "query_id": "q1",
+            "resource_unit_id": "resource:q1:udf:node:1",
+            "lease_id": "lease-1",
+            "attempt_id": "attempt-1",
+        }
+    )
+    metadata["producer_stage_id"] = metadata.pop("producer_unit_id")
+
+    with pytest.raises(ValueError, match="unknown=producer_stage_id"):
+        validate_stream_block_metadata(metadata)
+
+
 def _source(fake_ray, driver, *, request_id, submitter):
     request = {
         "request_id": request_id,
         "query_id": "q1",
-        "stage_id": "stage:q1:node:1:udf",
+        "resource_unit_id": "resource:q1:udf:node:1",
         "task_id": f"task:{request_id}",
         "attempt_id": f"attempt:{request_id}",
         "retained_input_bytes": 0,
@@ -1906,7 +1922,7 @@ def test_metadata_transition_is_atomic_with_concurrent_capacity_refresh(
         collector.shutdown()
 
 
-def test_inflight_block_keeps_item_capacity_from_read_admission():
+def test_inflight_block_survives_temporary_downstream_backpressure():
     fake_ray = _FakeRay()
     driver = _Driver()
     holder = {}
@@ -1943,9 +1959,8 @@ def test_inflight_block_keeps_item_capacity_from_read_admission():
             time.sleep(0.005)
         assert holder["generator"].read_count == 1
 
-        # The pair is already in flight. A temporary downstream backpressure
-        # update may prevent delivery, but it cannot retroactively revoke the
-        # item-size admission under which the block was consumed.
+        # The pair is already in flight. Temporary downstream backpressure may
+        # prevent delivery, but restoring capacity must resume it.
         assert collector.drain_results(zero_capacity) == []
         fake_ray.make_ready(holder["metadata_ref"])
         zero_capacity_events = []
@@ -2411,7 +2426,7 @@ def test_output_grant_transition_is_atomic_with_slot_cancellation():
         request = {
             "request_id": f"output-request:{metadata['block_id']}",
             "query_id": metadata["query_id"],
-            "producer_stage_id": metadata["producer_stage_id"],
+            "producer_unit_id": metadata["producer_unit_id"],
             "task_lease_id": metadata["task_lease_id"],
             "attempt_id": metadata["attempt_id"],
             "block_id": metadata["block_id"],
@@ -2496,7 +2511,7 @@ def test_terminal_record_releases_completed_output_lease_with_exact_rpc_contract
     metadata = _metadata(lease)
     output_request = {
         "query_id": metadata["query_id"],
-        "producer_stage_id": metadata["producer_stage_id"],
+        "producer_unit_id": metadata["producer_unit_id"],
         "task_lease_id": metadata["task_lease_id"],
         "attempt_id": metadata["attempt_id"],
         "block_id": metadata["block_id"],
@@ -2936,7 +2951,7 @@ def test_real_ray_generator_wait_is_non_consuming_and_preserves_pair_order():
         metadata = {
             "protocol_version": 1,
             "query_id": lease["query_id"],
-            "producer_stage_id": lease["stage_id"],
+            "producer_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
             "block_id": "real-ray:block:0",
@@ -3084,7 +3099,7 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
     def submitter(lease):
         payload = {
             "query_id": lease["query_id"],
-            "stage_id": lease["stage_id"],
+            "resource_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
         }
@@ -3131,7 +3146,7 @@ def test_remote_provider_capability_error_preserves_safe_details():
     def submitter(lease):
         payload = {
             "query_id": lease["query_id"],
-            "stage_id": lease["stage_id"],
+            "resource_unit_id": lease["resource_unit_id"],
             "task_lease_id": lease["lease_id"],
             "attempt_id": lease["attempt_id"],
         }
@@ -3351,7 +3366,7 @@ def test_pending_output_control_futures_do_not_withhold_task_or_stream_cleanup()
         collector.shutdown()
 
 
-def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queue():
+def test_block_larger_than_soft_item_target_uses_one_bounded_delivery():
     fake_ray = _FakeRay()
     driver = _Driver()
 
@@ -3373,13 +3388,13 @@ def test_block_larger_than_declared_item_capacity_fails_instead_of_stalling_queu
         events = _drain_until(
             collector,
             {7: {"rows": 1, "bytes": 128, "item_bytes": 128}},
-            predicate=lambda values: any(item[2] == "error" for item in values),
+            predicate=lambda values: any(item[2] in {"complete", "error"} for item in values),
         )
-        assert len(events) == 1
-        assert events[0][2] == "error"
-        assert "exceeds downstream item capacity" in events[0][3]
-        assert driver.acquire_query_output_block_lease.calls == []
-        assert len(driver.release_query_task_lease_after_completion.calls) == 1
+        assert [item[2] for item in events] == ["data", "complete"]
+        assert len(driver.acquire_query_output_block_lease.calls) == 1
+        request = driver.acquire_query_output_block_lease.calls[0][0][0]
+        assert request["size_bytes"] == 129
+        assert len(driver.release_query_task_lease.calls) == 1
     finally:
         collector.shutdown()
 

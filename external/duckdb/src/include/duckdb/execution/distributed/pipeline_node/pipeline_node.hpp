@@ -84,7 +84,7 @@ public:
 		    {"query_id", query_id_}, {"node_id", std::to_string(node_id_)}, {"node_name", node_name_}};
 		if (!query_id_.empty()) {
 			result.emplace("resource_query_id", query_id_);
-			result.emplace("resource_stage_id", "stage:" + query_id_ + ":node:" + std::to_string(node_id_) + ":fte");
+			result.emplace("resource_unit_id", "resource:" + query_id_ + ":fragment:node:" + std::to_string(node_id_));
 		}
 		return result;
 	}
@@ -115,6 +115,7 @@ public:
 	virtual DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) = 0;
 	virtual DuckDBResult<void> task_input_stream_exhausted(const std::string &query_id,
 	                                                       const std::unordered_set<SourceNodeId> &source_node_ids) = 0;
+	virtual DuckDBResult<void> materialization_barrier_completed(const std::string &query_id, NodeID node_id) = 0;
 	virtual DuckDBResult<std::vector<MaterializedOutput>> wait_query_finished(const std::string &query_id,
 	                                                                          double timeout_s) = 0;
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
@@ -434,6 +435,17 @@ public:
 	virtual bool is_sink() const {
 		return false;
 	}
+	/// True only when downstream distributed tasks cannot be emitted until this
+	/// node has materialized its complete distributed input.
+	virtual bool is_materialization_barrier() const {
+		return false;
+	}
+	/// Physical child nodes whose complete distributed output must be
+	/// materialized before this barrier is released. Barrier nodes must
+	/// explicitly identify at least one input; non-barrier nodes return none.
+	virtual std::vector<NodeID> materialized_input_node_ids() const {
+		return {};
+	}
 	virtual std::vector<std::string> multiline_display(bool verbose) const = 0;
 };
 
@@ -500,6 +512,18 @@ public:
 	// 获取节点名称
 	NodeName name() const {
 		return op_->name();
+	}
+
+	bool is_sink() const override {
+		return op_->is_sink();
+	}
+
+	bool is_materialization_barrier() const override {
+		return op_->is_materialization_barrier();
+	}
+
+	std::vector<NodeID> materialized_input_node_ids() const override {
+		return op_->materialized_input_node_ids();
 	}
 
 	const PipelineNodeRef &implementation() const {

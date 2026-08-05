@@ -37,8 +37,8 @@ class ExchangeManager {
 public:
 	virtual ~ExchangeManager() = default;
 
-	/// Create an Exchange for a shuffle stage.
-	/// Called once per shuffle stage on the coordinator.
+	/// Create an Exchange for a logical exchange.
+	/// Called once per logical exchange on the coordinator.
 	///
 	/// @param ctx                    Context with query/exchange identifiers
 	/// @param output_partition_count Number of output partitions for hash/range partitioning

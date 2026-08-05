@@ -59,7 +59,7 @@ class FakePlan:
                 "payload": {
                     "execution_backend": "ray_actor",
                     "side_effects": True,
-                    "stage_id": "stage:side-effect-fault",
+                    "resource_unit_id": "resource:side-effect-fault",
                 },
             }
         ]
@@ -120,7 +120,7 @@ try:
     node_id = ray.get_runtime_context().get_node_id()
     created, _ = udf_ray.ensure_actor_pools_for_plan(
         FakePlan(),
-        actor_node_ids_by_stage={"stage:side-effect-fault": (node_id,)},
+        actor_node_ids_by_unit={"resource:side-effect-fault": (node_id,)},
         query_driver_handle=object(),
         query_generation_capability="test-query-generation-capability",
         session_config={},

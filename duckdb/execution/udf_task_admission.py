@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import uuid
 import weakref
@@ -28,8 +27,6 @@ from duckdb.execution.udf_admission import (
     AdmissionLease,
 )
 
-_DEFAULT_RAY_TASK_HEAP_BYTES = 2 * 1024**3
-_DEFAULT_RAY_ACTOR_HEAP_BYTES = 4 * 1024**3
 _TASK_ADMISSION_CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _TASK_ADMISSION_CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _TASK_ADMISSION_CLEANUP_RESPONSE_TIMEOUT_S = 1.0
@@ -45,17 +42,11 @@ def _positive_int(value: Any, name: str) -> int:
 
 def ray_udf_task_memory_bytes(payload: dict[str, Any]) -> int:
     backend = str(payload.get("execution_backend") or "").strip()
-    if backend == "ray_task":
-        env_name = "VANE_UDF_TASK_HEAP_BYTES"
-        default = _DEFAULT_RAY_TASK_HEAP_BYTES
-    elif backend == "ray_actor":
-        env_name = "VANE_UDF_ACTOR_HEAP_BYTES"
-        default = _DEFAULT_RAY_ACTOR_HEAP_BYTES
-    else:
+    if backend not in {"ray_task", "ray_actor"}:
         raise ValueError(f"task admission requires a Ray UDF backend, got {backend!r}")
     raw = payload.get("memory_bytes")
     if raw is None:
-        raw = os.environ.get(env_name, str(default))
+        return 0
     return _positive_int(raw, "memory_bytes")
 
 
@@ -310,9 +301,9 @@ class TaskAdmissionController:
     ) -> None:
         self._payload = dict(payload)
         self._query_id = str(self._payload.get("query_id") or "").strip()
-        self._stage_id = str(self._payload.get("stage_id") or "").strip()
-        if not self._query_id or not self._stage_id:
-            raise ValueError("distributed Ray UDF task admission requires query_id and stage_id")
+        self._resource_unit_id = str(self._payload.get("resource_unit_id") or "").strip()
+        if not self._query_id or not self._resource_unit_id:
+            raise ValueError("distributed Ray UDF task admission requires query_id and resource_unit_id")
         if driver is None:
             raise ValueError("distributed Ray UDF task admission requires an explicit query driver handle")
         self._query_generation_capability = str(query_generation_capability or "").strip()
@@ -348,10 +339,10 @@ class TaskAdmissionController:
         self._sequence += 1
         identity = f"executor:{self._executor_id}:admission:{self._sequence}"
         return {
-            "request_id": f"request:task:{self._stage_id}:{identity}",
+            "request_id": f"request:task:{self._resource_unit_id}:{identity}",
             "query_id": self._query_id,
-            "stage_id": self._stage_id,
-            "task_id": f"task:{self._stage_id}:{identity}",
+            "resource_unit_id": self._resource_unit_id,
+            "task_id": f"task:{self._resource_unit_id}:{identity}",
             "attempt_id": f"attempt:{self._executor_id}:{self._sequence}",
             "node_id": None,
             "retained_input_bytes": retained_input_bytes,

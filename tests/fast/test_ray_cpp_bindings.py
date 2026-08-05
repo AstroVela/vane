@@ -1129,7 +1129,7 @@ def test_shuffle_cache_attempt_manifest_runtime_path(tmp_path):
     assert Path(result["committed_path"]).exists()
     manifest = result["manifest"]
     assert "version=1\n" in manifest
-    assert "shuffle_stage_id=shuffle_cache_manifest_test__sink_3__attempt_2\n" in manifest
+    assert "exchange_id=shuffle_cache_manifest_test__sink_3__attempt_2\n" in manifest
     assert "node_id=node-a\n" in manifest
     assert "sink_partition_id=3\n" in manifest
     assert "attempt_id=2\n" in manifest

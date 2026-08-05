@@ -27,9 +27,18 @@ from duckdb.execution.udf_ray_stream_protocol import (
     iter_bounded_stream_blocks,
     make_stream_block_metadata,
     make_stream_error_pair,
-    validate_task_runtime_node,
 )
 from duckdb.execution.udf_threading import configure_ray_actor_loaded_torch_threads
+from duckdb.runners.ray.query_runtime_protocol import (
+    RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+    RAY_ACTOR_INDEX_ENV,
+    RAY_ACTOR_POOL_NONCE_ENV,
+    RAY_ACTOR_QUERY_ID_ENV,
+    RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+    RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
+    query_runtime_actor_name,
+    ray_runtime_job_id,
+)
 from duckdb.runners.ray.ray_env import install_explicit_session_runtime_env
 from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
@@ -54,9 +63,9 @@ def _actor_debug_log(event: str, payload: dict[str, Any] | None = None, **fields
     query_id = payload.get("query_id")
     if query_id:
         parts.append(f"query_id={query_id}")
-    stage_id = payload.get("stage_id")
-    if stage_id:
-        parts.append(f"stage_id={stage_id}")
+    resource_unit_id = payload.get("resource_unit_id")
+    if resource_unit_id:
+        parts.append(f"resource_unit_id={resource_unit_id}")
     backend = payload.get("backend")
     if backend:
         parts.append(f"backend={backend}")
@@ -88,6 +97,98 @@ def _materialize_ref_bundle(
     return _apply_ref_bundle_slices(blocks, slices, metadata=metadata, names=names)
 
 
+def _reconstructed_actor_location_report(
+    runtime_context: Any,
+    *,
+    expected_payload: dict[str, Any] | None = None,
+    wait: bool,
+) -> Any | None:
+    if not bool(runtime_context.was_current_actor_reconstructed):
+        return None
+
+    values = {
+        "query_id": os.environ.get(RAY_ACTOR_QUERY_ID_ENV, "").strip(),
+        "resource_unit_id": os.environ.get(RAY_ACTOR_RESOURCE_UNIT_ID_ENV, "").strip(),
+        "pool_nonce": os.environ.get(RAY_ACTOR_POOL_NONCE_ENV, "").strip(),
+        "generation_capability": os.environ.get(RAY_ACTOR_GENERATION_CAPABILITY_ENV, "").strip(),
+        "actor_index": os.environ.get(RAY_ACTOR_INDEX_ENV, "").strip(),
+    }
+    missing = sorted(key for key, value in values.items() if not value)
+    if missing:
+        raise RuntimeError("reconstructed Ray actor is missing location protocol environment: " + ", ".join(missing))
+    try:
+        actor_index = int(values["actor_index"])
+    except ValueError as exc:
+        raise RuntimeError("reconstructed Ray actor has an invalid actor index") from exc
+    if actor_index < 0:
+        raise RuntimeError("reconstructed Ray actor has a negative actor index")
+    if expected_payload is not None:
+        expected_query_id = str(expected_payload.get("query_id") or "").strip()
+        expected_resource_unit_id = str(expected_payload.get("resource_unit_id") or "").strip()
+        expected_actor_index = expected_payload.get("actor_index")
+        if (
+            values["query_id"] != expected_query_id
+            or values["resource_unit_id"] != expected_resource_unit_id
+            or isinstance(expected_actor_index, bool)
+            or not isinstance(expected_actor_index, int)
+            or actor_index != expected_actor_index
+        ):
+            raise RuntimeError("reconstructed Ray actor location does not match its task lease")
+
+    node_id = str(runtime_context.get_node_id() or "").strip()
+    if not node_id:
+        raise RuntimeError("reconstructed Ray actor runtime did not expose node_id")
+    import ray
+
+    driver = ray.get_actor(
+        query_runtime_actor_name(ray_runtime_job_id(runtime_context)),
+        namespace=RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
+    )
+    report_ref = driver.report_query_udf_actor_location.remote(
+        {
+            "query_id": values["query_id"],
+            "resource_unit_id": values["resource_unit_id"],
+            "actor_index": actor_index,
+            "pool_nonce": values["pool_nonce"],
+            "node_id": node_id,
+        },
+        values["generation_capability"],
+    )
+    if not wait:
+        return report_ref
+    result = resolve_object_refs_blocking(report_ref)
+    if not isinstance(result, dict):
+        raise RuntimeError("Ray actor location reconciliation returned an invalid result")
+    if not bool(result.get("accepted")) or str(result.get("node_id") or "").strip() != node_id:
+        raise RuntimeError("Ray query no longer accepts this reconstructed actor location")
+    return report_ref
+
+
+def _validate_actor_task_runtime_node(payload: dict[str, Any]) -> str:
+    expected_node_id = str(payload.get("node_id") or "").strip()
+    if not expected_node_id:
+        raise RuntimeError("distributed Ray UDF task payload is missing leased node_id")
+    import ray
+
+    runtime_context = ray.get_runtime_context()
+    actual_node_id = str(runtime_context.get_node_id() or "").strip()
+    if not actual_node_id:
+        raise RuntimeError("Ray runtime context did not expose the executing node_id")
+    if actual_node_id == expected_node_id:
+        return actual_node_id
+    report_ref = _reconstructed_actor_location_report(
+        runtime_context,
+        expected_payload=payload,
+        wait=True,
+    )
+    if report_ref is None:
+        raise RuntimeError(
+            "distributed Ray UDF executed outside its query lease: "
+            f"expected_node_id={expected_node_id} actual_node_id={actual_node_id}"
+        )
+    return actual_node_id
+
+
 def _payload_requires_ray_block_stream(payload: dict[str, Any] | None) -> bool:
     payload = payload or {}
     if not bool(payload.get("produce_ray_block_stream", False)):
@@ -112,8 +213,22 @@ def _actor_class(
             # Payload is injected via init_payload() immediately after creation.
             self._payload: dict[str, Any] | None = None
             self.executor: RuntimeUDFExecutor | None = None  # lazy init on first streaming submission
+            self._vane_location_report_ref: Any | None = None
+            self._vane_location_report_error: BaseException | None = None
+            try:
+                import ray
 
-        def init_payload(self, payload: dict[str, Any]) -> None:
+                self._vane_location_report_ref = _reconstructed_actor_location_report(
+                    ray.get_runtime_context(),
+                    wait=False,
+                )
+            except BaseException as exc:
+                # Do not turn a transient driver lookup race into another Ray
+                # actor reconstruction. The first retried invocation performs
+                # the same report synchronously before executing user code.
+                self._vane_location_report_error = exc
+
+        def init_payload(self, payload: dict[str, Any]) -> str:
             """Inject payload after construction to avoid Ray object-store GC issues."""
             self._payload = payload
             _actor_debug_log("init_payload", self._payload)
@@ -128,6 +243,12 @@ def _actor_class(
                 if _eager_actor_warm_up_enabled(self._payload):
                     executor.warm_up()
                 _actor_debug_log("executor_init_done", self._payload, path="init_payload")
+            import ray
+
+            node_id = str(ray.get_runtime_context().get_node_id() or "").strip()
+            if not node_id:
+                raise RuntimeError("Ray actor runtime did not expose node_id after initialization")
+            return node_id
 
         def _ensure_executor(self, effective_payload: dict[str, Any]) -> RuntimeUDFExecutor:
             executor = self.executor
@@ -174,7 +295,7 @@ def _actor_class(
             effective_payload: dict[str, Any],
         ) -> Iterator[Any]:
             _payload_requires_ray_block_stream(effective_payload)
-            validate_task_runtime_node(effective_payload)
+            _validate_actor_task_runtime_node(effective_payload)
             executor = self.executor
             if executor is None:
                 _actor_debug_log("executor_init_start", effective_payload, path="run_block_stream")
@@ -262,11 +383,17 @@ def _actor_class(
             metadata: Any = None,
             names: Any = None,
         ) -> Iterator[Any]:
-            base_payload = payload or self._payload or {}
+            effective_payload = dict(payload or self._payload or {})
             try:
+                # A reconstructed actor may have moved to another Ray node. Move
+                # the resident slot and any prefetched task lease in QRM before
+                # resolving input ObjectRefs on that node, not merely before the
+                # user callable starts. Carry the reconciled node into the nested
+                # block-stream call so it does not report the same move twice.
+                effective_payload["node_id"] = _validate_actor_task_runtime_node(effective_payload)
                 _actor_debug_log(
                     "run_ref_bundle_stream_start",
-                    base_payload,
+                    effective_payload,
                     blocks=len(blocks or []),
                     slices=len(slices or []),
                     metadata=len(metadata or []),
@@ -277,18 +404,18 @@ def _actor_class(
                 args = _apply_ref_bundle_slices(blocks, slices, metadata=metadata, names=names)
                 _actor_debug_log(
                     "run_ref_bundle_stream_materialized",
-                    base_payload,
+                    effective_payload,
                     rows=args.num_rows,
                     columns=args.num_columns,
                     materialize_s=f"{time.perf_counter() - materialize_start:.6f}",
                 )
                 for result in self.run_block_stream(
                     args,
-                    payload=payload,
+                    payload=effective_payload,
                 ):
                     yield result
             except Exception as exc:
-                error_block, error_metadata = make_stream_error_pair(base_payload, exc)
+                error_block, error_metadata = make_stream_error_pair(effective_payload, exc)
                 yield error_block
                 yield error_metadata
 

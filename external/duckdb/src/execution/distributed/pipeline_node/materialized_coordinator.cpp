@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/execution/distributed/pipeline_node/materialized_coordinator.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/exchange/exchange.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
@@ -78,6 +79,11 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		return DuckDBResult<void>::err(
 		    DuckDBError::invalid_state_error("materialized coordinator requires an ExchangeManager"));
 	}
+	if (!node->is_materialization_barrier()) {
+		result_tx->close();
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+		    "materialized coordinator requires a node declared as a materialization barrier"));
+	}
 
 	auto types_res = ResolveSchemaTypes(materialized_schema ? materialized_schema : node->config().schema());
 	if (types_res.is_err()) {
@@ -134,6 +140,14 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		return DuckDBResult<void>::err(DuckDBError::internal_error(ex.what()));
 	}
 
+	auto barrier_result =
+	    fte_task_submitter->materialization_barrier_completed(node->context().query_id(), node->node_id());
+	if (barrier_result.is_err()) {
+		result_tx->close();
+		exchange->Close();
+		return DuckDBResult<void>::err(barrier_result.error());
+	}
+
 	auto source_handles = exchange->GetSourceHandles();
 	auto source_nodes = CollectCoordinatorSourceNodes(source_handles);
 	auto estimated_cardinality = EstimateRowsFromHandles(source_handles);
@@ -188,6 +202,9 @@ SubmittableTaskStream<WorkerTask> ProduceWithMaterializedCoordinator(
     PlanExecutionContext &plan_context, const PipelineNodeRef &child, const std::shared_ptr<PipelineNodeImpl> &node,
     MaterializedPlanBuilder final_plan_builder, PerTaskMaterializedPlanBuilderFactory per_task_builder_factory,
     std::shared_ptr<ExchangeManager> exchange_mgr, SchemaRef materialized_schema) {
+	if (!node) {
+		throw InternalException("Materialized coordinator requires a pipeline node");
+	}
 	auto input_stream = child->produce_tasks(plan_context);
 
 	auto channel_pair = create_channel<SubmittableTask<WorkerTask>>(1);

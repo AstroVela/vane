@@ -15,7 +15,7 @@ try:
 except Exception:
     ray = None
 
-from ray_test_profile import ray_test_object_store_bytes
+from ray_test_profile import ray_test_object_store_options
 
 import duckdb
 from duckdb import runners as _runners
@@ -28,9 +28,8 @@ def _vane_shuffle_env(monkeypatch):
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", "/tmp/duckdb_shuffle")
     monkeypatch.setenv("RAY_DEDUP_LOGS", "0")
-    # The default shared test profile reserves a 2 GiB object store. Keep FTE's
-    # production block target, while sizing UDF windows so multi-actor tests
-    # fit the query's 50% allocation and wide-row batches remain whole.
+    # Keep FTE's production block target, while sizing UDF windows so the
+    # multi-actor fixtures remain lightweight and wide-row batches stay whole.
     monkeypatch.setenv("VANE_UDF_TARGET_MAX_BATCH_BYTES", str(16 * 1024**2))
 
 
@@ -392,7 +391,7 @@ def ray_runner_local_cluster(_vane_shuffle_env):
             logging_level="info",
             log_to_driver=True,
             num_cpus=1,
-            object_store_memory=ray_test_object_store_bytes(),
+            **ray_test_object_store_options(),
         )
 
     try:

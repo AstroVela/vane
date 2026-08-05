@@ -64,6 +64,15 @@ public:
 		return collect_mark_join_build_summary_;
 	}
 
+	bool is_materialization_barrier() const override {
+		return collect_mark_join_build_summary_;
+	}
+
+	std::vector<NodeID> materialized_input_node_ids() const override {
+		return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()}
+		                                              : std::vector<NodeID> {};
+	}
+
 	// 生成任务流（核心方法）
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 

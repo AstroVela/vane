@@ -31,6 +31,9 @@ from duckdb.execution.udf_ray_actor_pool import (
     ensure_actor_pools_for_plan as _ensure_actor_pools_for_plan_impl,
 )
 from duckdb.execution.udf_ray_actor_pool import (
+    prepare_actor_pools_for_nodes as _prepare_actor_pools_for_nodes_impl,
+)
+from duckdb.execution.udf_ray_actor_pool import (
     prepare_actor_pools_for_plan as _prepare_actor_pools_for_plan_impl,
 )
 from duckdb.execution.udf_ray_actor_pool import (
@@ -38,6 +41,9 @@ from duckdb.execution.udf_ray_actor_pool import (
 )
 from duckdb.execution.udf_ray_actor_pool import (
     wait_for_actor_pools_ready as _wait_for_actor_pools_ready_impl,
+)
+from duckdb.execution.udf_ray_actor_pool import (
+    wait_for_first_actor_pool_ready as _wait_for_first_actor_pool_ready_impl,
 )
 from duckdb.execution.udf_ray_actor_runtime import (
     _actor_class as _actor_runtime_class,
@@ -62,9 +68,6 @@ from duckdb.execution.udf_ray_env import (
 )
 from duckdb.execution.udf_ray_env import (
     is_vane_worker_process as _is_vane_worker_process,
-)
-from duckdb.execution.udf_ray_env import (
-    normalize_actor_node_ids as _normalize_actor_node_ids,
 )
 from duckdb.execution.udf_ray_env import (
     normalize_actor_pool_payload as _normalize_actor_pool_payload,
@@ -110,6 +113,7 @@ from duckdb.runners.ray.ray_env import (
     install_explicit_session_runtime_env,
     scrub_shared_runtime_session_env,
 )
+from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
 
 DEFAULT_UDF_OUTPUT_TARGET_MAX_BYTES = 128 * 1024 * 1024
 DEFAULT_GENERATOR_BACKPRESSURE_NUM_OBJECTS = RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS
@@ -150,23 +154,15 @@ def _ray_payload_requires_block_stream(payload: dict[str, Any]) -> bool:
         raise RuntimeError("distributed Ray UDF output requires produce_ray_block_stream=True")
     if not str(payload.get("query_id") or "").strip():
         raise RuntimeError("distributed Ray UDF payload requires query_id")
-    if not str(payload.get("stage_id") or "").strip():
-        raise RuntimeError("distributed Ray UDF payload requires pre-registered stage_id")
+    if not str(payload.get("resource_unit_id") or "").strip():
+        raise RuntimeError("distributed Ray UDF payload requires pre-registered resource_unit_id")
     return True
 
 
-def _submit_ray_remote(remote_fn: Any, node_id: str, *args: Any, **kwargs: Any) -> Any:
-    node_key = str(node_id).strip()
-    if not node_key:
-        raise RuntimeError("Ray task submission requires its leased node_id")
-    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+def _submit_ray_remote(remote_fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Submit the real request without preselecting a physical Ray node."""
 
-    return remote_fn.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=node_key,
-            soft=False,
-        )
-    ).remote(*args, **kwargs)
+    return remote_fn.remote(*args, **kwargs)
 
 
 def _ray_task_debug_enabled() -> bool:
@@ -251,13 +247,15 @@ def _build_udf_executor_options(
     actor_handles: list[Any],
     actor_node_ids: list[str] | None,
     actor_dispatch_indices: set[int] | list[int] | tuple[int, ...] | None,
+    actor_init_refs: list[Any] | tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
-    normalized_node_ids = _normalize_actor_node_ids(
-        actor_node_ids,
-        expected_count=len(actor_handles),
+    normalized_node_ids = (
+        [""] * len(actor_handles)
+        if actor_node_ids is None
+        else [str(node_id or "").strip() for node_id in actor_node_ids]
     )
-    if normalized_node_ids is None:
-        raise ValueError("actor node IDs are required for pre-created Ray UDF actors")
+    if len(normalized_node_ids) != len(actor_handles):
+        raise ValueError("actor node IDs count must match actor handle count")
     if actor_dispatch_indices is None:
         raise ValueError("actor_dispatch_indices are required for pre-created Ray UDF actors")
     raw_dispatch_indices = list(actor_dispatch_indices)
@@ -268,10 +266,19 @@ def _build_udf_executor_options(
     invalid = [idx for idx in raw_dispatch_indices if idx < 0 or idx >= len(actor_handles)]
     if invalid:
         raise ValueError(f"actor_dispatch_indices contains out-of-range indices: {invalid}")
+    missing_ready_node_ids = [idx for idx in raw_dispatch_indices if not normalized_node_ids[idx]]
+    if missing_ready_node_ids:
+        raise ValueError(
+            "dispatch-ready actors require runtime node IDs: " + ", ".join(str(idx) for idx in missing_ready_node_ids)
+        )
+    init_refs = [] if actor_init_refs is None else list(actor_init_refs)
+    if init_refs and len(init_refs) != len(actor_handles):
+        raise ValueError("actor init refs count must match actor handle count")
     return {
         "actor_handles": list(actor_handles),
         "actor_node_ids": normalized_node_ids,
         "actor_dispatch_indices": sorted(raw_dispatch_indices),
+        "actor_init_refs": init_refs,
     }
 
 
@@ -305,14 +312,6 @@ class UDFActorPool(_UDFActorPoolBase):
     def _build_actor_runtime_env(ray_options: dict[str, Any] | None) -> dict[str, Any]:
         return _build_actor_runtime_env(ray_options)
 
-    @staticmethod
-    def _normalize_actor_node_ids(
-        node_ids: list[str] | None,
-        *,
-        expected_count: int,
-    ) -> list[str] | None:
-        return _normalize_actor_node_ids(node_ids, expected_count=expected_count)
-
 
 def _apply_actor_node_options(
     actors: _UDFActorPoolBase,
@@ -322,14 +321,12 @@ def _apply_actor_node_options(
     return _apply_actor_node_options_impl(
         actors,
         options=options,
-        normalize_actor_node_ids=_normalize_actor_node_ids,
     )
 
 
 def ensure_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -338,7 +335,6 @@ def ensure_actor_pools_for_plan(
     return _ensure_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -356,7 +352,6 @@ def ensure_actor_pools_for_plan(
 def ensure_actor_pools_for_nodes(
     udf_nodes: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -364,7 +359,31 @@ def ensure_actor_pools_for_nodes(
 ) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
     return _ensure_actor_pools_for_nodes_impl(
         udf_nodes,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
+        query_driver_handle=query_driver_handle,
+        query_generation_capability=query_generation_capability,
+        session_config=session_config,
+        set_handles=set_handles,
+        actor_pool_cls=UDFActorPool,
+        is_vane_worker_process=_is_vane_worker_process,
+        requires_actor_pool_fn=_requires_actor_pool_impl,
+        normalize_actor_pool_payload=_normalize_actor_pool_payload,
+        payload_num_gpus=_payload_num_gpus,
+        required_positive_int=_required_positive_int,
+        resolve_actor_num_cpus=_resolve_actor_num_cpus,
+        build_udf_executor_options=_build_udf_executor_options,
+    )
+
+
+def prepare_actor_pools_for_nodes(
+    udf_nodes: Any,
+    *,
+    query_driver_handle: Any,
+    query_generation_capability: str,
+    session_config: dict[str, str],
+    set_handles: Any = None,
+) -> tuple[list[_UDFActorPoolBase], dict[str, Any]]:
+    return _prepare_actor_pools_for_nodes_impl(
+        udf_nodes,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -383,7 +402,6 @@ def ensure_actor_pools_for_nodes(
 def prepare_actor_pools_for_plan(
     plan: Any,
     *,
-    actor_node_ids_by_stage: dict[str, tuple[str, ...]],
     query_driver_handle: Any,
     query_generation_capability: str,
     session_config: dict[str, str],
@@ -392,7 +410,6 @@ def prepare_actor_pools_for_plan(
     return _prepare_actor_pools_for_plan_impl(
         plan,
         conn=conn,
-        actor_node_ids_by_stage=actor_node_ids_by_stage,
         query_driver_handle=query_driver_handle,
         query_generation_capability=query_generation_capability,
         session_config=session_config,
@@ -409,6 +426,82 @@ def prepare_actor_pools_for_plan(
 
 def wait_for_actor_pools_ready(actor_pools: list[_UDFActorPoolBase]) -> None:
     _wait_for_actor_pools_ready_impl(actor_pools)
+
+
+def wait_for_first_actor_pool_ready(actor_pool: _UDFActorPoolBase) -> dict[int, str]:
+    return _wait_for_first_actor_pool_ready_impl(actor_pool)
+
+
+def configure_query_udf_execution_for_plan(
+    plan: Any,
+    *,
+    query_id: str,
+    query_driver_handle: Any,
+    query_generation_capability: str,
+    session_config: dict[str, str],
+    conn: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Inject query-scoped UDF options without eagerly creating actor pools.
+
+    Ray actor nodes receive a stable locator.  The executor resolves that
+    locator only when DuckDB reaches the node, so actor processes belong to the
+    current execution phase instead of the whole query lifetime.
+    """
+
+    if _is_vane_worker_process():
+        return {}
+    query_key = str(query_id or "").strip()
+    capability = str(query_generation_capability or "").strip()
+    if not query_key:
+        raise ValueError("query UDF execution requires query_id")
+    if query_driver_handle is None:
+        raise ValueError("query UDF execution requires an explicit query driver handle")
+    if not capability:
+        raise ValueError("query UDF execution requires a query generation capability")
+
+    normalized_session_config = {str(key): str(value) for key, value in session_config.items()}
+    actor_nodes_by_unit: dict[str, dict[str, Any]] = {}
+    executor_options_by_node: dict[str, dict[str, Any]] = {}
+    for raw_node in plan.collect_udf_nodes(conn=conn):
+        node = dict(raw_node)
+        payload = dict(node.get("payload") or {})
+        backend = str(payload.get("execution_backend") or "").strip().lower()
+        if backend not in {"ray_task", "ray_actor", "subprocess_task", "subprocess_actor"}:
+            continue
+        raw_node_id = node.get("node_id")
+        node_id = "" if raw_node_id is None else str(raw_node_id).strip()
+        if not node_id:
+            raise ValueError("query UDF node is missing node_id")
+        options: dict[str, Any] = {"session_config": normalized_session_config}
+        executor_options_by_node[node_id] = options
+        if backend not in {"ray_task", "ray_actor"}:
+            continue
+        options["query_driver_handle"] = query_driver_handle
+        options["query_generation_capability"] = capability
+        if backend != "ray_actor":
+            continue
+        normalized_payload = _normalize_actor_pool_payload(payload)
+        payload_query_id = str(normalized_payload.get("query_id") or "").strip()
+        if payload_query_id != query_key:
+            raise ValueError(
+                f"Ray actor UDF node {node_id} query_id mismatch: got {payload_query_id!r}, expected {query_key!r}"
+            )
+        resource_unit_id = str(normalized_payload.get("resource_unit_id") or "").strip()
+        if not resource_unit_id:
+            raise ValueError(f"Ray actor UDF node {node_id} is missing resource_unit_id")
+        if resource_unit_id in actor_nodes_by_unit:
+            raise ValueError(f"duplicate Ray actor UDF resource_unit_id: {resource_unit_id}")
+        node["payload"] = normalized_payload
+        actor_nodes_by_unit[resource_unit_id] = node
+        options["actor_pool_locator"] = {
+            "query_id": query_key,
+            "resource_unit_id": resource_unit_id,
+            "physical_node_id": node_id,
+        }
+
+    if executor_options_by_node:
+        plan.set_udf_actor_handles(executor_options_by_node, conn=conn)
+    return actor_nodes_by_unit
 
 
 class RemoteUDFExecutor(
@@ -457,12 +550,11 @@ class RemoteUDFExecutor(
         raw_input_names = payload.get("input_names")
         self._input_names: list[str] | None = list(raw_input_names) if raw_input_names else None
 
-        self._actor_node_ids = _normalize_actor_node_ids(
-            self._actors_obj.actor_node_ids,
-            expected_count=len(self.actors),
-        )
-        if not self._actor_node_ids or any(not node_id for node_id in self._actor_node_ids):
-            raise RuntimeError("every Ray actor handle requires a coordinator-confirmed node identity")
+        self._actor_node_ids = [str(node_id or "").strip() for node_id in self._actors_obj.actor_node_ids]
+        if len(self._actor_node_ids) != len(self.actors):
+            raise RuntimeError("Ray actor node identity count does not match its handle count")
+        if any(not self._actor_node_ids[actor_index] for actor_index in self._actors_obj._confirmed_ready):
+            raise RuntimeError("a confirmed-ready Ray actor is missing its runtime node identity")
 
         self._prime_actor_readiness()
         self._refresh_actor_readiness()
@@ -482,35 +574,66 @@ class RemoteUDFExecutor(
 
 
 def _build_ray_actor_executor(payload: dict[str, Any], options: dict[str, Any]) -> UDFExecutor:
-    """Build a Ray-backed UDF executor using pre-created actor handles.
-
-    Actor handles MUST be provided via ``options["actor_handles"]``.
-
-    This function NEVER creates actors.  All actor creation must happen
-    at the driver level.
-    """
+    """Resolve the phase-local pool on the driver and attach its handles."""
     if options.get("ray_actor_pool_name") is not None or payload.get("ray_actor_pool_name") is not None:
         raise RuntimeError("Ray UDF named actor pools have been removed; use driver pre-created actor_handles instead")
 
     payload = _normalize_actor_pool_payload(payload)
     _ray_payload_requires_block_stream(payload)
 
-    pre_created_handles = options.get("actor_handles")
-    if pre_created_handles is not None:
-        query_driver_handle = options.get("query_driver_handle")
+    resolved_options = dict(options)
+    locator = resolved_options.pop("actor_pool_locator", None)
+    if locator is not None:
+        if resolved_options.get("actor_handles") is not None:
+            raise RuntimeError("Ray actor UDF options cannot contain both actor_pool_locator and actor_handles")
+        if not isinstance(locator, dict):
+            raise TypeError("Ray actor UDF actor_pool_locator must be a dict")
+        expected_locator_fields = {"query_id", "resource_unit_id", "physical_node_id"}
+        if set(locator) != expected_locator_fields:
+            raise ValueError("Ray actor UDF actor_pool_locator fields do not match the query protocol")
+        query_driver_handle = resolved_options.get("query_driver_handle")
         if query_driver_handle is None:
             raise RuntimeError("Ray actor UDF executor requires an explicit query driver handle")
-        query_generation_capability = str(options.get("query_generation_capability") or "").strip()
+        query_generation_capability = str(resolved_options.get("query_generation_capability") or "").strip()
         if not query_generation_capability:
             raise RuntimeError("Ray actor UDF executor requires a query generation capability")
-        if "session_config" not in options:
+        activated_options = resolve_object_refs_blocking(
+            query_driver_handle.activate_query_udf_actor_pool.remote(
+                dict(locator),
+                query_generation_capability,
+            )
+        )
+        if not isinstance(activated_options, dict):
+            raise TypeError("query driver actor-pool activation must return a dict")
+        forbidden = set(activated_options) - {
+            "actor_handles",
+            "actor_node_ids",
+            "actor_dispatch_indices",
+            "actor_init_refs",
+        }
+        if forbidden:
+            raise ValueError(
+                "query driver actor-pool activation returned unknown fields: " + ", ".join(sorted(forbidden))
+            )
+        resolved_options.update(activated_options)
+
+    pre_created_handles = resolved_options.get("actor_handles")
+    if pre_created_handles is not None:
+        query_driver_handle = resolved_options.get("query_driver_handle")
+        if query_driver_handle is None:
+            raise RuntimeError("Ray actor UDF executor requires an explicit query driver handle")
+        query_generation_capability = str(resolved_options.get("query_generation_capability") or "").strip()
+        if not query_generation_capability:
+            raise RuntimeError("Ray actor UDF executor requires a query generation capability")
+        if "session_config" not in resolved_options:
             raise RuntimeError("Ray actor UDF executor requires explicit Vane session config")
         actors = UDFActorPool._from_handles(
             pre_created_handles,
             payload=payload,
-            actor_dispatch_indices=options.get("actor_dispatch_indices"),
+            actor_dispatch_indices=resolved_options.get("actor_dispatch_indices"),
+            actor_init_refs=resolved_options.get("actor_init_refs"),
         )
-        actors = _apply_actor_node_options(actors, options=options)
+        actors = _apply_actor_node_options(actors, options=resolved_options)
         return RemoteUDFExecutor(
             actors,
             payload,
@@ -518,9 +641,7 @@ def _build_ray_actor_executor(payload: dict[str, Any], options: dict[str, Any]) 
             query_generation_capability=query_generation_capability,
         )
 
-    raise RuntimeError(
-        "build_ray_executor requires pre-created actor handles. Ray UDF named actor pools have been removed."
-    )
+    raise RuntimeError("build_ray_executor requires an actor_pool_locator resolved by the query driver")
 
 
 class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
@@ -576,7 +697,6 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             admission=admission,
             submitter=lambda granted_lease: _submit_ray_remote(
                 self.run_bundle_stream,
-                granted_lease["node_id"],
                 task_payload_with_lease(self.payload, granted_lease),
                 [table],
             ),
@@ -608,7 +728,6 @@ class RayTaskUDFExecutor(TaskAdmissionExecutorMixin, UDFExecutor):
             admission=admission,
             submitter=lambda granted_lease: _submit_ray_remote(
                 self.run_ref_bundle_stream,
-                granted_lease["node_id"],
                 *task_block_refs,
                 payload=task_payload_with_lease(self.payload, granted_lease),
                 slices=list(slices or []),
@@ -649,7 +768,12 @@ def _task_remote_options(
     options = dict(ray_options or {})
     options["num_cpus"] = num_cpus
     options["num_gpus"] = num_gpus
-    options["memory"] = int(memory_bytes)
+    options.pop("memory", None)
+    declared_memory_bytes = int(memory_bytes)
+    if declared_memory_bytes < 0:
+        raise ValueError("memory_bytes must be non-negative")
+    if declared_memory_bytes > 0:
+        options["memory"] = declared_memory_bytes
     options["max_retries"] = max_retries
     options["_generator_backpressure_num_objects"] = RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS
     return options

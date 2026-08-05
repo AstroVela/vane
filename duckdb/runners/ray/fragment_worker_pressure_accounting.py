@@ -45,19 +45,19 @@ class FteWorkerPressureAccountingMixin:
         lease = dict(query_task_lease or {})
         query_id = str(lease.get("query_id") or "").strip()
         execution_query_id = str(lease.get("execution_query_id") or "").strip()
-        stage_id = str(lease.get("stage_id") or "").strip()
+        resource_unit_id = str(lease.get("resource_unit_id") or "").strip()
         task_lease_id = str(lease.get("lease_id") or "").strip()
         lease_attempt_id = str(lease.get("attempt_id") or "").strip()
         if execution_query_id != attempt.task_id.query_id or lease_attempt_id != str(attempt):
             raise RuntimeError("FTE result task lease identity does not match its attempt")
-        if not stage_id or not task_lease_id:
-            raise RuntimeError("FTE result task lease is missing stage_id or lease_id")
+        if not resource_unit_id or not task_lease_id:
+            raise RuntimeError("FTE result task lease is missing resource_unit_id or lease_id")
 
         manager = get_query_resource_manager(query_id)
         requests = tuple(
             OutputBlockRequest(
                 query_id=query_id,
-                producer_stage_id=stage_id,
+                producer_unit_id=resource_unit_id,
                 task_lease_id=task_lease_id,
                 attempt_id=lease_attempt_id,
                 block_id=str(output["block_id"]),

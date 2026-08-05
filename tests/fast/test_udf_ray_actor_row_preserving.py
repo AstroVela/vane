@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from concurrent.futures import Future
 from typing import Any
 
 import pyarrow as pa
@@ -41,7 +42,7 @@ def _rows_payload(fn: Any) -> dict[str, Any]:
         "actor_number": 1,
         "produce_ray_block_stream": True,
         "query_id": "query-row-preserving",
-        "stage_id": "stage-row-preserving",
+        "resource_unit_id": "resource:test:udf:row-preserving",
         "task_lease_id": "lease-row-preserving",
         "attempt_id": "attempt-row-preserving",
         "node_id": "node-row-preserving",
@@ -51,13 +52,58 @@ def _rows_payload(fn: Any) -> dict[str, Any]:
 
 
 class _FakeRuntimeContext:
+    def __init__(self, ray_module: _FakeRayModule) -> None:
+        self._ray_module = ray_module
+
     def get_node_id(self) -> str:
-        return "node-row-preserving"
+        return self._ray_module.node_id
+
+    def get_job_id(self) -> str:
+        return "job-row-preserving"
+
+    @property
+    def was_current_actor_reconstructed(self) -> bool:
+        return self._ray_module.reconstructed
+
+
+class _FakeReportRef:
+    def __init__(self, result: dict[str, Any]) -> None:
+        self._result = result
+
+    def future(self) -> Future:
+        future = Future()
+        future.set_result(dict(self._result))
+        return future
+
+
+class _FakeReportMethod:
+    def __init__(self, ray_module: _FakeRayModule) -> None:
+        self._ray_module = ray_module
+
+    def remote(self, payload: dict[str, Any], capability: str) -> _FakeReportRef:
+        self._ray_module.location_reports.append((dict(payload), str(capability)))
+        return _FakeReportRef(
+            {
+                "accepted": True,
+                "node_id": payload["node_id"],
+                "moved_task_lease_count": 1,
+            }
+        )
+
+
+class _FakeDriver:
+    def __init__(self, ray_module: _FakeRayModule) -> None:
+        self.report_query_udf_actor_location = _FakeReportMethod(ray_module)
 
 
 class _FakeRayModule(types.ModuleType):
     def __init__(self) -> None:
         super().__init__("ray")
+        self.node_id = "node-row-preserving"
+        self.reconstructed = False
+        self.location_reports: list[tuple[dict[str, Any], str]] = []
+        self._runtime_context = _FakeRuntimeContext(self)
+        self._driver = _FakeDriver(self)
 
     def remote(self, *args: Any, **kwargs: Any):
         if len(args) == 1 and callable(args[0]) and not kwargs:
@@ -69,7 +115,12 @@ class _FakeRayModule(types.ModuleType):
         return deco
 
     def get_runtime_context(self) -> _FakeRuntimeContext:
-        return _FakeRuntimeContext()
+        return self._runtime_context
+
+    def get_actor(self, name: str, *, namespace: str) -> _FakeDriver:
+        assert name == "vane-query-runtime-job-row-preserving"
+        assert namespace == "vane"
+        return self._driver
 
 
 @pytest.fixture()
@@ -175,3 +226,82 @@ def test_actor_rows_mode_reuses_executor_across_calls(fake_ray):
     assert actor.executor is executor_after_first
     assert first[0].to_pydict() == {"keep": ["a"], "y": [2]}
     assert second[0].to_pydict() == {"keep": ["b"], "y": [6]}
+
+
+def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):
+    from duckdb.runners.ray.query_runtime_protocol import (
+        RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+        RAY_ACTOR_INDEX_ENV,
+        RAY_ACTOR_POOL_NONCE_ENV,
+        RAY_ACTOR_QUERY_ID_ENV,
+        RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+    )
+
+    payload = _rows_payload(_AddOne)
+    payload["actor_index"] = 0
+    fake_ray.node_id = "node-after-restart"
+    fake_ray.reconstructed = True
+    monkeypatch.setenv(RAY_ACTOR_QUERY_ID_ENV, payload["query_id"])
+    monkeypatch.setenv(RAY_ACTOR_RESOURCE_UNIT_ID_ENV, payload["resource_unit_id"])
+    monkeypatch.setenv(RAY_ACTOR_INDEX_ENV, "0")
+    monkeypatch.setenv(RAY_ACTOR_POOL_NONCE_ENV, "pool-nonce")
+    monkeypatch.setenv(RAY_ACTOR_GENERATION_CAPABILITY_ENV, "generation-capability")
+    actor = _make_actor(payload)
+
+    blocks = _data_blocks(list(actor.run_block_stream(pa.table({"x": [1], "keep": ["a"]}))))
+
+    assert blocks[0].to_pydict() == {"keep": ["a"], "y": [2]}
+    assert len(fake_ray.location_reports) == 2
+    report, capability = fake_ray.location_reports[-1]
+    assert report == {
+        "query_id": payload["query_id"],
+        "resource_unit_id": payload["resource_unit_id"],
+        "actor_index": 0,
+        "pool_nonce": "pool-nonce",
+        "node_id": "node-after-restart",
+    }
+    assert capability == "generation-capability"
+
+
+def test_reconstructed_actor_reconciles_new_node_before_ref_bundle_materialization(fake_ray, monkeypatch):
+    import duckdb.execution.udf_ray_actor_runtime as actor_runtime
+    from duckdb.runners.ray.query_runtime_protocol import (
+        RAY_ACTOR_GENERATION_CAPABILITY_ENV,
+        RAY_ACTOR_INDEX_ENV,
+        RAY_ACTOR_POOL_NONCE_ENV,
+        RAY_ACTOR_QUERY_ID_ENV,
+        RAY_ACTOR_RESOURCE_UNIT_ID_ENV,
+    )
+
+    payload = _rows_payload(_AddOne)
+    payload["actor_index"] = 0
+    fake_ray.node_id = "node-after-restart"
+    fake_ray.reconstructed = True
+    monkeypatch.setenv(RAY_ACTOR_QUERY_ID_ENV, payload["query_id"])
+    monkeypatch.setenv(RAY_ACTOR_RESOURCE_UNIT_ID_ENV, payload["resource_unit_id"])
+    monkeypatch.setenv(RAY_ACTOR_INDEX_ENV, "0")
+    monkeypatch.setenv(RAY_ACTOR_POOL_NONCE_ENV, "pool-nonce")
+    monkeypatch.setenv(RAY_ACTOR_GENERATION_CAPABILITY_ENV, "generation-capability")
+    actor = _make_actor(payload)
+    original_materialize = actor_runtime._apply_ref_bundle_slices
+
+    def materialize_after_reconciliation(*args, **kwargs):
+        assert len(fake_ray.location_reports) == 2
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(actor_runtime, "_apply_ref_bundle_slices", materialize_after_reconciliation)
+    block = pa.table({"x": [1], "keep": ["a"]})
+
+    blocks = _data_blocks(
+        list(
+            actor.run_ref_bundle_stream(
+                block,
+                slices=[(0, 1)],
+                metadata=[{"num_rows": 1}],
+                names=["x", "keep"],
+            )
+        )
+    )
+
+    assert blocks[0].to_pydict() == {"keep": ["a"], "y": [2]}
+    assert len(fake_ray.location_reports) == 2

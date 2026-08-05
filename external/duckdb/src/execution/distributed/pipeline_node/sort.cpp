@@ -40,6 +40,22 @@ static vector<BoundOrderByNode> CopyOrderBys(const vector<BoundOrderByNode> &ord
 	return copies;
 }
 
+bool OrderByNode::is_materialization_barrier() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+std::vector<NodeID> OrderByNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
+bool TopNNode::is_materialization_barrier() const {
+	return ChildHasMultiplePartitions(child_);
+}
+
+std::vector<NodeID> TopNNode::materialized_input_node_ids() const {
+	return is_materialization_barrier() && child_ ? std::vector<NodeID> {child_->node_id()} : std::vector<NodeID> {};
+}
+
 static void FixOrderByReferenceTypes(Expression &expr, const vector<LogicalType> &input_types) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
@@ -810,6 +826,14 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			DebugOrderByOutputs("range-output", range_mat_res.outputs);
 			DebugOrderByHandles("range-handles", range_handles);
 			auto range_estimated_cardinality = EstimateRowsFromHandles(range_handles, staging_estimated_cardinality);
+			auto barrier_result = fte_task_submitter->materialization_barrier_completed(
+			    self_shared->context().query_id(), self_shared->node_id());
+			if (barrier_result.is_err()) {
+				result_tx_ptr->close();
+				range_exchange->Close();
+				staging_exchange->Close();
+				return DuckDBResult<void>::err(barrier_result.error());
+			}
 
 			auto final_tasks =
 			    BuildExchangeSourceTasks(self_shared->context(), self_shared->config(), *task_id_counter, exchange_mgr,

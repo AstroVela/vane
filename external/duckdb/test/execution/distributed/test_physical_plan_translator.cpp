@@ -1401,6 +1401,10 @@ TEST_CASE("PhysicalPlanTranslator: partitioned MARK joins preserve global build 
 		REQUIRE(right_shuffle != nullptr);
 		REQUIRE_FALSE(left_shuffle->CollectsMarkJoinBuildSummary());
 		REQUIRE(right_shuffle->CollectsMarkJoinBuildSummary());
+		REQUIRE_FALSE(left_shuffle->is_materialization_barrier());
+		REQUIRE(right_shuffle->is_materialization_barrier());
+		REQUIRE(right_shuffle->materialized_input_node_ids() ==
+		        vector<NodeID> {right_shuffle->children()[0]->node_id()});
 		REQUIRE(NodeDisplayContains(right_shuffle->into_node(), "MARK build summary: global"));
 	}
 
@@ -1413,6 +1417,8 @@ TEST_CASE("PhysicalPlanTranslator: partitioned MARK joins preserve global build 
 			auto shuffle = std::dynamic_pointer_cast<RepartitionNode>(child);
 			REQUIRE(shuffle != nullptr);
 			REQUIRE_FALSE(shuffle->CollectsMarkJoinBuildSummary());
+			REQUIRE_FALSE(shuffle->is_materialization_barrier());
+			REQUIRE(shuffle->materialized_input_node_ids().empty());
 			REQUIRE(shuffle->config().clustering_spec()->partition_by().size() == 1);
 		}
 	}
