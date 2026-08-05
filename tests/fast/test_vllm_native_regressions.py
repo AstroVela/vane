@@ -110,6 +110,24 @@ class _DeferredWakeupExecutor(_RecordingExecutor):
             callback()
 
 
+class _ChunkedBatchResultExecutor(_RecordingExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.returned_arrow_batch_counts = []
+
+    def submit(self, prefix, prompts, rows) -> None:
+        prompt_values = tuple(prompts)
+        self.submissions.append((prefix, prompt_values))
+        outputs = []
+        for prompt in prompt_values:
+            row_id = int(prompt.rsplit("-", 1)[1])
+            outputs.append(None if row_id % 7 == 0 else f"generated:{prompt}")
+        batches = rows.to_batches(max_chunksize=511)
+        self.returned_arrow_batch_counts.append(len(batches))
+        self.ready.append((outputs, pa.Table.from_batches(batches)))
+        self._notify_wakeups()
+
+
 def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=1, query_suffix=""):
     import duckdb
     import duckdb.execution.vllm as vllm
@@ -411,6 +429,75 @@ def test_native_downstream_limit_retires_producer_when_final_execute_is_skipped(
     assert rows == [(0, "prompt-0", "generated:prompt-0")]
     assert sum(len(submitted) for _, submitted in executor.submissions) < len(prompts)
     assert executor.finished_count == 1
+
+
+@pytest.mark.parametrize("row_count", [2049, 6144])
+def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(monkeypatch, row_count):
+    import duckdb
+    import duckdb.execution.vllm as vllm
+
+    executor = _ChunkedBatchResultExecutor()
+    observed_chunk_sizes = []
+
+    def observe_chunk(values):
+        observed_chunk_sizes.append(len(values))
+        return values
+
+    monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
+    prompts = [f"shared-prefix-{row_id:05d}" for row_id in range(row_count)]
+    con = duckdb.connect()
+    try:
+        con.execute("PRAGMA threads=1")
+        con.register(
+            "vllm_input",
+            pa.table(
+                {
+                    "id": pa.array(range(row_count), type=pa.int64()),
+                    "prompt": pa.array(prompts, type=pa.string()),
+                }
+            ),
+        )
+        con.create_function(
+            "observe_vllm_chunk",
+            observe_chunk,
+            ["VARCHAR"],
+            "VARCHAR",
+            type="arrow",
+            null_handling="special",
+            side_effects=True,
+        )
+        rows = con.execute(
+            """
+            SELECT id, observe_vllm_chunk(generated)
+            FROM (
+                SELECT id, vllm(prompt, 'recording-model', ?) AS generated
+                FROM vllm_input
+            )
+            """,
+            [
+                _packed_native_vllm_options(
+                    {
+                        "do_prefix_routing": True,
+                        "max_buffer_size": 5000,
+                        "min_bucket_size": 1,
+                        "batch_size": None,
+                        "inflight_limit": 0,
+                    }
+                )
+            ],
+        ).fetchall()
+    finally:
+        con.close()
+
+    vector_size = duckdb.__standard_vector_size__
+    assert observed_chunk_sizes
+    assert sum(observed_chunk_sizes) == row_count
+    assert max(observed_chunk_sizes) <= vector_size
+    assert [len(submitted) for _, submitted in executor.submissions] == [row_count]
+    assert executor.returned_arrow_batch_counts[0] > 1
+    assert dict(rows) == {
+        row_id: None if row_id % 7 == 0 else f"generated:{prompts[row_id]}" for row_id in range(row_count)
+    }
 
 
 def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
