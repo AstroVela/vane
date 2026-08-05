@@ -5,9 +5,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from duckdb.runners.fte import (
-    FteWorkerControlFailure,
-)
 from duckdb.runners.fte.fte_events import MemoryPressureDetected
 from duckdb.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTIONS,
@@ -123,17 +120,16 @@ class FteWorkerTransitionMixin:
             return revoked
         for _, fragment_execution in fragment_execution_items:
             count = remaining
-            try:
-                fragment_execution_revoked = fragment_execution.revoke_speculative_attempts(
-                    worker_id=worker_id,
-                    max_count=count,
-                    reason=reason,
-                )
-            except FteWorkerControlFailure as exc:
-                self._handles_for_fte_worker_control_failure(exc)
-                fragment_execution_revoked = []
+            result = fragment_execution.revoke_speculative_attempts(
+                worker_id=worker_id,
+                max_count=count,
+                reason=reason,
+            )
+            fragment_execution_revoked = list(result.revoked)
             _sync_write_sink_unit_for_fragment(fragment_execution)
             revoked.extend(fragment_execution_revoked)
+            for failure in result.failures:
+                self._handles_for_fte_worker_control_failure(failure)
             if remaining is not None:
                 remaining -= len(fragment_execution_revoked)
                 if remaining <= 0:

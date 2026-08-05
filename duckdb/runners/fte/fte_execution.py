@@ -102,6 +102,14 @@ class FteWorkerControlFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
+class FteSpeculativeRevocationResult:
+    """Expose committed revocations even when another cancellation fails."""
+
+    revoked: tuple[RevokedAttempt, ...] = ()
+    failures: tuple[FteWorkerControlFailure, ...] = ()
+
+
+@dataclass(frozen=True)
 class FtePartitionPlacementSnapshot:
     partition: FteTaskPartition
     generation: int
@@ -438,7 +446,23 @@ class FteTaskPartition:
         if retryable and self.remaining_attempts > 0:
             return ReadyTask(self.task_id, "retry")
         self.failed = True
+        self.ready_for_scheduling = False
+        self.execution_ready_deferred = False
         return None
+
+    def retire_quiesced_attempt(
+        self,
+        attempt_id: FteTaskAttemptId | str | Mapping[str, Any],
+    ) -> RunningAttempt | None:
+        attempt = FteTaskAttemptId.coerce(attempt_id)
+        self._validate_attempt_task(attempt)
+        running = self.running_attempts.pop(attempt.attempt_id, None)
+        if running is None:
+            return None
+        self.running_task_stats.pop(attempt.attempt_id, None)
+        self.revoking_attempts.discard(attempt.attempt_id)
+        self._invalidate_placement()
+        return running
 
     def update_running_task_stats(
         self,
@@ -1411,7 +1435,10 @@ class FteFragmentExecution:
     ) -> ScheduledAttempt | None:
         attempt = FteTaskAttemptId.coerce(attempt_id)
         failure = _normalize_failure_payload(error)
+        memory_failure = _is_memory_failure(failure)
         should_schedule = False
+        peer_cancel_failures: list[FteWorkerControlFailure] = []
+        pressure_releases: list[tuple[Any, FteTaskAttemptId]] = []
         with self._state_lock:
             partition = self.partitions[attempt.partition_id]
         with partition._lifecycle_lock:
@@ -1424,16 +1451,40 @@ class FteFragmentExecution:
                 running = partition.running_attempts.get(attempt.attempt_id)
                 if running is None:
                     return None
-                failure_retryable = retryable and _failure_allows_retry(failure)
+                pressure_releases.append((running.remote_handle, attempt))
+                failure_retryable = retryable and _failure_allows_retry(failure) and not memory_failure
+                peer_running_attempts = (
+                    [
+                        item
+                        for item in partition.running_attempts.values()
+                        if item.attempt_id.attempt_id != attempt.attempt_id
+                    ]
+                    if memory_failure
+                    else []
+                )
                 if self.exchange is not None and partition.sink_handle is not None:
                     exchange_abort = (partition.sink_handle, attempt.attempt_id)
 
             try:
-                if exchange_abort is not None:
+                quiesced_peers: list[RunningAttempt] = []
+                if peer_running_attempts:
+                    quiesced_peers, peer_cancel_failures = self._cancel_running_attempts(peer_running_attempts)
+                    pressure_releases.extend((peer.remote_handle, peer.attempt_id) for peer in quiesced_peers)
+
+                if exchange_abort is not None or (
+                    quiesced_peers and self.exchange is not None and partition.sink_handle is not None
+                ):
                     try:
                         with self._exchange_lock:
                             assert self.exchange is not None
-                            self.exchange.sink_aborted(*exchange_abort)
+                            if exchange_abort is not None:
+                                self.exchange.sink_aborted(*exchange_abort)
+                            if partition.sink_handle is not None:
+                                for peer in quiesced_peers:
+                                    self.exchange.sink_aborted(
+                                        partition.sink_handle,
+                                        peer.attempt_id.attempt_id,
+                                    )
                     except BaseException as exc:
                         with self._state_lock:
                             partition.mark_attempt_failed(attempt, failure, retryable=False)
@@ -1448,12 +1499,17 @@ class FteFragmentExecution:
 
                 with self._state_lock:
                     ready = partition.mark_attempt_failed(attempt, failure, retryable=failure_retryable)
-                    if ready is not None and _is_memory_failure(failure):
-                        partition.failed = True
-                        partition.ready_for_scheduling = False
-                        partition.execution_ready_deferred = False
-                        partition.running_attempts.clear()
+                    for peer in quiesced_peers:
+                        partition.retire_quiesced_attempt(peer.attempt_id)
+                    if memory_failure:
                         self.failed = True
+                        if peer_cancel_failures:
+                            partition.fail_closed(
+                                _failure_payload(
+                                    "PEER_CANCELLATION_FAILED",
+                                    str(peer_cancel_failures[0]),
+                                )
+                            )
                     else:
                         if partition.failed:
                             self.failed = True
@@ -1465,7 +1521,10 @@ class FteFragmentExecution:
                                 partition.mark_ready_for_execution()
                                 should_schedule = True
             finally:
-                self._record_task_terminal_without_drain(running.remote_handle, attempt)
+                for remote_handle, released_attempt in pressure_releases:
+                    self._record_task_terminal_without_drain(remote_handle, released_attempt)
+        if peer_cancel_failures:
+            raise peer_cancel_failures[0]
         if not should_schedule or not schedule_retry:
             return None
         return self._schedule_partition_if_ready(attempt.partition_id)
@@ -1476,12 +1535,12 @@ class FteFragmentExecution:
         worker_id: str | None = None,
         max_count: int | None = None,
         reason: Any = None,
-    ) -> list[RevokedAttempt]:
+    ) -> FteSpeculativeRevocationResult:
         revoked: list[RevokedAttempt] = []
         pressure_releases: list[tuple[Any, FteTaskAttemptId]] = []
         limit = None if max_count is None else max(0, int(max_count))
         if limit == 0:
-            return revoked
+            return FteSpeculativeRevocationResult()
         failure = _failure_payload(
             "SPECULATIVE_ATTEMPT_REVOKED",
             reason or "speculative task revoked",
@@ -1515,6 +1574,7 @@ class FteFragmentExecution:
             quiesced, cancel_failures = self._cancel_running_attempts([running for _, running in candidates])
             quiesced_ids = {str(running.attempt_id) for running in quiesced}
             pressure_releases.extend((running.remote_handle, running.attempt_id) for running in quiesced)
+            prepared: list[tuple[FteTaskPartition, RunningAttempt]] = []
             for partition, running in candidates:
                 attempt_number = running.attempt_id.attempt_id
                 if str(running.attempt_id) not in quiesced_ids:
@@ -1542,8 +1602,15 @@ class FteFragmentExecution:
                                 ):
                                     self.failed = True
                             raise
-                    # The exchange lock is deliberately released before the
-                    # state lock is reacquired; there is no reverse nesting.
+                    prepared.append((partition, running))
+
+            # Commit only after every prepared exchange abort has succeeded,
+            # so an exchange failure cannot hide earlier partial revocations.
+            for partition, running in prepared:
+                attempt_number = running.attempt_id.attempt_id
+                with partition._lifecycle_lock:
+                    # The exchange lock was released before the state lock is
+                    # reacquired; there is no reverse nesting.
                     with self._state_lock:
                         current_running = partition.running_attempts.get(attempt_number)
                         if (
@@ -1563,9 +1630,10 @@ class FteFragmentExecution:
                     partition.revoking_attempts.discard(running.attempt_id.attempt_id)
             for remote_handle, attempt in pressure_releases:
                 self._record_task_terminal_without_drain(remote_handle, attempt)
-        if cancel_failures:
-            raise cancel_failures[0]
-        return revoked
+        return FteSpeculativeRevocationResult(
+            revoked=tuple(revoked),
+            failures=tuple(cancel_failures),
+        )
 
     def _cancel_running_attempts(
         self,

@@ -29,7 +29,7 @@ import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
 import duckdb.runners.ray.worker as worker_mod
 import duckdb.runners.ray.worker_handle as worker_handle_mod
 from duckdb.runners.common import QueryDeadlineExceeded
-from duckdb.runners.fte.fte_attempts import FragmentExecutionMutationResult
+from duckdb.runners.fte.fte_attempts import FragmentExecutionMutationResult, RevokedAttempt
 from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
 from duckdb.runners.ray.fragment_worker_context import fragment_id_for_task
 from duckdb.runners.ray.fte import (
@@ -6159,6 +6159,56 @@ def test_fte_memory_pressure_skips_worker_without_budget(monkeypatch):
     )
 
     assert handle._revoke_fte_speculative_tasks_for_memory_pressure_direct() == []
+
+
+def test_fte_revoke_direct_surfaces_partial_success_before_worker_failure(monkeypatch):
+    attempt = FteTaskAttemptId.coerce("query-revoke-partial.0.0.0")
+    revoked = RevokedAttempt(attempt, worker_id="worker-success", retry_ready=True)
+    failure = fte_execution_mod.FteWorkerControlFailure(
+        worker_id="worker-failure",
+        worker_incarnation_id="incarnation-worker-failure",
+        attempt_id=FteTaskAttemptId.coerce("query-revoke-partial.0.1.0"),
+        method_name="fte_cancel_task",
+        cause=TimeoutError("planned partial cancellation failure"),
+    )
+
+    class _FragmentExecution:
+        @staticmethod
+        def revoke_speculative_attempts(**_kwargs):
+            return fte_execution_mod.FteSpeculativeRevocationResult(
+                revoked=(revoked,),
+                failures=(failure,),
+            )
+
+    fragment_execution = _FragmentExecution()
+    synced = []
+    handled = []
+    monkeypatch.setattr(
+        worker_transitions_mod,
+        "fte_fragment_execution_items",
+        lambda _query_id_filter: [(("query-revoke-partial", "fragment"), fragment_execution)],
+    )
+    monkeypatch.setattr(
+        worker_transitions_mod,
+        "_sync_write_sink_unit_for_fragment",
+        lambda value: synced.append(value),
+    )
+
+    class _Owner:
+        @staticmethod
+        def _handles_for_fte_worker_control_failure(value):
+            handled.append(value)
+            return []
+
+    result = worker_transitions_mod.FteWorkerTransitionMixin._revoke_fte_speculative_tasks_direct(
+        _Owner(),
+        max_count=2,
+        reason="memory pressure",
+    )
+
+    assert result == [revoked]
+    assert synced == [fragment_execution]
+    assert handled == [failure]
 
 
 def test_fte_query_scheduler_rejects_cross_manager_rebinding():

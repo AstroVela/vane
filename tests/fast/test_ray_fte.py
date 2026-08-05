@@ -3407,9 +3407,10 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
     assert len(scheduled) == 1
     assert scheduled[0].request["execution_class"] == "SPECULATIVE"
 
-    revoked = stage.revoke_speculative_attempts(reason="memory pressure")
+    result = stage.revoke_speculative_attempts(reason="memory pressure")
 
-    assert [str(item.attempt_id) for item in revoked] == ["q.31.0.0"]
+    assert [str(item.attempt_id) for item in result.revoked] == ["q.31.0.0"]
+    assert result.failures == ()
     assert worker.calls[-1] == ("cancel", scheduled[0].attempt_id.to_dict())
     assert stage.schedule_next_pending_partition() is None
     assert stage.partitions[0].ready_for_scheduling is False
@@ -3478,13 +3479,64 @@ def test_fte_fragment_execution_speculative_revoke_cancels_outside_state_lock():
             snapshot = None
         finally:
             cancel_release.set()
-        revoked = revoke.result(timeout=2.0)
+        result = revoke.result(timeout=2.0)
 
     assert worker.cancel_owned_state_lock is False
     assert snapshot is not None
     assert snapshot["partitions"][0]["running"] is True
-    assert [item.attempt_id for item in revoked] == [scheduled.attempt_id]
+    assert [item.attempt_id for item in result.revoked] == [scheduled.attempt_id]
+    assert result.failures == ()
     assert stage.partitions[0].running_attempts == {}
+
+
+def test_fte_fragment_execution_speculative_revoke_reports_partial_cancel_failure():
+    class _FailingCancelWorker(_FakeLiveWorker):
+        def resolve_fte_cancel_task(self, _cancellation):
+            raise TimeoutError("planned revoke cancellation timeout")
+
+    successful_worker = _FakeLiveWorker("worker-revoke-success")
+    failing_worker = _FailingCancelWorker("worker-revoke-failure")
+
+    def select_worker(partition):
+        if partition.task_id.partition_id == 0:
+            return successful_worker
+        return failing_worker
+
+    stage = _fte_fragment_execution(
+        "q",
+        69,
+        fragment_id="q:node:speculative-revoke-partial",
+        worker_selector=select_worker,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0), PartitionInfo(1)],
+            partition_updates=[
+                PartitionUpdate(
+                    partition_id,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    ready_for_scheduling=True,
+                )
+                for partition_id in (0, 1)
+            ],
+        )
+    )
+    _execute_stage_commands(stage, scheduled_result)
+
+    result = stage.revoke_speculative_attempts(max_count=2, reason="memory pressure")
+
+    assert [item.attempt_id for item in result.revoked] == [scheduled_result[0].attempt_id]
+    assert len(result.failures) == 1
+    assert result.failures[0].worker_id == failing_worker.worker_id
+    assert "planned revoke cancellation timeout" in str(result.failures[0])
+    assert stage.partitions[0].running_attempts == {}
+    assert list(stage.partitions[1].running_attempts) == [scheduled_result[1].attempt_id.attempt_id]
+    assert stage.partitions[0].revoking_attempts == set()
+    assert stage.partitions[1].revoking_attempts == set()
 
 
 def test_fte_fragment_execution_speculative_revoke_clears_reservation_after_exchange_failure():
@@ -3536,6 +3588,55 @@ def test_fte_fragment_execution_speculative_revoke_clears_reservation_after_exch
     assert stage.failed is True
     assert stage.has_pending_partitions() is False
     assert worker.terminal_attempts == [str(scheduled.attempt_id)]
+
+
+def test_fte_fragment_execution_revoke_exchange_failure_commits_no_partial_batch():
+    class _FailingSecondAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, sink_handle, attempt_id):
+            if sink_handle.partition_id == 1:
+                raise RuntimeError("planned second exchange abort failure")
+            return super().sink_aborted(sink_handle, attempt_id)
+
+    worker = _FakeLiveWorker("worker-speculative-revoke-batch-abort")
+    exchange = _FailingSecondAbortExchange("q", "exchange-speculative-revoke-batch-abort")
+    stage = _fte_fragment_execution(
+        "q",
+        73,
+        fragment_id="q:node:speculative-revoke-batch-abort",
+        worker=worker,
+        exchange=exchange,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0), PartitionInfo(1)],
+            partition_updates=[
+                PartitionUpdate(
+                    partition_id,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    ready_for_scheduling=True,
+                )
+                for partition_id in (0, 1)
+            ],
+        )
+    )
+    _execute_stage_commands(stage, scheduled_result)
+
+    with pytest.raises(RuntimeError, match="planned second exchange abort failure"):
+        stage.revoke_speculative_attempts(max_count=2, reason="memory pressure")
+
+    assert list(stage.partitions[0].running_attempts) == [scheduled_result[0].attempt_id.attempt_id]
+    assert list(stage.partitions[1].running_attempts) == [scheduled_result[1].attempt_id.attempt_id]
+    assert stage.partitions[0].failed is False
+    assert stage.partitions[1].failed is True
+    assert stage.failed is True
+    assert stage.partitions[0].revoking_attempts == set()
+    assert stage.partitions[1].revoking_attempts == set()
+    assert exchange._aborted_attempts[0] == {0}
+    assert 1 not in exchange._aborted_attempts
 
 
 def test_fte_fragment_execution_seal_transitions_running_speculative_to_standard():
@@ -4065,6 +4166,162 @@ def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
     assert stage.failed is True
     assert stage.partitions[0].state == FtePartitionState.FAILED
     assert [call[0] for call in worker.calls] == ["create"]
+
+
+def test_fte_fragment_execution_memory_failure_quiesces_other_running_attempts():
+    class _TerminalTrackingWorker(_FakeLiveWorker):
+        def __init__(self, worker_id):
+            super().__init__(worker_id)
+            self.terminal_attempts = []
+
+        def record_fte_task_terminal(self, attempt_id):
+            self.terminal_attempts.append(str(FteTaskAttemptId.coerce(attempt_id)))
+
+    failed_worker = _TerminalTrackingWorker("worker-memory-failed")
+    peer_worker = _TerminalTrackingWorker("worker-memory-peer")
+    exchange = FteExchangeTracker("q", "exchange-memory-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        70,
+        fragment_id="q:node:memory-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 70, 0), 1)
+    partition.running_attempts[peer_attempt.attempt_id] = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+
+    assert (
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+        is None
+    )
+
+    assert peer_worker.calls[-1] == ("cancel", peer_attempt.to_dict())
+    assert failed_worker.terminal_attempts == [str(failed_attempt.attempt_id)]
+    assert peer_worker.terminal_attempts == [str(peer_attempt)]
+    assert partition.running_attempts == {}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert exchange._aborted_attempts[0] == {0, 1}
+
+
+def test_fte_fragment_execution_memory_failure_preserves_peer_handle_when_abort_fails():
+    class _FailingPeerAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, sink_handle, attempt_id):
+            if attempt_id == 1:
+                raise RuntimeError("planned peer exchange abort failure")
+            return super().sink_aborted(sink_handle, attempt_id)
+
+    failed_worker = _FakeLiveWorker("worker-memory-abort-failed")
+    peer_worker = _FakeLiveWorker("worker-memory-abort-peer")
+    exchange = _FailingPeerAbortExchange("q", "exchange-memory-abort-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        71,
+        fragment_id="q:node:memory-abort-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 71, 0), 1)
+    peer_running = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+    partition.running_attempts[peer_attempt.attempt_id] = peer_running
+
+    with pytest.raises(RuntimeError, match="planned peer exchange abort failure"):
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+
+    assert peer_worker.calls[-1] == ("cancel", peer_attempt.to_dict())
+    assert partition.running_attempts == {peer_attempt.attempt_id: peer_running}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert exchange._aborted_attempts[0] == {0}
+
+
+def test_fte_fragment_execution_memory_failure_preserves_unquiesced_peer_handle():
+    class _FailingCancelWorker(_FakeLiveWorker):
+        def resolve_fte_cancel_task(self, _cancellation):
+            raise TimeoutError("planned memory peer cancellation timeout")
+
+    failed_worker = _FakeLiveWorker("worker-memory-cancel-failed")
+    peer_worker = _FailingCancelWorker("worker-memory-cancel-peer")
+    exchange = FteExchangeTracker("q", "exchange-memory-cancel-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        72,
+        fragment_id="q:node:memory-cancel-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 72, 0), 1)
+    peer_running = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+    partition.running_attempts[peer_attempt.attempt_id] = peer_running
+
+    with pytest.raises(FteWorkerControlFailure, match="planned memory peer cancellation timeout"):
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+
+    assert partition.running_attempts == {peer_attempt.attempt_id: peer_running}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert [failure["error_code"] for failure in partition.failures] == [
+        "EXCEEDED_LOCAL_MEMORY_LIMIT",
+        "PEER_CANCELLATION_FAILED",
+    ]
+    assert exchange._aborted_attempts[0] == {0}
 
 
 def test_fte_fragment_execution_finish_removes_descriptor_and_finalizes_exchange():
