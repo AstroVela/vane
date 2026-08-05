@@ -3532,6 +3532,9 @@ def test_fte_fragment_execution_speculative_revoke_clears_reservation_after_exch
         stage.revoke_speculative_attempts(reason="memory pressure")
 
     assert partition.revoking_attempts == set()
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert stage.has_pending_partitions() is False
     assert worker.terminal_attempts == [str(scheduled.attempt_id)]
 
 
@@ -3931,6 +3934,64 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
     assert stage.partitions[0].remaining_attempts == 1
 
 
+def test_fte_fragment_execution_exchange_abort_precedes_retry_and_fails_closed():
+    abort_started = threading.Event()
+    abort_release = threading.Event()
+
+    class _BlockingFailingAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, _sink_handle, _attempt_id):
+            abort_started.set()
+            assert abort_release.wait(timeout=5.0)
+            raise RuntimeError("exchange abort failed")
+
+    worker = _FakeLiveWorker("worker-task-failure-abort")
+    exchange = _BlockingFailingAbortExchange("q", "exchange-task-failure-abort")
+    stage = _fte_fragment_execution(
+        "q",
+        68,
+        fragment_id="q:node:task-failure-abort",
+        worker=worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    scheduled = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        failure = executor.submit(
+            stage.task_failed,
+            scheduled.attempt_id,
+            {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "planned task failure",
+            },
+        )
+        assert abort_started.wait(timeout=2.0)
+        try:
+            assert partition.running_attempts == {scheduled.attempt_id.attempt_id: partition.running_attempt}
+            assert stage.has_pending_partitions() is False
+            assert stage.pending_submission_count() == 0
+            assert stage.schedule_next_pending_partition() is None
+        finally:
+            abort_release.set()
+        with pytest.raises(RuntimeError, match="exchange abort failed"):
+            failure.result(timeout=2.0)
+
+    assert stage.failed is True
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.ready_for_scheduling is False
+    assert stage.has_pending_partitions() is False
+    assert [call[0] for call in worker.calls] == ["create"]
+    assert [failure["error_code"] for failure in partition.failures] == [
+        "GENERIC_INTERNAL_ERROR",
+        "EXCHANGE_ABORT_FAILED",
+    ]
+
+
 def test_fte_fragment_execution_rejects_terminal_status_without_error_code():
     worker = _FakeLiveWorker()
     stage = _fte_fragment_execution(
@@ -4145,6 +4206,10 @@ def test_fte_fragment_execution_loser_quiescence_does_not_hold_state_lock_or_pub
         snapshot_future = executor.submit(stage.query_status_snapshot)
         try:
             snapshot = snapshot_future.result(timeout=0.5)
+            assert stage.has_pending_partitions() is False
+            assert stage.pending_submission_count() == 0
+            assert stage.waiting_for_execution_count() == 0
+            assert stage.waiting_for_node_count() == 0
         except FutureTimeoutError:
             snapshot = None
         finally:

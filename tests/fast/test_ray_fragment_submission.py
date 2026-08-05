@@ -13247,6 +13247,43 @@ def test_worker_fte_cancel_reinterrupts_cursor_until_barrier_completes():
     assert worker.interrupt_count >= 2
 
 
+def test_worker_fte_cancel_fails_closed_after_native_interrupt_error():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    task_id = {
+        "query_id": "query-cancel-interrupt-failure",
+        "fragment_execution_id": 0,
+        "partition_id": 0,
+        "attempt_id": 0,
+    }
+
+    class _TaskManager:
+        async def cancel_task(self, canceled_task_id):
+            assert canceled_task_id == task_id
+            return {"state": FteTaskState.CANCELED.value, "task_id": task_id}
+
+    class _Worker:
+        retired = False
+
+        @staticmethod
+        def _close_worker_native_task(task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+            return ["planned native interrupt failure"]
+
+        @staticmethod
+        def _get_fte_task_manager():
+            return _TaskManager()
+
+        def _retire_worker_native_task(self, task_key):
+            assert task_key == str(FteTaskAttemptId.coerce(task_id))
+            self.retired = True
+
+    worker = _Worker()
+    with pytest.raises(RuntimeError, match="planned native interrupt failure"):
+        asyncio.run(actor_cls.fte_cancel_task(worker, task_id))
+
+    assert worker.retired is False
+
+
 def test_repeated_native_interrupt_barrier_retains_ownership_when_canceled():
     async def run_cancel_race():
         operation_started = asyncio.Event()
@@ -13283,7 +13320,7 @@ def test_repeated_native_interrupt_barrier_retains_ownership_when_canceled():
     exposed_before_terminal, interrupt_count, interrupt_errors = asyncio.run(run_cancel_race())
 
     assert exposed_before_terminal is False
-    assert interrupt_count > 0
+    assert 0 < interrupt_count < 20
     assert interrupt_errors == set()
 
 

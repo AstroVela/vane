@@ -120,6 +120,8 @@ async def _await_with_repeated_native_interrupts(
         try:
             await asyncio.wait({operation_task}, timeout=0.01)
         except asyncio.CancelledError as error:
+            # Retain this cancellation until the owned operation is terminal.
+            # Catching the injection lets the next timed wait preserve pacing.
             cancellation = error
         if operation_task.done():
             break
@@ -1262,6 +1264,9 @@ class RayWorkerActor:
                     f"failed to quiesce native FTE task {task_key} after interrupt errors: {details}"
                 ) from exc
             raise
+        if interrupt_errors:
+            details = "; ".join(sorted(interrupt_errors))
+            raise RuntimeError(f"failed to quiesce native FTE task {task_key} after interrupt errors: {details}")
         self._retire_worker_native_task(task_key)
         return _fte_applied_control_status("fte_cancel_task", task_id, status)
 
