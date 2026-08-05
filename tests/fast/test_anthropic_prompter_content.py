@@ -114,8 +114,18 @@ def test_prompt_rejects_unsuccessful_terminal_reasons(monkeypatch, stop_reason, 
         asyncio.run(prompter.prompt(("hello",)))
 
 
-@pytest.mark.parametrize("stop_reason", [None, "future_stop_reason", "tool_use"])
-def test_plain_prompt_rejects_missing_or_unsupported_stop_reason(monkeypatch, stop_reason):
+@pytest.mark.parametrize(
+    ("stop_reason", "message"),
+    [
+        (None, r"missing stop_reason.*plain Prompt output.*'end_turn'.*'stop_sequence'"),
+        (
+            "future_stop_reason",
+            r"unsupported stop_reason.*plain Prompt output.*'end_turn'.*'stop_sequence'",
+        ),
+        ("tool_use", r"stop_reason 'tool_use'.*plain Prompt output.*'end_turn'.*'stop_sequence'"),
+    ],
+)
+def test_plain_prompt_rejects_missing_or_unsupported_stop_reason(monkeypatch, stop_reason, message):
     from vane.ai.provider import _ProviderResultError
 
     prompter = _make_prompter(
@@ -124,8 +134,11 @@ def test_plain_prompt_rejects_missing_or_unsupported_stop_reason(monkeypatch, st
         stop_reason=stop_reason,
     )
 
-    with pytest.raises(_ProviderResultError, match="missing or unsupported stop_reason"):
+    with pytest.raises(_ProviderResultError, match=message) as exc_info:
         asyncio.run(prompter.prompt(("hello",)))
+
+    if stop_reason == "future_stop_reason":
+        assert stop_reason not in str(exc_info.value)
 
 
 def test_zero_max_tokens_prewarm_remains_successful(monkeypatch):

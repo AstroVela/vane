@@ -290,10 +290,23 @@ class AnthropicPrompter:
                 "Vane Prompt does not support continuing paused turns"
             )
 
-        complete_stop_reasons = {"tool_use"} if return_format is not None else {"end_turn", "stop_sequence"}
+        if return_format is not None:
+            complete_stop_reasons = ("tool_use",)
+            output_mode = "structured"
+        else:
+            complete_stop_reasons = ("end_turn", "stop_sequence")
+            output_mode = "plain"
         if stop_reason not in complete_stop_reasons:
+            if stop_reason is None:
+                received_stop_reason = "a missing stop_reason"
+            elif stop_reason in ("end_turn", "stop_sequence", "tool_use"):
+                received_stop_reason = f"stop_reason {stop_reason!r}"
+            else:
+                received_stop_reason = "an unsupported stop_reason"
+            expected_stop_reasons = " or ".join(repr(reason) for reason in complete_stop_reasons)
             raise _ProviderResultError(
-                f"Anthropic response from model {self._model!r} returned a missing or unsupported stop_reason"
+                f"Anthropic response from model {self._model!r} returned {received_stop_reason} "
+                f"for {output_mode} Prompt output; expected {expected_stop_reasons}"
             )
 
         blocks = getattr(response, "content", None) or []

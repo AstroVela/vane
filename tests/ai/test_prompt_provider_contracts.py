@@ -153,7 +153,10 @@ def test_anthropic_structured_tool_and_raw_body_contracts():
             stop_reason="end_turn",
         )
     )
-    with pytest.raises(_ProviderResultError, match="missing or unsupported stop_reason"):
+    with pytest.raises(
+        _ProviderResultError,
+        match=r"stop_reason 'end_turn'.*structured Prompt output.*'tool_use'",
+    ):
         asyncio.run(prompter.prompt(("question",)))
 
     prompter._return_raw_response = True
