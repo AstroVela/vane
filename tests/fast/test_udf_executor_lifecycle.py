@@ -1000,7 +1000,7 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
 
     class FakeReadyMethod:
         def remote(self, _executor_id):
-            return FakeRef((["out-a", "out-b"], rows, "reservation-1"))
+            return FakeRef((["out-a", "out-b"], rows, [("reservation-1", 2)]))
 
     class FakeRouter:
         report_start = FakeRemoteMethod()

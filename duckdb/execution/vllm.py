@@ -20,6 +20,7 @@ from numbers import Integral, Real
 from typing import Any, Callable, overload
 
 import pyarrow as pa
+from _duckdb import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE  # type: ignore[import-not-found]
 
 from duckdb.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
@@ -588,7 +589,9 @@ class LocalVLLMExecutor(VLLMExecutor):
     def take_ready_result(self, executor_id: None = None) -> tuple[list[str | None], pa.Table] | None: ...
 
     @overload
-    def take_ready_result(self, executor_id: str) -> tuple[list[str | None], pa.Table, str] | None: ...
+    def take_ready_result(
+        self, executor_id: str
+    ) -> tuple[list[str | None], pa.Table, list[tuple[str, int]]] | None: ...
 
     def take_ready_result(self, executor_id: str | None = None) -> tuple[Any, ...] | None:
         if self.on_error == "raise":
@@ -599,17 +602,30 @@ class LocalVLLMExecutor(VLLMExecutor):
         source_deque = (
             self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
         )
-        try:
-            item = source_deque.popleft()
-        except IndexError:
+        if not source_deque:
             return None
-        output, row, *extra = item
-        self._notify_state_change()
-        if executor_id:
+        if not executor_id:
+            output, row = source_deque.popleft()
+            self._notify_state_change()
+            return [output], row
+
+        outputs: list[str | None] = []
+        row_tables: list[pa.Table] = []
+        reservation_counts: OrderedDict[str, int] = OrderedDict()
+        while source_deque and len(outputs) < DUCKDB_STANDARD_VECTOR_SIZE:
+            output, row, *extra = source_deque.popleft()
             if len(extra) != 1 or not isinstance(extra[0], str) or not extra[0]:
                 raise RuntimeError("vllm per-executor result must include a non-empty reservation_id")
-            return [output], row, extra[0]
-        return [output], row
+            row = _ensure_table(row)
+            if row.num_rows != 1:
+                raise RuntimeError("vllm per-executor result row must contain exactly one row")
+            reservation_id = extra[0]
+            outputs.append(output)
+            row_tables.append(row)
+            reservation_counts[reservation_id] = reservation_counts.get(reservation_id, 0) + 1
+
+        self._notify_state_change()
+        return outputs, _concat_tables(row_tables), list(reservation_counts.items())
 
     def finished_submitting(self) -> None:
         self._finished_submitting = True
@@ -1119,12 +1135,48 @@ class RemoteVLLMExecutor(VLLMExecutor):
             )
         result = resolve_object_refs_blocking(self.llm_actors[actor_idx].take_ready_result.remote(self._executor_id))
         if not isinstance(result, tuple) or len(result) != 3:
-            raise RuntimeError("vllm actor result must be a 3-item tuple including reservation_id")
-        results_text, rows, reservation_id = result
-        if not isinstance(reservation_id, str) or not reservation_id:
-            raise RuntimeError("vllm actor result must include a non-empty reservation_id")
-        count = len(results_text) if results_text else 0
-        self._complete_reservation(reservation_id, count)
+            raise RuntimeError("vllm actor result must be a 3-item tuple including reservation completion counts")
+        results_text, rows, reservation_completions = result
+        if not isinstance(results_text, list) or not results_text:
+            raise RuntimeError("vllm actor result must include a non-empty output list")
+        rows = _ensure_table(rows)
+        count = len(results_text)
+        if count > DUCKDB_STANDARD_VECTOR_SIZE:
+            raise RuntimeError(
+                f"vllm actor result contains {count} outputs; maximum batch size is {DUCKDB_STANDARD_VECTOR_SIZE}"
+            )
+        if rows.num_rows != count:
+            raise RuntimeError(f"vllm actor result row count ({rows.num_rows}) does not match output count ({count})")
+        # Actor pools must be deployment-version homogeneous. Mixed-version
+        # pools and legacy scalar reservation IDs are intentionally unsupported.
+        if not isinstance(reservation_completions, list) or not reservation_completions:
+            raise RuntimeError("vllm actor result must include reservation completion counts")
+
+        normalized_completions: list[tuple[str, int]] = []
+        seen_reservations: set[str] = set()
+        completed_count = 0
+        for completion in reservation_completions:
+            if not isinstance(completion, (list, tuple)) or len(completion) != 2:
+                raise RuntimeError("vllm actor reservation completion must be a (reservation_id, count) pair")
+            reservation_id, completion_count = completion
+            if not isinstance(reservation_id, str) or not reservation_id:
+                raise RuntimeError("vllm actor reservation completion must include a non-empty reservation_id")
+            if reservation_id in seen_reservations:
+                raise RuntimeError(f"vllm actor result contains duplicate reservation {reservation_id}")
+            if isinstance(completion_count, bool) or not isinstance(completion_count, Integral):
+                raise RuntimeError("vllm actor reservation completion count must be a positive integer")
+            completion_count = int(completion_count)
+            if completion_count <= 0:
+                raise RuntimeError("vllm actor reservation completion count must be a positive integer")
+            seen_reservations.add(reservation_id)
+            normalized_completions.append((reservation_id, completion_count))
+            completed_count += completion_count
+        if completed_count != count:
+            raise RuntimeError(
+                f"vllm actor reservation completion count ({completed_count}) does not match output count ({count})"
+            )
+
+        self._complete_reservation_batch(actor_idx, normalized_completions)
         with self._result_cv:
             if self._wait_refs_by_actor[actor_idx] == ready_ref:
                 self._wait_refs_by_actor[actor_idx] = None
@@ -1137,34 +1189,48 @@ class RemoteVLLMExecutor(VLLMExecutor):
         self._ensure_wait_ref(actor_idx)
         self._notify_state_change()
 
-    def _complete_reservation(self, reservation_id: str | None, count: int) -> None:
-        if reservation_id is None or count <= 0:
+    def _complete_reservation_batch(self, actor_idx: int, completions: list[tuple[str, int]]) -> None:
+        if not completions:
             return
-        reservation_id = str(reservation_id)
         with self._reservation_rpc_lock:
             with self._reservation_lock:
-                reservation = self._reservations.get(reservation_id)
-                if reservation is None:
-                    raise RuntimeError(f"vllm result references unknown reservation {reservation_id}")
-                released = min(count, reservation["remaining"])
-                remaining_before = reservation["remaining"]
-                actor_idx = reservation["actor_idx"]
-            self._router_release(
-                "complete",
-                released,
-                reservation_id,
-                released,
-                operation_id=f"{self._executor_id}:complete:{reservation_id}:{remaining_before}:{released}",
-            )
-            with self._reservation_lock:
-                current = self._reservations.get(reservation_id)
-                if current is not reservation or current["remaining"] != remaining_before:
-                    raise RuntimeError(f"vllm reservation {reservation_id} changed during completion")
-                reservation["remaining"] -= released
-                if reservation["remaining"] == 0:
-                    self._reservations.pop(reservation_id, None)
-            with self._inflight_lock:
-                self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - released)
+                for reservation_id, count in completions:
+                    reservation = self._reservations.get(reservation_id)
+                    if reservation is None:
+                        raise RuntimeError(f"vllm result references unknown reservation {reservation_id}")
+                    if reservation["actor_idx"] != actor_idx:
+                        raise RuntimeError(
+                            f"vllm actor {actor_idx} result references reservation {reservation_id} "
+                            f"owned by actor {reservation['actor_idx']}"
+                        )
+                    if count > reservation["remaining"]:
+                        raise RuntimeError(
+                            f"vllm result completes {count} prompts for reservation {reservation_id}; "
+                            f"only {reservation['remaining']} remain"
+                        )
+
+            # Reservation RPCs are serialized by _reservation_rpc_lock, so the
+            # full preflight above remains valid throughout the batch.
+            for reservation_id, count in completions:
+                with self._reservation_lock:
+                    reservation = self._reservations[reservation_id]
+                    remaining_before = reservation["remaining"]
+                self._router_release(
+                    "complete",
+                    count,
+                    reservation_id,
+                    count,
+                    operation_id=f"{self._executor_id}:complete:{reservation_id}:{remaining_before}:{count}",
+                )
+                with self._reservation_lock:
+                    current = self._reservations.get(reservation_id)
+                    if current is not reservation or current["remaining"] != remaining_before:
+                        raise RuntimeError(f"vllm reservation {reservation_id} changed during completion")
+                    reservation["remaining"] -= count
+                    if reservation["remaining"] == 0:
+                        self._reservations.pop(reservation_id, None)
+                with self._inflight_lock:
+                    self._inflight_per_actor[actor_idx] = max(0, self._inflight_per_actor[actor_idx] - count)
 
     def _rollback_reservation(
         self,
