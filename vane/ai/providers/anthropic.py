@@ -13,7 +13,7 @@ from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import OutputValidationError, serialize_raw_response
 from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError
+from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -270,12 +270,30 @@ class AnthropicPrompter:
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
 
-        if getattr(response, "stop_reason", None) == "max_tokens":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens":
             if self._options.get("max_tokens") == 0:
                 return None
-            raise ValueError(
+            raise _ProviderResultError(
                 f"Anthropic response from model {self._model!r} was truncated at "
                 f"max_tokens={self._options.get('max_tokens')}"
+            )
+        if stop_reason == "model_context_window_exceeded":
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} was truncated at the model context window"
+            )
+        if stop_reason == "refusal":
+            raise _ProviderResultError(f"Anthropic model {self._model!r} refused the Prompt request")
+        if stop_reason == "pause_turn":
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} paused before completion; "
+                "Vane Prompt does not support continuing paused turns"
+            )
+
+        complete_stop_reasons = {"tool_use"} if return_format is not None else {"end_turn", "stop_sequence"}
+        if stop_reason not in complete_stop_reasons:
+            raise _ProviderResultError(
+                f"Anthropic response from model {self._model!r} returned a missing or unsupported stop_reason"
             )
 
         blocks = getattr(response, "content", None) or []

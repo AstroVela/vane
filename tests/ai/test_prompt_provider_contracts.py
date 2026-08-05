@@ -111,6 +111,7 @@ def test_openai_compatible_endpoint_omits_strict_schema_flag(chat):
 
 
 def test_anthropic_structured_tool_and_raw_body_contracts():
+    from vane.ai.provider import _ProviderResultError
     from vane.ai.providers.anthropic import AnthropicPrompter
 
     prompter = AnthropicPrompter.__new__(AnthropicPrompter)
@@ -144,6 +145,16 @@ def test_anthropic_structured_tool_and_raw_body_contracts():
         "name": "vane_structured_output",
         "disable_parallel_tool_use": True,
     }
+
+    prompter._client.messages.create = AsyncMock(
+        return_value=SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", name="vane_structured_output", input={"answer": "ok"})],
+            usage=None,
+            stop_reason="end_turn",
+        )
+    )
+    with pytest.raises(_ProviderResultError, match="missing or unsupported stop_reason"):
+        asyncio.run(prompter.prompt(("question",)))
 
     prompter._return_raw_response = True
     prompter._client.messages.create = AsyncMock(return_value=_RawBody({"id": "message-1", "content": []}))
