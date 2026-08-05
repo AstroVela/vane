@@ -396,7 +396,7 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
     executor._per_executor_abort_wait_tokens = {}
 
     assert executor.release_executor("executor") is False
-    assert executor.take_ready_result("executor") == ([None], rows, "reservation")
+    assert executor.take_ready_result("executor") == ([None], rows, [("reservation", 1)])
     assert executor.release_executor("executor") is True
 
     executor._per_executor_deques["aborted"] = deque()
@@ -406,6 +406,45 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
     asyncio.run(executor.abort_executor("aborted"))
     assert "aborted" in executor._per_executor_aborted
     assert executor.release_executor("aborted") is True
+
+
+def test_ray_actor_batches_ready_results_to_standard_vector_size():
+    import duckdb.execution.vllm as vllm
+
+    vector_size = vllm.DUCKDB_STANDARD_VECTOR_SIZE
+    source_rows = pa.table({"id": range(vector_size + 3)})
+    ready = deque()
+    for row_id in range(vector_size + 3):
+        if row_id < vector_size // 2:
+            reservation_id = "reservation-a"
+        elif row_id < vector_size:
+            reservation_id = "reservation-b"
+        else:
+            reservation_id = "reservation-c"
+        ready.append((f"output-{row_id}", source_rows.slice(row_id, 1), reservation_id))
+
+    executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
+    executor.on_error = "raise"
+    executor.completed_tasks = deque()
+    executor._per_executor_errors = {}
+    executor._per_executor_deques = {"executor": ready}
+    notifications = []
+    executor._notify_state_change = lambda **_kwargs: notifications.append(True)
+
+    first_outputs, first_rows, first_completions = executor.take_ready_result("executor")
+    assert first_outputs == [f"output-{row_id}" for row_id in range(vector_size)]
+    assert first_rows.to_pydict() == {"id": list(range(vector_size))}
+    assert first_completions == [
+        ("reservation-a", vector_size // 2),
+        ("reservation-b", vector_size // 2),
+    ]
+
+    second_outputs, second_rows, second_completions = executor.take_ready_result("executor")
+    assert second_outputs == [f"output-{row_id}" for row_id in range(vector_size, vector_size + 3)]
+    assert second_rows.to_pydict() == {"id": list(range(vector_size, vector_size + 3))}
+    assert second_completions == [("reservation-c", 3)]
+    assert executor.take_ready_result("executor") is None
+    assert notifications == [True, True]
 
 
 def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity():
@@ -706,6 +745,7 @@ class _FakeVLLMActor:
     def __init__(self):
         self.submissions = []
         self.results = deque()
+        self.take_calls = 0
         self.wait_refs = deque()
         self.wait_tokens = []
         self.released = []
@@ -729,6 +769,7 @@ class _FakeVLLMActor:
         return ref
 
     def _take(self, _executor_id):
+        self.take_calls += 1
         return self.results.popleft()
 
     def _finish(self, executor_id):
@@ -743,7 +784,7 @@ class _FakeVLLMActor:
         self.abort_wait_tokens.append((executor_id, wait_token))
 
     def publish(self, outputs, rows, reservation_id):
-        self.results.append((outputs, rows, reservation_id))
+        self.results.append((outputs, rows, [(reservation_id, len(outputs))]))
         self.wait_refs.popleft().set_result(True)
 
 
@@ -794,7 +835,7 @@ def test_remote_reservation_rpc_does_not_block_submit_and_serializes_shutdown(mo
 
     shutdown_future = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        complete_future = pool.submit(executor._complete_reservation, first_reservation, 1)
+        complete_future = pool.submit(executor._complete_reservation_batch, 0, [(first_reservation, 1)])
         assert complete_entered.wait(1)
         submit_future = pool.submit(submit_second)
         submit_was_not_blocked = submit_finished.wait(1)
@@ -868,6 +909,48 @@ def test_remote_executor_uses_router_reservation_and_one_shot_wakeup(monkeypatch
     assert executor._actors_owner.shutdown_calls == 1
 
 
+def test_remote_executor_consumes_multi_reservation_actor_batch_in_one_rpc(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    first_rows = pa.table({"id": [1]})
+    second_rows = pa.table({"id": [2]})
+    executor.submit(None, ["first"], first_rows)
+    executor.submit(None, ["second"], second_rows)
+    first_reservation = actor.submissions[0][3]
+    second_reservation = actor.submissions[1][3]
+    assert executor.take_ready_result() is None
+
+    combined_rows = pa.concat_tables([first_rows, second_rows])
+    actor.results.append(
+        (
+            ["out-first", "out-second"],
+            combined_rows,
+            [(first_reservation, 1), (second_reservation, 1)],
+        )
+    )
+    actor.wait_refs.popleft().set_result(True)
+
+    assert executor.take_ready_result() == (["out-first", "out-second"], combined_rows)
+    assert actor.take_calls == 1
+    assert router.inflight == [0]
+    assert executor._reservations == {}
+    executor.finished_submitting()
+    assert executor.all_tasks_finished() is True
+
+
 def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch):
     import duckdb.execution.vllm as vllm
 
@@ -891,6 +974,42 @@ def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch
     try:
         with pytest.raises(RuntimeError, match="3-item tuple"):
             executor._drain_ready_actor(0, True, actor.wait_refs[0])
+    finally:
+        executor.shutdown()
+
+
+def test_remote_executor_validates_batch_reservations_before_completion(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="pool")
+    rows = pa.table({"id": [1, 2]})
+    executor.submit(None, ["first", "second"], rows)
+    reservation_id = actor.submissions[0][3]
+    actor.results.append(
+        (
+            ["out-first", "out-second"],
+            rows,
+            [(reservation_id, 1), ("unknown-reservation", 1)],
+        )
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown reservation"):
+            executor._drain_ready_actor(0, True, actor.wait_refs[0])
+        assert router.inflight == [2]
+        assert executor._reservations[reservation_id]["remaining"] == 2
     finally:
         executor.shutdown()
 
@@ -1062,7 +1181,7 @@ def test_remote_executor_rearms_wait_for_already_buffered_actor_result(monkeypat
     second_reservation = actor.submissions[1][3]
 
     actor.publish(["out-first"], first_rows, first_reservation)
-    actor.results.append((["out-second"], second_rows, second_reservation))
+    actor.results.append((["out-second"], second_rows, [(second_reservation, 1)]))
 
     assert executor.take_ready_result() == (["out-first"], first_rows)
     assert executor.take_ready_result() == (["out-second"], second_rows)
