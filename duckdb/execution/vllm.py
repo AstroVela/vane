@@ -1147,6 +1147,8 @@ class RemoteVLLMExecutor(VLLMExecutor):
             )
         if rows.num_rows != count:
             raise RuntimeError(f"vllm actor result row count ({rows.num_rows}) does not match output count ({count})")
+        # Actor pools must be deployment-version homogeneous. Mixed-version
+        # pools and legacy scalar reservation IDs are intentionally unsupported.
         if not isinstance(reservation_completions, list) or not reservation_completions:
             raise RuntimeError("vllm actor result must include reservation completion counts")
 

@@ -978,6 +978,36 @@ def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch
         executor.shutdown()
 
 
+def test_remote_executor_rejects_legacy_named_pool_actor_result(monkeypatch):
+    import duckdb.execution.vllm as vllm
+
+    actor = _FakeVLLMActor()
+    router = vllm.PrefixRouter([actor], load_balance_threshold=0)
+
+    class Owner:
+        router_actor = _RemoteProxy(router)
+        llm_actors = [actor]
+
+        @staticmethod
+        def shutdown():
+            return None
+
+    monkeypatch.setattr(vllm, "resolve_object_refs_blocking", lambda ref, **_kwargs: ref.resolve())
+    executor = vllm.RemoteVLLMExecutor(Owner(), pool_name="named-pool")
+    rows = pa.table({"id": [1]})
+    executor.submit(None, ["prompt"], rows)
+    reservation_id = actor.submissions[0][3]
+    actor.results.append((["output"], rows, reservation_id))
+
+    try:
+        with pytest.raises(RuntimeError, match="reservation completion counts"):
+            executor._drain_ready_actor(0, True, actor.wait_refs[0])
+        assert router.inflight == [1]
+        assert executor._reservations[reservation_id]["remaining"] == 1
+    finally:
+        executor.shutdown()
+
+
 def test_remote_executor_validates_batch_reservations_before_completion(monkeypatch):
     import duckdb.execution.vllm as vllm
 
