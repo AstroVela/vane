@@ -4236,6 +4236,165 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     assert shutdown_finished.is_set()
 
 
+def _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call):
+    import duckdb.runners.ray.worker_handle as ray_worker_handle
+
+    class DummyRayWorkerHandle:
+        def __init__(self):
+            self.status_calls = 0
+
+        def fte_query_status(self, _query_id, _task_contexts):
+            self.status_calls += 1
+            return status_for_call(self.status_calls)
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not abort")
+
+    worker_handle = DummyRayWorkerHandle()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            duckdb.ray_cxx.RayWorkerRuntime(
+                "worker-a",
+                worker_handle,
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = duckdb.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 1
+    return manager, worker_handle
+
+
+def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeypatch):
+    def status_for_call(status_calls):
+        if status_calls < 5:
+            return {
+                "failed": False,
+                "finished": False,
+                "matched": False,
+                "canceled": False,
+                "registration_pending": False,
+            }
+        return {
+            "failed": False,
+            "finished": True,
+            "matched": True,
+            "canceled": False,
+            "registration_pending": False,
+        }
+
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+
+    try:
+        with pytest.raises(Exception, match="scope did not match any registered fragment"):
+            manager._wait_fte_query_scoped_for_test("query-unmatched-scope")
+        assert worker_handle.status_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_ray_worker_manager_scoped_wait_allows_pending_registration(monkeypatch):
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(
+        monkeypatch,
+        lambda status_calls: {
+            "failed": False,
+            "finished": status_calls > 1,
+            "matched": status_calls > 1,
+            "canceled": False,
+            "registration_pending": status_calls == 1,
+        },
+    )
+
+    try:
+        manager._wait_fte_query_scoped_for_test("query-pending-scope")
+        assert worker_handle.status_calls == 2
+    finally:
+        manager.shutdown()
+
+
+def test_ray_worker_manager_scoped_wait_stops_when_query_is_canceled(monkeypatch):
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(
+        monkeypatch,
+        lambda _status_calls: {
+            "failed": False,
+            "finished": False,
+            "matched": False,
+            "canceled": True,
+            "registration_pending": False,
+            "message": "query registry is closing",
+        },
+    )
+
+    try:
+        with pytest.raises(Exception, match="FTE query canceled.*query registry is closing"):
+            manager._wait_fte_query_scoped_for_test("query-canceled-scope")
+        assert worker_handle.status_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
+    status_entered = threading.Event()
+
+    def status_for_call(status_calls):
+        status_entered.set()
+        return {
+            "failed": False,
+            "finished": status_calls >= 50,
+            "matched": status_calls >= 50,
+            "canceled": False,
+            "registration_pending": status_calls < 50,
+        }
+
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+
+    wait_outcomes: list[str] = []
+
+    def wait_query():
+        try:
+            manager._wait_fte_query_scoped_for_test("query-shutdown-scope")
+        except BaseException as exc:
+            wait_outcomes.append(f"error:{exc}")
+        else:
+            wait_outcomes.append("ok")
+
+    shutdown_finished = threading.Event()
+
+    def shutdown():
+        manager.shutdown()
+        shutdown_finished.set()
+
+    waiter = threading.Thread(target=wait_query)
+    closer = threading.Thread(target=shutdown)
+    waiter.start()
+    assert status_entered.wait(timeout=5)
+    closer.start()
+    waiter.join(timeout=5)
+    closer.join(timeout=5)
+
+    assert waiter.is_alive() is False
+    assert closer.is_alive() is False
+    assert shutdown_finished.is_set()
+    assert len(wait_outcomes) == 1
+    assert wait_outcomes[0].startswith("error:")
+    assert "shutting down" in wait_outcomes[0]
+    assert worker_handle.status_calls < 50
+
+
 def test_ray_worker_manager_shutdown_aborts_all_actors_after_prepare_error(monkeypatch):
     calls: list[tuple[str, str]] = []
 

@@ -73,6 +73,11 @@ void RayWorkerManager::EndOperation() const {
 	shutdown_cv_.notify_all();
 }
 
+bool RayWorkerManager::ShutdownStarted() const {
+	lock_guard<mutex> guard(mutex_);
+	return state_.shutdown_started;
+}
+
 bool RayWorkerManager::RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
                                               const std::shared_ptr<std::atomic<bool>> &retired) const {
 	std::shared_ptr<RayWorkerRuntime> retired_worker;
@@ -1069,6 +1074,10 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 
 	try {
 		while (true) {
+			if (ShutdownStarted()) {
+				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+				    DuckDBError::invalid_state_error("Ray worker manager is shutting down"));
+			}
 			const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
 			auto status_res = FteQueryStatus(query_id, task_context_filter);
 			if (status_res.is_err()) {
@@ -1081,16 +1090,26 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("FTE query failed: " + status.message));
 			}
+			if (status.canceled) {
+				ClearFteResultHandles(query_id);
+				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+				    DuckDBError::external_error("FTE query canceled: " + status.message));
+			}
 			auto collect_res = CollectFteResultHandles(query_id);
 			if (collect_res.is_err()) {
 				ClearFteResultHandles(query_id);
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(collect_res.error());
 			}
-			// A materializer can enter this wait immediately after submitting
-			// its events while another thread is still registering the matching
-			// fragment. Treat an unmatched scope as pending until it either
-			// appears, the query fails, or the ordinary wait deadline expires.
-			if ((!task_context_filter || status.matched) && status.finished) {
+			// Registry operations fence every ingress path that can publish a
+			// fragment. Once no such operation remains, an unmatched materializer
+			// scope cannot appear later and must not poll indefinitely.
+			if (task_context_filter && !status.matched) {
+				if (!status.registration_pending) {
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+					    DuckDBError::external_error("FTE query scope did not match any registered fragment: " +
+					                                status.message));
+				}
+			} else if (status.finished) {
 				finished_status = status;
 				has_finished_status = true;
 				break;

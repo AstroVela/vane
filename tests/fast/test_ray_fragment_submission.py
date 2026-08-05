@@ -11760,6 +11760,18 @@ def test_fte_wait_query_finishes_from_status_events(monkeypatch):
     assert handle.pop_fte_result_handles("query-fte-wait") == []
 
 
+def test_fte_wait_query_stops_when_query_registry_closes():
+    query_id = "query-fte-wait-canceled"
+    handle = RayWorkerActorHandle(_FakeActor(), memory_capacity_bytes=1 << 60)
+    fte_fragment_scheduler_mod.close_fte_registry_for_query(query_id)
+
+    try:
+        with pytest.raises(RuntimeError, match=f"FTE query {query_id} canceled"):
+            handle.wait_fte_query(query_id, timeout_s=0)
+    finally:
+        fte_fragment_scheduler_mod.open_fte_registry_for_query(query_id)
+
+
 def test_fte_wait_query_raises_on_failed_partition(monkeypatch):
     monkeypatch.setattr(
         RayWorkerActorHandle,
