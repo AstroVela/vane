@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from math import isfinite
 from numbers import Real
-from typing import Any
+from types import CodeType
+from typing import Any, Protocol
 
 import _duckdb
 
@@ -21,6 +22,16 @@ import duckdb
 from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 from vane._expressions import as_expression, is_expression
 from vane.config import current_config
+
+
+class _PythonFunction(Protocol):
+    __name__: str
+    __qualname__: str
+    __code__: CodeType
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def __get__(self, instance: Any, owner: Any | None = None) -> _PythonFunction: ...
 
 
 def _invalid_input(message: str) -> duckdb.InvalidInputException:
@@ -187,13 +198,19 @@ def _callable_name(fn: Callable[..., Any]) -> str:
     return _qualified_name(fn, kind="UDF callable")
 
 
+def _validate_function_udf_callable(fn: Any, *, api: str) -> None:
+    if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
+        raise TypeError(f"{api} requires a Python function or bound method")
+    validate_synchronous_udf_callable(fn)
+
+
 def _class_name(cls: type) -> str:
     return _qualified_name(cls, kind="UDF class")
 
 
-def _resolve_udf_name(name: Any, default_name: str) -> str:
+def _resolve_udf_name(name: Any, default_name: Callable[[], str]) -> str:
     if name is None:
-        return default_name
+        return default_name()
     if not isinstance(name, str) or not name:
         raise _invalid_input("name must be a non-empty string")
     return name
@@ -741,20 +758,24 @@ def _validate_sql_actor_callable(fn: Any) -> None:
 
 
 class VaneFunction:
-    """Expression UDF decorator wrapper.
+    """Synchronous Python function or bound-method scalar UDF wrapper.
 
     When used as an instance-method descriptor, the serialized callable
     captures that instance's current snapshot. Persistent cross-batch state is
     intentionally provided only by :func:`vane.cls`.
     """
 
-    def __init__(self, fn: Callable[..., Any], *, return_dtype: Any | None = None, name: str | None = None):
-        if not callable(fn):
-            raise TypeError("vane.func requires a callable")
-        validate_synchronous_udf_callable(fn)
+    def __init__(
+        self,
+        fn: _PythonFunction,
+        *,
+        return_dtype: Any | None = None,
+        name: str | None = None,
+    ):
+        _validate_function_udf_callable(fn, api="vane.func")
         self._fn = fn
         self._return_dtype = return_dtype
-        self._name = _resolve_udf_name(name, _callable_name(fn))
+        self._name = _resolve_udf_name(name, lambda: _callable_name(fn))
         functools.update_wrapper(self, fn)
 
     @property
@@ -762,7 +783,7 @@ class VaneFunction:
         return self._return_dtype
 
     @property
-    def python_function(self) -> Callable[..., Any]:
+    def python_function(self) -> _PythonFunction:
         return self._fn
 
     @property
@@ -784,11 +805,11 @@ class VaneFunction:
 
 
 class VaneBatchFunction:
-    """Decorator wrapper for row-preserving Arrow column batch UDFs."""
+    """Synchronous Python function or bound-method Arrow column batch UDF wrapper."""
 
     def __init__(
         self,
-        fn: Callable[..., Any],
+        fn: _PythonFunction,
         *,
         return_dtype: Any,
         name: str | None = None,
@@ -796,9 +817,7 @@ class VaneBatchFunction:
         unnest: bool = False,
         gpus: float | None = None,
     ) -> None:
-        if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
-            raise TypeError("vane.func.batch requires a Python function")
-        validate_synchronous_udf_callable(fn)
+        _validate_function_udf_callable(fn, api="vane.func.batch")
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.func.batch")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -811,14 +830,14 @@ class VaneBatchFunction:
         self._signature = _batch_function_signature(fn)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
-        self._name = _resolve_udf_name(name, _callable_name(fn))
+        self._name = _resolve_udf_name(name, lambda: _callable_name(fn))
         self._batch_size = _normalize_batch_size(batch_size)
         self._unnest = bool(unnest)
         self._gpus = _normalize_gpus(gpus)
         functools.update_wrapper(self, fn)
 
     @property
-    def python_function(self) -> Callable[..., Any]:
+    def python_function(self) -> _PythonFunction:
         return self._fn
 
     @property
@@ -925,7 +944,7 @@ class VaneClass:
         self._actor_number = _validate_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
-        self._name = _resolve_udf_name(name, _class_name(class_))
+        self._name = _resolve_udf_name(name, lambda: _class_name(class_))
         self._gpus = 0 if gpus is None else gpus
         functools.update_wrapper(self, class_, updated=())
 
@@ -1071,7 +1090,7 @@ class VaneClassBatch:
         self._actor_number = _validate_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
-        self._name = _resolve_udf_name(name, _class_name(class_))
+        self._name = _resolve_udf_name(name, lambda: _class_name(class_))
         self._batch_size = _normalize_batch_size(batch_size)
         self._unnest = bool(unnest)
         self._gpus = 0.0 if gpus is None else _normalize_gpus(gpus)
@@ -1337,7 +1356,7 @@ def _build_map_batches_expression(
     resolved_backend = _runner_to_task_backend() if execution_backend is None else execution_backend
     return _duckdb._VaneUDFMapBatchesExpression(
         fn,
-        _resolve_udf_name(name, _callable_name(fn)),
+        _resolve_udf_name(name, lambda: _callable_name(fn)),
         normalized_schema,
         resolved_backend,
         input_names,
@@ -1381,11 +1400,12 @@ def _build_actor_map_batches_expression(
 
 
 def func(
-    fn: Callable[..., Any] | None = None,
+    fn: _PythonFunction | None = None,
     *,
     return_dtype: Any | None = None,
     name: str | None = None,
-) -> VaneFunction | Callable[[Callable[..., Any]], VaneFunction]:
+) -> VaneFunction | Callable[[_PythonFunction], VaneFunction]:
+    """Decorate a synchronous Python function or bound method as a scalar expression UDF."""
     if fn is None:
         return lambda actual_fn: VaneFunction(actual_fn, return_dtype=return_dtype, name=name)
     return VaneFunction(fn, return_dtype=return_dtype, name=name)
@@ -1398,8 +1418,8 @@ def _func_batch(
     batch_size: int | None = None,
     unnest: bool = False,
     gpus: float | None = None,
-) -> Callable[[Callable[..., Any]], VaneBatchFunction]:
-    """Decorate a row-preserving Arrow column batch function.
+) -> Callable[[_PythonFunction], VaneBatchFunction]:
+    """Decorate a synchronous Python function or bound method as an Arrow column batch UDF.
 
     Each decorated input is delivered as ``pyarrow.Array`` or
     ``pyarrow.ChunkedArray``. The function must return one of those column
