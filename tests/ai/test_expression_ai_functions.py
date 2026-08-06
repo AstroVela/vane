@@ -795,6 +795,195 @@ def test_embed_dynamic_dimension_mismatch_is_a_result_type_error():
         loop.close()
 
 
+def _drive_embed_wrapper(wrapper: Any, texts: list[str | None]) -> pa.Table:
+    loop = asyncio.new_event_loop()
+    wrapper.bind_async_runtime(loop.run_until_complete)
+    try:
+        return wrapper(pa.table({"text": texts}))
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_component",
+    [float("nan"), float("inf"), float("-inf"), 1e100],
+    ids=["nan", "positive-infinity", "negative-infinity", "float32-overflow"],
+)
+def test_embed_non_finite_result_raises_without_retry(invalid_component):
+    from vane.ai.functions import _EmbedTextBatch
+    from vane.ai.provider import _ProviderResultError
+
+    calls = []
+
+    class NonFiniteEmbedder:
+        def embed_text(self, texts):
+            calls.append(list(texts))
+            return [[1.0, invalid_component, 2.0] for _ in texts]
+
+    class Descriptor:
+        def get_provider(self):
+            return "mock"
+
+        def get_model(self):
+            return "non-finite-model"
+
+        def instantiate(self):
+            return NonFiniteEmbedder()
+
+    wrapper = _EmbedTextBatch(Descriptor(), "text", "embedding", 3, max_retries=3)
+
+    with pytest.raises(_ProviderResultError, match="embedding containing non-finite components"):
+        _drive_embed_wrapper(wrapper, ["bad"])
+
+    assert calls == [["bad"]]
+
+
+@pytest.mark.parametrize(
+    "invalid_embedding",
+    [
+        [1.0, float("nan"), 2.0],
+        ["not", "numeric", "values"],
+        [1.0, 2.0],
+    ],
+    ids=["non-finite", "non-numeric", "wrong-dimensions"],
+)
+def test_embed_on_error_ignore_nulls_invalid_result_row_without_reinvoking_provider(invalid_embedding):
+    from vane.ai.functions import _EmbedTextBatch
+
+    calls = []
+
+    class MixedEmbedder:
+        def embed_text(self, texts):
+            calls.append(list(texts))
+            vectors = {
+                "first": [3.0, 0.0, 4.0],
+                "bad": invalid_embedding,
+                "last": [0.0, 5.0, 0.0],
+            }
+            return [vectors[text] for text in texts]
+
+    class Descriptor:
+        def instantiate(self):
+            return MixedEmbedder()
+
+    wrapper = _EmbedTextBatch(
+        Descriptor(),
+        "text",
+        "embedding",
+        3,
+        max_retries=3,
+        on_error="ignore",
+        normalize=True,
+    )
+
+    result = _drive_embed_wrapper(wrapper, ["first", "bad", None, "last"])
+    embeddings = result.column("embedding").to_pylist()
+
+    np.testing.assert_allclose(embeddings[0], [0.6, 0.0, 0.8], rtol=1e-6)
+    assert embeddings[1:3] == [None, None]
+    np.testing.assert_allclose(embeddings[3], [0.0, 1.0, 0.0], rtol=1e-6)
+    assert calls == [["first", "bad", "last"]]
+    assert result.schema.field("embedding").type == pa.list_(pa.float32(), 3)
+
+
+@pytest.mark.parametrize(
+    "magnitude",
+    [np.finfo(np.float32).max, np.finfo(np.float32).tiny],
+    ids=["large", "small"],
+)
+def test_embed_normalization_uses_float64_for_extreme_finite_vector(magnitude):
+    from vane.ai.functions import _EmbedTextBatch
+
+    class ExtremeFiniteEmbedder:
+        def embed_text(self, texts):
+            return [np.array([magnitude, magnitude], dtype=np.float32) for _ in texts]
+
+    class Descriptor:
+        def instantiate(self):
+            return ExtremeFiniteEmbedder()
+
+    wrapper = _EmbedTextBatch(Descriptor(), "text", "embedding", 2, max_retries=0, normalize=True)
+    embedding = _drive_embed_wrapper(wrapper, ["extreme"]).column("embedding")[0].as_py()
+
+    assert all(math.isfinite(value) for value in embedding)
+    np.testing.assert_allclose(embedding, [math.sqrt(0.5), math.sqrt(0.5)], rtol=1e-6)
+
+
+def test_embed_normalization_preserves_finite_zero_vector():
+    from vane.ai.functions import _EmbedTextBatch
+
+    class ZeroEmbedder:
+        def embed_text(self, texts):
+            return [np.zeros(3, dtype=np.float32) for _ in texts]
+
+    class Descriptor:
+        def instantiate(self):
+            return ZeroEmbedder()
+
+    wrapper = _EmbedTextBatch(Descriptor(), "text", "embedding", 3, max_retries=0, normalize=True)
+
+    assert _drive_embed_wrapper(wrapper, ["zero"]).column("embedding").to_pylist() == [[0.0, 0.0, 0.0]]
+
+
+def test_embed_non_finite_chunk_nulls_parent_without_reinvoking_provider():
+    from vane.ai.functions import _EmbedTextBatch
+
+    calls = []
+
+    class ChunkEmbedder:
+        def embed_text(self, texts):
+            calls.append(list(texts))
+            return [[float("nan"), 0.0] if text == "bbbb" else [1.0, 0.0] for text in texts]
+
+    class Descriptor:
+        def instantiate(self):
+            return ChunkEmbedder()
+
+    wrapper = _EmbedTextBatch(
+        Descriptor(),
+        "text",
+        "embedding",
+        2,
+        max_chunk_chars=4,
+        chunk_overlap_chars=0,
+        max_retries=3,
+        on_error="ignore",
+    )
+
+    result = _drive_embed_wrapper(wrapper, ["aaaabbbb", "ccccdddd"])
+
+    assert result.column("embedding").to_pylist() == [None, [1.0, 0.0]]
+    assert calls == [["aaaa", "bbbb", "cccc", "dddd"]]
+
+
+def test_embed_final_contract_rejects_non_finite_normalized_output(monkeypatch):
+    from vane.ai.functions import _EmbedTextBatch
+
+    class FiniteEmbedder:
+        def embed_text(self, texts):
+            return [[1.0, 2.0] for _ in texts]
+
+    class Descriptor:
+        def instantiate(self):
+            return FiniteEmbedder()
+
+    monkeypatch.setattr(
+        "vane.ai.functions._normalize_embedding",
+        lambda _embedding: np.array([1.0, float("inf")], dtype=np.float32),
+    )
+    wrapper = _EmbedTextBatch(
+        Descriptor(),
+        "text",
+        "embedding",
+        2,
+        max_retries=0,
+        on_error="ignore",
+        normalize=True,
+    )
+
+    assert _drive_embed_wrapper(wrapper, ["row"]).column("embedding").to_pylist() == [None]
+
+
 def test_ai_prompt_expression_basic():
     conn = vane.connect()
     rel = conn.sql(
