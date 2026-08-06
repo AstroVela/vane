@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2278,6 +2279,12 @@ class _FakeLiveWorker:
             },
         }
 
+    def enqueue_fte_cancel_task(self, task_id):
+        return task_id
+
+    def resolve_fte_cancel_task(self, cancellation):
+        return self.fte_cancel_task(cancellation)
+
     def set_fte_task_execution_class(self, task_id, execution_class):
         self.calls.append(
             (
@@ -3400,9 +3407,10 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
     assert len(scheduled) == 1
     assert scheduled[0].request["execution_class"] == "SPECULATIVE"
 
-    revoked = stage.revoke_speculative_attempts(reason="memory pressure")
+    result = stage.revoke_speculative_attempts(reason="memory pressure")
 
-    assert [str(item.attempt_id) for item in revoked] == ["q.31.0.0"]
+    assert [str(item.attempt_id) for item in result.revoked] == ["q.31.0.0"]
+    assert result.failures == ()
     assert worker.calls[-1] == ("cancel", scheduled[0].attempt_id.to_dict())
     assert stage.schedule_next_pending_partition() is None
     assert stage.partitions[0].ready_for_scheduling is False
@@ -3419,6 +3427,216 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
     assert scheduled_after_seal is not None
     assert str(scheduled_after_seal.attempt_id) == "q.31.0.1"
     assert scheduled_after_seal.request["execution_class"] == "STANDARD"
+
+
+def test_fte_fragment_execution_speculative_revoke_cancels_outside_state_lock():
+    cancel_started = threading.Event()
+    cancel_release = threading.Event()
+    stage = None
+
+    class _BlockingCancelWorker(_FakeLiveWorker):
+        cancel_owned_state_lock = None
+
+        def fte_cancel_task(self, task_id):
+            assert stage is not None
+            self.cancel_owned_state_lock = stage._state_lock_owned_by_current_thread()
+            cancel_started.set()
+            assert cancel_release.wait(timeout=5.0)
+            return super().fte_cancel_task(task_id)
+
+    worker = _BlockingCancelWorker("worker-speculative-revoke-lock")
+    stage = _fte_fragment_execution(
+        "q",
+        38,
+        fragment_id="q:node:speculative-revoke-lock",
+        worker=worker,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0)],
+            partition_updates=[
+                PartitionUpdate(
+                    0,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    ready_for_scheduling=True,
+                )
+            ],
+        )
+    )[0]
+    _execute_stage_commands(stage)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        revoke = executor.submit(stage.revoke_speculative_attempts, reason="memory pressure")
+        assert cancel_started.wait(timeout=2.0)
+        snapshot_future = executor.submit(stage.query_status_snapshot)
+        try:
+            snapshot = snapshot_future.result(timeout=0.5)
+        except FutureTimeoutError:
+            snapshot = None
+        finally:
+            cancel_release.set()
+        result = revoke.result(timeout=2.0)
+
+    assert worker.cancel_owned_state_lock is False
+    assert snapshot is not None
+    assert snapshot["partitions"][0]["running"] is True
+    assert [item.attempt_id for item in result.revoked] == [scheduled.attempt_id]
+    assert result.failures == ()
+    assert stage.partitions[0].running_attempts == {}
+
+
+def test_fte_fragment_execution_speculative_revoke_reports_partial_cancel_failure():
+    class _FailingCancelWorker(_FakeLiveWorker):
+        def resolve_fte_cancel_task(self, _cancellation):
+            raise TimeoutError("planned revoke cancellation timeout")
+
+    successful_worker = _FakeLiveWorker("worker-revoke-success")
+    failing_worker = _FailingCancelWorker("worker-revoke-failure")
+
+    def select_worker(partition):
+        if partition.task_id.partition_id == 0:
+            return successful_worker
+        return failing_worker
+
+    stage = _fte_fragment_execution(
+        "q",
+        69,
+        fragment_id="q:node:speculative-revoke-partial",
+        worker_selector=select_worker,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0), PartitionInfo(1)],
+            partition_updates=[
+                PartitionUpdate(
+                    partition_id,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    ready_for_scheduling=True,
+                )
+                for partition_id in (0, 1)
+            ],
+        )
+    )
+    _execute_stage_commands(stage, scheduled_result)
+
+    result = stage.revoke_speculative_attempts(max_count=2, reason="memory pressure")
+
+    assert [item.attempt_id for item in result.revoked] == [scheduled_result[0].attempt_id]
+    assert len(result.failures) == 1
+    assert result.failures[0].worker_id == failing_worker.worker_id
+    assert "planned revoke cancellation timeout" in str(result.failures[0])
+    assert stage.partitions[0].running_attempts == {}
+    assert list(stage.partitions[1].running_attempts) == [scheduled_result[1].attempt_id.attempt_id]
+    assert stage.partitions[0].revoking_attempts == set()
+    assert stage.partitions[1].revoking_attempts == set()
+
+
+def test_fte_fragment_execution_speculative_revoke_clears_reservation_after_exchange_failure():
+    class _TerminalTrackingWorker(_FakeLiveWorker):
+        def __init__(self):
+            super().__init__("worker-speculative-revoke-abort-failure")
+            self.terminal_attempts = []
+
+        def record_fte_task_terminal(self, attempt_id):
+            self.terminal_attempts.append(str(FteTaskAttemptId.coerce(attempt_id)))
+
+    class _FailingAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, _sink_handle, _attempt_id):
+            raise RuntimeError("exchange abort failed")
+
+    worker = _TerminalTrackingWorker()
+    exchange = _FailingAbortExchange("q", "exchange-speculative-revoke-abort-failure")
+    stage = _fte_fragment_execution(
+        "q",
+        39,
+        fragment_id="q:node:speculative-revoke-abort-failure",
+        worker=worker,
+        exchange=exchange,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0)],
+            partition_updates=[
+                PartitionUpdate(
+                    0,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    ready_for_scheduling=True,
+                )
+            ],
+        )
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+
+    with pytest.raises(RuntimeError, match="exchange abort failed"):
+        stage.revoke_speculative_attempts(reason="memory pressure")
+
+    assert partition.revoking_attempts == set()
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert stage.has_pending_partitions() is False
+    assert worker.terminal_attempts == [str(scheduled.attempt_id)]
+
+
+def test_fte_fragment_execution_revoke_exchange_failure_commits_no_partial_batch():
+    class _FailingSecondAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, sink_handle, attempt_id):
+            if sink_handle.partition_id == 1:
+                raise RuntimeError("planned second exchange abort failure")
+            return super().sink_aborted(sink_handle, attempt_id)
+
+    worker = _FakeLiveWorker("worker-speculative-revoke-batch-abort")
+    exchange = _FailingSecondAbortExchange("q", "exchange-speculative-revoke-batch-abort")
+    stage = _fte_fragment_execution(
+        "q",
+        73,
+        fragment_id="q:node:speculative-revoke-batch-abort",
+        worker=worker,
+        exchange=exchange,
+        context={"task_execution_class": "SPECULATIVE"},
+        source_node_ids={"7"},
+        dynamic_scan_source_node_ids={"7"},
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(
+            partitions_added=[PartitionInfo(0), PartitionInfo(1)],
+            partition_updates=[
+                PartitionUpdate(
+                    partition_id,
+                    "7",
+                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    ready_for_scheduling=True,
+                )
+                for partition_id in (0, 1)
+            ],
+        )
+    )
+    _execute_stage_commands(stage, scheduled_result)
+
+    with pytest.raises(RuntimeError, match="planned second exchange abort failure"):
+        stage.revoke_speculative_attempts(max_count=2, reason="memory pressure")
+
+    assert list(stage.partitions[0].running_attempts) == [scheduled_result[0].attempt_id.attempt_id]
+    assert list(stage.partitions[1].running_attempts) == [scheduled_result[1].attempt_id.attempt_id]
+    assert stage.partitions[0].failed is False
+    assert stage.partitions[1].failed is True
+    assert stage.failed is True
+    assert stage.partitions[0].revoking_attempts == set()
+    assert stage.partitions[1].revoking_attempts == set()
+    assert exchange._aborted_attempts[0] == {0}
+    assert 1 not in exchange._aborted_attempts
 
 
 def test_fte_fragment_execution_seal_transitions_running_speculative_to_standard():
@@ -3817,6 +4035,64 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
     assert stage.partitions[0].remaining_attempts == 1
 
 
+def test_fte_fragment_execution_exchange_abort_precedes_retry_and_fails_closed():
+    abort_started = threading.Event()
+    abort_release = threading.Event()
+
+    class _BlockingFailingAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, _sink_handle, _attempt_id):
+            abort_started.set()
+            assert abort_release.wait(timeout=5.0)
+            raise RuntimeError("exchange abort failed")
+
+    worker = _FakeLiveWorker("worker-task-failure-abort")
+    exchange = _BlockingFailingAbortExchange("q", "exchange-task-failure-abort")
+    stage = _fte_fragment_execution(
+        "q",
+        68,
+        fragment_id="q:node:task-failure-abort",
+        worker=worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    scheduled = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        failure = executor.submit(
+            stage.task_failed,
+            scheduled.attempt_id,
+            {
+                "error_code": "GENERIC_INTERNAL_ERROR",
+                "message": "planned task failure",
+            },
+        )
+        assert abort_started.wait(timeout=2.0)
+        try:
+            assert partition.running_attempts == {scheduled.attempt_id.attempt_id: partition.running_attempt}
+            assert stage.has_pending_partitions() is False
+            assert stage.pending_submission_count() == 0
+            assert stage.schedule_next_pending_partition() is None
+        finally:
+            abort_release.set()
+        with pytest.raises(RuntimeError, match="exchange abort failed"):
+            failure.result(timeout=2.0)
+
+    assert stage.failed is True
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.ready_for_scheduling is False
+    assert stage.has_pending_partitions() is False
+    assert [call[0] for call in worker.calls] == ["create"]
+    assert [failure["error_code"] for failure in partition.failures] == [
+        "GENERIC_INTERNAL_ERROR",
+        "EXCHANGE_ABORT_FAILED",
+    ]
+
+
 def test_fte_fragment_execution_rejects_terminal_status_without_error_code():
     worker = _FakeLiveWorker()
     stage = _fte_fragment_execution(
@@ -3890,6 +4166,162 @@ def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
     assert stage.failed is True
     assert stage.partitions[0].state == FtePartitionState.FAILED
     assert [call[0] for call in worker.calls] == ["create"]
+
+
+def test_fte_fragment_execution_memory_failure_quiesces_other_running_attempts():
+    class _TerminalTrackingWorker(_FakeLiveWorker):
+        def __init__(self, worker_id):
+            super().__init__(worker_id)
+            self.terminal_attempts = []
+
+        def record_fte_task_terminal(self, attempt_id):
+            self.terminal_attempts.append(str(FteTaskAttemptId.coerce(attempt_id)))
+
+    failed_worker = _TerminalTrackingWorker("worker-memory-failed")
+    peer_worker = _TerminalTrackingWorker("worker-memory-peer")
+    exchange = FteExchangeTracker("q", "exchange-memory-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        70,
+        fragment_id="q:node:memory-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 70, 0), 1)
+    partition.running_attempts[peer_attempt.attempt_id] = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+
+    assert (
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+        is None
+    )
+
+    assert peer_worker.calls[-1] == ("cancel", peer_attempt.to_dict())
+    assert failed_worker.terminal_attempts == [str(failed_attempt.attempt_id)]
+    assert peer_worker.terminal_attempts == [str(peer_attempt)]
+    assert partition.running_attempts == {}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert exchange._aborted_attempts[0] == {0, 1}
+
+
+def test_fte_fragment_execution_memory_failure_preserves_peer_handle_when_abort_fails():
+    class _FailingPeerAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, sink_handle, attempt_id):
+            if attempt_id == 1:
+                raise RuntimeError("planned peer exchange abort failure")
+            return super().sink_aborted(sink_handle, attempt_id)
+
+    failed_worker = _FakeLiveWorker("worker-memory-abort-failed")
+    peer_worker = _FakeLiveWorker("worker-memory-abort-peer")
+    exchange = _FailingPeerAbortExchange("q", "exchange-memory-abort-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        71,
+        fragment_id="q:node:memory-abort-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 71, 0), 1)
+    peer_running = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+    partition.running_attempts[peer_attempt.attempt_id] = peer_running
+
+    with pytest.raises(RuntimeError, match="planned peer exchange abort failure"):
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+
+    assert peer_worker.calls[-1] == ("cancel", peer_attempt.to_dict())
+    assert partition.running_attempts == {peer_attempt.attempt_id: peer_running}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert exchange._aborted_attempts[0] == {0}
+
+
+def test_fte_fragment_execution_memory_failure_preserves_unquiesced_peer_handle():
+    class _FailingCancelWorker(_FakeLiveWorker):
+        def resolve_fte_cancel_task(self, _cancellation):
+            raise TimeoutError("planned memory peer cancellation timeout")
+
+    failed_worker = _FakeLiveWorker("worker-memory-cancel-failed")
+    peer_worker = _FailingCancelWorker("worker-memory-cancel-peer")
+    exchange = FteExchangeTracker("q", "exchange-memory-cancel-peer")
+    stage = _fte_fragment_execution(
+        "q",
+        72,
+        fragment_id="q:node:memory-cancel-peer",
+        worker=failed_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )
+    failed_attempt = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+    partition = stage.partitions[0]
+    peer_attempt = FteTaskAttemptId(FteTaskId("q", 72, 0), 1)
+    peer_running = RunningAttempt(
+        peer_attempt,
+        worker_id=peer_worker.worker_id,
+        worker_incarnation_id=peer_worker.worker_incarnation_id,
+        remote_handle=peer_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, peer_attempt.attempt_id),
+    )
+    partition.running_attempts[peer_attempt.attempt_id] = peer_running
+
+    with pytest.raises(FteWorkerControlFailure, match="planned memory peer cancellation timeout"):
+        stage.task_failed(
+            failed_attempt.attempt_id,
+            {
+                "error_code": "EXCEEDED_LOCAL_MEMORY_LIMIT",
+                "message": "planned fixed-heap failure",
+            },
+        )
+
+    assert partition.running_attempts == {peer_attempt.attempt_id: peer_running}
+    assert partition.state == FtePartitionState.FAILED
+    assert stage.failed is True
+    assert [failure["error_code"] for failure in partition.failures] == [
+        "EXCEEDED_LOCAL_MEMORY_LIMIT",
+        "PEER_CANCELLATION_FAILED",
+    ]
+    assert exchange._aborted_attempts[0] == {0}
 
 
 def test_fte_fragment_execution_finish_removes_descriptor_and_finalizes_exchange():
@@ -3970,6 +4402,433 @@ def test_fte_fragment_execution_finish_cancels_unselected_running_attempts():
     assert partition.running_task_stats == {}
     assert exchange.selected_attempt(partition.sink_handle) == 0
     assert exchange._aborted_attempts[0] == {1}
+
+
+def test_fte_fragment_execution_loser_quiescence_does_not_hold_state_lock_or_publish_winner():
+    cancel_started = threading.Event()
+    cancel_release = threading.Event()
+    stage = None
+
+    class _BlockingCancelWorker(_FakeLiveWorker):
+        cancel_owned_state_lock = None
+
+        def fte_cancel_task(self, task_id):
+            assert stage is not None
+            self.cancel_owned_state_lock = stage._state_lock_owned_by_current_thread()
+            cancel_started.set()
+            assert cancel_release.wait(timeout=5.0)
+            return super().fte_cancel_task(task_id)
+
+    class _LockCheckingExchange(FteExchangeTracker):
+        def sink_aborted(self, sink_handle, attempt_id):
+            assert stage is not None
+            assert stage._state_lock_owned_by_current_thread() is False
+            return super().sink_aborted(sink_handle, attempt_id)
+
+        def sink_finished(self, sink_handle, attempt_id):
+            assert stage is not None
+            assert stage._state_lock_owned_by_current_thread() is False
+            return super().sink_finished(sink_handle, attempt_id)
+
+    winner_worker = _FakeLiveWorker("worker-quiescence-winner")
+    loser_worker = _BlockingCancelWorker("worker-quiescence-loser")
+    storage = TaskDescriptorStorage()
+    exchange = _LockCheckingExchange("q", "exchange-quiescence")
+    stage = _fte_fragment_execution(
+        "q",
+        62,
+        fragment_id="q:node:quiescence",
+        worker=winner_worker,
+        descriptor_storage=storage,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 62, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
+        worker_id=loser_worker.worker_id,
+        remote_handle=loser_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        finish = executor.submit(stage.task_finished, winner.attempt_id, {"rows": 10})
+        assert cancel_started.wait(timeout=2.0)
+        snapshot_future = executor.submit(stage.query_status_snapshot)
+        try:
+            snapshot = snapshot_future.result(timeout=0.5)
+            assert stage.has_pending_partitions() is False
+            assert stage.pending_submission_count() == 0
+            assert stage.waiting_for_execution_count() == 0
+            assert stage.waiting_for_node_count() == 0
+        except FutureTimeoutError:
+            snapshot = None
+        finally:
+            cancel_release.set()
+        assert finish.result(timeout=2.0) is True
+
+    assert loser_worker.cancel_owned_state_lock is False
+    assert snapshot is not None
+    assert snapshot["partitions"][0]["finished"] is False
+    assert snapshot["partitions"][0]["finalizing"] is True
+    assert storage.get(partition.task_id) is None
+    assert exchange.selected_attempt(partition.sink_handle) == winner.attempt_id.attempt_id
+    assert partition.state == FtePartitionState.FINISHED
+
+
+def test_fte_fragment_execution_loser_cancel_failure_never_publishes_winner():
+    class _FailingCancelWorker(_FakeLiveWorker):
+        def fte_cancel_task(self, _task_id):
+            raise TimeoutError("loser cancellation barrier timed out")
+
+    winner_worker = _FakeLiveWorker("worker-cancel-failure-winner")
+    loser_worker = _FailingCancelWorker("worker-cancel-failure-loser")
+    storage = TaskDescriptorStorage()
+    exchange = FteExchangeTracker("q", "exchange-cancel-failure")
+    stage = _fte_fragment_execution(
+        "q",
+        63,
+        fragment_id="q:node:cancel-failure",
+        worker=winner_worker,
+        descriptor_storage=storage,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 63, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
+        worker_id=loser_worker.worker_id,
+        remote_handle=loser_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with pytest.raises(FteWorkerControlFailure, match="fte_cancel_task"):
+        stage.task_finished(winner.attempt_id, {"rows": 10})
+
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.finished is False
+    assert partition.finalizing_attempt is None
+    assert partition.selected_attempt is None
+    assert storage.get(partition.task_id) is not None
+    assert exchange.selected_attempt(partition.sink_handle) is None
+
+
+def test_fte_fragment_execution_exchange_abort_failure_releases_quiesced_loser():
+    class _TerminalTrackingWorker(_FakeLiveWorker):
+        def __init__(self, worker_id):
+            super().__init__(worker_id)
+            self.terminal_attempts = []
+
+        def record_fte_task_terminal(self, attempt_id):
+            self.terminal_attempts.append(str(FteTaskAttemptId.coerce(attempt_id)))
+
+    class _FailingAbortExchange(FteExchangeTracker):
+        def sink_aborted(self, _sink_handle, _attempt_id):
+            raise RuntimeError("exchange abort failed")
+
+    winner_worker = _FakeLiveWorker("worker-abort-failure-winner")
+    loser_worker = _TerminalTrackingWorker("worker-abort-failure-loser")
+    storage = TaskDescriptorStorage()
+    exchange = _FailingAbortExchange("q", "exchange-abort-failure")
+    stage = _fte_fragment_execution(
+        "q",
+        65,
+        fragment_id="q:node:abort-failure",
+        worker=winner_worker,
+        descriptor_storage=storage,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 65, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
+        worker_id=loser_worker.worker_id,
+        remote_handle=loser_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with pytest.raises(RuntimeError, match="exchange abort failed"):
+        stage.task_finished(winner.attempt_id)
+
+    assert loser_worker.terminal_attempts == [str(loser_attempt)]
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.finalizing_attempt is None
+    assert storage.get(partition.task_id) is not None
+    assert exchange.selected_attempt(partition.sink_handle) is None
+
+
+def test_fte_fragment_execution_descriptor_cleanup_failure_preserves_committed_winner():
+    stage = None
+
+    class _FailingRemoveStorage(TaskDescriptorStorage):
+        state_lock_owned = None
+
+        def remove(self, _task_id):
+            assert stage is not None
+            self.state_lock_owned = stage._state_lock_owned_by_current_thread()
+            raise RuntimeError("descriptor remove failed")
+
+    storage = _FailingRemoveStorage()
+    exchange = FteExchangeTracker("q", "exchange-descriptor-cleanup-failure")
+    stage = _fte_fragment_execution(
+        "q",
+        67,
+        fragment_id="q:node:descriptor-cleanup-failure",
+        worker=_FakeLiveWorker("worker-descriptor-cleanup-failure"),
+        descriptor_storage=storage,
+        exchange=exchange,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+
+    with pytest.raises(RuntimeError, match="descriptor remove failed"):
+        stage.task_finished(winner.attempt_id)
+
+    assert partition.state == FtePartitionState.FINISHED
+    assert stage.failed is False
+    assert storage.state_lock_owned is False
+    assert exchange.selected_attempt(partition.sink_handle) == winner.attempt_id.attempt_id
+
+
+def test_fte_fragment_execution_enqueues_all_loser_cancels_before_waiting():
+    enqueued = []
+    resolved = []
+
+    class _AsyncCancelWorker(_FakeLiveWorker):
+        def enqueue_fte_cancel_task(self, task_id):
+            cancellation = str(FteTaskAttemptId.coerce(task_id))
+            enqueued.append(cancellation)
+            return cancellation
+
+        def resolve_fte_cancel_task(self, cancellation):
+            assert len(enqueued) == 2
+            resolved.append(cancellation)
+            return {
+                "state": FteTaskState.CANCELED.value,
+                "task_id": FteTaskAttemptId.parse(cancellation).to_dict(),
+            }
+
+    winner_worker = _FakeLiveWorker("worker-batch-cancel-winner")
+    loser_workers = [
+        _AsyncCancelWorker("worker-batch-cancel-loser-a"),
+        _AsyncCancelWorker("worker-batch-cancel-loser-b"),
+    ]
+    stage = _fte_fragment_execution(
+        "q",
+        64,
+        fragment_id="q:node:batch-cancel",
+        worker=winner_worker,
+        max_attempts=3,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    for attempt_number, worker in enumerate(loser_workers, start=1):
+        loser_attempt = FteTaskAttemptId(FteTaskId("q", 64, 0), attempt_number)
+        partition.running_attempts[attempt_number] = RunningAttempt(
+            loser_attempt,
+            worker_incarnation_id=worker.worker_incarnation_id,
+            worker_id=worker.worker_id,
+            remote_handle=worker,
+        )
+
+    assert stage.task_finished(winner.attempt_id) is True
+
+    assert enqueued == ["q.64.0.1", "q.64.0.2"]
+    assert resolved == enqueued
+
+
+def test_fte_fragment_execution_rejects_sync_only_loser_cancellation():
+    class _SyncOnlyCancelWorker(_FakeLiveWorker):
+        enqueue_fte_cancel_task = None
+        resolve_fte_cancel_task = None
+
+        def __init__(self, worker_id):
+            super().__init__(worker_id)
+            self.sync_cancel_called = False
+
+        def fte_cancel_task(self, task_id):
+            self.sync_cancel_called = True
+            return super().fte_cancel_task(task_id)
+
+    winner_worker = _FakeLiveWorker("worker-mandatory-async-cancel-winner")
+    loser_worker = _SyncOnlyCancelWorker("worker-sync-only-cancel-loser")
+    exchange = FteExchangeTracker("q", "exchange-mandatory-async-cancel")
+    stage = _fte_fragment_execution(
+        "q",
+        68,
+        fragment_id="q:node:mandatory-async-cancel",
+        worker=winner_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 68, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
+        worker_id=loser_worker.worker_id,
+        remote_handle=loser_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with pytest.raises(FteWorkerControlFailure, match="fte_cancel_task"):
+        stage.task_finished(winner.attempt_id)
+
+    assert loser_worker.sync_cancel_called is False
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.selected_attempt is None
+    assert exchange.selected_attempt(partition.sink_handle) is None
+
+
+def test_fte_fragment_execution_rejects_missing_loser_cancellation_handle():
+    winner_worker = _FakeLiveWorker("worker-missing-cancel-handle-winner")
+    exchange = FteExchangeTracker("q", "exchange-missing-cancel-handle")
+    stage = _fte_fragment_execution(
+        "q",
+        70,
+        fragment_id="q:node:missing-cancel-handle",
+        worker=winner_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 70, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id="incarnation-missing-cancel-handle",
+        worker_id="worker-missing-cancel-handle-loser",
+        remote_handle=None,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with pytest.raises(FteWorkerControlFailure, match="mandatory worker control handle"):
+        stage.task_finished(winner.attempt_id)
+
+    assert partition.state == FtePartitionState.FAILED
+    assert partition.selected_attempt is None
+    assert exchange.selected_attempt(partition.sink_handle) is None
+
+
+def test_fte_fragment_execution_continues_enqueuing_after_missing_cancel_resolver():
+    class _EnqueueOnlyCancelWorker(_FakeLiveWorker):
+        resolve_fte_cancel_task = None
+
+        def __init__(self, worker_id):
+            super().__init__(worker_id)
+            self.cancel_enqueued = False
+
+        def enqueue_fte_cancel_task(self, task_id):
+            self.cancel_enqueued = True
+            return task_id
+
+    malformed_worker = _EnqueueOnlyCancelWorker("worker-enqueue-only-cancel-loser")
+    valid_worker = _FakeLiveWorker("worker-valid-async-cancel-loser")
+    stage = _fte_fragment_execution(
+        "q",
+        69,
+        fragment_id="q:node:partial-async-cancel",
+        worker=_FakeLiveWorker("worker-partial-async-cancel-winner"),
+        max_attempts=3,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    for attempt_number, worker in enumerate((malformed_worker, valid_worker), start=1):
+        loser_attempt = FteTaskAttemptId(FteTaskId("q", 69, 0), attempt_number)
+        partition.running_attempts[attempt_number] = RunningAttempt(
+            loser_attempt,
+            worker_incarnation_id=worker.worker_incarnation_id,
+            worker_id=worker.worker_id,
+            remote_handle=worker,
+        )
+
+    with pytest.raises(FteWorkerControlFailure, match="fte_cancel_task"):
+        stage.task_finished(winner.attempt_id)
+
+    assert malformed_worker.cancel_enqueued is True
+    assert not any(call[0] == "cancel" for call in malformed_worker.calls)
+    assert valid_worker.calls[-1] == (
+        "cancel",
+        FteTaskAttemptId(FteTaskId("q", 69, 0), 2).to_dict(),
+    )
+    assert partition.state == FtePartitionState.FAILED
+
+
+@pytest.mark.parametrize("invalid_status", ["nonterminal", "wrong_identity"])
+def test_fte_fragment_execution_rejects_invalid_loser_cancellation_status(invalid_status):
+    class _InvalidCancelWorker(_FakeLiveWorker):
+        def fte_cancel_task(self, task_id):
+            status_task_id = dict(task_id)
+            state = FteTaskState.RUNNING.value
+            if invalid_status == "wrong_identity":
+                status_task_id["partition_id"] += 1
+                state = FteTaskState.CANCELED.value
+            return {"state": state, "task_id": status_task_id}
+
+    winner_worker = _FakeLiveWorker(f"worker-invalid-cancel-winner-{invalid_status}")
+    loser_worker = _InvalidCancelWorker(f"worker-invalid-cancel-loser-{invalid_status}")
+    exchange = FteExchangeTracker("q", f"exchange-invalid-cancel-{invalid_status}")
+    stage = _fte_fragment_execution(
+        "q",
+        66,
+        fragment_id=f"q:node:invalid-cancel-{invalid_status}",
+        worker=winner_worker,
+        exchange=exchange,
+        max_attempts=2,
+    )
+    winner = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(0)], sealed_partitions=[0])
+    )[0]
+    _execute_stage_commands(stage)
+    partition = stage.partitions[0]
+    loser_attempt = FteTaskAttemptId(FteTaskId("q", 66, 0), 1)
+    partition.running_attempts[loser_attempt.attempt_id] = RunningAttempt(
+        loser_attempt,
+        worker_incarnation_id=loser_worker.worker_incarnation_id,
+        worker_id=loser_worker.worker_id,
+        remote_handle=loser_worker,
+        sink_instance=exchange.instantiate_sink(partition.sink_handle, loser_attempt.attempt_id),
+    )
+
+    with pytest.raises(FteWorkerControlFailure, match="fte_cancel_task"):
+        stage.task_finished(winner.attempt_id)
+
+    assert partition.state == FtePartitionState.FAILED
+    assert exchange.selected_attempt(partition.sink_handle) is None
 
 
 def test_fte_fragment_execution_handle_finished_status_marks_task_finished():

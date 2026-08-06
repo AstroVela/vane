@@ -6,6 +6,7 @@ from __future__ import annotations
 import concurrent.futures
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from duckdb.runners.fte import FteTaskAttemptId, FteTaskState, validate_fte_status_identity
@@ -48,6 +49,13 @@ class FteControlBarrierPendingError(RuntimeError):
 
 class FteControlBarrierTerminalError(RuntimeError):
     """The control cut is terminal, but one or more operations failed validation."""
+
+
+@dataclass(frozen=True)
+class _FteCancelControl:
+    attempt_id: FteTaskAttemptId
+    ref: Any
+    deadline: float
 
 
 class FteWorkerTaskControlMixin:
@@ -105,6 +113,31 @@ class FteWorkerTaskControlMixin:
         status.pop("_fte_control_applied", None)
         return status
 
+    @staticmethod
+    def _validated_terminal_fte_cancel_status(
+        task_id: FteTaskAttemptId | str | dict[str, Any],
+        status: dict[str, Any],
+    ) -> dict[str, Any]:
+        attempt_id = FteTaskAttemptId.coerce(task_id)
+        validate_fte_status_identity(status, attempt_id)
+        if status.get("_fte_control_operation") != "fte_cancel_task":
+            raise RuntimeError(
+                "FTE cancel control operation mismatch: "
+                f"task={attempt_id} actual={status.get('_fte_control_operation')!r}"
+            )
+        if status.get("_fte_control_applied") is not True:
+            raise RuntimeError(f"FTE cancel control was not applied: task={attempt_id}")
+        raw_state = status.get("state")
+        try:
+            state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"unknown FTE task state in cancel control: {raw_state!r}") from exc
+        if state not in _TERMINAL_STATES:
+            raise RuntimeError(
+                f"FTE cancel control did not reach a terminal task state: task={attempt_id} state={state.value}"
+            )
+        return status
+
     def _fte_control_rpc(
         self,
         method_name: str,
@@ -158,17 +191,7 @@ class FteWorkerTaskControlMixin:
         cancel_event: Any = None,
         honor_query_deadline: bool = True,
         on_cancel: Callable[[], None] | None = None,
-        wait_for_owned_side_effects: bool = False,
     ) -> Any:
-        if wait_for_owned_side_effects:
-            # A successful cancellation may gate a COPY commit. No local
-            # control, query, or ObjectRef timeout may outlive its writer.
-            return resolve_object_refs_blocking(
-                ref,
-                timeout=None,
-                honor_query_deadline=False,
-                honor_object_get_timeout=False,
-            )
         resolved_timeout_s = _fte_control_rpc_timeout_s() if timeout_s is None else max(0.0, float(timeout_s))
         if cancel_event is not None:
             try:
@@ -226,7 +249,6 @@ class FteWorkerTaskControlMixin:
         *args: Any,
         timeout_s: float | None = None,
         cancel_event: Any = None,
-        wait_for_owned_side_effects: bool = False,
     ) -> Any:
         tracked_query_id: str | None = None
         owns_registry_operation = False
@@ -254,7 +276,6 @@ class FteWorkerTaskControlMixin:
                 timeout_s=timeout_s,
                 cancel_event=cancel_event,
                 on_cancel=on_cancel,
-                wait_for_owned_side_effects=wait_for_owned_side_effects,
             )
         finally:
             if owns_registry_operation:
@@ -718,7 +739,9 @@ class FteWorkerTaskControlMixin:
                         f"task={task_key} expected={expected_operation!r} "
                         f"actual={status.get('_fte_control_operation')!r}"
                     )
-                if expected_operation == "fte_add_splits" and status.get("_fte_control_applied") is False:
+                if expected_operation == "fte_cancel_task":
+                    status = self._validated_terminal_fte_cancel_status(task_key, status)
+                elif expected_operation == "fte_add_splits" and status.get("_fte_control_applied") is False:
                     status = self._validated_terminal_fte_add_splits_status(
                         task_key,
                         status,
@@ -791,15 +814,32 @@ class FteWorkerTaskControlMixin:
                 or query_key in self._fte_prepare_terminal_errors
             )
 
-    def fte_cancel_task(self, task_id: str | dict[str, Any]) -> dict[str, Any]:
-        raw_status = self._enqueue_ordered_fte_control_rpc(
+    def enqueue_fte_cancel_task(self, task_id: str | dict[str, Any]) -> _FteCancelControl:
+        attempt_id = FteTaskAttemptId.coerce(task_id)
+        timeout_s = _fte_control_rpc_timeout_s()
+        ref = self._enqueue_ordered_fte_control_ref("fte_cancel_task", task_id)
+        return _FteCancelControl(
+            attempt_id=attempt_id,
+            ref=ref,
+            deadline=time.monotonic() + timeout_s,
+        )
+
+    def resolve_fte_cancel_task(self, cancellation: _FteCancelControl) -> dict[str, Any]:
+        if not isinstance(cancellation, _FteCancelControl):
+            raise TypeError("FTE cancellation must be created by enqueue_fte_cancel_task")
+        remaining_s = max(0.0, cancellation.deadline - time.monotonic())
+        raw_status = self._get_fte_control_ref(
             "fte_cancel_task",
-            task_id,
-            wait_for_owned_side_effects=True,
+            cancellation.ref,
+            timeout_s=remaining_s,
         )
         if not isinstance(raw_status, dict):
             raise TypeError("worker actor fte_cancel_task must return a dict")
-        return dict(raw_status)
+        status = dict(raw_status)
+        return self._validated_terminal_fte_cancel_status(cancellation.attempt_id, status)
+
+    def fte_cancel_task(self, task_id: str | dict[str, Any]) -> dict[str, Any]:
+        return self.resolve_fte_cancel_task(self.enqueue_fte_cancel_task(task_id))
 
     def fte_prepare_drop_query(self, query_id: str) -> dict[str, int]:
         query_id = (query_id or "").strip()
@@ -808,6 +848,22 @@ class FteWorkerTaskControlMixin:
         close_fte_registry_for_query(query_id)
         with self._fte_control_lock:
             self._fte_drop_incomplete_queries.add(query_id)
+        interrupt_error: BaseException | None = None
+        try:
+            interrupt_ref = self._submit_tracked_fte_drop_ref(query_id, "fte_interrupt_query")
+            raw_interrupt_result = self._get_fte_control_ref(
+                "fte_interrupt_query",
+                interrupt_ref,
+                timeout_s=_fte_control_rpc_timeout_s(),
+                honor_query_deadline=False,
+            )
+            if not isinstance(raw_interrupt_result, Mapping):
+                raise TypeError("worker actor fte_interrupt_query must return a mapping")
+        except BaseException as exc:
+            # Continue to classify the ordered controls. The interrupt ref is
+            # still teardown-owned, and a retry can issue another idempotent
+            # interrupt before attempting the remote drop again.
+            interrupt_error = exc
         barrier_error: FteControlBarrierTerminalError | None = None
         barrier_pending_error: BaseException | None = None
         try:
@@ -825,6 +881,8 @@ class FteWorkerTaskControlMixin:
             fence_error = exc
         if fence_error is not None:
             details = []
+            if interrupt_error is not None:
+                details.append(f"interrupt={type(interrupt_error).__name__}: {interrupt_error}")
             if barrier_error is not None or barrier_pending_error is not None:
                 control_error = barrier_pending_error if barrier_pending_error is not None else barrier_error
                 details.append(f"barrier={type(control_error).__name__}: {control_error}")
@@ -833,8 +891,12 @@ class FteWorkerTaskControlMixin:
                 f"FTE query teardown did not reach the remote-drop fence for {query_id}: " + "; ".join(details)
             ) from fence_error
         if barrier_pending_error is not None:
+            interrupt_detail = ""
+            if interrupt_error is not None:
+                interrupt_detail = f"; interrupt={type(interrupt_error).__name__}: {interrupt_error}"
             raise FteControlBarrierPendingError(
-                f"FTE query teardown retained pending control ownership for {query_id}: {barrier_pending_error}"
+                f"FTE query teardown retained pending control ownership for {query_id}: "
+                f"{barrier_pending_error}{interrupt_detail}"
             ) from barrier_pending_error
         if barrier_error is not None:
             with self._fte_control_lock:
@@ -863,6 +925,8 @@ class FteWorkerTaskControlMixin:
                 local_error = exc
         if drop_error is not None or local_error is not None:
             details = []
+            if interrupt_error is not None:
+                details.append(f"interrupt={type(interrupt_error).__name__}: {interrupt_error}")
             if barrier_error is not None:
                 details.append(f"barrier={type(barrier_error).__name__}: {barrier_error}")
             if drop_error is not None:

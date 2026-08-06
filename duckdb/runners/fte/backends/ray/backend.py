@@ -193,8 +193,14 @@ class RayWorkerHandleAdapter:
         return _dict_result("fte_wait_task_status", result)
 
     def fte_cancel_task(self, task_id: str | Mapping[str, Any]) -> dict[str, Any]:
-        result = _required_method(self._handle, "fte_cancel_task")(task_id)
-        return _dict_result("fte_cancel_task", result)
+        return self.resolve_fte_cancel_task(self.enqueue_fte_cancel_task(task_id))
+
+    def enqueue_fte_cancel_task(self, task_id: str | Mapping[str, Any]) -> Any:
+        return _required_method(self._handle, "enqueue_fte_cancel_task")(task_id)
+
+    def resolve_fte_cancel_task(self, cancellation: Any) -> dict[str, Any]:
+        result = _required_method(self._handle, "resolve_fte_cancel_task")(cancellation)
+        return _dict_result("resolve_fte_cancel_task", result)
 
 
 class RayWorkerManagerBackend:

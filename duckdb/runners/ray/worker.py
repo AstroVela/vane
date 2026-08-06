@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, NamedTuple, cast
 
 import ray
@@ -106,6 +106,33 @@ async def _to_thread_with_owned_side_effects(
     """Do not expose cancellation until a thread-owned mutation has finished."""
     thread_task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
     return await _await_future_with_owned_side_effects(thread_task)
+
+
+async def _await_with_repeated_native_interrupts(
+    operation: Awaitable[Any],
+    interrupt_callback: Callable[[], list[str]],
+    interrupt_errors: set[str],
+) -> Any:
+    """Keep an admitted native cursor interrupted until its owner is terminal."""
+    operation_task = asyncio.ensure_future(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation_task.done():
+        try:
+            await asyncio.wait({operation_task}, timeout=0.01)
+        except asyncio.CancelledError as error:
+            # Retain this cancellation until the owned operation is terminal.
+            # Catching the injection lets the next timed wait preserve pacing.
+            cancellation = error
+        if operation_task.done():
+            break
+        try:
+            interrupt_errors.update(str(error) for error in interrupt_callback())
+        except Exception as error:
+            interrupt_errors.add(f"{type(error).__name__}: {error}")
+    result = operation_task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 def _fte_applied_control_status(
@@ -872,10 +899,14 @@ class RayWorkerActor:
         self._native_execution_condition = threading.Condition()
         self._native_execution_count = 0
         self._native_execution_counts_by_query: dict[str, int] = {}
+        self._native_execution_counts_by_task: dict[str, int] = {}
+        self._native_task_query_ids: dict[str, str] = {}
         self._native_query_cleanup_contexts: dict[str, NativeQueryCleanupContext] = {}
         self._active_native_cursors: set[Any] = set()
         self._native_cursor_query_ids: dict[Any, str] = {}
+        self._native_cursor_task_ids: dict[Any, str] = {}
         self._closing_native_queries: set[str] = set()
+        self._closing_native_tasks: set[str] = set()
         self._shutdown_started = False
         self._shutdown_prepared = False
         self._shutdown_complete = False
@@ -1096,6 +1127,7 @@ class RayWorkerActor:
                 "fragment_id": fragment_id,
                 "worker_label": _fte_worker_label(),
             },
+            native_task_id=str(task_id),
         )
         spooling_output_stats = collect_spooling_output_stats(request.get("exchange_sink_instance"))
         if spooling_output_stats is None:
@@ -1216,37 +1248,79 @@ class RayWorkerActor:
         task_id: str | dict[str, Any],
         _fte_control_dependency: Any = None,
     ) -> dict[str, Any]:
-        status = await self._get_fte_task_manager().cancel_task(task_id)
+        attempt_id = FteTaskAttemptId.coerce(task_id)
+        task_key = str(attempt_id)
+        interrupt_errors = set(self._close_worker_native_task(task_key))
+        try:
+            status = await _await_with_repeated_native_interrupts(
+                self._get_fte_task_manager().cancel_task(task_id),
+                lambda: self._close_worker_native_task(task_key),
+                interrupt_errors,
+            )
+        except BaseException as exc:
+            if interrupt_errors:
+                details = "; ".join(sorted(interrupt_errors))
+                raise RuntimeError(
+                    f"failed to quiesce native FTE task {task_key} after interrupt errors: {details}"
+                ) from exc
+            raise
+        if interrupt_errors:
+            details = "; ".join(sorted(interrupt_errors))
+            raise RuntimeError(f"failed to quiesce native FTE task {task_key} after interrupt errors: {details}")
+        self._retire_worker_native_task(task_key)
         return _fte_applied_control_status("fte_cancel_task", task_id, status)
 
     @ray.method(concurrency_group="control")
-    async def fte_prepare_drop_query(self, query_id: str) -> dict[str, int]:
+    def fte_interrupt_query(self, query_id: str) -> dict[str, int]:
+        query_id = str(query_id)
         _close_flight_shuffle_query(query_id)
         interrupt_errors = self._close_worker_native_query(query_id)
-        try:
-            fte_result = await self._get_fte_task_manager().drop_query(query_id)
-            fragments_removed = self.drop_query_fragments(query_id)
-        finally:
-            native_drain_result, flight_drain_result = await asyncio.gather(
-                self._wait_worker_native_executions_for_query(query_id),
-                _wait_flight_shuffle_executions_for_query(query_id),
-                return_exceptions=True,
-            )
-            drain_errors = [
-                result for result in (native_drain_result, flight_drain_result) if isinstance(result, BaseException)
-            ]
-            if not isinstance(native_drain_result, BaseException):
-                try:
-                    _release_datasource_factories_for_query(query_id)
-                except Exception as error:
-                    drain_errors.append(error)
-            if drain_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in drain_errors)
-                raise RuntimeError(f"failed to prepare query teardown for {query_id}: {details}") from drain_errors[0]
         if interrupt_errors:
             raise RuntimeError(
                 f"failed to interrupt {len(interrupt_errors)} native execution(s) for {query_id}: "
                 + "; ".join(interrupt_errors)
+            )
+        return {"native_interrupt_errors": 0}
+
+    @ray.method(concurrency_group="control")
+    async def fte_prepare_drop_query(self, query_id: str) -> dict[str, int]:
+        _close_flight_shuffle_query(query_id)
+        interrupt_errors = set(self._close_worker_native_query(query_id))
+
+        async def prepare_query_drop() -> tuple[dict[str, Any], int]:
+            try:
+                fte_result = await self._get_fte_task_manager().drop_query(query_id)
+                fragments_removed = self.drop_query_fragments(query_id)
+            finally:
+                native_drain_result, flight_drain_result = await asyncio.gather(
+                    self._wait_worker_native_executions_for_query(query_id),
+                    _wait_flight_shuffle_executions_for_query(query_id),
+                    return_exceptions=True,
+                )
+                drain_errors = [
+                    result for result in (native_drain_result, flight_drain_result) if isinstance(result, BaseException)
+                ]
+                if not isinstance(native_drain_result, BaseException):
+                    try:
+                        _release_datasource_factories_for_query(query_id)
+                    except Exception as error:
+                        drain_errors.append(error)
+                if drain_errors:
+                    details = "; ".join(f"{type(error).__name__}: {error}" for error in drain_errors)
+                    raise RuntimeError(f"failed to prepare query teardown for {query_id}: {details}") from drain_errors[
+                        0
+                    ]
+            return fte_result, fragments_removed
+
+        fte_result, fragments_removed = await _await_with_repeated_native_interrupts(
+            prepare_query_drop(),
+            lambda: self._close_worker_native_query(query_id),
+            interrupt_errors,
+        )
+        if interrupt_errors:
+            raise RuntimeError(
+                f"failed to interrupt {len(interrupt_errors)} native execution(s) for {query_id}: "
+                + "; ".join(sorted(interrupt_errors))
             )
         return {
             "tasks_removed": int(fte_result["removed"]),
@@ -1631,8 +1705,9 @@ class RayWorkerActor:
 
         await _to_thread_with_owned_side_effects(_close)
 
-    def _begin_worker_native_execution(self, query_id: str) -> None:
+    def _begin_worker_native_execution(self, query_id: str, task_id: str = "") -> None:
         query_id = str(query_id or "").strip()
+        task_id = str(task_id or "").strip()
         if not query_id:
             raise ValueError("native execution admission requires a query_id")
         with self._native_execution_condition:
@@ -1640,41 +1715,82 @@ class RayWorkerActor:
                 raise RuntimeError("Ray worker runtime is shutting down")
             if query_id in self._closing_native_queries:
                 raise RuntimeError(f"native query is closing: {query_id}")
+            if task_id and task_id in self._closing_native_tasks:
+                raise RuntimeError(f"native task is closing: {task_id}")
+            if task_id:
+                existing_query_id = self._native_task_query_ids.get(task_id)
+                if existing_query_id is not None and existing_query_id != query_id:
+                    raise RuntimeError(
+                        f"native task ownership query mismatch: task={task_id} "
+                        f"expected={existing_query_id} actual={query_id}"
+                    )
             self._native_execution_count += 1
             self._native_execution_counts_by_query[query_id] = (
                 self._native_execution_counts_by_query.get(query_id, 0) + 1
             )
+            if task_id:
+                self._native_task_query_ids[task_id] = query_id
+                self._native_execution_counts_by_task[task_id] = (
+                    self._native_execution_counts_by_task.get(task_id, 0) + 1
+                )
 
-    def _end_worker_native_execution(self, query_id: str) -> None:
+    def _end_worker_native_execution(self, query_id: str, task_id: str = "") -> None:
         query_id = str(query_id or "").strip()
+        task_id = str(task_id or "").strip()
         with self._native_execution_condition:
             if self._native_execution_count <= 0:
                 raise RuntimeError("Ray worker native execution ownership underflow")
             query_count = self._native_execution_counts_by_query.get(query_id, 0)
             if query_count <= 0:
                 raise RuntimeError(f"Ray worker native query execution ownership underflow: {query_id}")
+            task_count = 0
+            if task_id:
+                task_count = self._native_execution_counts_by_task.get(task_id, 0)
+                if task_count <= 0:
+                    raise RuntimeError(f"Ray worker native task execution ownership underflow: {task_id}")
             self._native_execution_count -= 1
             if query_count == 1:
                 self._native_execution_counts_by_query.pop(query_id, None)
             else:
                 self._native_execution_counts_by_query[query_id] = query_count - 1
+            if task_id:
+                if task_count == 1:
+                    self._native_execution_counts_by_task.pop(task_id, None)
+                    if task_id not in self._closing_native_tasks:
+                        self._native_task_query_ids.pop(task_id, None)
+                else:
+                    self._native_execution_counts_by_task[task_id] = task_count - 1
             self._native_execution_condition.notify_all()
 
-    def _register_native_cursor(self, cursor: Any, query_id: str = "") -> bool:
+    def _register_native_cursor(self, cursor: Any, query_id: str = "", task_id: str = "") -> bool:
+        query_id = str(query_id)
+        task_id = str(task_id or "").strip()
         with self._native_execution_condition:
             self._active_native_cursors.add(cursor)
-            self._native_cursor_query_ids[cursor] = str(query_id)
-            return str(query_id) not in self._closing_native_queries
+            self._native_cursor_query_ids[cursor] = query_id
+            if task_id:
+                self._native_cursor_task_ids[cursor] = task_id
+            return query_id not in self._closing_native_queries and (
+                not task_id or task_id not in self._closing_native_tasks
+            )
 
     def _unregister_native_cursor(self, cursor: Any) -> None:
         with self._native_execution_condition:
             self._active_native_cursors.discard(cursor)
             self._native_cursor_query_ids.pop(cursor, None)
+            self._native_cursor_task_ids.pop(cursor, None)
             self._native_execution_condition.notify_all()
 
     def _worker_native_query_is_closing(self, query_id: str) -> bool:
         with self._native_execution_condition:
             return str(query_id) in self._closing_native_queries
+
+    def _worker_native_task_is_closing(self, task_id: str) -> bool:
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return False
+        with self._native_execution_condition:
+            return task_id in self._closing_native_tasks
 
     async def _wait_worker_native_executions_for_query(
         self,
@@ -1717,6 +1833,42 @@ class RayWorkerActor:
                 errors.append(str(exc))
         return errors
 
+    def _close_worker_native_task(self, task_id: str) -> list[str]:
+        attempt_id = FteTaskAttemptId.coerce(task_id)
+        task_id = str(attempt_id)
+        query_id = str(attempt_id.query_id)
+        with self._native_execution_condition:
+            existing_query_id = self._native_task_query_ids.get(task_id)
+            if existing_query_id is not None and existing_query_id != query_id:
+                raise RuntimeError(
+                    f"native task ownership query mismatch: task={task_id} "
+                    f"expected={existing_query_id} actual={query_id}"
+                )
+            self._native_task_query_ids[task_id] = query_id
+            self._closing_native_tasks.add(task_id)
+            cursors = [
+                cursor for cursor, cursor_task_id in self._native_cursor_task_ids.items() if cursor_task_id == task_id
+            ]
+        errors: list[str] = []
+        for cursor in cursors:
+            try:
+                cursor.interrupt()
+            except Exception as exc:
+                errors.append(str(exc))
+        return errors
+
+    def _retire_worker_native_task(self, task_id: str) -> None:
+        task_id = str(FteTaskAttemptId.coerce(task_id))
+        with self._native_execution_condition:
+            active_executions = self._native_execution_counts_by_task.get(task_id, 0)
+            if active_executions:
+                raise RuntimeError(
+                    "cannot retire Ray worker native task with active executions: "
+                    f"{task_id} active_executions={active_executions}"
+                )
+            self._closing_native_tasks.discard(task_id)
+            self._native_task_query_ids.pop(task_id, None)
+
     def _retire_worker_native_query(self, query_id: str) -> None:
         with self._native_execution_condition:
             query_id = str(query_id)
@@ -1727,6 +1879,12 @@ class RayWorkerActor:
                     f"{query_id} active_executions={active_executions}"
                 )
             self._closing_native_queries.discard(query_id)
+            retired_task_ids = [
+                task_id for task_id, task_query_id in self._native_task_query_ids.items() if task_query_id == query_id
+            ]
+            for task_id in retired_task_ids:
+                self._closing_native_tasks.discard(task_id)
+                self._native_task_query_ids.pop(task_id, None)
             getattr(self, "_native_query_cleanup_contexts", {}).pop(query_id, None)
 
     def _prepare_worker_runtime_shutdown(self) -> None:
@@ -1744,9 +1902,13 @@ class RayWorkerActor:
                 self._native_execution_condition = native_condition
                 self._native_execution_count = 0
                 self._native_execution_counts_by_query = {}
+                self._native_execution_counts_by_task = {}
+                self._native_task_query_ids = {}
                 self._active_native_cursors = set()
                 self._native_cursor_query_ids = {}
+                self._native_cursor_task_ids = {}
                 self._closing_native_queries = set()
+                self._closing_native_tasks = set()
             with native_condition:
                 self._shutdown_started = True
             task_manager = getattr(self, "_fte_task_manager", None)
@@ -1905,6 +2067,7 @@ class RayWorkerActor:
         native_progress_callback: Any | None = None,
         debug_context: dict[str, Any] | None = None,
         native_query_id: str = "",
+        native_task_id: str = "",
     ) -> Any:
         session_id = str(plan.session_id()).strip()
         session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
@@ -1940,10 +2103,16 @@ class RayWorkerActor:
                 if record is None or record[1] is not conn:
                     raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
                 cursor = conn.cursor()
-                query_admitted = self._register_native_cursor(cursor, native_query_id)
+                query_admitted = self._register_native_cursor(
+                    cursor,
+                    native_query_id,
+                    native_task_id,
+                )
                 cursor_registered = True
             if not query_admitted:
-                raise RuntimeError(f"native query is closing: {native_query_id}")
+                if self._worker_native_query_is_closing(native_query_id):
+                    raise RuntimeError(f"native query is closing: {native_query_id}")
+                raise RuntimeError(f"native task is closing: {native_task_id}")
             effective_s3_config = _configure_duckdb_s3(
                 cursor,
                 effective_s3_config,
@@ -2023,6 +2192,7 @@ class RayWorkerActor:
         dynamic_filter_domains: dict[str, Any] | None = None,
         native_progress_callback: Any | None = None,
         debug_context: dict[str, Any] | None = None,
+        native_task_id: str = "",
     ) -> Any:
         """Run a plan on worker and return a Ray-serializable result tuple."""
         debug_context = dict(debug_context or {})
@@ -2037,6 +2207,7 @@ class RayWorkerActor:
         # the execution query. The resource query can differ for nested
         # executions and is only the owner of the admission lease.
         query_id = str(query_task_lease.get("execution_query_id") or "").strip()
+        native_task_id = str(native_task_id or "").strip()
         if not query_id:
             raise RuntimeError("native task execution requires an execution_query_id")
 
@@ -2049,17 +2220,19 @@ class RayWorkerActor:
             hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
         )
 
-        self._begin_worker_native_execution(query_id)
+        self._begin_worker_native_execution(query_id, native_task_id)
         try:
             begin_execution(query_id)
         except BaseException:
-            self._end_worker_native_execution(query_id)
+            self._end_worker_native_execution(query_id, native_task_id)
             raise
 
         def execute_native_task() -> Any:
             try:
                 if self._worker_native_query_is_closing(query_id):
                     raise RuntimeError(f"native query is closing: {query_id}")
+                if self._worker_native_task_is_closing(native_task_id):
+                    raise RuntimeError(f"native task is closing: {native_task_id}")
                 return self._execute_native_task(
                     plan,
                     scan_task_map or None,
@@ -2072,12 +2245,13 @@ class RayWorkerActor:
                     native_progress_callback=native_progress_callback,
                     debug_context=debug_context,
                     native_query_id=query_id,
+                    native_task_id=native_task_id,
                 )
             finally:
                 try:
                     end_execution(query_id)
                 finally:
-                    self._end_worker_native_execution(query_id)
+                    self._end_worker_native_execution(query_id, native_task_id)
 
         try:
             native_future = asyncio.get_running_loop().run_in_executor(None, execute_native_task)
@@ -2085,7 +2259,7 @@ class RayWorkerActor:
             try:
                 end_execution(query_id)
             finally:
-                self._end_worker_native_execution(query_id)
+                self._end_worker_native_execution(query_id, native_task_id)
             raise
         result_list = await _await_future_with_owned_side_effects(native_future)
         (
