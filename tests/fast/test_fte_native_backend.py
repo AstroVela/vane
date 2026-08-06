@@ -78,6 +78,12 @@ class _FakeNativeWorkerTask:
         return self._exchange_sink_instance
 
 
+class _QueryLifecycleBackend:
+    def register_query_owner(self, query_id, owner_query_id):
+        assert str(query_id)
+        assert str(owner_query_id)
+
+
 def test_native_background_event_loop_concurrent_first_submit_starts_once(monkeypatch):
     background = _BackgroundEventLoop("native-fte-concurrent-start")
     original_thread_main = background._thread_main
@@ -1830,7 +1836,7 @@ def test_cxx_python_task_result_handle_polls_native_handle_without_ray_driver():
 
 
 def test_cxx_distributed_runner_accepts_python_backend_without_ray_worker_startup():
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.worker_snapshots_calls = 0
             self.shutdown_calls = 0
@@ -2390,7 +2396,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
         def release_result_payload(self):
             self.released = True
 
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.submitted_task_names = []
             self.exhausted_calls = []
@@ -2456,10 +2462,111 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
     assert all(handle.released for handle in backend.handles)
 
 
+def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
+    submit_started = threading.Event()
+    allow_submit_return = threading.Event()
+
+    class LateHandle:
+        def __init__(self, task):
+            context = task.context()
+            query_id = context["query_id"]
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(query_id, 0, 0), 0)
+            self.worker_id = "late-worker"
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return duckdb.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+            self.drop_calls = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "late-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            self.handle = LateHandle(tasks[0])
+            submit_started.set()
+            assert allow_submit_return.wait(timeout=5.0)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [],
+            }
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+            allow_submit_return.set()
+
+        def shutdown(self):
+            pass
+
+    con = duckdb.connect()
+    query_id = f"python-backend-late-submit-{uuid.uuid4()}"
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    drop_errors = []
+
+    def drop_while_submit_is_blocked():
+        try:
+            assert submit_started.wait(timeout=5.0)
+            runner.drop_query_fragments(query_id)
+        except BaseException as exc:
+            drop_errors.append(exc)
+        finally:
+            allow_submit_return.set()
+
+    drop_thread = threading.Thread(target=drop_while_submit_is_blocked)
+    drop_thread.start()
+    try:
+        with pytest.raises(RuntimeError, match="query is closing"):
+            list(runner.run_plan(plan, con))
+    finally:
+        allow_submit_return.set()
+        drop_thread.join(timeout=5.0)
+
+    assert not drop_thread.is_alive()
+    assert drop_errors == []
+    assert backend.drop_calls == [query_id]
+    assert backend.handle is not None
+    assert backend.handle.release_calls == 1
+    con.close()
+
+
 @pytest.mark.parametrize(
-    ("exchange_sink_instance", "expect_released_after_run"),
+    ("exchange_sink_instance", "expect_released_after_run", "cleanup_mode", "release_failures"),
     [
-        (None, False),
+        (None, False, "drop", 0),
+        (None, False, "drop", 1),
+        (None, False, "shutdown", 0),
         (
             {
                 "task_partition_id": 0,
@@ -2468,13 +2575,22 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
                 "output_location": "/tmp/fake-exchange-output",
             },
             True,
+            "drop",
+            0,
         ),
     ],
-    ids=["final-output", "exchange-output"],
+    ids=[
+        "final-output-drop",
+        "final-output-drop-release-retry",
+        "final-output-shutdown",
+        "exchange-output-drop",
+    ],
 )
 def test_cxx_streaming_runner_output_handle_release_lifecycle(
     exchange_sink_instance,
     expect_released_after_run: bool,
+    cleanup_mode: str,
+    release_failures: int,
 ):
     pa = pytest.importorskip("pyarrow")
 
@@ -2487,6 +2603,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
             self.worker_id = "native-worker-0"
             self.acked = False
             self.released = False
+            self.release_calls = 0
             self.exchange_sink_instance = exchange_sink_instance
 
         def done(self):
@@ -2506,12 +2623,16 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
             self.acked = True
 
         def release_result_payload(self):
+            self.release_calls += 1
+            if self.release_calls <= release_failures:
+                raise RuntimeError("planned transient result release failure")
             self.released = True
 
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.handles = []
             self.drop_calls = []
+            self.shutdown_calls = 0
 
         def worker_snapshots(self):
             return [
@@ -2546,7 +2667,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
             self.drop_calls.append(str(query_id))
 
         def shutdown(self):
-            pass
+            self.shutdown_calls += 1
 
     con = duckdb.connect()
     con.execute("SET threads=3")
@@ -2566,15 +2687,144 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
     assert all(handle.released is expect_released_after_run for handle in backend.handles)
     assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
 
-    runner.drop_query_fragments(query_id)
+    if cleanup_mode == "shutdown":
+        runner.shutdown()
+        assert backend.shutdown_calls == 1
+        assert all(handle.released for handle in backend.handles)
+        runner.drop_query_fragments(query_id)
+    else:
+        runner.drop_query_fragments(query_id)
 
-    assert backend.drop_calls == [query_id]
+    expected_drop_calls = [] if cleanup_mode == "shutdown" else [query_id]
+    assert backend.drop_calls == expected_drop_calls
     assert all(handle.released for handle in backend.handles)
+    expected_release_calls = 2 if release_failures else 1
+    assert all(handle.release_calls == expected_release_calls for handle in backend.handles)
     assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
 
 
+@pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
+def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
+    pa = pytest.importorskip("pyarrow")
+    status_started = threading.Event()
+    allow_status = threading.Event()
+
+    class OutputHandle:
+        def __init__(self, task, partition_id: int):
+            context = task.context()
+            query_id = context["query_id"]
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0)
+            self.worker_id = "native-worker-0"
+            self.acked = False
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return duckdb.ray_cxx.RayTaskResult.success(
+                [pa.table({"i": [1]})],
+                [],
+                None,
+                0,
+                None,
+            )
+
+        def ack(self):
+            self.acked = True
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+            self.cleanup_release_observations = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-0",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [OutputHandle(task, index) for index, task in enumerate(tasks)]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            status_started.set()
+            assert allow_status.wait(timeout=5.0)
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(handle.task_id) for handle in self.handles],
+                "message": "finished",
+            }
+
+        def _allow_cleanup(self):
+            self.cleanup_release_observations.append([handle.release_calls for handle in self.handles])
+            allow_status.set()
+
+        def drop_query(self, _query_id):
+            self._allow_cleanup()
+
+        def shutdown(self):
+            self._allow_cleanup()
+
+    con = duckdb.connect()
+    con.execute("SET threads=1")
+    query_id = f"active-output-delivery-{cleanup_mode}-{uuid.uuid4()}"
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    stream = runner.run_plan(plan, con)
+    consumed = []
+    consume_errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            consumed.extend(stream)
+        except BaseException as exc:
+            consume_errors.append(exc)
+
+    consumer = threading.Thread(target=consume)
+    consumer.start()
+    assert status_started.wait(timeout=5.0)
+
+    if cleanup_mode == "drop":
+        runner.drop_query_fragments(query_id)
+    else:
+        runner.shutdown()
+
+    consumer.join(timeout=5.0)
+    assert not consumer.is_alive()
+    assert consume_errors == []
+    assert consumed
+    assert backend.cleanup_release_observations[0]
+    assert all(release_calls == 0 for release_calls in backend.cleanup_release_observations[0])
+    assert all(handle.acked for handle in backend.handles)
+    assert all(handle.release_calls == 1 for handle in backend.handles)
+
+    if cleanup_mode == "drop":
+        runner.shutdown()
+    else:
+        runner.drop_query_fragments(query_id)
+
+
 def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.drop_calls = []
 
@@ -2585,11 +2835,280 @@ def test_cxx_backend_drop_query_failure_is_not_silently_accepted():
     query_id = f"backend-drop-failure-{uuid.uuid4()}"
     backend = Backend()
     runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test(query_id, query_id)
 
     with pytest.raises(RuntimeError, match="planned backend drop failure"):
         runner.drop_query_fragments(query_id)
 
     assert backend.drop_calls == [query_id]
+
+
+def test_cxx_backend_requires_drop_query_contract():
+    class Backend(_QueryLifecycleBackend):
+        def shutdown(self):
+            pass
+
+    query_id = f"backend-missing-drop-{uuid.uuid4()}"
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    runner._register_query_owner_for_test(query_id, query_id)
+
+    with pytest.raises(AttributeError, match="drop_query"):
+        runner.drop_query_fragments(query_id)
+
+    runner.shutdown()
+
+
+def test_cxx_backend_registration_failure_rolls_back_new_replay_state():
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def register_query_owner(self, _query_id, _owner_query_id):
+            raise RuntimeError("planned lifecycle registration failure")
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    con = duckdb.connect()
+    query_id = f"registration-replay-rollback-{uuid.uuid4()}"
+    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(RuntimeError, match="planned lifecycle registration failure"):
+        runner.run_plan(plan, con)
+
+    assert backend.drop_calls == []
+    assert duckdb.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+
+
+def test_cxx_backend_serializes_overlapping_drop_and_reuses_query_id():
+    drop_started = threading.Event()
+    allow_first_drop = threading.Event()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+            if len(self.drop_calls) == 1:
+                drop_started.set()
+                assert allow_first_drop.wait(timeout=5.0)
+
+    query_id = f"backend-overlapping-drop-{uuid.uuid4()}"
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test(query_id, query_id)
+    errors: list[BaseException] = []
+
+    def drop() -> None:
+        try:
+            runner.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=drop)
+    second = threading.Thread(target=drop)
+    first.start()
+    assert drop_started.wait(timeout=5.0)
+    second.start()
+    assert second.is_alive()
+
+    allow_first_drop.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert backend.drop_calls == [query_id]
+
+    runner._register_query_owner_for_test(query_id, query_id)
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id, query_id]
+
+
+def test_cxx_backend_routes_nested_execution_drop_to_registered_resource_owner():
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.registrations = []
+            self.drop_calls = []
+
+        def register_query_owner(self, query_id, owner_query_id):
+            self.registrations.append((str(query_id), str(owner_query_id)))
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    execution_query_id = f"nested-execution-{uuid.uuid4()}"
+    resource_query_id = f"resource-owner-{uuid.uuid4()}"
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    runner._register_query_owner_for_test(execution_query_id, resource_query_id)
+    runner.drop_query_fragments(execution_query_id)
+
+    assert backend.registrations == [(execution_query_id, resource_query_id)]
+    assert backend.drop_calls == [execution_query_id, resource_query_id]
+
+
+def test_cxx_backend_drop_waits_for_owner_registration_publication():
+    registration_started = threading.Event()
+    allow_registration = threading.Event()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def register_query_owner(self, _query_id, _owner_query_id):
+            registration_started.set()
+            assert allow_registration.wait(timeout=5.0)
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    query_id = f"register-drop-race-{uuid.uuid4()}"
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    errors: list[BaseException] = []
+
+    def register() -> None:
+        try:
+            runner._register_query_owner_for_test(query_id, query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def drop() -> None:
+        try:
+            runner.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    registration_thread = threading.Thread(target=register)
+    drop_thread = threading.Thread(target=drop)
+    registration_thread.start()
+    assert registration_started.wait(timeout=5.0)
+    drop_thread.start()
+    assert drop_thread.is_alive()
+    assert backend.drop_calls == []
+
+    allow_registration.set()
+    registration_thread.join(timeout=5.0)
+    drop_thread.join(timeout=5.0)
+
+    assert not registration_thread.is_alive()
+    assert not drop_thread.is_alive()
+    assert errors == []
+    assert backend.drop_calls == [query_id]
+
+
+def test_cxx_backend_drop_waits_for_all_owner_registrations():
+    second_registration_started = threading.Event()
+    allow_second_registration = threading.Event()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def register_query_owner(self, query_id, _owner_query_id):
+            if str(query_id) == second_execution_query_id:
+                second_registration_started.set()
+                assert allow_second_registration.wait(timeout=5.0)
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    resource_query_id = f"owner-registration-race-{uuid.uuid4()}"
+    first_execution_query_id = f"{resource_query_id}-execution-a"
+    second_execution_query_id = f"{resource_query_id}-execution-b"
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test(first_execution_query_id, resource_query_id)
+    errors: list[BaseException] = []
+
+    def register_second() -> None:
+        try:
+            runner._register_query_owner_for_test(second_execution_query_id, resource_query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def drop_first() -> None:
+        try:
+            runner.drop_query_fragments(first_execution_query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    registration_thread = threading.Thread(target=register_second)
+    drop_thread = threading.Thread(target=drop_first)
+    registration_thread.start()
+    assert second_registration_started.wait(timeout=5.0)
+    drop_thread.start()
+    assert drop_thread.is_alive()
+    assert backend.drop_calls == []
+
+    allow_second_registration.set()
+    registration_thread.join(timeout=5.0)
+    drop_thread.join(timeout=5.0)
+
+    assert not registration_thread.is_alive()
+    assert not drop_thread.is_alive()
+    assert errors == []
+    assert backend.drop_calls == [
+        first_execution_query_id,
+        second_execution_query_id,
+        resource_query_id,
+    ]
+
+
+def test_cxx_backend_serializes_concurrent_shutdown_calls():
+    shutdown_started = threading.Event()
+    allow_shutdown = threading.Event()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+            shutdown_started.set()
+            assert allow_shutdown.wait(timeout=5.0)
+
+    backend = Backend()
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    errors: list[BaseException] = []
+
+    def shutdown() -> None:
+        try:
+            runner.shutdown()
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=shutdown)
+    second = threading.Thread(target=shutdown)
+    first.start()
+    assert shutdown_started.wait(timeout=5.0)
+    second.start()
+    assert second.is_alive()
+
+    allow_shutdown.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert backend.shutdown_calls == 1
+
+
+def test_cxx_backend_requires_shutdown_contract():
+    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner(_QueryLifecycleBackend())
+
+    with pytest.raises(RuntimeError, match="shutdown"):
+        runner.shutdown()
 
 
 def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
@@ -2610,7 +3129,7 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
         def release_result_payload(self):
             self.release_calls += 1
 
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.handle = None
 
@@ -2668,7 +3187,7 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
 
 
 def test_cxx_run_plan_startup_failure_cleans_query_replay_snapshot():
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.drop_calls = []
 
@@ -2697,7 +3216,7 @@ def test_cxx_run_plan_startup_failure_cleans_query_replay_snapshot():
 
 
 def test_cxx_run_plan_startup_and_cleanup_failures_are_aggregated():
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def drop_query(self, _query_id):
             raise RuntimeError("planned stream startup cleanup failure")
 
@@ -2761,7 +3280,7 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     submission_calls = []
     dropped_queries = []
 
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def worker_snapshots(self):
             return [
                 {
@@ -3347,7 +3866,7 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
         def release_result_payload(self):
             self.released = True
 
-    class Backend:
+    class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.handles: list[CopyOutputHandle] = []
             self.selected_task_id: str | None = None

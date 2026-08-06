@@ -1543,6 +1543,10 @@ class NativeFteWorkerManagerBackend:
         if _native_submit_debug_enabled():
             self._start_debug_sampler()
 
+    def register_query_owner(self, query_id: str, owner_query_id: str) -> None:
+        if not str(query_id or "").strip() or not str(owner_query_id or "").strip():
+            raise ValueError("FTE query ownership requires non-empty query and owner IDs")
+
     def worker_snapshots(self) -> Sequence[Mapping[str, Any]]:
         return [worker.snapshot() for worker in self._workers]
 
@@ -1665,7 +1669,7 @@ class NativeFteWorkerManagerBackend:
         self,
         query_id: str,
         source_node_ids: Sequence[str],
-    ) -> None:
+    ) -> Sequence[NativeTaskResultHandle]:
         query_id = str(query_id)
         source_ids = [str(source_node_id) for source_node_id in source_node_ids]
         with self._handles_lock:
@@ -1712,6 +1716,7 @@ class NativeFteWorkerManagerBackend:
                         error_type=type(exc).__name__,
                         error=str(exc),
                     )
+        return []
 
     def wait_query(
         self,
