@@ -204,12 +204,21 @@ export NUM_GPU_NODES=1
   RUN_ID=$(date +%Y%m%d_%H%M%S)
   export INPUT_PATH=/data/multimodal_inference_benchmarks/hollywood2/AVIClips
   export BATCH_SIZE=32
+  export PARQUET_ROW_GROUP_SIZE=122880
+  export PARQUET_ROW_GROUP_SIZE_BYTES=256MB
 
   VANE_RUNNER=ray OUTPUT_PATH="/tmp/vane_video_$RUN_ID" python vane_main.py
   OUTPUT_PATH="/tmp/ray_data_video_$RUN_ID" python ray_data_main.py
   OUTPUT_PATH="/tmp/daft_video_$RUN_ID" python daft_main.py
 )
 ```
+
+The Parquet row-group settings apply to the Vane entrypoint. The byte limit
+makes DuckDB flush each writer's buffered row group once its estimated size
+reaches the threshold, independently of its row count. Vane disables
+insertion-order preservation for this write because DuckDB requires it when
+`ROW_GROUP_SIZE_BYTES` is set; output row order is not part of this
+benchmark's result contract.
 
 ## Batch-size sweep
 
