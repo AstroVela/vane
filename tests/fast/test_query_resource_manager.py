@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import random
 
 import pytest
 
@@ -157,6 +158,138 @@ def _task(resource_unit_id, partition, attempt="0", retained=None, node_id=None)
         node_id=node_id,
         retained_input_bytes=retained,
     )
+
+
+def _assert_object_store_budget_invariants(snapshot):
+    state = snapshot["admission"]["object_store"]
+    budgets = [unit["object_store_budget"] for unit in snapshot["units"].values()]
+    total_reserved = sum(
+        budget["task_reserved_bytes"] + budget["output_reserved_bytes"]
+        for budget in budgets
+        if budget["reservation_eligible"]
+    )
+
+    assert state["ineligible_usage_bytes"] == sum(budget["ineligible_usage_bytes"] for budget in budgets)
+    assert state["shared_used_bytes"] == sum(budget["shared_used_bytes"] for budget in budgets)
+    assert state["shared_pool_bytes"] == max(
+        0,
+        state["limit_bytes"] - state["ineligible_usage_bytes"] - total_reserved,
+    )
+    assert state["shared_remaining_bytes"] == max(
+        0,
+        state["shared_pool_bytes"] - state["shared_used_bytes"],
+    )
+    assert state["query_usage_bytes"] == sum(
+        budget["task_internal_usage_bytes"] + budget["output_usage_bytes"] for budget in budgets
+    )
+    for budget in budgets:
+        if budget["reservation_eligible"]:
+            assert budget["ineligible_usage_bytes"] == 0
+        else:
+            assert budget["task_reserved_bytes"] == 0
+            assert budget["output_reserved_bytes"] == 0
+            assert budget["shared_used_bytes"] == 0
+
+
+@pytest.mark.parametrize(
+    ("task_reserved", "output_reserved"),
+    [(0, 0), (0, 3), (3, 0), (3, 4), (7, 8)],
+)
+def test_object_store_unit_budget_exhaustively_partitions_protected_and_shared_usage(
+    task_reserved,
+    output_reserved,
+):
+    for task_internal_usage in range(10):
+        for output_usage in range(10):
+            budget = manager_module._ObjectStoreUnitBudget(
+                task_reserved_bytes=task_reserved,
+                output_reserved_bytes=output_reserved,
+                task_internal_usage_bytes=task_internal_usage,
+                output_usage_bytes=output_usage,
+            )
+            output_protected_used = min(output_usage, output_reserved)
+            expected_task_budget_usage = task_internal_usage + max(0, output_usage - output_reserved)
+            task_protected_used = min(expected_task_budget_usage, task_reserved)
+
+            assert budget.task_budget_usage_bytes == expected_task_budget_usage
+            assert budget.task_reserved_remaining_bytes == max(0, task_reserved - expected_task_budget_usage)
+            assert budget.output_reserved_remaining_bytes == max(0, output_reserved - output_usage)
+            assert budget.shared_used_bytes == max(0, expected_task_budget_usage - task_reserved)
+            assert task_internal_usage + output_usage == (
+                output_protected_used + task_protected_used + budget.shared_used_bytes
+            )
+
+
+@pytest.mark.parametrize("reservation_ratio", [-0.01, 1.01, float("nan"), float("inf")])
+def test_reservation_ratio_rejects_nonfinite_or_out_of_range_values(reservation_ratio):
+    with pytest.raises(ValueError, match=r"reservation_ratio must be in \[0, 1\]"):
+        _manager(_unit("resource:f:ratio-invalid"), reservation_ratio=reservation_ratio)
+
+
+@pytest.mark.parametrize(
+    ("reservation_ratio", "task_reserved", "output_reserved", "shared_pool"),
+    [
+        (0.0, 0, 0, 7),
+        (0.5, 1, 2, 4),
+        (1.0, 3, 4, 0),
+    ],
+)
+def test_object_store_reservation_ratio_endpoints_and_odd_byte_rounding(
+    reservation_ratio,
+    task_reserved,
+    output_reserved,
+    shared_pool,
+):
+    unit = _unit("resource:f:ratio", target=1, blocks=1)
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=7),
+        reservation_ratio=reservation_ratio,
+    )
+    snapshot = manager.snapshot()
+
+    _assert_object_store_budget_invariants(snapshot)
+    assert snapshot["admission"]["object_store"]["shared_pool_bytes"] == shared_pool
+    assert snapshot["units"][unit.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": task_reserved,
+        "output_reserved_bytes": output_reserved,
+        "task_internal_usage_bytes": 0,
+        "output_usage_bytes": 0,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 0,
+    }
+
+
+def test_zero_reservation_ratio_uses_only_shared_credit_then_bounded_liveness():
+    unit = _unit("resource:f:zero-ratio", target=1, blocks=1)
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=2),
+        reservation_ratio=0,
+    )
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+
+    first = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    second = manager.try_acquire_task(_task(unit.resource_unit_id, 1))
+    third_request = _task(unit.resource_unit_id, 2)
+    assert first.granted and not first.liveness
+    assert second.granted and not second.liveness
+    assert manager._normal_task_block_reason_locked(third_request)[0] == "query_soft_object_store_bytes"
+    third = manager.try_acquire_task(third_request)
+    assert not third.granted and third.blocked_reason == "liveness_task_active"
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            first.lease.lease_id,
+            first.lease.attempt_id,
+            "zero-ratio-liveness-output",
+            1,
+        )
+    )
+    assert output.granted and output.liveness
 
 
 def test_task_admission_requires_runnable_registered_unit_and_ready_actor():
@@ -672,7 +805,9 @@ def test_submitted_actor_processes_are_charged_once_to_soft_usage():
             cpu=2,
             gpu=1,
             heap=200,
-            store=20,
+            # Two retained 10-byte inputs plus one declared 20-byte
+            # generator window for each active actor slot.
+            store=60,
         ).to_dict()
     )
 
@@ -793,6 +928,8 @@ def test_fixed_actor_soft_debt_does_not_block_zero_increment_invocations():
         "resource:f:soft-debt-actor",
         resources=_r(),
         resident=_r(cpu=1, gpu=1, heap=100),
+        target=0,
+        blocks=0,
         backend="ray_actor",
         actor_pool_size=1,
     )
@@ -1024,8 +1161,498 @@ def test_identical_waiter_and_unit_state_updates_do_not_publish_spurious_edges()
     assert len(changes) == after_first_waiter
 
 
+def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
+    upstream = _unit("resource:f:ledger-upstream", target=1, blocks=1)
+    downstream = _unit(
+        "resource:f:ledger-downstream",
+        inputs=(upstream.resource_unit_id,),
+        target=1,
+        blocks=1,
+    )
+    manager = _manager(
+        upstream,
+        downstream,
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    _ready(manager, upstream.resource_unit_id, downstream.resource_unit_id)
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0, retained=20))
+    request = OutputBlockRequest(
+        "q",
+        upstream.resource_unit_id,
+        upstream_task.lease.lease_id,
+        upstream_task.lease.attempt_id,
+        "ledger-output",
+        15,
+    )
+    assert manager.note_output_waiting(request) is None
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+    selected, output = manager.try_acquire_next_queued_output_block({request.block_id})
+    assert selected == request and output.granted
+    assert manager.transition_output_block(output.lease.lease_id, "downstream_input")
+    assert manager.release_task_lease(
+        upstream_task.lease.lease_id,
+        attempt_id=upstream_task.lease.attempt_id,
+    )
+    manager.update_unit_state(upstream.resource_unit_id, runnable=False, completed=True)
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=100), generation=2),
+        admission_open=True,
+    )
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=10))
+    assert downstream_task.granted
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=40), generation=3),
+        admission_open=True,
+    )
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+    assert manager.release_output_block(output.lease.lease_id)
+    assert manager.release_task_lease(
+        downstream_task.lease.lease_id,
+        attempt_id=downstream_task.lease.attempt_id,
+    )
+    _assert_object_store_budget_invariants(manager.snapshot())
+
+
+def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
+    """Exercise valid lifecycle interleavings while checking an independent ledger."""
+
+    for seed in range(12):
+        randomizer = random.Random(seed)
+        upstream = _unit(f"resource:f:trace-{seed}-upstream", target=1, blocks=1)
+        middle = _unit(
+            f"resource:f:trace-{seed}-middle",
+            inputs=(upstream.resource_unit_id,),
+            target=3,
+            blocks=1,
+        )
+        downstream = _unit(
+            f"resource:f:trace-{seed}-downstream",
+            inputs=(middle.resource_unit_id,),
+            target=5,
+            blocks=1,
+        )
+        units = (upstream, middle, downstream)
+        manager = _manager(
+            *units,
+            resources=_r(cpu=100, heap=1_000, store=(17, 31, 64)[seed % 3]),
+            reservation_ratio=(0.0, 0.5, 1.0)[seed % 3],
+        )
+        _ready(
+            manager,
+            *(unit.resource_unit_id for unit in units),
+            consumer_waiting=True,
+        )
+
+        active_tasks = []
+        waiting_outputs = {}
+        active_outputs = {}
+        output_states = {}
+        completed_unit_ids = set()
+        next_identity = 0
+        allocation_generation = 1
+
+        for step in range(120):
+            action = randomizer.randrange(8)
+            live_unit_ids = [unit.resource_unit_id for unit in units if unit.resource_unit_id not in completed_unit_ids]
+
+            if action == 0 and live_unit_ids:
+                resource_unit_id = randomizer.choice(live_unit_ids)
+                request = _task(
+                    resource_unit_id,
+                    f"{seed}-{next_identity}",
+                    retained=randomizer.randrange(24),
+                )
+                next_identity += 1
+                grant = manager.try_acquire_task(request)
+                if grant.granted:
+                    active_tasks.append(grant.lease)
+            elif action == 1 and active_tasks:
+                task = randomizer.choice(active_tasks)
+                request = OutputBlockRequest(
+                    "q",
+                    task.resource_unit_id,
+                    task.lease_id,
+                    task.attempt_id,
+                    f"trace-{seed}-block-{next_identity}",
+                    randomizer.randrange(1, 24),
+                )
+                next_identity += 1
+                assert manager.note_output_waiting(request) is None
+                waiting_outputs[request.block_id] = request
+            elif action == 2 and waiting_outputs:
+                request = randomizer.choice(list(waiting_outputs.values()))
+                selected, grant = manager.try_acquire_next_queued_output_block({request.block_id})
+                assert selected == request
+                assert grant is not None
+                if grant.granted:
+                    waiting_outputs.pop(request.block_id)
+                    active_outputs[grant.lease.lease_id] = grant.lease
+                    output_states[grant.lease.lease_id] = grant.lease.state
+                elif grant.fatal:
+                    assert manager.remove_output_waiter(request.block_id)
+                    waiting_outputs.pop(request.block_id)
+            elif action == 3 and active_outputs:
+                transitionable = [
+                    lease_id for lease_id, state in output_states.items() if state in {"unit_queue", "downstream_input"}
+                ]
+                if transitionable:
+                    lease_id = randomizer.choice(transitionable)
+                    target = "downstream_input" if output_states[lease_id] == "unit_queue" else "external_consumer"
+                    assert manager.transition_output_block(lease_id, target)
+                    output_states[lease_id] = target
+            elif action == 4 and active_tasks:
+                task = randomizer.choice(active_tasks)
+                assert manager.release_task_lease(task.lease_id, attempt_id=task.attempt_id)
+                active_tasks.remove(task)
+            elif action == 5 and active_outputs:
+                lease_id = randomizer.choice(list(active_outputs))
+                assert manager.release_output_block(lease_id)
+                active_outputs.pop(lease_id)
+                output_states.pop(lease_id)
+            elif action == 6:
+                allocation_generation += 1
+                manager.update_allocation(
+                    _allocation(
+                        _r(
+                            cpu=100,
+                            heap=1_000,
+                            store=randomizer.choice((0, 7, 17, 31, 64, 101)),
+                        ),
+                        generation=allocation_generation,
+                    ),
+                    admission_open=True,
+                )
+            elif step >= 30:
+                completable = [
+                    unit.resource_unit_id for unit in units[:-1] if unit.resource_unit_id not in completed_unit_ids
+                ]
+                if completable:
+                    resource_unit_id = randomizer.choice(completable)
+                    manager.update_unit_state(resource_unit_id, runnable=False, completed=True)
+                    completed_unit_ids.add(resource_unit_id)
+                    allocation_generation += 1
+                    manager.update_allocation(
+                        _allocation(
+                            _r(cpu=100, heap=1_000, store=randomizer.choice((7, 31, 64))),
+                            generation=allocation_generation,
+                        ),
+                        admission_open=True,
+                    )
+
+            snapshot = manager.snapshot()
+            _assert_object_store_budget_invariants(snapshot)
+
+            expected_output_bytes_by_unit = {unit.resource_unit_id: 0 for unit in units}
+            for request in waiting_outputs.values():
+                expected_output_bytes_by_unit[request.producer_unit_id] += request.size_bytes
+            for output in active_outputs.values():
+                expected_output_bytes_by_unit[output.producer_unit_id] += output.size_bytes
+            for resource_unit_id, expected in expected_output_bytes_by_unit.items():
+                assert snapshot["units"][resource_unit_id]["object_store_budget"]["output_usage_bytes"] == expected
+
+            expected_query_usage = sum(task.resources.object_store_bytes for task in active_tasks)
+            expected_query_usage += sum(expected_output_bytes_by_unit.values())
+            expected_query_usage += sum(
+                snapshot["units"][unit.resource_unit_id]["active_task_count"]
+                * snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"]
+                for unit in units
+            )
+            assert snapshot["admission"]["object_store"]["query_usage_bytes"] == expected_query_usage
+
+            expected_task_liveness = {task.resource_unit_id: task.lease_id for task in active_tasks if task.liveness}
+            expected_output_liveness = {
+                output.producer_unit_id: output.lease_id
+                for output in active_outputs.values()
+                if output.liveness and output_states[output.lease_id] in {"generator_pending", "unit_queue"}
+            }
+            assert snapshot["liveness"]["active_task_lease_ids_by_unit"] == expected_task_liveness
+            assert snapshot["liveness"]["active_output_lease_ids_by_unit"] == expected_output_liveness
+
+
+def test_task_admission_cannot_consume_the_output_handoff_reservation():
+    unit = _unit("resource:f:task-output-split", target=1, blocks=1)
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=100),
+        reservation_ratio=1.0,
+    )
+    _ready(manager, unit.resource_unit_id)
+
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0, retained=49))
+    assert task.granted and not task.liveness
+    next_request = _task(unit.resource_unit_id, 1, retained=0)
+    assert manager._normal_task_block_reason_locked(next_request)[0] == "unit_soft_object_store_bytes"
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            task.lease.lease_id,
+            task.lease.attempt_id,
+            "fills-output-reservation",
+            50,
+        )
+    )
+    assert output.granted and not output.liveness
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 100
+
+
+def test_output_handoff_can_use_unused_task_reservation_without_shared_credit():
+    unit = _unit("resource:f:output-borrows-task", target=1, blocks=1)
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=100),
+        reservation_ratio=1.0,
+    )
+    _ready(manager, unit.resource_unit_id)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0, retained=0))
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            task.lease.lease_id,
+            task.lease.attempt_id,
+            "uses-both-protected-halves",
+            99,
+        )
+    )
+
+    assert output.granted and not output.liveness
+    budget = manager.snapshot()["units"][unit.resource_unit_id]["object_store_budget"]
+    assert budget == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": 50,
+        "output_reserved_bytes": 50,
+        "task_internal_usage_bytes": 1,
+        "output_usage_bytes": 99,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 0,
+    }
+
+
+def test_query_debt_still_preserves_an_independent_units_protected_progress():
+    oversized = _unit(
+        "resource:f:oversized-branch",
+        resources=_r(cpu=1, heap=10, store=101),
+        target=0,
+        blocks=0,
+    )
+    protected = _unit("resource:f:protected-branch", target=1, blocks=1)
+    manager = _manager(
+        oversized,
+        protected,
+        terminals=(oversized.resource_unit_id, protected.resource_unit_id),
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    _ready(manager, oversized.resource_unit_id, protected.resource_unit_id)
+
+    debt = manager.try_acquire_task(_task(oversized.resource_unit_id, 0))
+    assert debt.granted and debt.liveness
+    protected_task = manager.try_acquire_task(_task(protected.resource_unit_id, 0, retained=11))
+    assert protected_task.granted and not protected_task.liveness
+    protected_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            protected.resource_unit_id,
+            protected_task.lease.lease_id,
+            protected_task.lease.attempt_id,
+            "parallel-protected-output",
+            13,
+        )
+    )
+    assert protected_output.granted and not protected_output.liveness
+
+    shared_request = _task(protected.resource_unit_id, 1, retained=0)
+    assert manager._normal_task_block_reason_locked(shared_request)[0] == "query_soft_object_store_bytes"
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 126
+
+
+@pytest.mark.parametrize("retained_output_bytes", [100, 101])
+def test_ineligible_usage_at_or_above_the_limit_zeroes_current_reservations(retained_output_bytes):
+    completed = _unit(
+        "resource:f:completed-native",
+        target=1,
+        blocks=1,
+        backend="ray_worker",
+    )
+    current = _unit(
+        "resource:f:current",
+        inputs=(completed.resource_unit_id,),
+        target=1,
+        blocks=1,
+    )
+    manager = _manager(
+        completed,
+        current,
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    _ready(manager, completed.resource_unit_id, current.resource_unit_id)
+    task = manager.try_acquire_task(_task(completed.resource_unit_id, 0, node_id="node-a"))
+    manager.finish_task_with_outputs(
+        task.lease.lease_id,
+        attempt_id=task.lease.attempt_id,
+        outputs=(
+            OutputBlockRequest(
+                "q",
+                completed.resource_unit_id,
+                task.lease.lease_id,
+                task.lease.attempt_id,
+                f"completed-{retained_output_bytes}",
+                retained_output_bytes,
+            ),
+        ),
+    )
+    manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=100), generation=2),
+        admission_open=True,
+    )
+
+    snapshot = manager.snapshot()
+    _assert_object_store_budget_invariants(snapshot)
+    assert snapshot["admission"]["object_store"] == {
+        "limit_bytes": 100,
+        "ineligible_usage_bytes": retained_output_bytes,
+        "shared_pool_bytes": 0,
+        "shared_used_bytes": 0,
+        "shared_remaining_bytes": 0,
+        "query_usage_bytes": retained_output_bytes,
+    }
+    completed_budget = snapshot["units"][completed.resource_unit_id]["object_store_budget"]
+    assert completed_budget["reservation_eligible"] is False
+    assert completed_budget["ineligible_usage_bytes"] == retained_output_bytes
+    assert completed_budget["shared_used_bytes"] == 0
+    assert snapshot["units"][current.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 0
+    assert snapshot["units"][current.resource_unit_id]["object_store_budget"]["output_reserved_bytes"] == 0
+    assert manager._normal_task_block_reason_locked(_task(current.resource_unit_id, 0))[0] == (
+        "query_soft_object_store_bytes"
+    )
+
+
+def test_completed_producer_can_handoff_an_already_waiting_output_without_a_reservation():
+    unit = _unit("resource:f:completed-output-handoff", target=10, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=10))
+    _ready(manager, unit.resource_unit_id)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0, retained=0))
+    request = OutputBlockRequest(
+        "q",
+        unit.resource_unit_id,
+        task.lease.lease_id,
+        task.lease.attempt_id,
+        "completed-output-handoff",
+        7,
+    )
+    assert manager.note_output_waiting(request) is None
+
+    manager.update_unit_state(unit.resource_unit_id, runnable=False, completed=True)
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=10), generation=2),
+        admission_open=True,
+    )
+    before = manager.snapshot()
+    _assert_object_store_budget_invariants(before)
+    assert before["units"][unit.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": False,
+        "task_reserved_bytes": 0,
+        "output_reserved_bytes": 0,
+        "task_internal_usage_bytes": 7,
+        "output_usage_bytes": 7,
+        "ineligible_usage_bytes": 14,
+        "shared_used_bytes": 0,
+    }
+
+    selected, output = manager.try_acquire_next_queued_output_block({request.block_id})
+
+    assert selected == request
+    assert output.granted and not output.liveness
+    after = manager.snapshot()
+    _assert_object_store_budget_invariants(after)
+    assert after["usage"]["object_store_bytes"] == before["usage"]["object_store_bytes"]
+    assert after["units"][unit.resource_unit_id]["object_store_budget"]["ineligible_usage_bytes"] == 14
+
+
+def test_allocation_shrink_preserves_output_credit_and_growth_restores_shared_credit():
+    unit = _unit("resource:f:object-allocation-resize", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=200))
+    _ready(manager, unit.resource_unit_id)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0, retained=99))
+    assert task.granted and not task.liveness
+
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=100), generation=2),
+        admission_open=True,
+    )
+    shrunk = manager.snapshot()
+    assert shrunk["units"][unit.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": 25,
+        "output_reserved_bytes": 25,
+        "task_internal_usage_bytes": 100,
+        "output_usage_bytes": 0,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 75,
+    }
+    assert shrunk["admission"]["object_store"]["shared_remaining_bytes"] == 0
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            task.lease.lease_id,
+            task.lease.attempt_id,
+            "protected-after-shrink",
+            25,
+        )
+    )
+    assert output.granted and not output.liveness
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 125
+
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=300), generation=3),
+        admission_open=True,
+    )
+    assert manager._normal_task_block_reason_locked(_task(unit.resource_unit_id, 1, retained=0))[0] is None
+
+
+def test_completing_an_idle_unit_reassigns_its_protected_reservation():
+    completed = _unit("resource:f:idle-completed", target=1, blocks=1)
+    remaining = _unit("resource:f:remaining", target=1, blocks=1)
+    manager = _manager(
+        completed,
+        remaining,
+        terminals=(completed.resource_unit_id, remaining.resource_unit_id),
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    before = manager.snapshot()
+    assert before["units"][remaining.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 12
+    assert before["units"][remaining.resource_unit_id]["object_store_budget"]["output_reserved_bytes"] == 13
+
+    manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=100), generation=2),
+        admission_open=True,
+    )
+    after = manager.snapshot()
+    assert after["units"][completed.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 0
+    assert after["units"][completed.resource_unit_id]["object_store_budget"]["output_reserved_bytes"] == 0
+    assert after["units"][remaining.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 25
+    assert after["units"][remaining.resource_unit_id]["object_store_budget"]["output_reserved_bytes"] == 25
+
+
 def test_retained_input_uses_exact_dynamic_credit_above_nominal_target():
-    unit = _unit("resource:f:decode", resources=_r(cpu=1, heap=100, store=30))
+    unit = _unit(
+        "resource:f:decode",
+        resources=_r(cpu=1, heap=100, store=30),
+        target=0,
+        blocks=0,
+    )
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=1_000))
     _ready(manager, unit.resource_unit_id)
 
@@ -1040,7 +1667,12 @@ def test_retained_input_uses_exact_dynamic_credit_above_nominal_target():
 
 
 def test_retained_input_larger_than_soft_budget_uses_one_liveness_task():
-    unit = _unit("resource:f:decode", resources=_r(cpu=1, heap=100, store=101))
+    unit = _unit(
+        "resource:f:decode",
+        resources=_r(cpu=1, heap=100, store=101),
+        target=0,
+        blocks=0,
+    )
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=100))
     _ready(manager, unit.resource_unit_id)
 
@@ -1051,6 +1683,211 @@ def test_retained_input_larger_than_soft_budget_uses_one_liveness_task():
     assert granted.granted
     assert granted.liveness
     assert manager.snapshot()["soft_object_store_debt_bytes"] == 1
+
+
+def test_object_store_debt_preserves_downstream_task_and_output_reservations():
+    upstream = _unit(
+        "resource:f:decode",
+        resources=_r(cpu=1, heap=10, store=101),
+        target=0,
+        blocks=0,
+    )
+    downstream = _unit(
+        "resource:f:model",
+        inputs=(upstream.resource_unit_id,),
+        resources=_r(cpu=1, heap=10, store=1),
+        target=1,
+        blocks=1,
+    )
+    sink = _unit(
+        "resource:f:sink",
+        inputs=(downstream.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        upstream,
+        downstream,
+        sink,
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    _ready(
+        manager,
+        upstream.resource_unit_id,
+        downstream.resource_unit_id,
+        sink.resource_unit_id,
+    )
+
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+    assert upstream_task.granted and upstream_task.liveness
+    assert manager.snapshot()["soft_object_store_debt_bytes"] == 1
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=11))
+    assert downstream_task.granted and not downstream_task.liveness
+
+    downstream_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            downstream.resource_unit_id,
+            downstream_task.lease.lease_id,
+            downstream_task.lease.attempt_id,
+            "model-output",
+            1,
+        )
+    )
+    assert downstream_output.granted and not downstream_output.liveness
+
+    shared_borrower = _task(upstream.resource_unit_id, 1, retained=1)
+    assert manager._normal_task_block_reason_locked(shared_borrower)[0] == "query_soft_object_store_bytes"
+    blocked = manager.try_acquire_task(shared_borrower)
+    assert not blocked.granted
+    assert blocked.blocked_reason == "liveness_task_active"
+
+    snapshot = manager.snapshot()
+    assert snapshot["admission"]["object_store"] == {
+        "limit_bytes": 100,
+        "ineligible_usage_bytes": 0,
+        "shared_pool_bytes": 50,
+        "shared_used_bytes": 76,
+        "shared_remaining_bytes": 0,
+        "query_usage_bytes": 114,
+    }
+    assert snapshot["units"][downstream.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": 12,
+        "output_reserved_bytes": 13,
+        "task_internal_usage_bytes": 12,
+        "output_usage_bytes": 1,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 0,
+    }
+
+
+def test_declared_generator_window_seeds_admission_before_the_first_output():
+    unit = _unit(
+        "resource:f:decode",
+        resources=_r(cpu=1, heap=10),
+        target=50,
+        blocks=2,
+    )
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=300),
+    )
+    _ready(manager, unit.resource_unit_id)
+
+    first = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    second = manager.try_acquire_task(_task(unit.resource_unit_id, 1))
+    third_request = _task(unit.resource_unit_id, 2)
+
+    assert first.granted and not first.liveness
+    assert second.granted and not second.liveness
+    assert manager._normal_task_block_reason_locked(third_request)[0] == "unit_soft_object_store_bytes"
+    third = manager.try_acquire_task(third_request)
+    assert not third.granted
+    assert third.blocked_reason == "liveness_task_active"
+
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 200
+    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 100
+    assert snapshot["units"][unit.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": 75,
+        "output_reserved_bytes": 75,
+        "task_internal_usage_bytes": 200,
+        "output_usage_bytes": 0,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 125,
+    }
+
+
+def test_completed_zero_output_task_releases_the_cold_start_estimate():
+    unit = _unit(
+        "resource:f:filter",
+        resources=_r(cpu=1, heap=10),
+        target=50,
+        blocks=2,
+    )
+    manager = _manager(
+        unit,
+        resources=_r(cpu=10, heap=100, store=300),
+    )
+    _ready(manager, unit.resource_unit_id)
+
+    first = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 100
+    assert manager.release_task_lease(
+        first.lease.lease_id,
+        attempt_id=first.lease.attempt_id,
+    )
+
+    snapshot = manager.snapshot()
+    assert snapshot["units"][unit.resource_unit_id]["num_tasks_finished"] == 1
+    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 0
+    second = manager.try_acquire_task(_task(unit.resource_unit_id, 1))
+    assert second.granted and not second.liveness
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_ineligible_output_usage_reduces_current_phase_reservations():
+    upstream = _unit("resource:f:completed-producer", target=10, blocks=1)
+    downstream = _unit(
+        "resource:f:current-producer",
+        inputs=(upstream.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    manager = _manager(
+        upstream,
+        downstream,
+        resources=_r(cpu=10, heap=100, store=100),
+    )
+    _ready(manager, upstream.resource_unit_id, downstream.resource_unit_id)
+
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+    upstream_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            upstream.resource_unit_id,
+            upstream_task.lease.lease_id,
+            upstream_task.lease.attempt_id,
+            "retained-output",
+            80,
+        )
+    )
+    assert upstream_output.granted and upstream_output.liveness
+    assert manager.transition_output_block(upstream_output.lease.lease_id, "unit_queue")
+    assert manager.transition_output_block(upstream_output.lease.lease_id, "downstream_input")
+    assert manager.release_task_lease(
+        upstream_task.lease.lease_id,
+        attempt_id=upstream_task.lease.attempt_id,
+    )
+    manager.update_unit_state(
+        upstream.resource_unit_id,
+        runnable=False,
+        completed=True,
+    )
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=100, store=100), generation=2),
+        admission_open=True,
+    )
+
+    budget = manager.snapshot()["admission"]["object_store"]
+    assert budget == {
+        "limit_bytes": 100,
+        "ineligible_usage_bytes": 80,
+        "shared_pool_bytes": 10,
+        "shared_used_bytes": 0,
+        "shared_remaining_bytes": 10,
+        "query_usage_bytes": 80,
+    }
+    downstream_budget = manager.snapshot()["units"][downstream.resource_unit_id]["object_store_budget"]
+    assert downstream_budget["task_reserved_bytes"] == 5
+    assert downstream_budget["output_reserved_bytes"] == 5
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0))
+    assert downstream_task.granted and not downstream_task.liveness
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 90
 
 
 def test_global_idle_liveness_is_bounded_to_one_task_across_units():
@@ -1088,6 +1925,159 @@ def test_global_idle_liveness_is_bounded_to_one_task_across_units():
     assert next_escape.granted and next_escape.liveness
 
 
+def test_task_liveness_cannot_move_back_upstream():
+    upstream = _unit("resource:f:liveness-upstream", target=0, blocks=0)
+    downstream = _unit(
+        "resource:f:liveness-downstream",
+        inputs=(upstream.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(upstream, downstream, resources=_r())
+    _ready(manager, upstream.resource_unit_id, downstream.resource_unit_id)
+
+    downstream_escape = manager.try_acquire_task(_task(downstream.resource_unit_id, 0))
+    upstream_request = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+
+    assert downstream_escape.granted and downstream_escape.liveness
+    assert not upstream_request.granted
+    assert upstream_request.blocked_reason == "liveness_task_active"
+
+
+def test_task_liveness_can_cross_a_diamond_only_after_convergence():
+    source = _unit("resource:f:diamond-source", target=0, blocks=0)
+    left = _unit(
+        "resource:f:diamond-left",
+        inputs=(source.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    right = _unit(
+        "resource:f:diamond-right",
+        inputs=(source.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    join = _unit(
+        "resource:f:diamond-join",
+        inputs=(left.resource_unit_id, right.resource_unit_id),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        source,
+        left,
+        right,
+        join,
+        resources=_r(cpu=2, heap=20),
+    )
+    _ready(
+        manager,
+        source.resource_unit_id,
+        left.resource_unit_id,
+        right.resource_unit_id,
+        join.resource_unit_id,
+    )
+
+    source_task = manager.try_acquire_task(_task(source.resource_unit_id, 0))
+    left_escape = manager.try_acquire_task(_task(left.resource_unit_id, 0))
+    right_parallel = manager.try_acquire_task(_task(right.resource_unit_id, 0))
+    join_escape = manager.try_acquire_task(_task(join.resource_unit_id, 0))
+
+    assert source_task.granted and not source_task.liveness
+    assert left_escape.granted and left_escape.liveness
+    assert not right_parallel.granted and right_parallel.blocked_reason == "liveness_task_active"
+    assert join_escape.granted and join_escape.liveness
+    assert manager.snapshot()["liveness"]["active_task_lease_ids_by_unit"] == {
+        left.resource_unit_id: left_escape.lease.lease_id,
+        join.resource_unit_id: join_escape.lease.lease_id,
+    }
+
+
+def test_task_liveness_advances_a_bounded_downstream_chain():
+    upstream = _unit("resource:f:decode", target=10, blocks=1)
+    middle = _unit(
+        "resource:f:first-model",
+        inputs=(upstream.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    downstream = _unit(
+        "resource:f:second-model",
+        inputs=(middle.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    sink = _unit(
+        "resource:f:sink",
+        inputs=(downstream.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        upstream,
+        middle,
+        downstream,
+        sink,
+        resources=_r(cpu=10, heap=1_000, store=100),
+    )
+    _ready(manager, upstream.resource_unit_id)
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+    _ready(
+        manager,
+        middle.resource_unit_id,
+        downstream.resource_unit_id,
+        sink.resource_unit_id,
+    )
+    middle_task = manager.try_acquire_task(_task(middle.resource_unit_id, 0, retained=101))
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=101))
+
+    assert upstream_task.granted and not upstream_task.liveness
+    assert middle_task.granted and middle_task.liveness
+    assert downstream_task.granted and downstream_task.liveness
+    assert manager.snapshot()["liveness"]["active_task_lease_ids_by_unit"] == {
+        middle.resource_unit_id: middle_task.lease.lease_id,
+        downstream.resource_unit_id: downstream_task.lease.lease_id,
+    }
+
+    same_unit = manager.try_acquire_task(_task(downstream.resource_unit_id, 1, retained=101))
+    assert not same_unit.granted
+    assert same_unit.blocked_reason == "liveness_task_active"
+
+
+def test_task_liveness_does_not_open_a_parallel_downstream_branch():
+    upstream = _unit("resource:f:source", target=10, blocks=1)
+    left = _unit(
+        "resource:f:left",
+        inputs=(upstream.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    right = _unit(
+        "resource:f:right",
+        inputs=(upstream.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    manager = _manager(
+        upstream,
+        left,
+        right,
+        resources=_r(cpu=10, heap=1_000, store=100),
+        terminals=(left.resource_unit_id, right.resource_unit_id),
+    )
+    _ready(manager, upstream.resource_unit_id)
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+    _ready(manager, left.resource_unit_id, right.resource_unit_id)
+    left_task = manager.try_acquire_task(_task(left.resource_unit_id, 0, retained=101))
+    right_task = manager.try_acquire_task(_task(right.resource_unit_id, 0, retained=101))
+
+    assert upstream_task.granted and not upstream_task.liveness
+    assert left_task.granted and left_task.liveness
+    assert not right_task.granted
+    assert right_task.blocked_reason == "liveness_task_active"
+
+
 def test_task_lease_release_is_attempt_aware_and_idempotent():
     unit = _unit("resource:f:decode")
     manager = _manager(unit)
@@ -1122,7 +2112,7 @@ def test_output_blocks_add_exact_refs_to_dynamic_pending_generator_estimate():
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=1_000))
     _ready(manager, unit.resource_unit_id)
     task = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
-    assert manager.snapshot()["usage"]["object_store_bytes"] == 10
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 110
 
     first = manager.try_acquire_output_block(
         OutputBlockRequest("q", unit.resource_unit_id, task.lease.lease_id, "0", "block-1", 40)
@@ -1203,6 +2193,9 @@ def test_prefetched_actor_invocation_has_no_pending_generator_estimate():
     _ready(manager, actor.resource_unit_id)
     active = manager.try_acquire_task(_task(actor.resource_unit_id, 0, retained=0))
     prefetched = manager.try_acquire_task(_task(actor.resource_unit_id, 1, retained=0))
+    assert active.granted and prefetched.granted
+    # Only the active call can populate this actor's generator window.
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 100
     output = manager.try_acquire_output_block(
         OutputBlockRequest(
             "q",
@@ -1214,7 +2207,7 @@ def test_prefetched_actor_invocation_has_no_pending_generator_estimate():
         )
     )
 
-    assert active.granted and prefetched.granted and output.granted
+    assert output.granted
     # 10 exact output bytes + 20 estimated bytes for only the active call.
     assert manager.snapshot()["usage"]["object_store_bytes"] == 30
     assert manager.release_task_lease(
@@ -1224,6 +2217,31 @@ def test_prefetched_actor_invocation_has_no_pending_generator_estimate():
     # The promoted call now uses the learned 10-byte/one-output estimate, while
     # the first call's ObjectRef remains exact.
     assert manager.snapshot()["usage"]["object_store_bytes"] == 20
+
+
+def test_prefetched_actor_admission_does_not_reserve_a_second_generator_window():
+    actor = _unit(
+        "resource:f:actor-prefetch-admission",
+        resources=_r(),
+        resident=_r(cpu=1, heap=10),
+        target=50,
+        blocks=2,
+        backend="ray_actor",
+        actor_pool_size=1,
+        actor_prefetch_depth=2,
+    )
+    manager = _manager(
+        actor,
+        resources=_r(cpu=1, heap=10, store=100),
+    )
+    _ready(manager, actor.resource_unit_id)
+
+    active = manager.try_acquire_task(_task(actor.resource_unit_id, 0, retained=0))
+    prefetched = manager.try_acquire_task(_task(actor.resource_unit_id, 1, retained=0))
+
+    assert active.granted and active.liveness
+    assert prefetched.granted and not prefetched.liveness
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 100
 
 
 def test_frontier_materializer_disables_object_store_backpressure_for_input():
@@ -1401,6 +2419,115 @@ def test_output_lease_transitions_preserve_bytes_and_release_after_task_completi
     assert manager.snapshot()["usage"]["object_store_bytes"] == 0
 
 
+def test_multiple_waiting_outputs_are_counted_once_when_each_becomes_a_lease():
+    unit = _unit("resource:f:multiple-waiters", target=10, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1_000))
+    _ready(manager, unit.resource_unit_id)
+    first_task = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    second_task = manager.try_acquire_task(_task(unit.resource_unit_id, 1))
+    first_request = OutputBlockRequest(
+        "q",
+        unit.resource_unit_id,
+        first_task.lease.lease_id,
+        first_task.lease.attempt_id,
+        "first-waiting-output",
+        7,
+    )
+    second_request = OutputBlockRequest(
+        "q",
+        unit.resource_unit_id,
+        second_task.lease.lease_id,
+        second_task.lease.attempt_id,
+        "second-waiting-output",
+        11,
+    )
+    assert manager.note_output_waiting(first_request) is None
+    assert manager.note_output_waiting(second_request) is None
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 36
+
+    selected, first_grant = manager.try_acquire_next_queued_output_block({first_request.block_id})
+    assert selected == first_request and first_grant.granted
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 36
+    selected, second_grant = manager.try_acquire_next_queued_output_block({second_request.block_id})
+    assert selected == second_request and second_grant.granted
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 36
+
+    assert manager.release_task_lease(
+        first_task.lease.lease_id,
+        attempt_id=first_task.lease.attempt_id,
+    )
+    assert manager.release_task_lease(
+        second_task.lease.lease_id,
+        attempt_id=second_task.lease.attempt_id,
+    )
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 18
+    assert manager.release_output_block(first_grant.lease.lease_id)
+    assert manager.release_output_block(second_grant.lease.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
+def test_removing_a_waiting_output_drops_exact_bytes_but_keeps_the_learned_window():
+    unit = _unit("resource:f:removed-waiter", target=10, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=100))
+    _ready(manager, unit.resource_unit_id)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    request = OutputBlockRequest(
+        "q",
+        unit.resource_unit_id,
+        task.lease.lease_id,
+        task.lease.attempt_id,
+        "removed-waiter",
+        7,
+    )
+    assert manager.note_output_waiting(request) is None
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 14
+
+    assert manager.remove_output_waiter(request.block_id)
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 7
+    assert snapshot["units"][unit.resource_unit_id]["num_task_outputs_generated"] == 1
+    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 7
+
+
+def test_waiting_output_stays_charged_during_task_completion_cleanup_race():
+    unit = _unit("resource:f:cleanup-race", target=10, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=100))
+    _ready(manager, unit.resource_unit_id)
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0))
+    request = OutputBlockRequest(
+        "q",
+        unit.resource_unit_id,
+        task.lease.lease_id,
+        task.lease.attempt_id,
+        "waiting-during-task-cleanup",
+        7,
+    )
+    assert manager.note_output_waiting(request) is None
+
+    assert manager.release_task_lease(
+        task.lease.lease_id,
+        attempt_id=task.lease.attempt_id,
+    )
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 7
+    assert snapshot["units"][unit.resource_unit_id]["object_store_budget"] == {
+        "reservation_eligible": True,
+        "task_reserved_bytes": 25,
+        "output_reserved_bytes": 25,
+        "task_internal_usage_bytes": 0,
+        "output_usage_bytes": 7,
+        "ineligible_usage_bytes": 0,
+        "shared_used_bytes": 0,
+    }
+
+    selected, denied = manager.try_acquire_next_queued_output_block({request.block_id})
+    assert selected == request
+    assert denied is not None and denied.fatal
+    assert denied.blocked_reason == "task_lease_not_active"
+    assert manager.remove_output_waiter(request.block_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
 def test_released_output_block_identity_cannot_be_leased_again():
     unit = _unit("resource:f:decode", resources=_r(cpu=1, heap=100), target=50, blocks=2)
     manager = _manager(unit)
@@ -1515,6 +2642,46 @@ def test_output_transition_rejects_skips_and_attempt_mismatch():
         manager.transition_output_block(block.lease.lease_id, "external_consumer")
 
 
+def test_task_and_output_liveness_tokens_have_independent_lifetimes():
+    unit = _unit("resource:f:liveness-lifetimes", target=1, blocks=1)
+    manager = _manager(unit, resources=_r(cpu=10, heap=100, store=1))
+    _ready(manager, unit.resource_unit_id, consumer_waiting=True)
+
+    task = manager.try_acquire_task(_task(unit.resource_unit_id, 0, retained=2))
+    assert task.granted and task.liveness
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            task.lease.lease_id,
+            task.lease.attempt_id,
+            "liveness-lifetime-output",
+            2,
+        )
+    )
+    assert output.granted and output.liveness
+    assert manager.snapshot()["liveness"] == {
+        "active_task_lease_ids_by_unit": {unit.resource_unit_id: task.lease.lease_id},
+        "active_output_lease_ids_by_unit": {unit.resource_unit_id: output.lease.lease_id},
+        "task_grants_total": 1,
+        "output_grants_total": 1,
+    }
+
+    assert manager.transition_output_block(output.lease.lease_id, "unit_queue")
+    assert manager.snapshot()["liveness"]["active_output_lease_ids_by_unit"] == {
+        unit.resource_unit_id: output.lease.lease_id
+    }
+    assert manager.transition_output_block(output.lease.lease_id, "downstream_input")
+    handed_off = manager.snapshot()["liveness"]
+    assert handed_off["active_output_lease_ids_by_unit"] == {}
+    assert handed_off["active_task_lease_ids_by_unit"] == {unit.resource_unit_id: task.lease.lease_id}
+
+    assert manager.release_task_lease(task.lease.lease_id, attempt_id=task.lease.attempt_id)
+    assert manager.snapshot()["liveness"]["active_task_lease_ids_by_unit"] == {}
+    assert manager.release_output_block(output.lease.lease_id)
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+
+
 def test_oversized_output_block_uses_one_bounded_liveness_grant():
     unit = _unit("resource:f:decode", target=50, blocks=2)
     manager = _manager(unit, resources=_r(cpu=10, heap=1_000, store=100))
@@ -1546,6 +2713,209 @@ def test_oversized_output_block_uses_one_bounded_liveness_grant():
     assert manager.snapshot()["soft_object_store_debt_bytes"] == 102
 
 
+def test_output_liveness_advances_a_bounded_downstream_chain():
+    upstream = _unit("resource:f:decode", target=10, blocks=1)
+    bridge = _unit(
+        "resource:f:bridge",
+        inputs=(upstream.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    downstream = _unit(
+        "resource:f:model",
+        inputs=(bridge.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    sink = _unit(
+        "resource:f:sink",
+        inputs=(downstream.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        upstream,
+        bridge,
+        downstream,
+        sink,
+        resources=_r(cpu=10, heap=1_000, store=10),
+    )
+    _ready(
+        manager,
+        upstream.resource_unit_id,
+        bridge.resource_unit_id,
+        downstream.resource_unit_id,
+        sink.resource_unit_id,
+    )
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
+    upstream_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            upstream.resource_unit_id,
+            upstream_task.lease.lease_id,
+            upstream_task.lease.attempt_id,
+            "decode-output",
+            11,
+        )
+    )
+    assert upstream_output.granted and upstream_output.liveness
+    assert manager.transition_output_block(upstream_output.lease.lease_id, "unit_queue")
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0))
+    assert downstream_task.granted
+    model_output = OutputBlockRequest(
+        "q",
+        downstream.resource_unit_id,
+        downstream_task.lease.lease_id,
+        downstream_task.lease.attempt_id,
+        "model-output",
+        2,
+    )
+    assert manager.note_output_waiting(model_output) is None
+
+    selected, grant = manager.try_acquire_next_queued_output_block({model_output.block_id})
+
+    assert selected == model_output
+    assert grant.granted and grant.liveness
+    assert manager.snapshot()["liveness"]["active_output_lease_ids_by_unit"] == {
+        upstream.resource_unit_id: upstream_output.lease.lease_id,
+        downstream.resource_unit_id: grant.lease.lease_id,
+    }
+
+    next_model_output = OutputBlockRequest(
+        "q",
+        downstream.resource_unit_id,
+        downstream_task.lease.lease_id,
+        downstream_task.lease.attempt_id,
+        "next-model-output",
+        1,
+    )
+    assert manager.note_output_waiting(next_model_output) is None
+    blocked_request, blocked = manager.try_acquire_next_queued_output_block({next_model_output.block_id})
+    assert blocked_request == next_model_output
+    assert not blocked.granted and blocked.blocked_reason == "liveness_output_active"
+
+    assert manager.transition_output_block(grant.lease.lease_id, "downstream_input")
+    selected, next_grant = manager.try_acquire_next_queued_output_block({next_model_output.block_id})
+    assert selected == next_model_output
+    assert next_grant.granted and next_grant.liveness
+
+
+def test_output_liveness_cannot_move_back_upstream():
+    upstream = _unit("resource:f:output-liveness-upstream", target=10, blocks=1)
+    downstream = _unit(
+        "resource:f:output-liveness-downstream",
+        inputs=(upstream.resource_unit_id,),
+        target=10,
+        blocks=1,
+    )
+    manager = _manager(
+        upstream,
+        downstream,
+        resources=_r(cpu=10, heap=1_000, store=100),
+    )
+    _ready(
+        manager,
+        upstream.resource_unit_id,
+        downstream.resource_unit_id,
+        consumer_waiting=True,
+    )
+    upstream_task = manager.try_acquire_task(_task(upstream.resource_unit_id, 0, retained=0))
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0))
+    manager.update_allocation(
+        _allocation(_r(cpu=10, heap=1_000, store=10), generation=2),
+        admission_open=True,
+    )
+
+    downstream_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            downstream.resource_unit_id,
+            downstream_task.lease.lease_id,
+            downstream_task.lease.attempt_id,
+            "downstream-liveness-first",
+            11,
+        )
+    )
+    upstream_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            upstream.resource_unit_id,
+            upstream_task.lease.lease_id,
+            upstream_task.lease.attempt_id,
+            "upstream-cannot-follow",
+            11,
+        )
+    )
+
+    assert downstream_output.granted and downstream_output.liveness
+    assert not upstream_output.granted
+    assert upstream_output.blocked_reason == "liveness_output_active"
+    assert manager.snapshot()["liveness"]["active_output_lease_ids_by_unit"] == {
+        downstream.resource_unit_id: downstream_output.lease.lease_id
+    }
+
+
+def test_output_liveness_does_not_open_a_parallel_branch():
+    left = _unit("resource:f:left", target=10, blocks=1)
+    left_sink = _unit(
+        "resource:f:left-sink",
+        inputs=(left.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    right = _unit("resource:f:right", target=10, blocks=1)
+    right_sink = _unit(
+        "resource:f:right-sink",
+        inputs=(right.resource_unit_id,),
+        target=0,
+        blocks=0,
+    )
+    manager = _manager(
+        left,
+        left_sink,
+        right,
+        right_sink,
+        terminals=(left_sink.resource_unit_id, right_sink.resource_unit_id),
+        resources=_r(cpu=10, heap=1_000, store=40),
+    )
+    _ready(
+        manager,
+        left.resource_unit_id,
+        left_sink.resource_unit_id,
+        right.resource_unit_id,
+        right_sink.resource_unit_id,
+    )
+    left_task = manager.try_acquire_task(_task(left.resource_unit_id, 0))
+    right_task = manager.try_acquire_task(_task(right.resource_unit_id, 0))
+    left_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            left.resource_unit_id,
+            left_task.lease.lease_id,
+            left_task.lease.attempt_id,
+            "left-output",
+            41,
+        )
+    )
+    assert left_output.granted and left_output.liveness
+    assert manager.transition_output_block(left_output.lease.lease_id, "unit_queue")
+
+    right_output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            right.resource_unit_id,
+            right_task.lease.lease_id,
+            right_task.lease.attempt_id,
+            "right-output",
+            41,
+        )
+    )
+
+    assert not right_output.granted
+    assert right_output.blocked_reason == "liveness_output_active"
+
+
 def test_queued_output_liveness_skips_higher_ranked_nonstarving_branch():
     starving_producer = _unit("resource:f:a-producer", target=10, blocks=1)
     starving_consumer = _unit(
@@ -1567,7 +2937,7 @@ def test_queued_output_liveness_skips_higher_ranked_nonstarving_branch():
         busy_producer,
         busy_consumer,
         terminals=(starving_consumer.resource_unit_id, busy_consumer.resource_unit_id),
-        resources=_r(cpu=100, heap=1_000, store=10),
+        resources=_r(cpu=100, heap=1_000, store=40),
     )
     _ready(
         manager,
@@ -1587,7 +2957,7 @@ def test_queued_output_liveness_skips_higher_ranked_nonstarving_branch():
         starving_task.lease.lease_id,
         starving_task.lease.attempt_id,
         "starving-output",
-        11,
+        41,
     )
     busy_request = OutputBlockRequest(
         "q",
@@ -1595,7 +2965,7 @@ def test_queued_output_liveness_skips_higher_ranked_nonstarving_branch():
         busy_task.lease.lease_id,
         busy_task.lease.attempt_id,
         "busy-output",
-        11,
+        41,
     )
     assert manager.note_output_waiting(starving_request) is None
     assert manager.note_output_waiting(busy_request) is None
@@ -1745,7 +3115,7 @@ def test_native_task_and_materialized_output_preserve_the_actual_runtime_node():
     )
     manager = _manager(
         unit,
-        resources=_r(cpu=2, heap=20, store=40),
+        resources=_r(cpu=2, heap=20, store=60),
     )
     _ready(manager, unit.resource_unit_id)
 

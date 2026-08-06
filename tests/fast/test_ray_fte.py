@@ -259,7 +259,11 @@ def _register_fte_query(query_id: str, node_id: str, *, partitions: int, task_sl
     allocation_resources = ResourceVector(
         cpu=task_slots,
         heap_bytes=task_slots * 2 * _GIB,
-        object_store_bytes=task_slots * 256 * _MIB,
+        # A streaming unit reserves 25% of its object-store allocation for
+        # output handoff. Size the fixture so the remaining 75% admits exactly
+        # ``task_slots`` native 256 MiB generator windows; these tests exercise
+        # FTE lease ownership rather than output backpressure.
+        object_store_bytes=(task_slots * 256 * _MIB * 4 + 2) // 3,
     )
     manager = register_query_resource_graph(
         graph,

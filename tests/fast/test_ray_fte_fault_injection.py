@@ -307,7 +307,11 @@ def _register_fault_query(tasks) -> None:
     allocation_resources = ResourceVector(
         cpu=max(1, len(tasks)),
         heap_bytes=max(1, len(tasks)) * 64 * 1024 * 1024,
-        object_store_bytes=max(1, len(tasks)) * target_output_block_bytes,
+        # These tests exercise FTE recovery rather than object-store
+        # backpressure.  A streaming unit keeps 25% of the default allocation
+        # protected for output handoff, so size the fixture such that the
+        # remaining 75% admits every native generator window concurrently.
+        object_store_bytes=(max(1, len(tasks)) * target_output_block_bytes * 4 + 2) // 3,
     )
     manager = register_query_resource_graph(
         QueryResourceGraph(

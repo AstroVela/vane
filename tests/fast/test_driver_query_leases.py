@@ -2865,7 +2865,10 @@ def test_task_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
         resources = ResourceVector(
             cpu=10,
             heap_bytes=1_000,
-            object_store_bytes=200,
+            # Ten 20-byte generator windows must fit without consuming the
+            # protected output-handoff portion of the object-store budget; this
+            # test exercises pump batching rather than resource backpressure.
+            object_store_bytes=400,
         )
         manager.update_allocation(
             QueryAllocation(
