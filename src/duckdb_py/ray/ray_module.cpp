@@ -929,7 +929,7 @@ void register_ray_bindings(py::module_ &mod) {
 			                string query_id = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
 			                PyLogicalPlan plan;
 			                plan.query_id_ = std::move(query_id);
-			                plan.relation_ = rel;
+			                plan.serialized_logical_plan_ = SerializeLogicalPlanFromRelation(rel);
 			                auto connection_owner = pyrel.GetConnectionOwner();
 			                if (connection_owner && !connection_owner.is_none() &&
 			                    py::isinstance<DuckDBPyConnection>(connection_owner)) {
@@ -957,12 +957,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def(py::pickle(
 	        [](const PyLogicalPlan &p) {
 		        if (p.serialized_logical_plan_.empty()) {
-			        if (!p.relation_) {
-				        throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
-			        }
-			        auto serialized = SerializeLogicalPlanFromRelation(p.relation_);
-			        return py::make_tuple(p.query_id_, py::bytes(serialized), p.udf_registrations_,
-			                              p.connection_snapshot_);
+			        throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
 		        }
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,
 		                              p.connection_snapshot_);
