@@ -10,7 +10,6 @@ struct PyLogicalPlan {
 	string serialized_logical_plan_;
 	// Driver-local source connection; intentionally omitted from pickle state.
 	py::object source_connection_ = py::none();
-	duckdb::shared_ptr<duckdb::Relation> relation_;
 	py::object udf_registrations_ = py::none();
 	py::object connection_snapshot_ = py::none();
 

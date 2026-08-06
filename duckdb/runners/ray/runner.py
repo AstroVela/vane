@@ -146,22 +146,27 @@ class RayRunner(Runner):
             return client
 
     def run_iter(self, relation: duckdb.DuckDBPyRelation) -> Iterator[RayMaterializedResult]:
-        query_id = str(uuid.uuid4())
+        # PyLogicalPlan is transport-only. This generator owns the source
+        # relation until the client stream and its teardown have finished.
+        try:
+            query_id = str(uuid.uuid4())
 
-        PyLogicalPlan = require_ray_cxx_attr(
-            "PyLogicalPlan",
-            hint="Ensure the C++ ray extension is built and importable in worker processes.",
-        )
+            PyLogicalPlan = require_ray_cxx_attr(
+                "PyLogicalPlan",
+                hint="Ensure the C++ ray extension is built and importable in worker processes.",
+            )
 
-        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
-        session_id = str(logical_plan.session_id())
+            logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+            session_id = str(logical_plan.session_id())
 
-        client = self._client_for_session(session_id)
+            client = self._client_for_session(session_id)
 
-        # Send PyLogicalPlan to Driver — Driver will create physical plan
-        yield from client.stream_plan(
-            logical_plan,
-        )
+            # Send PyLogicalPlan to Driver — Driver will create physical plan
+            yield from client.stream_plan(
+                logical_plan,
+            )
+        finally:
+            del relation
 
     def run_write(self, relation: duckdb.DuckDBPyRelation) -> dict[str, Any]:
         """Execute a distributed COPY/write plan and return file metadata."""
@@ -191,5 +196,8 @@ class RayRunner(Runner):
         return client.retry_copy_cleanup(operation_id)
 
     def run_iter_tables(self, relation: Any) -> Iterator[pa.Table]:
-        for result in self.run_iter(relation):
-            yield result.partition()
+        try:
+            for result in self.run_iter(relation):
+                yield result.partition()
+        finally:
+            del relation

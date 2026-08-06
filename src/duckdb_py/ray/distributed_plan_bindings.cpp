@@ -990,14 +990,10 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 		throw duckdb::InternalException("Connection is required for to_physical_plan");
 	}
 
-	string logical_payload;
-	if (!serialized_logical_plan_.empty()) {
-		logical_payload = serialized_logical_plan_;
-	} else if (relation_) {
-		logical_payload = SerializeLogicalPlanFromRelation(relation_);
-	} else {
-		throw duckdb::InternalException("Logical plan is empty and no relation is available");
+	if (serialized_logical_plan_.empty()) {
+		throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
 	}
+	const auto &logical_payload = serialized_logical_plan_;
 
 	py::object planning_conn = ResolvePlanningConnectionForSnapshot(conn_obj, source_connection_, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
