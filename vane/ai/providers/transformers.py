@@ -13,13 +13,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-import pyarrow as pa
-
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.options import validate_embed_options
 from vane.ai.protocols import TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -108,11 +106,11 @@ class TransformersTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_options(self) -> Options:
         return dict(self.options)
 
-    def get_dimensions(self) -> EmbeddingDimensions:
+    def get_dimensions(self) -> int:
         if self.dimensions is not None:
-            return EmbeddingDimensions(size=self.dimensions, dtype=pa.float32())
+            return self.dimensions
         if self.model in _EMBEDDING_DIMS:
-            return EmbeddingDimensions(size=_EMBEDDING_DIMS[self.model], dtype=pa.float32())
+            return _EMBEDDING_DIMS[self.model]
         raise ValueError(
             f"Cannot determine embedding dimensions for Transformers model {self.model!r} "
             "from trusted local metadata; pass dimensions=... explicitly"

@@ -21,7 +21,6 @@ import pytest
 import vane
 from vane.ai.protocols import TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
     from vane.ai.protocols import TextEmbedder
@@ -84,8 +83,8 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_options(self) -> Options:
         return {"batch_size": 2}
 
-    def get_dimensions(self) -> EmbeddingDimensions:
-        return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+    def get_dimensions(self) -> int:
+        return self.dim
 
     def instantiate(self) -> TextEmbedder:
         return MockTextEmbedder(dim=self.dim)
@@ -237,7 +236,7 @@ class TestGoogleProviderEmbedPlanning:
         descriptor = GoogleProvider().get_text_embedder()
 
         assert descriptor.model_name == "gemini-embedding-2"
-        assert descriptor.get_dimensions().size == 3072
+        assert descriptor.get_dimensions() == 3072
 
     def test_get_text_embedder_default_rejects_unsupported_request_options(self):
         from vane.ai.providers.google import GoogleProvider
@@ -277,9 +276,9 @@ class TestGoogleProviderEmbedPlanning:
             embedding_dimensions=128,
         ).get_text_embedder()
 
-        assert (builtin.get_dimensions().size, builtin.request_dimensions) == (3072, None)
-        assert (explicit.get_dimensions().size, explicit.request_dimensions) == (256, 256)
-        assert (unknown.get_dimensions().size, unknown.request_dimensions) == (128, None)
+        assert (builtin.get_dimensions(), builtin.request_dimensions) == (3072, None)
+        assert (explicit.get_dimensions(), explicit.request_dimensions) == (256, 256)
+        assert (unknown.get_dimensions(), unknown.request_dimensions) == (128, None)
 
     @pytest.mark.skipif(not _has_module("google.genai"), reason="google-genai not installed")
     def test_provider_dimension_metadata_is_not_sent_as_request_override(self):
@@ -292,9 +291,7 @@ class TestGoogleProviderEmbedPlanning:
         async def request_for(descriptor):
             client = MagicMock()
             client.aio.models.embed_content = AsyncMock(
-                return_value=SimpleNamespace(
-                    embeddings=[SimpleNamespace(values=[1.0] * descriptor.get_dimensions().size)]
-                )
+                return_value=SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0] * descriptor.get_dimensions())])
             )
             with patch("google.genai.Client", return_value=client):
                 embedder = descriptor.instantiate()
@@ -305,7 +302,7 @@ class TestGoogleProviderEmbedPlanning:
         metadata_only = provider.get_text_embedder()
         explicit_override = provider.get_text_embedder(dimensions=3)
 
-        assert metadata_only.get_dimensions().size == 4
+        assert metadata_only.get_dimensions() == 4
         assert "config" not in asyncio.run(request_for(metadata_only))
         explicit_request = asyncio.run(request_for(explicit_override))
         assert explicit_request["config"]["output_dimensionality"] == 3
@@ -629,7 +626,7 @@ class TestChunking:
                 return {}
 
             def get_dimensions(self):
-                return EmbeddingDimensions(size=dim)
+                return dim
 
             def instantiate(self):
                 return FakeEmbedder()
@@ -672,7 +669,7 @@ class TestChunking:
                 return {}
 
             def get_dimensions(self):
-                return EmbeddingDimensions(size=dim)
+                return dim
 
             def instantiate(self):
                 return CountingEmbedder()
@@ -708,7 +705,7 @@ class TestChunking:
                 return {}
 
             def get_dimensions(self):
-                return EmbeddingDimensions(size=dim)
+                return dim
 
             def instantiate(self):
                 return SimpleEmbedder()
@@ -2287,12 +2284,7 @@ class TestWrapperRetry:
     def _make_embed_descriptor(self, embed_fn):
         """Create a minimal descriptor + embedder for testing."""
         desc = MagicMock(spec=[])
-        desc.get_dimensions = MagicMock(
-            return_value=MagicMock(
-                as_arrow_type=MagicMock(return_value=pa.list_(pa.float32(), 3)),
-                list_size=3,
-            )
-        )
+        desc.get_dimensions = MagicMock(return_value=3)
         embedder = MagicMock(spec=[])
         embedder.embed_text = embed_fn
         desc.instantiate = MagicMock(return_value=embedder)

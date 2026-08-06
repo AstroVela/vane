@@ -65,9 +65,9 @@ def test_google_embedding_metadata_and_retry_contract_without_optional_sdk(monke
 
     metadata_embedder = metadata_only.instantiate()
     explicit_embedder = explicit_override.instantiate()
-    assert metadata_only.get_dimensions().size == 4
+    assert metadata_only.get_dimensions() == 4
     assert metadata_embedder._dimensions is None
-    assert explicit_override.get_dimensions().size == 3
+    assert explicit_override.get_dimensions() == 3
     assert explicit_embedder._dimensions == 3
     assert [call["http_options"].retry_options.attempts for call in calls] == [1, 1]
 

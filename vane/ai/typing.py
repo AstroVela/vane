@@ -9,8 +9,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar
 
-import pyarrow as pa
-
 if TYPE_CHECKING:
     import numpy as np
 
@@ -64,17 +62,6 @@ class Descriptor(ABC, Generic[T]):
         of execution defaults.
         """
         return UDFOptions()
-
-
-@dataclass(frozen=True)
-class EmbeddingDimensions:
-    """Describes the shape and dtype of an embedding vector."""
-
-    size: int
-    dtype: pa.DataType = pa.float32()
-
-    def as_arrow_type(self) -> pa.DataType:
-        return pa.list_(self.dtype, self.size)
 
 
 @dataclass

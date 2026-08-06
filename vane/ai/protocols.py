@@ -19,7 +19,7 @@ from vane.ai.typing import Descriptor
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
-    from vane.ai.typing import Embedding, EmbeddingDimensions
+    from vane.ai.typing import Embedding
 
 
 # ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ class TextEmbedderDescriptor(Descriptor["TextEmbedder"]):
     """Serializable factory for a :class:`TextEmbedder`."""
 
     @abstractmethod
-    def get_dimensions(self) -> EmbeddingDimensions:
-        """Return the embedding dimensions produced by this embedder."""
+    def get_dimensions(self) -> int:
+        """Return the positive number of float32 values in each embedding."""
         ...
 
     def is_async(self) -> bool:
