@@ -554,7 +554,7 @@ std::pair<UnboundedSender<T>, UnboundedReceiver<T>> create_unbounded_channel() {
 // Types used as streams should provide:
 //   - std::pair<bool, value_type> poll_next()
 
-// 简化的流类型别名（对应 Rust 的 BoxStream）
+// Simplified stream alias corresponding to Rust's BoxStream
 template <typename T>
 class BoxStream {
 public:
@@ -631,7 +631,7 @@ private:
 	std::unique_ptr<StreamConcept> stream_;
 };
 
-// 工具函数：将流装箱（对应 .boxed() 方法）
+// Box a stream, corresponding to Rust's .boxed() method
 template <typename T, typename StreamType>
 std::unique_ptr<BoxStream<T>> boxed(StreamType &&stream) {
 	return std::unique_ptr<BoxStream<T>>(new BoxStream<T>(std::forward<StreamType>(stream)));

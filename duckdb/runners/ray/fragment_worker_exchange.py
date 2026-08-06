@@ -5,10 +5,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from duckdb.runners.fte import FteSplit
 from duckdb.runners.ray.fragment_registry import (
     _FTE_REGISTRY_LOCK,
 )
-from duckdb.runners.fte import FteSplit
 from duckdb.runners.ray.fte_fragment_scheduler import (
     _apply_exchange_selector_snapshot,
     _exchange_source_split_key,

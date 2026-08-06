@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from duckdb.runners.fte.backends.ray.backend import (
     RayTaskResultHandleAdapter as RayTaskResultHandleAdapter,
+)
+from duckdb.runners.fte.backends.ray.backend import (
     RayWorkerHandleAdapter as RayWorkerHandleAdapter,
+)
+from duckdb.runners.fte.backends.ray.backend import (
     RayWorkerManagerBackend as RayWorkerManagerBackend,
 )
 

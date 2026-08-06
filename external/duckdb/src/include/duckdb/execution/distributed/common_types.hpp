@@ -666,7 +666,7 @@ private:
 	size_t distributed_worker_slots_;
 	size_t scan_task_backlog_;
 
-	// 环境变量名常量
+	// Environment variable names
 	static constexpr const char *ENV_VANE_SHUFFLE_ALGORITHM = "VANE_SHUFFLE_ALGORITHM";
 	static constexpr const char *ENV_VANE_MIN_CPU_PER_TASK = "VANE_MIN_CPU_PER_TASK";
 	static constexpr const char *ENV_SCAN_TASK_SIZE_GROUPING = "VANE_RAY_SCAN_TASK_SIZE_GROUPING";
@@ -679,7 +679,6 @@ private:
 	static constexpr const char *ENV_SCAN_TASK_MIN_PARTITION_NUM = "VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM";
 
 public:
-	// 默认构造函数
 	DuckDBExecutionConfig()
 	    : shuffle_algorithm_(""), min_cpu_per_task_(1), scan_task_size_grouping_enabled_(true),
 	      scan_task_min_bytes_(96ULL * 1024 * 1024), scan_task_max_bytes_(384ULL * 1024 * 1024),
@@ -687,11 +686,9 @@ public:
 	      distributed_worker_slots_(0), scan_task_backlog_(0) {
 	}
 
-	// 从环境变量创建配置
 	static DuckDBExecutionConfig from_env() {
 		DuckDBExecutionConfig cfg;
 
-		// 解析字符串环境变量
 		{
 			auto val = parse_string_from_env(ENV_VANE_SHUFFLE_ALGORITHM, true);
 			if (val.first) {
@@ -699,7 +696,6 @@ public:
 			}
 		}
 
-		// 解析整数环境变量
 		{
 			auto val = parse_int_from_env(ENV_VANE_MIN_CPU_PER_TASK);
 			if (val.first) {
@@ -760,7 +756,6 @@ public:
 		return cfg;
 	}
 
-	// Getter 方法
 	const std::string &shuffle_algorithm() const {
 		return shuffle_algorithm_;
 	}
@@ -802,7 +797,6 @@ public:
 	}
 
 private:
-	// 解析字符串环境变量
 	static std::pair<bool, std::string> parse_string_from_env(const char *env_name, bool trim_whitespace = false) {
 		const char *val = std::getenv(env_name);
 		if (val == nullptr) {
@@ -818,7 +812,6 @@ private:
 		return std::make_pair(true, result);
 	}
 
-	// 解析布尔值环境变量
 	static std::pair<bool, bool> parse_bool_from_env(const char *env_name) {
 		const char *val = std::getenv(env_name);
 		if (val == nullptr) {
@@ -837,7 +830,6 @@ private:
 		return std::make_pair(false, false);
 	}
 
-	// 解析整数环境变量
 	static std::pair<bool, int> parse_int_from_env(const char *env_name) {
 		const char *val = std::getenv(env_name);
 		if (val == nullptr) {

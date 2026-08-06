@@ -8,7 +8,9 @@ from typing import Any
 import pyarrow as pa
 
 from duckdb.execution._common import ensure_table as _ensure_table
-from duckdb.execution.udf_output_schema import empty_output_table_from_payload
+from duckdb.execution.udf_output_schema import (
+    empty_output_table_from_payload as empty_output_table_from_payload,
+)
 
 
 def ref_bundle_slice_rows(slice_desc: Any, metadata: dict[str, Any] | None = None) -> int:

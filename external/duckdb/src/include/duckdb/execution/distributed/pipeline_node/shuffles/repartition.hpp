@@ -21,7 +21,6 @@ class ExchangeManager;
 namespace duckdb {
 namespace distributed {
 
-// 重分区节点类
 class RepartitionNode : public PipelineNodeImpl, public std::enable_shared_from_this<RepartitionNode> {
 private:
 	PipelineNodeConfig config_;
@@ -36,17 +35,14 @@ private:
 	static constexpr const char *NODE_NAME = "Repartition";
 
 public:
-	// 构造函数
 	static std::shared_ptr<RepartitionNode> create(NodeID node_id, const std::shared_ptr<PlanConfig> &plan_config,
 	                                               std::shared_ptr<::duckdb::RepartitionSpec> repartition_spec,
 	                                               size_t num_partitions, SchemaRef schema,
 	                                               std::shared_ptr<DistributedPipelineNode> child,
 	                                               std::shared_ptr<ExchangeManager> exchange_mgr = nullptr);
 
-	// 转换为分布式管道节点
 	std::shared_ptr<DistributedPipelineNode> into_node();
 
-	// PipelineNodeImpl 接口实现
 	const PipelineNodeContext &context() const override;
 
 	const PipelineNodeConfig &config() const override;
@@ -73,16 +69,13 @@ public:
 		                                              : std::vector<NodeID> {};
 	}
 
-	// 生成任务流（核心方法）
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 
-	// 节点ID获取方法
 	NodeID node_id() const override {
 		return context_.node_id();
 	}
 
 private:
-	// 私有构造函数
 	RepartitionNode(PipelineNodeConfig config, PipelineNodeContext context,
 	                std::shared_ptr<::duckdb::RepartitionSpec> repartition_spec, size_t num_partitions,
 	                std::shared_ptr<DistributedPipelineNode> child, std::shared_ptr<ExchangeManager> exchange_mgr);

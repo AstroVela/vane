@@ -58,7 +58,6 @@ std::vector<ExprRef> CopyRangeExpressions(const vector<BoundOrderByNode> &orders
 
 } // namespace
 
-// HashRepartitionConfig 实现
 HashRepartitionConfig::HashRepartitionConfig(size_t num_partitions, std::vector<ExprRef> by)
     : num_partitions(num_partitions), by(std::move(by)) {
 }
@@ -82,7 +81,6 @@ std::shared_ptr<HashRepartitionConfig> HashRepartitionConfig::create(size_t num_
 	return std::make_shared<HashRepartitionConfig>(num_partitions, std::move(by));
 }
 
-// RandomShuffleConfig 实现
 RandomShuffleConfig::RandomShuffleConfig(size_t num_partitions) : num_partitions(num_partitions) {
 }
 
@@ -94,7 +92,6 @@ std::shared_ptr<RandomShuffleConfig> RandomShuffleConfig::create(size_t num_part
 	return std::make_shared<RandomShuffleConfig>(num_partitions);
 }
 
-// RangeRepartitionConfig 实现
 RangeRepartitionConfig::RangeRepartitionConfig(size_t num_partitions, vector<BoundOrderByNode> orders,
                                                vector<string> boundaries)
     : num_partitions_(num_partitions), orders_(std::move(orders)), boundaries_(std::move(boundaries)) {
@@ -147,7 +144,6 @@ vector<BoundOrderByNode> RangeRepartitionConfig::CopyOrders() const {
 	return CopyRangeOrders(orders_);
 }
 
-// IntoPartitionsConfig 实现
 IntoPartitionsConfig::IntoPartitionsConfig(size_t num_partitions) : num_partitions(num_partitions) {
 }
 
@@ -159,7 +155,6 @@ std::shared_ptr<IntoPartitionsConfig> IntoPartitionsConfig::create(size_t num_pa
 	return std::make_shared<IntoPartitionsConfig>(num_partitions);
 }
 
-// RepartitionSpec 工厂方法
 std::shared_ptr<RepartitionSpec> RepartitionSpec::create_hash(size_t num_partitions, std::vector<ExprRef> by) {
 	auto config = HashRepartitionConfig::create(num_partitions, std::move(by));
 	return std::make_shared<HashRepartitionSpec>(config);
@@ -181,7 +176,6 @@ std::shared_ptr<RepartitionSpec> RepartitionSpec::create_range(size_t num_partit
 	return std::make_shared<RangeRepartitionSpec>(std::move(config));
 }
 
-// HashRepartitionSpec 实现
 HashRepartitionSpec::HashRepartitionSpec(std::shared_ptr<HashRepartitionConfig> config) : config_(std::move(config)) {
 }
 
@@ -195,10 +189,6 @@ ClusteringSpecRef HashRepartitionSpec::to_clustering_spec(size_t upstream_num_pa
 	return ClusteringSpec::from_hash_config(clustering_config);
 }
 
-// 其他 RepartitionSpec 派生类的实现类似...
-// 为简洁起见，这里省略详细实现
-
-// RandomRepartitionSpec 实现
 RandomRepartitionSpec::RandomRepartitionSpec(std::shared_ptr<RandomShuffleConfig> config) : config_(std::move(config)) {
 }
 
@@ -212,7 +202,6 @@ ClusteringSpecRef RandomRepartitionSpec::to_clustering_spec(size_t upstream_num_
 	return ClusteringSpec::from_random_config(cfg);
 }
 
-// IntoPartitionsRepartitionSpec 实现
 IntoPartitionsRepartitionSpec::IntoPartitionsRepartitionSpec(std::shared_ptr<IntoPartitionsConfig> config)
     : config_(std::move(config)) {
 }
@@ -226,7 +215,6 @@ ClusteringSpecRef IntoPartitionsRepartitionSpec::to_clustering_spec(size_t /*ups
 	return ClusteringSpec::from_unknown_config(cfg);
 }
 
-// RangeRepartitionSpec 实现
 RangeRepartitionSpec::RangeRepartitionSpec(std::shared_ptr<const RangeRepartitionConfig> config)
     : config_(std::move(config)) {
 	if (!config_) {
@@ -244,7 +232,6 @@ ClusteringSpecRef RangeRepartitionSpec::to_clustering_spec(size_t upstream_num_p
 	return ClusteringSpec::from_range_config(RangeClusteringConfig(actual, config_->CopyOrders()));
 }
 
-// RangeClusteringConfig 实现
 RangeClusteringConfig::RangeClusteringConfig(size_t num_partitions, vector<BoundOrderByNode> orders)
     : num_partitions_(num_partitions), orders_(std::move(orders)) {
 	ValidateRangeOrders(orders_);
@@ -285,12 +272,10 @@ std::vector<ExprRef> RangeClusteringConfig::partition_by() const {
 	return CopyRangeExpressions(orders_);
 }
 
-// HashClusteringConfig 实现
 HashClusteringConfig::HashClusteringConfig(size_t num_partitions, std::vector<ExprRef> by)
     : num_partitions(num_partitions), by(std::move(by)) {
 }
 
-// HashClusteringSpec 实现
 HashClusteringSpec::HashClusteringSpec(const HashClusteringConfig &config) : config_(config) {
 }
 
@@ -306,7 +291,6 @@ std::vector<std::string> HashClusteringSpec::multiline_display() const {
 	return config_.multiline_display();
 }
 
-// RandomClusteringSpec 实现
 RandomClusteringSpec::RandomClusteringSpec(const RandomClusteringConfig &config) : config_(config) {
 }
 
@@ -322,7 +306,6 @@ std::vector<std::string> RandomClusteringSpec::multiline_display() const {
 	return config_.multiline_display();
 }
 
-// UnknownClusteringSpec 实现
 UnknownClusteringSpec::UnknownClusteringSpec(const UnknownClusteringConfig &config) : config_(config) {
 }
 
@@ -353,7 +336,6 @@ std::vector<std::string> HashClusteringConfig::multiline_display() const {
 	return result;
 }
 
-// RandomClusteringConfig 实现
 RandomClusteringConfig::RandomClusteringConfig(size_t num_partitions) : num_partitions(num_partitions) {
 }
 
@@ -361,7 +343,6 @@ std::vector<std::string> RandomClusteringConfig::multiline_display() const {
 	return {"Num partitions = " + std::to_string(num_partitions)};
 }
 
-// UnknownClusteringConfig 实现
 UnknownClusteringConfig::UnknownClusteringConfig(size_t num_partitions) : num_partitions(num_partitions) {
 }
 
@@ -369,10 +350,6 @@ std::vector<std::string> UnknownClusteringConfig::multiline_display() const {
 	return {"Num partitions = " + std::to_string(num_partitions)};
 }
 
-// ClusteringSpec 静态工厂方法
-// The ClusteringSpec factory helpers are now implemented inline in repartition.hpp.
-
-// RangeClusteringSpec 实现
 RangeClusteringSpec::RangeClusteringSpec(RangeClusteringConfig config) : config_(std::move(config)) {
 }
 

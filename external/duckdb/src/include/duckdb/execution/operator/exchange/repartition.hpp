@@ -13,7 +13,6 @@
 
 namespace duckdb {
 
-// 前置声明
 class Expression;
 class ClusteringSpec;
 
@@ -33,14 +32,12 @@ class HashClusteringSpec;
 class RandomClusteringSpec;
 class UnknownClusteringSpec;
 
-// 基础配置类
 class BaseConfig {
 public:
 	virtual ~BaseConfig() = default;
 	virtual std::vector<std::string> multiline_display() const = 0;
 };
 
-// 哈希重新分区配置
 class HashRepartitionConfig : public BaseConfig {
 public:
 	size_t num_partitions; // 0 means auto
@@ -52,7 +49,6 @@ public:
 	static std::shared_ptr<HashRepartitionConfig> create(size_t num_partitions, std::vector<ExprRef> by);
 };
 
-// 随机洗牌配置
 class RandomShuffleConfig : public BaseConfig {
 public:
 	size_t num_partitions; // 0 means auto
@@ -63,7 +59,6 @@ public:
 	static std::shared_ptr<RandomShuffleConfig> create(size_t num_partitions);
 };
 
-// 范围重新分区配置
 class RangeRepartitionConfig : public BaseConfig {
 public:
 	RangeRepartitionConfig(size_t num_partitions, vector<BoundOrderByNode> orders, vector<string> boundaries);
@@ -92,7 +87,6 @@ private:
 	vector<string> boundaries_;
 };
 
-// 分区数配置
 class IntoPartitionsConfig : public BaseConfig {
 public:
 	size_t num_partitions;
@@ -103,7 +97,6 @@ public:
 	static std::shared_ptr<IntoPartitionsConfig> create(size_t num_partitions);
 };
 
-// 重新分区规范枚举的类层次结构
 class RepartitionSpec {
 public:
 	enum class Type { Hash, Random, IntoPartitions, Range };
@@ -115,7 +108,6 @@ public:
 	virtual std::vector<std::string> multiline_display() const = 0;
 	virtual ClusteringSpecRef to_clustering_spec(size_t upstream_num_partitions) const = 0;
 
-	// 静态工厂方法
 	static std::shared_ptr<RepartitionSpec> create_hash(size_t num_partitions, std::vector<ExprRef> by);
 	static std::shared_ptr<RepartitionSpec> create_random(size_t num_partitions);
 	static std::shared_ptr<RepartitionSpec> create_into_partitions(size_t num_partitions);
@@ -123,7 +115,6 @@ public:
 	                                                     vector<string> boundaries);
 };
 
-// 聚类规范（ClusteringSpec）基础类
 class ClusteringSpec {
 public:
 	enum class Type { Range, Hash, Random, Unknown };
@@ -156,7 +147,6 @@ class HashClusteringConfig;
 class RandomClusteringConfig;
 class UnknownClusteringConfig;
 
-// 具体的重新分区规范实现
 class HashRepartitionSpec : public RepartitionSpec {
 private:
 	std::shared_ptr<HashRepartitionConfig> config_;
@@ -288,7 +278,6 @@ public:
 	std::vector<std::string> multiline_display() const override;
 };
 
-// 具体的聚类规范实现
 class RangeClusteringSpec : public ClusteringSpec {
 private:
 	RangeClusteringConfig config_;
