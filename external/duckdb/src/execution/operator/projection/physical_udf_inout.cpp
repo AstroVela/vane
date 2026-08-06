@@ -441,15 +441,6 @@ static bool UDFRequiresRowPreservingOutput(const UDFOperatorState &state) {
 	return true;
 }
 
-static void ReleaseUDFOutputLease(std::function<void()> &callback) {
-	if (!callback) {
-		return;
-	}
-	auto release = std::move(callback);
-	callback = nullptr;
-	release();
-}
-
 static void EnsureExecutor(ExecutionContext &context, UDFOperatorState &state);
 static void PreserveFlatMapLazyOutputShape(UDFOperatorState &state, LazyRefDataChunk &bundle);
 static void PreserveScalarMapLazyOutputShape(UDFOperatorState &state, LazyRefDataChunk &bundle);
@@ -1075,8 +1066,7 @@ struct StreamingReadyOutput {
 	ExecutionBatch batch;
 	idx_t bytes = 0;
 	idx_t submit_id = 0;
-	std::function<void()> handoff_output_lease;
-	std::function<void()> release_output_lease;
+	UDFOutputLease output_lease;
 	bool lease_handed_off = false;
 };
 
@@ -1707,9 +1697,8 @@ static void RefreshStreamingOutputCapacitySnapshotLocked(StreamingUDFState &stat
 
 struct StreamingOutputHandoffLease {
 	StreamingOutputHandoffLease(shared_ptr<StreamingHandoffCounters> counters_p, idx_t rows_p, idx_t bytes_p,
-	                            std::function<void()> release_output_lease_p)
-	    : counters(std::move(counters_p)), rows(rows_p), bytes(bytes_p),
-	      release_output_lease(std::move(release_output_lease_p)) {
+	                            UDFOutputLease output_lease_p)
+	    : counters(std::move(counters_p)), rows(rows_p), bytes(bytes_p), output_lease(std::move(output_lease_p)) {
 		auto current_outputs = counters->outputs.fetch_add(1, std::memory_order_relaxed) + 1;
 		auto current_rows = counters->rows.fetch_add(rows, std::memory_order_relaxed) + rows;
 		auto current_bytes = counters->bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
@@ -1723,7 +1712,7 @@ struct StreamingOutputHandoffLease {
 		// the dispatcher. This destructor can run under an unrelated downstream
 		// operator lock, so handoff metrics are deliberately lock-free.
 		try {
-			ReleaseUDFOutputLease(release_output_lease);
+			output_lease.Release();
 		} catch (...) {
 		}
 		counters->outputs.fetch_sub(1, std::memory_order_relaxed);
@@ -1734,7 +1723,7 @@ struct StreamingOutputHandoffLease {
 	shared_ptr<StreamingHandoffCounters> counters;
 	idx_t rows;
 	idx_t bytes;
-	std::function<void()> release_output_lease;
+	UDFOutputLease output_lease;
 };
 
 static void StartStreamingOutputHandoffLocked(StreamingUDFState &state, StreamingReadyOutput &ready,
@@ -1748,14 +1737,10 @@ static void StartStreamingOutputHandoffLocked(StreamingUDFState &state, Streamin
 	// release callback is moved into the descriptor token below and continues
 	// to own/account the physical ObjectRef until the final downstream copy is
 	// destroyed.
-	if (ready.handoff_output_lease) {
-		auto handoff = std::move(ready.handoff_output_lease);
-		ready.handoff_output_lease = nullptr;
-		handoff();
-	}
+	ready.output_lease.Handoff();
 	const auto rows = UDFExecutionBatchSize(ready.batch);
 	auto token = make_shared_ptr<StreamingOutputHandoffLease>(state.handoff_counters, rows, ready.bytes,
-	                                                          std::move(ready.release_output_lease));
+	                                                          std::move(ready.output_lease));
 	for (auto &block : ready.batch.lazy->blocks) {
 		block.ownership_tokens.push_back(token);
 	}
@@ -1828,12 +1813,12 @@ static void ReleaseQueuedStreamingOutputsLocked(StreamingUDFState &state, unique
 	while (!state.ready_outputs.empty()) {
 		auto ready = std::move(state.ready_outputs.front());
 		state.ready_outputs.pop_front();
-		ReleaseUDFOutputLease(ready.release_output_lease);
+		ready.output_lease.Release();
 	}
 	while (!state.deferred_outputs.empty()) {
 		auto ready = std::move(state.deferred_outputs.front());
 		state.deferred_outputs.pop_front();
-		ReleaseUDFOutputLease(ready.release_output_lease);
+		ready.output_lease.Release();
 	}
 	state.ready_rows = 0;
 	state.ready_bytes = 0;
@@ -1850,7 +1835,7 @@ static void ReleaseQueuedStreamingEvents(StreamingUDFState &state) {
 		state.queued_output_events.store(0, std::memory_order_relaxed);
 	}
 	for (auto &event : events) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 	}
 }
 
@@ -2207,20 +2192,20 @@ static void FlushDeferredStreamingOutputsLocked(StreamingUDFState &state, unique
 }
 
 static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputEvent &&event, unique_lock<mutex> &guard,
-                                            std::function<void()> &release_after_enqueue) {
+                                            UDFOutputLease &release_after_enqueue) {
 	state.VerifyLock(guard);
 	if (event.kind != UDFOutputEventKind::DATA) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 		SetStreamingErrorLocked(state, guard, "streaming UDF internal error: non-DATA event in data enqueue");
 		return false;
 	}
 	if (!event.ref_outputs) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 		SetStreamingErrorLocked(state, guard, "streaming UDF DATA event received null lazy/ref-bundle output");
 		return false;
 	}
 	if (state.has_error || state.source_finished) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 		return false;
 	}
 
@@ -2234,7 +2219,7 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 	const auto lazy_bytes = event.ref_outputs->EstimatedBytes();
 	auto entry = state.inflight_batches.find(event.submit_id);
 	if (entry == state.inflight_batches.end()) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 		SetStreamingErrorLocked(state, guard,
 		                        StringUtil::Format("streaming UDF DATA event received unknown submit_id %llu",
 		                                           static_cast<unsigned long long>(event.submit_id)));
@@ -2243,7 +2228,7 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 	auto &inflight_ref = entry->second;
 	const bool row_preserving_output = UDFRequiresRowPreservingOutput(*state.op);
 	if (row_preserving_output && inflight_ref.emitted_rows + lazy_rows > inflight_ref.total_rows) {
-		ReleaseUDFOutputLease(event.release_output_lease);
+		event.output_lease.Release();
 		SetStreamingErrorLocked(
 		    state, guard,
 		    StringUtil::Format("streaming UDF partial lazy output rows (%d) exceed input rows (%d) for "
@@ -2257,7 +2242,6 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 	if (lazy_rows > 0) {
 		AtomicAddStreamingCounter(state.produced_output_rows, lazy_rows);
 		AtomicAddStreamingCounter(state.produced_output_bytes, lazy_bytes);
-		auto release_output_lease = std::move(event.release_output_lease);
 		StreamingReadyOutput ready;
 		ready.batch.kind = ExecutionBatchKind::LAZY_DATA_CHUNK;
 		ready.batch.rows = lazy_rows;
@@ -2265,8 +2249,7 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 		ready.batch.lazy = std::move(event.ref_outputs);
 		ready.bytes = lazy_bytes;
 		ready.submit_id = event.submit_id;
-		ready.handoff_output_lease = std::move(event.handoff_output_lease);
-		ready.release_output_lease = std::move(release_output_lease);
+		ready.output_lease = std::move(event.output_lease);
 		FlushDeferredStreamingOutputsLocked(state, guard);
 		if (StreamingReadyFull(state) || !state.deferred_outputs.empty()) {
 			state.deferred_outputs.push_back(std::move(ready));
@@ -2278,7 +2261,7 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 			PushStreamingReadyOutputLocked(state, std::move(ready), guard);
 		}
 	} else {
-		release_after_enqueue = std::move(event.release_output_lease);
+		release_after_enqueue = std::move(event.output_lease);
 	}
 	StreamingUDFDebugState(state, "accept_data");
 	if (StreamingTerminalReady(state)) {
@@ -2569,7 +2552,7 @@ TakeStreamingMaterializedEnvelope(ExecutionContext &context, StreamingUDFState &
 }
 
 static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent &&event, unique_lock<mutex> &guard,
-                                       std::function<void()> &release_after_enqueue) {
+                                       UDFOutputLease &release_after_enqueue) {
 	state.VerifyLock(guard);
 	state.result_callbacks.fetch_add(1);
 	if (event.kind == UDFOutputEventKind::ERROR) {
@@ -2632,11 +2615,11 @@ static bool AcceptStreamingEventLocked(StreamingUDFState &state, UDFOutputEvent 
 
 static void AcceptStreamingEvent(StreamingUDFState &state, UDFOutputEvent &&event) {
 	auto guard = state.Lock();
-	std::function<void()> release_after_enqueue;
+	UDFOutputLease release_after_enqueue;
 	AcceptStreamingEventLocked(state, std::move(event), guard, release_after_enqueue);
 	RefreshStreamingOutputCapacitySnapshotLocked(state, guard);
 	guard.unlock();
-	ReleaseUDFOutputLease(release_after_enqueue);
+	release_after_enqueue.Release();
 }
 
 static bool DrainStreamingOutputEventsLocked(StreamingUDFState &state, unique_lock<mutex> &guard) {
@@ -2654,13 +2637,13 @@ static bool DrainStreamingOutputEventsLocked(StreamingUDFState &state, unique_lo
 			auto queued = state.queued_output_events.load(std::memory_order_relaxed);
 			state.queued_output_events.store(queued > 0 ? queued - 1 : 0, std::memory_order_relaxed);
 		}
-		std::function<void()> release_after_enqueue;
+		UDFOutputLease release_after_enqueue;
 		AcceptStreamingEventLocked(state, std::move(event), guard, release_after_enqueue);
 		RefreshStreamingOutputCapacitySnapshotLocked(state, guard);
 		did_work = true;
 		if (release_after_enqueue) {
 			guard.unlock();
-			ReleaseUDFOutputLease(release_after_enqueue);
+			release_after_enqueue.Release();
 			guard.lock();
 		}
 		if (state.has_error) {

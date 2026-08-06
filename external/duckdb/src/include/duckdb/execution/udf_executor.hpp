@@ -19,6 +19,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include <functional>
+#include <utility>
 
 namespace duckdb {
 class InterruptState;
@@ -35,6 +36,63 @@ using RefBundleBundler = LazyDataChunkBundler;
 
 enum class UDFOutputEventKind { DATA, COMPLETE, ERROR, FINISHED };
 
+class UDFOutputLease {
+public:
+	UDFOutputLease() = default;
+	UDFOutputLease(std::function<void()> handoff, std::function<void()> release)
+	    : handoff_(std::move(handoff)), release_(std::move(release)) {
+	}
+	UDFOutputLease(const UDFOutputLease &) = delete;
+	UDFOutputLease &operator=(const UDFOutputLease &) = delete;
+	UDFOutputLease(UDFOutputLease &&other) noexcept
+	    : handoff_(std::exchange(other.handoff_, {})), release_(std::exchange(other.release_, {})) {
+	}
+	UDFOutputLease &operator=(UDFOutputLease &&other) noexcept {
+		if (this == &other) {
+			return *this;
+		}
+		ReleaseNoThrow();
+		handoff_ = std::exchange(other.handoff_, {});
+		release_ = std::exchange(other.release_, {});
+		return *this;
+	}
+	~UDFOutputLease() {
+		ReleaseNoThrow();
+	}
+
+	explicit operator bool() const {
+		return static_cast<bool>(release_);
+	}
+
+	void Handoff() {
+		if (!handoff_) {
+			return;
+		}
+		auto handoff = std::exchange(handoff_, {});
+		handoff();
+	}
+
+	void Release() {
+		handoff_ = {};
+		if (!release_) {
+			return;
+		}
+		auto release = std::exchange(release_, {});
+		release();
+	}
+
+private:
+	void ReleaseNoThrow() noexcept {
+		try {
+			Release();
+		} catch (...) {
+		}
+	}
+
+	std::function<void()> handoff_;
+	std::function<void()> release_;
+};
+
 struct UDFOutputEvent {
 	UDFOutputEventKind kind = UDFOutputEventKind::DATA;
 	idx_t submit_id = 0;
@@ -45,8 +103,7 @@ struct UDFOutputEvent {
 
 	bool submit_complete = true;
 	string error;
-	std::function<void()> handoff_output_lease;
-	std::function<void()> release_output_lease;
+	UDFOutputLease output_lease;
 };
 
 struct UDFOutputConsumer {
