@@ -1801,7 +1801,7 @@ def test_declared_generator_window_seeds_admission_before_the_first_output():
     }
 
 
-def test_completed_zero_output_task_releases_the_cold_start_estimate():
+def test_completed_zero_output_task_keeps_cold_start_estimate_until_positive_output():
     unit = _unit(
         "resource:f:filter",
         resources=_r(cpu=1, heap=10),
@@ -1823,10 +1823,35 @@ def test_completed_zero_output_task_releases_the_cold_start_estimate():
 
     snapshot = manager.snapshot()
     assert snapshot["units"][unit.resource_unit_id]["num_tasks_finished"] == 1
-    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 0
+    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 100
     second = manager.try_acquire_task(_task(unit.resource_unit_id, 1))
     assert second.granted and not second.liveness
-    assert manager.snapshot()["usage"]["object_store_bytes"] == 0
+    assert manager.snapshot()["usage"]["object_store_bytes"] == 100
+
+    output = manager.try_acquire_output_block(
+        OutputBlockRequest(
+            "q",
+            unit.resource_unit_id,
+            second.lease.lease_id,
+            second.lease.attempt_id,
+            "positive-output",
+            10,
+        )
+    )
+    assert output.granted
+    snapshot = manager.snapshot()
+    assert snapshot["usage"]["object_store_bytes"] == 30
+    assert snapshot["units"][unit.resource_unit_id]["pending_output_estimate_per_active_task_bytes"] == 20
+
+    assert manager.release_output_block(output.lease.lease_id)
+    assert manager.release_task_lease(
+        second.lease.lease_id,
+        attempt_id=second.lease.attempt_id,
+    )
+    learned = manager.snapshot()["units"][unit.resource_unit_id]
+    assert learned["num_tasks_finished"] == 2
+    assert learned["average_output_blocks_per_finished_task"] == pytest.approx(0.5)
+    assert learned["pending_output_estimate_per_active_task_bytes"] == 5
 
 
 def test_ineligible_output_usage_reduces_current_phase_reservations():

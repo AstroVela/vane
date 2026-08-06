@@ -1296,16 +1296,15 @@ class RayQueryResourceManager:
             return int(spec.output_window_bytes)
         state = self._units[spec.resource_unit_id]
         if state.num_task_outputs_generated <= 0:
-            if state.num_tasks_finished > 0:
-                return 0
             # Before the first real block arrives, charge the declared generator
             # window instead of treating every running task as output-free.  A
-            # zero seed can admit a full CPU wave and then create query-wide
-            # object-store debt when the first observation retroactively teaches
-            # the manager the real per-task pending-output size.
+            # zero-output partition is not evidence that later data-dependent
+            # partitions are also empty.  Dropping the seed after such a task can
+            # admit a full CPU wave and then create query-wide object-store debt
+            # when a later partition emits the first real block.
             return int(spec.output_window_bytes)
         pending_blocks = float(spec.generator_buffer_blocks)
-        if state.num_tasks_finished > 0:
+        if state.num_outputs_of_finished_tasks > 0:
             pending_blocks = min(
                 pending_blocks,
                 state.num_outputs_of_finished_tasks / state.num_tasks_finished,
