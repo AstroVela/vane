@@ -21,13 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from vane.datasource import read_datasource
 from vane.datasource.video_reader import VideoFrameSource
-
-import vane
 from video_kernels import (
     crop_bbox_to_png,
     frames_to_torch_tensor,
     yolo_result_to_features,
 )
+
+import vane
 
 INPUT_PATH = Path(
     os.environ.get(
@@ -38,6 +38,8 @@ INPUT_PATH = Path(
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_PATH", f"/tmp/vane_video_{uuid.uuid4().hex}")).expanduser()
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "32"))
 NUM_GPU_NODES = int(os.environ.get("NUM_GPU_NODES", "1"))
+PARQUET_ROW_GROUP_SIZE = int(os.environ.get("PARQUET_ROW_GROUP_SIZE", "122880"))
+PARQUET_ROW_GROUP_SIZE_BYTES = os.environ.get("PARQUET_ROW_GROUP_SIZE_BYTES", "256MB").strip()
 
 FRAME_HEIGHT = 640
 FRAME_WIDTH = 640
@@ -56,8 +58,10 @@ FRAME_TYPE = vane.tensor_type(vane.sqltypes.UTINYINT, (FRAME_HEIGHT, FRAME_WIDTH
 FEATURE_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])")
 FEATURE_LIST_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])[]")
 
-if BATCH_SIZE <= 0 or NUM_GPU_NODES <= 0:
-    raise ValueError("BATCH_SIZE and NUM_GPU_NODES must be positive")
+if min(BATCH_SIZE, NUM_GPU_NODES, PARQUET_ROW_GROUP_SIZE) <= 0:
+    raise ValueError("BATCH_SIZE, NUM_GPU_NODES, and PARQUET_ROW_GROUP_SIZE must be positive")
+if not PARQUET_ROW_GROUP_SIZE_BYTES:
+    raise ValueError("PARQUET_ROW_GROUP_SIZE_BYTES must be non-empty")
 
 
 def _video_files(path: Path) -> list[str]:
@@ -146,6 +150,8 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     con = vane.connect()
     try:
+        con.execute("SET preserve_insertion_order=false")
+        print(f"Parquet row groups: rows={PARQUET_ROW_GROUP_SIZE}, bytes={PARQUET_ROW_GROUP_SIZE_BYTES}")
         rel = read_datasource(
             VideoFrameSource(
                 _video_files(INPUT_PATH),
@@ -173,7 +179,12 @@ def main() -> None:
                 "object": vane.sqltypes.BLOB,
             },
         )
-        rel.write_parquet(str(OUTPUT_DIR), per_thread_output=True)
+        rel.write_parquet(
+            str(OUTPUT_DIR),
+            per_thread_output=True,
+            row_group_size=PARQUET_ROW_GROUP_SIZE,
+            row_group_size_bytes=PARQUET_ROW_GROUP_SIZE_BYTES,
+        )
     finally:
         con.close()
 
