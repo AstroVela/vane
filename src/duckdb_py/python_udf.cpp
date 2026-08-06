@@ -177,20 +177,20 @@ static void VerifyVectorizedNullHandling(Vector &result, idx_t count) {
 	throw InvalidInputException(NullHandlingError());
 }
 
-static bool MayBeAwaitable(const py::object &result) {
+static bool MayBeAsynchronousResult(const py::object &result) {
 	if (!result) {
 		return false;
 	}
 	auto object = result.ptr();
-	if (PyCoro_CheckExact(object) || PyGen_Check(object)) {
+	if (PyCoro_CheckExact(object) || PyGen_Check(object) || PyAsyncGen_CheckExact(object)) {
 		return true;
 	}
 	auto async_methods = Py_TYPE(object)->tp_as_async;
-	return async_methods && async_methods->am_await;
+	return async_methods && (async_methods->am_await || async_methods->am_aiter || async_methods->am_anext);
 }
 
 static void EnsureSynchronousUDFResult(const py::object &result) {
-	if (!MayBeAwaitable(result)) {
+	if (!MayBeAsynchronousResult(result)) {
 		return;
 	}
 	py::module_::import("duckdb.execution._udf_validation").attr("ensure_synchronous_udf_result")(result);

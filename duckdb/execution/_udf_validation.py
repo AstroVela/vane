@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
+from collections.abc import AsyncIterable
 from typing import Any
 
 _ASYNC_CALLABLE_ERROR = (
-    "generic UDF callables must be synchronous; async functions and async __call__ methods are not supported"
+    "generic UDF callables must be synchronous; async functions, constructors, and __call__ methods are not supported"
 )
-_AWAITABLE_RESULT_ERROR = "generic UDF callables must return values synchronously; received an awaitable result"
+_ASYNC_RESULT_ERROR = (
+    "generic UDF callables must return values synchronously; received an awaitable or async iterable result"
+)
 
 
 def _is_async_function(value: Any) -> bool:
@@ -19,29 +23,57 @@ def _is_async_function(value: Any) -> bool:
     return (
         inspect.iscoroutinefunction(value)
         or inspect.isasyncgenfunction(value)
+        or _is_generator_coroutine_function(value)
         or inspect.iscoroutinefunction(unwrapped)
         or inspect.isasyncgenfunction(unwrapped)
+        or _is_generator_coroutine_function(unwrapped)
     )
 
 
+def _is_generator_coroutine_function(value: Any) -> bool:
+    code = getattr(value, "__code__", None)
+    flags = getattr(code, "co_flags", 0)
+    return isinstance(flags, int) and bool(flags & inspect.CO_ITERABLE_COROUTINE)
+
+
+def _unwrap_method_descriptor(value: Any) -> Any:
+    if isinstance(value, (classmethod, staticmethod)):
+        return value.__func__
+    return value
+
+
 def is_async_udf_callable(value: Any) -> bool:
-    """Return whether calling *value* uses an async function body."""
-    if _is_async_function(value):
-        return True
+    """Return whether invoking *value* enters a declared async call protocol."""
+    seen: set[int] = set()
 
-    if inspect.isclass(value):
-        call = inspect.getattr_static(value, "__call__")
-        if isinstance(call, (classmethod, staticmethod)):
-            call = call.__func__
-        return _is_async_function(call)
+    def visit(candidate: Any) -> bool:
+        identity = id(candidate)
+        if identity in seen:
+            return False
+        seen.add(identity)
 
-    if not (inspect.isfunction(value) or inspect.ismethod(value)) and callable(value):
-        call = inspect.getattr_static(type(value), "__call__")
-        if isinstance(call, (classmethod, staticmethod)):
-            call = call.__func__
-        return _is_async_function(call)
+        if isinstance(candidate, (functools.partial, functools.partialmethod)):
+            return visit(_unwrap_method_descriptor(candidate.func))
 
-    return False
+        if _is_async_function(candidate):
+            return True
+
+        if inspect.isclass(candidate):
+            class_callables = (
+                inspect.getattr_static(candidate, "__call__"),
+                inspect.getattr_static(type(candidate), "__call__"),
+                inspect.getattr_static(candidate, "__new__"),
+                inspect.getattr_static(candidate, "__init__"),
+            )
+            return any(visit(_unwrap_method_descriptor(item)) for item in class_callables)
+
+        if not (inspect.isfunction(candidate) or inspect.ismethod(candidate)) and callable(candidate):
+            call = inspect.getattr_static(type(candidate), "__call__")
+            return visit(_unwrap_method_descriptor(call))
+
+        return False
+
+    return visit(value)
 
 
 def validate_synchronous_udf_callable(value: Any) -> None:
@@ -51,12 +83,13 @@ def validate_synchronous_udf_callable(value: Any) -> None:
 
 
 def ensure_synchronous_udf_result(result: Any) -> Any:
-    """Reject and close coroutine results returned by nominally sync UDFs."""
-    if not inspect.isawaitable(result):
+    """Reject results that require an asynchronous execution protocol."""
+    is_awaitable = inspect.isawaitable(result)
+    if not is_awaitable and not isinstance(result, AsyncIterable):
         return result
-    if inspect.iscoroutine(result):
+    if is_awaitable and (inspect.iscoroutine(result) or inspect.isgenerator(result)):
         result.close()
-    raise TypeError(_AWAITABLE_RESULT_ERROR)
+    raise TypeError(_ASYNC_RESULT_ERROR)
 
 
 __all__ = [

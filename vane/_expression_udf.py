@@ -656,7 +656,7 @@ def _build_row_actor_class(
 
     class _VaneRowActorAdapter:
         def __init__(self) -> None:
-            self._instance = user_class(*init_args, **captured_init_kwargs)
+            self._instance = ensure_synchronous_udf_result(user_class(*init_args, **captured_init_kwargs))
 
         def __call__(self, table: Any) -> Any:
             columns = [table.column(name).to_pylist() for name in captured_input_names]
@@ -693,7 +693,7 @@ def _build_batch_actor_class(
 
     class _VaneBatchActorAdapter:
         def __init__(self) -> None:
-            self._instance = user_class(*init_args, **captured_init_kwargs)
+            self._instance = ensure_synchronous_udf_result(user_class(*init_args, **captured_init_kwargs))
 
         def __call__(self, table: Any) -> Any:
             columns = [_arrow_batch_column(table, name) for name in captured_input_names]
@@ -990,7 +990,7 @@ class VaneClassInstance:
 
     def _instance(self) -> Any:
         if self._eager_instance is None:
-            self._eager_instance = self.user_class(*self._init_args, **self._init_kwargs)
+            self._eager_instance = ensure_synchronous_udf_result(self.user_class(*self._init_args, **self._init_kwargs))
         return self._eager_instance
 
     def input_names_for_expression(self, arg_count: int, call_kwargs: Mapping[str, Any]) -> list[str]:
@@ -1162,7 +1162,7 @@ class VaneClassBatchInstance:
 
     def _instance(self) -> Any:
         if self._eager_instance is None:
-            self._eager_instance = self.user_class(*self._init_args, **self._init_kwargs)
+            self._eager_instance = ensure_synchronous_udf_result(self.user_class(*self._init_args, **self._init_kwargs))
         return self._eager_instance
 
     def actor_class(self, layout: _BatchCallLayout) -> type:

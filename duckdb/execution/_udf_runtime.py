@@ -86,7 +86,7 @@ def _load_runtime_callable(
             "callable class UDF constructors must be zero-argument; "
             "use environment variables or class-level defaults when configuration is required"
         )
-    return udf()
+    return ensure_synchronous_udf_result(udf())
 
 
 def _has_required_constructor_args(cls: type) -> bool:
@@ -243,6 +243,7 @@ def _effective_output_batch_size(payload: dict[str, Any]) -> int | None:
 
 def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
     """Iterate over output batches from a stream UDF result."""
+    result = ensure_synchronous_udf_result(result)
     if result is None:
         return
 
@@ -747,6 +748,7 @@ class UDFExecutor:
                     yield from append_output_row(result)
                 else:
                     for out_row in result:
+                        out_row = ensure_synchronous_udf_result(out_row)
                         if out_row is None:
                             continue
                         yield from append_output_row(out_row)
