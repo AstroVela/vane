@@ -124,15 +124,34 @@ def test_vane_function_immediate_call_without_expression():
     assert add_one(41) == 42
 
 
-def test_vane_function_rejects_missing_qualified_name_without_fallback():
+@pytest.mark.parametrize("name", [None, "callable_object"])
+def test_vane_function_rejects_callable_classes_and_instances_at_decoration(name):
     import vane
 
     class CallableObject:
         def __call__(self, value):
             return value
 
+    for target in (CallableObject, CallableObject()):
+        with pytest.raises(TypeError, match=r"vane\.func requires a Python function or bound method"):
+            vane.func(target, return_dtype="INTEGER", name=name)
+
+
+def test_vane_function_explicit_name_does_not_evaluate_default_qualified_name():
+    import vane
+
+    def identity(value):
+        return value
+
+    identity.__qualname__ = ""
+
     with pytest.raises(vane.InvalidInputException, match="must expose a non-empty __qualname__"):
-        vane.func(return_dtype="INTEGER")(CallableObject())
+        vane.func(identity, return_dtype="INTEGER")
+
+    decorated = vane.func(identity, return_dtype="INTEGER", name="identity")
+
+    assert decorated.sql_name == "identity"
+    assert decorated(1) == 1
 
 
 def test_vane_function_rejects_empty_explicit_name_without_defaulting():

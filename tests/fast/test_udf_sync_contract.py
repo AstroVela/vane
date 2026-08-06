@@ -17,10 +17,11 @@ import pytest
 import duckdb
 import vane
 from duckdb.execution._udf_runtime import UDFExecutor
-from duckdb.execution._udf_validation import ensure_synchronous_udf_result
+from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
 _ASYNC_CALLABLE_ERROR = "generic UDF callables must be synchronous"
 _AWAITABLE_RESULT_ERROR = "generic UDF callables must return values synchronously"
+_FUNCTION_SHAPE_ERROR = r"vane\.func requires a Python function or bound method"
 
 
 async def _async_value(value):
@@ -103,7 +104,6 @@ class _SyncReturnsAwaitable:
 
 class _SyncCallableWithShadowedAsyncCall:
     def __init__(self):
-        self.__qualname__ = type(self).__qualname__
         self.__call__ = _async_value
 
     def __call__(self, value):
@@ -148,23 +148,31 @@ def test_vane_decorators_reject_async_callables():
     with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
         vane.cls.batch(actor_number=1, return_dtype=pa.int32())(_AsyncCallable)
 
-    with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-        vane.func(_AsyncCallable(), return_dtype="INTEGER")
-
 
 @pytest.mark.parametrize(
     "target",
     [
         pytest.param(_async_values, id="async-generator"),
         pytest.param(_wrapped_async_value, id="wrapped-async"),
-        pytest.param(functools.partial(_async_value, 1), id="partial-async"),
-        pytest.param(functools.partial(_AsyncCallable()), id="partial-async-callable-instance"),
         pytest.param(_generator_coroutine, id="generator-coroutine"),
     ],
 )
-def test_vane_func_rejects_indirect_async_callables(target):
+def test_vane_func_rejects_indirect_async_functions(target):
     with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
         vane.func(target, return_dtype="INTEGER")
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param(_AsyncCallable(), id="async-callable-instance"),
+        pytest.param(functools.partial(_async_value, 1), id="partial-async"),
+        pytest.param(functools.partial(_AsyncCallable()), id="partial-async-callable-instance"),
+    ],
+)
+def test_vane_func_rejects_non_function_async_callables_by_shape(target):
+    with pytest.raises(TypeError, match=_FUNCTION_SHAPE_ERROR):
+        vane.func(target, return_dtype="INTEGER", name="invalid_callable")
 
 
 @pytest.mark.parametrize(
@@ -182,10 +190,12 @@ def test_vane_class_rejects_async_construction_and_call_descriptors(target):
         vane.cls(target, actor_number=1, return_dtype="INTEGER")
 
 
-def test_vane_func_validates_the_effective_callable_object_call_method():
-    fn = vane.func(_SyncCallableWithShadowedAsyncCall(), return_dtype="INTEGER", name="sync_callable")
+def test_sync_validator_uses_the_effective_type_call_method():
+    target = _SyncCallableWithShadowedAsyncCall()
 
-    assert fn(1) == 1
+    validate_synchronous_udf_callable(target)
+
+    assert target(1) == 1
 
 
 @pytest.mark.parametrize("method", ["map", "map_batches", "flat_map"])
