@@ -177,6 +177,25 @@ static void VerifyVectorizedNullHandling(Vector &result, idx_t count) {
 	throw InvalidInputException(NullHandlingError());
 }
 
+static bool MayBeAsynchronousResult(const py::object &result) {
+	if (!result) {
+		return false;
+	}
+	auto object = result.ptr();
+	if (PyCoro_CheckExact(object) || PyGen_Check(object) || PyAsyncGen_CheckExact(object)) {
+		return true;
+	}
+	auto async_methods = Py_TYPE(object)->tp_as_async;
+	return async_methods && (async_methods->am_await || async_methods->am_aiter || async_methods->am_anext);
+}
+
+static void EnsureSynchronousUDFResult(const py::object &result) {
+	if (!MayBeAsynchronousResult(result)) {
+		return;
+	}
+	py::module_::import("duckdb.execution._udf_validation").attr("ensure_synchronous_udf_result")(result);
+}
+
 static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExceptionHandling exception_handling,
                                                   FunctionNullHandling null_handling) {
 	// Through the capture of the lambda, we have access to the function pointer
@@ -248,6 +267,7 @@ static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExce
 		} else {
 			python_object = py::reinterpret_steal<py::object>(ret);
 		}
+		EnsureSynchronousUDFResult(python_object);
 		if (!py::isinstance(python_object, py::module_::import("pyarrow").attr("lib").attr("Table"))) {
 			// Try to convert into a table
 			py::list single_array(1);
@@ -361,6 +381,7 @@ static scalar_function_t CreateNativeFunction(PyObject *function, PythonExceptio
 					throw InvalidInputException(NullHandlingError());
 				}
 			}
+			EnsureSynchronousUDFResult(ret);
 			TransformPythonObject(ret, result, row);
 		}
 

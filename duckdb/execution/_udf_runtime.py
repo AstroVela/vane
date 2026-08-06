@@ -32,6 +32,7 @@ from duckdb.execution._common import (
     load_udf_from_payload,
     load_udf_from_payload_cached,
 )
+from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 from duckdb.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from duckdb.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
 from duckdb.func import FunctionNullHandling
@@ -52,6 +53,8 @@ def _load_runtime_callable(
         udf = load_udf_from_payload_cached(payload, max_entries=cache_max_entries)
     else:
         udf = load_udf_from_payload(payload)
+
+    validate_synchronous_udf_callable(udf)
 
     backend = str(payload.get("execution_backend") or "").strip().lower()
     is_actor_backend = backend in ("subprocess_actor", "ray_actor")
@@ -83,7 +86,7 @@ def _load_runtime_callable(
             "callable class UDF constructors must be zero-argument; "
             "use environment variables or class-level defaults when configuration is required"
         )
-    return udf()
+    return ensure_synchronous_udf_result(udf())
 
 
 def _has_required_constructor_args(cls: type) -> bool:
@@ -240,6 +243,7 @@ def _effective_output_batch_size(payload: dict[str, Any]) -> int | None:
 
 def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
     """Iterate over output batches from a stream UDF result."""
+    result = ensure_synchronous_udf_result(result)
     if result is None:
         return
 
@@ -620,7 +624,7 @@ class UDFExecutor:
         )
         for batch in batches:
             saw_compute_batch = True
-            result = self._map_fn(batch)
+            result = ensure_synchronous_udf_result(self._map_fn(batch))
             if self._is_map_batches_rows:
                 results.append(self._coerce_row_preserving_batch_output(result, batch.num_rows))
                 continue
@@ -677,7 +681,7 @@ class UDFExecutor:
             shared_output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
             for batch in batches:
                 saw_compute_batch = True
-                result = self._map_fn(batch)
+                result = ensure_synchronous_udf_result(self._map_fn(batch))
                 output_buffer = (
                     RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
                     if self._preserve_compute_batch_boundaries
@@ -735,7 +739,7 @@ class UDFExecutor:
 
         for batch in batches:
             for row_dict in _iter_table_row_dicts(batch):
-                result = self._map_fn(row_dict)
+                result = ensure_synchronous_udf_result(self._map_fn(row_dict))
                 if result is None:
                     continue
                 if isinstance(result, pa.RecordBatchReader):
@@ -744,6 +748,7 @@ class UDFExecutor:
                     yield from append_output_row(result)
                 else:
                     for out_row in result:
+                        out_row = ensure_synchronous_udf_result(out_row)
                         if out_row is None:
                             continue
                         yield from append_output_row(out_row)
@@ -788,6 +793,7 @@ class UDFExecutor:
                     outputs.append(None)
                     continue
                 raise
+            result = ensure_synchronous_udf_result(result)
             if isinstance(result, pa.RecordBatchReader):
                 raise TypeError("map UDF output must be scalar; RecordBatchReader is not supported")
             if self._default_null_handling() and result is None:
@@ -819,6 +825,7 @@ class UDFExecutor:
                     result = [None] * batch.num_rows
                 else:
                     raise
+            result = ensure_synchronous_udf_result(result)
             outputs.append(_coerce_scalar_array(result, batch.num_rows))
 
         if outputs:

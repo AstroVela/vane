@@ -1046,6 +1046,7 @@ DuckDBPyConnection::RegisterScalarUDF(const string &name, const py::function &ud
                                       const shared_ptr<DuckDBPyType> &return_type_p, PythonUDFType type,
                                       FunctionNullHandling null_handling, PythonExceptionHandling exception_handling,
                                       bool side_effects) {
+	ValidateSynchronousUDFCallable(udf);
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
 
@@ -1188,6 +1189,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
                                                                     const shared_ptr<DuckDBPyType> &return_type_p,
                                                                     const Optional<py::object> &batch_size,
                                                                     bool side_effects) {
+	ValidateSynchronousUDFCallable(udf);
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
 
