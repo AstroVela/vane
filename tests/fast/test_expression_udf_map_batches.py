@@ -43,7 +43,7 @@ def test_vane_function_batch_rejects_async_function():
 
     import vane
 
-    with pytest.raises(TypeError, match="requires a synchronous Python function"):
+    with pytest.raises(TypeError, match="generic UDF callables must be synchronous"):
 
         @vane.func.batch(return_dtype=pa.int32())
         async def identity(values):

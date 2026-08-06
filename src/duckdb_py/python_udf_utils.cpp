@@ -165,6 +165,7 @@ static bool IsTaskExecutionBackend(const string &backend) {
 }
 
 static void ValidateUDFCallableShape(const py::object &udf, const string &execution_backend) {
+	ValidateSynchronousUDFCallable(udf);
 	auto inspect_module = py::module_::import("inspect");
 	const bool is_class = py::cast<bool>(inspect_module.attr("isclass")(udf));
 	const bool is_function = py::cast<bool>(inspect_module.attr("isfunction")(udf));
@@ -294,6 +295,10 @@ static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<
 	fields.emplace_back("expression_id", Value(std::move(parsed_expression_id)));
 }
 } // namespace
+
+void ValidateSynchronousUDFCallable(const py::object &udf) {
+	py::module_::import("duckdb.execution._udf_validation").attr("validate_synchronous_udf_callable")(udf);
+}
 
 static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindExpressionInput &input,
                                                                    bool preserve_foldable_nulls) {

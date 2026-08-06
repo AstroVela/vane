@@ -18,6 +18,7 @@ from typing import Any
 import _duckdb
 
 import duckdb
+from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 from vane._expressions import as_expression, is_expression
 from vane.config import current_config
 
@@ -367,7 +368,7 @@ def _execute_batch_callable(
     expected_length = len(columns[0])
     if any(len(column) != expected_length for column in columns[1:]):
         raise _invalid_input(f"batch UDF {udf_name!r} input columns must have equal lengths")
-    result = _invoke_batch_callable(fn, layout, columns)
+    result = ensure_synchronous_udf_result(_invoke_batch_callable(fn, layout, columns))
     normalized = _normalize_batch_result(
         result,
         output_arrow_type=output_arrow_type,
@@ -472,7 +473,6 @@ def _build_map_expression(
 @dataclass(frozen=True)
 class _ClassCallContract:
     signature: inspect.Signature
-    is_coroutine: bool
     positional_parameters: tuple[inspect.Parameter, ...]
     min_required_positional: int
     max_positional: int | None
@@ -526,7 +526,6 @@ def _class_call_contract(user_class: type) -> _ClassCallContract:
     )
     return _ClassCallContract(
         signature=signature,
-        is_coroutine=inspect.iscoroutinefunction(callable_object),
         positional_parameters=positional_parameters,
         min_required_positional=sum(
             parameter.default is inspect.Parameter.empty for parameter in positional_parameters
@@ -666,7 +665,7 @@ def _build_row_actor_class(
                 if any(value is None for value in row):
                     out.append(None)
                     continue
-                out.append(self._instance(*row, **captured_call_kwargs))
+                out.append(ensure_synchronous_udf_result(self._instance(*row, **captured_call_kwargs)))
             if pa.types.is_timestamp(output_arrow_type):
                 for value in out:
                     if isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None:
@@ -752,6 +751,7 @@ class VaneFunction:
     def __init__(self, fn: Callable[..., Any], *, return_dtype: Any | None = None, name: str | None = None):
         if not callable(fn):
             raise TypeError("vane.func requires a callable")
+        validate_synchronous_udf_callable(fn)
         self._fn = fn
         self._return_dtype = return_dtype
         self._name = _resolve_udf_name(name, _callable_name(fn))
@@ -772,7 +772,7 @@ class VaneFunction:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return _call_or_build_expression(
             has_expression=_has_expression(args) or _has_expression(kwargs.values()),
-            call_immediately=lambda: self._fn(*args, **kwargs),
+            call_immediately=lambda: ensure_synchronous_udf_result(self._fn(*args, **kwargs)),
             build_expression=lambda: _build_map_expression(self._fn, self._name, self._return_dtype, args, kwargs),
         )
 
@@ -798,8 +798,7 @@ class VaneBatchFunction:
     ) -> None:
         if not (inspect.isfunction(fn) or inspect.ismethod(fn)):
             raise TypeError("vane.func.batch requires a Python function")
-        if inspect.iscoroutinefunction(fn):
-            raise TypeError("vane.func.batch requires a synchronous Python function")
+        validate_synchronous_udf_callable(fn)
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.func.batch")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -918,6 +917,7 @@ class VaneClass:
     ) -> None:
         if not inspect.isclass(class_):
             raise TypeError("vane.cls requires a class")
+        validate_synchronous_udf_callable(class_)
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -1010,7 +1010,7 @@ class VaneClassInstance:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return _call_or_build_expression(
             has_expression=_has_expression(args) or _has_expression(kwargs.values()),
-            call_immediately=lambda: self._instance()(*args, **kwargs),
+            call_immediately=lambda: ensure_synchronous_udf_result(self._instance()(*args, **kwargs)),
             build_expression=lambda: self._build_expression(args, kwargs),
         )
 
@@ -1048,6 +1048,7 @@ class VaneClassBatch:
     ) -> None:
         if not inspect.isclass(class_):
             raise TypeError("vane.cls.batch requires a class")
+        validate_synchronous_udf_callable(class_)
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls.batch")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
@@ -1056,10 +1057,7 @@ class VaneClassBatch:
 
             if not pa.types.is_struct(return_arrow_dtype):
                 raise _invalid_input("unnest=True requires a Struct return_dtype")
-        contract = _class_call_contract(class_)
-        if contract.is_coroutine:
-            raise TypeError("vane.cls.batch requires a synchronous Python __call__")
-        signature = contract.signature
+        signature = _class_call_contract(class_).signature
         variadic = [
             parameter.name
             for parameter in signature.parameters.values()
@@ -1538,6 +1536,7 @@ def _preflight_vane_class_instance(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
+    validate_synchronous_udf_callable(fn_or_instance.user_class)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1590,6 +1589,7 @@ def _preflight_vane_class_batch_instance(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
+    validate_synchronous_udf_callable(fn_or_instance.user_class)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1654,6 +1654,7 @@ def _preflight_vane_batch_function(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedBatchSQLRegistration:
+    validate_synchronous_udf_callable(fn_or_function.python_function)
     _reject_attach_override(
         "return_dtype",
         return_dtype,
@@ -1715,6 +1716,7 @@ def _preflight_vane_function(
     actor_number: Any,
     replace: bool,
 ) -> _PreparedScalarSQLRegistration:
+    validate_synchronous_udf_callable(fn_or_function.python_function)
     invalid_batch_options = [
         name
         for name, value in (
@@ -1760,6 +1762,7 @@ def _preflight_raw_callable(
 ) -> _PreparedSQLRegistration:
     if not callable(fn):
         raise TypeError("vane.attach_function requires a callable or vane.func object")
+    validate_synchronous_udf_callable(fn)
 
     has_input_names = input_names is not None
     has_schema = schema is not None

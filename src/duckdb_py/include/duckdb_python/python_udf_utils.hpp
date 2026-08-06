@@ -20,6 +20,7 @@ namespace duckdb {
 
 unique_ptr<Expression> LowerRegisteredExpressionUDF(FunctionBindExpressionInput &input);
 unique_ptr<Expression> LowerRegisteredExpressionUDFPreservingFoldableNulls(FunctionBindExpressionInput &input);
+void ValidateSynchronousUDFCallable(const py::object &udf);
 
 Value BuildPythonUDFPayload(
     const string &name, const py::function &udf, const py::object &schema, const shared_ptr<DuckDBPyType> &return_type,

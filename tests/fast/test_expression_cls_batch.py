@@ -145,7 +145,7 @@ def test_vane_cls_batch_rejects_async_call():
 
     import vane
 
-    with pytest.raises(TypeError, match="requires a synchronous Python __call__"):
+    with pytest.raises(TypeError, match="generic UDF callables must be synchronous"):
 
         @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
         class AsyncBatch:
