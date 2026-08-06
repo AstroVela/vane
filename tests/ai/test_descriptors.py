@@ -9,7 +9,6 @@ import base64
 import pickle
 
 import numpy as np
-import pyarrow as pa
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -152,7 +151,7 @@ class TestProviderLoading:
             options={"base_url": "https://compatible.example.test/v1"},
         )
 
-        assert descriptor.get_dimensions().size == dimensions
+        assert descriptor.get_dimensions() == dimensions
 
     def test_openai_compatible_endpoint_requires_explicit_dimensions(self):
         from vane.ai.providers.openai import OpenAIProvider
@@ -310,13 +309,6 @@ class TestDescriptorAPI:
         opts = desc.get_udf_options()
         assert opts.batch_size is None
         assert opts.num_gpus == 0
-
-    def test_embedding_dimensions_arrow_type(self):
-        from vane.ai.typing import EmbeddingDimensions
-
-        dims = EmbeddingDimensions(size=384, dtype=pa.float32())
-        arrow_type = dims.as_arrow_type()
-        assert isinstance(arrow_type, pa.DataType)
 
 
 # ---------------------------------------------------------------------------

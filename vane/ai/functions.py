@@ -388,8 +388,7 @@ def _resolve_embedding_dimension(descriptor: Any, explicit: int | None) -> int:
     if explicit is not None:
         return explicit
     try:
-        metadata = descriptor.get_dimensions()
-        resolved = getattr(metadata, "size", metadata)
+        resolved = descriptor.get_dimensions()
     except Exception as exc:
         model = getattr(descriptor, "get_model", lambda: "unknown")()
         raise ValueError(
@@ -397,7 +396,7 @@ def _resolve_embedding_dimension(descriptor: Any, explicit: int | None) -> int:
             "pass dimensions=... explicitly"
         ) from exc
     if isinstance(resolved, bool) or not isinstance(resolved, int) or resolved <= 0:
-        raise ValueError("Provider embedding dimension metadata must be a positive integer")
+        raise ValueError("Provider get_dimensions() must return a positive integer")
     return int(resolved)
 
 

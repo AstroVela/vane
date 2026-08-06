@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pyarrow as pa
 
 import duckdb
 import vane
@@ -18,7 +17,6 @@ from vane.ai.protocols import (
     TextEmbedderDescriptor,
 )
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions
 
 if TYPE_CHECKING:
     from vane.ai.protocols import Prompter, TextEmbedder
@@ -50,8 +48,8 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_options(self) -> Options:
         return {"batch_size": 2}
 
-    def get_dimensions(self) -> EmbeddingDimensions:
-        return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+    def get_dimensions(self) -> int:
+        return self.dim
 
     def instantiate(self) -> TextEmbedder:
         return MockTextEmbedder(dim=self.dim)

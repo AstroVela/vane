@@ -33,7 +33,7 @@ from vane.ai.options import (
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -414,10 +414,10 @@ class GoogleTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_options(self) -> Options:
         return dict(self.options)
 
-    def get_dimensions(self) -> EmbeddingDimensions:
+    def get_dimensions(self) -> int:
         if self.dimensions is not None:
-            return EmbeddingDimensions(size=self.dimensions)
-        return EmbeddingDimensions(size=_EMBEDDING_DIMS[_canonical_model_id(self.model_name)])
+            return self.dimensions
+        return _EMBEDDING_DIMS[_canonical_model_id(self.model_name)]
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)

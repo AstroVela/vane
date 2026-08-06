@@ -96,7 +96,7 @@ def test_remote_code_requires_an_explicit_option(monkeypatch):
         options={"revision": _PINNED_REVISION, "trust_remote_code": True},
     )
 
-    assert descriptor.get_dimensions().size == 384
+    assert descriptor.get_dimensions() == 384
     descriptor.instantiate()
 
     assert auto_config_calls == []

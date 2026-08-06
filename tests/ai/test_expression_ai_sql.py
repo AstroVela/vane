@@ -22,7 +22,7 @@ import vane
 from vane.ai import provider as provider_registry
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import UDFOptions
 
 
 class MockTextEmbedder:
@@ -47,8 +47,8 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
     def get_options(self) -> dict[str, object]:
         return {}
 
-    def get_dimensions(self) -> EmbeddingDimensions:
-        return EmbeddingDimensions(self.dimensions)
+    def get_dimensions(self) -> int:
+        return self.dimensions
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0, batch_size=2, max_retries=0)

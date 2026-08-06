@@ -21,7 +21,7 @@ from vane.ai import provider as provider_registry
 from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider
-from vane.ai.typing import EmbeddingDimensions, UDFOptions
+from vane.ai.typing import UDFOptions
 
 
 class MockTextEmbedder:
@@ -49,8 +49,8 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
             "actor_number": self.actor_number,
         }
 
-    def get_dimensions(self) -> EmbeddingDimensions:
-        return EmbeddingDimensions(size=self.dim, dtype=pa.float32())
+    def get_dimensions(self) -> int:
+        return self.dim
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(
@@ -625,6 +625,36 @@ def test_ai_embed_explicit_dimensions_skip_provider_dimension_lookup():
     expr = vane.ai.embed(vane.col("text"), provider=ExplicitProvider(), dimensions=7)
 
     assert [str(value) for value in rel.select(expr).types] == ["FLOAT[7]"]
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 3.0, "3"])
+def test_ai_embed_rejects_invalid_provider_dimensions(value):
+    class Descriptor(MockTextEmbedderDescriptor):
+        def get_dimensions(self):
+            return value
+
+    class InvalidProvider(MockProvider):
+        def get_text_embedder(self, model=None, dimensions=None, *, options=None):
+            return Descriptor(dim=3)
+
+    with pytest.raises(ValueError, match=r"get_dimensions\(\).*positive integer"):
+        vane.ai.embed(vane.col("text"), provider=InvalidProvider())
+
+
+def test_ai_embed_rejects_legacy_dimension_metadata_object():
+    class LegacyDimensions:
+        size = 3
+
+    class Descriptor(MockTextEmbedderDescriptor):
+        def get_dimensions(self):
+            return LegacyDimensions()
+
+    class LegacyProvider(MockProvider):
+        def get_text_embedder(self, model=None, dimensions=None, *, options=None):
+            return Descriptor(dim=3)
+
+    with pytest.raises(ValueError, match=r"get_dimensions\(\).*positive integer"):
+        vane.ai.embed(vane.col("text"), provider=LegacyProvider())
 
 
 def test_embed_on_error_ignore_returns_fixed_type_nulls():

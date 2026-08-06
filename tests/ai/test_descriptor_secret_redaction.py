@@ -386,7 +386,7 @@ class TestOptionsAtExecutionBoundary:
 
         monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoConfig=FakeAutoConfig))
         descriptor = _transformers_embedder_descriptor()
-        assert descriptor.get_dimensions().size == 384
+        assert descriptor.get_dimensions() == 384
         assert auto_config_calls == []
 
     def test_transformers_embedder_model_receives_registered_loading_options(self, monkeypatch):
