@@ -6289,6 +6289,128 @@ def test_fte_worker_failure_event_rejects_cross_manager_scheduler(failed_manager
     assert failed._fte_healthy is True
 
 
+def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-failure",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-duplicate-worker-failure")
+    failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned duplicate failure"),
+    )
+    reconciliation_started = threading.Event()
+    release_reconciliation = threading.Event()
+    state_published = threading.Event()
+    duplicate_joined = threading.Event()
+    reconciliation_calls = []
+
+    class _ObservedReconciliation(Future):
+        def result(self, timeout=None):
+            duplicate_joined.set()
+            return super().result(timeout)
+
+    def reconcile_worker_failure(reported_event, **_kwargs):
+        reconciliation_calls.append(reported_event)
+        reconciliation_started.set()
+        assert release_reconciliation.wait(timeout=2.0)
+        state_published.set()
+        return []
+
+    monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        reconcile_worker_failure,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        assert reconciliation_started.wait(timeout=1.0)
+        duplicate_entered = threading.Event()
+
+        def report_duplicate_failure():
+            duplicate_entered.set()
+            result = worker_failures_mod.mark_fte_worker_failed_for_event(event)
+            assert state_published.is_set()
+            return result
+
+        duplicate = executor.submit(report_duplicate_failure)
+        assert duplicate_entered.wait(timeout=1.0)
+        try:
+            assert duplicate_joined.wait(timeout=1.0)
+            assert not duplicate.done()
+        finally:
+            release_reconciliation.set()
+
+        assert owner.result(timeout=1.0) == []
+        assert duplicate.result(timeout=1.0) == []
+
+    assert reconciliation_calls == [event]
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-failure-error",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-duplicate-worker-failure-error")
+    failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned duplicate failure"),
+    )
+    reconciliation_started = threading.Event()
+    release_reconciliation = threading.Event()
+    duplicate_joined = threading.Event()
+
+    class _ObservedReconciliation(Future):
+        def result(self, timeout=None):
+            duplicate_joined.set()
+            return super().result(timeout)
+
+    def fail_reconciliation(*_args, **_kwargs):
+        reconciliation_started.set()
+        assert release_reconciliation.wait(timeout=2.0)
+        raise RuntimeError("planned reconciliation failure")
+
+    monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        fail_reconciliation,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        assert reconciliation_started.wait(timeout=1.0)
+        duplicate = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        try:
+            assert duplicate_joined.wait(timeout=1.0)
+            assert not duplicate.done()
+        finally:
+            release_reconciliation.set()
+
+        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+            owner.result(timeout=1.0)
+        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+            duplicate.result(timeout=1.0)
+
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
 def test_stale_worker_shutdown_does_not_fail_current_registry_owner(monkeypatch):
     stale = RayWorkerActorHandle(
         _FakeActor(),

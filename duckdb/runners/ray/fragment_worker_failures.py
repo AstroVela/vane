@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import Future
 from typing import Any
 
 from duckdb.runners.ray.fragment_registry import (
@@ -18,6 +20,9 @@ from duckdb.runners.ray.fte_fragment_scheduler import (
     _worker_actor_death_confirms_quiescence,
     _worker_failure_payload,
 )
+
+_WORKER_FAILURE_RECONCILIATION_LOCK = threading.Lock()
+_WORKER_FAILURE_RECONCILIATIONS: dict[tuple[str, str, str], Future[None]] = {}
 
 
 def quarantine_fte_worker(
@@ -68,19 +73,18 @@ def retire_fte_worker_for_failure(
     )
 
 
-def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[Any], list[Any]]]:
-    manager_instance_id = str(event.manager_instance_id)
-    worker_incarnation_id = str(event.worker_incarnation_id)
+def _reconcile_fte_worker_failure(
+    event: Any,
+    *,
+    manager_instance_id: str,
+    worker_incarnation_id: str,
+    event_query_id: str,
+) -> list[tuple[str, str, list[Any], list[Any]]]:
     failure = _worker_failure_payload(
         event.worker_id,
         event.error,
         worker_incarnation_id=worker_incarnation_id,
     )
-    event_query_id = str(event.query_id)
-    with _FTE_REGISTRY_LOCK:
-        event_scheduler = _FTE_SCHEDULERS.get(event_query_id)
-    if event_scheduler is not None and not event_scheduler.is_owned_by_manager_instance(manager_instance_id):
-        return []
     quarantine_fte_worker(
         event.worker_id,
         manager_instance_id=manager_instance_id,
@@ -124,3 +128,45 @@ def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[An
         if delay_s > 0:
             scheduler.arm_retry_delay(delay_s)
     return scheduled_by_fragment
+
+
+def mark_fte_worker_failed_for_event(event: Any) -> list[tuple[str, str, list[Any], list[Any]]]:
+    manager_instance_id = str(event.manager_instance_id)
+    worker_incarnation_id = str(event.worker_incarnation_id)
+    event_query_id = str(event.query_id)
+    with _FTE_REGISTRY_LOCK:
+        event_scheduler = _FTE_SCHEDULERS.get(event_query_id)
+    if event_scheduler is not None and not event_scheduler.is_owned_by_manager_instance(manager_instance_id):
+        return []
+
+    # Independent status watchers can observe the same actor death. Only the
+    # owner mutates fragment state; later observers join its completion.
+    failure_key = (manager_instance_id, str(event.worker_id), worker_incarnation_id)
+    with _WORKER_FAILURE_RECONCILIATION_LOCK:
+        reconciliation = _WORKER_FAILURE_RECONCILIATIONS.get(failure_key)
+        owns_reconciliation = reconciliation is None
+        if owns_reconciliation:
+            reconciliation = Future()
+            _WORKER_FAILURE_RECONCILIATIONS[failure_key] = reconciliation
+    assert reconciliation is not None
+    if not owns_reconciliation:
+        reconciliation.result()
+        return []
+
+    try:
+        scheduled_by_fragment = _reconcile_fte_worker_failure(
+            event,
+            manager_instance_id=manager_instance_id,
+            worker_incarnation_id=worker_incarnation_id,
+            event_query_id=event_query_id,
+        )
+    except BaseException as exc:
+        reconciliation.set_exception(exc)
+        raise
+    else:
+        reconciliation.set_result(None)
+        return scheduled_by_fragment
+    finally:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if _WORKER_FAILURE_RECONCILIATIONS.get(failure_key) is reconciliation:
+                _WORKER_FAILURE_RECONCILIATIONS.pop(failure_key, None)
