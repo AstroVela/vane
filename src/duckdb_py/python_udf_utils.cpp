@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb_python/pybind11/pybind_wrapper.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -28,6 +29,7 @@ namespace {
 
 constexpr idx_t DEFAULT_UDF_TARGET_MAX_BATCH_BYTES = 134217728;
 constexpr const char *UDF_TARGET_MAX_BATCH_BYTES_ENV = "VANE_UDF_TARGET_MAX_BATCH_BYTES";
+static std::atomic<uint64_t> registered_expression_sequence {0};
 
 static Value BuildShapeValue(const vector<idx_t> &shape) {
 	vector<Value> shape_values;
@@ -277,6 +279,20 @@ static Value PayloadWithAddedOrUpdatedFields(const Value &payload, child_list_t<
 
 	return Value::STRUCT(std::move(new_children));
 }
+
+static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<py::object> &expression_id) {
+	if (expression_id.is_none()) {
+		return;
+	}
+	if (!py::isinstance<py::str>(expression_id)) {
+		throw InvalidInputException("expression_id must be a non-empty string");
+	}
+	auto parsed_expression_id = py::cast<string>(expression_id);
+	if (parsed_expression_id.empty()) {
+		throw InvalidInputException("expression_id must be a non-empty string");
+	}
+	fields.emplace_back("expression_id", Value(std::move(parsed_expression_id)));
+}
 } // namespace
 
 static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindExpressionInput &input,
@@ -294,7 +310,13 @@ static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindE
 	for (auto &child : input.children) {
 		children.push_back(std::move(child));
 	}
-	children.push_back(make_uniq<BoundConstantExpression>(registered_data.payload));
+	auto expression_sequence = registered_expression_sequence.fetch_add(1, std::memory_order_relaxed);
+	child_list_t<Value> expression_fields;
+	expression_fields.emplace_back(
+	    "expression_id",
+	    Value(StringUtil::Format("registered:%llu", static_cast<unsigned long long>(expression_sequence))));
+	auto call_payload = PayloadWithAddedOrUpdatedFields(registered_data.payload, std::move(expression_fields));
+	children.push_back(make_uniq<BoundConstantExpression>(std::move(call_payload)));
 
 	FunctionBinder binder(input.context);
 	if (preserve_foldable_nulls) {
@@ -537,7 +559,8 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 
 Value BuildExpressionScalarUDFPayload(const string &name, const py::function &udf,
                                       const shared_ptr<DuckDBPyType> &return_type, const string &execution_backend,
-                                      idx_t default_parallelism, idx_t scalar_arg_count) {
+                                      idx_t default_parallelism, idx_t scalar_arg_count,
+                                      const Optional<py::object> &expression_id) {
 	vector<LogicalType> passthrough_types;
 	auto payload = BuildScalarUDFPayload(name, udf, return_type, execution_backend, default_parallelism,
 	                                     passthrough_types, py::none(), py::none(), py::none(), py::none(),
@@ -548,6 +571,7 @@ Value BuildExpressionScalarUDFPayload(const string &name, const py::function &ud
 	fields.emplace_back("expression_udf", Value::BOOLEAN(true));
 	fields.emplace_back("method_return_type", Value(return_type->Type().ToString()));
 	fields.emplace_back("scalar_arg_count", Value::BIGINT(NumericCast<int64_t>(scalar_arg_count)));
+	AppendExpressionIdField(fields, expression_id);
 	return PayloadWithAddedOrUpdatedFields(payload, std::move(fields));
 }
 
@@ -555,7 +579,8 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
                                           const string &execution_backend, idx_t default_parallelism,
                                           const vector<string> &input_names, const Optional<py::object> &batch_size,
                                           bool row_preserving, const Optional<py::object> &gpus,
-                                          const Optional<py::object> &actor_number, bool stateful) {
+                                          const Optional<py::object> &actor_number, bool stateful,
+                                          const Optional<py::object> &expression_id) {
 	ValidateStatefulActorContract(execution_backend, actor_number, stateful);
 	auto payload =
 	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), execution_backend, default_parallelism,
@@ -572,6 +597,7 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	fields.emplace_back("input_names", StringListValue(input_names));
 	fields.emplace_back("row_preserving", Value::BOOLEAN(row_preserving));
 	fields.emplace_back("prebatched_input", Value::BOOLEAN(false));
+	AppendExpressionIdField(fields, expression_id);
 	if (stateful) {
 		fields.emplace_back("stateful", Value::BOOLEAN(true));
 	}

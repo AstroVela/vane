@@ -100,6 +100,7 @@ def test_expression_udfs_reject_non_projection_positions(sql_udf_contract_connec
         ("DECIMAL(10,2)", "decimal128(10, 2)"),
         ("FLOAT[]", "list<item: float>"),
         ("FLOAT[4]", "fixed_size_list<item: float>[4]"),
+        ("STRUCT(value INTEGER)", "struct<value: int32>"),
     ],
 )
 def test_vane_cls_arrow_return_type_support_matrix(dtype, arrow_type):
@@ -116,7 +117,6 @@ def test_vane_cls_arrow_return_type_support_matrix(dtype, arrow_type):
         "UUID",
         "TIMESTAMPTZ",
         "ENUM('red', 'green')",
-        "STRUCT(value INTEGER)",
         "MAP(VARCHAR, INTEGER)",
     ],
 )
@@ -154,6 +154,11 @@ def test_vane_cls_rejects_unsupported_arrow_return_types_with_original_type(dtyp
         pytest.param("timestamp_ns", "TIMESTAMP_NS", id="timestamp-ns"),
         pytest.param("timestamp_ms", "TIMESTAMP_MS", id="timestamp-ms"),
         pytest.param("timestamp_s", "TIMESTAMP_S", id="timestamp-s"),
+        pytest.param(
+            "struct",
+            'STRUCT("value" BIGINT, nested STRUCT(score DOUBLE))',
+            id="nested-struct",
+        ),
     ],
 )
 def test_pyarrow_datatype_canonicalization_matrix(arrow_type, duckdb_type):
@@ -185,6 +190,12 @@ def test_pyarrow_datatype_canonicalization_matrix(arrow_type, duckdb_type):
         "timestamp_ns": pa.timestamp("ns"),
         "timestamp_ms": pa.timestamp("ms"),
         "timestamp_s": pa.timestamp("s"),
+        "struct": pa.struct(
+            [
+                pa.field("value", pa.int64()),
+                pa.field("nested", pa.struct([pa.field("score", pa.float64())])),
+            ]
+        ),
     }
     expected_arrow = types[arrow_type]
 
@@ -197,7 +208,6 @@ def test_pyarrow_datatype_canonicalization_matrix(arrow_type, duckdb_type):
 @pytest.mark.parametrize(
     "unsupported",
     [
-        pytest.param("struct", id="struct"),
         pytest.param("map", id="map"),
         pytest.param("duration", id="duration"),
         pytest.param("dictionary", id="dictionary"),
@@ -211,7 +221,6 @@ def test_unsupported_pyarrow_datatype_matrix_is_rejected_during_canonicalization
     from vane._expression_udf import _canonicalize_dtype
 
     dtype = {
-        "struct": pa.struct([("value", pa.int64())]),
         "map": pa.map_(pa.string(), pa.int64()),
         "duration": pa.duration("us"),
         "dictionary": pa.dictionary(pa.int8(), pa.string()),
@@ -223,6 +232,19 @@ def test_unsupported_pyarrow_datatype_matrix_is_rejected_during_canonicalization
 
     assert str(dtype) in str(exc_info.value)
     assert "not supported" in str(exc_info.value) or "TIMESTAMPTZ" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("duplicate_name", ["value", "VALUE"])
+def test_pyarrow_struct_duplicate_field_names_are_rejected_without_collapsing(duplicate_name):
+    import pyarrow as pa
+
+    import vane
+    from vane._expression_udf import _canonicalize_dtype
+
+    dtype = pa.struct([pa.field("value", pa.int32()), pa.field(duplicate_name, pa.string())])
+
+    with pytest.raises(vane.InvalidInputException, match="Struct field names must be unique case-insensitively"):
+        _canonicalize_dtype(dtype)
 
 
 @pytest.mark.parametrize(
@@ -251,8 +273,8 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     monkeypatch.setenv("VANE_RUNNER", decorator_runner)
 
     class IdentityBatch:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            return pa.table({"result": table.column("value")})
+        def __call__(self, value):
+            return value
 
     # Defining the decorator is configuration-only: it must not inspect the
     # runner or warn, even when warnings are promoted to exceptions.
@@ -260,8 +282,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
         warnings.simplefilter("error")
         DecoratedBatch = vane.cls.batch(
             actor_number=1,
-            schema={"result": "INTEGER"},
-            row_preserving=True,
+            return_dtype=pa.int32(),
             gpus=gpus,
         )(IdentityBatch)
 
@@ -270,9 +291,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            relation = con.sql("SELECT 1::INTEGER AS value").select(
-                DecoratedBatch()(value=vane.col("value")).alias("result")
-            )
+            relation = con.sql("SELECT 1::INTEGER AS value").select(DecoratedBatch()(vane.col("value")).alias("result"))
             plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
                 relation,
                 f"gpu-order-{decorator_runner}-{resolved_runner}-{gpus}",
@@ -372,17 +391,16 @@ def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
 
     @vane.cls.batch(
         actor_number=1,
-        schema={"result": "INTEGER"},
-        row_preserving=True,
+        return_dtype=pa.int32(),
         gpus=0.75,
     )
     class IdentityBatch:
-        def __call__(self, table: pa.Table) -> pa.Table:
-            return pa.table({"result": table.column("value")})
+        def __call__(self, value):
+            return value
 
     monkeypatch.setenv("VANE_RUNNER", "local")
     with pytest.raises(vane.InvalidInputException, match="GPU resources require a Ray UDF backend"):
-        IdentityBatch()(value=vane.col("value"))
+        IdentityBatch()(vane.col("value"))
 
 
 def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch):
@@ -423,6 +441,7 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     assert nodes[0]["actor_pool_size"] == 3
     assert nodes[0]["payload"]["actor_number"] == 3
     assert not nodes[0]["payload"].get("stateful", False)
+    assert nodes[0]["payload"]["expression_id"]
 
     calls = []
 

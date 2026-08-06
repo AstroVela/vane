@@ -268,20 +268,19 @@ def test_attached_vane_cls_batch_alias_survives_logical_plan_pickle_to_fresh_con
     pa = pytest.importorskip("pyarrow")
     source = vane.connect()
 
-    @vane.cls.batch(actor_number=1, schema={"result": "INTEGER"}, row_preserving=True)
+    @vane.cls.batch(actor_number=1, return_dtype=pa.int32())
     class BatchOffset:
         def __init__(self, offset):
             self.offset = offset
 
-        def __call__(self, table):
-            values = table.column("value").to_pylist()
-            return pa.table({"result": [value + self.offset for value in values]})
+        def __call__(self, value):
+            values = value.to_pylist()
+            return pa.array([item + self.offset for item in values], type=pa.int32())
 
     vane.attach_function(
         BatchOffset(20),
         connection=source,
         alias="fresh_class_batch_sql",
-        input_names=["value"],
         parameters=["INTEGER"],
     )
     relation = source.sql("SELECT fresh_class_batch_sql(i::INTEGER) AS value FROM range(3) t(i) ORDER BY i")

@@ -73,14 +73,14 @@ class BlockingStatefulCounter:
         ray.get(self.control.record_class_init.remote())
         self.calls = 0
 
-    def __call__(self, table):
+    def __call__(self, value):
         self.calls += 1
-        values = table.column("value").to_pylist()
+        values = value.to_pylist()
         batch_id = str(values[0]) if values else "empty"
         ray.get(self.control.record_batch_started.remote(batch_id))
         while not ray.get(self.control.should_release.remote()):
             time.sleep(0.01)
-        return pa.table({"state": [self.calls] * table.num_rows})
+        return pa.array([self.calls] * len(value), type=pa.int32())
 
 
 os.environ["VANE_ENABLE_UDF_TEST_HOOKS"] = "1"
@@ -97,9 +97,8 @@ vane.configure(runner="ray")
 
 StatefulCounter = vane.cls.batch(
     actor_number=1,
-    schema={"state": "INTEGER"},
+    return_dtype=pa.int32(),
     name=UDF_NAME,
-    row_preserving=True,
 )(BlockingStatefulCounter)
 
 con = vane.connect()
@@ -115,7 +114,7 @@ try:
     relation = con.sql(f"select value from read_parquet('{input_path}')")
     output = relation.select(
         vane.col("value"),
-        StatefulCounter()(value=vane.col("value")).alias("state"),
+        StatefulCounter()(vane.col("value")).alias("state"),
     )
     logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         output,
