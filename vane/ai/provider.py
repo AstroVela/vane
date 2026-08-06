@@ -3,9 +3,9 @@
 
 """Provider base class and registry for AI model backends.
 
-A :class:`Provider` maps high-level intents (embed text, classify text, prompt)
-to either concrete :class:`~vane.ai.typing.Descriptor` factories or native
-planning metadata. Both forms are lightweight and serializable.
+A :class:`Provider` maps high-level Prompt and Embed intents to either concrete
+:class:`~vane.ai.typing.Descriptor` factories or native planning metadata. Both
+forms are lightweight and serializable.
 
 Supported providers are loaded lazily so optional dependencies (e.g.
 ``transformers``, ``openai``) are only imported when actually used.
@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from vane.ai.protocols import (
         NativePrompterPlan,
         PrompterDescriptor,
-        TextClassifierDescriptor,
         TextEmbedderDescriptor,
     )
 
@@ -246,8 +245,8 @@ def _not_implemented(provider: Provider, method: str) -> NotImplementedError:
 class Provider(ABC):
     """Base class for AI model providers.
 
-    Subclasses implement ``get_text_embedder``, ``get_text_classifier``, etc.
-    to return lightweight descriptors or native planning metadata.
+    Subclasses implement Prompt and Embed factories that return lightweight
+    descriptors or native planning metadata.
     """
 
     @property
@@ -266,11 +265,6 @@ class Provider(ABC):
         options: Mapping[str, Any] | None = None,
     ) -> TextEmbedderDescriptor:
         raise _not_implemented(self, "embed_text")
-
-    # -- Text classification ------------------------------------------------
-
-    def get_text_classifier(self, model: str | None = None, **options: Any) -> TextClassifierDescriptor:
-        raise _not_implemented(self, "classify_text")
 
     # -- Prompting / chat completion ----------------------------------------
 

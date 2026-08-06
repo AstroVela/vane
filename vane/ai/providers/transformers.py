@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""HuggingFace Transformers provider for Vane AI.
-
-Supports text embedding via ``sentence-transformers`` and text
-classification via ``transformers`` zero-shot-classification pipelines.
+"""HuggingFace Transformers provider for Vane AI text embedding.
 
 Requires::
 
@@ -20,15 +17,15 @@ import pyarrow as pa
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.options import validate_embed_options
-from vane.ai.protocols import TextClassifierDescriptor, TextEmbedderDescriptor
+from vane.ai.protocols import TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError
 from vane.ai.typing import EmbeddingDimensions, UDFOptions
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from vane.ai.protocols import TextClassifier, TextEmbedder
-    from vane.ai.typing import Embedding, Label, Options
+    from vane.ai.protocols import TextEmbedder
+    from vane.ai.typing import Embedding, Options
 
 
 _EMBEDDING_DIMS = {"sentence-transformers/all-MiniLM-L6-v2": 384}
@@ -44,7 +41,6 @@ class TransformersProvider(Provider):
     """Provider backed by HuggingFace Transformers / SentenceTransformers."""
 
     DEFAULT_TEXT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
-    DEFAULT_TEXT_CLASSIFIER = "facebook/bart-large-mnli"
 
     def __init__(self, name: str | None = None):
         self._name = name or "transformers"
@@ -66,12 +62,6 @@ class TransformersProvider(Provider):
             provider_name=self._name,
             dimensions=dimensions,
             options=resolved_options,
-        )
-
-    def get_text_classifier(self, model: str | None = None, **options: Any) -> TextClassifierDescriptor:
-        return TransformersTextClassifierDescriptor(
-            model=model or self.DEFAULT_TEXT_CLASSIFIER,
-            classify_options=options,
         )
 
 
@@ -203,75 +193,3 @@ class TransformersTextEmbedder:
         if capability_error is not None:
             raise capability_error from None
         return list(batch)
-
-
-# ---------------------------------------------------------------------------
-# Text Classification
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TransformersTextClassifierDescriptor(TextClassifierDescriptor):
-    """Serializable factory for a Transformers zero-shot classifier."""
-
-    model: str
-    classify_options: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.classify_options = wrap_sensitive_options(self.classify_options)
-
-    def get_provider(self) -> str:
-        return "transformers"
-
-    def get_model(self) -> str:
-        return self.model
-
-    def get_options(self) -> Options:
-        return dict(self.classify_options)
-
-    def get_udf_options(self) -> UDFOptions:
-        return UDFOptions(
-            batch_size=self.classify_options.get("batch_size"),
-            max_retries=self.classify_options.get("max_retries", 3),
-            on_error=self.classify_options.get("on_error", "raise"),
-        )
-
-    def instantiate(self) -> TextClassifier:
-        pipeline_options = {
-            k: v
-            for k, v in self.classify_options.items()
-            if k
-            not in {
-                "batch_size",
-                "max_retries",
-                "on_error",
-                "actor_number",
-                "num_gpus",
-            }
-        }
-        return TransformersTextClassifier(self.model, **pipeline_options)
-
-
-class TransformersTextClassifier:
-    """Concrete text classifier using ``transformers`` zero-shot pipeline."""
-
-    def __init__(self, model_name: str, **options: Any):
-        from transformers import pipeline
-
-        # Restore plaintext credentials sealed by the descriptor; plain dicts
-        # from direct callers pass through unchanged.
-        options = unwrap_sensitive_options(options)
-        options["trust_remote_code"] = options.get("trust_remote_code") is True
-        self.pipeline = pipeline(
-            "zero-shot-classification",
-            model=model_name,
-            **options,
-        )
-
-    def classify_text(self, text: list[str], labels: Label | list[Label]) -> list[Label]:
-        if isinstance(labels, str):
-            labels = [labels]
-        results = self.pipeline(text, candidate_labels=labels)
-        if not isinstance(results, list):
-            results = [results]
-        return [r["labels"][0] for r in results]

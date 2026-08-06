@@ -277,13 +277,16 @@ def test_retry_after_cancellation_retains_no_original_exception_data():
     assert all(secret not in surface for surface in surfaces)
 
 
-def test_ordinary_provider_error_is_not_attached_to_backoff_cancellation(monkeypatch):
+def test_transient_provider_error_is_not_attached_to_backoff_cancellation(monkeypatch):
     from vane.ai.functions import _retry_call_async
 
     secret = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
+    class ServiceUnavailableError(RuntimeError):
+        status_code = 503
+
     async def fail():
-        raise RuntimeError(secret)
+        raise ServiceUnavailableError(secret)
 
     async def cancel_sleep(_seconds):
         raise asyncio.CancelledError

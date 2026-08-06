@@ -3,13 +3,13 @@
 
 """Vane AI — high-level AI function APIs.
 
-Provides one-line functions for common AI tasks (embedding, classification,
-prompting) that integrate with Vane's distributed execution engine.
+Provides one-line functions for embedding and prompting that integrate with
+Vane's distributed execution engine.
 
 Quick start::
 
     import vane
-    from vane.ai import classify_text, embed, prompt
+    from vane.ai import embed, prompt
 
     conn = vane.connect()
     rel = conn.sql("SELECT text FROM documents")
@@ -39,7 +39,6 @@ __all__ = [
     "SchemaValidationError",
     "TokenMetricsEntry",
     "UDFOptions",
-    "classify_text",
     "embed",
     "get_token_metrics",
     "get_token_metrics_summary",
@@ -62,7 +61,6 @@ _LAZY_EXPORTS = {
     "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
     "TokenMetricsEntry": ("vane.ai.metrics", "TokenMetricsEntry"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
-    "classify_text": ("vane.ai.functions", "classify_text"),
     "embed": ("vane.ai.functions", "embed"),
     "get_token_metrics": ("vane.ai.metrics", "get_token_metrics"),
     "get_token_metrics_summary": ("vane.ai.metrics", "get_token_metrics_summary"),

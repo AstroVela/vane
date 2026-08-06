@@ -217,22 +217,6 @@ class TestTransformersDescriptorPickle:
         assert restored.get_provider() == "transformers"
         assert restored.get_model() == "sentence-transformers/all-MiniLM-L6-v2"
 
-    def test_text_classifier_descriptor_roundtrip(self):
-        from vane.ai.providers.transformers import (
-            TransformersTextClassifierDescriptor,
-        )
-
-        desc = TransformersTextClassifierDescriptor(
-            model="facebook/bart-large-mnli",
-            classify_options={"max_retries": 5},
-        )
-
-        data = pickle.dumps(desc)
-        restored = pickle.loads(data)
-
-        assert restored.model == desc.model
-        assert restored.get_provider() == "transformers"
-
 
 class TestOpenAIDescriptorPickle:
     def test_text_embedder_descriptor_roundtrip(self):
@@ -349,15 +333,6 @@ class TestProtocols:
                 return [[] for _ in text]
 
         assert isinstance(MyEmbedder(), TextEmbedder)
-
-    def test_text_classifier_protocol_check(self):
-        from vane.ai.protocols import TextClassifier
-
-        class MyClassifier:
-            def classify_text(self, text, _labels):
-                return ["pos" for _ in text]
-
-        assert isinstance(MyClassifier(), TextClassifier)
 
     def test_prompter_protocol_check(self):
         from vane.ai.protocols import Prompter

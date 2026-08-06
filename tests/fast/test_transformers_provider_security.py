@@ -8,7 +8,6 @@ import pytest
 
 from vane.ai.providers.transformers import (
     TransformersProvider,
-    TransformersTextClassifier,
     TransformersTextEmbedder,
     TransformersTextEmbedderDescriptor,
 )
@@ -114,9 +113,8 @@ def test_remote_code_requires_an_explicit_option(monkeypatch):
     ]
 
 
-def test_remote_code_is_enabled_only_by_the_boolean_true(monkeypatch):
+def test_remote_code_string_does_not_enable_remote_code(monkeypatch):
     sentence_transformer_calls = []
-    pipeline_calls = []
 
     class FakeSentenceTransformer:
         def __init__(self, model, **options):
@@ -125,19 +123,12 @@ def test_remote_code_is_enabled_only_by_the_boolean_true(monkeypatch):
         def eval(self):
             return self
 
-    def fake_pipeline(task, **options):
-        pipeline_calls.append((task, options))
-        return object()
-
     monkeypatch.setitem(
         sys.modules,
         "sentence_transformers",
         SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
     )
-    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(pipeline=fake_pipeline))
 
     TransformersTextEmbedder("reviewed-model", trust_remote_code="true")
-    TransformersTextClassifier("reviewed-classifier", trust_remote_code="true")
 
     assert sentence_transformer_calls[0][1]["trust_remote_code"] is False
-    assert pipeline_calls[0][1]["trust_remote_code"] is False
