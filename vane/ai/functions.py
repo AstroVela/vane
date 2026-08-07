@@ -582,18 +582,15 @@ def _descriptor_identity(descriptor: Any) -> tuple[str, str]:
     return values[0], values[1]
 
 
-def _normalize_embeddings(values: list[Any]) -> list[Any]:
-    normalized: list[Any] = []
-    for value in values:
-        if value is None:
-            normalized.append(None)
-            continue
-        arr = np.asarray(value, dtype=np.float32)
-        norm = float(np.linalg.norm(arr))
-        if norm > 0:
-            arr = arr / norm
-        normalized.append(arr)
-    return normalized
+def _normalize_embedding(value: np.ndarray) -> np.ndarray:
+    """L2-normalize a finite float32 embedding without float32 overflow."""
+    working = np.asarray(value, dtype=np.float64)
+    norm = float(np.linalg.norm(working))
+    if not np.isfinite(norm):
+        raise _ProviderResultError("Embedding normalization produced a non-finite norm")
+    if norm > 0:
+        working /= norm
+    return working.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -710,18 +707,62 @@ class _EmbedTextBatch:
 
     def _coerce_embedding(self, value: Any) -> np.ndarray:
         try:
-            embedding = np.asarray(value, dtype=np.float32)
+            with np.errstate(over="ignore", invalid="ignore"):
+                embedding = np.asarray(value, dtype=np.float32)
         except Exception:
-            raise TypeError("Provider returned a non-numeric embedding") from None
-        if embedding.ndim != 1 or embedding.size != self._dimensions:
+            raise _ProviderResultError("Provider returned a non-numeric embedding") from None
+        if embedding.ndim != 1:
             provider, model = _descriptor_identity(self._descriptor)
-            raise TypeError(
+            raise _ProviderResultError(
+                f"Provider {provider!r} model {model!r} "
+                f"returned an embedding with shape {embedding.shape}; expected a one-dimensional "
+                f"embedding with length {self._dimensions}"
+            )
+        if embedding.size != self._dimensions:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _ProviderResultError(
                 f"Provider {provider!r} model {model!r} "
                 f"returned an embedding with length {embedding.size}; expected {self._dimensions}"
             )
+        if not bool(np.isfinite(embedding).all()):
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _ProviderResultError(
+                f"Provider {provider!r} model {model!r} returned an embedding containing non-finite components"
+            )
         return embedding
 
-    def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray]:
+    def _coerce_embedding_rows(
+        self,
+        values: list[Any],
+        *,
+        allow_nulls: bool,
+        normalize: bool = False,
+    ) -> list[np.ndarray | None]:
+        """Enforce the typed embedding contract for known result rows.
+
+        A row-aligned result violation is already attributable to one input,
+        so ``on_error="ignore"`` can null that row without calling the provider
+        again. ``allow_nulls`` is reserved for rows already nulled by that
+        policy or by a failed chunk.
+        """
+        embeddings: list[np.ndarray | None] = []
+        for value in values:
+            if value is None and allow_nulls:
+                embeddings.append(None)
+                continue
+            try:
+                embedding = self._coerce_embedding(value)
+                if normalize:
+                    embedding = self._coerce_embedding(_normalize_embedding(embedding))
+            except _ProviderResultError:
+                if self._on_error == "raise":
+                    raise
+                embeddings.append(None)
+                continue
+            embeddings.append(embedding)
+        return embeddings
+
+    def _invoke_embedder(self, texts: list[str]) -> list[np.ndarray | None]:
         capability_error: ProviderCapabilityError | None = None
         provider_error: Exception | None = None
         try:
@@ -749,13 +790,13 @@ class _EmbedTextBatch:
         try:
             values = list(raw)
         except TypeError:
-            raise TypeError("Provider embedding result must be a sequence") from None
+            raise _ProviderResultError("Provider embedding result must be a sequence") from None
         if len(values) != len(texts):
-            raise ValueError(
+            raise _ProviderResultError(
                 f"Provider returned {len(values)} embeddings for {len(texts)} inputs; "
                 "embedding calls must preserve row count and order"
             )
-        return [self._coerce_embedding(value) for value in values]
+        return self._coerce_embedding_rows(values, allow_nulls=False)
 
     def _embed_texts(self, texts: list[str]) -> list[np.ndarray | None]:
         if not texts:
@@ -796,8 +837,11 @@ class _EmbedTextBatch:
             else:
                 active_results = self._embed_texts(active_texts)
 
-            if self._normalize:
-                active_results = _normalize_embeddings(active_results)
+            active_results = self._coerce_embedding_rows(
+                active_results,
+                allow_nulls=True,
+                normalize=self._normalize,
+            )
             for index, value in zip(active_indices, active_results, strict=True):
                 results[index] = value
 
