@@ -212,6 +212,9 @@ RepartitionNode::RepartitionNode(PipelineNodeConfig config, PipelineNodeContext 
                                  std::shared_ptr<ExchangeManager> exchange_mgr)
     : config_(std::move(config)), context_(std::move(context)), repartition_spec_(std::move(repartition_spec)),
       num_partitions_(num_partitions), child_(std::move(child)), exchange_mgr_(std::move(exchange_mgr)) {
+	if (num_partitions_ == 0) {
+		throw InvalidInputException("RepartitionNode requires at least one partition");
+	}
 }
 
 // Static factory method.
@@ -220,6 +223,9 @@ std::shared_ptr<RepartitionNode> RepartitionNode::create(NodeID node_id, const s
                                                          size_t num_partitions, SchemaRef schema,
                                                          std::shared_ptr<DistributedPipelineNode> child,
                                                          std::shared_ptr<ExchangeManager> exchange_mgr) {
+	if (num_partitions == 0) {
+		throw InvalidInputException("RepartitionNode requires at least one partition");
+	}
 	PipelineNodeContext context(plan_config->query_idx, plan_config->query_id, node_id, NODE_NAME);
 	auto upstream_num = child ? child->config().clustering_spec()->num_partitions() : 1;
 	// Use num_partitions (not the node-count-capped remote_partitions) for the
