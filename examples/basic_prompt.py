@@ -8,10 +8,8 @@ import vane
 connection = vane.connect()
 relation = connection.sql(
     """
-    SELECT *
-    FROM (VALUES
-        ('Summarize this image.', read_blob('example.png'))
-    ) input(prompt, image)
+    SELECT 'Summarize this image.' AS prompt, content AS image
+    FROM read_blob('examples/example.png')
     """
 )
 
