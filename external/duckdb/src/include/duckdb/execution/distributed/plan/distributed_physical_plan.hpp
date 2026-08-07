@@ -116,22 +116,23 @@ public:
 			}
 			return std::make_pair(true, curr_fragments_[curr_index_++]);
 		}
-		// Fetch next MaterializedOutput from receiver
-		auto opt = receiver_.recv();
-		if (status_) {
-			status_->ThrowIfError();
+		while (true) {
+			// Fetch next MaterializedOutput from receiver
+			auto opt = receiver_.recv();
+			if (status_) {
+				status_->ThrowIfError();
+			}
+			if (!opt.first)
+				return std::make_pair(false, ResultPartitionRef());
+			curr_fragments_ = opt.second.fragments();
+			curr_index_ = 0;
+			if (!curr_fragments_.empty()) {
+				if (status_) {
+					status_->ThrowIfError();
+				}
+				return std::make_pair(true, curr_fragments_[curr_index_++]);
+			}
 		}
-		if (!opt.first)
-			return std::make_pair(false, ResultPartitionRef());
-		curr_fragments_ = opt.second.fragments();
-		curr_index_ = 0;
-		if (curr_fragments_.empty()) {
-			return next(); // skip empty outputs
-		}
-		if (status_) {
-			status_->ThrowIfError();
-		}
-		return std::make_pair(true, curr_fragments_[curr_index_++]);
 	}
 
 	bool is_exhausted() const {
