@@ -51,7 +51,7 @@ jobs:
             ':(exclude,glob).github/ISSUE_TEMPLATE/**' \
             ':(exclude,glob).github/PULL_REQUEST_TEMPLATE/**'; then
             run_full=false
-            echo "Only Markdown or static GitHub templates changed; skipping package, native, and fast-test CI."
+            echo "Only Markdown or static GitHub templates changed; skipping package, native, fast-test, and AI-test CI."
           else
             run_full=true
             echo "A product, build, dependency, or automation file changed; running full CI."
@@ -357,6 +357,80 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  ai-tests:
+    name: AI tests
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Restore the uv package cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/uv
+          key: ai-tests-uv-v1-${{ runner.os }}-${{ runner.arch }}-py312-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install the wheel and AI test dependencies
+        run: |
+          python -m pip install --upgrade pip uv
+          uv pip install --system --group ai-test dist/*.whl
+          uv pip check
+
+      - name: Verify the artifact-installed AI environment
+        run: |
+          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" python - <<'PY'
+          import importlib.metadata
+          import pathlib
+          import sys
+
+          import _duckdb
+          import anthropic
+          import duckdb
+          import google.genai
+          import openai
+          import vane
+
+          environment_root = pathlib.Path(sys.prefix).resolve()
+          for package in (_duckdb, duckdb, vane):
+              package_path = pathlib.Path(package.__file__).resolve()
+              if not package_path.is_relative_to(environment_root):
+                  raise RuntimeError(f"{package.__name__} was not imported from the wheel: {package_path}")
+              print(f"{package.__name__}: {package_path}")
+          for distribution_name in ("anthropic", "google-genai", "openai"):
+              version = importlib.metadata.version(distribution_name)
+              print(f"{distribution_name}: {version}")
+          PY
+
+      - name: Run AI tests
+        run: |
+          site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+          cd "$RUNNER_TEMP"
+          PYTHONSAFEPATH=1 PYTHONPATH="$site_packages:$GITHUB_WORKSPACE" \
+            timeout --signal=INT --kill-after=30s 600s \
+            python -m pytest --import-mode=importlib --quiet "$GITHUB_WORKSPACE/tests/ai"
+
   # Keep this as the stable branch-protection check; matrix jobs may be skipped.
   required-ci:
     name: Required CI
@@ -366,11 +440,13 @@ jobs:
       - source-package
       - native-fast-tests
       - fast-tests
+      - ai-tests
     runs-on: ubuntu-24.04
     steps:
       - name: Verify CI results
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          AI_TESTS_RESULT: ${{ needs.ai-tests.result }}
           FAST_TESTS_RESULT: ${{ needs.fast-tests.result }}
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
@@ -396,8 +472,9 @@ jobs:
 
           if [[ "$SOURCE_PACKAGE_RESULT" != "$expected_result" ||
                 "$NATIVE_TESTS_RESULT" != "$expected_result" ||
-                "$FAST_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT" >&2
+                "$FAST_TESTS_RESULT" != "$expected_result" ||
+                "$AI_TESTS_RESULT" != "$expected_result" ]]; then
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 
