@@ -118,23 +118,6 @@ pre-commit run --from-ref origin/main --to-ref HEAD
 
 Run `pre-commit install` once per clone.
 
-Run the full Python lint and format checks without modifying the checkout:
-
-```bash
-ruff check --no-fix .
-ruff format --check .
-```
-
-Apply repository-wide Ruff fixes and formatting explicitly:
-
-```bash
-ruff check --fix .
-ruff format .
-```
-
-These commands follow the exclusions in `pyproject.toml`; the imported
-`external/duckdb` tree uses its own formatter below.
-
 Add `--check` to verify formatting without modifying files. Use `workspace`
 when both Vane-owned files and the DuckDB subtree have changed:
 
