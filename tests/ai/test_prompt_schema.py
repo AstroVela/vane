@@ -8,6 +8,7 @@ import json
 import pyarrow as pa
 import pytest
 
+import duckdb
 from vane.ai._schema import OutputValidationError, SchemaValidationError, compile_return_format
 
 PORTABLE_SCHEMA = {
@@ -251,11 +252,119 @@ def test_non_pydantic_class_with_schema_method_is_rejected():
             {"type": "object", "properties": {"x": {"$ref": "https://example.test/schema"}}},
             "only local",
         ),
+        (
+            {
+                "type": "object",
+                "properties": {"meta": {"type": "object", "properties": {}}},
+            },
+            "at least one",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}, "ANSWER": {"type": "integer"}},
+            },
+            "differ only by case",
+        ),
+        (
+            {
+                "type": "object",
+                "properties": {
+                    "nested": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}, "VALUE": {"type": "integer"}},
+                    }
+                },
+            },
+            "differ only by case",
+        ),
     ],
 )
 def test_schema_subset_rejects_unsupported_shapes(schema, match):
     with pytest.raises(SchemaValidationError, match=match):
         compile_return_format(schema)
+
+
+def test_case_insensitive_collision_in_definitions_is_rejected():
+    with pytest.raises(SchemaValidationError, match="differ only by case"):
+        compile_return_format(
+            {
+                "$defs": {
+                    "Detail": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}, "LABEL": {"type": "string"}},
+                    }
+                },
+                "type": "object",
+                "properties": {"detail": {"$ref": "#/$defs/Detail"}},
+            }
+        )
+
+
+def test_empty_nested_object_in_array_items_is_rejected():
+    with pytest.raises(SchemaValidationError, match="at least one property"):
+        compile_return_format(
+            {
+                "type": "object",
+                "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {}}}},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "type": "object",
+            "properties": {
+                "s": {"type": "string"},
+                "i": {"type": "integer"},
+                "n": {"type": "number"},
+                "b": {"type": "boolean"},
+            },
+        },
+        {"type": "object", "properties": {"a": {"type": "array", "items": {"type": "integer"}}}},
+        {
+            "type": "object",
+            "properties": {
+                "a": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "string"}}}}
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"a": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}}},
+        },
+        {"type": "object", "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "null"}]}}},
+        {"type": "object", "properties": {"x": {"type": ["integer", "null"]}}},
+        {"type": "object", "properties": {"e": {"type": "string", "enum": ["a", "b"]}}},
+        {"type": "object", "properties": {"e": {"type": ["string", "null"], "enum": ["a"]}}},
+        {
+            "$defs": {"Detail": {"type": "object", "properties": {"y": {"type": "integer"}}}},
+            "type": "object",
+            "properties": {"d": {"$ref": "#/$defs/Detail"}},
+        },
+        {
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "properties": {
+                        "b": {
+                            "type": "object",
+                            "properties": {"c": {"type": "object", "properties": {"d": {"type": "string"}}}},
+                        }
+                    },
+                }
+            },
+        },
+    ],
+)
+def test_every_supported_schema_shape_derives_a_duckdb_bindable_type(schema):
+    spec = compile_return_format(schema)
+    assert spec is not None
+
+    duckdb.sqltype(spec.duckdb_type)
+    duckdb.sql(f"SELECT CAST(NULL AS {spec.duckdb_type})")
 
 
 @pytest.mark.parametrize(

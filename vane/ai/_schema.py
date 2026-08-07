@@ -372,8 +372,6 @@ class _Compiler:
         root = self._compile_node(self.schema, "$", ())
         if root.kind != "object" or root.nullable:
             raise _schema_error("$", "root type must be a non-nullable object")
-        if not root.properties:
-            raise _schema_error("$.properties", "root object must define at least one property")
         for reference in self.definitions:
             self._compile_reference(reference, f"definition {reference}", ())
         return root
@@ -478,6 +476,18 @@ class _Compiler:
                 raise _schema_error(
                     f"{path}.properties", "property names must match [A-Za-z0-9_-] and contain 1-64 characters"
                 )
+        if not properties:
+            raise _schema_error(f"{path}.properties", "object schemas must define at least one property")
+        seen: dict[str, str] = {}
+        for name in properties:
+            folded = name.casefold()
+            if folded in seen:
+                raise _schema_error(
+                    f"{path}.properties",
+                    f"property names differ only by case, which DuckDB treats as the same STRUCT member: "
+                    f"{seen[folded]!r} and {name!r}",
+                )
+            seen[folded] = name
         required_raw = schema.get("required", [])
         if not isinstance(required_raw, list) or any(not isinstance(name, str) for name in required_raw):
             raise _schema_error(f"{path}.required", "must be a string array")
