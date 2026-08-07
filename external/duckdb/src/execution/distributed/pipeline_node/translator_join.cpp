@@ -187,7 +187,7 @@ DistributedJoinStrategyOverride GetJoinStrategyOverride() {
 Optional<bool> BroadcastReceiverRepartitionOverride() {
 	const char *env = std::getenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION");
 	if (!env || !*env) {
-		return 0;
+		return Optional<bool>{};
 	}
 	std::string value(env);
 	std::transform(value.begin(), value.end(), value.begin(),
@@ -198,7 +198,7 @@ Optional<bool> BroadcastReceiverRepartitionOverride() {
 	if (value == "0" || value == "false" || value == "no" || value == "off") {
 		return false;
 	}
-	return 0;
+	return Optional<bool>{};
 }
 
 } // namespace
