@@ -519,6 +519,7 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
+    "cloudpickle",
     "fsspec.*",
     "pandas",
     "polars",

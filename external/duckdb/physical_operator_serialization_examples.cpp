@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //===----------------------------------------------------------------------===//
-// PhysicalOperator 序列化使用示例
+// PhysicalOperator serialization examples
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -15,15 +15,15 @@
 
 namespace duckdb {
 
-// 示例：序列化和反序列化 PhysicalFilter
+// Example: serialize and deserialize PhysicalFilter
 void ExampleSerializePhysicalFilter() {
-    // 注意：这是伪代码示例，实际使用需要完整的 DuckDB 上下文
+    // This is pseudocode; real usage requires a complete DuckDB context.
     
     /* 
-    // 1. 创建 PhysicalPlan
+    // 1. Create a PhysicalPlan.
     PhysicalPlan physical_plan;
     
-    // 2. 创建过滤表达式 (例如: column > 10)
+    // 2. Create a filter expression, such as column > 10.
     vector<unique_ptr<Expression>> filter_expressions;
     auto left = make_uniq<BoundReferenceExpression>("column", LogicalType::INTEGER, 0);
     auto right = make_uniq<BoundConstantExpression>(Value::INTEGER(10));
@@ -34,7 +34,7 @@ void ExampleSerializePhysicalFilter() {
     );
     filter_expressions.push_back(std::move(comparison));
     
-    // 3. 创建 PhysicalFilter 算子
+    // 3. Create the PhysicalFilter operator.
     vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::VARCHAR};
     auto filter_op = make_uniq<PhysicalFilter>(
         physical_plan,
@@ -43,40 +43,39 @@ void ExampleSerializePhysicalFilter() {
         1000  // estimated_cardinality
     );
     
-    // 4. 序列化
+    // 4. Serialize it.
     BinarySerializer serializer;
     filter_op->Serialize(serializer);
     auto serialized_data = serializer.GetData();
     
-    // 5. 反序列化
+    // 5. Deserialize it.
     BinaryDeserializer deserializer(serialized_data);
     auto deserialized_filter = PhysicalFilter::Deserialize(deserializer, physical_plan);
     
-    // 6. 使用反序列化的算子
-    // deserialized_filter 现在可以像原始算子一样使用
+    // 6. Use the deserialized operator like the original one.
     */
 }
 
-// 示例：序列化和反序列化 PhysicalProjection
+// Example: serialize and deserialize PhysicalProjection
 void ExampleSerializePhysicalProjection() {
     /* 
-    // 1. 创建 PhysicalPlan
+    // 1. Create a PhysicalPlan.
     PhysicalPlan physical_plan;
     
-    // 2. 创建投影表达式列表
+    // 2. Create the projection expression list.
     vector<unique_ptr<Expression>> select_list;
     
-    // 投影第一列
+    // Project the first column.
     select_list.push_back(
         make_uniq<BoundReferenceExpression>("col1", LogicalType::INTEGER, 0)
     );
     
-    // 投影第二列
+    // Project the second column.
     select_list.push_back(
         make_uniq<BoundReferenceExpression>("col2", LogicalType::VARCHAR, 1)
     );
     
-    // 3. 创建 PhysicalProjection 算子
+    // 3. Create the PhysicalProjection operator.
     vector<LogicalType> output_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
     auto projection_op = make_uniq<PhysicalProjection>(
         physical_plan,
@@ -85,130 +84,129 @@ void ExampleSerializePhysicalProjection() {
         1000  // estimated_cardinality
     );
     
-    // 4. 序列化
+    // 4. Serialize it.
     BinarySerializer serializer;
     projection_op->Serialize(serializer);
     auto serialized_data = serializer.GetData();
     
-    // 5. 反序列化
+    // 5. Deserialize it.
     BinaryDeserializer deserializer(serialized_data);
     auto deserialized_projection = PhysicalProjection::Deserialize(deserializer, physical_plan);
     
-    // 6. 验证
+    // 6. Verify the result.
     assert(deserialized_projection->select_list.size() == 2);
     */
 }
 
-// 示例：尝试序列化未实现的算子
+// Example: try to serialize an unsupported operator
 void ExampleUnimplementedOperator() {
     /* 
-    // 对于未实现序列化的算子，会抛出 NotImplementedException
+    // Operators without serialization support throw NotImplementedException.
     
     try {
-        // 假设某个算子没有实现序列化
+        // Assume an operator does not implement serialization.
         PhysicalPlan physical_plan;
-        // ... 创建某个未实现序列化的算子 ...
+        // ... create an operator without serialization support ...
         
         BinarySerializer serializer;
-        // operator->Serialize(serializer);  // 会抛出异常
+        // operator->Serialize(serializer);  // Throws an exception.
         
     } catch (const NotImplementedException &e) {
-        // 错误信息类似: "Serialization not implemented for operator type: XXX"
+        // The error resembles: "Serialization not implemented for operator type: XXX".
         std::cout << "Expected error: " << e.what() << std::endl;
     }
     */
 }
 
-// 示例：序列化包含子算子的算子树
+// Example: serialize an operator tree with child operators
 void ExampleSerializeOperatorTree() {
     /* 
-    // 对于包含子算子的情况，需要递归序列化
+    // Trees with child operators require recursive serialization.
     
     PhysicalPlan physical_plan;
     
-    // 1. 创建叶子算子（如 TableScan）
-    // ... 创建 table_scan ...
+    // 1. Create a leaf operator such as TableScan.
+    // ... create table_scan ...
     
-    // 2. 创建 Projection 算子，以 TableScan 为子算子
+    // 2. Create a Projection operator with TableScan as its child.
     vector<unique_ptr<Expression>> proj_list;
-    // ... 添加投影表达式 ...
+    // ... add projection expressions ...
     auto projection = make_uniq<PhysicalProjection>(
         physical_plan,
         types,
         std::move(proj_list),
         1000
     );
-    // projection->children.push_back(table_scan);  // 添加子算子
+    // projection->children.push_back(table_scan);  // Add the child operator.
     
-    // 3. 创建 Filter 算子，以 Projection 为子算子
+    // 3. Create a Filter operator with Projection as its child.
     vector<unique_ptr<Expression>> filter_exprs;
-    // ... 添加过滤表达式 ...
+    // ... add filter expressions ...
     auto filter = make_uniq<PhysicalFilter>(
         physical_plan,
         types,
         std::move(filter_exprs),
         500
     );
-    // filter->children.push_back(projection);  // 添加子算子
+    // filter->children.push_back(projection);  // Add the child operator.
     
-    // 4. 序列化整个算子树
-    // 注意：当前实现需要手动处理子算子的序列化
-    // 未来可以在基类中实现通用的子算子序列化逻辑
+    // 4. Serialize the complete operator tree.
+    // The current implementation requires child operators to be handled manually.
+    // Common child-operator serialization could be added to the base class later.
     */
 }
 
 } // namespace duckdb
 
-// 主要用法总结
+// Usage summary
 /* 
 
-## 基本用法
+## Basic usage
 
-### 序列化
+### Serialization
 ```cpp
-// 1. 创建算子
+// 1. Create an operator.
 auto op = make_uniq<PhysicalFilter>(...);
 
-// 2. 创建序列化器
+// 2. Create a serializer.
 BinarySerializer serializer;
 
-// 3. 序列化
+// 3. Serialize the operator.
 op->Serialize(serializer);
 
-// 4. 获取序列化数据
+// 4. Retrieve the serialized data.
 auto data = serializer.GetData();
 ```
 
-### 反序列化
+### Deserialization
 ```cpp
-// 1. 创建反序列化器
+// 1. Create a deserializer.
 BinaryDeserializer deserializer(data);
 
-// 2. 反序列化
+// 2. Deserialize the operator.
 auto op = PhysicalFilter::Deserialize(deserializer, physical_plan);
 
-// 3. 使用算子
-// op 现在可以正常使用了
+// 3. Use the operator normally.
 ```
 
-## 已实现的算子
+## Supported operators
 
-1. **PhysicalFilter** - 完整实现
-   - 序列化过滤表达式
-   - 支持复杂的布尔表达式
+1. **PhysicalFilter** - fully implemented
+   - Serializes filter expressions
+   - Supports complex Boolean expressions
 
-2. **PhysicalProjection** - 完整实现
-   - 序列化投影表达式列表
-   - 支持多列投影
+2. **PhysicalProjection** - fully implemented
+   - Serializes projection expression lists
+   - Supports multi-column projections
 
-3. **PhysicalTableScan** - 部分实现
-   - 声明了接口
-   - 实现会抛出 NotImplementedException
-   - 原因：需要 catalog context 和 TableFunction 序列化
+3. **PhysicalTableScan** - partially implemented
+   - Declares the interface
+   - Throws NotImplementedException
+   - Requires catalog context and TableFunction serialization
 
-## 错误处理
+## Error handling
 
-未实现序列化的算子会抛出清晰的错误：
+Operators without serialization support throw a clear error:
 ```cpp
 throw NotImplementedException(
     "Serialization not implemented for operator type: %s",
@@ -216,29 +214,29 @@ throw NotImplementedException(
 );
 ```
 
-## 扩展指南
+## Extension guide
 
-为新算子添加序列化支持：
+To add serialization support to a new operator:
 
-1. 在头文件中声明：
+1. Declare the methods in the header:
 ```cpp
 void Serialize(Serializer &serializer) const override;
 static unique_ptr<PhysicalOperator> Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan);
 ```
 
-2. 在实现文件中：
+2. Define them in the implementation file:
 ```cpp
 void MyOperator::Serialize(Serializer &serializer) const {
     serializer.WriteProperty(100, "type", type);
     serializer.WriteProperty(101, "types", types);
     serializer.WriteProperty(102, "estimated_cardinality", estimated_cardinality);
-    // ... 序列化算子特定字段 ...
+    // ... serialize operator-specific fields ...
 }
 
 unique_ptr<PhysicalOperator> MyOperator::Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan) {
     auto types = deserializer.ReadProperty<vector<LogicalType>>(101, "types");
     auto estimated_cardinality = deserializer.ReadProperty<idx_t>(102, "estimated_cardinality");
-    // ... 反序列化算子特定字段 ...
+    // ... deserialize operator-specific fields ...
     return make_uniq<MyOperator>(physical_plan, ...);
 }
 ```

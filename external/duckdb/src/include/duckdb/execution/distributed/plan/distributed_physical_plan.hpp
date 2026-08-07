@@ -38,29 +38,24 @@ private:
 	DuckDBExecutionConfigRef config_;
 
 public:
-	// 构造函数
 	DistributedPhysicalPlan(uint16_t query_idx, std::string query_id,
 	                        std::shared_ptr<duckdb::PhysicalPlan> physical_plan, DuckDBExecutionConfigRef config)
 	    : query_idx_(query_idx), query_id_(std::move(query_id)), physical_plan_(std::move(physical_plan)),
 	      config_(std::move(config)) {
 	}
 
-	// 获取查询索引
 	uint16_t idx() const {
 		return query_idx_;
 	}
 
-	// 获取查询ID
 	const std::string &query_id() const {
 		return query_id_;
 	}
 
-	// 获取物理计划（返回引用避免不必要的拷贝）
 	const std::shared_ptr<duckdb::PhysicalPlan> &physical_plan() const {
 		return physical_plan_;
 	}
 
-	// 获取执行配置
 	DuckDBExecutionConfigRef execution_config() const {
 		return config_;
 	}
@@ -76,7 +71,6 @@ public:
 	                     DuckDBExecutionConfigRef config = nullptr);
 
 private:
-	// 禁用默认构造函数
 	DistributedPhysicalPlan() = delete;
 };
 

@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import _duckdb
 import pytest
 
-import _duckdb
 import duckdb
 from duckdb._ray_cxx import require_ray_cxx_attr
 

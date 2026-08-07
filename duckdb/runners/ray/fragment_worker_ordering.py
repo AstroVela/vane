@@ -5,12 +5,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
 from duckdb.runners.ray.fragment_registry import (
     _FTE_FRAGMENT_EXECUTION_IDS,
     _FTE_FRAGMENT_EXECUTIONS,
     _FTE_REGISTRY_LOCK,
 )
-from duckdb.runners.fte import FteTaskAttemptId, FteTaskExecutionClass
 
 
 def fragment_id_for_fte_fragment_execution_id(query_id: str, fragment_execution_id: int) -> str | None:

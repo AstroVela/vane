@@ -60,7 +60,6 @@ private:
 	DuckPhysicalPlanRef plan_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
 
-	// 辅助方法：获取下一个节点ID
 	int get_next_pipeline_node_id() {
 		return ++pipeline_node_id_counter_;
 	}
@@ -85,24 +84,24 @@ private:
 	// stack of constructed DistributedPipelineNodes corresponding to visited operators
 	std::vector<std::shared_ptr<DistributedPipelineNode>> node_stack_;
 
-	// 生成 shuffle 节点（实现自 Rust 逻辑）
+	// Generate a shuffle node using the logic from the Rust implementation
 	std::shared_ptr<DistributedPipelineNode> gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
 	                                                          SchemaRef schema,
 	                                                          std::shared_ptr<DistributedPipelineNode> child);
 
-	// 生成无预聚合的聚合节点（GroupBy/Shuffle/Gather）
+	// Generate aggregation nodes without pre-aggregation (GroupBy/Shuffle/Gather)
 	std::shared_ptr<DistributedPipelineNode> gen_without_pre_agg(std::shared_ptr<DistributedPipelineNode> input_node,
 	                                                             const std::vector<BoundExpr> &group_by,
 	                                                             const std::vector<BoundAggExpr> &aggregations,
 	                                                             SchemaRef output_schema,
 	                                                             const std::vector<BoundExpr> &partition_by);
 
-	// 生成有预聚合的聚合节点（两阶段聚合：pre-agg -> shuffle -> final agg -> project）
+	// Generate two-stage aggregation nodes (pre-agg -> shuffle -> final agg -> project)
 	std::shared_ptr<DistributedPipelineNode> gen_with_pre_agg(std::shared_ptr<DistributedPipelineNode> input_node,
 	                                                          const GroupByAggSplit &split_details,
 	                                                          SchemaRef output_schema);
 
-	// 生成聚合节点（主入口，选择有或无预聚合路径）
+	// Generate aggregation nodes, selecting the path with or without pre-aggregation
 	std::shared_ptr<DistributedPipelineNode> gen_agg_nodes(std::shared_ptr<DistributedPipelineNode> input_node,
 	                                                       const std::vector<BoundExpr> &group_by,
 	                                                       const std::vector<BoundAggExpr> &aggregations,
@@ -115,7 +114,7 @@ private:
 	                      const std::vector<std::vector<idx_t>> &grouping_functions,
 	                      const std::vector<LogicalType> &input_types, SchemaRef output_schema);
 
-	// 生成 gather 节点（使用 RepartitionNode with num_partitions=1）
+	// Generate a gather node using RepartitionNode with num_partitions=1
 	std::shared_ptr<DistributedPipelineNode> gen_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
 
 	std::shared_ptr<PipelineNodeImpl>

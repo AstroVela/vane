@@ -13,8 +13,8 @@ from duckdb.runners.fte import (
 )
 
 if TYPE_CHECKING:
-    from duckdb.runners.ray.fragment_registry import _FteFragmentState
     from duckdb.runners.fte import SplitAssigner
+    from duckdb.runners.ray.fragment_registry import _FteFragmentState
 
 
 def _dynamic_scan_max_splits_per_partition() -> int | None:

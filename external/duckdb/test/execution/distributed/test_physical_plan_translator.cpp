@@ -6,7 +6,7 @@
 //
 // test_physical_plan_translator.cpp
 //
-// 单元测试：DuckDB 物理计划到分布式流水线节点的转换
+// Unit tests for translating DuckDB physical plans into distributed pipeline nodes.
 //===----------------------------------------------------------------------===//
 
 #include "catch.hpp"
@@ -352,7 +352,7 @@ TEST_CASE("Streaming UDF passthrough schema preserves physical column boundaries
 }
 
 TEST_CASE("PhysicalPlanTranslator: simple projection", "[distributed]") {
-	// 构造一个简单的物理计划: TableScan -> Projection
+	// Construct a simple physical plan: TableScan -> Projection.
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
 	LogicalType int_type = LogicalType::INTEGER;
@@ -388,7 +388,6 @@ TEST_CASE("PhysicalPlanTranslator: simple projection", "[distributed]") {
 	plan_ptr->SetRoot(projection2);
 	auto result = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
 	REQUIRE(result.ok);
-	// ...检查类型和警告...
 }
 
 TEST_CASE("PhysicalPlanTranslator: filter + projection", "[distributed]") {
@@ -434,7 +433,6 @@ TEST_CASE("PhysicalPlanTranslator: filter + projection", "[distributed]") {
 	plan_ptr2->SetRoot(projection3);
 	auto result2 = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr2);
 	REQUIRE(result2.ok);
-	// ...检查类型和警告...
 }
 
 TEST_CASE("PhysicalPlanTranslator: null plan returns error", "[distributed]") {
@@ -1092,8 +1090,6 @@ TEST_CASE("GroupedAggregateData: initialize with BoundAggregateExpression", "[di
 	// Should not throw
 	gad.InitializeGroupby(std::move(groups), std::move(aggrs), {});
 }
-
-// 此测试已被上面两个更详细的测试覆盖，可移除或重写为更复杂的计划测试
 
 TEST_CASE("PhysicalPlanTranslator: grouped hash aggregate produces Aggregate node", "[distributed]") {
 	Allocator allocator;

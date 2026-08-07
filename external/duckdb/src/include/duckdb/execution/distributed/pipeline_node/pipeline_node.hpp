@@ -156,9 +156,7 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// PipelineNodeImpl - 流水线节点接口
-// 对应 DuckDB 的 PipelineNodeImpl trait
-// 所有具体节点类型必须实现此接口
+// Distributed task stream primitives
 //===----------------------------------------------------------------------===//
 // Forward declarations needed by the stream types
 template <typename TaskT>
@@ -207,23 +205,21 @@ private:
 	TaskT task_;
 };
 
-// 可提交任务流类
+// Stream of tasks ready for submission
 template <typename TaskT>
 class SubmittableTaskStream {
 public:
-	// 从接收器构造（对应 From<Receiver> trait 实现）
+	// Construct from a receiver, mirroring the From<Receiver> trait implementation
 	static SubmittableTaskStream from_receiver(Receiver<SubmittableTask<TaskT>> receiver);
 
-	// 构造函数
 	SubmittableTaskStream(std::unique_ptr<BoxStream<SubmittableTask<TaskT>>> task_stream)
 	    : task_stream_(std::move(task_stream)) {
 	}
 
-	// 物化方法 - 返回 MaterializeResult (synchronous for C++11)
+	// Materialize and return a MaterializeResult (synchronous for C++11)
 	MaterializeResult materialize(FteTaskSubmitter *fte_task_submitter = nullptr,
 	                              MaterializedOutputCallback on_output = {});
 
-	// 管道指令方法
 	template <typename F>
 	SubmittableTaskStream pipeline_instruction(std::shared_ptr<PipelineNodeImpl> node, F plan_builder,
 	                                           ::duckdb::ClientContext *client_context = nullptr) {
@@ -387,7 +383,7 @@ public:
 		return SubmittableTaskStream(std::move(boxed_stream));
 	}
 
-	// 流接口的轮询方法
+	// Poll the stream interface
 	std::pair<bool, SubmittableTask<TaskT>> poll_next() {
 		return task_stream_->poll_next();
 	}
@@ -409,20 +405,18 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
-// PipelineNodeImpl - 流水线节点接口
-// 对应 DuckDB 的 PipelineNodeImpl trait
-// 所有具体节点类型必须实现此接口
+// PipelineNodeImpl interface for pipeline nodes.
+// This mirrors DuckDB's PipelineNodeImpl trait and is implemented by every concrete node type.
 //===----------------------------------------------------------------------===//
 class PipelineNodeImpl {
 public:
-	// 纯虚函数：必须在派生类中实现
 	virtual const PipelineNodeContext &context() const = 0;
 	virtual const PipelineNodeConfig &config() const = 0;
 
 	virtual std::vector<PipelineNodeRef> children() const = 0;
-	//! 产生可提交的任务流
-	//! 对应 Rust: fn produce_tasks(...) -> BoxStream<'static, SubmittableTask<WorkerTask>>
-	//! C++20 协程版本返回 Generator，使用 co_yield 产出任务
+	//! Produce a stream of tasks ready for submission.
+	//! Corresponds to Rust: fn produce_tasks(...) -> BoxStream<'static, SubmittableTask<WorkerTask>>.
+	//! The C++20 coroutine returns a Generator and yields tasks with co_yield.
 	virtual SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) = 0;
 	virtual NodeName name() const {
 		return this->context().node_name();
@@ -474,7 +468,6 @@ class DistributedPipelineNode : public PipelineNodeImpl,
                                 public TreeDisplay,
                                 public std::enable_shared_from_this<DistributedPipelineNode> {
 public:
-	// 构造函数
 	DistributedPipelineNode(std::shared_ptr<PipelineNodeImpl> op) : op_(std::move(op)) {
 		// Defensive: if op_ is null, do not attempt to inspect children.
 		if (!op_)
@@ -490,26 +483,21 @@ public:
 		}
 	}
 
-	// 拷贝构造函数（对应 #[derive(Clone)]）
 	DistributedPipelineNode(const DistributedPipelineNode &other) : op_(other.op_), children_(other.children_) {
 	}
 
-	// 获取上下文
 	const PipelineNodeContext &context() const {
 		return op_->context();
 	}
 
-	// 获取配置
 	const PipelineNodeConfig &config() const {
 		return op_->config();
 	}
 
-	// 获取节点ID
 	NodeID node_id() const {
 		return op_->node_id();
 	}
 
-	// 获取节点名称
 	NodeName name() const {
 		return op_->name();
 	}
@@ -530,19 +518,16 @@ public:
 		return op_;
 	}
 
-	// 获取分区数量
 	size_t num_partitions() const;
 
 	// If this node is a ScanSource with scan tasks, return them.
 	bool try_get_scan_tasks(std::vector<ScanTaskDescriptor> &out) const;
 
-	// 生产任务流
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
 		auto result = op_->produce_tasks(plan_context);
 		return std::move(result);
 	}
 
-	// 转换为树显示接口
 	const TreeDisplay *as_tree_display() const {
 		return this;
 	}
@@ -567,20 +552,18 @@ public:
 		return DuckDBResult<DistributedPipelineNodeRef>::ok(std::move(node));
 	}
 
-	// TreeDisplay 接口实现
 	std::string display_as(DisplayLevel level) const {
 		switch (level) {
 		case DisplayLevel::Compact:
 			return get_name();
 		case DisplayLevel::Default: {
 			auto display_lines = op_->multiline_display(false);
-			// 将字符串向量连接为单个字符串
 			std::string result;
 			for (const auto &line : display_lines) {
 				result += line + "\n";
 			}
 			if (!result.empty())
-				result.pop_back(); // 移除最后一个换行符
+				result.pop_back(); // Remove the trailing newline
 			return result;
 		}
 		case DisplayLevel::Verbose: {
@@ -602,9 +585,8 @@ public:
 		return op_->multiline_display(verbose);
 	}
 
-	// JSON 表示（简化版，实际需要完整的 JSON 库支持）
+	// Simplified JSON representation; full support requires a JSON library
 	std::string repr_json() const {
-		// 简化实现，实际需要使用 JSON 库
 		return "{\"id\":\"" + std::to_string(node_id()) + "\",\"type\":\"" + name() + "\",\"name\":\"" + get_name() +
 		       "\"}";
 	}
@@ -628,8 +610,6 @@ public:
 	}
 
 private:
-	// 私有构造函数，用于 with_new_children
-	// Private constructor used by with_new_children
 	DistributedPipelineNode(std::shared_ptr<PipelineNodeImpl> op, std::vector<DistributedPipelineNodeRef> children)
 	    : op_(op), children_(std::move(children)) {
 	}
