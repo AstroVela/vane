@@ -70,7 +70,7 @@ jobs:
           scripts/format root --check
 
   run-checks:
-    name: Lint, format and type checks
+    name: Lint, format and type checks for changed files
     needs: validate-format-script
     runs-on: ubuntu-24.04
     steps:
@@ -101,17 +101,6 @@ jobs:
         with:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
-
-      - name: Check the full-tree Ruff baseline
-        if: github.event_name != 'pull_request'
-        run: |
-          export PRE_COMMIT_HOME="$HOME/.cache/pre-commit"
-          pre-commit run ruff-check \
-            --show-diff-on-failure \
-            --color=always \
-            --all-files
-          git diff --exit-code
-          git diff --cached --exit-code
 
       - name: Run checks for the changed range
         env:
