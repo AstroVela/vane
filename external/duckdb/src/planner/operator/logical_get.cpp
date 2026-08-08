@@ -245,9 +245,9 @@ void LogicalGet::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(204, "projection_ids", projection_ids);
 	serializer.WriteProperty(205, "table_filters", table_filters);
 	FunctionSerializer::Serialize(serializer, function, bind_data.get());
-	if (!function.serialize) {
-		D_ASSERT(!function.serialize);
-		// no serialize method: serialize input values and named_parameters for rebinding purposes
+	if (!function.serialize || function.in_out_function) {
+		// Functions without custom serialization need these values for rebinding. In-out functions also need them
+		// during execution.
 		serializer.WriteProperty(206, "parameters", parameters);
 		serializer.WriteProperty(207, "named_parameters", named_parameters);
 		serializer.WriteProperty(208, "input_table_types", input_table_types);
@@ -277,13 +277,14 @@ unique_ptr<LogicalOperator> LogicalGet::Deserialize(Deserializer &deserializer) 
 	auto &function = result->function;
 	auto has_serialize = entry.second;
 	unique_ptr<FunctionData> bind_data;
-	if (!has_serialize) {
+	if (has_serialize) {
+		bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
+	}
+	if (!has_serialize || function.in_out_function) {
 		deserializer.ReadProperty(206, "parameters", result->parameters);
 		deserializer.ReadProperty(207, "named_parameters", result->named_parameters);
 		deserializer.ReadProperty(208, "input_table_types", result->input_table_types);
 		deserializer.ReadProperty(209, "input_table_names", result->input_table_names);
-	} else {
-		bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
 	}
 	deserializer.ReadProperty(210, "projected_input", result->projected_input);
 	deserializer.ReadPropertyWithDefault(211, "column_indexes", result->column_ids);

@@ -21,16 +21,6 @@
 
 namespace duckdb {
 
-static void EnsureCopyOutputParentExists(FileSystem &fs, const string &path) {
-	auto parent_dir = StringUtil::GetFilePath(path);
-	if (parent_dir.empty()) {
-		return;
-	}
-	if (!fs.DirectoryExists(parent_dir)) {
-		fs.CreateDirectoriesRecursive(parent_dir);
-	}
-}
-
 struct PartitionWriteInfo {
 	unique_ptr<GlobalFunctionData> global_state;
 	idx_t active_writes = 0;
@@ -104,8 +94,6 @@ public:
 		}
 		// initialize writing to the file
 		created_files.push_back(op.file_path);
-		auto &fs = FileSystem::GetFileSystem(context);
-		EnsureCopyOutputParentExists(fs, op.file_path);
 		global_state = op.function.copy_to_initialize_global(context, *op.bind_data, op.file_path);
 		if (op.function.initialize_operator) {
 			op.function.initialize_operator(*global_state, op);
@@ -404,7 +392,6 @@ unique_ptr<GlobalFunctionData> PhysicalCopyToFile::CreateFileState(ClientContext
 	idx_t this_file_offset = g.last_file_offset++;
 	auto &fs = FileSystem::GetFileSystem(context);
 	string output_path(filename_pattern.CreateFilename(fs, file_path, file_extension, this_file_offset));
-	EnsureCopyOutputParentExists(fs, output_path);
 	g.created_files.push_back(output_path);
 	optional_ptr<CopyToFileInfo> written_file_info;
 	if (return_type != CopyFunctionReturnType::CHANGED_ROWS) {

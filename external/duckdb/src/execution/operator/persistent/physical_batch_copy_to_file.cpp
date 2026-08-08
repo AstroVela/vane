@@ -7,9 +7,7 @@
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 
 #include "duckdb/common/allocator.hpp"
-#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/queue.hpp"
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/batched_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/operator/persistent/batch_memory_manager.hpp"
@@ -23,16 +21,6 @@
 #include <algorithm>
 
 namespace duckdb {
-
-static void EnsureBatchCopyOutputParentExists(FileSystem &fs, const string &path) {
-	auto parent_dir = StringUtil::GetFilePath(path);
-	if (parent_dir.empty()) {
-		return;
-	}
-	if (!fs.DirectoryExists(parent_dir)) {
-		fs.CreateDirectoriesRecursive(parent_dir);
-	}
-}
 
 struct ActiveFlushGuard {
 	explicit ActiveFlushGuard(atomic<bool> &bool_value_p) : bool_value(bool_value_p) {
@@ -149,8 +137,6 @@ public:
 			return;
 		}
 		// initialize writing to the file
-		auto &fs = FileSystem::GetFileSystem(context);
-		EnsureBatchCopyOutputParentExists(fs, op.file_path);
 		global_state = op.function.copy_to_initialize_global(context, *op.bind_data, op.file_path);
 		if (op.function.initialize_operator) {
 			op.function.initialize_operator(*global_state, op);
