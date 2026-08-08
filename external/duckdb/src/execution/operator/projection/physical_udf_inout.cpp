@@ -90,6 +90,12 @@ static bool InjectEarlyStreamingWakeupForTesting() {
 	return injected.compare_exchange_strong(expected, true);
 }
 
+static bool IsolateQueuedStreamingControlWakeupForTesting() {
+	static const bool enabled = DebugEnvFlagEnabled("VANE_ENABLE_UDF_TEST_HOOKS") &&
+	                            DebugEnvFlagEnabled("VANE_TEST_ISOLATE_QUEUED_UDF_CONTROL_WAKEUP");
+	return enabled;
+}
+
 static void StreamingUDFDebugLog(const string &message) {
 	if (!StreamingUDFDebugEnabled()) {
 		return;
@@ -1539,9 +1545,15 @@ static void NotifyStreamingDispatcherFinished(StreamingUDFState &state);
 
 static void TryWakeStreamingTasksForQueuedEvent(StreamingUDFState &state) {
 	auto guard = state.Lock();
-	// DATA events are consumed by the source side. Waking control tasks here can
-	// race with task descheduling and strand the dispatcher in RescheduleTask.
-	WakeOneStreamingSource(state, guard);
+	// Queue insertion is a real state transition for both sides. The source is
+	// the normal DATA consumer, but its task can already be gone after a
+	// downstream LIMIT finishes and a task-mode callback is then a no-op. Keep
+	// Finalize as the durable fallback consumer so it can drain DATA and terminal
+	// events, advance submission state, and wake a live source task if needed.
+	WakeStreamingUDFTasks(state, guard);
+	if (!IsolateQueuedStreamingControlWakeupForTesting()) {
+		WakeOneStreamingSource(state, guard);
+	}
 }
 
 static void QueueStreamingOutputEvent(StreamingUDFState &state, UDFOutputEvent &&event) {
@@ -1571,6 +1583,10 @@ static void EnsureStreamingExecutor(ExecutionContext &context, StreamingUDFState
 		state.op->executor->RegisterWakeupCallback([weak_state]() {
 			auto shared = weak_state.lock();
 			if (!shared) {
+				return;
+			}
+			if (IsolateQueuedStreamingControlWakeupForTesting() &&
+			    shared->queued_output_events.load(std::memory_order_relaxed) > 0) {
 				return;
 			}
 			auto guard = shared->Lock();

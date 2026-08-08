@@ -327,6 +327,131 @@ def test_streaming_task_wakeup_epoch_handles_early_and_duplicate_callbacks():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
+    """Finalize must keep output-event progress alive after a stale source callback."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import threading
+        import time
+
+        import duckdb
+        import duckdb.execution.udf as udf_exec
+        import pyarrow as pa
+        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+
+
+        class DelayedExecutor:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._wakeup = None
+                self._state = "idle"
+                self._retained_input_bytes = 0
+                self._output = None
+                self._finished = False
+                self._producer = None
+
+            def register_wakeup(self, callback):
+                self._wakeup = callback
+
+            def request_task_admission(self, retained_input_bytes):
+                with self._lock:
+                    self._retained_input_bytes = int(retained_input_bytes)
+                    self._state = "ready"
+                return True
+
+            def task_admission_state(self):
+                with self._lock:
+                    return {
+                        "state": self._state,
+                        "available": self._state == "ready",
+                        "retained_input_bytes": self._retained_input_bytes,
+                    }
+
+            def submit_with_id(self, submit_id, table):
+                values = table.column(0).to_pylist()
+                output = (
+                    "__vane_submit_result__",
+                    int(submit_id),
+                    make_local_shm_ref_bundle_result(pa.table({"y": [value + 1 for value in values]})),
+                )
+                with self._lock:
+                    self._state = "idle"
+
+                def publish():
+                    time.sleep(0.25)
+                    with self._lock:
+                        self._output = output
+                    self._wakeup()
+
+                self._producer = threading.Thread(target=publish, daemon=True)
+                self._producer.start()
+
+            def take_ready_result(self):
+                with self._lock:
+                    output = self._output
+                    self._output = None
+                    return output
+
+            def finished_submitting(self):
+                with self._lock:
+                    self._finished = True
+
+            def all_tasks_finished(self):
+                with self._lock:
+                    return self._finished and self._output is None
+
+            def close(self):
+                if self._producer is not None:
+                    self._producer.join(timeout=2)
+
+
+        def build_executor(_payload, options=None):
+            del options
+            return DelayedExecutor()
+
+
+        def add_one(table):
+            return pa.table({"y": [value + 1 for value in table.column(0).to_pylist()]})
+
+
+        udf_exec.build_executor = build_executor
+        connection = duckdb.connect()
+        try:
+            relation = connection.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
+                add_one,
+                schema={"y": duckdb.sqltypes.INTEGER},
+                execution_backend="subprocess_task",
+                batch_size=4,
+            )
+            rows = relation.limit(1).fetchall()
+            assert len(rows) == 1, rows
+            assert rows[0][0] in {1, 2, 3, 4}, rows
+        finally:
+            connection.close()
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env={
+            **os.environ,
+            "VANE_ENABLE_UDF_TEST_HOOKS": "1",
+            "VANE_TEST_ISOLATE_QUEUED_UDF_CONTROL_WAKEUP": "1",
+            "VANE_RUNNER": "local-fast",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_native_dispatcher_shutdown_closes_active_executor():
     """Terminal shutdown must close Python ownership before it returns."""
     import os
