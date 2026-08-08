@@ -255,18 +255,6 @@ class AnthropicPrompter:
         if capability_error is not None:
             raise capability_error from None
 
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            from vane.ai.metrics import record_token_metrics
-
-            record_token_metrics(
-                protocol="prompt",
-                model=self._model,
-                provider="anthropic",
-                input_tokens=getattr(usage, "input_tokens", None),
-                output_tokens=getattr(usage, "output_tokens", None),
-            )
-
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
 

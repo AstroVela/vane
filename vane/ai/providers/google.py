@@ -661,20 +661,6 @@ class GooglePrompter:
         if capability_error is not None:
             raise capability_error from None
 
-        # Record token usage metrics
-        um = getattr(response, "usage_metadata", None)
-        if um is not None:
-            from vane.ai.metrics import record_token_metrics
-
-            record_token_metrics(
-                protocol="prompt",
-                model=self._model,
-                provider="google",
-                input_tokens=getattr(um, "prompt_token_count", None),
-                output_tokens=getattr(um, "candidates_token_count", None),
-                total_tokens=getattr(um, "total_token_count", None),
-            )
-
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(
                 response,

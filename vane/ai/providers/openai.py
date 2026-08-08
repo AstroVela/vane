@@ -651,16 +651,6 @@ class OpenAITextEmbedder:
                 response_data = [
                     item for _, item in sorted(zip(indices, response_data, strict=True), key=lambda pair: pair[0])
                 ]
-            if hasattr(response, "usage") and response.usage is not None:
-                from vane.ai.metrics import record_token_metrics
-
-                record_token_metrics(
-                    protocol="embed",
-                    model=self._model,
-                    provider="openai",
-                    input_tokens=getattr(response.usage, "prompt_tokens", None),
-                    total_tokens=getattr(response.usage, "total_tokens", None),
-                )
             if encoding_format == "base64":
                 return [_decode_openai_embedding_base64(e.embedding) for e in response_data]
             return [np.array(e.embedding, dtype=np.float32) for e in response_data]
@@ -835,24 +825,6 @@ class OpenAIPrompter:
 
     # --- API dispatch -----------------------------------------------------
 
-    def _record_usage(self, response: Any) -> None:
-        """Extract token usage from an API response and record metrics."""
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
-        from vane.ai.metrics import record_token_metrics
-
-        # Chat Completions API: prompt_tokens / completion_tokens / total_tokens
-        # Responses API: input_tokens / output_tokens / total_tokens
-        record_token_metrics(
-            protocol="prompt",
-            model=self._model,
-            provider="openai",
-            input_tokens=(getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)),
-            output_tokens=(getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)),
-            total_tokens=getattr(usage, "total_tokens", None),
-        )
-
     def _chat_completions_options(self) -> dict[str, Any]:
         options = dict(self._options)
         if "max_output_tokens" in options:
@@ -923,7 +895,6 @@ class OpenAIPrompter:
                 raise
         if capability_error is not None:
             raise capability_error from None
-        self._record_usage(response)
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
         return response.choices[0].message.content
@@ -950,7 +921,6 @@ class OpenAIPrompter:
                 raise
         if capability_error is not None:
             raise capability_error from None
-        self._record_usage(response)
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
         return response.output_text
