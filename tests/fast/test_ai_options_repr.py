@@ -46,3 +46,14 @@ def test_prompt_options_reject_sensitive_values_before_repr_or_planning(options)
     with pytest.raises(ValueError, match="sensitive") as error:
         validate_prompt_options(family, options, relation=False)
     assert "plaintext-secret" not in str(error.value)
+
+
+@pytest.mark.parametrize("family", ["openai", "anthropic", "google", "vllm"])
+def test_prompt_options_reject_negative_temperature(family):
+    with pytest.raises(ValueError, match=r"temperature' must be >= 0"):
+        validate_prompt_options(family, {"temperature": -0.1}, relation=False)
+
+
+@pytest.mark.parametrize("family", ["openai", "anthropic", "google", "vllm"])
+def test_prompt_options_accept_zero_temperature(family):
+    assert validate_prompt_options(family, {"temperature": 0}, relation=False) == {"temperature": 0}

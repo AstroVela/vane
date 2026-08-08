@@ -405,7 +405,7 @@ def validate_prompt_options(
             f"Unsupported Prompt option(s) for provider {provider_family or 'custom'!r}: " + ", ".join(unknown)
         )
 
-    _require_prompt_number(copied, "temperature", nullable=True)
+    _require_prompt_number(copied, "temperature", minimum=0, nullable=True)
     for name in ("batch_size", "actor_number", "max_concurrency_per_actor"):
         _require_prompt_int(copied, name, minimum=1)
     _require_prompt_int(copied, "max_retries", minimum=0)
