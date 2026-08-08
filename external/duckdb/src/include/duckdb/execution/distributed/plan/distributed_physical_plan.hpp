@@ -126,12 +126,16 @@ public:
 				return std::make_pair(false, ResultPartitionRef());
 			curr_fragments_ = opt.second.fragments();
 			curr_index_ = 0;
-			if (!curr_fragments_.empty()) {
+			if (curr_fragments_.empty()) {
 				if (status_) {
 					status_->ThrowIfError();
 				}
-				return std::make_pair(true, curr_fragments_[curr_index_++]);
+				continue;
 			}
+			if (status_) {
+				status_->ThrowIfError();
+			}
+			return std::make_pair(true, curr_fragments_[curr_index_++]);
 		}
 	}
 

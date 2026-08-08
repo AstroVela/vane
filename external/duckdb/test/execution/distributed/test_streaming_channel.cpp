@@ -12,6 +12,7 @@
  * 3. Receiver abandonment closes the channel and releases queued values.
  * 4. Moving a receiver transfers its single-consumer ownership.
  * 5. Concurrent sender activity and receiver closure are thread-safe.
+ * 6. PlanResultStream skips empty outputs without recursion or lost errors.
  */
 
 #include <atomic>
@@ -28,6 +29,32 @@
 
 using namespace duckdb::distributed;
 using namespace duckdb::distributed::testing;
+
+namespace {
+
+class RecordErrorOnDestructionPartition : public ResultPartition {
+public:
+	explicit RecordErrorOnDestructionPartition(std::shared_ptr<PlanExecutionStatus> status)
+	    : status_(std::move(status)) {
+	}
+
+	~RecordErrorOnDestructionPartition() override {
+		status_->RecordError(DuckDBError::external_error("result partition destruction error"));
+	}
+
+	DuckDBResult<size_t> size_bytes() const override {
+		return DuckDBResult<size_t>::ok(0);
+	}
+
+	DuckDBResult<size_t> num_rows() const override {
+		return DuckDBResult<size_t>::ok(0);
+	}
+
+private:
+	std::shared_ptr<PlanExecutionStatus> status_;
+};
+
+} // namespace
 
 static_assert(!std::is_copy_constructible<UnboundedReceiver<int>>::value,
               "unbounded channels must have exactly one receiver owner");
@@ -242,6 +269,84 @@ TEST_CASE("Streaming channel: dropping plan result stream disconnects result rec
 	{ PlanResultStream stream(nullptr, std::move(receiver)); }
 
 	REQUIRE(sender.send(MaterializedOutput()).is_err());
+}
+
+TEST_CASE("Plan result stream: skips a large run of empty outputs", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+
+	// The recursive implementation retained one MaterializedOutput per call frame.
+	// This count exceeds the normal Linux test-process stack while descending.
+	constexpr idx_t EMPTY_OUTPUT_COUNT = 100000;
+	for (idx_t output_idx = 0; output_idx < EMPTY_OUTPUT_COUNT; output_idx++) {
+		sender.send(MaterializedOutput()).value();
+	}
+	{ auto dropped_sender = std::move(sender); }
+
+	PlanResultStream stream(nullptr, std::move(receiver));
+	auto result = stream.next();
+
+	REQUIRE_FALSE(result.first);
+	REQUIRE(result.second == nullptr);
+	REQUIRE(stream.is_exhausted());
+}
+
+TEST_CASE("Plan result stream: skips empty outputs before non-empty output", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	std::shared_ptr<duckdb::ColumnDataCollection> empty_collection;
+	auto first_fragment = std::make_shared<ColumnDataResultPartition>(empty_collection);
+	auto second_fragment = std::make_shared<ColumnDataResultPartition>(empty_collection);
+	std::vector<ResultPartitionRef> fragments {first_fragment, second_fragment};
+
+	REQUIRE(sender.send(MaterializedOutput()).is_ok());
+	REQUIRE(sender.send(MaterializedOutput(std::move(fragments), nullptr)).is_ok());
+	{ auto dropped_sender = std::move(sender); }
+
+	PlanResultStream stream(nullptr, std::move(receiver));
+	auto first_result = stream.next();
+	auto second_result = stream.next();
+	auto exhausted_result = stream.next();
+
+	REQUIRE(first_result.first);
+	REQUIRE(first_result.second == first_fragment);
+	REQUIRE(second_result.first);
+	REQUIRE(second_result.second == second_fragment);
+	REQUIRE_FALSE(exhausted_result.first);
+	REQUIRE(exhausted_result.second == nullptr);
+	REQUIRE(stream.is_exhausted());
+}
+
+TEST_CASE("Plan result stream: checks errors before receiving after an empty output",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto channel_state = sender.state();
+	auto status = std::make_shared<PlanExecutionStatus>();
+	std::vector<ResultPartitionRef> trigger_fragments;
+	trigger_fragments.push_back(std::make_shared<RecordErrorOnDestructionPartition>(status));
+	std::shared_ptr<duckdb::ColumnDataCollection> empty_collection;
+	auto queued_fragment = std::make_shared<ColumnDataResultPartition>(empty_collection);
+	std::vector<ResultPartitionRef> queued_fragments {queued_fragment};
+
+	REQUIRE(sender.send(MaterializedOutput(std::move(trigger_fragments), nullptr)).is_ok());
+	REQUIRE(sender.send(MaterializedOutput()).is_ok());
+	REQUIRE(sender.send(MaterializedOutput(std::move(queued_fragments), nullptr)).is_ok());
+
+	PlanResultStream stream(nullptr, std::move(receiver), status);
+	{
+		auto trigger_result = stream.next();
+		REQUIRE(trigger_result.first);
+		trigger_result.second.reset();
+	}
+
+	// Replacing the exhausted buffered fragments with the empty output records
+	// the error. The stream must observe it before consuming the queued output.
+	REQUIRE_THROWS_WITH(stream.next(), Catch::Matchers::Contains("result partition destruction error"));
+	REQUIRE_FALSE(channel_state->is_empty());
 }
 
 TEST_CASE("Streaming channel: receiver close races safely with active sender", "[distributed][streaming_channel]") {
