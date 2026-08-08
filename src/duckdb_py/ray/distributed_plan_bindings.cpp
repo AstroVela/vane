@@ -1050,13 +1050,86 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	return plan_wrapper;
 }
 
+class PyBackendResultOperationGuard {
+public:
+	explicit PyBackendResultOperationGuard(std::function<void()> finish) : finish_(std::move(finish)) {
+	}
+
+	PyBackendResultOperationGuard(const PyBackendResultOperationGuard &) = delete;
+	PyBackendResultOperationGuard &operator=(const PyBackendResultOperationGuard &) = delete;
+
+	~PyBackendResultOperationGuard() {
+		finish_();
+	}
+
+private:
+	std::function<void()> finish_;
+};
+
 class PyBackendWorkerManager : public duckdb::distributed::WorkerManager {
 public:
 	template <class T>
 	using DuckDBResult = duckdb::distributed::DuckDBResult<T>;
 	using DuckDBError = duckdb::distributed::DuckDBError;
+	using QueryCleanup = std::function<void(const string &)>;
 
-	explicit PyBackendWorkerManager(py::object backend) : backend_(std::move(backend)) {
+	explicit PyBackendWorkerManager(py::object backend, QueryCleanup query_cleanup)
+	    : backend_(std::move(backend)), query_cleanup_(std::move(query_cleanup)) {
+	}
+
+	void register_query_owner(const string &query_id, const string &owner_query_id) {
+		if (query_id.empty() || owner_query_id.empty()) {
+			throw std::invalid_argument("FTE query ownership requires non-empty query and owner IDs");
+		}
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto existing_owner = result_handle_owner_by_query_.find(query_id);
+			if (existing_owner != result_handle_owner_by_query_.end() && existing_owner->second != owner_query_id) {
+				throw std::runtime_error("FTE query result owner changed while active: query=" + query_id +
+				                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
+			}
+			if (all_result_handle_ingress_closed_ ||
+			    closed_result_handle_queries_.find(query_id) != closed_result_handle_queries_.end() ||
+			    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end() ||
+			    dropping_result_handle_query_owners_.find(owner_query_id) !=
+			        dropping_result_handle_query_owners_.end()) {
+				throw std::runtime_error("cannot register closing FTE query lifecycle: " + query_id);
+			}
+			if (existing_owner != result_handle_owner_by_query_.end()) {
+				return;
+			}
+			if (registering_result_handle_owner_by_query_.find(query_id) !=
+			    registering_result_handle_owner_by_query_.end()) {
+				throw std::runtime_error("FTE query lifecycle registration is already in progress: " + query_id);
+			}
+			registering_result_handle_owner_by_query_[query_id] = owner_query_id;
+		}
+		try {
+			duckdb::PythonGILWrapper gil;
+			auto backend = backend_.get();
+			backend.attr("register_query_owner")(query_id, owner_query_id);
+		} catch (...) {
+			{
+				lock_guard<mutex> guard(mutex_);
+				registering_result_handle_owner_by_query_.erase(query_id);
+			}
+			result_handle_condition_.notify_all();
+			throw;
+		}
+		{
+			lock_guard<mutex> guard(mutex_);
+			registering_result_handle_owner_by_query_.erase(query_id);
+			if (all_result_handle_ingress_closed_ ||
+			    closed_result_handle_queries_.find(query_id) != closed_result_handle_queries_.end() ||
+			    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end() ||
+			    dropping_result_handle_query_owners_.find(owner_query_id) !=
+			        dropping_result_handle_query_owners_.end()) {
+				result_handle_condition_.notify_all();
+				throw std::runtime_error("cannot publish closing FTE query lifecycle: " + query_id);
+			}
+			result_handle_owner_by_query_[query_id] = owner_query_id;
+		}
+		result_handle_condition_.notify_all();
 	}
 
 	DuckDBResult<std::vector<duckdb::distributed::WorkerSnapshot>> worker_snapshots() const override {
@@ -1092,16 +1165,80 @@ public:
 	}
 
 	DuckDBResult<void> shutdown() override {
-		duckdb::PythonGILWrapper gil;
-		try {
-			auto backend = backend_.get();
-			if (py::hasattr(backend, "shutdown")) {
-				backend.attr("shutdown")();
-			}
+		if (!BeginResultHandleShutdown()) {
 			return DuckDBResult<void>::ok();
-		} catch (const std::exception &e) {
-			return DuckDBResult<void>::err(DuckDBError(string("Python backend shutdown failed: ") + e.what()));
 		}
+		bool shutdown_succeeded = false;
+		PyBackendResultOperationGuard shutdown_guard(
+		    [this, &shutdown_succeeded]() { EndResultHandleShutdown(shutdown_succeeded); });
+		auto clear_handles = [&](const char *phase) -> std::optional<string> {
+			try {
+				ClearAllResultHandles();
+				return std::nullopt;
+			} catch (const std::exception &ex) {
+				return string(phase) + " result cleanup: " + ex.what();
+			} catch (...) {
+				return string(phase) + " result cleanup: unknown error";
+			}
+		};
+		std::optional<string> backend_shutdown_error;
+		try {
+			duckdb::PythonGILWrapper gil;
+			auto backend = backend_.get();
+			backend.attr("shutdown")();
+		} catch (const std::exception &e) {
+			backend_shutdown_error = string("backend shutdown: ") + e.what();
+		} catch (...) {
+			backend_shutdown_error = "backend shutdown: unknown error";
+		}
+		WaitForAllResultHandleOperations();
+		auto initial_cleanup_error = clear_handles("post-quiescence");
+		std::optional<string> final_cleanup_error;
+		if (initial_cleanup_error) {
+			final_cleanup_error = clear_handles("cleanup retry");
+		}
+		std::vector<string> owner_cleanup_errors;
+		if (!backend_shutdown_error && !final_cleanup_error) {
+			std::unordered_set<string> owner_query_ids;
+			{
+				lock_guard<mutex> guard(mutex_);
+				for (const auto &entry : result_handle_owner_by_query_) {
+					owner_query_ids.insert(entry.second);
+				}
+			}
+			std::vector<string> ordered_owner_query_ids(owner_query_ids.begin(), owner_query_ids.end());
+			std::sort(ordered_owner_query_ids.begin(), ordered_owner_query_ids.end());
+			for (const auto &owner_query_id : ordered_owner_query_ids) {
+				try {
+					query_cleanup_(owner_query_id);
+				} catch (const std::exception &ex) {
+					owner_cleanup_errors.push_back(owner_query_id + ": " + ex.what());
+				} catch (...) {
+					owner_cleanup_errors.push_back(owner_query_id + ": unknown cleanup error");
+				}
+			}
+		}
+		std::vector<string> errors;
+		if (backend_shutdown_error) {
+			errors.push_back(*backend_shutdown_error);
+		}
+		if (initial_cleanup_error && final_cleanup_error) {
+			errors.push_back(*initial_cleanup_error);
+			errors.push_back(*final_cleanup_error);
+		}
+		for (const auto &owner_cleanup_error : owner_cleanup_errors) {
+			errors.push_back("query owner cleanup: " + owner_cleanup_error);
+		}
+		if (!errors.empty()) {
+			string message = "Python backend shutdown failed";
+			for (const auto &error : errors) {
+				message += "; " + error;
+			}
+			return DuckDBResult<void>::err(DuckDBError(std::move(message)));
+		}
+		FinishResultHandleShutdown();
+		shutdown_succeeded = true;
+		return DuckDBResult<void>::ok();
 	}
 
 	DuckDBResult<void> submit_fte_task_events(std::vector<duckdb::distributed::WorkerTask> tasks) override {
@@ -1113,6 +1250,15 @@ public:
 			if (!tasks.empty() && query_id.empty()) {
 				return DuckDBResult<void>::err(DuckDBError::value_error("FTE task events require non-empty query_id"));
 			}
+			if (tasks.empty()) {
+				return DuckDBResult<void>::ok();
+			}
+			auto active_owner = BeginResultHandleOperation(query_id, submission_error_owner);
+			if (!active_owner) {
+				return DuckDBResult<void>::ok();
+			}
+			PyBackendResultOperationGuard operation(
+			    [this, owner = *active_owner]() { EndResultHandleOperation(owner); });
 			duckdb::PythonGILWrapper gil;
 			py::list py_tasks;
 			for (auto &task : tasks) {
@@ -1121,7 +1267,7 @@ public:
 			}
 			auto backend = backend_.get();
 			py::object raw_handles = backend.attr("submit_tasks")(py_tasks);
-			StorePythonResultHandles(query_id, std::move(raw_handles));
+			StorePythonResultHandles(query_id, *active_owner, std::move(raw_handles));
 			return DuckDBResult<void>::ok();
 		} catch (const py::error_already_set &e) {
 			submission_errors_.Store(submission_error_owner, e);
@@ -1139,6 +1285,12 @@ public:
 			    DuckDBError::value_error("FTE task input exhaustion requires non-empty query_id"));
 		}
 		try {
+			auto active_owner = BeginResultHandleOperation(query_id);
+			if (!active_owner) {
+				return DuckDBResult<void>::ok();
+			}
+			PyBackendResultOperationGuard operation(
+			    [this, owner = *active_owner]() { EndResultHandleOperation(owner); });
 			duckdb::PythonGILWrapper gil;
 			py::list py_source_node_ids;
 			for (auto source_node_id : source_node_ids) {
@@ -1146,7 +1298,7 @@ public:
 			}
 			auto backend = backend_.get();
 			py::object raw_handles = backend.attr("task_input_stream_exhausted")(query_id, py_source_node_ids);
-			StorePythonResultHandles(query_id, std::move(raw_handles));
+			StorePythonResultHandles(query_id, *active_owner, std::move(raw_handles));
 			return DuckDBResult<void>::ok();
 		} catch (const std::exception &e) {
 			return DuckDBResult<void>::err(
@@ -1161,6 +1313,12 @@ public:
 			    DuckDBError::value_error("materialization barrier completion requires non-empty query_id"));
 		}
 		try {
+			auto active_owner = BeginResultHandleOperation(query_id);
+			if (!active_owner) {
+				return DuckDBResult<void>::ok();
+			}
+			PyBackendResultOperationGuard operation(
+			    [this, owner = *active_owner]() { EndResultHandleOperation(owner); });
 			duckdb::PythonGILWrapper gil;
 			auto backend = backend_.get();
 			backend.attr("materialization_barrier_completed")(query_id, std::to_string(node_id));
@@ -1191,6 +1349,12 @@ public:
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
 		}
+		auto active_owner = BeginResultHandleOperation(query_id);
+		if (!active_owner) {
+			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+			    DuckDBError::external_error("Python backend FTE query is closing: " + query_id));
+		}
+		PyBackendResultOperationGuard operation([this, owner = *active_owner]() { EndResultHandleOperation(owner); });
 
 		std::unordered_set<string> selected_attempt_task_ids;
 		const bool has_deadline = timeout_s > 0.0;
@@ -1295,45 +1459,124 @@ public:
 		if (query_id.empty()) {
 			return;
 		}
-		submission_errors_.Discard(query_id);
-		std::exception_ptr result_cleanup_error;
-		try {
-			ClearResultHandles(query_id);
-		} catch (...) {
-			result_cleanup_error = std::current_exception();
+		auto active_drop_owner = BeginResultHandleDrop(query_id);
+		if (!active_drop_owner) {
+			return;
 		}
+		const auto owner_query_id = active_drop_owner->owner_query_id;
+		const auto drop_token = active_drop_owner->token;
+		PyBackendResultOperationGuard drop_guard(
+		    [this, owner_query_id, drop_token]() { EndResultHandleDrop(owner_query_id, drop_token); });
+		std::vector<string> backend_drop_query_ids;
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto query_ids = ResultHandleQueryIdsForOwnerLocked(owner_query_id);
+			backend_drop_query_ids.assign(query_ids.begin(), query_ids.end());
+		}
+		std::sort(backend_drop_query_ids.begin(), backend_drop_query_ids.end(),
+		          [&](const string &lhs, const string &rhs) {
+			          if ((lhs == owner_query_id) != (rhs == owner_query_id)) {
+				          return lhs != owner_query_id;
+			          }
+			          return lhs < rhs;
+		          });
+		submission_errors_.Discard(owner_query_id);
 		std::exception_ptr backend_drop_error;
 		{
 			duckdb::PythonGILWrapper gil;
 			try {
 				auto backend = backend_.get();
-				if (py::hasattr(backend, "drop_query")) {
-					backend.attr("drop_query")(query_id);
+				std::vector<std::pair<string, std::exception_ptr>> backend_drop_errors;
+				auto drop_query = backend.attr("drop_query");
+				for (const auto &execution_query_id : backend_drop_query_ids) {
+					try {
+						drop_query(execution_query_id);
+					} catch (...) {
+						backend_drop_errors.emplace_back(execution_query_id, std::current_exception());
+					}
+				}
+				if (backend_drop_errors.size() == 1) {
+					backend_drop_error = backend_drop_errors.front().second;
+				} else if (!backend_drop_errors.empty()) {
+					auto exception_message = [](const std::exception_ptr &error) {
+						try {
+							std::rethrow_exception(error);
+						} catch (const std::exception &ex) {
+							return string(ex.what());
+						} catch (...) {
+							return string("unknown exception");
+						}
+					};
+					string message = "Python backend execution query teardown failed";
+					for (const auto &error : backend_drop_errors) {
+						message += "; " + error.first + "=" + exception_message(error.second);
+					}
+					backend_drop_error = std::make_exception_ptr(std::runtime_error(std::move(message)));
 				}
 			} catch (...) {
 				backend_drop_error = std::current_exception();
 			}
 		}
-		if (result_cleanup_error && backend_drop_error) {
-			auto exception_message = [](const std::exception_ptr &error) {
+		std::exception_ptr initial_cleanup_error;
+		std::exception_ptr final_cleanup_error;
+		std::exception_ptr owner_cleanup_error;
+		if (!backend_drop_error) {
+			WaitForResultHandleOperations(owner_query_id);
+			submission_errors_.Discard(owner_query_id);
+			try {
+				ClearResultHandlesForOwner(owner_query_id);
+			} catch (...) {
+				initial_cleanup_error = std::current_exception();
+			}
+			if (initial_cleanup_error) {
 				try {
-					std::rethrow_exception(error);
-				} catch (const std::exception &e) {
-					return string(e.what());
+					ClearResultHandlesForOwner(owner_query_id);
 				} catch (...) {
-					return string("unknown exception");
+					final_cleanup_error = std::current_exception();
 				}
-			};
-			throw std::runtime_error(
-			    "Python backend query teardown failed: result cleanup=" + exception_message(result_cleanup_error) +
-			    "; backend drop=" + exception_message(backend_drop_error));
+			}
 		}
-		if (result_cleanup_error) {
-			std::rethrow_exception(result_cleanup_error);
+		if (!backend_drop_error && !final_cleanup_error) {
+			try {
+				query_cleanup_(owner_query_id);
+			} catch (...) {
+				owner_cleanup_error = std::current_exception();
+			}
+		}
+		if (!backend_drop_error && !final_cleanup_error && !owner_cleanup_error) {
+			FinishResultHandleIngress(owner_query_id, drop_token);
+			return;
+		}
+		std::vector<std::pair<const char *, std::exception_ptr>> errors;
+		if (initial_cleanup_error && final_cleanup_error) {
+			errors.emplace_back("initial result cleanup", initial_cleanup_error);
 		}
 		if (backend_drop_error) {
-			std::rethrow_exception(backend_drop_error);
+			errors.emplace_back("backend drop", backend_drop_error);
 		}
+		if (final_cleanup_error) {
+			errors.emplace_back("final result cleanup", final_cleanup_error);
+		}
+		if (owner_cleanup_error) {
+			errors.emplace_back("query owner cleanup", owner_cleanup_error);
+		}
+		if (errors.size() == 1) {
+			std::rethrow_exception(errors.front().second);
+		}
+		auto exception_message = [](const std::exception_ptr &error) {
+			try {
+				std::rethrow_exception(error);
+			} catch (const std::exception &e) {
+				return string(e.what());
+			} catch (...) {
+				return string("unknown exception");
+			}
+		};
+		string message = "Python backend query teardown failed";
+		for (const auto &error : errors) {
+			message += string("; ") + error.first + "=" + exception_message(error.second);
+		}
+		throw std::runtime_error(std::move(message));
 	}
 
 	void rethrow_submission_error(const string &query_id) {
@@ -1380,13 +1623,32 @@ public:
 	}
 
 private:
+	struct ResultHandleDrop {
+		string owner_query_id;
+		uint64_t token;
+	};
+
 	mutable mutex mutex_;
+	std::condition_variable result_handle_condition_;
 	duckdb::distributed::python::ray::SafePyObject backend_;
+	QueryCleanup query_cleanup_;
 	duckdb::distributed::python::ray::PythonExceptionStore submission_errors_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
 	    result_handles_by_query_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
 	    retained_result_handles_by_query_;
+	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
+	    cleanup_retry_result_handles_by_query_;
+	std::unordered_map<string, string> result_handle_owner_by_query_;
+	std::unordered_map<string, string> registering_result_handle_owner_by_query_;
+	std::unordered_map<string, idx_t> active_result_handle_operations_by_owner_;
+	std::unordered_set<string> closed_result_handle_queries_;
+	std::unordered_set<string> closed_result_handle_query_owners_;
+	std::unordered_map<string, uint64_t> dropping_result_handle_query_owners_;
+	uint64_t next_result_handle_drop_token_ = 1;
+	bool all_result_handle_ingress_closed_ = false;
+	bool result_handle_shutdown_running_ = false;
+	bool result_handle_shutdown_finished_ = false;
 
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
 		std::string query_id;
@@ -1405,6 +1667,282 @@ private:
 			}
 		}
 		return query_id;
+	}
+
+	string ResultHandleOwnerForQueryLocked(const string &query_id) const {
+		auto owner = result_handle_owner_by_query_.find(query_id);
+		return owner == result_handle_owner_by_query_.end() ? query_id : owner->second;
+	}
+
+	std::optional<string> BeginResultHandleOperation(const string &query_id,
+	                                                 const string &requested_owner_query_id = string()) {
+		if (query_id.empty()) {
+			throw std::invalid_argument("result-handle operation requires non-empty query_id");
+		}
+		lock_guard<mutex> guard(mutex_);
+		auto existing_owner = result_handle_owner_by_query_.find(query_id);
+		if (existing_owner == result_handle_owner_by_query_.end()) {
+			return std::nullopt;
+		}
+		const auto owner_query_id =
+		    requested_owner_query_id.empty() ? existing_owner->second : requested_owner_query_id;
+		if (owner_query_id.empty()) {
+			throw std::invalid_argument("result-handle operation requires non-empty owner query_id");
+		}
+		if (existing_owner->second != owner_query_id) {
+			throw std::runtime_error("FTE query result owner changed while active: query=" + query_id +
+			                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
+		}
+		if (all_result_handle_ingress_closed_ ||
+		    closed_result_handle_queries_.find(query_id) != closed_result_handle_queries_.end() ||
+		    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end() ||
+		    dropping_result_handle_query_owners_.find(owner_query_id) != dropping_result_handle_query_owners_.end()) {
+			return std::nullopt;
+		}
+		result_handle_owner_by_query_[query_id] = owner_query_id;
+		active_result_handle_operations_by_owner_[owner_query_id]++;
+		return owner_query_id;
+	}
+
+	void EndResultHandleOperation(const string &owner_query_id) {
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto active = active_result_handle_operations_by_owner_.find(owner_query_id);
+			D_ASSERT(active != active_result_handle_operations_by_owner_.end());
+			D_ASSERT(active->second > 0);
+			if (--active->second == 0) {
+				active_result_handle_operations_by_owner_.erase(active);
+			}
+		}
+		result_handle_condition_.notify_all();
+	}
+
+	void WaitForResultHandleOperationsWithoutGIL(const string &owner_query_id) {
+		std::unique_lock<mutex> guard(mutex_);
+		result_handle_condition_.wait(guard, [&]() {
+			return active_result_handle_operations_by_owner_.find(owner_query_id) ==
+			       active_result_handle_operations_by_owner_.end();
+		});
+	}
+
+	void WaitForResultHandleOperations(const string &owner_query_id) {
+		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+			py::gil_scoped_release release;
+			WaitForResultHandleOperationsWithoutGIL(owner_query_id);
+			return;
+		}
+		WaitForResultHandleOperationsWithoutGIL(owner_query_id);
+	}
+
+	void WaitForAllResultHandleOperationsWithoutGIL() {
+		std::unique_lock<mutex> guard(mutex_);
+		result_handle_condition_.wait(guard, [&]() { return active_result_handle_operations_by_owner_.empty(); });
+	}
+
+	void WaitForAllResultHandleOperations() {
+		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+			py::gil_scoped_release release;
+			WaitForAllResultHandleOperationsWithoutGIL();
+			return;
+		}
+		WaitForAllResultHandleOperationsWithoutGIL();
+	}
+
+	std::unordered_set<string> ResultHandleQueryIdsForOwnerLocked(const string &owner_query_id) const {
+		std::unordered_set<string> query_ids {owner_query_id};
+		for (const auto &entry : result_handle_owner_by_query_) {
+			if (entry.second == owner_query_id) {
+				query_ids.insert(entry.first);
+			}
+		}
+		auto collect_owned_keys = [&](const auto &handles_by_query) {
+			for (const auto &entry : handles_by_query) {
+				if (ResultHandleOwnerForQueryLocked(entry.first) == owner_query_id) {
+					query_ids.insert(entry.first);
+				}
+			}
+		};
+		collect_owned_keys(result_handles_by_query_);
+		collect_owned_keys(retained_result_handles_by_query_);
+		collect_owned_keys(cleanup_retry_result_handles_by_query_);
+		return query_ids;
+	}
+
+	bool ResultHandleOwnerHasHandlesLocked(const string &owner_query_id) const {
+		auto has_owned_handles = [&](const auto &handles_by_query) {
+			for (const auto &entry : handles_by_query) {
+				if (!entry.second.empty() && ResultHandleOwnerForQueryLocked(entry.first) == owner_query_id) {
+					return true;
+				}
+			}
+			return false;
+		};
+		return has_owned_handles(result_handles_by_query_) || has_owned_handles(retained_result_handles_by_query_) ||
+		       has_owned_handles(cleanup_retry_result_handles_by_query_);
+	}
+
+	std::optional<ResultHandleDrop> BeginResultHandleDropWithoutGIL(const string &query_id) {
+		std::unique_lock<mutex> guard(mutex_);
+		auto registration_in_progress = [&]() {
+			return std::any_of(registering_result_handle_owner_by_query_.begin(),
+			                   registering_result_handle_owner_by_query_.end(),
+			                   [&](const auto &entry) { return entry.first == query_id || entry.second == query_id; });
+		};
+		result_handle_condition_.wait(guard, [&]() { return !registration_in_progress(); });
+		auto mapped_owner = result_handle_owner_by_query_.find(query_id);
+		string owner_query_id;
+		if (mapped_owner != result_handle_owner_by_query_.end()) {
+			owner_query_id = mapped_owner->second;
+		} else {
+			const bool known_owner =
+			    std::any_of(result_handle_owner_by_query_.begin(), result_handle_owner_by_query_.end(),
+			                [&](const auto &entry) { return entry.second == query_id; });
+			if (!known_owner &&
+			    dropping_result_handle_query_owners_.find(query_id) == dropping_result_handle_query_owners_.end()) {
+				return std::nullopt;
+			}
+			owner_query_id = query_id;
+		}
+		auto owner_registration_in_progress = [&]() {
+			return std::any_of(
+			    registering_result_handle_owner_by_query_.begin(), registering_result_handle_owner_by_query_.end(),
+			    [&](const auto &entry) { return entry.first == owner_query_id || entry.second == owner_query_id; });
+		};
+		result_handle_condition_.wait(guard, [&]() { return !owner_registration_in_progress(); });
+		auto joined_drop = dropping_result_handle_query_owners_.find(owner_query_id);
+		if (joined_drop != dropping_result_handle_query_owners_.end()) {
+			const auto joined_drop_token = joined_drop->second;
+			result_handle_condition_.wait(guard, [&]() {
+				auto current = dropping_result_handle_query_owners_.find(owner_query_id);
+				return current == dropping_result_handle_query_owners_.end() || current->second != joined_drop_token;
+			});
+			if (closed_result_handle_query_owners_.find(owner_query_id) == closed_result_handle_query_owners_.end()) {
+				return std::nullopt;
+			}
+			if (dropping_result_handle_query_owners_.find(owner_query_id) !=
+			    dropping_result_handle_query_owners_.end()) {
+				return std::nullopt;
+			}
+		}
+		if (all_result_handle_ingress_closed_) {
+			while (result_handle_shutdown_running_) {
+				result_handle_condition_.wait(guard);
+			}
+			if (result_handle_shutdown_finished_) {
+				return std::nullopt;
+			}
+			throw std::runtime_error("cannot drop FTE query after Python backend shutdown failed: " + query_id);
+		}
+		closed_result_handle_queries_.insert(query_id);
+		closed_result_handle_query_owners_.insert(owner_query_id);
+		const auto drop_token = next_result_handle_drop_token_++;
+		if (next_result_handle_drop_token_ == 0) {
+			next_result_handle_drop_token_ = 1;
+		}
+		dropping_result_handle_query_owners_[owner_query_id] = drop_token;
+		return ResultHandleDrop {owner_query_id, drop_token};
+	}
+
+	std::optional<ResultHandleDrop> BeginResultHandleDrop(const string &query_id) {
+		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+			py::gil_scoped_release release;
+			return BeginResultHandleDropWithoutGIL(query_id);
+		}
+		return BeginResultHandleDropWithoutGIL(query_id);
+	}
+
+	void EndResultHandleDrop(const string &owner_query_id, uint64_t drop_token) {
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto current = dropping_result_handle_query_owners_.find(owner_query_id);
+			if (current != dropping_result_handle_query_owners_.end() && current->second == drop_token) {
+				dropping_result_handle_query_owners_.erase(current);
+			}
+		}
+		result_handle_condition_.notify_all();
+	}
+
+	bool BeginResultHandleShutdownWithoutGIL() {
+		std::unique_lock<mutex> guard(mutex_);
+		while (result_handle_shutdown_running_) {
+			result_handle_condition_.wait(guard);
+		}
+		if (result_handle_shutdown_finished_) {
+			return false;
+		}
+		all_result_handle_ingress_closed_ = true;
+		result_handle_shutdown_running_ = true;
+		result_handle_condition_.wait(guard, [&]() {
+			return registering_result_handle_owner_by_query_.empty() && dropping_result_handle_query_owners_.empty();
+		});
+		return true;
+	}
+
+	bool BeginResultHandleShutdown() {
+		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+			py::gil_scoped_release release;
+			return BeginResultHandleShutdownWithoutGIL();
+		}
+		return BeginResultHandleShutdownWithoutGIL();
+	}
+
+	void EndResultHandleShutdown(bool succeeded) {
+		{
+			lock_guard<mutex> guard(mutex_);
+			result_handle_shutdown_finished_ = succeeded;
+			result_handle_shutdown_running_ = false;
+		}
+		result_handle_condition_.notify_all();
+	}
+
+	void FinishResultHandleIngress(const string &owner_query_id, uint64_t drop_token) {
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto current_drop = dropping_result_handle_query_owners_.find(owner_query_id);
+			if (current_drop == dropping_result_handle_query_owners_.end() || current_drop->second != drop_token) {
+				throw std::runtime_error("cannot finish stale FTE query result drop: " + owner_query_id);
+			}
+			if (active_result_handle_operations_by_owner_.find(owner_query_id) !=
+			    active_result_handle_operations_by_owner_.end()) {
+				throw std::runtime_error("cannot finish active FTE query result lifecycle: " + owner_query_id);
+			}
+			if (ResultHandleOwnerHasHandlesLocked(owner_query_id)) {
+				throw std::runtime_error("cannot finish FTE query lifecycle with pending result cleanup: " +
+				                         owner_query_id);
+			}
+			std::unordered_set<string> owned_query_ids {owner_query_id};
+			for (auto entry = result_handle_owner_by_query_.begin(); entry != result_handle_owner_by_query_.end();) {
+				if (entry->second == owner_query_id) {
+					owned_query_ids.insert(entry->first);
+					entry = result_handle_owner_by_query_.erase(entry);
+				} else {
+					++entry;
+				}
+			}
+			for (const auto &query_id : owned_query_ids) {
+				closed_result_handle_queries_.erase(query_id);
+			}
+			closed_result_handle_query_owners_.erase(owner_query_id);
+			dropping_result_handle_query_owners_.erase(current_drop);
+		}
+		result_handle_condition_.notify_all();
+	}
+
+	void FinishResultHandleShutdown() {
+		lock_guard<mutex> guard(mutex_);
+		if (!registering_result_handle_owner_by_query_.empty() || !dropping_result_handle_query_owners_.empty()) {
+			throw std::runtime_error("cannot finish Python backend shutdown with active lifecycle transitions");
+		}
+		if (!active_result_handle_operations_by_owner_.empty()) {
+			throw std::runtime_error("cannot finish Python backend shutdown with active result operations");
+		}
+		if (!result_handles_by_query_.empty() || !retained_result_handles_by_query_.empty() ||
+		    !cleanup_retry_result_handles_by_query_.empty()) {
+			throw std::runtime_error("cannot finish Python backend shutdown with pending result cleanup");
+		}
+		result_handle_owner_by_query_.clear();
+		closed_result_handle_queries_.clear();
+		closed_result_handle_query_owners_.clear();
 	}
 
 	static string PyStringField(const py::dict &dict, const char *field_name, const string &default_value) {
@@ -1495,7 +2033,7 @@ private:
 		return selected;
 	}
 
-	void StorePythonResultHandles(const string &query_id, py::object raw_handles) {
+	void StorePythonResultHandles(const string &query_id, const string &owner_query_id, py::object raw_handles) {
 		if (query_id.empty() || raw_handles.is_none()) {
 			return;
 		}
@@ -1508,11 +2046,22 @@ private:
 		if (wrapped.empty()) {
 			return;
 		}
-		lock_guard<mutex> guard(mutex_);
-		auto &stored = result_handles_by_query_[query_id];
-		stored.reserve(stored.size() + wrapped.size());
-		for (auto &handle : wrapped) {
-			stored.push_back(std::move(handle));
+		bool query_closed = false;
+		{
+			lock_guard<mutex> guard(mutex_);
+			query_closed =
+			    all_result_handle_ingress_closed_ ||
+			    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end();
+			if (!query_closed) {
+				auto &stored = result_handles_by_query_[query_id];
+				stored.reserve(stored.size() + wrapped.size());
+				for (auto &handle : wrapped) {
+					stored.push_back(std::move(handle));
+				}
+			}
+		}
+		if (query_closed) {
+			ReleaseLatePythonTaskResultHandles(query_id, std::move(wrapped));
 		}
 	}
 
@@ -1522,11 +2071,23 @@ private:
 		if (query_id.empty() || handles.empty()) {
 			return;
 		}
-		lock_guard<mutex> guard(mutex_);
-		auto &stored = result_handles_by_query_[query_id];
-		stored.reserve(stored.size() + handles.size());
-		for (auto &handle : handles) {
-			stored.push_back(std::move(handle));
+		bool query_closed = false;
+		{
+			lock_guard<mutex> guard(mutex_);
+			const auto owner_query_id = ResultHandleOwnerForQueryLocked(query_id);
+			query_closed =
+			    all_result_handle_ingress_closed_ ||
+			    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end();
+			if (!query_closed) {
+				auto &stored = result_handles_by_query_[query_id];
+				stored.reserve(stored.size() + handles.size());
+				for (auto &handle : handles) {
+					stored.push_back(std::move(handle));
+				}
+			}
+		}
+		if (query_closed) {
+			ReleaseLatePythonTaskResultHandles(query_id, std::move(handles));
 		}
 	}
 
@@ -1536,6 +2097,11 @@ private:
 		if (query_id.empty() || handles.empty()) {
 			return;
 		}
+		// These handles back outputs that the current operation has already
+		// materialized and is about to hand downstream. A concurrent drop may
+		// close ingress, but it must wait for that operation before releasing
+		// this ownership. Late, not-yet-consumed ingress uses
+		// StorePythonResultHandles/StorePythonTaskResultHandles instead.
 		lock_guard<mutex> guard(mutex_);
 		auto &retained = retained_result_handles_by_query_[query_id];
 		retained.reserve(retained.size() + handles.size());
@@ -1544,11 +2110,57 @@ private:
 		}
 	}
 
+	void StoreCleanupRetryResultHandles(
+	    const string &query_id,
+	    std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles) {
+		if (handles.empty()) {
+			return;
+		}
+		lock_guard<mutex> guard(mutex_);
+		auto &retry = cleanup_retry_result_handles_by_query_[query_id];
+		retry.reserve(retry.size() + handles.size());
+		for (auto &handle : handles) {
+			retry.push_back(std::move(handle));
+		}
+	}
+
+	void ReleaseLatePythonTaskResultHandles(
+	    const string &query_id,
+	    std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles) {
+		std::vector<string> errors;
+		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
+		for (size_t index = 0; index < handles.size(); index++) {
+			try {
+				handles[index]->ReleasePollResult();
+			} catch (const std::exception &ex) {
+				errors.push_back("late[" + std::to_string(index) + "]: " + ex.what());
+				retry_handles.push_back(std::move(handles[index]));
+			} catch (...) {
+				errors.push_back("late[" + std::to_string(index) + "]: unknown release error");
+				retry_handles.push_back(std::move(handles[index]));
+			}
+		}
+		StoreCleanupRetryResultHandles(query_id, std::move(retry_handles));
+		if (!errors.empty()) {
+			string message = "failed to release late Python backend result handle(s) for closed query " + query_id;
+			for (const auto &error : errors) {
+				message += "; " + error;
+			}
+			throw std::runtime_error(message);
+		}
+	}
+
 	void ClearResultHandles(const string &query_id) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retained_handles;
+		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> cleanup_retry_handles;
+		bool query_closed = false;
 		{
 			lock_guard<mutex> guard(mutex_);
+			const auto owner_query_id = ResultHandleOwnerForQueryLocked(query_id);
+			query_closed =
+			    all_result_handle_ingress_closed_ ||
+			    closed_result_handle_query_owners_.find(owner_query_id) != closed_result_handle_query_owners_.end();
 			auto it = result_handles_by_query_.find(query_id);
 			if (it != result_handles_by_query_.end()) {
 				handles = std::move(it->second);
@@ -1558,6 +2170,11 @@ private:
 			if (retained_it != retained_result_handles_by_query_.end()) {
 				retained_handles = std::move(retained_it->second);
 				retained_result_handles_by_query_.erase(retained_it);
+			}
+			auto cleanup_retry_it = cleanup_retry_result_handles_by_query_.find(query_id);
+			if (cleanup_retry_it != cleanup_retry_result_handles_by_query_.end()) {
+				cleanup_retry_handles = std::move(cleanup_retry_it->second);
+				cleanup_retry_result_handles_by_query_.erase(cleanup_retry_it);
 			}
 		}
 		std::vector<string> errors;
@@ -1577,9 +2194,72 @@ private:
 		};
 		release_all(handles, "pending");
 		release_all(retained_handles, "retained");
-		StorePythonTaskResultHandles(query_id, std::move(retry_handles));
+		release_all(cleanup_retry_handles, "cleanup-retry");
+		if (query_closed) {
+			StoreCleanupRetryResultHandles(query_id, std::move(retry_handles));
+		} else {
+			StorePythonTaskResultHandles(query_id, std::move(retry_handles));
+		}
 		if (!errors.empty()) {
 			string message = "failed to release " + std::to_string(errors.size()) + " backend result handle(s)";
+			for (const auto &error : errors) {
+				message += "; " + error;
+			}
+			throw std::runtime_error(message);
+		}
+	}
+
+	void ClearResultHandlesForOwner(const string &owner_query_id) {
+		std::unordered_set<string> query_ids;
+		{
+			lock_guard<mutex> guard(mutex_);
+			query_ids = ResultHandleQueryIdsForOwnerLocked(owner_query_id);
+		}
+		std::vector<string> errors;
+		for (const auto &query_id : query_ids) {
+			try {
+				ClearResultHandles(query_id);
+			} catch (const std::exception &ex) {
+				errors.push_back(query_id + ": " + ex.what());
+			} catch (...) {
+				errors.push_back(query_id + ": unknown cleanup error");
+			}
+		}
+		if (!errors.empty()) {
+			string message = "failed to clear Python backend result handles for owner " + owner_query_id;
+			for (const auto &error : errors) {
+				message += "; " + error;
+			}
+			throw std::runtime_error(message);
+		}
+	}
+
+	void ClearAllResultHandles() {
+		std::unordered_set<string> query_ids;
+		{
+			lock_guard<mutex> guard(mutex_);
+			for (const auto &entry : result_handles_by_query_) {
+				query_ids.insert(entry.first);
+			}
+			for (const auto &entry : retained_result_handles_by_query_) {
+				query_ids.insert(entry.first);
+			}
+			for (const auto &entry : cleanup_retry_result_handles_by_query_) {
+				query_ids.insert(entry.first);
+			}
+		}
+		std::vector<string> errors;
+		for (const auto &query_id : query_ids) {
+			try {
+				ClearResultHandles(query_id);
+			} catch (const std::exception &ex) {
+				errors.push_back(query_id + ": " + ex.what());
+			} catch (...) {
+				errors.push_back(query_id + ": unknown cleanup error");
+			}
+		}
+		if (!errors.empty()) {
+			string message = "failed to clear Python backend result handles";
 			for (const auto &error : errors) {
 				message += "; " + error;
 			}
@@ -1727,6 +2407,19 @@ private:
 	}
 };
 
+static void CleanupQueryOwnedPythonState(const string &query_id) {
+	std::exception_ptr datasource_cleanup_error;
+	try {
+		ReleaseDataSourceFactoriesForQuery(query_id);
+	} catch (...) {
+		datasource_cleanup_error = std::current_exception();
+	}
+	CleanupQueryPythonReplayState(query_id);
+	if (datasource_cleanup_error) {
+		std::rethrow_exception(datasource_cleanup_error);
+	}
+}
+
 struct PyPhysicalPlanWrapperRunner {
 	std::shared_ptr<duckdb::distributed::WorkerManager> worker_manager_;
 	std::shared_ptr<duckdb::distributed::python::ray::RayWorkerManager> ray_worker_manager_;
@@ -1749,8 +2442,15 @@ struct PyPhysicalPlanWrapperRunner {
 			worker_manager_ = ray_worker_manager_;
 			return;
 		}
-		py_backend_worker_manager_ = std::make_shared<PyBackendWorkerManager>(std::move(backend));
+		py_backend_worker_manager_ =
+		    std::make_shared<PyBackendWorkerManager>(std::move(backend), CleanupQueryOwnedPythonState);
 		worker_manager_ = py_backend_worker_manager_;
+	}
+
+	void register_query_owner(const string &query_id, const string &owner_query_id) {
+		if (py_backend_worker_manager_) {
+			py_backend_worker_manager_->register_query_owner(query_id, owner_query_id);
+		}
 	}
 
 	void drop_query_fragments(const string &query_id) {
@@ -1767,15 +2467,23 @@ struct PyPhysicalPlanWrapperRunner {
 		} catch (...) {
 			teardown_error = std::current_exception();
 		}
-		try {
-			ReleaseDataSourceFactoriesForQuery(query_id);
-		} catch (...) {
-			if (!teardown_error) {
-				teardown_error = std::current_exception();
+		if (!teardown_error && ray_worker_manager_) {
+			// Teardown completed (active result-handle operations were drained by the
+			// backend), so it is safe to release the cached datasource factories and
+			// Python replay state for this query.
+			try {
+				CleanupQueryOwnedPythonState(query_id);
+			} catch (...) {
+				if (!teardown_error) {
+					teardown_error = std::current_exception();
+				}
 			}
 		}
-		CleanupQueryPythonReplayState(query_id);
 		if (teardown_error) {
+			// Teardown failed before draining active operations. Keep the outer
+			// datasource factories and Python replay state attached to this query so
+			// that any still-running submit can keep using them; a successful retry or
+			// shutdown will release them once in-flight work has quiesced.
 			std::rethrow_exception(teardown_error);
 		}
 	}
@@ -1824,8 +2532,6 @@ struct PyPhysicalPlanWrapperRunner {
 	                                                duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                                                    duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
-		                               plan.connection_snapshot_);
 		auto run_state = std::make_shared<PlanRunState>();
 		run_state->client_context = client_context;
 		run_state->py_conn_keepalive = std::move(py_conn_keepalive);
@@ -1838,7 +2544,11 @@ struct PyPhysicalPlanWrapperRunner {
 				return string("unknown exception");
 			}
 		};
+		bool query_owner_registered = false;
 		auto cleanup_failed_start = [&](const std::exception_ptr &execution_error) {
+			if (!query_owner_registered) {
+				return;
+			}
 			std::exception_ptr cleanup_error;
 			try {
 				drop_query_fragments(plan.idx());
@@ -1854,6 +2564,17 @@ struct PyPhysicalPlanWrapperRunner {
 
 		// Call PlanRunner::run_plan
 		try {
+			const bool replay_state_created = RegisterQueryPythonReplayState(
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			try {
+				register_query_owner(plan.idx(), plan.resource_query_id_);
+			} catch (...) {
+				if (replay_state_created) {
+					CleanupQueryPythonReplayState(plan.resource_query_id_);
+				}
+				throw;
+			}
+			query_owner_registered = true;
 			// Defensive check: ensure the distributed physical plan includes a valid physical plan
 			if (!plan.plan_) {
 				string msg =
@@ -1927,8 +2648,6 @@ struct PyPhysicalPlanWrapperRunner {
 	                         duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
 	                             duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
-		RegisterQueryPythonReplayState(plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_,
-		                               plan.connection_snapshot_);
 		(void)py_conn_keepalive;
 		auto copy_started = std::chrono::steady_clock::now();
 		idx_t cleanup_ms = 0;
@@ -1944,6 +2663,7 @@ struct PyPhysicalPlanWrapperRunner {
 		};
 		bool cleanup_done = false;
 		bool body_succeeded = false;
+		bool query_owner_registered = false;
 		std::exception_ptr cleanup_error;
 		auto exception_message = [](const std::exception_ptr &error) {
 			try {
@@ -1959,6 +2679,9 @@ struct PyPhysicalPlanWrapperRunner {
 				return;
 			}
 			cleanup_done = true;
+			if (!query_owner_registered) {
+				return;
+			}
 			auto cleanup_started = std::chrono::steady_clock::now();
 			try {
 				drop_query_fragments(plan.idx());
@@ -1969,6 +2692,17 @@ struct PyPhysicalPlanWrapperRunner {
 		};
 
 		try {
+			const bool replay_state_created = RegisterQueryPythonReplayState(
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			try {
+				register_query_owner(plan.idx(), plan.resource_query_id_);
+			} catch (...) {
+				if (replay_state_created) {
+					CleanupQueryPythonReplayState(plan.resource_query_id_);
+				}
+				throw;
+			}
+			query_owner_registered = true;
 			if (!plan.plan_) {
 				throw py::value_error("DistributedPhysicalPlan missing underlying physical plan");
 			}

@@ -345,6 +345,10 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
     submission_calls = []
 
     class SubmissionTarget:
+        def register_query_owner(self, actual_query_id, owner_query_id):
+            assert actual_query_id == query_id
+            assert owner_query_id == query_id
+
         def worker_snapshots(self):
             return [
                 {

@@ -130,15 +130,6 @@ static const char *UDFOutputEventKindName(UDFOutputEventKind kind) {
 	}
 }
 
-static void ReleaseOutputLeaseCallback(std::function<void()> &callback) {
-	if (!callback) {
-		return;
-	}
-	auto release = std::move(callback);
-	callback = nullptr;
-	release();
-}
-
 static atomic<uint64_t> g_udf_debug_drain_tick {0};
 static atomic<uint64_t> g_udf_debug_dispatcher_tick {0};
 static atomic<uint64_t> g_udf_distributed_ref_bundle_data_events {0};
@@ -2385,7 +2376,7 @@ private:
 
 	bool DeliverOutputEvent(ExecutorSlot &slot, UDFOutputEvent &&event, uint64_t generation) {
 		if (!IsActiveSlotGeneration(slot, generation)) {
-			ReleaseOutputLeaseCallback(event.release_output_lease);
+			event.output_lease.Release();
 			return true;
 		}
 		const auto event_kind = event.kind;
@@ -2418,18 +2409,17 @@ private:
 		UDFOutputConsumer consumer;
 		if (!GetOutputConsumer(slot, consumer)) {
 			release_terminal_submit();
-			ReleaseOutputLeaseCallback(event.release_output_lease);
+			event.output_lease.Release();
 			SetSlotError(slot, "UDF execution started without its required output consumer");
 			return true;
 		}
 		if (!consumer.accept_event) {
 			release_terminal_submit();
-			ReleaseOutputLeaseCallback(event.release_output_lease);
+			event.output_lease.Release();
 			SetSlotError(slot, "udf output consumer is missing accept_event callback");
 			return true;
 		}
 
-		auto release_on_consumer_error = event.release_output_lease;
 		try {
 			// Streaming consumers can wake the downstream source
 			// synchronously from accept_event(). Release submit capacity first
@@ -2440,17 +2430,16 @@ private:
 			consumer.accept_event(std::move(event));
 		} catch (const std::exception &ex) {
 			if (!IsActiveSlotGeneration(slot, generation)) {
-				ReleaseOutputLeaseCallback(release_on_consumer_error);
+				event.output_lease.Release();
 				return true;
 			}
 			release_terminal_submit();
-			ReleaseOutputLeaseCallback(release_on_consumer_error);
+			event.output_lease.Release();
 			SetSlotError(slot, ex.what());
 			return true;
 		}
 
 		if (!IsActiveSlotGeneration(slot, generation)) {
-			ReleaseOutputLeaseCallback(release_on_consumer_error);
 			return true;
 		}
 		release_terminal_submit();
@@ -3012,8 +3001,7 @@ private:
 						} else {
 							throw InvalidInputException("udf stream result collector returned invalid result tuple");
 						}
-						std::function<void()> handoff_output_lease;
-						std::function<void()> release_output_lease;
+						UDFOutputLease output_lease;
 						if (event_kind == "data") {
 							if (tuple_len != 6 || output_request_id.empty() || output_lease_id.empty()) {
 								throw InvalidInputException(
@@ -3021,19 +3009,14 @@ private:
 							}
 							auto callbacks = MakeCollectorOutputLeaseCallbacks(
 							    udf_stream_result_collector->obj, slot_id, output_request_id, output_lease_id);
-							handoff_output_lease = std::move(callbacks.handoff);
-							release_output_lease = std::move(callbacks.release);
+							output_lease = UDFOutputLease(std::move(callbacks.handoff), std::move(callbacks.release));
 						}
 						if (!slot) {
-							if (release_output_lease) {
-								release_output_lease();
-							}
+							output_lease.Release();
 							continue;
 						}
 						if (slot->abort_requested.load() || !IsActiveSlotGeneration(*slot, slot_generation)) {
-							if (release_output_lease) {
-								release_output_lease();
-							}
+							output_lease.Release();
 							did_work = true;
 							continue;
 						}
@@ -3050,22 +3033,15 @@ private:
 									event.kind = UDFOutputEventKind::ERROR;
 									event.submit_complete = true;
 									event.error = DistributedRefBundleContractError(slot->payload, submit_id, payload);
-									if (release_output_lease) {
-										release_output_lease();
-										release_output_lease = nullptr;
-									}
+									output_lease.Release();
 								} else {
 									g_udf_distributed_ref_bundle_data_events.fetch_add(1, std::memory_order_relaxed);
 									event.ref_outputs =
 									    ConvertPythonRefBundleResult(payload, slot->expected_ref_output_types);
-									event.handoff_output_lease = std::move(handoff_output_lease);
-									event.release_output_lease = std::move(release_output_lease);
+									event.output_lease = std::move(output_lease);
 								}
 							} catch (const std::exception &ex) {
-								if (release_output_lease) {
-									release_output_lease();
-									release_output_lease = nullptr;
-								}
+								output_lease.Release();
 								event.kind = UDFOutputEventKind::ERROR;
 								event.submit_complete = true;
 								event.error = ex.what();
