@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, overload
@@ -140,7 +141,9 @@ class RetryAfterError(Exception):
 
     Providers raise this when they receive a rate-limit (429) or
     service-unavailable (503) response with a ``Retry-After`` header.
-    The retry helpers honour :attr:`retry_after` for the sleep duration.
+    The retry helpers honour :attr:`retry_after` for the sleep duration when
+    it is a finite, non-negative number (capped at 120s); any other value
+    falls back to exponential backoff (see :func:`_retry_wait_seconds`).
     """
 
     def __init__(self, retry_after: float, original: Exception | None = None) -> None:
@@ -156,6 +159,31 @@ class RetryAfterError(Exception):
                 continue
             if type(value) is int and -999_999 <= value <= 999_999:
                 setattr(self, name, value)
+
+
+def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
+    """Seconds to sleep before the next retry attempt.
+
+    A :class:`RetryAfterError` whose ``retry_after`` is a finite, non-negative
+    number is honoured, capped at 120s. Any other value falls back to
+    exponential backoff: a negative, NaN, or infinite delay — reachable from a
+    malformed but parseable provider ``Retry-After`` header (Google parses the
+    header with ``float()``) or a misbehaving custom provider — must never reach
+    ``time.sleep``/``asyncio.sleep``, where a negative or NaN value raises
+    ``ValueError`` (sync) or can hang the retry forever (async NaN), replacing
+    the provider's retry/``on_error`` behaviour with a spurious sleep failure
+    (issue #469).
+    """
+    if isinstance(exc, RetryAfterError):
+        retry_after = exc.retry_after
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            try:
+                wait = float(retry_after)
+            except OverflowError:  # int beyond float range — not a usable delay
+                wait = math.inf
+            if math.isfinite(wait) and wait >= 0:
+                return min(wait, 120)
+    return min(2**attempt, 30)  # 1, 2, 4, 8, ... capped at 30s
 
 
 _TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
@@ -262,10 +290,7 @@ def _retry_call(
             if not _is_transient_provider_error(exc):
                 break
             if attempt < max_retries:
-                if isinstance(exc, RetryAfterError):
-                    wait = min(exc.retry_after, 120)
-                else:
-                    wait = min(2**attempt, 30)  # 1, 2, 4, 8, ... capped at 30s
+                wait = _retry_wait_seconds(exc, attempt)
         # Do not sleep while the provider exception is the active exception.
         # Otherwise an interrupt can retain the raw SDK error as its context.
         if wait is not None:
@@ -313,10 +338,7 @@ async def _retry_call_async(
             if not _is_transient_provider_error(exc):
                 break
             if attempt < max_retries:
-                if isinstance(exc, RetryAfterError):
-                    wait = min(exc.retry_after, 120)
-                else:
-                    wait = min(2**attempt, 30)
+                wait = _retry_wait_seconds(exc, attempt)
         # Keep cancellation outside the raw provider exception handler so the
         # provider error cannot become CancelledError.__context__.
         if wait is not None:
