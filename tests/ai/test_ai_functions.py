@@ -2102,22 +2102,6 @@ def test_google_request_mapping_preserves_text_image_order():
     assert kwargs["config"].stop_sequences == ["END"]
 
 
-@pytest.mark.parametrize(
-    ("module_name", "helper_name"),
-    [
-        ("vane.ai.providers.openai", "_guess_mime_type"),
-        ("vane.ai.providers.anthropic", "_guess_media_type"),
-        ("vane.ai.providers.google", "_guess_media_type"),
-    ],
-)
-def test_prompt_image_detection_rejects_unknown_or_non_image_content(module_name, helper_name):
-    from importlib import import_module
-
-    helper = getattr(import_module(module_name), helper_name)
-    assert helper(b"%PDF-1.7") is None
-    assert helper(b"not-an-image") is None
-
-
 def test_prompt_provider_capability_error_preserves_context():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock

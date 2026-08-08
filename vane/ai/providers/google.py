@@ -33,6 +33,7 @@ from vane.ai.options import (
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -42,17 +43,19 @@ if TYPE_CHECKING:
     from vane.ai.typing import Embedding, Options
 
 
-def _guess_media_type(data: bytes) -> str | None:
-    """Guess image MIME type from magic bytes."""
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    if data[:4] == b"GIF8":
-        return "image/gif"
-    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
+# https://ai.google.dev/gemini-api/docs/image-understanding#supported-image-formats
+_IMAGE_MIME_POLICY = ImageMimePolicy(
+    provider_name="Google",
+    supported_mime_types=frozenset(
+        {
+            "image/heic",
+            "image/heif",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+    ),
+)
 
 
 def _retry_after_error_from_google_error(exc: Exception) -> Exception | None:
@@ -612,9 +615,7 @@ class GooglePrompter:
         if isinstance(msg, str):
             return types.Part.from_text(text=msg)
         if isinstance(msg, bytes):
-            media_type = _guess_media_type(msg)
-            if media_type is None:
-                raise ValueError("Prompt image BLOB has an unsupported or unrecognized image format")
+            media_type = _IMAGE_MIME_POLICY.require_supported(msg)
             return types.Part.from_bytes(data=msg, mime_type=media_type)
         raise TypeError(f"Unsupported Prompt content type: {type(msg).__name__}")
 

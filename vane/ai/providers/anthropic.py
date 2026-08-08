@@ -14,6 +14,7 @@ from vane.ai._schema import OutputValidationError, serialize_raw_response
 from vane.ai.options import validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -26,18 +27,18 @@ if TYPE_CHECKING:
 _REQUEST_OPTIONS = frozenset({"max_tokens", "temperature", "top_p", "top_k", "stop_sequences"})
 _PROMPT_OPTIONS = _REQUEST_OPTIONS | frozenset({"base_url", "timeout"})
 _STRUCTURED_OUTPUT_TOOL = "vane_structured_output"
-
-
-def _guess_media_type(data: bytes) -> str | None:
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    if data[:4] == b"GIF8":
-        return "image/gif"
-    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
+# https://platform.claude.com/docs/en/build-with-claude/vision#supported-formats
+_IMAGE_MIME_POLICY = ImageMimePolicy(
+    provider_name="Anthropic",
+    supported_mime_types=frozenset(
+        {
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+    ),
+)
 
 
 def _is_prompt_capability_error(exc: Exception) -> bool:
@@ -201,9 +202,7 @@ class AnthropicPrompter:
         if isinstance(message, str):
             return {"type": "text", "text": message}
         if isinstance(message, bytes):
-            media_type = _guess_media_type(message)
-            if media_type is None:
-                raise ValueError("Prompt image BLOB has an unsupported or unrecognized image format")
+            media_type = _IMAGE_MIME_POLICY.require_supported(message)
             return {
                 "type": "image",
                 "source": {
