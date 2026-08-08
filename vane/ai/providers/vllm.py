@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -40,12 +41,146 @@ from duckdb.execution._vllm_options_protocol import (
     _dump_vllm_protocol_json,
 )
 from vane.ai._redaction import Secret, wrap_sensitive_options
-from vane.ai.options import validate_prompt_options
+from vane.ai.options import (
+    _reject_sensitive_prompt_options,
+    _require_prompt_int,
+    _require_prompt_number,
+    normalize_prompt_options,
+)
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options
+
+
+_VLLM_PROVIDER_OPTIONS = frozenset(
+    {
+        "temperature",
+        "max_tokens",
+        "gpus_per_actor",
+        "engine_args",
+        "generate_args",
+        "do_prefix_routing",
+        "max_buffer_size",
+        "min_bucket_size",
+        "prefix_match_threshold",
+        "load_balance_threshold",
+        "inflight_limit",
+        "engine_init_timeout_s",
+    }
+)
+_VLLM_EXECUTION_OPTIONS = frozenset({"batch_size", "actor_number", "max_retries"})
+_HUGGING_FACE_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
+_REMOTE_CODE_SPECULATIVE_METHODS = frozenset(
+    {
+        "mtp",
+        "deepseek_mtp",
+        "mimo_mtp",
+        "glm4_moe_mtp",
+        "ernie_mtp",
+        "qwen3_next_mtp",
+        "longcat_flash_mtp",
+    }
+)
+
+
+def _is_hugging_face_commit_sha(value: Any) -> bool:
+    return isinstance(value, str) and _HUGGING_FACE_COMMIT_SHA.fullmatch(value) is not None
+
+
+def _validate_vllm_json(value: Any, path: str) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Prompt option {path} must contain only finite numbers")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Prompt option {path} must use string keys; got {type(key).__name__}")
+            if key in {"structured_outputs", "guided_decoding"}:
+                raise ValueError(f"Prompt option generate_args cannot configure {key} directly; use return_format")
+            _validate_vllm_json(item, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_vllm_json(item, f"{path}[{index}]")
+        return
+    raise TypeError(f"Prompt option {path} must be JSON-compatible; got {type(value).__name__}")
+
+
+def _validate_vllm_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate options owned by the native vLLM Prompt adapter."""
+
+    copied = dict(options)
+    unknown = sorted(set(copied) - _VLLM_PROVIDER_OPTIONS - _VLLM_EXECUTION_OPTIONS)
+    if unknown:
+        raise TypeError(f"Unsupported vLLM Prompt option(s): {', '.join(unknown)}")
+
+    _require_prompt_number(copied, "temperature", minimum=0, nullable=True)
+    _require_prompt_int(copied, "max_tokens", minimum=1, nullable=True)
+    for name in ("max_buffer_size", "min_bucket_size", "load_balance_threshold", "inflight_limit"):
+        _require_prompt_int(copied, name, minimum=0)
+    _require_prompt_number(copied, "prefix_match_threshold", minimum=0, maximum=1)
+    _require_prompt_number(copied, "engine_init_timeout_s", minimum=0, nullable=True)
+    if "gpus_per_actor" in copied:
+        _require_prompt_number(copied, "gpus_per_actor", minimum=0)
+        value = float(copied["gpus_per_actor"])
+        if value <= 0 or (value >= 1 and not value.is_integer()):
+            raise ValueError("Prompt option 'gpus_per_actor' must be positive and must be an integer when >= 1")
+    if "do_prefix_routing" in copied and not isinstance(copied["do_prefix_routing"], bool):
+        raise ValueError("Prompt option 'do_prefix_routing' must be a bool")
+
+    for name in ("engine_args", "generate_args"):
+        if name in copied:
+            value = copied[name]
+            if not isinstance(value, Mapping):
+                raise TypeError(f"Prompt option {name!r} must be a mapping")
+            _validate_vllm_json(value, name)
+
+    generate_args = copied.get("generate_args", {})
+    sampling_params = generate_args.get("sampling_params")
+    if isinstance(sampling_params, str):
+        try:
+            sampling_params = json.loads(sampling_params)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Prompt option 'generate_args.sampling_params' must be valid JSON") from exc
+        if not isinstance(sampling_params, Mapping):
+            raise ValueError("Prompt option 'generate_args.sampling_params' JSON must decode to a mapping")
+        _reject_sensitive_prompt_options(sampling_params, path="options.generate_args.sampling_params")
+        _validate_vllm_json(sampling_params, "generate_args.sampling_params")
+    if isinstance(sampling_params, Mapping) and "temperature" in sampling_params:
+        nested_name = "generate_args.sampling_params.temperature"
+        _require_prompt_number({nested_name: sampling_params["temperature"]}, nested_name, minimum=0, nullable=True)
+
+    engine_args = copied.get("engine_args", {})
+    if "trust_remote_code" in engine_args and not isinstance(engine_args["trust_remote_code"], bool):
+        raise ValueError("Prompt option 'engine_args.trust_remote_code' must be a bool")
+    if engine_args.get("trust_remote_code") is True:
+        for revision_name in ("code_revision", "tokenizer_revision"):
+            if not _is_hugging_face_commit_sha(engine_args.get(revision_name)):
+                raise ValueError(
+                    "Prompt option 'engine_args.trust_remote_code=True' requires "
+                    f"engine_args.{revision_name} as a full 40-character commit SHA"
+                )
+        speculative_config = engine_args.get("speculative_config")
+        speculative_model = speculative_config.get("model") if isinstance(speculative_config, Mapping) else None
+        speculative_method = speculative_config.get("method") if isinstance(speculative_config, Mapping) else None
+        if (
+            isinstance(speculative_config, Mapping)
+            and (
+                (speculative_model is not None and speculative_model not in {"ngram", "[ngram]"})
+                or speculative_method in _REMOTE_CODE_SPECULATIVE_METHODS
+            )
+            and not _is_hugging_face_commit_sha(speculative_config.get("code_revision"))
+        ):
+            raise ValueError(
+                "Prompt option 'engine_args.trust_remote_code=True' with a speculative model requires "
+                "engine_args.speculative_config.code_revision as a full 40-character commit SHA"
+            )
+    return copied
 
 
 def _canonicalize_native_json(value: Any, path: str = "options") -> Any:
@@ -159,7 +294,8 @@ class VLLMProvider(Provider):
     ) -> NativeVLLMPromptPlan:
         if return_raw_response:
             raise ValueError("Provider 'vllm' does not support return_raw_response")
-        prepared = validate_prompt_options("vllm", options or {}, relation=False)
+        prepared = normalize_prompt_options("vllm", options or {}, relation=False)
+        prepared = _validate_vllm_prompt_options(prepared)
         model_name = model or self.DEFAULT_MODEL
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("vLLM prompt model must be a non-empty string")

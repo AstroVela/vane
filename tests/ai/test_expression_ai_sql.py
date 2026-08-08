@@ -597,6 +597,19 @@ def test_ai_prompt_sql_options_must_be_a_foldable_struct_or_null():
         """).fetchall()
 
 
+def test_ai_prompt_sql_rejects_negative_temperature_during_planning():
+    conn = vane.connect()
+
+    with pytest.raises(Exception, match=r"Prompt option 'temperature' must be >= 0"):
+        conn.sql("""
+            SELECT ai_prompt(
+                'alpha',
+                provider := 'openai',
+                options := struct_pack(temperature := -0.1)
+            )
+        """).fetchall()
+
+
 @pytest.mark.parametrize("argument", ["system_message", "provider", "model", "on_error"])
 def test_ai_prompt_sql_call_level_configuration_must_be_foldable(argument):
     values = {

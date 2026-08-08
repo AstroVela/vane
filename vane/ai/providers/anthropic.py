@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Any
 
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import OutputValidationError, serialize_raw_response
-from vane.ai.options import validate_prompt_options
+from vane.ai.options import (
+    _require_prompt_int,
+    _require_prompt_number,
+    _validate_base_url_option,
+    _validate_prompt_stop_sequences,
+)
 from vane.ai.protocols import PrompterDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.providers._mime import ImageMimePolicy
@@ -109,6 +114,25 @@ class AnthropicProvider(Provider):
         )
 
 
+def _validate_anthropic_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate options owned by the Anthropic Prompt adapter."""
+
+    copied = dict(options)
+    unknown = sorted(set(copied) - _PROMPT_OPTIONS)
+    if unknown:
+        raise TypeError(f"Unsupported Anthropic Prompt option(s): {', '.join(unknown)}")
+    _require_prompt_number(copied, "temperature", minimum=0, nullable=True)
+    _require_prompt_int(copied, "max_tokens", minimum=0, nullable=True)
+    _require_prompt_int(copied, "top_k", minimum=0, nullable=True)
+    _require_prompt_number(copied, "top_p", minimum=0, maximum=1, nullable=True)
+    _validate_prompt_stop_sequences(copied)
+    _validate_base_url_option(copied, api="Prompt")
+    _require_prompt_number(copied, "timeout", minimum=0, nullable=True)
+    if copied.get("timeout") == 0:
+        raise ValueError("Prompt option 'timeout' must be a finite positive number or None")
+    return copied
+
+
 @dataclass
 class AnthropicPrompterDescriptor(PrompterDescriptor):
     """Serializable factory for the Anthropic Messages API."""
@@ -123,10 +147,7 @@ class AnthropicPrompterDescriptor(PrompterDescriptor):
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Anthropic prompt model must be a non-empty string")
-        unknown = sorted(set(self.options) - _PROMPT_OPTIONS)
-        if unknown:
-            raise TypeError(f"Unsupported Anthropic Prompt option(s): {', '.join(unknown)}")
-        validated_options = validate_prompt_options("anthropic", self.options, relation=False)
+        validated_options = _validate_anthropic_prompt_options(self.options)
         if validated_options.get("max_tokens") is None:
             raise ValueError(
                 "No max_tokens configured for the Anthropic provider. Pass max_tokens=... on the Prompt call."

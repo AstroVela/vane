@@ -27,7 +27,13 @@ from vane.ai._schema import (
     _uses_openai_strict_structured_outputs,
     serialize_raw_response,
 )
-from vane.ai.options import validate_embed_options, validate_prompt_options
+from vane.ai.options import (
+    _require_prompt_int,
+    _require_prompt_number,
+    _validate_base_url_option,
+    _validate_prompt_stop_sequences,
+    validate_embed_options,
+)
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
 from vane.ai.providers._mime import ImageMimePolicy
@@ -687,6 +693,26 @@ class OpenAITextEmbedder:
 # ---------------------------------------------------------------------------
 
 
+def _validate_openai_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate options owned by the OpenAI Prompt adapter."""
+
+    copied = dict(options)
+    unknown = sorted(set(copied) - OpenAIProvider._PROMPT_OPTIONS)
+    if unknown:
+        raise TypeError(f"Unsupported OpenAI Prompt option(s): {', '.join(unknown)}")
+    if "use_chat_completions" in copied and not isinstance(copied["use_chat_completions"], bool):
+        raise ValueError("Prompt option 'use_chat_completions' must be a bool")
+    _require_prompt_number(copied, "temperature", minimum=0, nullable=True)
+    _require_prompt_int(copied, "max_output_tokens", minimum=1, nullable=True)
+    _require_prompt_number(copied, "top_p", minimum=0, maximum=1, nullable=True)
+    _validate_prompt_stop_sequences(copied)
+    _validate_base_url_option(copied, api="Prompt")
+    _require_prompt_number(copied, "timeout", minimum=0, nullable=True)
+    if copied.get("timeout") == 0:
+        raise ValueError("Prompt option 'timeout' must be a finite positive number or None")
+    return copied
+
+
 @dataclass
 class OpenAIPrompterDescriptor(PrompterDescriptor):
     """Serializable factory for a basic text/image OpenAI prompter."""
@@ -701,10 +727,7 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("OpenAI prompt model must be a non-empty string")
-        unknown = sorted(set(self.options) - OpenAIProvider._PROMPT_OPTIONS)
-        if unknown:
-            raise TypeError(f"Unsupported OpenAI Prompt option(s): {', '.join(unknown)}")
-        validated_options = validate_prompt_options("openai", self.options, relation=False)
+        validated_options = _validate_openai_prompt_options(self.options)
         if validated_options.get("stop_sequences") is not None and not validated_options.get(
             "use_chat_completions", False
         ):

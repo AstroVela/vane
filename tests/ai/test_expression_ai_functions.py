@@ -1469,6 +1469,45 @@ def test_ai_prompt_options_are_provider_closed(provider, options, offending):
 
 
 @pytest.mark.parametrize(
+    ("provider", "model", "required_options"),
+    [
+        ("openai", None, {}),
+        ("anthropic", "claude-test", {"max_tokens": 8}),
+        ("google", "gemini-test", {}),
+        ("vllm", None, {}),
+    ],
+)
+def test_builtin_prompt_rejects_negative_temperature_during_planning(provider, model, required_options):
+    with pytest.raises(ValueError, match=r"Prompt option 'temperature' must be >= 0"):
+        vane.ai.prompt(
+            vane.col("text"),
+            provider=provider,
+            model=model,
+            temperature=-0.1,
+            **required_options,
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "required_options"),
+    [
+        ("openai", None, {}),
+        ("anthropic", "claude-test", {"max_tokens": 8}),
+        ("google", "gemini-test", {}),
+        ("vllm", None, {}),
+    ],
+)
+def test_builtin_prompt_accepts_zero_temperature_during_planning(provider, model, required_options):
+    vane.ai.prompt(
+        vane.col("text"),
+        provider=provider,
+        model=model,
+        temperature=0,
+        **required_options,
+    )
+
+
+@pytest.mark.parametrize(
     "options",
     [
         {"api_key": "secret"},

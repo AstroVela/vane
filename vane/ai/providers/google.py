@@ -26,10 +26,12 @@ import numpy as np
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import serialize_raw_response
 from vane.ai.options import (
-    validate_embed_options as validate_closed_embed_options,
+    _require_prompt_int,
+    _require_prompt_number,
+    _validate_prompt_stop_sequences,
 )
 from vane.ai.options import (
-    validate_prompt_options as validate_closed_prompt_options,
+    validate_embed_options as validate_closed_embed_options,
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
@@ -198,7 +200,7 @@ def _canonical_model_id(model_name: str) -> str:
     return model_name.removeprefix("models/")
 
 
-def _validate_prompt_options(model_name: str, options: Mapping[str, Any]) -> None:
+def _validate_google_prompt_model_options(model_name: str, options: Mapping[str, Any]) -> None:
     """Reject request options the selected model is documented not to support.
 
     Raises:
@@ -521,6 +523,21 @@ class GoogleTextEmbedder:
 # ---------------------------------------------------------------------------
 
 
+def _validate_google_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate options owned by the Google Prompt adapter."""
+
+    copied = dict(options)
+    unknown = sorted(set(copied) - _PROMPT_REQUEST_OPTIONS)
+    if unknown:
+        raise TypeError(f"Unsupported Google Prompt option(s): {', '.join(unknown)}")
+    _require_prompt_number(copied, "temperature", minimum=0, nullable=True)
+    _require_prompt_int(copied, "max_output_tokens", minimum=1, nullable=True)
+    _require_prompt_int(copied, "top_k", minimum=0, nullable=True)
+    _require_prompt_number(copied, "top_p", minimum=0, maximum=1, nullable=True)
+    _validate_prompt_stop_sequences(copied)
+    return copied
+
+
 @dataclass
 class GooglePrompterDescriptor(PrompterDescriptor):
     """Serializable factory for a basic Gemini text/image prompter."""
@@ -535,13 +552,10 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     def __post_init__(self) -> None:
         if not isinstance(self.model_name, str) or not self.model_name.strip():
             raise ValueError("Google prompt model must be a non-empty string")
-        unknown = sorted(set(self.options) - _PROMPT_REQUEST_OPTIONS)
-        if unknown:
-            raise TypeError(f"Unsupported Google Prompt option(s): {', '.join(unknown)}")
-        validated_options = validate_closed_prompt_options("google", self.options, relation=False)
+        validated_options = _validate_google_prompt_options(self.options)
         if _canonical_model_id(self.model_name) in _EMBEDDING_DIMS:
             raise ValueError(f"Google model {self.model_name!r} supports Embed, not Prompt")
-        _validate_prompt_options(self.model_name, validated_options)
+        _validate_google_prompt_model_options(self.model_name, validated_options)
         self.options = wrap_sensitive_options(validated_options)
 
     def get_provider(self) -> str:
