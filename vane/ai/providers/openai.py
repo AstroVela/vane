@@ -30,6 +30,7 @@ from vane.ai._schema import (
 from vane.ai.options import validate_embed_options, validate_prompt_options
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
 from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -74,6 +75,18 @@ _OPENAI_OFFICIAL_API_HOSTS = frozenset(
         "sg.api.openai.com",
         "us.api.openai.com",
     }
+)
+# https://developers.openai.com/api/docs/guides/images-vision#image-input-requirements
+_IMAGE_MIME_POLICY = ImageMimePolicy(
+    provider_name="OpenAI",
+    supported_mime_types=frozenset(
+        {
+            "image/gif",
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+    ),
 )
 
 _EMBED_CAPABILITY_ERROR_PARAMS = frozenset({"model", "dimensions", "encoding_format"})
@@ -821,9 +834,7 @@ class OpenAIPrompter:
     def _process_bytes(self, msg: bytes) -> dict[str, Any]:
         import base64
 
-        mime_type = _guess_mime_type(msg)
-        if mime_type is None:
-            raise ValueError("Prompt image BLOB has an unsupported or unrecognized image format")
+        mime_type = _IMAGE_MIME_POLICY.require_supported(msg)
         b64 = base64.b64encode(msg).decode("utf-8")
         data_url = f"data:{mime_type};base64,{b64}"
         return self._build_image_part(data_url)
@@ -964,16 +975,3 @@ class OpenAIPrompter:
         if self._use_chat_completions:
             return await self._prompt_chat_completions(chat_messages)
         return await self._prompt_responses(chat_messages)
-
-
-def _guess_mime_type(data: bytes) -> str | None:
-    """Guess a supported image MIME type from magic bytes."""
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    if data[:4] == b"GIF8":
-        return "image/gif"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
