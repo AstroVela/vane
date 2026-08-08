@@ -37,16 +37,10 @@ __all__ = [
     "ProviderCapabilityError",
     "RetryAfterError",
     "SchemaValidationError",
-    "TokenMetricsEntry",
     "UDFOptions",
     "embed",
-    "get_token_metrics",
-    "get_token_metrics_summary",
     "load_provider",
     "prompt",
-    "record_token_metrics",
-    "reset_token_metrics",
-    "set_token_metrics_callback",
 ]
 
 _LAZY_EXPORTS = {
@@ -59,16 +53,10 @@ _LAZY_EXPORTS = {
     "ProviderCapabilityError": ("vane.ai.provider", "ProviderCapabilityError"),
     "RetryAfterError": ("vane.ai.functions", "RetryAfterError"),
     "SchemaValidationError": ("vane.ai._schema", "SchemaValidationError"),
-    "TokenMetricsEntry": ("vane.ai.metrics", "TokenMetricsEntry"),
     "UDFOptions": ("vane.ai.typing", "UDFOptions"),
     "embed": ("vane.ai.functions", "embed"),
-    "get_token_metrics": ("vane.ai.metrics", "get_token_metrics"),
-    "get_token_metrics_summary": ("vane.ai.metrics", "get_token_metrics_summary"),
     "load_provider": ("vane.ai.provider", "load_provider"),
     "prompt": ("vane.ai.functions", "prompt"),
-    "record_token_metrics": ("vane.ai.metrics", "record_token_metrics"),
-    "reset_token_metrics": ("vane.ai.metrics", "reset_token_metrics"),
-    "set_token_metrics_callback": ("vane.ai.metrics", "set_token_metrics_callback"),
 }
 
 
