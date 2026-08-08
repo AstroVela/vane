@@ -223,6 +223,98 @@ function(_duckdb_resolve_source_id)
       PARENT_SCOPE)
 endfunction()
 
+function(_duckdb_resolve_fork_version)
+  set(_VANE_DUCKDB_FORK_REVISION_FILE
+      "${PROJECT_SOURCE_DIR}/DUCKDB_FORK_REVISION")
+  set(_VANE_DUCKDB_FORK_VERSION_SCRIPT
+      "${PROJECT_SOURCE_DIR}/scripts/resolve_duckdb_fork_version.py")
+  set(_VANE_DUCKDB_UPSTREAM_VERSION_FILE
+      "${PROJECT_SOURCE_DIR}/DUCKDB_UPSTREAM_VERSION")
+  set(_VANE_DUCKDB_DEFAULT_SOURCE_PATH "${PROJECT_SOURCE_DIR}/external/duckdb")
+  set(_VANE_DUCKDB_FORK_REVISION_DYNAMIC FALSE)
+
+  if(NOT EXISTS "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}")
+    message(FATAL_ERROR "Missing ${_VANE_DUCKDB_FORK_VERSION_SCRIPT}")
+  endif()
+
+  if(DUCKDB_SOURCE_PATH STREQUAL _VANE_DUCKDB_DEFAULT_SOURCE_PATH)
+    if(NOT EXISTS "${_VANE_DUCKDB_UPSTREAM_VERSION_FILE}")
+      message(FATAL_ERROR "Missing ${_VANE_DUCKDB_UPSTREAM_VERSION_FILE}")
+    endif()
+    file(READ "${_VANE_DUCKDB_UPSTREAM_VERSION_FILE}"
+         _VANE_DUCKDB_UPSTREAM_VERSION)
+    string(STRIP "${_VANE_DUCKDB_UPSTREAM_VERSION}"
+                 _VANE_DUCKDB_UPSTREAM_VERSION)
+  elseif(NOT DEFINED VANE_DUCKDB_UPSTREAM_VERSION
+         OR VANE_DUCKDB_UPSTREAM_VERSION STREQUAL "")
+    message(FATAL_ERROR "A custom DUCKDB_SOURCE_PATH requires an explicit "
+                        "VANE_DUCKDB_UPSTREAM_VERSION.")
+  else()
+    set(_VANE_DUCKDB_UPSTREAM_VERSION "${VANE_DUCKDB_UPSTREAM_VERSION}")
+  endif()
+
+  if(DEFINED VANE_DUCKDB_FORK_REVISION)
+    set(_VANE_DUCKDB_FORK_REVISION "${VANE_DUCKDB_FORK_REVISION}")
+  elseif(NOT DUCKDB_SOURCE_PATH STREQUAL _VANE_DUCKDB_DEFAULT_SOURCE_PATH)
+    message(FATAL_ERROR "A custom DUCKDB_SOURCE_PATH requires an explicit "
+                        "VANE_DUCKDB_FORK_REVISION.")
+  elseif(EXISTS "${_VANE_DUCKDB_FORK_REVISION_FILE}"
+         AND NOT EXISTS "${PROJECT_SOURCE_DIR}/.git")
+    file(READ "${_VANE_DUCKDB_FORK_REVISION_FILE}" _VANE_DUCKDB_FORK_REVISION)
+    string(STRIP "${_VANE_DUCKDB_FORK_REVISION}" _VANE_DUCKDB_FORK_REVISION)
+  else()
+    find_package(Python REQUIRED COMPONENTS Interpreter)
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}"
+              --print-revision
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      RESULT_VARIABLE _VANE_DUCKDB_FORK_REVISION_RESULT
+      OUTPUT_VARIABLE _VANE_DUCKDB_FORK_REVISION
+      ERROR_VARIABLE _VANE_DUCKDB_FORK_REVISION_ERROR
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(_VANE_DUCKDB_FORK_REVISION_RESULT)
+      message(FATAL_ERROR "Unable to compute the DuckDB fork revision: "
+                          "${_VANE_DUCKDB_FORK_REVISION_ERROR}")
+    endif()
+    set(_VANE_DUCKDB_FORK_REVISION_DYNAMIC TRUE)
+  endif()
+
+  find_package(Python REQUIRED COMPONENTS Interpreter)
+  execute_process(
+    COMMAND
+      "${Python_EXECUTABLE}" "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}"
+      --print-version --revision "${_VANE_DUCKDB_FORK_REVISION}" --base-version
+      "${_VANE_DUCKDB_UPSTREAM_VERSION}"
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    RESULT_VARIABLE _VANE_DUCKDB_FORK_VERSION_RESULT
+    OUTPUT_VARIABLE _VANE_DUCKDB_FORK_VERSION
+    ERROR_VARIABLE _VANE_DUCKDB_FORK_VERSION_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(_VANE_DUCKDB_FORK_VERSION_RESULT)
+    message(FATAL_ERROR "Unable to compute the DuckDB fork version: "
+                        "${_VANE_DUCKDB_FORK_VERSION_ERROR}")
+  endif()
+
+  set(OVERRIDE_GIT_DESCRIBE
+      "${_VANE_DUCKDB_UPSTREAM_VERSION}-0-g${GIT_COMMIT_HASH}"
+      PARENT_SCOPE)
+  set(DUCKDB_EXPLICIT_VERSION
+      "${_VANE_DUCKDB_FORK_VERSION}"
+      PARENT_SCOPE)
+  set(VANE_DUCKDB_UPSTREAM_VERSION
+      "${_VANE_DUCKDB_UPSTREAM_VERSION}"
+      PARENT_SCOPE)
+  set(VANE_DUCKDB_FORK_REVISION
+      "${_VANE_DUCKDB_FORK_REVISION}"
+      PARENT_SCOPE)
+  set(VANE_DUCKDB_FORK_VERSION
+      "${_VANE_DUCKDB_FORK_VERSION}"
+      PARENT_SCOPE)
+  set(VANE_DUCKDB_FORK_REVISION_DYNAMIC
+      "${_VANE_DUCKDB_FORK_REVISION_DYNAMIC}"
+      PARENT_SCOPE)
+endfunction()
+
 function(_duckdb_collect_buildsystem_targets directory output_variable)
   get_property(
     _VANE_DUCKDB_DIRECTORY_TARGETS
@@ -242,14 +334,21 @@ function(_duckdb_collect_buildsystem_targets directory output_variable)
       PARENT_SCOPE)
 endfunction()
 
-function(_duckdb_enable_source_id_refresh)
+function(_duckdb_enable_identity_refresh)
   set(_VANE_DUCKDB_SOURCE_ID_SCRIPT
       "${PROJECT_SOURCE_DIR}/scripts/sync_duckdb_source_id.py")
   set(_VANE_DUCKDB_SOURCE_ID_HEADER
       "${PROJECT_BINARY_DIR}/generated/vane_duckdb_source_id.hpp")
+  set(_VANE_DUCKDB_FORK_VERSION_SCRIPT
+      "${PROJECT_SOURCE_DIR}/scripts/resolve_duckdb_fork_version.py")
+  set(_VANE_DUCKDB_FORK_VERSION_HEADER
+      "${PROJECT_BINARY_DIR}/generated/vane_duckdb_version.hpp")
 
   if(NOT EXISTS "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
     message(FATAL_ERROR "Missing ${_VANE_DUCKDB_SOURCE_ID_SCRIPT}")
+  endif()
+  if(NOT EXISTS "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}")
+    message(FATAL_ERROR "Missing ${_VANE_DUCKDB_FORK_VERSION_SCRIPT}")
   endif()
   if(NOT TARGET duckdb_func_table_version)
     message(FATAL_ERROR "DuckDB version target is unavailable")
@@ -258,6 +357,12 @@ function(_duckdb_enable_source_id_refresh)
   find_package(Python REQUIRED COMPONENTS Interpreter)
   set(_VANE_DUCKDB_SOURCE_ID_ARGUMENTS --header
                                        "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  set(_VANE_DUCKDB_FORK_VERSION_ARGUMENTS --header
+                                          "${_VANE_DUCKDB_FORK_VERSION_HEADER}")
+  if(NOT DUCKDB_SOURCE_PATH STREQUAL "${PROJECT_SOURCE_DIR}/external/duckdb")
+    list(APPEND _VANE_DUCKDB_FORK_VERSION_ARGUMENTS --base-version
+         "${VANE_DUCKDB_UPSTREAM_VERSION}")
+  endif()
 
   # DuckDB supplies the configured source hash as the default version of each
   # in-tree extension. Record those entry-point targets so the generated header
@@ -329,6 +434,10 @@ function(_duckdb_enable_source_id_refresh)
     list(APPEND _VANE_DUCKDB_SOURCE_ID_ARGUMENTS --source-id
          "${VANE_DUCKDB_SOURCE_TREE}")
   endif()
+  if(NOT VANE_DUCKDB_FORK_REVISION_DYNAMIC)
+    list(APPEND _VANE_DUCKDB_FORK_VERSION_ARGUMENTS --revision
+         "${VANE_DUCKDB_FORK_REVISION}")
+  endif()
 
   execute_process(
     COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
@@ -340,8 +449,18 @@ function(_duckdb_enable_source_id_refresh)
     message(FATAL_ERROR "Unable to generate the DuckDB SourceID header: "
                         "${_VANE_DUCKDB_HEADER_ERROR}")
   endif()
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}"
+            ${_VANE_DUCKDB_FORK_VERSION_ARGUMENTS}
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    RESULT_VARIABLE _VANE_DUCKDB_VERSION_HEADER_RESULT
+    ERROR_VARIABLE _VANE_DUCKDB_VERSION_HEADER_ERROR)
+  if(_VANE_DUCKDB_VERSION_HEADER_RESULT)
+    message(FATAL_ERROR "Unable to generate the DuckDB version header: "
+                        "${_VANE_DUCKDB_VERSION_HEADER_ERROR}")
+  endif()
 
-  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
+  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC OR VANE_DUCKDB_FORK_REVISION_DYNAMIC)
     # Makefile generators check whether CMake must rerun before executing ALL
     # targets. Watch the external tree itself so configure-time version values
     # are refreshed on the first incremental build for every generator.
@@ -354,33 +473,42 @@ function(_duckdb_enable_source_id_refresh)
       APPEND
       PROPERTY CMAKE_CONFIGURE_DEPENDS ${_VANE_DUCKDB_SOURCE_DEPENDENCIES})
 
-    # This target intentionally runs on every native build. The script computes
-    # the identity without writing the source tree and rewrites the generated
-    # header only when the DuckDB tree ID changes, so direct incremental builds
-    # cannot retain an earlier SourceID.
+    # This target intentionally runs on every native build. The scripts compute
+    # both identities without writing the source tree and rewrite generated
+    # headers only when their values change, so direct incremental builds cannot
+    # retain an earlier SourceID, fork commit, or dirty marker.
     add_custom_target(
-      vane_duckdb_source_id_refresh ALL
+      vane_duckdb_identity_refresh ALL
       COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_SOURCE_ID_SCRIPT}"
               ${_VANE_DUCKDB_SOURCE_ID_ARGUMENTS}
+      COMMAND "${Python_EXECUTABLE}" "${_VANE_DUCKDB_FORK_VERSION_SCRIPT}"
+              ${_VANE_DUCKDB_FORK_VERSION_ARGUMENTS}
       BYPRODUCTS "${_VANE_DUCKDB_SOURCE_ID_HEADER}"
+                 "${_VANE_DUCKDB_FORK_VERSION_HEADER}"
       WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-      COMMENT "Refreshing DuckDB SourceID"
+      COMMENT "Refreshing DuckDB build identities"
       VERBATIM)
   endif()
 
-  set_source_files_properties("${_VANE_DUCKDB_SOURCE_ID_HEADER}"
-                              PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
-  target_sources(duckdb_func_table_version
-                 PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+  set_source_files_properties(
+    "${_VANE_DUCKDB_SOURCE_ID_HEADER}" "${_VANE_DUCKDB_FORK_VERSION_HEADER}"
+    PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
+  target_sources(
+    duckdb_func_table_version PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}"
+                                      "${_VANE_DUCKDB_FORK_VERSION_HEADER}")
   if(MSVC)
-    target_compile_options(duckdb_func_table_version
-                           PRIVATE "/FI${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+    target_compile_options(
+      duckdb_func_table_version
+      PRIVATE "/FI${_VANE_DUCKDB_SOURCE_ID_HEADER}"
+              "/FI${_VANE_DUCKDB_FORK_VERSION_HEADER}")
   else()
-    target_compile_options(duckdb_func_table_version
-                           PRIVATE -include "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
+    target_compile_options(
+      duckdb_func_table_version
+      PRIVATE "SHELL:-include \"${_VANE_DUCKDB_SOURCE_ID_HEADER}\""
+              "SHELL:-include \"${_VANE_DUCKDB_FORK_VERSION_HEADER}\"")
   endif()
-  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
-    add_dependencies(duckdb_func_table_version vane_duckdb_source_id_refresh)
+  if(VANE_DUCKDB_SOURCE_ID_DYNAMIC OR VANE_DUCKDB_FORK_REVISION_DYNAMIC)
+    add_dependencies(duckdb_func_table_version vane_duckdb_identity_refresh)
   endif()
 
   list(LENGTH _VANE_DUCKDB_IDENTITY_EXTENSION_TARGETS
@@ -418,7 +546,7 @@ function(_duckdb_enable_source_id_refresh)
       endif()
       if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
         add_dependencies("${_VANE_DUCKDB_IDENTITY_EXTENSION_TARGET}"
-                         vane_duckdb_source_id_refresh)
+                         vane_duckdb_identity_refresh)
       endif()
 
       # Static and loadable variants share the same entry-point source and
@@ -434,7 +562,7 @@ function(_duckdb_enable_source_id_refresh)
                        PRIVATE "${_VANE_DUCKDB_SOURCE_ID_HEADER}")
         if(VANE_DUCKDB_SOURCE_ID_DYNAMIC)
           add_dependencies("${_VANE_DUCKDB_IDENTITY_LOADABLE_TARGET}"
-                           vane_duckdb_source_id_refresh)
+                           vane_duckdb_identity_refresh)
         endif()
       endif()
     endforeach()
@@ -498,6 +626,9 @@ endfunction()
 function(_duckdb_print_summary)
   message(STATUS "DuckDB Configuration:")
   message(STATUS "  Source: ${DUCKDB_SOURCE_PATH}")
+  message(STATUS "  Upstream version: ${VANE_DUCKDB_UPSTREAM_VERSION}")
+  message(STATUS "  Fork revision: ${VANE_DUCKDB_FORK_REVISION}")
+  message(STATUS "  Fork version: ${VANE_DUCKDB_FORK_VERSION}")
   message(STATUS "  Source tree: ${VANE_DUCKDB_SOURCE_TREE}")
   message(STATUS "  Source ID: ${GIT_COMMIT_HASH}")
   message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
@@ -525,11 +656,12 @@ function(duckdb_add_library target_name)
   _duckdb_validate_source_path()
   _duckdb_validate_jemalloc_config()
   _duckdb_resolve_source_id()
+  _duckdb_resolve_fork_version()
   _duckdb_print_summary()
 
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
-  _duckdb_enable_source_id_refresh()
+  _duckdb_enable_identity_refresh()
 
   # Create clean interface target
   _duckdb_create_interface_target(${target_name})

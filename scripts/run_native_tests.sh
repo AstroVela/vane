@@ -60,13 +60,18 @@ if [[ ! -f "$arrow_config" ]]; then
 fi
 cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
 
-override_git_describe="$(
-  awk -F'"' '/^OVERRIDE_GIT_DESCRIBE = "/ { print $2; exit }' \
-    "$project_root/pyproject.toml"
+duckdb_upstream_version="$(<"$project_root/DUCKDB_UPSTREAM_VERSION")"
+duckdb_fork_version="$(
+  python3 "$project_root/scripts/resolve_duckdb_fork_version.py" --print-version
 )"
-if [[ -n "$override_git_describe" ]]; then
-  cmake_args+=("-DOVERRIDE_GIT_DESCRIBE=$override_git_describe")
-fi
+duckdb_source_id="$(
+  python3 "$project_root/scripts/sync_duckdb_source_id.py" --print
+)"
+cmake_args+=(
+  "-DOVERRIDE_GIT_DESCRIBE=${duckdb_upstream_version}-0-g${duckdb_source_id:0:10}"
+  "-DDUCKDB_EXPLICIT_VERSION=$duckdb_fork_version"
+  "-DGIT_COMMIT_HASH=${duckdb_source_id:0:10}"
+)
 
 build_dir="${VANE_NATIVE_BUILD_DIR:-$project_root/build/native-cxx20}"
 if [[ "$build_dir" != /* ]]; then

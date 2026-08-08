@@ -129,9 +129,6 @@ exclude = [
 
 [tool.scikit-build.cmake.define]
 BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs"
-# Source archives have no Git metadata. This preserves DuckDB's human-readable
-# version line; source archives receive the exact generated DUCKDB_SOURCE_ID.
-OVERRIDE_GIT_DESCRIBE = "v1.5.0-2-g55abe0cb9e"
 
 # Override: if COVERAGE is set then:
 # - we create a RelWithDebInfo build
@@ -187,7 +184,9 @@ include = [
     "/MAINTAINERS.md",
     "/RELEASE.md",
     "/ROADMAP.md",
+    "/DUCKDB_FORK_REVISION",
     "/DUCKDB_SOURCE_ID",
+    "/DUCKDB_UPSTREAM_VERSION",
 
     # Build configuration
     "/build_backend.py",
@@ -199,6 +198,7 @@ include = [
     "cmake/**",
     "/scripts/check_release_artifacts.py",
     "/scripts/run_release_tests.sh",
+    "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
     "/scripts/sync_vcpkg_licenses.py",
     "/scripts/verify_base_install.py",

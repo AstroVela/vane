@@ -14,14 +14,15 @@ export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation
 ```
 
-Native builds compute the content-derived DuckDB SourceID without modifying the
-checkout. Direct incremental builds watch the external tree for CMake
-reconfiguration and refresh a generated header in the build directory. The
-engine version object and default in-tree static extension entry points consume
-that header, including after mode-only changes. Git-exported trees derive the
-same Git-compatible identity from their files when no manifest exists. The PEP
-517 backend injects `DUCKDB_SOURCE_ID` into source distributions; do not add
-that generated file to Git.
+Native builds compute both the last Vane commit that changed `external/duckdb`
+and the content-derived DuckDB SourceID without modifying the checkout. Direct
+incremental builds watch the external tree for CMake reconfiguration and
+refresh generated headers in the build directory. The engine version object
+and default in-tree static extension entry points consume the applicable
+headers, including after mode-only changes. Git-exported trees derive the same
+Git-compatible SourceID from their files when no manifest exists. The PEP 517
+backend injects `DUCKDB_FORK_REVISION` and `DUCKDB_SOURCE_ID` into source
+distributions; do not add either generated file to Git.
 
 ## Formatting
 

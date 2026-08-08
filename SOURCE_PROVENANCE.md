@@ -41,33 +41,50 @@ archival prerequisite.
 
 At Vane commit `74f8d91976c69d8861262944eb61f4b8a05abd42`, the
 DuckDB-rooted subtree history is described as `v1.5.0-2-g55abe0cb9e`. That
-description is passed through `OVERRIDE_GIT_DESCRIBE` in `pyproject.toml` to
-preserve DuckDB's human-readable version line in source archives without Git
-metadata.
+description is retained only as historical provenance and is no longer used as
+the runtime version.
 
-The exact engine identity is content-derived instead. The build computes the
-full Git tree object for `external/duckdb` with
+Vane records the reviewed official release line in
+`DUCKDB_UPSTREAM_VERSION`. The build combines that value with the first ten
+characters of the last Vane commit that changed `external/duckdb`, as resolved
+by `git rev-list -1 HEAD -- external/duckdb`. DuckDB therefore reports a
+user-facing version such as `v1.5.0-vane.594c360bbc`, without a manually
+maintained counter or `g` prefix. Uncommitted engine changes append `-dirty`;
+uncommitted changes outside the engine do not affect this version. Incremental
+builds refresh a generated version header, so both dirty-state transitions and
+new engine commits are reflected without manually editing build metadata.
+
+The exact engine identity remains content-derived. The build computes the full
+Git tree object for `external/duckdb` with
 `scripts/sync_duckdb_source_id.py`. Git builds write the short identity only to
 a generated header in the CMake binary directory. The external tree is a CMake
 configuration dependency, so direct Ninja and Makefile builds refresh
-configure-time version metadata after timestamp-visible source changes. The
-version object and the default in-tree static extension entry points
-force-include the generated header, keeping their runtime identities consistent
-on the first build even for mode-only changes that leave timestamps untouched.
-When Git metadata and a source-distribution manifest are absent, the script
-derives the same Git-compatible object encoding from the materialized tree. The
-constant
-`.git_archival.txt` export template records whether that encoding uses SHA-1 or
-SHA-256 without introducing a generated identity file that changes in normal
-commits. The PEP 517 backend injects the full `DUCKDB_SOURCE_ID` manifest into
-source distributions without modifying the checkout, so subsequent builds
-without Git metadata retain the same identity. The tree object depends on
-engine paths, modes, symlinks, and contents rather than commit topology, so
-rebases and squash merges do not change the SourceID. Ordinary engine changes
-require no tracked identity update. Changes to the upstream baseline, DuckDB
-version line, or historical mapping must update this document and
-`OVERRIDE_GIT_DESCRIBE`. Release reviews must record the full tree ID and inspect
-subsequent Vane engine commits since the previously released state.
+configure-time metadata after timestamp-visible source changes. The version
+object and default in-tree static extension entry points force-include the
+applicable generated headers, keeping runtime identities consistent on the
+first build even for mode-only changes that leave timestamps untouched. Vane
+fork versions are treated as development identities for extension lookup, so
+extension compatibility continues to use the SourceID rather than the
+human-readable fork commit.
+
+When Git metadata and a source-distribution manifest are absent, the SourceID
+script derives the same Git-compatible object encoding from the materialized
+tree. The constant `.git_archival.txt` export template records whether that
+encoding uses SHA-1 or SHA-256 without introducing a generated identity file
+that changes in normal commits. A commit identity cannot be reconstructed from
+files alone, so the PEP 517 backend injects both the full `DUCKDB_SOURCE_ID` and
+the full `DUCKDB_FORK_REVISION` into source distributions without modifying the
+checkout. Subsequent builds without Git metadata require the injected fork
+revision and retain both identities. The tree object depends on engine paths,
+modes, symlinks, and contents rather than commit topology, while the fork
+revision intentionally records Vane history; rebases and squash merges can
+therefore change the displayed revision without changing the SourceID.
+
+Ordinary engine changes require no tracked identity update. Changes to the
+upstream baseline, DuckDB version line, or historical mapping must update this
+document and `DUCKDB_UPSTREAM_VERSION`. Release reviews must record the full
+fork revision and tree ID and inspect subsequent Vane engine commits since the
+previously released state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit

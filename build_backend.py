@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""PEP 517 backend that adds DuckDB's generated identity to source archives."""
+"""PEP 517 backend that adds DuckDB's generated identities to source archives."""
 
 from __future__ import annotations
 
@@ -15,10 +15,13 @@ from pathlib import Path, PurePosixPath
 
 from scikit_build_core import build as _backend
 
+from scripts.resolve_duckdb_fork_version import source_revision, validate_revision
 from scripts.sync_duckdb_source_id import REPOSITORY_ROOT, source_tree_id, validate_source_id
 
 SOURCE_ID_PATH = "DUCKDB_SOURCE_ID"
 SOURCE_ID_FILE = REPOSITORY_ROOT / SOURCE_ID_PATH
+FORK_REVISION_PATH = "DUCKDB_FORK_REVISION"
+FORK_REVISION_FILE = REPOSITORY_ROOT / FORK_REVISION_PATH
 
 build_editable = _backend.build_editable
 build_wheel = _backend.build_wheel
@@ -37,6 +40,14 @@ def _source_id_for_sdist() -> str:
     return source_tree_id()
 
 
+def _fork_revision_for_sdist() -> str:
+    if (REPOSITORY_ROOT / ".git").exists():
+        return source_revision()
+    if FORK_REVISION_FILE.is_file():
+        return validate_revision(FORK_REVISION_FILE.read_text(encoding="ascii").strip())
+    return source_revision()
+
+
 def _gzip_timestamp(path: Path) -> int:
     with path.open("rb") as archive_file:
         header = archive_file.read(10)
@@ -45,9 +56,12 @@ def _gzip_timestamp(path: Path) -> int:
     return struct.unpack("<I", header[4:8])[0]
 
 
-def _inject_source_id(archive_path: Path, source_id: str) -> None:
-    """Atomically add or replace DUCKDB_SOURCE_ID in a generated sdist."""
-    expected = (validate_source_id(source_id) + "\n").encode("ascii")
+def _inject_duckdb_manifests(archive_path: Path, source_id: str, fork_revision: str) -> None:
+    """Atomically add or replace DuckDB build manifests in a generated sdist."""
+    expected_files = {
+        SOURCE_ID_PATH: (validate_source_id(source_id) + "\n").encode("ascii"),
+        FORK_REVISION_PATH: (validate_revision(fork_revision) + "\n").encode("ascii"),
+    }
     timestamp = _gzip_timestamp(archive_path)
 
     with tarfile.open(archive_path, mode="r:gz") as source_archive:
@@ -55,28 +69,36 @@ def _inject_source_id(archive_path: Path, source_id: str) -> None:
         roots = {PurePosixPath(member.name).parts[0] for member in members if PurePosixPath(member.name).parts}
         if len(roots) != 1:
             raise RuntimeError(f"sdist must contain exactly one root directory, found {sorted(roots)}")
-        target_name = str(PurePosixPath(roots.pop()) / SOURCE_ID_PATH)
-        existing = [member for member in members if member.name == target_name]
-        if len(existing) == 1 and existing[0].isfile():
+        root = roots.pop()
+        targets = {str(PurePosixPath(root) / path): contents for path, contents in expected_files.items()}
+        existing_files_match = True
+        for target_name, expected in targets.items():
+            existing = [member for member in members if member.name == target_name]
+            if len(existing) != 1 or not existing[0].isfile():
+                existing_files_match = False
+                break
             source_file = source_archive.extractfile(existing[0])
-            if source_file is not None and source_file.read() == expected:
-                return
+            if source_file is None or source_file.read() != expected:
+                existing_files_match = False
+                break
+        if existing_files_match:
+            return
 
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{archive_path.name}.", dir=archive_path.parent)
         os.close(descriptor)
         temporary_path = Path(temporary_name)
         try:
-            target = tarfile.TarInfo(target_name)
-            target.size = len(expected)
-            target.mode = 0o644
-            target.mtime = timestamp
-            target.uid = 0
-            target.gid = 0
-            target.uname = ""
-            target.gname = ""
-
-            entries = [(member.name, member, None) for member in members if member.name != target_name]
-            entries.append((target_name, target, expected))
+            entries = [(member.name, member, None) for member in members if member.name not in targets]
+            for target_name, expected in targets.items():
+                target = tarfile.TarInfo(target_name)
+                target.size = len(expected)
+                target.mode = 0o644
+                target.mtime = timestamp
+                target.uid = 0
+                target.gid = 0
+                target.uname = ""
+                target.gname = ""
+                entries.append((target_name, target, expected))
             with temporary_path.open("wb") as raw_archive:
                 gzip_name = archive_path.name.removesuffix(".gz")
                 with gzip.GzipFile(
@@ -108,8 +130,9 @@ def build_sdist(
     sdist_directory: str,
     config_settings: dict[str, list[str] | str] | None = None,
 ) -> str:
-    """Build an sdist containing the exact DuckDB tree ID for this checkout."""
+    """Build an sdist containing the exact DuckDB identities for this checkout."""
     source_id = _source_id_for_sdist()
+    fork_revision = _fork_revision_for_sdist()
     filename = _backend.build_sdist(sdist_directory, config_settings)
-    _inject_source_id(Path(sdist_directory) / filename, source_id)
+    _inject_duckdb_manifests(Path(sdist_directory) / filename, source_id, fork_revision)
     return filename
