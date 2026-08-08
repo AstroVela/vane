@@ -33,6 +33,17 @@ def _expected_duckdb_source_id(repository_root: Path) -> str:
     return result.stdout.strip()
 
 
+def _expected_duckdb_fork_version(repository_root: Path) -> str:
+    result = subprocess.run(
+        [sys.executable, "scripts/resolve_duckdb_fork_version.py", "--print-version"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def _base_requirements():
     base_requirements = {}
     for raw_requirement in requires("vane-ai") or []:
@@ -145,11 +156,20 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("compression/alprd/algorithm/LICENSE") for path in files)
 
 
-def test_duckdb_source_id_matches_recorded_source_tree():
-    source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
-    embedded_source_id = duckdb.sql("SELECT source_id FROM pragma_version()").fetchone()[0]
+def test_duckdb_version_and_source_id_match_recorded_engine_identities():
+    import _duckdb
 
+    fork_version = _expected_duckdb_fork_version(REPOSITORY_ROOT)
+    source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
+    embedded_version, embedded_source_id = duckdb.sql(
+        "SELECT library_version, source_id FROM pragma_version()"
+    ).fetchone()
+
+    assert embedded_version == fork_version
     assert embedded_source_id == source_tree_id[:10]
+    assert _duckdb.__version__ == fork_version.removeprefix("v")
+    assert duckdb.__version__ == version("vane-ai")
+    assert duckdb.__duckdb_version__ == fork_version.removeprefix("v")
     assert duckdb.__git_revision__ == embedded_source_id
 
 
@@ -169,10 +189,10 @@ def test_release_runtime_is_self_contained_by_default():
         ).fetchall()
     )
     static_extensions = {
-        name: (installed, loaded)
-        for name, installed, loaded in connection.execute(
+        name: (installed, loaded, extension_version)
+        for name, installed, loaded, extension_version in connection.execute(
             """
-            SELECT extension_name, installed, loaded
+            SELECT extension_name, installed, loaded, extension_version
             FROM duckdb_extensions()
             WHERE install_mode = 'STATICALLY_LINKED'
             """
@@ -188,7 +208,14 @@ def test_release_runtime_is_self_contained_by_default():
         "autoinstall_known_extensions": "false",
         "autoload_known_extensions": "false",
     }
-    assert static_extensions == {name: (True, True) for name in expected_extensions}
+    assert set(static_extensions) == expected_extensions
+    assert all(installed and loaded for installed, loaded, _ in static_extensions.values())
+
+    source_id = _expected_duckdb_source_id(REPOSITORY_ROOT)[:10]
+    in_tree_extensions = expected_extensions - {"httpfs"}
+    assert {name: static_extensions[name][2] for name in in_tree_extensions} == {
+        name: source_id for name in in_tree_extensions
+    }
 
 
 @pytest.mark.parametrize(

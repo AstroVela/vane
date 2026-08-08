@@ -35,6 +35,8 @@ EXPECTED_NAME = str(PROJECT_METADATA["name"])
 EXPECTED_VERSION = str(PROJECT_METADATA["version"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+DUCKDB_FORK_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:-dirty)?")
+DUCKDB_UPSTREAM_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 BANNED_PATH_PARTS = (
@@ -313,6 +315,24 @@ def _checkout_duckdb_source_id() -> str | None:
     return source_id
 
 
+def _checkout_duckdb_fork_revision() -> str | None:
+    """Return the checkout's last DuckDB-changing commit when Git is available."""
+    if not (REPOSITORY_ROOT / ".git").exists():
+        return None
+
+    result = subprocess.run(
+        [sys.executable, "scripts/resolve_duckdb_fork_version.py", "--print-revision"],
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    revision = result.stdout.strip()
+    if DUCKDB_FORK_REVISION.fullmatch(revision) is None:
+        raise ValueError(f"current checkout produced an invalid DuckDB fork revision {revision!r}")
+    return revision
+
+
 def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
     metadata_name = _require_suffix(artifact.names(), ".dist-info/METADATA", artifact.path)
     license_root = PurePosixPath(metadata_name).parent / "licenses"
@@ -330,7 +350,9 @@ def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
 def _check_sdist(artifact: SdistArtifact) -> None:
     names = artifact.names()
     required_paths = (
+        "DUCKDB_FORK_REVISION",
         "DUCKDB_SOURCE_ID",
+        "DUCKDB_UPSTREAM_VERSION",
         "LICENSE",
         "NOTICE",
         "THIRD_PARTY.md",
@@ -339,6 +361,7 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "LICENSES/vcpkg-binary-dependencies.txt",
         "external/duckdb/LICENSE",
         "build_backend.py",
+        "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
         "tests/ray_test_profile.py",
@@ -356,6 +379,28 @@ def _check_sdist(artifact: SdistArtifact) -> None:
     if checkout_source_id is not None and source_id != checkout_source_id:
         raise ValueError(
             f"{artifact.path}: DuckDB source tree ID {source_id!r} does not match checkout {checkout_source_id!r}"
+        )
+
+    fork_revision_name = _require_sdist_path(names, "DUCKDB_FORK_REVISION", artifact.path)
+    fork_revision = artifact.read(fork_revision_name).decode("ascii").strip()
+    if DUCKDB_FORK_REVISION.fullmatch(fork_revision) is None:
+        raise ValueError(f"{artifact.path}: invalid DuckDB fork revision {fork_revision!r}")
+    checkout_fork_revision = _checkout_duckdb_fork_revision()
+    if checkout_fork_revision is not None and fork_revision != checkout_fork_revision:
+        raise ValueError(
+            f"{artifact.path}: DuckDB fork revision {fork_revision!r} "
+            f"does not match checkout {checkout_fork_revision!r}"
+        )
+
+    upstream_version_name = _require_sdist_path(names, "DUCKDB_UPSTREAM_VERSION", artifact.path)
+    upstream_version = artifact.read(upstream_version_name).decode("ascii").strip()
+    if DUCKDB_UPSTREAM_VERSION.fullmatch(upstream_version) is None:
+        raise ValueError(f"{artifact.path}: invalid DuckDB upstream version {upstream_version!r}")
+    checkout_upstream_version = (REPOSITORY_ROOT / "DUCKDB_UPSTREAM_VERSION").read_text(encoding="ascii").strip()
+    if upstream_version != checkout_upstream_version:
+        raise ValueError(
+            f"{artifact.path}: DuckDB upstream version {upstream_version!r} "
+            f"does not match checkout {checkout_upstream_version!r}"
         )
 
     metadata = _check_metadata(artifact, "/PKG-INFO")

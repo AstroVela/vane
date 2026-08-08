@@ -152,14 +152,15 @@ The subtree metadata records the exact official DuckDB revision in
 under `external/duckdb`; review and resolve them when updating the official
 baseline. When replaying a change formerly maintained in another repository,
 preserve its author and date and record the original commit and upstream parent
-as commit trailers. To inspect the content-derived identity without writing the
+as commit trailers. To inspect both engine identities without writing the
 checkout, run:
 
 ```bash
 python scripts/sync_duckdb_source_id.py --print
+python scripts/resolve_duckdb_fork_version.py --print-version
 ```
 
-The script computes the full Git tree object for `external/duckdb`, including
+The first command computes the full Git tree object for `external/duckdb`, including
 staged, unstaged, and untracked non-ignored engine files without changing the
 real Git index or object store. When Git metadata and a source-distribution
 manifest are both absent, as in a `git archive` or GitHub source archive, the
@@ -173,15 +174,31 @@ timestamp-visible source changes. A lightweight build target also refreshes a
 generated header in the CMake binary directory. DuckDB's version object and the
 entry points of its default in-tree static extensions force-include that header,
 so mode-only changes that leave file timestamps untouched still update every
-runtime SourceID on the first incremental build. The local PEP 517 backend
-injects `DUCKDB_SOURCE_ID` directly into the completed sdist, so read-only source
-trees remain supported.
-The sdist carries that manifest for subsequent builds without Git metadata, and
-artifact validation checks it against the checkout. The manifest is ignored
-build metadata and must not be committed, so parallel engine pull requests do
-not modify a shared generated file. Update `SOURCE_PROVENANCE.md` and
-`OVERRIDE_GIT_DESCRIBE` only when the imported upstream baseline, DuckDB version
-line, or historical mapping changes.
+runtime SourceID on the first incremental build.
+
+The second command reports the user-facing fork version as
+`vX.Y.Z-vane.<revision>`. `vX.Y.Z` comes from `DUCKDB_UPSTREAM_VERSION`, and the
+ten-character revision is calculated from the last Vane commit that changed
+`external/duckdb`. Uncommitted changes within that directory append `-dirty`;
+changes elsewhere in the checkout do not. Direct incremental builds refresh
+the generated version header on every build, so committing an unchanged dirty
+tree also replaces the dirty marker with the new path-changing commit.
+
+A custom `DUCKDB_SOURCE_PATH` has no in-tree baseline to infer. Such builds must
+set full `VANE_DUCKDB_SOURCE_ID` and `VANE_DUCKDB_FORK_REVISION` values and an
+exact `VANE_DUCKDB_UPSTREAM_VERSION` in `vX.Y.Z` form. Configuration fails when
+any of these explicit identities is absent; it never reuses the in-tree base.
+
+The local PEP 517 backend injects full `DUCKDB_SOURCE_ID` and
+`DUCKDB_FORK_REVISION` manifests directly into the completed sdist, so
+read-only source trees remain supported. The sdist carries both manifests for
+subsequent builds without Git metadata, and artifact validation checks them
+against the checkout. The manifests are ignored build metadata and must not be
+committed, so parallel engine pull requests do not modify shared generated
+files. A source archive without Git history must contain the injected fork
+revision manifest. Update `SOURCE_PROVENANCE.md` and
+`DUCKDB_UPSTREAM_VERSION` only when the imported upstream baseline, DuckDB
+version line, or historical mapping changes.
 
 The original upstream history remains in `duckdb/duckdb`. Vane's path history
 begins at the squashed snapshot and includes every later Vane engine commit. To

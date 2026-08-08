@@ -37,6 +37,7 @@ a.out
 
 build
 # Present in source distributions only; ignore accidental local copies.
+/DUCKDB_FORK_REVISION
 /DUCKDB_SOURCE_ID
 .build_debug/*
 .build_release/*
