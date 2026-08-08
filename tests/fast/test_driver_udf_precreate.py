@@ -21,8 +21,8 @@ _TEST_QUERY_ID = "query:test"
 
 
 def _assert_actor_location_runtime_env(env_vars, resource_unit_id):
-    from duckdb.runners.ray import ray_env
-    from duckdb.runners.ray.query_runtime_protocol import (
+    from vane.runners.ray import ray_env
+    from vane.runners.ray.query_runtime_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,
         RAY_ACTOR_POOL_NONCE_ENV,
         RAY_ACTOR_QUERY_ID_ENV,
@@ -57,7 +57,7 @@ class _FakePlan:
 
 
 def test_drop_query_fragments_releases_registered_query_resources():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -76,8 +76,8 @@ def test_drop_query_fragments_releases_registered_query_resources():
 
 
 def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -103,8 +103,8 @@ def test_drop_resource_query_closes_owned_internal_fte_queries(monkeypatch):
 
 
 def test_drop_resource_query_remembers_failed_internal_teardown_after_registry_loss(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -158,8 +158,8 @@ def test_drop_resource_query_remembers_failed_internal_teardown_after_registry_l
 
 
 def test_drop_resource_query_keeps_outer_owner_until_internal_blockers_clear(monkeypatch):
-    import duckdb.runners.ray.fte_fragment_scheduler as fte_scheduler
-    from duckdb.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
+    import vane.runners.ray.fte_fragment_scheduler as fte_scheduler
+    from vane.runners.ray.driver import QueryTeardownOwnershipError, RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -213,7 +213,7 @@ def test_drop_resource_query_keeps_outer_owner_until_internal_blockers_clear(mon
 
 
 def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -241,7 +241,7 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
 
 
 def test_driver_actor_rejects_detach_from_non_owner():
-    from duckdb.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor
+    from vane.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -257,7 +257,7 @@ def test_driver_actor_rejects_detach_from_non_owner():
 
 
 def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
-    from duckdb.runners.ray import driver as driver_module
+    from vane.runners.ray import driver as driver_module
 
     events: list[str] = []
     detach_ref = object()
@@ -312,7 +312,7 @@ def test_driver_client_close_detaches_and_kills_last_job_runtime(monkeypatch):
 
 
 def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -368,7 +368,7 @@ def test_precreate_udf_actors_injects_driver_handle_for_ray_task(monkeypatch):
 
 
 def test_precreate_udf_actors_preserves_zero_physical_node_id():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     driver_handle = object()
@@ -416,7 +416,7 @@ def test_precreate_udf_actors_preserves_zero_physical_node_id():
 
 
 def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -466,7 +466,7 @@ def test_precreate_udf_actors_skips_non_ray_nodes(monkeypatch):
     ("module_name", "factory_name", "method_name", "active_attr", "by_plan_attr"),
     [
         (
-            "duckdb.execution.vllm",
+            "vane.execution.vllm",
             "ensure_named_vllm_pools_for_plan",
             "_precreate_vllm_actors",
             "_active_vllm_actors",
@@ -482,7 +482,7 @@ def test_precreate_retains_partially_created_actor_pool_for_teardown(
     active_attr,
     by_plan_attr,
 ):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     pool = object()
     creation_error = RuntimeError("partial actor cleanup failed")
@@ -529,7 +529,7 @@ def test_precreate_retains_partially_created_actor_pool_for_teardown(
 
 
 def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     monkeypatch.delenv("VANE_ENABLE_UDF_TEST_HOOKS", raising=False)
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
@@ -540,7 +540,7 @@ def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
 
 
 def test_stateful_actor_loss_error_includes_stable_query_context():
-    from duckdb.execution.udf_ray_actor_state import format_stateful_actor_loss
+    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
 
     class RayActorError(RuntimeError):
         pass
@@ -564,7 +564,7 @@ def test_stateful_actor_loss_error_includes_stable_query_context():
 
 
 def test_non_stateful_udf_error_is_not_rewritten():
-    from duckdb.execution.udf_ray_actor_state import format_stateful_actor_loss
+    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
 
     error = RuntimeError("ordinary UDF failure")
 
@@ -572,7 +572,7 @@ def test_non_stateful_udf_error_is_not_rewritten():
 
 
 def test_stateful_actor_loss_during_readiness_keeps_recoverability_context():
-    from duckdb.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
+    from vane.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
 
     class RayActorError(RuntimeError):
         pass
@@ -599,8 +599,8 @@ def test_stateful_actor_loss_during_readiness_keeps_recoverability_context():
 
 
 def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_context(monkeypatch):
-    import duckdb.execution.udf_ray_remote_submit as remote_submit
-    from duckdb.execution.udf_ray_remote_submit import RemoteUDFSubmitMixin
+    import vane.execution.udf_ray_remote_submit as remote_submit
+    from vane.execution.udf_ray_remote_submit import RemoteUDFSubmitMixin
 
     class RayActorError(RuntimeError):
         pass
@@ -673,7 +673,7 @@ def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_cont
 def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
     monkeypatch,
 ):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -742,7 +742,7 @@ def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
 
 
 def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -832,7 +832,7 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
 
 
 def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_udf(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -914,8 +914,8 @@ def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_
 
 
 def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
-    from duckdb.execution.udf_ray_config import MAX_ACTOR_RESTARTS
+    import vane.execution.udf_ray as udf_ray
+    from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS
 
     calls = []
 
@@ -994,8 +994,8 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
     ids=["stateless", "ai"],
 )
 def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful_udf(monkeypatch, payload):
-    import duckdb.execution.udf_ray as udf_ray
-    from duckdb.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
+    import vane.execution.udf_ray as udf_ray
+    from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
     calls = []
 
@@ -1046,7 +1046,7 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
 
 
 def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
-    from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_nodes
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_nodes
 
     payload = {
         "udf_name": "stateful_counter",
@@ -1066,8 +1066,8 @@ def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
 
 
 def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context():
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
-    from duckdb.execution.udf_subprocess import LocalSubprocessActorPool
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
+    from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
     class LostWorker:
         def __init__(self):
@@ -1108,7 +1108,7 @@ def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context()
 
 
 def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
     injected = []
@@ -1186,7 +1186,7 @@ def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):
 
 
 def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     fake_ray = types.ModuleType("ray")
     fake_ray.is_initialized = lambda: True
@@ -1230,7 +1230,7 @@ def test_ray_plan_injects_session_context_for_explicit_subprocess_backends(monke
 
 
 def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     resolved = []
 
@@ -1305,7 +1305,7 @@ def test_prepare_actor_pools_publishes_handles_before_waiting_for_init(monkeypat
 
 
 def test_actor_pool_opens_after_first_ray_core_actor_becomes_ready(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _Ref:
         def __init__(self, node_id):
@@ -1354,7 +1354,7 @@ def test_actor_pool_opens_after_first_ray_core_actor_becomes_ready(monkeypatch):
 def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
     from concurrent.futures import Future
 
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -1405,7 +1405,7 @@ def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
 def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
     from concurrent.futures import Future
 
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -1455,7 +1455,7 @@ def test_later_actor_init_failure_fences_query_without_releasing_live_owners():
 def test_retired_pool_ignores_late_actor_init_failure():
     from concurrent.futures import Future
 
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
 
@@ -1506,8 +1506,8 @@ def test_retired_pool_ignores_late_actor_init_failure():
 def test_stale_execution_phase_callback_does_not_retire_current_actor_pool(
     monkeypatch,
 ):
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     shutdowns = []
@@ -1542,8 +1542,8 @@ def test_stale_execution_phase_callback_does_not_retire_current_actor_pool(
 
 
 def test_phase_actor_retirement_serializes_plan_cleanup(monkeypatch):
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     shutdown_entered = threading.Event()
@@ -1621,8 +1621,8 @@ def test_phase_actor_retirement_serializes_plan_cleanup(monkeypatch):
 
 
 def test_plan_cleanup_serializes_late_phase_actor_retirement(monkeypatch):
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     shutdown_entered = threading.Event()
@@ -1691,9 +1691,9 @@ def test_plan_cleanup_serializes_late_phase_actor_retirement(monkeypatch):
 
 
 def test_actor_activation_rechecks_phase_after_slow_pool_creation(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -1775,9 +1775,9 @@ def test_actor_activation_rechecks_phase_after_slow_pool_creation(monkeypatch):
 
 
 def test_actor_activation_cleans_up_when_atomic_slot_publication_is_fenced(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -1856,8 +1856,8 @@ def test_actor_activation_cleans_up_when_atomic_slot_publication_is_fenced(monke
 
 
 def test_actor_activation_recreates_retired_pool_after_phase_reentry(monkeypatch):
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -1904,8 +1904,8 @@ def test_actor_activation_recreates_retired_pool_after_phase_reentry(monkeypatch
 
 
 def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypatch):
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -1973,9 +1973,9 @@ def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypa
 def test_phase_retirement_cancels_pending_actor_readiness_without_deadlock(
     monkeypatch,
 ):
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -2094,9 +2094,9 @@ def test_phase_retirement_cancels_pending_actor_readiness_without_deadlock(
 
 
 def test_actor_activation_retains_unpublished_pool_when_shutdown_fails(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -2171,9 +2171,9 @@ def test_actor_activation_retains_unpublished_pool_when_shutdown_fails(monkeypat
 
 
 def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
-    import duckdb.runners.ray.query_resource_runtime as resource_runtime
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     resource_unit_id = "resource:q1:actor"
@@ -2260,7 +2260,7 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
 
 
 def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     killed = []
     fake_ray = types.SimpleNamespace(
@@ -2284,7 +2284,7 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
 
 
 def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     killed = []
     fake_ray = types.SimpleNamespace(
@@ -2337,7 +2337,7 @@ def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
 
 
 def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     fail_kill = True
 
@@ -2402,7 +2402,7 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
 
 
 def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snapshot(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -2465,7 +2465,7 @@ def test_ensure_actor_pools_for_plan_does_not_fail_fast_on_cluster_resource_snap
 
 
 def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     calls = []
 
@@ -2528,7 +2528,7 @@ def test_ensure_actor_pools_for_plan_publishes_driver_handle_for_ray_task(monkey
 
 
 def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _BadPlan:
         def collect_udf_nodes(self, conn=None):
@@ -2547,7 +2547,7 @@ def test_ensure_actor_pools_for_plan_propagates_collect_errors(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_propagates_actor_creation_errors(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeRay(types.ModuleType):
         def __init__(self) -> None:
@@ -2607,7 +2607,7 @@ def _build_simple_ray_udf_plan(con):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
+    import vane
 
     class AddOne:
         def __call__(self, table):
@@ -2616,12 +2616,12 @@ def _build_simple_ray_udf_plan(con):
 
     relation = con.sql("SELECT 1 AS x UNION ALL SELECT 2 AS x").map_batches(
         AddOne,
-        schema={"y": duckdb.sqltypes.BIGINT},
+        schema={"y": vane.sqltypes.BIGINT},
         execution_backend="ray_actor",
         actor_number=1,
         gpus=0.0,
     )
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         f"udf-executor-options-{uuid.uuid4().hex[:8]}",
     ).to_physical_plan(con)
@@ -2633,9 +2633,9 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb
-    import duckdb.execution.udf as udf_exec
-    from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+    import vane
+    import vane.execution.udf as udf_exec
+    from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
     build_calls = []
 
@@ -2705,7 +2705,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
 
     monkeypatch.setattr(udf_exec, "build_executor", _build_executor)
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
         query_driver_handle = object()
@@ -2722,7 +2722,7 @@ def test_physical_plan_structured_executor_options_reach_udf_builder(monkeypatch
             conn=con,
         )
 
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
         table = _table_from_native_result(result)
     finally:
         con.close()
@@ -2745,10 +2745,10 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
         import gc
         import uuid
 
-        import duckdb
+        import vane
         import pyarrow as pa
-        import duckdb.execution.udf as udf_exec
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        import vane.execution.udf as udf_exec
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
 
         class _FakeExecutor:
@@ -2821,16 +2821,16 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
 
         udf_exec.build_executor = _build_executor
 
-        con = duckdb.connect()
+        con = vane.connect()
         cursor = con.cursor()
         relation = con.sql("SELECT 1 AS x UNION ALL SELECT 2 AS x").map_batches(
             AddOne,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             f"udf-cleanup-gil-{uuid.uuid4().hex[:8]}",
         ).to_physical_plan(con)
@@ -2845,7 +2845,7 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
             conn=con,
         )
 
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(cursor, plan, None, None)
         payloads = list(result.partition_payloads)
         values = [
             value
@@ -2874,8 +2874,8 @@ def test_execute_native_udf_cleanup_does_not_deadlock_with_gil_held():
 
 def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
     pytest.importorskip("pyarrow")
-    import duckdb
-    import duckdb.execution.udf as udf_exec
+    import vane
+    import vane.execution.udf as udf_exec
 
     build_call_count = 0
 
@@ -2886,13 +2886,13 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
 
     monkeypatch.setattr(udf_exec, "build_executor", _unexpected_build_executor)
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _build_simple_ray_udf_plan(con)
         plan.set_udf_actor_handles({"0": ["bad-handle"]}, conn=con)
 
         with pytest.raises(ValueError, match="udf executor options must be a dict"):
-            duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(con.cursor(), plan, None, None)
     finally:
         con.close()
 
@@ -2900,7 +2900,7 @@ def test_physical_plan_rejects_legacy_list_executor_options(monkeypatch):
 
 
 def test_ensure_actor_pools_for_plan_publishes_runtime_actor_nodes(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeActorsObj:
         def __init__(self, actors):
@@ -2962,7 +2962,7 @@ def test_ensure_actor_pools_for_plan_publishes_runtime_actor_nodes(monkeypatch):
 
 
 def test_ensure_actor_pools_waits_for_init_refs_before_ready_lookup(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     class _FakeActorsObj:
         def __init__(self, actors, init_refs):

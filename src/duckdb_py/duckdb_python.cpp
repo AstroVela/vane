@@ -35,10 +35,6 @@
 #include "duckdb/execution/distributed/utils/stream.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
-#ifndef DUCKDB_PYTHON_LIB_NAME
-#define DUCKDB_PYTHON_LIB_NAME _duckdb
-#endif
-
 namespace py = pybind11;
 
 namespace duckdb {
@@ -1051,7 +1047,7 @@ static void InitializeConnectionMethods(py::module_ &m) {
 }
 
 static void RegisterStatementType(py::handle &m) {
-	auto statement_type = py::enum_<duckdb::StatementType>(m, "StatementType");
+	auto statement_type = py::enum_<duckdb::StatementType>(m, "StatementType", py::module_local());
 	static const duckdb::StatementType TYPES[] = {
 	    duckdb::StatementType::INVALID_STATEMENT,       duckdb::StatementType::SELECT_STATEMENT,
 	    duckdb::StatementType::INSERT_STATEMENT,        duckdb::StatementType::UPDATE_STATEMENT,
@@ -1077,7 +1073,7 @@ static void RegisterStatementType(py::handle &m) {
 }
 
 static void RegisterExpectedResultType(py::handle &m) {
-	auto expected_return_type = py::enum_<duckdb::StatementReturnType>(m, "ExpectedResultType");
+	auto expected_return_type = py::enum_<duckdb::StatementReturnType>(m, "ExpectedResultType", py::module_local());
 	static const duckdb::StatementReturnType TYPES[] = {duckdb::StatementReturnType::QUERY_RESULT,
 	                                                    duckdb::StatementReturnType::CHANGED_ROWS,
 	                                                    duckdb::StatementReturnType::NOTHING};
@@ -1096,23 +1092,25 @@ static void RegisterExpectedResultType(py::handle &m) {
 // This means we compile with -fvisibility=hidden to hide all symbols,
 // and then explicitly export only the symbols we want.
 //
-// Right now we export two symbols only:
-// - duckdb_adbc_init: the entrypoint for our ADBC driver
-// - PyInit__duckdb: the entrypoint for the python extension
+// Right now we export two Vane-owned symbols only:
+// - vane_adbc_init: the entrypoint for our ADBC driver
+// - PyInit__native: the entrypoint for the Python extension
 //
 // All symbols that need exporting must be added to both the list below
 // AND to CMakeLists.txt.
 extern "C" {
+AdbcStatusCode vane_adbc_init(int version, void *driver, struct AdbcError *error);
+
 PYBIND11_EXPORT void *_force_symbol_inclusion() {
 	static void *symbols[] = {
 	    // Add functions to export here
-	    (void *)&duckdb_adbc_init,
+	    (void *)&vane_adbc_init,
 	};
 	return symbols;
 }
 };
 
-PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
+PYBIND11_MODULE(_native, m) { // NOLINT
 	// DO NOT REMOVE: the below forces that we include all symbols we want to export
 	volatile auto *keep_alive = _force_symbol_inclusion();
 	(void)keep_alive;
@@ -1124,7 +1122,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	m.def("_clear_datasource_factory_registry", &duckdb::ClearDataSourceFactoryRegistry);
 	m.def("_release_datasource_factories_for_query", &duckdb::ReleaseDataSourceFactoriesForQuery, py::arg("query_id"));
 
-	py::enum_<duckdb::ExplainType>(m, "ExplainType")
+	py::enum_<duckdb::ExplainType>(m, "ExplainType", py::module_local())
 	    .value("STANDARD", duckdb::ExplainType::EXPLAIN_STANDARD)
 	    .value("ANALYZE", duckdb::ExplainType::EXPLAIN_ANALYZE)
 	    .export_values();
@@ -1132,25 +1130,25 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	RegisterStatementType(m);
 	RegisterExpectedResultType(m);
 
-	// Expose experimental ray C++ bindings as `duckdb.ray_cxx`
+	// Expose experimental Ray bindings as ``vane._native.ray_cxx``.
 	extern void register_ray_bindings(py::module_ & m);
 	register_ray_bindings(m);
 
-	// Expose vane-runners C++ bindings as `duckdb.vane_runners` and `duckdb.vane_runners_cpp`
+	// Expose runner lifecycle functions directly on ``vane._native``.
 	extern void register_vane_runners(py::module_ & m);
 	register_vane_runners(m);
 
-	py::enum_<duckdb::PythonCSVLineTerminator::Type>(m, "CSVLineTerminator")
+	py::enum_<duckdb::PythonCSVLineTerminator::Type>(m, "CSVLineTerminator", py::module_local())
 	    .value("LINE_FEED", duckdb::PythonCSVLineTerminator::Type::LINE_FEED)
 	    .value("CARRIAGE_RETURN_LINE_FEED", duckdb::PythonCSVLineTerminator::Type::CARRIAGE_RETURN_LINE_FEED)
 	    .export_values();
 
-	py::enum_<duckdb::PythonExceptionHandling>(m, "PythonExceptionHandling")
+	py::enum_<duckdb::PythonExceptionHandling>(m, "PythonExceptionHandling", py::module_local())
 	    .value("DEFAULT", duckdb::PythonExceptionHandling::FORWARD_ERROR)
 	    .value("RETURN_NULL", duckdb::PythonExceptionHandling::RETURN_NULL)
 	    .export_values();
 
-	py::enum_<duckdb::RenderMode>(m, "RenderMode")
+	py::enum_<duckdb::RenderMode>(m, "RenderMode", py::module_local())
 	    .value("ROWS", duckdb::RenderMode::ROWS)
 	    .value("COLUMNS", duckdb::RenderMode::COLUMNS)
 	    .export_values();
@@ -1178,8 +1176,8 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 
 	py::options pybind_opts;
 
-	m.doc() = "DuckDB is an embeddable SQL OLAP Database Management System";
-	m.attr("__package__") = "duckdb";
+	m.doc() = "Vane is a distributed, multimodal data engine";
+	m.attr("__package__") = "vane";
 	m.attr("__version__") = std::string(DuckDB::LibraryVersion()).substr(1);
 	m.attr("__standard_vector_size__") = DuckDB::StandardVectorSize();
 	m.attr("__git_revision__") = DuckDB::SourceID();

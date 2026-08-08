@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import zoneinfo
 from pathlib import Path
@@ -5,7 +11,7 @@ from pathlib import Path
 import pytest
 from packaging.version import Version
 
-import duckdb
+import vane
 
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
@@ -70,7 +76,7 @@ class TestNativeTimeZone:
 
     def test_pandas_timestamp_time(self, duckdb_cursor):
         with pytest.raises(
-            duckdb.NotImplementedException, match='Not implemented Error: Unsupported type "TIME WITH TIME ZONE"'
+            vane.NotImplementedException, match='Not implemented Error: Unsupported type "TIME WITH TIME ZONE"'
         ):
             duckdb_cursor.execute(f"select TimeRecStart::TIMETZ  as tz  from '{filename}'").df()
 

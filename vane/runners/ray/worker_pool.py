@@ -1,0 +1,180 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import ray
+
+from vane._ray_cxx import require_ray_cxx_attr
+from vane.runners.ray.fragment_worker_client import RayWorkerActorHandle
+from vane.runners.ray.fte_fragment_scheduler import (
+    _collect_vane_env_overrides,
+)
+from vane.runners.ray.fte_scheduler_config import _is_ray_worker_context
+from vane.runners.ray.safe_get import resolve_object_refs_blocking
+from vane.runners.ray.worker import RayWorkerActor
+from vane.runners.ray.worker_memory import build_ray_node_memory_layout
+
+RayWorkerRuntime: Any = require_ray_cxx_attr(
+    "RayWorkerRuntime",
+    hint="Ensure the C++ ray extension is built and importable in the driver process.",
+)
+
+
+def _persistent_worker_runtime_env(env_vars: dict[str, str]) -> dict[str, Any]:
+    """Build the persistent actor environment without node-local overrides.
+
+    Ray 2.53 through 2.55 clear accelerator visibility for actors that do not
+    reserve accelerators unless this compatibility switch is disabled. Ray
+    2.56 and later preserve it by default, but accepting the switch keeps the
+    behavior stable across the supported Ray range. The Flight advertised host
+    is resolved inside the target worker so this runtime environment cannot
+    overwrite a node-local value.
+    """
+    runtime_env_vars = dict(env_vars)
+    runtime_env_vars.pop("VANE_FLIGHT_ADVERTISE_HOST", None)
+    runtime_env_vars["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+    runtime_env_vars["VANE_WORKER"] = "1"
+    return {"env_vars": runtime_env_vars}
+
+
+def _cleanup_started_workers(
+    actors: list[tuple[dict[str, Any], str, Any]],
+    worker_handles: list[RayWorkerActorHandle],
+) -> list[str]:
+    errors = []
+    cleaned_actor_ids = set()
+    for worker_handle in reversed(worker_handles):
+        actor = worker_handle.actor_handle
+        try:
+            worker_handle.abort_shutdown()
+            cleaned_actor_ids.add(id(actor))
+        except BaseException as exc:
+            errors.append(f"{worker_handle.worker_id}: {exc}")
+
+    for _node, worker_id, actor in reversed(actors):
+        if id(actor) in cleaned_actor_ids:
+            continue
+        try:
+            ray.kill(actor, no_restart=True)
+        except BaseException as exc:
+            errors.append(f"{worker_id}: {exc}")
+    return errors
+
+
+def start_ray_workers(existing_worker_ids: list[str], manager_instance_id: str) -> list[RayWorkerRuntime]:
+    ACTOR_STARTUP_TIMEOUT = 120
+    manager_instance_id = str(manager_instance_id or "").strip()
+    if not manager_instance_id:
+        raise ValueError("manager_instance_id must be non-empty")
+    env_overrides = _collect_vane_env_overrides()
+    actors = []
+    worker_handles = []
+    try:
+        for node in ray.nodes():  # type: ignore[no-untyped-call]
+            node_manager_address = str(node.get("NodeManagerAddress") or "").strip()
+            node_id = str(node.get("NodeID") or "").strip()
+            worker_host = node_manager_address or node_id
+            if (
+                "Resources" in node
+                and "CPU" in node["Resources"]
+                and "memory" in node["Resources"]
+                and node["Resources"]["CPU"] > 0
+                and node["Resources"]["memory"] > 0
+                and node_id
+                and worker_host
+            ):
+                worker_id = f"{manager_instance_id}:{node_id}:0"
+                if worker_id in existing_worker_ids:
+                    continue
+                worker_env = dict(env_overrides)
+                worker_env["VANE_WORKER_HOST"] = worker_host
+                worker_env["VANE_WORKER_ID"] = worker_id
+                worker_env["VANE_WORKER_INDEX"] = "0"
+                worker_env["VANE_WORKER_MANAGER_INSTANCE_ID"] = manager_instance_id
+                worker_env["VANE_WORKER_NODE_ID"] = node_id
+                memory_layout = build_ray_node_memory_layout(int(node["Resources"]["memory"]))
+                # max_concurrency limits how many control/execute RPCs can queue
+                # inside the actor. FTE backpressure is handled by task
+                # status/split-queue feedback and the shared DuckDB TaskScheduler.
+                #
+                # The persistent actor is a node-local execution container, not a
+                # Ray CPU/GPU lease. Vane admission accounts for native fragments
+                # and Ray-backed UDFs, so reserving the node's full CPU/GPU capacity
+                # here would prevent those child Ray workloads from being scheduled.
+                _actor_max_conc = int(os.environ.get("VANE_RAY_ACTOR_MAX_CONCURRENCY", "256"))
+                actor = RayWorkerActor.options(  # type: ignore[attr-defined]
+                    max_concurrency=_actor_max_conc,
+                    memory=(memory_layout.worker_duckdb_memory_bytes + memory_layout.runtime_reserve_bytes),
+                    runtime_env=_persistent_worker_runtime_env(worker_env),
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=False,
+                    ),
+                ).remote(
+                    num_cpus=int(node["Resources"]["CPU"]),
+                    num_gpus=int(node["Resources"].get("GPU", 0)),
+                    duckdb_memory_bytes=memory_layout.worker_duckdb_memory_bytes,
+                    task_heap_capacity_bytes=memory_layout.task_heap_capacity_bytes,
+                    ray_node_ip_address=node_manager_address,
+                )
+                actors.append((node, worker_id, actor))
+
+        # Pre-warm: wait for all actors to be fully initialized before returning.
+        # This absorbs the ~2.5s actor cold-start so the first task dispatch is fast.
+        # Matches upstream Vane's start_ray_workers() pattern.
+        warmup_refs = [actor.ping.remote() for _, _, actor in actors]
+        # Nested distributed execution may call start_ray_workers() from inside a
+        # Ray actor. Let actor startup proceed asynchronously there and rely on the
+        # first task submission for backpressure.
+        if not _is_ray_worker_context():
+            try:
+                resolve_object_refs_blocking(warmup_refs, timeout=ACTOR_STARTUP_TIMEOUT)
+            except ray.exceptions.GetTimeoutError as exc:
+                raise RuntimeError(f"Failed to warm up Worker actors within {ACTOR_STARTUP_TIMEOUT}s") from exc
+
+        handles = []
+        for node, worker_id, actor in actors:
+            actor_handle = RayWorkerActorHandle(
+                actor,
+                worker_id=worker_id,
+                node_id=str(node["NodeID"]).strip(),
+                host=str(node.get("NodeManagerAddress") or "").strip() or str(node["NodeID"]).strip(),
+                manager_instance_id=manager_instance_id,
+                memory_capacity_bytes=build_ray_node_memory_layout(
+                    int(node["Resources"]["memory"])
+                ).task_heap_capacity_bytes,
+            )
+            worker_handles.append(actor_handle)
+            handles.append(
+                RayWorkerRuntime(
+                    worker_id,
+                    actor_handle,
+                    int(node["Resources"]["CPU"]),
+                    int(node["Resources"].get("GPU", 0)),
+                    int(node["Resources"]["memory"]),
+                )
+            )
+
+        return handles
+    except BaseException as startup_error:
+        cleanup_errors = _cleanup_started_workers(actors, worker_handles)
+        if cleanup_errors:
+            raise RuntimeError(
+                f"Ray worker startup failed: {startup_error}; actor cleanup failed: {'; '.join(cleanup_errors)}"
+            ) from startup_error
+        raise
+
+
+def try_autoscale(bundles: list[dict[str, int]]) -> None:
+    from ray.autoscaler.sdk import request_resources
+
+    request_resources(
+        bundles=bundles,
+    )
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]

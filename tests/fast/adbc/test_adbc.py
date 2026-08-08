@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 from pathlib import Path
 
@@ -6,16 +12,16 @@ import pytest
 
 adbc_driver_manager = pytest.importorskip("adbc_driver_manager")
 adbc_driver_manager_dbapi = pytest.importorskip("adbc_driver_manager.dbapi")
-adbc_driver_duckdb = pytest.importorskip("adbc_driver_duckdb")
+vane_adbc = pytest.importorskip("vane.adbc")
 pyarrow = pytest.importorskip("pyarrow")
 
 xfail = pytest.mark.xfail
-driver_path = adbc_driver_duckdb.driver_path()
+driver_path = vane_adbc.driver_path()
 
 
 @pytest.fixture
 def duck_conn():
-    with adbc_driver_manager_dbapi.connect(driver=driver_path, entrypoint="duckdb_adbc_init") as conn:
+    with adbc_driver_manager_dbapi.connect(driver=driver_path, entrypoint="vane_adbc_init") as conn:
         yield conn
 
 
@@ -96,7 +102,7 @@ def test_commit(tmp_path):
     # Start connection with auto-commit off
     with adbc_driver_manager_dbapi.connect(
         driver=driver_path,
-        entrypoint="duckdb_adbc_init",
+        entrypoint="vane_adbc_init",
         db_kwargs=db_kwargs,
     ) as conn:
         assert not conn._autocommit
@@ -106,7 +112,7 @@ def test_commit(tmp_path):
     # Check Data is not there
     with adbc_driver_manager_dbapi.connect(
         driver=driver_path,
-        entrypoint="duckdb_adbc_init",
+        entrypoint="vane_adbc_init",
         db_kwargs=db_kwargs,
         autocommit=True,
     ) as conn:
@@ -125,7 +131,7 @@ def test_commit(tmp_path):
     with (
         adbc_driver_manager_dbapi.connect(
             driver=driver_path,
-            entrypoint="duckdb_adbc_init",
+            entrypoint="vane_adbc_init",
             db_kwargs=db_kwargs,
         ) as conn,
         conn.cursor() as cur,
@@ -297,7 +303,7 @@ def test_large_chunk(tmp_path):
     with (
         adbc_driver_manager_dbapi.connect(
             driver=driver_path,
-            entrypoint="duckdb_adbc_init",
+            entrypoint="vane_adbc_init",
             db_kwargs=db_kwargs,
             autocommit=True,
         ) as conn,
@@ -323,7 +329,7 @@ def test_dictionary_data(tmp_path):
     with (
         adbc_driver_manager_dbapi.connect(
             driver=driver_path,
-            entrypoint="duckdb_adbc_init",
+            entrypoint="vane_adbc_init",
             db_kwargs=db_kwargs,
             autocommit=True,
         ) as conn,
@@ -351,7 +357,7 @@ def test_ree_data(tmp_path):
     with (
         adbc_driver_manager_dbapi.connect(
             driver=driver_path,
-            entrypoint="duckdb_adbc_init",
+            entrypoint="vane_adbc_init",
             db_kwargs=db_kwargs,
             autocommit=True,
         ) as conn,

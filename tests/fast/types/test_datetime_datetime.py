@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import pytest
 
-import duckdb
+import vane
 
 
 def create_query(positive, type):
@@ -26,7 +32,7 @@ class TestDateTimeDateTime:
         ],
     )
     def test_timestamp_infinity(self, positive, type):
-        con = duckdb.connect()
+        con = vane.connect()
 
         if type in ["TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS"]:
             # Infinity (both positive and negative) is not supported for non-usecond timetamps
@@ -38,7 +44,7 @@ class TestDateTimeDateTime:
         assert res == expected_val
 
     def test_timestamp_infinity_roundtrip(self):
-        con = duckdb.connect()
+        con = vane.connect()
 
         # positive infinity
         con.execute("select $1, $1 = 'infinity'::TIMESTAMP", [datetime.datetime.max])

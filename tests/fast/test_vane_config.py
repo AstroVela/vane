@@ -69,7 +69,7 @@ def test_configure_normalizes_empty_runner_to_ray(monkeypatch):
 def test_get_or_create_runner_does_not_create_runner_for_local_fast():
     script = """
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "local-fast"
 try:
@@ -86,7 +86,7 @@ else:
 def test_get_or_infer_runner_type_defaults_to_ray(configured):
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 configured = {configured!r}
 if configured is None:
@@ -110,7 +110,7 @@ assert runners.get_or_infer_runner_type() == "ray"
 def test_get_or_infer_runner_type_uses_shared_normalization(configured, expected):
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = {configured!r}
 assert runners.get_or_infer_runner_type() == {expected!r}
@@ -122,7 +122,7 @@ def test_runner_entry_points_use_shared_invalid_value_error(monkeypatch):
     expected = "Invalid runner type 'invalid-runner'. Please use 'local' or 'ray'."
     script = f"""
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "  invalid-runner  "
 try:
@@ -150,7 +150,7 @@ else:
 def test_get_or_create_runner_creates_local_runner():
     script = """
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "local"
 runner = runners.get_or_create_runner()
@@ -170,10 +170,10 @@ import threading
 sys.setswitchinterval(1000.0)
 faulthandler.dump_traceback_later(5.0, repeat=False)
 
-import duckdb
-import duckdb.runners.local.runner as local_runner_module
+import vane
+import vane.runners.local.runner as local_runner_module
 
-vane_runners = duckdb.vane_runners_cpp
+vane_runners = vane
 vane_runners.teardown_runner()
 os.environ["VANE_RUNNER"] = "local"
 
@@ -239,10 +239,10 @@ def test_failed_runner_initialization_is_not_published_and_can_retry():
     script = r"""
 import os
 
-import duckdb
-import duckdb.runners.local.runner as local_runner_module
+import vane
+import vane.runners.local.runner as local_runner_module
 
-vane_runners = duckdb.vane_runners_cpp
+vane_runners = vane
 vane_runners.teardown_runner()
 os.environ["VANE_RUNNER"] = "local"
 attempts = 0
@@ -289,10 +289,10 @@ import threading
 sys.setswitchinterval(1000.0)
 faulthandler.dump_traceback_later(5.0, repeat=False)
 
-import duckdb
-import duckdb.runners.local.runner as local_runner_module
+import vane
+import vane.runners.local.runner as local_runner_module
 
-vane_runners = duckdb.vane_runners_cpp
+vane_runners = vane
 vane_runners.teardown_runner()
 os.environ["VANE_RUNNER"] = "local"
 
@@ -362,7 +362,7 @@ assert vane_runners.get_runner() is results[0]
 
 def test_ray_noop_does_not_reuse_local_runner():
     script = """
-import duckdb.runners as runners
+import vane.runners as runners
 
 runners.set_runner_local()
 try:
@@ -376,7 +376,7 @@ else:
 
 
 def test_set_runner_ray_rejects_removed_force_client_mode():
-    from duckdb import runners
+    from vane import runners
 
     with pytest.raises(TypeError, match="force_client_mode"):
         runners.set_runner_ray(force_client_mode=True)
@@ -384,7 +384,7 @@ def test_set_runner_ray_rejects_removed_force_client_mode():
 
 @pytest.mark.parametrize("method_name", ["run_iter", "run_iter_tables"])
 def test_ray_runner_rejects_removed_results_buffer_size(method_name):
-    from duckdb.runners.ray.runner import RayRunner
+    from vane.runners.ray.runner import RayRunner
 
     runner = object.__new__(RayRunner)
     method = getattr(runner, method_name)
@@ -394,16 +394,16 @@ def test_ray_runner_rejects_removed_results_buffer_size(method_name):
 
 
 def test_native_set_runner_ray_rejects_removed_fourth_argument():
-    import duckdb
+    import vane
 
     with pytest.raises(TypeError):
-        duckdb.vane_runners_cpp.set_runner_ray(None, False, None, False)
+        vane.set_runner_ray(None, False, None, False)
 
 
 def test_ray_noop_reuses_existing_runner_without_validating_address():
     script = """
-import duckdb
-import duckdb.runners.ray.runner as ray_runner_module
+import vane
+import vane.runners.ray.runner as ray_runner_module
 
 
 class FakeRayRunner:
@@ -417,7 +417,7 @@ class FakeRayRunner:
 
 
 ray_runner_module.RayRunner = FakeRayRunner
-vane_runners = duckdb.vane_runners_cpp
+vane_runners = vane
 vane_runners.teardown_runner()
 
 first = vane_runners.set_runner_ray(None, False, None)

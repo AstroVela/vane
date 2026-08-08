@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import string
 import warnings
 from contextlib import suppress
@@ -7,7 +13,7 @@ import pandas as pd
 import pytest
 from packaging import version
 
-import duckdb
+import vane
 
 
 def round_trip(data, pandas_type):
@@ -17,7 +23,7 @@ def round_trip(data, pandas_type):
         }
     )
 
-    df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+    df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
     print(df_out)
     print(df_in)
     assert df_out.equals(df_in)
@@ -60,7 +66,7 @@ class TestNumpyNullableTypes:
             data[letter] = base_df.a.astype(dtype)
 
         df = pd.DataFrame.from_dict(data)  # noqa: F841
-        conn = duckdb.connect()
+        conn = vane.connect()
         out_df = conn.execute("select * from df").df()
 
         # Verify that the types in the out_df are correct
@@ -108,7 +114,7 @@ class TestNumpyNullableTypes:
             }
         )
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
         assert df_out["object"][0] == df_in["object"][0]
         assert pd.isna(df_out["object"][1])
         assert pd.isna(df_out["object"][2])
@@ -123,7 +129,7 @@ class TestNumpyNullableTypes:
             }
         )
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
 
         assert df_out["object"][0] == df_in["object"][0]
         assert df_out["object"][1] == df_in["object"][1]
@@ -137,7 +143,7 @@ class TestNumpyNullableTypes:
                 "object": pd.Series(data, dtype="float64"),
             }
         )
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
 
         for i in range(len(data)):
             if pd.isna(df_out["object"][i]):
@@ -156,7 +162,7 @@ class TestNumpyNullableTypes:
             }
         )
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
 
         assert df_out["object"][0] == df_in["object"][0]
         assert pd.isnull(df_out["object"][1])
@@ -166,7 +172,7 @@ class TestNumpyNullableTypes:
         data = [data.encode("utf8")]
         expected_result = data[0]
         df_in = pd.DataFrame({"object": pd.Series(data, dtype="object")})
-        result = duckdb.query_df(df_in, "data", "SELECT * FROM data").fetchone()[0]
+        result = vane.query_df(df_in, "data", "SELECT * FROM data").fetchone()[0]
         assert result == expected_result
 
     @pytest.mark.parametrize(

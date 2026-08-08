@@ -15,7 +15,6 @@ import pyarrow as pa
 import pytest
 from typing_extensions import Unpack
 
-import duckdb
 import vane
 from vane.ai import provider as provider_registry
 from vane.ai.options import EmbedOptions, PromptOptions
@@ -256,14 +255,14 @@ def test_ai_embed_literal_null_is_fixed_type_without_runtime_calls(monkeypatch):
 
     expression_result = source.select(
         vane.ai.embed(
-            duckdb.ConstantExpression(None).cast("VARCHAR"),
+            vane.ConstantExpression(None).cast("VARCHAR"),
             provider=MockProvider(),
             dimensions=4,
         ).alias("embedding")
     )
     relation_result = vane.ai.embed(
         source,
-        duckdb.ConstantExpression(None).cast("VARCHAR"),
+        vane.ConstantExpression(None).cast("VARCHAR"),
         provider=MockProvider(),
         dimensions=4,
     ).project("embedding")
@@ -465,7 +464,7 @@ def test_ai_embed_relation_rejects_non_string_output_column(output_column):
 def test_ai_embed_python_entries_reject_non_varchar_during_planning(relation_api, text_sql):
     rel = vane.connect().sql(f"SELECT {text_sql} AS text")
 
-    with pytest.raises(duckdb.BinderException, match="ai SQL input argument must be VARCHAR"):
+    with pytest.raises(vane.BinderException, match="ai SQL input argument must be VARCHAR"):
         if relation_api:
             vane.ai.embed(
                 rel,
@@ -1575,7 +1574,7 @@ def test_vllm_prompt_injects_structured_schema_without_mutating_callers():
 
 
 def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     schema = {
         "type": "object",

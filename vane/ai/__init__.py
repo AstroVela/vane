@@ -18,7 +18,7 @@ Quick start::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vane.ai._schema import OutputValidationError, SchemaValidationError
@@ -60,7 +60,7 @@ _LAZY_EXPORTS = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazily import AI helpers so base ``import vane`` has minimal deps."""
     if name not in _LAZY_EXPORTS:
         raise AttributeError(name)

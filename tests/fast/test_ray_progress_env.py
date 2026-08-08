@@ -10,7 +10,7 @@ from textwrap import dedent
 
 import pytest
 
-from duckdb._ray_progress_env import (
+from vane._ray_progress_env import (
     dynamic_ray_progress_enabled,
     ray_log_to_driver_default,
 )
@@ -106,8 +106,8 @@ def test_explicit_ray_log_to_driver_is_preserved(monkeypatch):
     "module_name",
     [
         "vane",
-        "duckdb.runners.ray.runner",
-        "duckdb.runners.ray.driver",
+        "vane.runners.ray.runner",
+        "vane.runners.ray.driver",
     ],
 )
 def test_import_does_not_set_process_global_ray_logging_defaults(module_name):
@@ -137,7 +137,7 @@ def test_ray_runner_scopes_progress_logging_to_ray_init(monkeypatch):
     monkeypatch.delenv("RAY_LOG_TO_DRIVER", raising=False)
     monkeypatch.delenv("RAY_BACKEND_LOG_LEVEL", raising=False)
 
-    from duckdb.runners.ray import runner as ray_runner_module
+    from vane.runners.ray import runner as ray_runner_module
 
     init_kwargs = {}
     monkeypatch.setattr(ray_runner_module, "ensure_vane_session_dir", lambda: None)

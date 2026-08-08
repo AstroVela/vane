@@ -1,22 +1,28 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pytest.importorskip("adbc_driver_manager")
-adbc_driver_duckdb_dbapi = pytest.importorskip("adbc_driver_duckdb.dbapi")
+vane_adbc_dbapi = pytest.importorskip("vane.adbc.dbapi")
 
 
 class TestADBCConnectionGetInfo:
     def test_connection_basic(self):
-        con = adbc_driver_duckdb_dbapi.connect()
+        con = vane_adbc_dbapi.connect()
         with con.cursor() as cursor:
             cursor.execute("select 42")
             res = cursor.fetchall()
             assert res == [(42,)]
 
     def test_connection_get_info_all(self):
-        con = adbc_driver_duckdb_dbapi.connect()
+        con = vane_adbc_dbapi.connect()
         adbc_con = con.adbc_connection
         res = adbc_con.get_info()
         reader = pa.RecordBatchReader._import_from_c(res.address)
@@ -26,9 +32,9 @@ class TestADBCConnectionGetInfo:
         expected_result = pa.array(
             [
                 "duckdb",
-                "v" + duckdb.__duckdb_version__,  # don't hardcode this, as it will change every version
+                "v" + vane.__engine_version__,  # don't hardcode this, as it will change every version
                 "ADBC DuckDB Driver",
-                "v" + duckdb.__duckdb_version__,  # don't hardcode this, as it will change every version
+                "v" + vane.__engine_version__,  # don't hardcode this, as it will change every version
                 "(unknown)",
                 None,
             ],
@@ -41,7 +47,7 @@ class TestADBCConnectionGetInfo:
         assert string_values == expected_result
 
     def test_empty_result(self):
-        con = adbc_driver_duckdb_dbapi.connect()
+        con = vane_adbc_dbapi.connect()
         adbc_con = con.adbc_connection
         res = adbc_con.get_info([1337])
         reader = pa.RecordBatchReader._import_from_c(res.address)
@@ -52,7 +58,7 @@ class TestADBCConnectionGetInfo:
         assert values.num_chunks == 0
 
     def test_unrecognized_codes(self):
-        con = adbc_driver_duckdb_dbapi.connect()
+        con = vane_adbc_dbapi.connect()
         adbc_con = con.adbc_connection
         res = adbc_con.get_info([0, 1000, 4, 2000])
         reader = pa.RecordBatchReader._import_from_c(res.address)

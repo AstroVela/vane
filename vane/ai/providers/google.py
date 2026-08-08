@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 
@@ -665,7 +665,7 @@ class GooglePrompter:
         try:
             response = await self._client.aio.models.generate_content(
                 model=self._model,
-                contents=contents,
+                contents=cast(Any, contents),
                 config=config,
             )
         except Exception as exc:

@@ -13,26 +13,23 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb
+import vane
 
 ray = pytest.importorskip("ray")
 
-import duckdb.runners.fte.fte_execution as fte_execution_mod
-import duckdb.runners.ray.fragment_worker_commands as worker_commands_mod
-import duckdb.runners.ray.fragment_worker_failures as worker_failures_mod
-import duckdb.runners.ray.fragment_worker_placement as worker_placement_mod
-import duckdb.runners.ray.fragment_worker_selection as worker_selection_mod
-import duckdb.runners.ray.fragment_worker_submission as fragment_submission_mod
-import duckdb.runners.ray.fragment_worker_task_control as task_control_mod
-import duckdb.runners.ray.fragment_worker_transitions as worker_transitions_mod
-import duckdb.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
-import duckdb.runners.ray.worker as worker_mod
-import duckdb.runners.ray.worker_handle as worker_handle_mod
-from duckdb.runners.common import QueryDeadlineExceeded
-from duckdb.runners.fte.fte_attempts import FragmentExecutionMutationResult, RevokedAttempt
-from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-from duckdb.runners.ray.fragment_worker_context import fragment_id_for_task
-from duckdb.runners.ray.fte import (
+import vane.runners.fte.fte_execution as fte_execution_mod
+import vane.runners.ray.fragment_worker_commands as worker_commands_mod
+import vane.runners.ray.fragment_worker_failures as worker_failures_mod
+import vane.runners.ray.fragment_worker_placement as worker_placement_mod
+import vane.runners.ray.fragment_worker_selection as worker_selection_mod
+import vane.runners.ray.fragment_worker_submission as fragment_submission_mod
+import vane.runners.ray.fragment_worker_task_control as task_control_mod
+import vane.runners.ray.fragment_worker_transitions as worker_transitions_mod
+import vane.runners.ray.fte_fragment_scheduler as fte_fragment_scheduler_mod
+import vane.runners.ray.worker as worker_mod
+import vane.runners.ray.worker_handle as worker_handle_mod
+from vane.runners.common import QueryDeadlineExceeded
+from vane.runners.fte import (
     AssignmentResult,
     FteFragmentExecution,
     FteTaskAttemptId,
@@ -43,7 +40,9 @@ from duckdb.runners.ray.fte import (
     NodeRequirements,
     PartitionInfo,
 )
-from duckdb.runners.ray.fte_events import (
+from vane.runners.fte.fte_attempts import FragmentExecutionMutationResult, RevokedAttempt
+from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
+from vane.runners.fte.fte_events import (
     FteAddSplitsCommand,
     FteCreateTaskCommand,
     FteNoMoreSplitsCommand,
@@ -51,19 +50,20 @@ from duckdb.runners.ray.fte_events import (
     WorkerFailed,
     WorkerReservationCompleted,
 )
-from duckdb.runners.ray.query_resource_graph import (
+from vane.runners.ray.fragment_worker_context import fragment_id_for_task
+from vane.runners.ray.query_resource_graph import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
     register_query_resource_graph,
 )
-from duckdb.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
+from vane.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
 
 
 def _test_ray_node_id() -> str:
@@ -6887,7 +6887,7 @@ def test_fte_worker_reservation_completion_after_query_drop_is_ignored(monkeypat
 
 
 def test_fte_worker_reservation_completion_racing_query_drop_is_ignored(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
+    from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-reservation-during-drop"
     actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
@@ -6971,7 +6971,7 @@ def test_fte_stale_worker_reservation_generation_does_not_consume_new_future(mon
 
 
 def test_fte_worker_reservation_completion_is_atomic_with_pending_drain(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
+    from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-reservation-completion-race"
     actor, handle, pending_key, pending_future = _submit_strict_worker_reservation_pending_pair(
@@ -7420,7 +7420,7 @@ def test_fte_denied_descriptor_is_not_registered_and_block_is_removed_when_aband
 
 
 def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch):
-    from duckdb.runners.ray.query_resource_manager import TaskGrant
+    from vane.runners.ray.query_resource_manager import TaskGrant
 
     query_id = "query-aggregate-soft-denial"
     fragment_id = _install_manual_test_fragment(query_id, "8")
@@ -9765,7 +9765,7 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
         inputs={"7": {"kind": "scan_task", "data": b"scan-a"}},
         plan={"plan": "scan-template"},
     )
-    downstream_descriptor = duckdb.ray_cxx.make_exchange_source_task_descriptor_for_test(
+    downstream_descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
         [
             {
                 "partition_id": 0,
@@ -9824,7 +9824,7 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
     exchange_retry = retry_by_fragment["query-host-loss:node:exchange"]
     assert exchange_retry["task_id"]["attempt_id"] == 1
     assert exchange_retry["dynamic_exchange_source_node_ids"] == ["3"]
-    source_handles = duckdb.ray_cxx.exchange_source_task_source_handles_for_test(
+    source_handles = vane.ray_cxx.exchange_source_task_source_handles_for_test(
         exchange_retry["initial_splits"]["3"][0]["data"]
     )
     assert source_handles[0]["attempt_id"] == 1
@@ -9967,7 +9967,7 @@ def test_fte_downstream_exchange_source_propagates_only_selected_retry_attempt(m
             ],
         },
     ]
-    downstream_descriptor = duckdb.ray_cxx.make_exchange_source_task_descriptor_for_test(
+    downstream_descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
         selected_handles,
         [0, 1],
         2,
@@ -9995,7 +9995,7 @@ def test_fte_downstream_exchange_source_propagates_only_selected_retry_attempt(m
         split = request["initial_splits"]["3"][0]
         assert split["kind"] == "exchange_source_task"
         assert split["source_partition_id"] == idx
-        source_handles = duckdb.ray_cxx.exchange_source_task_source_handles_for_test(split["data"])
+        source_handles = vane.ray_cxx.exchange_source_task_source_handles_for_test(split["data"])
         assert source_handles == [selected_handles[idx]]
         assert source_handles[0]["attempt_id"] == 1
         assert source_handles[0]["node_id"] == "worker-retry"
@@ -11153,7 +11153,7 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
 
 
 def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
+    from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-fte-live-status"
     fragment_id = f"{query_id}:node:7"
@@ -11231,7 +11231,7 @@ def test_fte_status_handler_keeps_watcher_until_terminal_status(monkeypatch):
 
 
 def test_fte_status_watcher_registry_is_not_dropped_while_thread_is_alive():
-    from duckdb.runners.ray.fte_scheduler import (
+    from vane.runners.fte.fte_scheduler import (
         FteAttemptStatusWatcher,
         FteSchedulerRegistry,
     )
@@ -11315,8 +11315,8 @@ def test_status_watcher_drop_uses_exact_query_identity():
 
 
 def test_worker_pressure_drop_uses_exact_query_identity():
-    from duckdb.runners.ray.fragment_registry import _FteWorkerPressure
-    from duckdb.runners.ray.fragment_worker_pressure import partition_reservation_key
+    from vane.runners.ray.fragment_registry import _FteWorkerPressure
+    from vane.runners.ray.fragment_worker_pressure import partition_reservation_key
 
     pressure = _FteWorkerPressure()
     parent_attempt = "q.0.0.0"
@@ -11341,7 +11341,7 @@ def test_worker_pressure_drop_uses_exact_query_identity():
 
 
 def test_fte_status_watcher_rejects_mismatched_status_identity():
-    from duckdb.runners.ray.fte_scheduler import (
+    from vane.runners.fte.fte_scheduler import (
         FteAttemptStatusWatcher,
         FteEventHandlers,
         FteSchedulerRegistry,
@@ -11395,8 +11395,8 @@ def test_fte_status_watcher_rejects_mismatched_status_identity():
 
 
 def test_fte_registry_close_waits_for_terminal_handler_and_suppresses_retry(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_events as worker_events_mod
-    from duckdb.runners.ray.fte_scheduler import FteAttemptStatusWatcher
+    from vane.runners.fte.fte_scheduler import FteAttemptStatusWatcher
+    from vane.runners.ray import fragment_worker_events as worker_events_mod
 
     query_id = "query-fte-close-terminal-race"
     fragment_id = f"{query_id}:node:7"
@@ -12294,7 +12294,7 @@ def test_ray_worker_actor_class_cloudpickle_roundtrip():
     script = """
 import ray
 
-from duckdb.runners.ray import worker as worker_mod
+from vane.runners.ray import worker as worker_mod
 
 actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
 payload = ray.cloudpickle.dumps(actor_cls)
@@ -12775,7 +12775,7 @@ def test_worker_handle_session_close_treats_dead_actor_as_terminal(monkeypatch):
     worker_handle = object.__new__(_ProductionRayWorkerActorHandle)
     worker_handle.actor_handle = SimpleNamespace(close_session=_CloseMethod())
 
-    import duckdb.runners.ray.safe_get as safe_get
+    import vane.runners.ray.safe_get as safe_get
 
     monkeypatch.setattr(
         safe_get,
@@ -13839,7 +13839,7 @@ def test_session_credential_resolver_uses_only_explicit_child_environment(monkey
         "AWS_SESSION_TOKEN": "resolved-token",
     }
     assert expiration_epoch_s == 1234.5
-    assert calls[0][0] == [sys.executable, "-m", "duckdb.runners.ray.aws_credentials"]
+    assert calls[0][0] == [sys.executable, "-m", "vane.runners.ray.aws_credentials"]
     assert calls[0][1]["capture_output"] is True
     assert calls[0][1]["check"] is False
     assert calls[0][1]["text"] is True

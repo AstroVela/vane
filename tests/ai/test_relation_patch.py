@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-import duckdb
 import vane
 from vane.ai.protocols import (
     PrompterDescriptor,
@@ -105,7 +104,7 @@ class TestRelationPatch:
 
     def test_embed_on_relation(self):
         """rel.embed() preserves source columns and appends embeddings."""
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'hello' AS text UNION ALL SELECT 'world' AS text")
 
         result = rel.embed(vane.col("text"), provider=MockProvider())
@@ -116,7 +115,7 @@ class TestRelationPatch:
             assert len(row[1]) == 4
 
     def test_embed_replaces_existing_output_column_case_insensitively(self):
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'hello' AS text, [42, 42, 42, 42]::FLOAT[4] AS Embedding")
 
         result = rel.embed(vane.col("text"), provider=MockProvider())
@@ -157,21 +156,21 @@ class TestRelationPatch:
 
     def test_methods_exist_on_relation(self):
         """DuckDBPyRelation has the patched methods."""
-        assert hasattr(duckdb.DuckDBPyRelation, "embed")
-        assert not hasattr(duckdb.DuckDBPyRelation, "embed_text")
-        assert not hasattr(duckdb.DuckDBPyRelation, "classify_text")
-        assert hasattr(duckdb.DuckDBPyRelation, "prompt")
+        assert hasattr(vane.DuckDBPyRelation, "embed")
+        assert not hasattr(vane.DuckDBPyRelation, "embed_text")
+        assert not hasattr(vane.DuckDBPyRelation, "classify_text")
+        assert hasattr(vane.DuckDBPyRelation, "prompt")
 
     def test_patch_is_idempotent(self):
         """Importing the patch module again doesn't break anything."""
         import vane.ai._relation_patch
 
         vane.ai._relation_patch._patch()
-        assert hasattr(duckdb.DuckDBPyRelation, "embed")
+        assert hasattr(vane.DuckDBPyRelation, "embed")
 
     def test_embed_chaining(self):
         """embed returns a relation that can be further queried."""
-        conn = duckdb.connect()
+        conn = vane.connect()
         rel = conn.sql("SELECT 'test' AS text")
 
         result = rel.embed(vane.col("text"), provider=MockProvider())

@@ -1,7 +1,7 @@
 {
     global:
-        PyInit__duckdb;
-        duckdb_adbc_init;
+        PyInit__native;
+        vane_adbc_init;
     local:
         *;
 };

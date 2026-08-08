@@ -1,11 +1,17 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 @pytest.fixture
 def con():
-    conn = duckdb.connect()
+    conn = vane.connect()
     conn.execute(
         """
 		create table tbl as (SELECT * FROM (VALUES

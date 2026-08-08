@@ -19,6 +19,16 @@ import pytest
 from scripts import check_release_artifacts
 
 
+class _NamesOnlyArtifact:
+    path = Path("vane_ai-test.whl")
+
+    def __init__(self, names: list[str]):
+        self._names = names
+
+    def names(self) -> list[str]:
+        return self._names
+
+
 def _runtime_sentinel() -> bytes:
     return b"Aa0!" + secrets.token_urlsafe(32).encode("ascii")
 
@@ -116,6 +126,24 @@ def test_literal_rule_repr_does_not_expose_value():
     rule = check_release_artifacts.LiteralContentRule("runtime-sensitive-content", sentinel)
 
     _assert_no_recoverable_value(sentinel, repr(rule))
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "duckdb/__init__.py",
+        "duckdb.py",
+        "_duckdb.cpython-312-x86_64-linux-gnu.so",
+        "adbc_driver_duckdb/dbapi.py",
+        "vane_ai-0.1.0.data/purelib/duckdb/__init__.py",
+        "vane_ai-0.1.0.data/platlib/_duckdb.pyd",
+    ],
+)
+def test_wheel_rejects_every_official_duckdb_import_location(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="conflicting Python package path"):
+        check_release_artifacts._check_wheel(artifact)
 
 
 @pytest.mark.parametrize(

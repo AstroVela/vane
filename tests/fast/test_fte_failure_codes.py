@@ -7,16 +7,16 @@ import asyncio
 
 import pytest
 
-from duckdb import OutOfMemoryException
-from duckdb.runners.fte.fte_failures import (
+from vane import OutOfMemoryException
+from vane.runners.fte.fte_failures import (
     _failure_allows_retry,
     _failure_payload,
     _is_memory_failure,
     _normalize_failure_payload,
 )
-from duckdb.runners.fte.fte_state import FteTaskState
-from duckdb.runners.fte.fte_worker_runtime import FteTaskExecution, _failure_payload_from_exception
-from duckdb.runners.fte.memory_config import DuckDBMemoryLimitError
+from vane.runners.fte.fte_state import FteTaskState
+from vane.runners.fte.fte_worker_runtime import FteTaskExecution, _failure_payload_from_exception
+from vane.runners.fte.memory_config import DuckDBMemoryLimitError
 
 
 @pytest.mark.parametrize(

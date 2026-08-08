@@ -6,7 +6,7 @@ import sys
 import numpy as np
 import pytest
 
-from duckdb.datasource import video_reader
+from vane.datasource import video_reader
 
 
 def test_missing_decord_error_names_video_extra(monkeypatch):

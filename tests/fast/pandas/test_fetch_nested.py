@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import numpy as np
 import pytest
 
-import duckdb
+import vane
 
 pd = pytest.importorskip("pandas")
 
@@ -304,7 +310,7 @@ class TestFetchNested:
         if not expected_error:
             compare_results(duckdb_cursor, query, expected)
         else:
-            with pytest.raises(duckdb.InvalidInputException, match=expected_error):
+            with pytest.raises(vane.InvalidInputException, match=expected_error):
                 compare_results(duckdb_cursor, query, expected)
 
     # fmt: off

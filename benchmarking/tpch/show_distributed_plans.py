@@ -22,9 +22,9 @@ QUERY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")
 
 
 def show_plan(parquet_folder, qnum, threads, plan_timeout):
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     if threads:
         con.execute(f"SET threads={threads}")
 
@@ -40,7 +40,7 @@ def show_plan(parquet_folder, qnum, threads, plan_timeout):
     relation = con.sql(sql)
 
     # Build logical plan
-    PyLogicalPlan = duckdb.ray_cxx.PyLogicalPlan
+    PyLogicalPlan = vane.ray_cxx.PyLogicalPlan
     query_id = str(uuid.uuid4())
 
     logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)

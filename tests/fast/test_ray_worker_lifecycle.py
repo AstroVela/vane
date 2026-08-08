@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.runners.ray.fragment_worker_lifecycle import FteWorkerLifecycleMixin
+from vane.runners.ray.fragment_worker_lifecycle import FteWorkerLifecycleMixin
 
 
 class _RemoteMethod:
@@ -36,7 +36,7 @@ def _lifecycle(actor: object) -> FteWorkerLifecycleMixin:
 
 
 def test_worker_finish_shutdown_waits_for_graceful_rpc_before_kill(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_lifecycle as lifecycle_module
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
 
     events: list[str] = []
     result = object()
@@ -56,7 +56,7 @@ def test_worker_finish_shutdown_waits_for_graceful_rpc_before_kill(monkeypatch):
 
 
 def test_worker_finish_shutdown_kills_actor_when_graceful_rpc_fails(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_lifecycle as lifecycle_module
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
 
     events: list[str] = []
     result = object()
@@ -77,7 +77,7 @@ def test_worker_finish_shutdown_kills_actor_when_graceful_rpc_fails(monkeypatch)
 
 
 def test_worker_two_phase_shutdown_keeps_actor_alive_until_finish(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_lifecycle as lifecycle_module
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
 
     events: list[str] = []
     prepare_result = object()
@@ -109,7 +109,7 @@ def test_worker_two_phase_shutdown_keeps_actor_alive_until_finish(monkeypatch):
 
 
 def test_failed_worker_prepare_does_not_publish_failure_recursively(monkeypatch):
-    from duckdb.runners.ray import fragment_worker_lifecycle as lifecycle_module
+    from vane.runners.ray import fragment_worker_lifecycle as lifecycle_module
 
     events: list[str] = []
     prepare_result = object()
@@ -133,7 +133,7 @@ def test_failed_worker_prepare_does_not_publish_failure_recursively(monkeypatch)
 
 
 def test_query_close_interrupts_only_owned_native_cursors():
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     class Cursor:
         def __init__(self):
@@ -175,7 +175,7 @@ def test_query_close_interrupts_only_owned_native_cursors():
 
 
 def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     events: list[str] = []
     interrupted = threading.Event()
@@ -283,7 +283,7 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
 
 
 def test_query_teardown_waits_for_pre_registration_native_admission():
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     class DummyActor:
         _shutdown_started = False
@@ -327,8 +327,8 @@ def test_query_teardown_waits_for_pre_registration_native_admission():
 
 
 def test_fte_task_manager_rejects_new_tasks_after_shutdown():
-    from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-    from duckdb.runners.fte.fte_worker_runtime import FteWorkerTaskManager
+    from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
+    from vane.runners.fte.fte_worker_runtime import FteWorkerTaskManager
 
     async def execute(_request):
         raise AssertionError("shut-down manager must not execute a task")
@@ -348,9 +348,9 @@ def test_fte_task_manager_rejects_new_tasks_after_shutdown():
 
 
 def test_fte_task_manager_shutdown_retries_retained_task_cleanup():
-    from duckdb.runners.fte import FteTaskState
-    from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-    from duckdb.runners.fte.fte_worker_runtime import FteWorkerTaskManager
+    from vane.runners.fte import FteTaskState
+    from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
+    from vane.runners.fte.fte_worker_runtime import FteWorkerTaskManager
 
     async def execute(_request):
         raise AssertionError("injected task must not execute")
@@ -394,9 +394,9 @@ def test_fte_task_manager_shutdown_retries_retained_task_cleanup():
 
 
 def test_fte_task_manager_shutdown_does_not_admit_queued_task_from_completion_callback():
-    from duckdb.runners.fte import FteTaskState
-    from duckdb.runners.fte.fte_config import FteWorkerAdmissionConfig
-    from duckdb.runners.fte.fte_worker_runtime import FteWorkerTaskManager
+    from vane.runners.fte import FteTaskState
+    from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
+    from vane.runners.fte.fte_worker_runtime import FteWorkerTaskManager
 
     async def execute(_request):
         raise AssertionError("queued task must not execute during shutdown")
@@ -443,7 +443,7 @@ def test_fte_task_manager_shutdown_does_not_admit_queued_task_from_completion_ca
 
 
 def test_actor_task_manager_creation_is_rejected_after_shutdown_starts():
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     class DummyActor:
         _shutdown_lock = threading.RLock()
@@ -457,7 +457,7 @@ def test_actor_task_manager_creation_is_rejected_after_shutdown_starts():
 
 
 def test_actor_session_connection_creation_is_rejected_after_shutdown_starts():
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
@@ -471,7 +471,7 @@ def test_actor_session_connection_creation_is_rejected_after_shutdown_starts():
 
 
 def test_actor_shutdown_retries_failed_session_connection_close():
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     class SessionConnection:
         close_calls = 0

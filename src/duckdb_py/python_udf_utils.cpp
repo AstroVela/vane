@@ -297,7 +297,7 @@ static void AppendExpressionIdField(child_list_t<Value> &fields, const Optional<
 } // namespace
 
 void ValidateSynchronousUDFCallable(const py::object &udf) {
-	py::module_::import("duckdb.execution._udf_validation").attr("validate_synchronous_udf_callable")(udf);
+	py::module_::import("vane.execution._udf_validation").attr("validate_synchronous_udf_callable")(udf);
 }
 
 static unique_ptr<Expression> LowerRegisteredExpressionUDFInternal(FunctionBindExpressionInput &input,
@@ -403,7 +403,7 @@ Value BuildPythonUDFPayload(
 	const auto resolved_output_target_max_bytes =
 	    output_target_max_bytes_value.first ? output_target_max_bytes_value.second : resolved_target_max_batch_bytes;
 
-	auto pickle_module = py::module_::import("duckdb.pickle");
+	auto pickle_module = py::module_::import("vane.pickle");
 	auto dumps = pickle_module.attr("dumps");
 	auto pickled_obj = dumps(udf);
 	auto pickled_bytes = py::reinterpret_borrow<py::bytes>(pickled_obj);
@@ -510,7 +510,7 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	const auto resolved_target_max_batch_bytes = ResolveTargetMaxBatchBytes(std::make_pair(false, idx_t(0)));
 
-	auto pickle_module = py::module_::import("duckdb.pickle");
+	auto pickle_module = py::module_::import("vane.pickle");
 	auto dumps = pickle_module.attr("dumps");
 	auto pickled_obj = dumps(udf);
 	auto pickled_bytes = py::reinterpret_borrow<py::bytes>(pickled_obj);

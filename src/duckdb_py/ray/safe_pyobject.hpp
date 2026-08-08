@@ -169,7 +169,7 @@ public:
 		if (stored.traceback.has_value()) {
 			original.attr("__traceback__") = stored.traceback.get();
 		}
-		auto transported = py::module_::import("duckdb._ray_errors").attr("remote_ray_exception")(message, original);
+		auto transported = py::module_::import("vane._ray_errors").attr("remote_ray_exception")(message, original);
 		PyErr_SetObject(py::type::of(transported).ptr(), transported.ptr());
 		throw py::error_already_set();
 	}

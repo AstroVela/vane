@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # simple DB API testcase
 
 import pandas as pd
 
-import duckdb
+import vane
 
 
 class TestImplicitPandasScan:
     def test_local_pandas_scan(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         df = pd.DataFrame([{"COL1": "val1", "CoL2": 1.05}, {"COL1": "val3", "CoL2": 17}])  # noqa: F841
         r1 = con.execute("select * from df").fetchdf()
         assert r1["COL1"][0] == "val1"
@@ -17,7 +23,7 @@ class TestImplicitPandasScan:
 
     def test_global_pandas_scan(self, duckdb_cursor):
         """Test that DuckDB can scan a module-level DataFrame variable."""
-        con = duckdb.connect()
+        con = vane.connect()
         # Create a global-scope dataframe for this test
         global test_global_df
         test_global_df = pd.DataFrame([{"COL1": "val1", "CoL2": 1.05}, {"COL1": "val4", "CoL2": 17}])

@@ -597,7 +597,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 	{
 		duckdb::PythonGILWrapper gil;
 		try {
-			py::module_ worker_pool_obj = py::module_::import("duckdb.runners.ray.worker_pool");
+			py::module_ worker_pool_obj = py::module_::import("vane.runners.ray.worker_pool");
 			py::object py_workers_obj = worker_pool_obj.attr("start_ray_workers")(existing_ids, manager_instance_id_);
 
 			py::iterable workers_iter;
@@ -1000,7 +1000,7 @@ DuckDBResult<void> RayWorkerManager::materialization_barrier_completed(const str
 
 	try {
 		duckdb::PythonGILWrapper gil;
-		py::module_ resource_runtime = py::module_::import("duckdb.runners.ray.query_resource_runtime");
+		py::module_ resource_runtime = py::module_::import("vane.runners.ray.query_resource_runtime");
 		resource_runtime.attr("mark_materialization_barrier_completed")(query_id, std::to_string(node_id));
 	} catch (const std::exception &e) {
 		return DuckDBResult<void>::err(
@@ -1215,7 +1215,7 @@ DuckDBResult<void> RayWorkerManager::try_autoscale(const std::vector<TaskResourc
 		}
 
 		duckdb::PythonGILWrapper gil;
-		py::module_ worker_pool = py::module_::import("duckdb.runners.ray.worker_pool");
+		py::module_ worker_pool = py::module_::import("vane.runners.ray.worker_pool");
 		py::list python_bundles;
 		for (auto &b : bundles) {
 			py::dict d;

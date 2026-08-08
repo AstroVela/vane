@@ -1,32 +1,38 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestPythonResult:
     def test_result_closed(self, duckdb_cursor):
-        connection = duckdb.connect("")
+        connection = vane.connect("")
         cursor = connection.cursor()
         cursor.execute("CREATE TABLE integers (i integer)")
         cursor.execute("INSERT INTO integers VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(NULL)")
         rel = connection.table("integers")
         res = rel.aggregate("sum(i)").execute()
         res.close()
-        with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+        with pytest.raises(vane.InvalidInputException, match="result closed"):
             res.fetchone()
-        with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+        with pytest.raises(vane.InvalidInputException, match="result closed"):
             res.fetchall()
-        with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+        with pytest.raises(vane.InvalidInputException, match="result closed"):
             res.fetchnumpy()
-        with pytest.raises(duckdb.InvalidInputException, match="There is no query result"):
+        with pytest.raises(vane.InvalidInputException, match="There is no query result"):
             res.to_arrow_table()
-        with pytest.raises(duckdb.InvalidInputException, match="There is no query result"):
+        with pytest.raises(vane.InvalidInputException, match="There is no query result"):
             res.to_arrow_reader(1)
 
     def test_result_describe_types(self, duckdb_cursor):
-        connection = duckdb.connect("")
+        connection = vane.connect("")
         cursor = connection.cursor()
         cursor.execute("CREATE TABLE test (i bool, j TIME, k VARCHAR)")
         cursor.execute("INSERT INTO test VALUES (TRUE, '01:01:01', 'bla' )")
@@ -39,7 +45,7 @@ class TestPythonResult:
         ]
 
     def test_result_timestamps(self, duckdb_cursor):
-        connection = duckdb.connect("")
+        connection = vane.connect("")
         cursor = connection.cursor()
         cursor.execute(
             "CREATE TABLE IF NOT EXISTS timestamps (sec TIMESTAMP_S, milli TIMESTAMP_MS,micro TIMESTAMP_US, nano TIMESTAMP_NS );"  # noqa: E501
@@ -59,7 +65,7 @@ class TestPythonResult:
         ]
 
     def test_result_interval(self):
-        connection = duckdb.connect()
+        connection = vane.connect()
         cursor = connection.cursor()
         cursor.execute("CREATE TABLE IF NOT EXISTS intervals (ivals INTERVAL)")
         cursor.execute("INSERT INTO intervals VALUES ('1 day'), ('2 second'), ('1 microsecond')")
@@ -74,6 +80,6 @@ class TestPythonResult:
         ]
 
     def test_description_uuid(self):
-        connection = duckdb.connect()
+        connection = vane.connect()
         connection.execute("select uuid();")
         connection.description  # noqa: B018

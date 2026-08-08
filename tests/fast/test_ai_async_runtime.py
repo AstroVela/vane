@@ -30,7 +30,7 @@ def _load_functions() -> types.ModuleType:
 
     On CI the real module imports normally and nothing is stubbed. Under the
     no-duckdb harness the import fails on dependencies that reach into
-    ``duckdb.execution`` at module level; those get stubbed and the import is
+    ``vane.execution`` at module level; those get stubbed and the import is
     retried — the wrapper tests never touch the stubbed surfaces.
     """
     module = sys.modules.get("vane.ai.functions")
@@ -44,7 +44,7 @@ def _load_functions() -> types.ModuleType:
         stub_specs: tuple[tuple[str, tuple[str, ...]], ...] = (
             ("vane._expressions", ("as_expression", "is_expression")),
             ("vane._expression_udf", ("_build_actor_map_batches_expression",)),
-            # The real vllm provider module imports duckdb.execution at top
+            # The real vllm provider module imports vane.execution at top
             # level; the wrapper tests never touch the native vLLM plan.
             ("vane.ai.providers.vllm", ("NativeVLLMPromptPlan", "_build_native_vllm_options_argument")),
         )

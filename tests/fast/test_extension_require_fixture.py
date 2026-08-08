@@ -3,7 +3,7 @@
 
 import pytest
 
-import duckdb
+import vane
 
 
 class RecordingConnection:
@@ -26,7 +26,7 @@ def test_require_loads_present_extension(require, tmp_path, monkeypatch):
         return connection
 
     monkeypatch.setenv("DUCKDB_PYTHON_TEST_EXTENSION_PATH", str(tmp_path))
-    monkeypatch.setattr(duckdb, "connect", connect)
+    monkeypatch.setattr(vane, "connect", connect)
 
     assert require("fixture_test", "fixture.db") is connection
     assert connect_calls == [("fixture.db", {"allow_unsigned_extensions": "true"})]
@@ -41,7 +41,7 @@ def test_require_skips_only_when_extension_is_absent(require, tmp_path, monkeypa
     def unexpected_connect(*_args, **_kwargs):
         pytest.fail("require should not connect without a matching extension")
 
-    monkeypatch.setattr(duckdb, "connect", unexpected_connect)
+    monkeypatch.setattr(vane, "connect", unexpected_connect)
 
     with pytest.raises(pytest.skip.Exception, match="could not load missing"):
         require("missing")

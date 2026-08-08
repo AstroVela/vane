@@ -3,12 +3,12 @@
 
 import pytest
 
-from duckdb.runners.ray.cluster_resource_coordinator import (
+from vane.runners.ray.cluster_resource_coordinator import (
     ClusterQueryResourceCoordinator,
     NodeCapacity,
 )
-from duckdb.runners.ray.query_resource_graph import ResourceVector
-from duckdb.runners.ray.query_resource_graph_builder import (
+from vane.runners.ray.query_resource_graph import ResourceVector
+from vane.runners.ray.query_resource_graph_builder import (
     build_query_demand,
     build_query_resource_graph,
     native_fragment_unit_id_for_fragment,

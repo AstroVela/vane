@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 import os
 import platform
 import subprocess
 import sys
+import types
 from importlib.metadata import distribution, metadata, requires, version
 from pathlib import Path
 
@@ -13,9 +15,105 @@ from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
-import duckdb
+import vane
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_vane_public_exports_are_unique_and_resolvable():
+    assert len(vane.__all__) == len(set(vane.__all__))
+
+    expected_vane_exports = {
+        "Connection",
+        "EnvRegistry",
+        "Relation",
+        "VaneConfig",
+        "__engine_version__",
+        "__version__",
+        "attach_function",
+        "cls",
+        "col",
+        "configure",
+        "current_config",
+        "detach_function",
+        "env",
+        "func",
+        "lit",
+        "sql_expr",
+    }
+    assert expected_vane_exports <= set(vane.__all__)
+    assert all(hasattr(vane, name) for name in vane.__all__)
+    undeclared_public_objects = {
+        name
+        for name, value in vars(vane).items()
+        if not name.startswith("_") and not isinstance(value, types.ModuleType) and name not in vane.__all__
+    }
+    assert not undeclared_public_objects
+
+    wildcard_namespace: dict[str, object] = {}
+    exec("from vane import *", wildcard_namespace)
+    assert wildcard_namespace["Connection"] is vane.DuckDBPyConnection
+    assert wildcard_namespace["Relation"] is vane.DuckDBPyRelation
+
+    assert not hasattr(vane, "__duckdb_version__")
+    assert not hasattr(vane, "__vane_version__")
+    assert not hasattr(vane, "vane_runners_cpp")
+
+
+def test_vane_native_extensions_are_declared_in_package_stubs():
+    from vane import _native
+
+    stub_path = REPOSITORY_ROOT / "vane" / "_native.pyi"
+    module = ast.parse(stub_path.read_text(encoding="utf-8"))
+    classes = {node.name: node for node in module.body if isinstance(node, ast.ClassDef)}
+    stub_functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+
+    expected_methods = {
+        "DuckDBPyConnection": {
+            "_create_vane_batch_function",
+            "_create_vane_function",
+            "create_table_function",
+            "from_datasource",
+            "tensor_type",
+        },
+        "DuckDBPyRelation": {"explode", "local_exchange", "repartition"},
+    }
+    for class_name, method_names in expected_methods.items():
+        runtime_class = getattr(_native, class_name)
+        stub_methods = {node.name for node in classes[class_name].body if isinstance(node, ast.FunctionDef)}
+        assert method_names <= set(dir(runtime_class))
+        assert method_names <= stub_methods
+
+    native_functions = {
+        "create_table_function",
+        "get_or_create_runner",
+        "get_or_infer_runner_type",
+        "get_runner",
+        "set_runner_local",
+        "set_runner_ray",
+        "teardown_runner",
+        "tensor_type",
+    }
+    assert native_functions <= set(dir(_native))
+    assert native_functions <= set(stub_functions)
+
+    annotations = {
+        node.target.id for node in module.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert "ray_cxx" in annotations
+
+    for function_name in ("read_json", "write_csv"):
+        keyword_names = {argument.arg for argument in stub_functions[function_name].args.kwonlyargs}
+        assert "connection" in keyword_names
+
+    sqltypes_path = REPOSITORY_ROOT / "vane" / "sqltypes" / "__init__.pyi"
+    sqltypes_module = ast.parse(sqltypes_path.read_text(encoding="utf-8"))
+    sqltypes_all = next(
+        ast.literal_eval(node.value)
+        for node in sqltypes_module.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "__all__"
+    )
+    assert "TIME_NS" in sqltypes_all
 
 
 def _expected_duckdb_source_id(repository_root: Path) -> str:
@@ -58,6 +156,7 @@ def test_base_distribution_installs_expression_runtime_dependencies():
     base_requirements = _base_requirements()
 
     assert {"numpy", "pyarrow"} <= set(base_requirements)
+    assert "duckdb" not in base_requirements
 
 
 def test_base_distribution_requires_pyarrow_14_or_newer():
@@ -79,7 +178,9 @@ def test_artifact_mode_imports_installed_python_packages():
     import vane
 
     environment_root = Path(sys.prefix).resolve()
-    for package in (duckdb, vane):
+    from vane import _native
+
+    for package in (_native, vane):
         package_path = Path(package.__file__).resolve()
         assert package_path.is_relative_to(environment_root), (
             f"{package.__name__} was imported from the checkout: {package_path}"
@@ -90,6 +191,31 @@ def test_vane_distribution_declares_inline_types():
     import vane
 
     assert Path(vane.__file__).with_name("py.typed").is_file()
+
+
+def test_vane_distribution_owns_only_the_vane_import_namespace():
+    files = {str(path).replace("\\", "/") for path in distribution("vane-ai").files or []}
+    removed_runner_compatibility_modules = {
+        "vane/runners/ray/_fte_compat.py",
+        "vane/runners/ray/fte.py",
+        "vane/runners/ray/fte_attempts.py",
+        "vane/runners/ray/fte_config.py",
+        "vane/runners/ray/fte_descriptor.py",
+        "vane/runners/ray/fte_events.py",
+        "vane/runners/ray/fte_exchange.py",
+        "vane/runners/ray/fte_execution.py",
+        "vane/runners/ray/fte_failures.py",
+        "vane/runners/ray/fte_scheduler.py",
+        "vane/runners/ray/fte_split_assigner.py",
+        "vane/runners/ray/fte_state.py",
+        "vane/runners/ray/fte_types.py",
+        "vane/runners/ray/fte_update_batch.py",
+        "vane/runners/ray/fte_worker_runtime.py",
+    }
+
+    assert any(path.startswith("vane/_native.") and path.endswith((".so", ".pyd")) for path in files)
+    assert not any(path == "duckdb" or path.startswith(("duckdb/", "_duckdb", "adbc_driver_duckdb/")) for path in files)
+    assert files.isdisjoint(removed_runner_compatibility_modules)
 
 
 def _requirements_for_extra(extra):
@@ -151,30 +277,30 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/NOTICE") for path in files)
     assert any(path.endswith("licenses/LICENSES/DuckDB-MIT.txt") for path in files)
     assert any(path.endswith("licenses/LICENSES/vcpkg-binary-dependencies.txt") for path in files)
-    assert any(path.endswith("licenses/duckdb/experimental/spark/LICENSE") for path in files)
+    assert any(path.endswith("licenses/vane/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)
     assert any(path.endswith("compression/alprd/algorithm/LICENSE") for path in files)
 
 
 def test_duckdb_version_and_source_id_match_recorded_engine_identities():
-    import _duckdb
+    from vane import _native
 
     fork_version = _expected_duckdb_fork_version(REPOSITORY_ROOT)
     source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
-    embedded_version, embedded_source_id = duckdb.sql(
+    embedded_version, embedded_source_id = vane.sql(
         "SELECT library_version, source_id FROM pragma_version()"
     ).fetchone()
 
     assert embedded_version == fork_version
     assert embedded_source_id == source_tree_id[:10]
-    assert _duckdb.__version__ == fork_version.removeprefix("v")
-    assert duckdb.__version__ == version("vane-ai")
-    assert duckdb.__duckdb_version__ == fork_version.removeprefix("v")
-    assert duckdb.__git_revision__ == embedded_source_id
+    assert _native.__version__ == fork_version.removeprefix("v")
+    assert vane.__version__ == version("vane-ai")
+    assert vane.__engine_version__ == fork_version.removeprefix("v")
+    assert vane.__git_revision__ == embedded_source_id
 
 
 def test_release_runtime_is_self_contained_by_default():
-    connection = duckdb.connect()
+    connection = vane.connect()
     settings = dict(
         connection.execute(
             """
@@ -228,7 +354,7 @@ def test_release_runtime_is_self_contained_by_default():
 )
 def test_static_extension_settings_are_available_during_connect(tmp_path, setting_name, setting_value, expected):
     extension_directory = tmp_path / "extensions"
-    connection = duckdb.connect(
+    connection = vane.connect(
         config={
             setting_name: setting_value,
             "extension_directory": str(extension_directory),
@@ -243,8 +369,8 @@ def test_static_extension_settings_are_available_during_connect(tmp_path, settin
 def test_dynamic_extension_settings_are_rejected_during_connect_without_installing(tmp_path):
     extension_directory = tmp_path / "extensions"
 
-    with pytest.raises(duckdb.InvalidInputException, match="sqlite_all_varchar.*sqlite_scanner.*not statically linked"):
-        duckdb.connect(
+    with pytest.raises(vane.InvalidInputException, match="sqlite_all_varchar.*sqlite_scanner.*not statically linked"):
+        vane.connect(
             config={
                 "sqlite_all_varchar": "true",
                 "extension_directory": str(extension_directory),

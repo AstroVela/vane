@@ -33,7 +33,7 @@ import time
 
 import vane
 
-print(f"DuckDB version: {vane.__duckdb_version__}")
+print(f"DuckDB version: {vane.__engine_version__}")
 
 TABLES = ["nation", "region", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 QUERY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queries")

@@ -40,7 +40,9 @@ python -m pip install . --no-build-isolation -v
 
 Do not use `pip install -e`. An editable install can cause Ray workers to invoke the build backend during import and delay actor startup.
 
-Python-only changes do not require a native rebuild. Changes below `src/duckdb_py/` or `external/duckdb/src/` do.
+Python-only changes do not require a native rebuild, but reinstall the
+non-editable package so the test environment receives them. Changes below
+`src/duckdb_py/` or `external/duckdb/src/` require an incremental native build.
 
 ## Native C++ tests
 
@@ -73,13 +75,24 @@ need model downloads, cloud credentials, GPUs, or external services:
 scripts/run_release_tests.sh
 ```
 
+Vane's native extension is private to the installed `vane` package. Test
+launchers therefore run outside the checkout and put the installed
+site-packages directory before repository support modules. This prevents the
+source package from shadowing `vane._native` and ensures tests exercise the
+same layout shipped in the wheel. Run an affected test through the same
+installed-package wrapper:
+
+```bash
+scripts/run_installed_pytest.sh tests/fast/test_udf_process.py
+```
+
 The inherited compatibility suites are broader and require the development
 dependency group. Run them when changing the corresponding integration:
 
 ```bash
 scripts/run_fast_tests.sh
-python -m pytest tests/slow
-python -m pytest tests/ai
+scripts/run_installed_pytest.sh tests/slow
+scripts/run_installed_pytest.sh tests/ai
 ```
 
 The fast-test launcher runs non-Ray tests, shared-cluster Ray tests, and
@@ -100,7 +113,7 @@ Tests that require an externally provisioned service are excluded by default.
 Run them explicitly when the required service and credentials are available:
 
 ```bash
-python -m pytest -m external_service tests/fast
+scripts/run_installed_pytest.sh -m external_service tests/fast
 ```
 
 Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must

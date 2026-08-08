@@ -14,6 +14,8 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb_python/import_cache/python_import_cache_modules.hpp"
 
+//! Note: This file is generated using scripts/generate_import_cache_cpp.py.
+
 namespace duckdb {
 
 struct PythonImportCache {
@@ -32,7 +34,7 @@ public:
 	NumpyCacheItem numpy;
 	PathlibCacheItem pathlib;
 	PolarsCacheItem polars;
-	DuckdbCacheItem duckdb;
+	VaneCacheItem vane;
 	PytzCacheItem pytz;
 	TypesCacheItem types;
 	TypingCacheItem typing;

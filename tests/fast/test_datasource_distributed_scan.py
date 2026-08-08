@@ -13,13 +13,13 @@ import uuid
 import weakref
 from collections.abc import Iterator
 
-import _duckdb
 import pyarrow as pa
 import pytest
 
-import duckdb
-from duckdb import runners as _runners
-from duckdb.datasource import DataSource, DataSourceTask, read_datasource
+import vane
+from vane import _native
+from vane import runners as _runners
+from vane.datasource import DataSource, DataSourceTask, read_datasource
 
 
 @pytest.fixture(autouse=True)
@@ -31,7 +31,7 @@ def _vane_shuffle_env(monkeypatch):
 
 @pytest.fixture
 def duckdb_conn():
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         yield con
     finally:
@@ -52,7 +52,7 @@ def ray_runner(_vane_shuffle_env, request):
     try:
         yield runner
     finally:
-        vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+        vane_mod = vane
         if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
             vane_mod.teardown_runner()
 
@@ -67,7 +67,7 @@ def _collect_tables(runner, relation, timeout_s: float = 60.0) -> pa.Table:
 
 
 def _datasource_registry_state() -> dict:
-    return dict(_duckdb._datasource_factory_registry_state_for_test())
+    return dict(_native._datasource_factory_registry_state_for_test())
 
 
 class RegistryProbeTask(DataSourceTask):
@@ -75,9 +75,9 @@ class RegistryProbeTask(DataSourceTask):
         self.value = int(value)
 
     def execute(self) -> Iterator[pa.RecordBatch]:
-        import _duckdb
+        from vane import _native
 
-        state = dict(_duckdb._datasource_factory_registry_state_for_test())
+        state = dict(_native._datasource_factory_registry_state_for_test())
         source_ids = list(state["source_ids"])
         if len(source_ids) != 1:
             raise RuntimeError(f"expected one active datasource source, found {source_ids!r}")
@@ -229,7 +229,7 @@ def test_ray_runner_plan_retention_does_not_extend_datasource_lifetime(
     stream_outcome,
     tmp_path,
 ):
-    from duckdb.runners.ray.runner import RayRunner
+    from vane.runners.ray.runner import RayRunner
 
     source_path = tmp_path / "runner-plan-retention-source.txt"
     source_path.write_text("43", encoding="utf-8")
@@ -392,20 +392,20 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
     resource_query_id = "query-datasource-resource-owner"
     execution_query_id = f"{resource_query_id}:stage:retry"
     relation = read_datasource(RegistryProbeSource([41]), con=duckdb_conn)
-    logical_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, source_plan_id)
+    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, source_plan_id)
     source_plan = logical_plan.to_physical_plan(duckdb_conn)
     assert source_plan.idx() == source_plan_id
     assert source_plan.resource_query_id() == source_plan_id
 
-    duckdb.ray_cxx._register_query_python_replay_state(resource_query_id, source_plan)
-    worker_connection = duckdb.connect()
+    vane.ray_cxx._register_query_python_replay_state(resource_query_id, source_plan)
+    worker_connection = vane.connect()
     worker_source_plan = None
     task = None
     worker_plan = None
     result = None
     try:
         worker_source_plan = source_plan.clone(worker_connection)
-        task = duckdb.ray_cxx._make_worker_task_from_plan_for_test(
+        task = vane.ray_cxx._make_worker_task_from_plan_for_test(
             worker_source_plan,
             execution_query_id,
             resource_query_id,
@@ -414,7 +414,7 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
         assert worker_plan.idx() == execution_query_id
         assert worker_plan.resource_query_id() == resource_query_id
 
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
             worker_connection,
             worker_plan,
         )
@@ -431,8 +431,8 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
         task = None
         worker_source_plan = None
         worker_connection.close()
-        _duckdb._release_datasource_factories_for_query(resource_query_id)
-        duckdb.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+        _native._release_datasource_factories_for_query(resource_query_id)
+        vane.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
 
 
 def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
@@ -450,9 +450,9 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
 
         import pyarrow as pa
 
-        import duckdb
-        import _duckdb
-        from duckdb.datasource import DataSource, DataSourceTask, read_datasource
+        import vane
+        from vane import _native
+        from vane.datasource import DataSource, DataSourceTask, read_datasource
 
 
         class SingleTask(DataSourceTask):
@@ -475,9 +475,9 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
         sys.setswitchinterval(1000.0)
 
         query_id = f"query-datasource-fte-gil-{uuid.uuid4().hex[:8]}"
-        source_connection = duckdb.connect()
+        source_connection = vane.connect()
         relation = read_datasource(SingleSource(), con=source_connection)
-        source_plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             query_id,
         ).to_physical_plan(source_connection)
@@ -486,10 +486,10 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
         node_id, descriptors = next(iter(scan_task_descriptors.items()))
         assert len(descriptors) == 1
 
-        duckdb.ray_cxx._register_query_python_replay_state(query_id, source_plan)
-        worker_connection = duckdb.connect()
+        vane.ray_cxx._register_query_python_replay_state(query_id, source_plan)
+        worker_connection = vane.connect()
         worker_plan = source_plan.clone(worker_connection)
-        split_queue = duckdb.ray_cxx.FteSplitQueue()
+        split_queue = vane.ray_cxx.FteSplitQueue()
         split_queue.add_scan_split(bytes(descriptors[0]))
         started = threading.Event()
         results = []
@@ -500,7 +500,7 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
             started.set()
             try:
                 results.append(
-                    duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                    vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
                         worker_connection,
                         worker_plan,
                         fte_scan_source_queues={str(node_id): split_queue},
@@ -526,8 +526,8 @@ def test_datasource_fte_scan_wait_releases_gil_for_queue_seal():
         results.clear()
         worker_plan = None
         worker_connection.close()
-        _duckdb._release_datasource_factories_for_query(query_id)
-        duckdb.ray_cxx._cleanup_query_python_replay_state(query_id)
+        _native._release_datasource_factories_for_query(query_id)
+        vane.ray_cxx._cleanup_query_python_replay_state(query_id)
         source_connection.close()
         print("ok", flush=True)
         """
@@ -551,10 +551,10 @@ def test_ray_runner_executes_python_datasource_task_on_worker(ray_runner, duckdb
             self.task_id = int(task_id)
 
         def execute(self) -> Iterator[pa.RecordBatch]:
-            import _duckdb
+            from vane import _native
 
             worker_id = os.getenv("VANE_WORKER_ID", "").strip() or os.getenv("VANE_FTE_WORKER_ID", "").strip()
-            registry = dict(_duckdb._datasource_factory_registry_state_for_test())
+            registry = dict(_native._datasource_factory_registry_state_for_test())
             source_ids = list(registry["source_ids"])
             if len(source_ids) != 1:
                 raise RuntimeError(f"expected one active datasource source, found {source_ids!r}")

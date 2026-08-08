@@ -12,21 +12,21 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb.execution.udf_stream_result_collector as collector_module
-from duckdb.execution.ray_stream_adapter import (
+import vane.execution.udf_stream_result_collector as collector_module
+from vane.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupOperation,
     RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
 )
-from duckdb.execution.udf_ray_stream_protocol import validate_stream_block_metadata
-from duckdb.execution.udf_stream_result_collector import (
+from vane.execution.udf_ray_stream_protocol import validate_stream_block_metadata
+from vane.execution.udf_stream_result_collector import (
     UDFStreamResultCollector,
     _OutputLeaseToken,
     _ReadyEvent,
     _StreamRecord,
 )
-from duckdb.execution.udf_task_admission import TaskAdmission
+from vane.execution.udf_task_admission import TaskAdmission
 
 _CLEANUP_SUBMISSION_SCOPE = "query:test-cleanup"
 
@@ -1232,7 +1232,7 @@ def test_slot_retirement_reports_async_cancellation_ticket_failure():
 
 def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
     collector = UDFStreamResultCollector(ray_module=_FakeRay())
@@ -1274,7 +1274,7 @@ def test_cleanup_ticket_retries_a_hung_control_response(monkeypatch):
 
 def test_cleanup_ticket_accepts_late_ack_from_timed_out_attempt(monkeypatch):
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
     collector = UDFStreamResultCollector(ray_module=_FakeRay())
@@ -1319,7 +1319,7 @@ def test_cleanup_ticket_accepts_late_ack_from_timed_out_attempt(monkeypatch):
 
 def test_cleanup_ticket_ignores_invalid_late_ack(monkeypatch):
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
     collector = UDFStreamResultCollector(ray_module=_FakeRay())
@@ -1366,7 +1366,7 @@ def test_cleanup_ticket_ignores_invalid_late_ack(monkeypatch):
 
 def test_cleanup_ticket_finishes_once_when_retried_acks_race(monkeypatch):
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
     collector = UDFStreamResultCollector(ray_module=_FakeRay())
@@ -1431,11 +1431,11 @@ def test_cleanup_ticket_finishes_once_when_retried_acks_race(monkeypatch):
 
 def test_cleanup_ticket_expands_slow_response_deadline(monkeypatch):
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_S",
         0.01,
     )
     monkeypatch.setattr(
-        "duckdb.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_MAX_S",
+        "vane.execution.udf_stream_result_collector._CLEANUP_RESPONSE_TIMEOUT_MAX_S",
         0.04,
     )
     collector = UDFStreamResultCollector(ray_module=_FakeRay())
@@ -3090,7 +3090,7 @@ def test_failed_completion_retires_without_cancelling_terminal_remote_work():
 
 
 def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
-    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
     fake_ray = _FakeRay()
     driver = _Driver()
@@ -3137,8 +3137,8 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
 
 
 def test_remote_provider_capability_error_preserves_safe_details():
-    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
     from vane.ai.provider import ProviderCapabilityError
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
     fake_ray = _FakeRay()
     driver = _Driver()

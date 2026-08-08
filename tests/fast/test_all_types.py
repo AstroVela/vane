@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import math
 import warnings
@@ -10,7 +16,7 @@ import pandas as pd
 import pytest
 import pytz
 
-import duckdb
+import vane
 
 
 def replace_with_ndarray(obj):
@@ -44,7 +50,7 @@ def recursive_equality(o1, o2):
 # Regenerate the 'all_types' list using:
 
 # def get_all_types():
-#    conn = duckdb.connect()
+#    conn = vane.connect()
 #    rel = conn.sql("""
 #        select * EXCLUDE
 #            time_tz
@@ -114,7 +120,7 @@ all_types = [
 class TestAllTypes:
     @pytest.mark.parametrize("cur_type", all_types)
     def test_fetchall(self, cur_type):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.execute("SET TimeZone =UTC")
         # We replace these values since the extreme ranges are not supported in native-python.
         replacement_values = {
@@ -282,7 +288,7 @@ class TestAllTypes:
         assert recursive_equality(result, correct_result)
 
     def test_bytearray_with_nulls(self):
-        con = duckdb.connect(database=":memory:")
+        con = vane.connect(database=":memory:")
         con.execute("CREATE TABLE test (content BLOB)")
         want = bytearray([1, 2, 0, 3, 4])
         con.execute("INSERT INTO test VALUES (?)", [want])
@@ -294,7 +300,7 @@ class TestAllTypes:
 
     @pytest.mark.parametrize("cur_type", all_types)
     def test_fetchnumpy(self, cur_type):
-        conn = duckdb.connect()
+        conn = vane.connect()
 
         correct_answer_map = {
             "bool": np.ma.array(
@@ -549,7 +555,7 @@ class TestAllTypes:
         if cur_type in skip_types:
             return
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         if cur_type in replacement_values:
             arrow_table = conn.execute("select " + replacement_values[cur_type]).to_arrow_table()
         else:
@@ -581,7 +587,7 @@ class TestAllTypes:
         adjusted_values = {
             "time": """CASE WHEN "time" = '24:00:00'::TIME THEN '23:59:59.999999'::TIME ELSE "time" END AS "time" """,
         }
-        conn = duckdb.connect()
+        conn = vane.connect()
         # Pandas <= 2.2.3 does not convert without throwing a warning
         conn.execute("SET timezone = UTC")
         warnings.simplefilter(action="ignore", category=RuntimeWarning)

@@ -6,18 +6,18 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import _duckdb
+from vane import _native
 
 
 def test_vane_map_runtime_and_stub_signatures_stay_in_sync():
-    runtime_doc = _duckdb._VaneUDFMapExpression.__doc__ or ""
+    runtime_doc = _native._VaneUDFMapExpression.__doc__ or ""
     runtime_parameters = ("expression_id", "*args")
     assert all(parameter in runtime_doc for parameter in runtime_parameters)
     assert [runtime_doc.index(parameter) for parameter in runtime_parameters] == sorted(
         runtime_doc.index(parameter) for parameter in runtime_parameters
     )
 
-    stub_path = Path(__file__).parents[2] / "_duckdb-stubs" / "__init__.pyi"
+    stub_path = Path(__file__).parents[2] / "vane" / "_native.pyi"
     module = ast.parse(stub_path.read_text(encoding="utf-8"))
     function = next(
         node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "_VaneUDFMapExpression"
@@ -32,14 +32,14 @@ def test_vane_map_runtime_and_stub_signatures_stay_in_sync():
 
 
 def test_vane_map_batches_runtime_and_stub_signatures_stay_in_sync():
-    runtime_doc = _duckdb._VaneUDFMapBatchesExpression.__doc__ or ""
+    runtime_doc = _native._VaneUDFMapBatchesExpression.__doc__ or ""
     runtime_parameters = ("gpus", "actor_number", "stateful", "expression_id", "*args")
     assert all(parameter in runtime_doc for parameter in runtime_parameters)
     assert [runtime_doc.index(parameter) for parameter in runtime_parameters] == sorted(
         runtime_doc.index(parameter) for parameter in runtime_parameters
     )
 
-    stub_path = Path(__file__).parents[2] / "_duckdb-stubs" / "__init__.pyi"
+    stub_path = Path(__file__).parents[2] / "vane" / "_native.pyi"
     module = ast.parse(stub_path.read_text(encoding="utf-8"))
     function = next(
         node

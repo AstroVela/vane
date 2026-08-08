@@ -3,15 +3,15 @@
 
 import pytest
 
-from duckdb.runners.ray.query_resource_graph import (
+from vane.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_manager import TaskRequest
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_manager import TaskRequest
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
     mark_materialization_barrier_completed,

@@ -7,7 +7,7 @@ pytest.importorskip("pyarrow")
 
 import pyarrow as pa
 
-import duckdb
+import vane
 
 
 def test_native_dispatcher_shutdown_is_terminal():
@@ -19,8 +19,8 @@ def test_native_dispatcher_shutdown_is_terminal():
 
     script = textwrap.dedent(
         """
-        import _duckdb
-        import duckdb
+        from vane import _native
+        import vane
         import pyarrow as pa
 
 
@@ -28,14 +28,14 @@ def test_native_dispatcher_shutdown_is_terminal():
             return pa.table({"y": table.column(0)})
 
 
-        _duckdb._shutdown_udf_executor_dispatcher()
-        _duckdb._shutdown_udf_executor_dispatcher()
+        _native._shutdown_udf_executor_dispatcher()
+        _native._shutdown_udf_executor_dispatcher()
 
-        connection = duckdb.connect()
+        connection = vane.connect()
         try:
             relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
                 passthrough,
-                schema={"y": duckdb.sqltypes.BIGINT},
+                schema={"y": vane.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
             )
             try:
@@ -71,8 +71,8 @@ def test_native_dispatcher_concurrent_shutdown_never_reopens():
         """
         import threading
 
-        import _duckdb
-        import duckdb
+        from vane import _native
+        import vane
         import pyarrow as pa
 
 
@@ -80,10 +80,10 @@ def test_native_dispatcher_concurrent_shutdown_never_reopens():
             return pa.table({"y": table.column(0)})
 
 
-        connection = duckdb.connect()
+        connection = vane.connect()
         relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
         )
         barrier = threading.Barrier(3)
@@ -102,7 +102,7 @@ def test_native_dispatcher_concurrent_shutdown_never_reopens():
         def run_shutdown():
             barrier.wait()
             try:
-                _duckdb._shutdown_udf_executor_dispatcher()
+                _native._shutdown_udf_executor_dispatcher()
             except BaseException as exc:
                 shutdown_errors.append(exc)
 
@@ -119,11 +119,11 @@ def test_native_dispatcher_concurrent_shutdown_never_reopens():
         assert not shutdown_errors, shutdown_errors
         connection.close()
 
-        final_connection = duckdb.connect()
+        final_connection = vane.connect()
         try:
             final_relation = final_connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
                 passthrough,
-                schema={"y": duckdb.sqltypes.BIGINT},
+                schema={"y": vane.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
             )
             try:
@@ -157,10 +157,10 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
 
     script = textwrap.dedent(
         """
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         build_count = 0
 
@@ -238,13 +238,13 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
         def make_relation(connection):
             return connection.sql("select 1::BIGINT as x").map_batches(
                 add_one,
-                schema={"y": duckdb.sqltypes.BIGINT},
+                schema={"y": vane.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
             )
 
 
         udf_exec.build_executor = build_executor
-        failed_connection = duckdb.connect()
+        failed_connection = vane.connect()
         try:
             try:
                 make_relation(failed_connection).fetchall()
@@ -255,7 +255,7 @@ def test_native_dispatcher_isolates_async_task_admission_failure():
         finally:
             failed_connection.close()
 
-        healthy_connection = duckdb.connect()
+        healthy_connection = vane.connect()
         try:
             assert make_relation(healthy_connection).fetchall() == [(2,)]
         finally:
@@ -339,10 +339,10 @@ def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
         import threading
         import time
 
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
 
         class DelayedExecutor:
@@ -420,11 +420,11 @@ def test_streaming_control_task_drains_event_after_source_wakeup_is_lost():
 
 
         udf_exec.build_executor = build_executor
-        connection = duckdb.connect()
+        connection = vane.connect()
         try:
             relation = connection.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
                 add_one,
-                schema={"y": duckdb.sqltypes.INTEGER},
+                schema={"y": vane.sqltypes.INTEGER},
                 execution_backend="subprocess_task",
                 batch_size=4,
             )
@@ -463,9 +463,9 @@ def test_native_dispatcher_shutdown_closes_active_executor():
         """
         import threading
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
 
         submitted = threading.Event()
@@ -520,10 +520,10 @@ def test_native_dispatcher_shutdown_closes_active_executor():
 
 
         udf_exec.build_executor = build_executor
-        connection = duckdb.connect()
+        connection = vane.connect()
         relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="subprocess_task",
         )
         query_errors = []
@@ -540,7 +540,7 @@ def test_native_dispatcher_shutdown_closes_active_executor():
         query_thread.start()
         try:
             assert submitted.wait(timeout=5), "query never submitted to the fake executor"
-            _duckdb._shutdown_udf_executor_dispatcher()
+            _native._shutdown_udf_executor_dispatcher()
             assert closed.is_set(), "shutdown returned before closing the active executor"
             query_thread.join(timeout=5)
             assert not query_thread.is_alive(), "active query did not observe terminal shutdown"
@@ -575,10 +575,10 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
         import threading
         import time
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
 
         slot_count = 4
@@ -682,11 +682,11 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        connections = [duckdb.connect() for _ in range(slot_count)]
+        connections = [vane.connect() for _ in range(slot_count)]
         relations = [
             connection.sql("select 1::BIGINT as x").map_batches(
                 passthrough,
-                schema={"y": duckdb.sqltypes.BIGINT},
+                schema={"y": vane.sqltypes.BIGINT},
                 execution_backend="ray_task",
             )
             for connection in connections
@@ -711,7 +711,7 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
             assert all_tracked.wait(timeout=5), "not every Ray slot reached the collector"
             assert cancel_calls == 0, cancel_calls
             started_at = time.monotonic()
-            _duckdb._shutdown_udf_executor_dispatcher()
+            _native._shutdown_udf_executor_dispatcher()
             elapsed = time.monotonic() - started_at
             assert aggregate_shutdown.is_set(), "aggregate collector shutdown was not called"
             assert shutdown_calls == 1, shutdown_calls
@@ -756,10 +756,10 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
         import threading
         import weakref
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
 
         tracked = threading.Event()
@@ -860,10 +860,10 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        connection = duckdb.connect()
+        connection = vane.connect()
         relation = connection.sql("select 1::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         query_errors = []
@@ -888,7 +888,7 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
             assert executor_released.wait(timeout=5), "pending remote cleanup retained the executor object"
             assert len(executor_close_calls) == 1
 
-            _duckdb._shutdown_udf_executor_dispatcher()
+            _native._shutdown_udf_executor_dispatcher()
             assert len(executor_close_calls) == 1, "terminal shutdown closed an already released executor again"
         finally:
             query_thread.join(timeout=5)
@@ -923,11 +923,11 @@ def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
 
         import threading
 
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         collector_instances = []
         first_collector_shutdown = threading.Event()
@@ -1059,16 +1059,16 @@ def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        failed_connection = duckdb.connect()
-        recovered_connection = duckdb.connect()
+        failed_connection = vane.connect()
+        recovered_connection = vane.connect()
         failed_relation = failed_connection.sql("select 1::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         recovered_relation = recovered_connection.sql("select 2::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         try:
@@ -1114,11 +1114,11 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
         import threading
         import time
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         dispatcher_blocked = threading.Event()
         release_dispatcher = threading.Event()
@@ -1198,13 +1198,13 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
         def make_relation(connection):
             return connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
                 add_one,
-                schema={"y": duckdb.sqltypes.BIGINT},
+                schema={"y": vane.sqltypes.BIGINT},
                 execution_backend="subprocess_task",
             )
 
 
         udf_exec.build_executor = build_executor
-        connection = duckdb.connect()
+        connection = vane.connect()
         relation = make_relation(connection)
         query_errors = []
 
@@ -1223,7 +1223,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
             connection.interrupt()
             teardown_deadline = time.monotonic() + 5
             while query_thread.is_alive() and time.monotonic() < teardown_deadline:
-                _duckdb._wake_udf_executor_slots_for_testing()
+                _native._wake_udf_executor_slots_for_testing()
                 query_thread.join(timeout=0.01)
             assert not query_thread.is_alive(), "query teardown did not honor the unregister deadline"
             assert query_errors, "the interrupted query unexpectedly succeeded"
@@ -1237,7 +1237,7 @@ def test_unregister_timeout_detaches_stale_dispatcher_work():
             release_dispatcher.set()
             assert stale_executor_closed.wait(timeout=5), "detached slot was not eventually cleaned"
 
-            healthy_connection = duckdb.connect()
+            healthy_connection = vane.connect()
             try:
                 assert make_relation(healthy_connection).fetchall() == [(1,), (2,)]
             finally:
@@ -1279,10 +1279,10 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
         import threading
         import time
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
 
         submit_entered = threading.Event()
@@ -1389,10 +1389,10 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        connection = duckdb.connect()
+        connection = vane.connect()
         relation = connection.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         query_errors = []
@@ -1412,7 +1412,7 @@ def test_retired_ray_submit_is_discarded_before_python_ref_is_dropped(failure_ph
             connection.interrupt()
             teardown_deadline = time.monotonic() + 5
             while query_thread.is_alive() and time.monotonic() < teardown_deadline:
-                _duckdb._wake_udf_executor_slots_for_testing()
+                _native._wake_udf_executor_slots_for_testing()
                 query_thread.join(timeout=0.01)
             assert not query_thread.is_alive(), "query teardown did not honor the unregister deadline"
             assert query_errors, "the interrupted query unexpectedly succeeded"
@@ -1461,12 +1461,12 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
         import threading
         import time
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         state_lock = threading.Lock()
         slow_tracked = threading.Event()
@@ -1618,16 +1618,16 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        slow_connection = duckdb.connect()
-        healthy_connection = duckdb.connect()
+        slow_connection = vane.connect()
+        healthy_connection = vane.connect()
         slow_relation = slow_connection.sql("select 1::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         healthy_relation = healthy_connection.sql("select 2::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         slow_errors = []
@@ -1647,7 +1647,7 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
             slow_connection.interrupt()
             deadline = time.monotonic() + 5
             while not slow_cancel_started.is_set() and time.monotonic() < deadline:
-                _duckdb._wake_udf_executor_slots_for_testing()
+                _native._wake_udf_executor_slots_for_testing()
                 time.sleep(0.01)
             assert slow_cancel_started.is_set(), "slow Ray slot never entered cleanup"
 
@@ -1717,11 +1717,11 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
 
         import threading
 
-        import duckdb
-        import duckdb.execution.udf as udf_exec
-        import duckdb.execution.udf_stream_result_collector as collector_mod
+        import vane
+        import vane.execution.udf as udf_exec
+        import vane.execution.udf_stream_result_collector as collector_mod
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         both_tracked = threading.Event()
         good_handoff = threading.Event()
@@ -1867,16 +1867,16 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
 
         udf_exec.build_executor = build_executor
         collector_mod.UDFStreamResultCollector = FakeCollector
-        bad_connection = duckdb.connect()
-        good_connection = duckdb.connect()
+        bad_connection = vane.connect()
+        good_connection = vane.connect()
         bad_relation = bad_connection.sql("select 1::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         good_relation = good_connection.sql("select 2::BIGINT as x").map_batches(
             passthrough,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_task",
         )
         barrier = threading.Barrier(3)
@@ -1948,11 +1948,11 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
         import threading
         import time
 
-        import _duckdb
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        from vane import _native
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import make_local_shm_ref_bundle_result
+        from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         conversion_blocked = threading.Event()
         release_conversion = threading.Event()
@@ -2052,9 +2052,9 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
 
 
         udf_exec.build_executor = build_executor
-        connection = duckdb.connect()
+        connection = vane.connect()
         connection.execute("SET arrow_lossless_conversion = true")
-        relation = make_relation(connection, "HUGEINT", duckdb.sqltypes.HUGEINT)
+        relation = make_relation(connection, "HUGEINT", vane.sqltypes.HUGEINT)
         query_errors = []
 
 
@@ -2073,7 +2073,7 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
             connection.interrupt()
             teardown_deadline = time.monotonic() + 5
             while query_thread.is_alive() and time.monotonic() < teardown_deadline:
-                _duckdb._wake_udf_executor_slots_for_testing()
+                _native._wake_udf_executor_slots_for_testing()
                 query_thread.join(timeout=0.01)
             assert not query_thread.is_alive(), "query teardown did not honor the unregister deadline"
             assert query_errors, "the interrupted query unexpectedly succeeded"
@@ -2089,9 +2089,9 @@ def test_unregister_timeout_keeps_context_alive_during_input_conversion():
             assert stale_executor_closed.wait(timeout=5), "detached slot was not eventually cleaned"
             assert not stale_submit_called.is_set(), "retired input was submitted after Arrow conversion resumed"
 
-            healthy_connection = duckdb.connect()
+            healthy_connection = vane.connect()
             try:
-                assert make_relation(healthy_connection, "BIGINT", duckdb.sqltypes.BIGINT).fetchall() == [(1,), (2,)]
+                assert make_relation(healthy_connection, "BIGINT", vane.sqltypes.BIGINT).fetchall() == [(1,), (2,)]
             finally:
                 healthy_connection.close()
         finally:
@@ -2131,10 +2131,10 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         import time
         import uuid
 
-        import duckdb
-        import duckdb.execution.udf as udf_exec
+        import vane
+        import vane.execution.udf as udf_exec
         import pyarrow as pa
-        from duckdb.execution.ref_bundle import (
+        from vane.execution.ref_bundle import (
             make_local_shm_ref_bundle_result,
             materialize_ref_bundle,
         )
@@ -2299,11 +2299,11 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
 
 
         udf_exec.build_executor = build_executor
-        connection = duckdb.connect()
+        connection = vane.connect()
         cursor = connection.cursor()
         lazy = connection.sql("SELECT i::BIGINT AS x FROM range(4) t(i)").map_batches(
             Stage1,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
@@ -2313,14 +2313,14 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         materialized = connection.sql("SELECT (100 + i)::BIGINT AS y FROM range(4) t(i)")
         relation = materialized.union(lazy).map_batches(
             Stage2,
-            schema={"z": duckdb.sqltypes.BIGINT},
+            schema={"z": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
             batch_size=4,
             task_input_max_bytes=1024 * 1024,
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             f"mixed-task-admission-{uuid.uuid4().hex[:8]}",
         ).to_physical_plan(connection)
@@ -2337,7 +2337,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         plan.set_udf_actor_handles(handles, conn=connection)
 
         try:
-            result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
                 cursor,
                 plan,
                 None,
@@ -2377,7 +2377,7 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
 
 
 def test_create_function_rejects_removed_process_and_ray_args():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_one(value):
         return value + 1
@@ -2404,7 +2404,7 @@ def test_create_function_rejects_removed_process_and_ray_args():
 
 
 def test_map_batches_rejects_removed_process_and_actor_count_args():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_one(table):
         values = table.column(0).to_pylist()
@@ -2415,21 +2415,21 @@ def test_map_batches_rejects_removed_process_and_actor_count_args():
     with pytest.raises(TypeError):
         rel.map_batches(
             add_one,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             use_process=True,
         )
 
     with pytest.raises(TypeError):
         rel.map_batches(
             add_one,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             actor_count=1,
         )
 
 
 def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
-    con = duckdb.connect()
+    con = vane.connect()
 
     def add_ten(table):
         values = table.column(0).to_pylist()
@@ -2437,7 +2437,7 @@ def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
 
     relation = con.sql("select i from range(0, 5) t(i)").map_batches(
         add_ten,
-        schema={"out": duckdb.sqltypes.BIGINT},
+        schema={"out": vane.sqltypes.BIGINT},
         execution_backend="ray_task",
         batch_size=2,
     )
@@ -2447,7 +2447,7 @@ def test_ray_task_map_batches_local_execution_is_rejected(monkeypatch):
 
 
 def test_flat_map_rejects_removed_actor_count_arg():
-    con = duckdb.connect()
+    con = vane.connect()
 
     def expand(row):
         return [{"out": row["i"]}, {"out": row["i"] + 10}]
@@ -2455,6 +2455,6 @@ def test_flat_map_rejects_removed_actor_count_arg():
     with pytest.raises(TypeError):
         con.sql("select i from range(0, 2) t(i)").flat_map(
             expand,
-            schema={"out": duckdb.sqltypes.BIGINT},
+            schema={"out": vane.sqltypes.BIGINT},
             actor_count=1,
         )

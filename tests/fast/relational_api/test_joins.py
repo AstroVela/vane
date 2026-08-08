@@ -8,8 +8,8 @@ from itertools import product
 # Modified by Vane contributors.
 import pytest
 
-import duckdb
-from duckdb import ColumnExpression
+import vane
+from vane import ColumnExpression
 
 STANDARD_VECTOR_SIZE = 2048
 CROSS_JOIN_BOUNDARY_CASES = (
@@ -29,7 +29,7 @@ CROSS_JOIN_BOUNDARY_CASES = (
 
 @pytest.fixture
 def con():
-    conn = duckdb.connect()
+    conn = vane.connect()
     # Main relation
     conn.execute(
         """
@@ -271,7 +271,7 @@ class TestRAPIJoins:
         assert relation.fetchall() == [(20,)]
         assert relation.sql_query() == ""
 
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM relation")
 
     @pytest.mark.parametrize("operation", ["filter", "order", "project", "aggregate", "distinct", "limit", "alias"])
@@ -327,7 +327,7 @@ class TestRAPIJoins:
         assert relation.fetchall() == [(20,)]
         assert relation.sql_query() == ""
 
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM relation")
 
     def test_explicit_alias_restores_serializable_scope_for_correlated_subquery(self, con):
@@ -417,7 +417,7 @@ class TestRAPIJoins:
 
         assert result.fetchall() == expected
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     def test_nested_alias_with_matching_column_hides_join_binding(self, con):
@@ -454,7 +454,7 @@ class TestRAPIJoins:
         hidden = boundary.project("l.x_1 AS value")
         assert hidden.fetchall() == [(2,)]
         assert hidden.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM hidden")
 
         surviving = boundary.project("x_1 AS value")
@@ -521,7 +521,7 @@ class TestRAPIJoins:
         con.execute("CREATE OR REPLACE VIEW local_scope_source AS SELECT 99 AS other")
         assert result.fetchall() == [(100,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
         con.execute("CREATE OR REPLACE VIEW local_scope_source AS SELECT 84 AS right_value")
@@ -565,7 +565,7 @@ class TestRAPIJoins:
 
         assert correlated.sql_query() == ""
         assert correlated.fetchall() == expected_correlated
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM correlated")
 
     @pytest.mark.parametrize("operation", ["project", "filter", "order", "aggregate", "window_order"])
@@ -592,7 +592,7 @@ class TestRAPIJoins:
             assert sorted(result.fetchall()) == [(7, 1, 1), (8, 1, 1)]
 
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     def test_macro_expansion_keeps_surviving_struct_column_serializable(self, con):
@@ -630,7 +630,7 @@ class TestRAPIJoins:
 
         assert result.fetchall() == [(7,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     def test_table_function_alias_is_not_visible_inside_its_arguments(self, con):
@@ -644,7 +644,7 @@ class TestRAPIJoins:
 
         assert result.fetchall() == [(2,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     def test_pivot_source_alias_is_not_visible_after_pivot(self, con):
@@ -660,7 +660,7 @@ class TestRAPIJoins:
 
         assert result.fetchall() == [(7,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
@@ -679,7 +679,7 @@ class TestRAPIJoins:
 
         assert sorted(result.fetchall()) == [(0,), (1,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
@@ -689,7 +689,7 @@ class TestRAPIJoins:
         left = con.table("rowid_source")
         right = con.sql("SELECT 1 AS join_key").set_alias("r")
 
-        with pytest.raises(duckdb.BinderException, match="rowid"):
+        with pytest.raises(vane.BinderException, match="rowid"):
             left.cross(right).distinct().project(expression)
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
@@ -708,7 +708,7 @@ class TestRAPIJoins:
 
         assert sorted(result.fetchall()) == [(0,), (1,)]
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize("expression", ["rowid_source.rowid AS row_id", "rowid AS row_id"])
@@ -716,7 +716,7 @@ class TestRAPIJoins:
         con.execute("CREATE TABLE rowid_source(value INTEGER)")
         con.execute("INSERT INTO rowid_source VALUES (10), (20)")
 
-        with pytest.raises(duckdb.BinderException, match="rowid"):
+        with pytest.raises(vane.BinderException, match="rowid"):
             con.table("rowid_source").distinct().project(expression)
 
     @pytest.mark.parametrize(
@@ -736,7 +736,7 @@ class TestRAPIJoins:
         left = con.table_function("read_parquet", [str(parquet_path)])
         right = con.sql("SELECT 1 AS join_key").set_alias("r")
 
-        with pytest.raises(duckdb.BinderException):
+        with pytest.raises(vane.BinderException):
             left.cross(right).distinct().project(expression)
 
     @pytest.mark.parametrize(
@@ -769,7 +769,7 @@ class TestRAPIJoins:
 
         assert result.fetchall() == expected
         assert result.sql_query() == ""
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             con.sql("SELECT * FROM result")
 
     @pytest.mark.parametrize(
@@ -788,7 +788,7 @@ class TestRAPIJoins:
         con.execute(f"COPY (SELECT 1 AS id) TO '{parquet_path}' (FORMAT PARQUET)")
         relation = con.table_function("read_parquet", [str(parquet_path)])
 
-        with pytest.raises(duckdb.BinderException):
+        with pytest.raises(vane.BinderException):
             relation.distinct().project(expression)
 
     @pytest.mark.parametrize("boundary", ["distinct", "limit", "order"])
@@ -909,7 +909,7 @@ class TestRAPIJoins:
         if operation == "insert_into":
             con.execute(f"CREATE TABLE {target} (right_value INTEGER)")
 
-        with pytest.raises(duckdb.NotImplementedException, match="faithfully represented"):
+        with pytest.raises(vane.NotImplementedException, match="faithfully represented"):
             getattr(relation, operation)(target)
 
     @pytest.mark.parametrize("threads", [1, 4])

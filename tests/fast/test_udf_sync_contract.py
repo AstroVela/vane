@@ -14,10 +14,9 @@ import cloudpickle
 import pyarrow as pa
 import pytest
 
-import duckdb
 import vane
-from duckdb.execution._udf_runtime import UDFExecutor
-from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution._udf_runtime import UDFExecutor
+from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
 _ASYNC_CALLABLE_ERROR = "generic UDF callables must be synchronous"
 _AWAITABLE_RESULT_ERROR = "generic UDF callables must return values synchronously"
@@ -200,13 +199,13 @@ def test_sync_validator_uses_the_effective_type_call_method():
 
 @pytest.mark.parametrize("method", ["map", "map_batches", "flat_map"])
 def test_relation_task_udfs_reject_async_functions(method):
-    with duckdb.connect() as connection:
+    with vane.connect() as connection:
         source = connection.sql("SELECT 1::INTEGER AS value")
         kwargs = {"execution_backend": "subprocess_task"}
         if method == "map":
-            kwargs["return_type"] = duckdb.sqltypes.INTEGER
+            kwargs["return_type"] = vane.sqltypes.INTEGER
         else:
-            kwargs["schema"] = {"value": duckdb.sqltypes.INTEGER}
+            kwargs["schema"] = {"value": vane.sqltypes.INTEGER}
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             getattr(source, method)(_async_value, **kwargs)
@@ -214,7 +213,7 @@ def test_relation_task_udfs_reject_async_functions(method):
 
 @pytest.mark.parametrize("method", ["map", "map_batches", "flat_map"])
 def test_relation_actor_udfs_reject_async_call_methods(method):
-    with duckdb.connect() as connection:
+    with vane.connect() as connection:
         source = connection.sql("SELECT 1::INTEGER AS value")
         kwargs = {
             "execution_backend": "subprocess_actor",
@@ -222,29 +221,29 @@ def test_relation_actor_udfs_reject_async_call_methods(method):
             "gpus": 0,
         }
         if method == "map":
-            kwargs["return_type"] = duckdb.sqltypes.INTEGER
+            kwargs["return_type"] = vane.sqltypes.INTEGER
         else:
-            kwargs["schema"] = {"value": duckdb.sqltypes.INTEGER}
+            kwargs["schema"] = {"value": vane.sqltypes.INTEGER}
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             getattr(source, method)(_AsyncCallable, **kwargs)
 
 
 def test_connection_udf_registration_rejects_async_functions():
-    with duckdb.connect() as connection:
+    with vane.connect() as connection:
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             connection.create_function(
                 "async_scalar",
                 _async_value,
-                [duckdb.sqltypes.INTEGER],
-                duckdb.sqltypes.INTEGER,
+                [vane.sqltypes.INTEGER],
+                vane.sqltypes.INTEGER,
             )
 
         with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
             connection.create_table_function(
                 "async_batches",
                 _async_value,
-                schema={"value": duckdb.sqltypes.INTEGER},
+                schema={"value": vane.sqltypes.INTEGER},
             )
 
 
@@ -297,16 +296,16 @@ def test_attach_function_rejects_raw_async_callables():
 def test_scalar_registration_rejects_async_results_without_leaking_coroutines(udf_type, exception_handling, target):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with duckdb.connect() as connection:
+        with vane.connect() as connection:
             connection.create_function(
                 "returns_async_result",
                 target,
-                [duckdb.sqltypes.INTEGER],
-                duckdb.sqltypes.INTEGER,
+                [vane.sqltypes.INTEGER],
+                vane.sqltypes.INTEGER,
                 type=udf_type,
                 exception_handling=exception_handling,
             )
-            with pytest.raises(duckdb.Error, match=_AWAITABLE_RESULT_ERROR):
+            with pytest.raises(vane.Error, match=_AWAITABLE_RESULT_ERROR):
                 connection.execute("SELECT returns_async_result(1)").fetchall()
         gc.collect()
 

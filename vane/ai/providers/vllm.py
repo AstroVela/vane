@@ -29,7 +29,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from duckdb.execution._vllm_options_protocol import (
+from vane.ai._redaction import Secret, wrap_sensitive_options
+from vane.ai.options import (
+    _reject_sensitive_prompt_options,
+    _require_prompt_int,
+    _require_prompt_number,
+    normalize_prompt_options,
+)
+from vane.ai.protocols import NativePrompterPlan
+from vane.ai.provider import Provider
+from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
     _NATIVE_OPTIONS_PUBLIC_KEY,
     _NATIVE_OPTIONS_RESERVED_KEYS,
@@ -40,15 +49,6 @@ from duckdb.execution._vllm_options_protocol import (
     _NATIVE_SECRET_REF_KEY,
     _dump_vllm_protocol_json,
 )
-from vane.ai._redaction import Secret, wrap_sensitive_options
-from vane.ai.options import (
-    _reject_sensitive_prompt_options,
-    _require_prompt_int,
-    _require_prompt_number,
-    normalize_prompt_options,
-)
-from vane.ai.protocols import NativePrompterPlan
-from vane.ai.provider import Provider
 
 if TYPE_CHECKING:
     from vane.ai.typing import Options

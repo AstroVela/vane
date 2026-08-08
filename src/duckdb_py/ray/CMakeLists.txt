@@ -11,7 +11,7 @@ target_include_directories(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/yyjson/include)
 
-target_link_libraries(python_ray PRIVATE _duckdb_dependencies)
+target_link_libraries(python_ray PRIVATE vane_python_dependencies)
 
-# No installation target; this is built into _duckdb module via
+# No installation target; this is built into the vane._native module via
 # $<TARGET_OBJECTS:python_ray>

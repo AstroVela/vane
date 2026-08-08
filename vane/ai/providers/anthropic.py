@@ -244,6 +244,7 @@ class AnthropicPrompter:
         if self._system_message is not None:
             kwargs["system"] = self._system_message
         return_format = getattr(self, "_return_format", None)
+        complete_stop_reasons: tuple[str, ...]
         if return_format is not None:
             kwargs["tools"] = [
                 {

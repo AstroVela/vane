@@ -45,4 +45,4 @@ add_library(
   udf_executor.cpp
   vllm_executor.cpp)
 
-target_link_libraries(python_src PRIVATE _duckdb_dependencies)
+target_link_libraries(python_src PRIVATE vane_python_dependencies)

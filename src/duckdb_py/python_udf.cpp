@@ -193,7 +193,7 @@ static void EnsureSynchronousUDFResult(const py::object &result) {
 	if (!MayBeAsynchronousResult(result)) {
 		return;
 	}
-	py::module_::import("duckdb.execution._udf_validation").attr("ensure_synchronous_udf_result")(result);
+	py::module_::import("vane.execution._udf_validation").attr("ensure_synchronous_udf_result")(result);
 }
 
 static scalar_function_t CreateVectorizedFunction(PyObject *function, PythonExceptionHandling exception_handling,

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -598,8 +598,6 @@ class OpenAITextEmbedder:
             batch_tokens = 0
 
         for item in text:
-            if item is None:
-                item = ""
             est_tokens = estimate_tokens(item)
             single_input_limit = min(self._input_text_token_limit, self._batch_token_limit)
 
@@ -660,9 +658,15 @@ class OpenAITextEmbedder:
                     f"OpenAI Embeddings API returned {len(response_data)} embeddings for {len(texts)} inputs; "
                     "embedding calls must preserve row count and order"
                 )
-            indices = [getattr(item, "index", None) for item in response_data]
-            if any(index is not None for index in indices):
-                if any(type(index) is not int for index in indices) or sorted(indices) != list(range(len(texts))):
+            raw_indices: list[object] = [getattr(item, "index", None) for item in response_data]
+            if any(index is not None for index in raw_indices):
+                if any(type(index) is not int for index in raw_indices):
+                    raise _ProviderResultError(
+                        "OpenAI Embeddings API returned invalid embedding indices; "
+                        "embedding calls must preserve row count and order"
+                    )
+                indices = cast(list[int], raw_indices)
+                if sorted(indices) != list(range(len(texts))):
                     raise _ProviderResultError(
                         "OpenAI Embeddings API returned invalid embedding indices; "
                         "embedding calls must preserve row count and order"
@@ -671,7 +675,7 @@ class OpenAITextEmbedder:
                     item for _, item in sorted(zip(indices, response_data, strict=True), key=lambda pair: pair[0])
                 ]
             if encoding_format == "base64":
-                return [_decode_openai_embedding_base64(e.embedding) for e in response_data]
+                return [_decode_openai_embedding_base64(cast(str, e.embedding)) for e in response_data]
             return [np.array(e.embedding, dtype=np.float32) for e in response_data]
         except OpenAIError as ex:
             if _is_embedding_capability_error(ex):
@@ -914,7 +918,7 @@ class OpenAIPrompter:
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
-                messages=messages,
+                messages=cast(Any, messages),
                 **options,
             )
         except Exception as exc:
@@ -931,7 +935,7 @@ class OpenAIPrompter:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return response.choices[0].message.content
+        return cast(str | None, response.choices[0].message.content)
 
     async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Responses API."""
@@ -940,7 +944,7 @@ class OpenAIPrompter:
         try:
             response = await self._client.responses.create(
                 model=self._model,
-                input=messages,
+                input=cast(Any, messages),
                 **options,
             )
         except Exception as exc:
@@ -957,7 +961,7 @@ class OpenAIPrompter:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return response.output_text
+        return cast(str | None, response.output_text)
 
     async def prompt(self, messages: tuple[Any, ...]) -> str | None:
         chat_messages: list[dict[str, Any]] = []

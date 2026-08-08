@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
-from duckdb import (
+import vane
+from vane import (
     ColumnExpression,
     ConstantExpression,
     SQLExpression,
@@ -89,16 +95,16 @@ class TestSQLExpression:
 
     def test_sql_expression_errors(self, duckdb_cursor):
         # Test empty string
-        with pytest.raises(duckdb.ParserException, match="SELECT clause without selection list"):
+        with pytest.raises(vane.ParserException, match="SELECT clause without selection list"):
             SQLExpression("")
 
         # Test invalid SQL
-        with pytest.raises(duckdb.ParserException, match='Parser Error: syntax error at or near "SELECT"'):
+        with pytest.raises(vane.ParserException, match='Parser Error: syntax error at or near "SELECT"'):
             SQLExpression("SELECT *")
 
         # Test multiple expressions
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="Please provide only a single expression to SQLExpression, found 2 expressions in the parsed string",
         ):
             SQLExpression("1, 2")

@@ -40,7 +40,6 @@ from typing import Any
 
 import pyarrow as pa
 
-import duckdb
 import vane
 
 DEFAULT_OUTPUT_DIR = Path("examples/output/minhash_dedupe")
@@ -135,7 +134,7 @@ def relation_from_rows(
     if not rows:
         raise RuntimeError("Cannot create a relation from zero rows.")
     columns = list(schema or rows[0])
-    constant = duckdb.ConstantExpression
+    constant = vane.ConstantExpression
     raw = conn.values(
         *(tuple(constant(row[column]) for column in columns) for row in rows),
     )
@@ -668,12 +667,12 @@ def run(args: argparse.Namespace) -> None:
     processed = rel.map_batches(
         minhasher.__call__,
         schema={
-            "node_id": duckdb.sqltypes.BIGINT,
-            "block_id": duckdb.sqltypes.VARCHAR,
-            "block": duckdb.sqltypes.VARCHAR,
-            "content_normalized": duckdb.sqltypes.VARCHAR,
-            "minhashes_json": duckdb.sqltypes.VARCHAR,
-            "shingles_json": duckdb.sqltypes.VARCHAR,
+            "node_id": vane.sqltypes.BIGINT,
+            "block_id": vane.sqltypes.VARCHAR,
+            "block": vane.sqltypes.VARCHAR,
+            "content_normalized": vane.sqltypes.VARCHAR,
+            "minhashes_json": vane.sqltypes.VARCHAR,
+            "shingles_json": vane.sqltypes.VARCHAR,
         },
         batch_size=args.batch_size,
     )

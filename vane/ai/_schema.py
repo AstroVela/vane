@@ -558,7 +558,7 @@ def _copy_json_schema(value: Any) -> dict[str, Any]:
             raise TypeError("return_format requires pydantic when passing a Pydantic BaseModel class") from None
         if not issubclass(value, BaseModel):
             raise TypeError("return_format class must be a Pydantic BaseModel subclass")
-        value = value.model_json_schema()
+        value = getattr(value, "model_json_schema")()
     elif not isinstance(value, Mapping):
         raise TypeError("return_format must be a Pydantic BaseModel class, a JSON schema mapping, or None")
     try:

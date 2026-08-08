@@ -8,7 +8,7 @@ import warnings
 
 import pytest
 
-from duckdb.runners.ray.ray_env import (
+from vane.runners.ray.ray_env import (
     build_explicit_session_process_env,
     build_session_runtime_env_vars,
     collect_vane_env_overrides,
@@ -16,7 +16,7 @@ from duckdb.runners.ray.ray_env import (
     scrub_shared_runtime_session_env,
     session_environment_overrides,
 )
-from duckdb.runners.ray.runner import (
+from vane.runners.ray.runner import (
     _configure_scan_task_backlog_env,
 )
 
@@ -76,7 +76,7 @@ def test_collect_vane_env_overrides_excludes_app_benchmark_env(monkeypatch):
 def test_node_local_flight_host_is_not_inherited_from_query_driver(monkeypatch):
     import ray
 
-    from duckdb.runners.ray.worker_pool import _persistent_worker_runtime_env
+    from vane.runners.ray.worker_pool import _persistent_worker_runtime_env
 
     env_key = "VANE_FLIGHT_ADVERTISE_HOST"
     driver_host = "driver.example.internal"
@@ -122,7 +122,7 @@ def test_query_driver_rejects_flight_host_in_ray_job_runtime_env():
     import ray
     from ray_test_profile import ray_test_object_store_options
 
-    from duckdb.runners.ray.driver import RayQueryDriverClient
+    from vane.runners.ray.driver import RayQueryDriverClient
 
     ray.shutdown()
     with warnings.catch_warnings():

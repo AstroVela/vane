@@ -5,14 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.runners.ray import cluster_resource_coordinator as coordinator_module
-from duckdb.runners.ray.cluster_resource_coordinator import (
+from vane.runners.ray import cluster_resource_coordinator as coordinator_module
+from vane.runners.ray.cluster_resource_coordinator import (
     ClusterQueryResourceCoordinator,
     NodeCapacity,
     QueryDemand,
     read_ray_node_capacities,
 )
-from duckdb.runners.ray.query_resource_graph import ResourceVector
+from vane.runners.ray.query_resource_graph import ResourceVector
 
 
 def _r(

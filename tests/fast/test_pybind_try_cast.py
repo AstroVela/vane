@@ -8,29 +8,29 @@ from pathlib import Path
 
 import pytest
 
-import duckdb
-from duckdb import FunctionExpression
-from duckdb.sqltypes import BIGINT
+import vane
+from vane import FunctionExpression
+from vane.sqltypes import BIGINT
 
 
 @pytest.mark.parametrize("fields", [[None], {"a": None}])
 def test_struct_type_rejects_null_type_holder(fields):
-    with pytest.raises(duckdb.InvalidInputException, match="object has to be a list of DuckDBPyType"):
-        duckdb.struct_type(fields)
+    with pytest.raises(vane.InvalidInputException, match="object has to be a list of DuckDBPyType"):
+        vane.struct_type(fields)
 
 
 def test_execute_rejects_null_statement_holder(duckdb_cursor):
     with pytest.raises(
-        duckdb.InvalidInputException,
+        vane.InvalidInputException,
         match="Please provide either a DuckDBPyStatement or a string representing the query",
     ):
         duckdb_cursor.execute(None)
 
 
 def test_value_rejects_null_type_holder(duckdb_cursor):
-    value = duckdb.Value(1, None)
+    value = vane.Value(1, None)
     with pytest.raises(
-        duckdb.InvalidInputException,
+        vane.InvalidInputException,
         match="The 'type' of a Value should be of type DuckDBPyType",
     ):
         duckdb_cursor.execute("select ?", [value])
@@ -39,7 +39,7 @@ def test_value_rejects_null_type_holder(duckdb_cursor):
 @pytest.mark.parametrize("dtype", [[None], {"category_id": None}])
 def test_read_csv_rejects_null_type_holder(duckdb_cursor, dtype):
     csv_path = Path(__file__).parent / "data" / "category.csv"
-    with pytest.raises(duckdb.InvalidInputException, match="can not be converted to a DuckDB Type"):
+    with pytest.raises(vane.InvalidInputException, match="can not be converted to a DuckDB Type"):
         duckdb_cursor.read_csv(csv_path, dtype=dtype)
 
 

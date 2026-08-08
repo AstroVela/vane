@@ -4930,29 +4930,6 @@ void register_ray_bindings(py::module_ &mod) {
 	    },
 	    py::arg("bytes"), "Split a raw ExchangeSourceTaskDescriptor into one descriptor per source partition.");
 
-	// Also attach the submodule to the higher-level Python package `duckdb` so it is available
-	// as `duckdb.ray_cxx` from Python code.
-	try {
-		py::module_ duckdb_pkg = py::module_::import("duckdb");
-		duckdb_pkg.attr("ray_cxx") = m;
-
-		// Ensure that `import duckdb.ray_cxx` succeeds in all execution contexts by
-		// registering the submodule directly into `sys.modules` under the canonical
-		// name `duckdb.ray_cxx` (and also under `_duckdb.ray_cxx` as a defensive fallback
-		// for some build variants that use an internal module name).
-		try {
-			py::module_ sys = py::module_::import("sys");
-			py::dict modules = sys.attr("modules");
-			modules["duckdb.ray_cxx"] = m;
-			modules["_duckdb.ray_cxx"] = m;
-		} catch (...) {
-			// Not fatal: if we can't mutate sys.modules for some reason, continue.
-		}
-
-	} catch (...) {
-		// swallow: package may not be importable in some contexts during build
-	}
-
 	// Stop the poller before CPython enters late finalization. The callback is
 	// registered after the other Ray cleanup hook, so it runs first at exit.
 	py::module_::import("atexit").attr("register")(

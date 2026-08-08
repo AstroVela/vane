@@ -10,7 +10,7 @@ try:
 except Exception:
     ray = None
 
-import duckdb
+import vane
 
 
 def _collect_rows_from_parts(parts):
@@ -36,13 +36,13 @@ def _collect_rows_from_parts(parts):
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_run_simple_plan_on_ray_local():
-    from duckdb import runners as _runners
+    from vane import runners as _runners
 
     _runners.set_runner_ray(noop_if_initialized=True)
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"
 
-    relation = duckdb.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
+    relation = vane.sql("SELECT a, b, a + b AS sum FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b)")
     parts = list(runner.run_iter_tables(relation))
     assert parts
     rows = sorted(_collect_rows_from_parts(parts))
@@ -52,14 +52,14 @@ def test_run_simple_plan_on_ray_local():
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
-    from duckdb import runners as _runners
+    from vane import runners as _runners
 
     _runners.set_runner_ray(noop_if_initialized=True)
 
     # Build a small parquet-backed relation with multiple planner partitions.
     n = 12
     path = tmp_path / "ray_real_integration_input.parquet"
-    duckdb.sql(
+    vane.sql(
         f"""
         COPY (
             SELECT
@@ -69,7 +69,7 @@ def test_run_distributed_plan_end_to_end_on_ray_local(tmp_path):
         ) TO '{path}' (FORMAT PARQUET)
         """
     )
-    relation = duckdb.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
+    relation = vane.sql(f"SELECT a, b, a + b AS sum FROM read_parquet('{path}')")
 
     runner = _runners.get_or_create_runner()
     assert getattr(runner, "name", None) == "ray"
@@ -95,20 +95,20 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
 
     import pyarrow as pa
 
-    from duckdb import runners as _runners
-    from duckdb.runners.ray.driver import RayQueryDriverClient
+    from vane import runners as _runners
+    from vane.runners.ray.driver import RayQueryDriverClient
 
     _runners.set_runner_ray(noop_if_initialized=True)
     runner = _runners.get_or_create_runner()
 
     session_secret_key = "AWS_ISSUE75_SESSION_SECRET"
     path = tmp_path / "ray_two_sessions.parquet"
-    duckdb.sql(f"COPY (SELECT i::INTEGER AS value FROM range(8) AS t(i)) TO '{path}' (FORMAT PARQUET)")
+    vane.sql(f"COPY (SELECT i::INTEGER AS value FROM range(8) AS t(i)) TO '{path}' (FORMAT PARQUET)")
 
     monkeypatch.setenv(session_secret_key, "connection-a")
-    connection_a = duckdb.connect()
+    connection_a = vane.connect()
     monkeypatch.setenv(session_secret_key, "connection-b")
-    connection_b = duckdb.connect()
+    connection_b = vane.connect()
     monkeypatch.delenv(session_secret_key)
 
     def read_session_secret(table):
@@ -117,12 +117,12 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
 
     relation_a = connection_a.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
         read_session_secret,
-        schema={"secret": duckdb.sqltypes.VARCHAR},
+        schema={"secret": vane.sqltypes.VARCHAR},
         execution_backend="ray_task",
     )
     relation_b = connection_b.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
         read_session_secret,
-        schema={"secret": duckdb.sqltypes.VARCHAR},
+        schema={"secret": vane.sqltypes.VARCHAR},
         execution_backend="ray_task",
     )
 
@@ -140,7 +140,7 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
     connection_a.close()
     relation_b_after_close = connection_b.sql(f"SELECT * FROM read_parquet('{path}')").map_batches(
         read_session_secret,
-        schema={"secret": duckdb.sqltypes.VARCHAR},
+        schema={"secret": vane.sqltypes.VARCHAR},
         execution_backend="ray_task",
     )
     assert set(_collect_rows_from_parts(runner.run_iter_tables(relation_b_after_close))) == {("connection-b",)}
@@ -150,7 +150,7 @@ def test_two_connections_share_job_runtime_and_close_independently(monkeypatch, 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_crashed_runtime_client_is_reclaimed_while_peer_survives(monkeypatch):
-    from duckdb.runners.ray.driver import (
+    from vane.runners.ray.driver import (
         RayQueryDriverClient,
         _collect_vane_env_overrides,
     )
@@ -262,10 +262,10 @@ def test_crashed_runtime_client_is_reclaimed_while_peer_survives(monkeypatch):
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
-    from duckdb import runners
+    from vane import runners
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = duckdb.connect()
+    connection = vane.connect()
     path = tmp_path / "ray_relation_result_consumers.parquet"
     connection.execute(
         f"""
@@ -304,17 +304,17 @@ def test_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
     partial_relation = connection.sql(query)
     assert partial_relation.fetchone() == (0, "row-0")
     partial_relation.close()
-    with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+    with pytest.raises(vane.InvalidInputException, match="result closed"):
         partial_relation.fetchall()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_lossless_relation_result_types_on_ray_local(monkeypatch):
-    from duckdb import runners
+    from vane import runners
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.execute("SET arrow_lossless_conversion = true")
     connection.execute("SET TimeZone = 'America/New_York'")
     monkeypatch.setenv("VANE_RUNNER", "ray")
@@ -346,10 +346,10 @@ def test_lossless_relation_result_types_on_ray_local(monkeypatch):
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
 def test_complex_relation_result_consumers_on_ray_local(tmp_path, monkeypatch):
-    from duckdb import runners
+    from vane import runners
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = duckdb.connect()
+    connection = vane.connect()
     facts_path = tmp_path / "ray_relation_result_facts.parquet"
     dimensions_path = tmp_path / "ray_relation_result_dimensions.parquet"
     connection.execute(

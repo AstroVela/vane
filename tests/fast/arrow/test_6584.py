@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import duckdb
+import vane
 
 pyarrow = pytest.importorskip("pyarrow")
 
@@ -15,7 +21,7 @@ def f(cur, i, data):
 def test_6584():
     pool = ThreadPoolExecutor(max_workers=2)
     data = pyarrow.Table.from_pydict({"a": [1, 2, 3]})
-    c = duckdb.connect()
+    c = vane.connect()
     futures = []
     for i in range(2):
         fut = pool.submit(f, c.cursor(), i, data)

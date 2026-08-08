@@ -39,7 +39,7 @@ def test_vllm_e2e_basic():
         **ray_test_object_store_options(),
     )
 
-    import duckdb
+    import vane
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     timeout_s = int(os.getenv("VLLM_E2E_TIMEOUT", "300"))
@@ -69,7 +69,7 @@ def test_vllm_e2e_basic():
         },
     }
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute("CREATE TABLE prompts(id INTEGER, prompt VARCHAR)")
         con.execute(
@@ -80,20 +80,20 @@ def test_vllm_e2e_basic():
         )
 
         packed_options = _build_native_vllm_options_argument(options)
-        input_prompt = duckdb.FunctionExpression(
+        input_prompt = vane.FunctionExpression(
             "concat",
-            duckdb.ConstantExpression("请用简洁中文回答："),
-            duckdb.ColumnExpression("prompt"),
+            vane.ConstantExpression("请用简洁中文回答："),
+            vane.ColumnExpression("prompt"),
         )
-        generated = duckdb.FunctionExpression(
+        generated = vane.FunctionExpression(
             "vllm",
             input_prompt,
-            duckdb.ConstantExpression(model),
-            duckdb.ConstantExpression(packed_options),
+            vane.ConstantExpression(model),
+            vane.ConstantExpression(packed_options),
         ).alias("out")
         relation = con.table("prompts").select(
-            duckdb.ColumnExpression("id"),
-            duckdb.ColumnExpression("prompt"),
+            vane.ColumnExpression("id"),
+            vane.ColumnExpression("prompt"),
             generated,
         )
         relation = relation.order("id")

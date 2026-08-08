@@ -7,9 +7,10 @@ This document describes third-party code distributed in Vane source or binary ar
 | Component | Use in Vane | License | License text |
 | --- | --- | --- | --- |
 | DuckDB and DuckDB Python | Core SQL engine, Python API, and the base for Vane's engine modifications | MIT | `LICENSES/DuckDB-MIT.txt` and `external/duckdb/LICENSE` |
+| Apache Arrow ADBC DuckDB driver facade | Python ADBC facade adapted to load Vane's private native driver | Apache-2.0 | ASF license notices retained in `vane/adbc/` and the repository `LICENSE` |
 | DuckDB HTTPFS | Statically linked HTTP/S3 filesystem extension, fetched at the pinned revision in `external/duckdb/.github/config/extensions/httpfs.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
 | ALP and ALP-RD compression algorithms | Compression implementation retained in the DuckDB source tree | MIT | `external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE` and the corresponding `alprd` path |
-| Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `duckdb/experimental/spark/LICENSE` |
+| Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `vane/experimental/spark/LICENSE` |
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 

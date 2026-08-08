@@ -1,4 +1,10 @@
-import duckdb
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
+import vane
 
 
 class TestColumnOrder:
@@ -11,6 +17,6 @@ class TestColumnOrder:
 		);
 		SELECT timepoint, date, col1 FROM t1;
 		"""
-        df = duckdb.execute(to_execute).fetchdf()
+        df = vane.execute(to_execute).fetchdf()
         cols = list(df.columns)
         assert cols == ["timepoint", "date", "col1"]

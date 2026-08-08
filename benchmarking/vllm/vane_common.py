@@ -8,7 +8,6 @@ from pathlib import Path
 import pyarrow as pa
 from vllm import LLM
 
-import duckdb
 import vane
 
 _CONFIG_SPEC = importlib.util.spec_from_file_location(
@@ -77,21 +76,21 @@ def _native_vllm_relation(con, *, do_prefix_routing: bool, sorted_by_prompt: boo
         )
     )
     generated = con.sql(build_input_sql(sorted_by_prompt=sorted_by_prompt)).select(
-        duckdb.ColumnExpression("id"),
-        duckdb.ColumnExpression("prompt"),
-        duckdb.FunctionExpression(
+        vane.ColumnExpression("id"),
+        vane.ColumnExpression("prompt"),
+        vane.FunctionExpression(
             "vllm",
-            duckdb.ColumnExpression("prompt"),
-            duckdb.ConstantExpression(MODEL_NAME),
-            duckdb.ConstantExpression(options),
+            vane.ColumnExpression("prompt"),
+            vane.ConstantExpression(MODEL_NAME),
+            vane.ConstantExpression(options),
         ).alias("output"),
     )
     return generated.select(
-        duckdb.ColumnExpression("id"),
-        duckdb.ColumnExpression("prompt"),
-        duckdb.ColumnExpression("output"),
-        duckdb.FunctionExpression("length", duckdb.ColumnExpression("prompt")).alias("prompt_len"),
-        duckdb.FunctionExpression("length", duckdb.ColumnExpression("output")).alias("output_len"),
+        vane.ColumnExpression("id"),
+        vane.ColumnExpression("prompt"),
+        vane.ColumnExpression("output"),
+        vane.FunctionExpression("length", vane.ColumnExpression("prompt")).alias("prompt_len"),
+        vane.FunctionExpression("length", vane.ColumnExpression("output")).alias("output_len"),
     )
 
 
@@ -99,7 +98,7 @@ def _run_relation_benchmark(script_name: str, rel, *, distributed: bool = False)
     print("Running benchmark...")
     start_time = time.perf_counter()
     if distributed:
-        from duckdb.runners import get_or_create_runner
+        from vane.runners import get_or_create_runner
 
         runner = get_or_create_runner()
         tables = list(runner.run_iter_tables(rel))

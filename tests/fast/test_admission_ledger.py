@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-from duckdb.runners.ray.admission_ledger import BoundedReplayMap, BoundedSet
+from vane.runners.ray.admission_ledger import BoundedReplayMap, BoundedSet
 
 
 def test_bounded_set_retains_only_the_newest_exact_identities():

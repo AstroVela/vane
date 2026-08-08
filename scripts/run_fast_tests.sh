@@ -11,8 +11,6 @@ Usage: scripts/run_fast_tests.sh [all|non-ray|shared-ray|owner-ray]
 Run the complete fast suite or one process-isolated phase.
 
 Environment variables:
-  VANE_FAST_TEST_ARTIFACT_MODE
-      Set to 1 to test installed packages while retaining checkout support modules.
   VANE_FAST_TEST_EXCLUDE_GPU
       Set to 1 to exclude tests marked gpu on CPU-only hosts.
   VANE_FAST_TEST_EXTERNAL_RAY_CLEANUP
@@ -47,23 +45,23 @@ case "$phase" in
 esac
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$project_root"
+site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+test_workdir="$(mktemp -d "${TMPDIR:-/tmp}/vane-fast-tests.XXXXXX")"
+cleanup_test_workdir() {
+  rm -rf -- "$test_workdir"
+}
+trap cleanup_test_workdir EXIT
+cd "$test_workdir"
 
-artifact_mode="${VANE_FAST_TEST_ARTIFACT_MODE:-0}"
-pytest_mode_args=()
-case "$artifact_mode" in
-  0) ;;
-  1)
-    site_packages="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-    export PYTHONSAFEPATH=1
-    export PYTHONPATH="${site_packages}:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
-    pytest_mode_args+=("--import-mode=importlib")
-    ;;
-  *)
-    printf 'VANE_FAST_TEST_ARTIFACT_MODE must be 0 or 1: %s\n' "$artifact_mode" >&2
-    exit 2
-    ;;
-esac
+export PYTHONSAFEPATH=1
+export PYTHONPATH="${site_packages}:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export VANE_FAST_TEST_ARTIFACT_MODE=1
+pytest_mode_args=(
+  -c "$project_root/pyproject.toml"
+  --rootdir="$project_root"
+  --import-mode=importlib
+  -o "pythonpath=$project_root/tests"
+)
 
 exclude_gpu="${VANE_FAST_TEST_EXCLUDE_GPU:-0}"
 case "$exclude_gpu" in
@@ -179,12 +177,12 @@ collect_nodeids() {
       --collect-only \
       -q \
       -m "$marker" \
-      tests/fast
+      "$project_root/tests/fast"
   } 2>&1)" || {
     printf '%s\n' "$collection" >&2
     return 1
   }
-  printf '%s\n' "$collection" | sed -n '/^tests\/fast\/.*::/p'
+  printf '%s\n' "$collection" | sed -n "s|^tests/fast/|$project_root/tests/fast/|p"
 }
 
 run_non_ray_tests() {
@@ -193,7 +191,7 @@ run_non_ray_tests() {
     run_reported_pytest \
       "non-ray" \
       -m "$marker" \
-      tests/fast
+      "$project_root/tests/fast"
     return
   fi
 
@@ -232,7 +230,7 @@ run_shared_ray_tests() {
   run_ray_pytest \
     "shared-ray" \
     -m "not external_service and real_ray and not ray_cluster_owner${gpu_marker}" \
-    tests/fast
+    "$project_root/tests/fast"
 }
 
 run_owner_ray_tests() {

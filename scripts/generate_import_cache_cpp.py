@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import json
 from pathlib import Path
 
@@ -203,6 +209,8 @@ import_cache_file = f"""
 #include "duckdb/common/vector.hpp"
 #include "duckdb_python/import_cache/python_import_cache_modules.hpp"
 
+//! Note: This file is generated using scripts/generate_import_cache_cpp.py.
+
 namespace duckdb {{
 
 struct PythonImportCache {{
@@ -239,7 +247,9 @@ module_includes = get_module_file_path_includes(files)
 modules_header = (
     Path(script_dir) / ".." / ("src/duckdb_py/include/duckdb_python/import_cache/python_import_cache_modules.hpp")
 )
-modules_header.write_text(module_includes)
+modules_header.write_text(
+    "// This file is generated using scripts/generate_import_cache_cpp.py.\n\n" + module_includes + "\n"
+)
 
 # Generate the python_import_cache_modules.hpp file
 # listing all the generated header files

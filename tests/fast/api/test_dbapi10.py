@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # cursor description
 from datetime import date, datetime
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestCursorDescription:
@@ -32,12 +38,12 @@ class TestCursorDescription:
         assert isinstance(duckdb_cursor.fetchone()[0], real_type)
 
     def test_description_comparisons(self):
-        duckdb.execute("select 42 a, 'test' b, true c")
-        types = [x[1] for x in duckdb.description()]
+        vane.execute("select 42 a, 'test' b, true c")
+        types = [x[1] for x in vane.description()]
 
-        STRING = duckdb.STRING
-        NUMBER = duckdb.NUMBER
-        DATETIME = duckdb.DATETIME
+        STRING = vane.STRING
+        NUMBER = vane.NUMBER
+        DATETIME = vane.DATETIME
 
         assert types[1] == STRING
         assert STRING == types[1]  # noqa: SIM300

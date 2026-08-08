@@ -67,7 +67,7 @@ def _actor_map_batches_payload(cls) -> dict:
 
 
 def test_async_runtime_lazy_loop_reused_across_runs():
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
     assert runtime.loop is None
@@ -85,7 +85,7 @@ def test_async_runtime_lazy_loop_reused_across_runs():
 def test_async_runtime_runs_on_the_calling_thread():
     import threading
 
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
 
@@ -97,7 +97,7 @@ def test_async_runtime_runs_on_the_calling_thread():
 
 
 def test_async_runtime_close_is_idempotent_and_closes_loop():
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
 
@@ -114,7 +114,7 @@ def test_async_runtime_close_is_idempotent_and_closes_loop():
 
 
 def test_async_runtime_close_before_first_run_is_noop():
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
     runtime.close()
@@ -124,7 +124,7 @@ def test_async_runtime_close_before_first_run_is_noop():
 def test_async_runtime_close_cancels_pending_tasks():
     """Background tasks left behind by a coroutine are cancelled — their
     finally blocks run — instead of being destroyed with the loop."""
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
     states: list[str] = []
@@ -148,7 +148,7 @@ def test_async_runtime_close_cancels_pending_tasks():
 
 
 def test_async_runtime_close_finalizes_async_generators():
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     runtime = AsyncRuntime()
     finalized = []
@@ -180,7 +180,7 @@ def test_async_runtime_rejects_nested_use_no_fallback():
     import gc
     import warnings
 
-    from duckdb.execution._async_runtime import AsyncRuntime
+    from vane.execution._async_runtime import AsyncRuntime
 
     outer = AsyncRuntime()
     inner = AsyncRuntime()
@@ -212,7 +212,7 @@ def test_async_runtime_rejects_nested_use_no_fallback():
 
 
 def test_executor_binds_runtime_and_batches_share_one_loop():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     executor = UDFExecutor(_actor_map_batches_payload(AsyncBatchCallable))
     executor.submit(pa.table({"x": [1]}))
@@ -236,7 +236,7 @@ def test_executor_binds_runtime_and_batches_share_one_loop():
 
 
 def test_executor_close_is_idempotent():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     executor = UDFExecutor(_actor_map_batches_payload(AsyncBatchCallable))
     executor.close()
@@ -244,7 +244,7 @@ def test_executor_close_is_idempotent():
 
 
 def test_executor_without_hook_binds_nothing():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table: pa.Table) -> pa.Table:
         return table

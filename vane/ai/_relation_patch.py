@@ -4,7 +4,7 @@
 """Monkey-patch AI convenience methods onto DuckDBPyRelation.
 
 This module adds ``.embed()`` and ``.prompt()`` directly to
-:class:`duckdb.DuckDBPyRelation` so users can write::
+:class:`vane.DuckDBPyRelation` so users can write::
 
     rel.embed(vane.col("text_col"), provider="transformers")
 
@@ -23,13 +23,13 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from typing_extensions import Unpack
 
-from duckdb import DuckDBPyRelation, Expression
+from vane import DuckDBPyRelation, Expression
 from vane.ai.options import EmbedOptions, PromptOptions
 from vane.ai.provider import Provider
 from vane.ai.typing import JSONSchema
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel  # type: ignore[import-not-found]
+    from pydantic import BaseModel
 else:
     BaseModel = Any
 
@@ -93,9 +93,9 @@ def _prompt(
 def _patch() -> None:
     """Apply AI methods to DuckDBPyRelation (idempotent)."""
     if not hasattr(DuckDBPyRelation, "embed"):
-        DuckDBPyRelation.embed = _embed  # type: ignore[attr-defined]
+        setattr(DuckDBPyRelation, "embed", _embed)
     if not hasattr(DuckDBPyRelation, "prompt"):
-        DuckDBPyRelation.prompt = _prompt  # type: ignore[attr-defined]
+        setattr(DuckDBPyRelation, "prompt", _prompt)
 
 
 _patch()

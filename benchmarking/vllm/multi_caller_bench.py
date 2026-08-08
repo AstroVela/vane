@@ -95,7 +95,7 @@ def main():
 
     # Create actors (Vane's LocalVLLMExecutor)
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-    from duckdb.execution.vllm import LocalVLLMExecutor
+    from vane.execution.vllm import LocalVLLMExecutor
 
     num_gpus = max(1, int(ray.cluster_resources().get("GPU", 1)))
     engine_args = get_vllm_engine_args()

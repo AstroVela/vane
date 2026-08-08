@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import numpy as np
 import pandas as pd
 
-import duckdb
+import vane
 
 
 class TestPandasMergeSameName:
@@ -25,7 +31,7 @@ class TestPandasMergeSameName:
             }
         )
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df1", df1)
         con.register("df2", df2)
         query = """SELECT * from df1
@@ -74,7 +80,7 @@ class TestPandasMergeSameName:
             }
         )
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df1", df1)
         con.register("df2", df2)
         query = """SELECT * from df1
@@ -104,7 +110,7 @@ class TestPandasMergeSameName:
             }
         )
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.register("df1", df1)
         con.register("df2", df2)
 

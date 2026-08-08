@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
-from duckdb.sqltypes import (
+import vane
+from vane.sqltypes import (
     BIGINT,
     HUGEINT,
     INTEGER,
@@ -21,8 +27,8 @@ class TestNativeUDF:
         def passthrough(x):
             return x
 
-        duckdb.create_function("default_conn_passthrough", passthrough, [BIGINT], BIGINT)
-        res = duckdb.sql("select default_conn_passthrough(5)").fetchall()
+        vane.create_function("default_conn_passthrough", passthrough, [BIGINT], BIGINT)
+        res = vane.sql("select default_conn_passthrough(5)").fetchall()
         assert res == [(5,)]
 
     def test_basic_use(self):
@@ -31,7 +37,7 @@ class TestNativeUDF:
                 return x
             return x + 1
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("plus_one", plus_one, [BIGINT], BIGINT)
         assert con.sql("select plus_one(5)").fetchall() == [(6,)]
 
@@ -39,7 +45,7 @@ class TestNativeUDF:
         res = con.sql("select plus_one(i) from range_table tbl(i)").fetchall()
         assert len(res) == 5000
 
-        vector_size = duckdb.__standard_vector_size__
+        vector_size = vane.__standard_vector_size__
         res = con.sql(f"select i, plus_one(i) from test_vector_types(NULL::BIGINT, false) t(i), range({vector_size})")
         assert len(res) == (vector_size * 11)
 
@@ -47,7 +53,7 @@ class TestNativeUDF:
         def passthrough(x):
             return x
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("passthrough", passthrough, [BIGINT], BIGINT)
         assert (
             con.sql("select passthrough(i) from range(5000) tbl(i)").fetchall()
@@ -58,7 +64,7 @@ class TestNativeUDF:
         def func(x):
             return x % 2
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("modulo_op", func, [BIGINT], TINYINT)
         res = con.execute("select modulo_op(?)", [5]).fetchall()
         assert res == [(1,)]
@@ -67,20 +73,20 @@ class TestNativeUDF:
         def takes_string(x):
             return x
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("casts_from_string", takes_string, [VARCHAR], BIGINT)
 
         res = con.sql("select casts_from_string('42')").fetchall()
         assert res == [(42,)]
 
-        with pytest.raises(duckdb.InvalidInputException):
+        with pytest.raises(vane.InvalidInputException):
             res = con.sql("select casts_from_string('test')").fetchall()
 
     def test_detected_parameters(self):
         def concatenate(a: str, b: str):
             return a + b
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("py_concatenate", concatenate, None, VARCHAR)
         res = con.sql(
             """
@@ -96,7 +102,7 @@ class TestNativeUDF:
                 sum += arg
             return sum
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("add_nums", add_nums)
         res = con.sql(
             """
@@ -110,7 +116,7 @@ class TestNativeUDF:
             amount = len(args)
             return amount
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("varargs", variable_args, None, BIGINT)
         res = con.sql("""select varargs('5', '3', '2', 1, 0.12345)""").fetchall()
         assert res == [(5,)]
@@ -119,10 +125,10 @@ class TestNativeUDF:
         def returns_duckdb() -> int:
             return "duckdb"
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("fastest_database_in_the_west", returns_duckdb)
         with pytest.raises(
-            duckdb.InvalidInputException, match="Failed to cast value: Could not convert string 'duckdb' to INT64"
+            vane.InvalidInputException, match="Failed to cast value: Could not convert string 'duckdb' to INT64"
         ):
             con.sql("select fastest_database_in_the_west()").fetchall()
 
@@ -132,7 +138,7 @@ class TestNativeUDF:
                 return 5
             return x
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("null_test", five_if_null, [BIGINT], BIGINT, null_handling="SPECIAL")
         res = con.sql("select null_test(NULL)").fetchall()
         assert res == [(5,)]
@@ -168,10 +174,10 @@ class TestNativeUDF:
         def return_overflow():
             return overflowing_value
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("return_overflow", return_overflow, None, duckdb_type)
         rel = con.sql("select return_overflow()")
-        with pytest.raises(duckdb.InvalidInputException):
+        with pytest.raises(vane.InvalidInputException):
             rel.fetchall()
 
     def test_structs(self):
@@ -180,13 +186,13 @@ class TestNativeUDF:
             original["c"] = 0
             return original
 
-        con = duckdb.connect()
+        con = vane.connect()
         range_table = con.table_function("range", [5000])  # noqa: F841
         con.create_function(
             "append_field",
             add_extra_column,
-            [duckdb.struct_type({"a": BIGINT, "b": BIGINT})],
-            duckdb.struct_type({"a": BIGINT, "b": BIGINT, "c": BIGINT}),
+            [vane.struct_type({"a": BIGINT, "b": BIGINT})],
+            vane.struct_type({"a": BIGINT, "b": BIGINT, "c": BIGINT}),
         )
 
         res = con.sql(

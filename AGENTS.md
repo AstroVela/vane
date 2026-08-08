@@ -39,7 +39,7 @@ Use `root` for Vane-owned files and `duckdb` for the `external/duckdb` subtree. 
 Run the tests affected by the change first, then run the Vane base test suite:
 
 ```bash
-python -m pytest tests/fast/test_udf_process.py
+scripts/run_installed_pytest.sh tests/fast/test_udf_process.py
 scripts/run_release_tests.sh
 ```
 

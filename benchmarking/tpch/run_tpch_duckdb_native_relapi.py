@@ -76,9 +76,8 @@ def _run_query_native_in_subprocess(
         # by itself; we explicitly call into vane.runners below.
         os.environ["VANE_RUNNER"] = "native"
 
-        import vane.runners
-
         import vane
+        import vane.runners
 
         # Instantiate NativeRunner with optional thread hint.
         # Note: set_runner_native() can only be called once per process.
@@ -188,7 +187,7 @@ if __name__ == "__main__":
 
     import vane
 
-    print(f"DuckDB version: {vane.__duckdb_version__}")
+    print(f"DuckDB version: {vane.__engine_version__}")
     print("Runner: native (Relation API via vane.runners.NativeRunner)")
     print(f"  Subprocess timeout: {args.timeout}s")
     print(f"  Verify: {'enabled' if args.verify else 'disabled'}")

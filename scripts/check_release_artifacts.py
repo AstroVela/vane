@@ -38,6 +38,7 @@ GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 DUCKDB_FORK_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:-dirty)?")
 DUCKDB_UPSTREAM_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+FORBIDDEN_DISTRIBUTION_ROOTS = {"adbc_driver_duckdb", "duckdb"}
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -140,6 +141,11 @@ class SdistArtifact:
 
 def _normalized(name: str) -> str:
     return "/" + name.replace("\\", "/").lstrip("/")
+
+
+def _is_forbidden_import_root(path_component: str) -> bool:
+    import_name = path_component.partition(".")[0]
+    return import_name in FORBIDDEN_DISTRIBUTION_ROOTS or import_name.startswith("_duckdb")
 
 
 def _require_suffix(names: list[str], suffix: str, artifact: Path) -> str:
@@ -349,6 +355,14 @@ def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
 
 def _check_sdist(artifact: SdistArtifact) -> None:
     names = artifact.names()
+    for name in names:
+        parts = PurePosixPath(name).parts
+        if len(parts) < 2:
+            continue
+        source_root = parts[1]
+        if _is_forbidden_import_root(source_root):
+            raise ValueError(f"{artifact.path}: Vane sdist contains conflicting Python package path {name!r}")
+
     required_paths = (
         "DUCKDB_FORK_REVISION",
         "DUCKDB_SOURCE_ID",
@@ -362,8 +376,10 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "external/duckdb/LICENSE",
         "build_backend.py",
         "scripts/resolve_duckdb_fork_version.py",
+        "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
+        "scripts/verify_duckdb_coexistence.py",
         "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
@@ -431,13 +447,34 @@ def _check_wheel_record(artifact: WheelArtifact) -> None:
 
 def _check_wheel(artifact: WheelArtifact) -> None:
     names = artifact.names()
+    for name in names:
+        parts = PurePosixPath(name).parts
+        import_parts = parts
+        if len(parts) >= 3 and parts[0].endswith(".data") and parts[1] in {"platlib", "purelib"}:
+            import_parts = parts[2:]
+        import_root = import_parts[0]
+        if _is_forbidden_import_root(import_root):
+            raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
+
+    native_extensions = [
+        name
+        for name in names
+        if PurePosixPath(name).parent == PurePosixPath("vane")
+        and PurePosixPath(name).name.startswith("_native.")
+        and PurePosixPath(name).suffix in {".pyd", ".so"}
+    ]
+    if len(native_extensions) != 1:
+        raise ValueError(
+            f"{artifact.path}: expected one platform extension under vane/_native.*, found {native_extensions}"
+        )
+
     required_suffixes = (
         "/vane/py.typed",
         ".dist-info/licenses/LICENSE",
         ".dist-info/licenses/NOTICE",
         ".dist-info/licenses/LICENSES/DuckDB-MIT.txt",
         ".dist-info/licenses/LICENSES/vcpkg-binary-dependencies.txt",
-        ".dist-info/licenses/duckdb/experimental/spark/LICENSE",
+        ".dist-info/licenses/vane/experimental/spark/LICENSE",
         ".dist-info/licenses/external/duckdb/LICENSE",
         ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE",
         ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alprd/algorithm/LICENSE",
@@ -445,6 +482,10 @@ def _check_wheel(artifact: WheelArtifact) -> None:
     for suffix in required_suffixes:
         _require_suffix(names, suffix, artifact.path)
     metadata = _check_metadata(artifact, ".dist-info/METADATA")
+    for requirement in metadata.get_all("Requires-Dist", []):
+        requirement_name = re.split(r"[ ;(<=>!~\[]", requirement, maxsplit=1)[0].lower().replace("_", "-")
+        if requirement_name == "duckdb":
+            raise ValueError(f"{artifact.path}: vane-ai must not depend on the official duckdb distribution")
     _check_wheel_license_files(artifact, metadata)
     _check_wheel_record(artifact)
 

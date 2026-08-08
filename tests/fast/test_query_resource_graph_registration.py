@@ -6,8 +6,8 @@ import uuid
 
 import pytest
 
-import duckdb
-from duckdb.runners.ray.query_resource_graph_builder import (
+import vane
+from vane.runners.ray.query_resource_graph_builder import (
     build_query_resource_graph,
     native_fragment_unit_id_for_node,
     udf_unit_id_for_node,
@@ -15,7 +15,7 @@ from duckdb.runners.ray.query_resource_graph_builder import (
 
 
 def _physical_plan(relation, con, prefix):
-    return duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         f"{prefix}-{uuid.uuid4().hex[:8]}",
     ).to_physical_plan(con)
@@ -28,7 +28,7 @@ def _parquet_relation(con, tmp_path):
 
 
 def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp_path):
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _physical_plan(_parquet_relation(con, tmp_path), con, "graph-plain")
 
@@ -65,7 +65,7 @@ def test_physical_plan_exports_complete_deterministic_resource_unit_metadata(tmp
     ],
 )
 def test_physical_plan_marks_only_true_materialization_barriers(tmp_path, transform, expected_nodes):
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         plan = _physical_plan(transform(_parquet_relation(con, tmp_path)), con, "graph-barrier")
         metadata = plan.collect_query_resource_graph_metadata(conn=con)
@@ -95,7 +95,7 @@ def test_broadcast_join_barrier_materializes_only_broadcaster_input(
 ):
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast")
     monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         path = tmp_path / "broadcast_input.parquet"
         con.execute(f"COPY (SELECT i::BIGINT AS x FROM range(8) tbl(i)) TO '{path}' (FORMAT PARQUET)")
@@ -121,7 +121,7 @@ def test_broadcast_join_barrier_materializes_only_broadcaster_input(
 
 
 def test_resource_unit_collection_does_not_treat_generic_inout_as_python_udf(tmp_path):
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         path = tmp_path / "generic_inout.parquet"
         con.execute(f"COPY (SELECT i::BIGINT AS x FROM range(2) tbl(i)) TO '{path}' (FORMAT PARQUET)")
@@ -146,11 +146,11 @@ def test_resource_unit_collection_preannotates_ray_udf_payload_on_original_plan(
         def __call__(self, table):
             return pa.table({"y": table.column(0)})
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         relation = _parquet_relation(con, tmp_path).map_batches(
             Identity,
-            schema={"y": duckdb.sqltypes.BIGINT},
+            schema={"y": vane.sqltypes.BIGINT},
             execution_backend="ray_actor",
             actor_number=1,
             gpus=0.0,
@@ -186,18 +186,18 @@ def test_resource_unit_collection_preserves_distinct_identity_for_nested_udfs(tm
         def __call__(self, table):
             return pa.table({"second": table.column(0)})
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         relation = (
             _parquet_relation(con, tmp_path)
             .map_batches(
                 first,
-                schema={"first": duckdb.sqltypes.BIGINT},
+                schema={"first": vane.sqltypes.BIGINT},
                 execution_backend="ray_task",
             )
             .map_batches(
                 Second,
-                schema={"second": duckdb.sqltypes.BIGINT},
+                schema={"second": vane.sqltypes.BIGINT},
                 execution_backend="ray_actor",
                 actor_number=1,
                 gpus=0.0,
@@ -241,7 +241,7 @@ def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
     left_path = tmp_path / "left.parquet"
     right_path = tmp_path / "right.parquet"
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(
             f"COPY (SELECT i::BIGINT AS id, (i + 10)::BIGINT AS left_value FROM range(8) tbl(i)) "
@@ -255,7 +255,7 @@ def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity
             con.read_parquet(str(left_path))
             .map_batches(
                 left_udf,
-                schema={"id": duckdb.sqltypes.BIGINT, "left_value": duckdb.sqltypes.BIGINT},
+                schema={"id": vane.sqltypes.BIGINT, "left_value": vane.sqltypes.BIGINT},
                 execution_backend="ray_task",
                 cpus=1.0,
                 memory_bytes=1 << 30,
@@ -266,7 +266,7 @@ def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity
             con.read_parquet(str(right_path))
             .map_batches(
                 right_udf,
-                schema={"id": duckdb.sqltypes.BIGINT, "right_value": duckdb.sqltypes.BIGINT},
+                schema={"id": vane.sqltypes.BIGINT, "right_value": vane.sqltypes.BIGINT},
                 execution_backend="ray_task",
                 cpus=3.0,
                 memory_bytes=3 << 30,
@@ -322,7 +322,7 @@ def test_resource_unit_collection_pairs_reordered_branch_udfs_by_stable_identity
         corrupted_plan = pickle.loads(
             serialized_plan.replace(operator_ids[1].encode(), operator_ids[0].encode())
         ).clone(con)
-        with pytest.raises(duckdb.InvalidInputException, match="duplicate physical UDF operator identity"):
+        with pytest.raises(vane.InvalidInputException, match="duplicate physical UDF operator identity"):
             corrupted_plan.collect_query_resource_graph_metadata(conn=con)
     finally:
         con.close()

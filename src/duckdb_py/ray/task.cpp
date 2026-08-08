@@ -344,7 +344,7 @@ duckdb::distributed::python::ray::MaterializePyPayloadToCollection(const py::obj
 	if (!ray_mod.is_none()) {
 		try {
 			auto object_ref_cls = ray_mod.attr("ObjectRef");
-			auto safe_get = py::module_::import("duckdb.runners.ray.safe_get").attr("resolve_object_refs_blocking");
+			auto safe_get = py::module_::import("vane.runners.ray.safe_get").attr("resolve_object_refs_blocking");
 			for (int depth = 0; depth < 5 && py::isinstance(resolved, object_ref_cls); ++depth) {
 				resolved = safe_get(resolved);
 			}
@@ -808,8 +808,8 @@ private:
 					bool batch_succeeded = false;
 					std::string batch_failure;
 					try {
-						operation = "import duckdb.runners.ray.driver";
-						auto driver_mod = py::module_::import("duckdb.runners.ray.driver");
+						operation = "import vane.runners.ray.driver";
+						auto driver_mod = py::module_::import("vane.runners.ray.driver");
 						operation = "resolve batch_wait_ready";
 						py::object batch_wait_fn = driver_mod.attr("batch_wait_ready");
 						operation = "batch_wait_ready";
@@ -1303,7 +1303,7 @@ py::object RayWorkerTask::Plan() const {
 
 	// Create PyPhysicalPlanWrapper by passing the plan via capsule
 	duckdb::PythonGILWrapper gil;
-	auto ray_cxx = py::module_::import("_duckdb.ray_cxx");
+	auto ray_cxx = py::module_::import("vane._native.ray_cxx");
 	auto task_context = task_.context();
 	auto query_id_entry = task_context.find("query_id");
 	if (query_id_entry == task_context.end() || query_id_entry->second.empty()) {

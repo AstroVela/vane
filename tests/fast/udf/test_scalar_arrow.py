@@ -1,7 +1,13 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
-from duckdb.sqltypes import BIGINT, INTEGER, VARCHAR
+import vane
+from vane.sqltypes import BIGINT, INTEGER, VARCHAR
 
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
@@ -17,7 +23,7 @@ class TestPyArrowUDF:
             df["c0"] = df["c0"] + 1
             return pa.lib.Table.from_pandas(df)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("plus_one", plus_one, [BIGINT], BIGINT, type="arrow")
         assert con.sql("select plus_one(5)").fetchall() == [(6,)]
 
@@ -25,11 +31,11 @@ class TestPyArrowUDF:
         res = con.sql("select plus_one(i) from range_table tbl(i)").fetchall()
         assert len(res) == 5000
 
-        vector_size = duckdb.__standard_vector_size__
+        vector_size = vane.__standard_vector_size__
         res = con.sql(f"select i, plus_one(i) from test_vector_types(NULL::BIGINT, false) t(i), range({vector_size})")
         assert len(res) == (vector_size * 11)
 
-    # NOTE: This only works up to duckdb.__standard_vector_size__,
+    # NOTE: This only works up to vane.__standard_vector_size__,
     # because we process up to STANDARD_VECTOR_SIZE tuples at a time
     def test_sort_table(self):
         def sort_table(x):
@@ -37,7 +43,7 @@ class TestPyArrowUDF:
             sorted_table = table.sort_by([("c0", "ascending")])
             return sorted_table
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("sort_table", sort_table, [BIGINT], BIGINT, type="arrow")
         res = con.sql("select 100-i as original, sort_table(original) from range(100) tbl(i)").fetchall()
         assert res[0] == (100, 1)
@@ -51,7 +57,7 @@ class TestPyArrowUDF:
             for item in args:
                 return item
 
-        con = duckdb.connect()
+        con = vane.connect()
         # This function takes any number of arguments, returning the first column
         con.create_function("varargs", variable_args, None, BIGINT, type="arrow")
         res = con.sql("""select varargs(5, '3', '2', 1, 0.12345)""").fetchall()
@@ -64,7 +70,7 @@ class TestPyArrowUDF:
         def takes_string(col):
             return col
 
-        con = duckdb.connect()
+        con = vane.connect()
         # The return type of the function is set to BIGINT, but it takes a VARCHAR
         con.create_function("pyarrow_string_to_num", takes_string, [VARCHAR], BIGINT, type="arrow")
 
@@ -72,7 +78,7 @@ class TestPyArrowUDF:
         res = con.sql("""select pyarrow_string_to_num('5')""").fetchall()
         assert res == [(5,)]
 
-        with pytest.raises(duckdb.ConversionException, match="""Could not convert string 'test' to INT64"""):
+        with pytest.raises(vane.ConversionException, match="""Could not convert string 'test' to INT64"""):
             res = con.sql("""select pyarrow_string_to_num('test')""").fetchall()
 
     def test_return_multiple_columns(self):
@@ -82,11 +88,11 @@ class TestPyArrowUDF:
             # Return a pyarrow table consisting of two columns
             return pa.lib.Table.from_pandas(pd.DataFrame({"a": [5, 4, 3], "b": ["test", "quack", "duckdb"]}))
 
-        con = duckdb.connect()
+        con = vane.connect()
         # Scalar functions only return a single value per tuple
         con.create_function("two_columns", returns_two_columns, [BIGINT], BIGINT, type="arrow")
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="The returned table from a pyarrow scalar udf should only contain one column, found 2",
         ):
             con.sql("""select two_columns(5)""").fetchall()
@@ -95,9 +101,9 @@ class TestPyArrowUDF:
         def returns_none(col) -> None:
             return None
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("will_crash", returns_none, [BIGINT], BIGINT, type="arrow")
-        with pytest.raises(duckdb.Error, match="""Could not convert the result into an Arrow Table"""):
+        with pytest.raises(vane.Error, match="""Could not convert the result into an Arrow Table"""):
             con.sql("""select will_crash(5)""").fetchall()
 
     def test_empty_result(self):
@@ -105,9 +111,9 @@ class TestPyArrowUDF:
             # Always returns an empty table
             return pa.lib.Table.from_arrays([[]], names=["c0"])
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("empty_result", return_empty, [BIGINT], BIGINT, type="arrow")
-        with pytest.raises(duckdb.InvalidInputException, match="Returned pyarrow table should have 1 tuples, found 0"):
+        with pytest.raises(vane.InvalidInputException, match="Returned pyarrow table should have 1 tuples, found 0"):
             con.sql("""select empty_result(5)""").fetchall()
 
     def test_excessive_result(self):
@@ -115,9 +121,9 @@ class TestPyArrowUDF:
             # Always returns a table consisting of 5 tuples
             return pa.lib.Table.from_arrays([[5, 4, 3, 2, 1]], names=["c0"])
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("too_many_tuples", return_too_many, [BIGINT], BIGINT, type="arrow")
-        with pytest.raises(duckdb.InvalidInputException, match="Returned pyarrow table should have 1 tuples, found 5"):
+        with pytest.raises(vane.InvalidInputException, match="Returned pyarrow table should have 1 tuples, found 5"):
             con.sql("""select too_many_tuples(5)""").fetchall()
 
     def test_arrow_side_effects(self, duckdb_cursor):
@@ -144,14 +150,14 @@ class TestPyArrowUDF:
 
     def test_return_struct(self):
         def return_struct(col):
-            con = duckdb.connect()
+            con = vane.connect()
             return con.sql(
                 """
                 select {'a': 5, 'b': 'test', 'c': [5,3,2]}
             """
             ).to_arrow_table()
 
-        con = duckdb.connect()
+        con = vane.connect()
         struct_type = con.struct_type({"a": BIGINT, "b": VARCHAR, "c": con.list_type(BIGINT)})
         con.create_function("return_struct", return_struct, [BIGINT], struct_type, type="arrow")
         res = con.sql("""select return_struct(5)""").fetchall()
@@ -161,7 +167,7 @@ class TestPyArrowUDF:
         def return_unmodified(col):
             return col
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("unmodified", return_unmodified, [BIGINT], BIGINT, type="arrow")
         res = con.sql(
             """
@@ -180,7 +186,7 @@ class TestPyArrowUDF:
             df["c0"] = df["c0"] ** 2
             return pa.lib.Table.from_pandas(df)
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("inferred", func, type="arrow")
         res = con.sql("select inferred(42)").fetchall()
         assert res == [(1764,)]
@@ -192,13 +198,13 @@ class TestPyArrowUDF:
             length = len(x)
             return pa.lib.Table.from_pandas(pd.DataFrame({"a": [5 for _ in range(length)]}))
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("return_five", return_five, [BIGINT], BIGINT, null_handling="special", type="arrow")
         res = con.sql("select return_five(NULL) from range(10)").fetchall()
         # without 'special' null handling these would all be NULL
         assert res == [(5,), (5,), (5,), (5,), (5,), (5,), (5,), (5,), (5,), (5,)]
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.create_function("return_five", return_five, [BIGINT], BIGINT, null_handling="default", type="arrow")
         res = con.sql("select return_five(NULL) from range(10)").fetchall()
         # Because we didn't specify 'special' null handling, these are all NULL

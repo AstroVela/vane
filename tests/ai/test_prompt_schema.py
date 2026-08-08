@@ -8,7 +8,7 @@ import json
 import pyarrow as pa
 import pytest
 
-import duckdb
+import vane
 from vane.ai._schema import OutputValidationError, SchemaValidationError, compile_return_format
 
 PORTABLE_SCHEMA = {
@@ -363,8 +363,8 @@ def test_every_supported_schema_shape_derives_a_duckdb_bindable_type(schema):
     spec = compile_return_format(schema)
     assert spec is not None
 
-    duckdb.sqltype(spec.duckdb_type)
-    duckdb.sql(f"SELECT CAST(NULL AS {spec.duckdb_type})")
+    vane.sqltype(spec.duckdb_type)
+    vane.sql(f"SELECT CAST(NULL AS {spec.duckdb_type})")
 
 
 @pytest.mark.parametrize(

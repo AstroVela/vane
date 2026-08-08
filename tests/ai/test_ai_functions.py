@@ -2275,7 +2275,7 @@ def test_provider_capability_error_redacts_upstream_credentials_and_round_trips(
     assert error.__context__ is None
     assert str(error.original_error) == "EndpointError (status_code=404)"
 
-    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
     _, stream_metadata = make_stream_error_pair(
         {

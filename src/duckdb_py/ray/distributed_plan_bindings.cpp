@@ -1045,7 +1045,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.udf_registrations_ = udf_registrations_;
 	plan_wrapper.connection_snapshot_ = connection_snapshot_;
 	auto validate_serialization =
-	    py::module_::import("duckdb._ray_cxx").attr("validate_plan_serialization_for_submission");
+	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
 	validate_serialization(py::cast(plan_wrapper));
 	return plan_wrapper;
 }

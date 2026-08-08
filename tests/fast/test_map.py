@@ -6,7 +6,7 @@
 
 import pytest
 
-import duckdb
+import vane
 
 
 class TestMap:
@@ -18,12 +18,12 @@ class TestMap:
 
         result = relation.map(
             add_one,
-            return_type=duckdb.sqltypes.INTEGER,
+            return_type=vane.sqltypes.INTEGER,
             execution_backend="subprocess_task",
         )
 
         assert result.columns == ["x", "value"]
-        assert result.types == [duckdb.sqltypes.INTEGER, duckdb.sqltypes.INTEGER]
+        assert result.types == [vane.sqltypes.INTEGER, vane.sqltypes.INTEGER]
         assert result.fetchall() == [(0, 1), (1, 2), (2, 3)]
 
     def test_scalar_map_passes_each_input_column(self, duckdb_cursor):
@@ -34,7 +34,7 @@ class TestMap:
 
         result = relation.map(
             add_columns,
-            return_type=duckdb.sqltypes.INTEGER,
+            return_type=vane.sqltypes.INTEGER,
             execution_backend="subprocess_task",
         )
 
@@ -59,13 +59,13 @@ class TestMap:
         relation = duckdb_cursor.sql("select 1::INTEGER as x")
 
         with pytest.raises(TypeError):
-            relation.map(add_one, schema={"x": duckdb.sqltypes.INTEGER})
+            relation.map(add_one, schema={"x": vane.sqltypes.INTEGER})
 
     def test_scalar_map_requires_callable(self, duckdb_cursor):
         relation = duckdb_cursor.sql("select 1::INTEGER as x")
 
         with pytest.raises(TypeError):
-            relation.map(42, return_type=duckdb.sqltypes.INTEGER)
+            relation.map(42, return_type=vane.sqltypes.INTEGER)
 
     def test_map_batches_basic(self, duckdb_cursor):
         relation = duckdb_cursor.sql("select i from range(5) tbl(i)")
@@ -78,7 +78,7 @@ class TestMap:
 
         result = relation.map_batches(
             double_values,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
         )
 
         assert result.fetchall() == [(0,), (2,), (4,), (6,), (8,)]
@@ -93,7 +93,7 @@ class TestMap:
         duckdb_cursor.create_table_function(
             "map_batches_test",
             triple_values,
-            schema={"x": duckdb.sqltypes.INTEGER},
+            schema={"x": vane.sqltypes.INTEGER},
         )
         result = duckdb_cursor.sql("select * from map_batches_test((select i from range(3) tbl(i)))")
 
@@ -111,7 +111,7 @@ class TestMap:
         duckdb_cursor.create_table_function(
             "prepared_map_batches_test",
             identity,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
         )
         duckdb_cursor.execute(
             "PREPARE prepared_streaming_udf AS SELECT * FROM prepared_map_batches_test((SELECT i FROM range(3) tbl(i)))"
@@ -131,7 +131,7 @@ class TestMap:
         duckdb_cursor.create_table_function(
             "filter_batches_test",
             keep_first_three,
-            schema={"x": duckdb.sqltypes.BIGINT},
+            schema={"x": vane.sqltypes.BIGINT},
         )
         result = duckdb_cursor.sql("select * from filter_batches_test((select i from range(5) tbl(i)))")
 
@@ -153,8 +153,8 @@ class TestMap:
             "map_batches_projection_test",
             calculate_values,
             schema={
-                "doubled": duckdb.sqltypes.INTEGER,
-                "tripled": duckdb.sqltypes.INTEGER,
+                "doubled": vane.sqltypes.INTEGER,
+                "tripled": vane.sqltypes.INTEGER,
             },
         )
         result = duckdb_cursor.sql("select tripled from map_batches_projection_test((select i from range(3) tbl(i)))")

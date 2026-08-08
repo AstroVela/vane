@@ -11,7 +11,7 @@ import pytest
 from conftest import PANDAS_GE_3
 from packaging.version import Version
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pa_ds = pytest.importorskip("pyarrow.dataset")
@@ -635,7 +635,7 @@ class TestArrowFilterPushdown:
                 "c": [bytes([1]), bytes([2]), bytes([3]), None],
             }
         )
-        rel = duckdb.from_df(df)
+        rel = vane.from_df(df)
         arrow_table = create_table(rel)
 
         # Try ==
@@ -712,8 +712,8 @@ class TestArrowFilterPushdown:
         glob_pattern = tmp_path / "data*.parquet"
         table = duckdb_cursor.read_parquet(glob_pattern.as_posix()).to_arrow_table()
 
-        output_df = duckdb.arrow(table).filter("date > '2019-01-01'").df()
-        expected_df = duckdb.from_parquet(glob_pattern.as_posix()).filter("date > '2019-01-01'").df()
+        output_df = vane.arrow(table).filter("date > '2019-01-01'").df()
+        expected_df = vane.from_parquet(glob_pattern.as_posix()).filter("date > '2019-01-01'").df()
         pandas.testing.assert_frame_equal(expected_df, output_df)
 
     @pytest.mark.skipif(sys.version_info < (3, 9), reason="Requires python 3.9")
@@ -871,7 +871,7 @@ class TestArrowFilterPushdown:
         }
 
     def test_filter_pushdown_not_supported(self):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute(
             "CREATE TABLE T as SELECT i::integer a, i::varchar b, i::uhugeint c, i::integer d FROM range(5) tbl(i)"
         )
@@ -906,7 +906,7 @@ class TestArrowFilterPushdown:
         ).fetchall() == [(28, "28")]
 
     def test_join_filter_pushdown(self, duckdb_cursor):
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(10000);")
         duckdb_conn.execute("CREATE TABLE build as select (random()*9999)::INT b from range(20);")
         duck_probe = duckdb_conn.table("probe")
@@ -920,7 +920,7 @@ class TestArrowFilterPushdown:
         ]
 
     def test_in_filter_pushdown(self, duckdb_cursor):
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(1000);")
         duck_probe = duckdb_conn.table("probe")
         duck_probe_arrow = duck_probe.to_arrow_table()
@@ -932,26 +932,26 @@ class TestArrowFilterPushdown:
         """Large IN lists must not hang."""
         arrow_table = pa.table({"a": pa.array(range(5000))})
         in_list = ", ".join(str(i) for i in range(0, 5000, 2))
-        result = duckdb.sql(f"SELECT count(*) FROM arrow_table WHERE a IN ({in_list})").fetchone()
+        result = vane.sql(f"SELECT count(*) FROM arrow_table WHERE a IN ({in_list})").fetchone()
         assert result == (2500,)
 
     def test_in_filter_pushdown_with_nulls(self, duckdb_cursor):
         arrow_table = pa.table({"a": pa.array([1, 2, None, 4, None, 6])})
         # IN list without NULL: null rows should not match
-        result = duckdb.sql("SELECT a FROM arrow_table WHERE a IN (1, 4) ORDER BY a").fetchall()
+        result = vane.sql("SELECT a FROM arrow_table WHERE a IN (1, 4) ORDER BY a").fetchall()
         assert result == [(1,), (4,)]
         # IN list with NULL: null rows still should not match (SQL semantics)
-        result = duckdb.sql("SELECT a FROM arrow_table WHERE a IN (1, 4, NULL) ORDER BY a").fetchall()
+        result = vane.sql("SELECT a FROM arrow_table WHERE a IN (1, 4, NULL) ORDER BY a").fetchall()
         assert result == [(1,), (4,)]
 
     def test_in_filter_pushdown_varchar(self, duckdb_cursor):
         arrow_table = pa.table({"s": pa.array(["alice", "bob", "charlie", "dave", None])})
-        result = duckdb.sql("SELECT s FROM arrow_table WHERE s IN ('bob', 'dave') ORDER BY s").fetchall()
+        result = vane.sql("SELECT s FROM arrow_table WHERE s IN ('bob', 'dave') ORDER BY s").fetchall()
         assert result == [("bob",), ("dave",)]
 
     def test_in_filter_pushdown_float(self, duckdb_cursor):
         arrow_table = pa.table({"f": pa.array([1.0, 2.5, 3.75, 4.0, None], type=pa.float64())})
-        result = duckdb.sql("SELECT f FROM arrow_table WHERE f IN (2.5, 4.0) ORDER BY f").fetchall()
+        result = vane.sql("SELECT f FROM arrow_table WHERE f IN (2.5, 4.0) ORDER BY f").fetchall()
         assert result == [(2.5,), (4.0,)]
 
     def test_pushdown_of_optional_filter(self, duckdb_cursor):
@@ -972,7 +972,7 @@ class TestArrowFilterPushdown:
             }
         )
 
-        result = duckdb.query(
+        result = vane.query(
             """
             SELECT *
             FROM cardinality_table

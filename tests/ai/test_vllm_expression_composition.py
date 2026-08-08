@@ -7,7 +7,6 @@ from collections import deque
 
 import pytest
 
-import duckdb
 import vane
 
 _EMPTY_NATIVE_VLLM_OPTIONS_SQL = """struct_pack(
@@ -54,7 +53,7 @@ class _ImmediateVLLMExecutor:
 
 
 def _record_native_executors(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     executors: list[_ImmediateVLLMExecutor] = []
 
@@ -73,7 +72,7 @@ def test_python_vllm_expressions_support_multiple_nested_outputs(monkeypatch):
     conn.execute("PRAGMA threads=1")
     rel = conn.sql("SELECT * FROM (VALUES (1, 'Alpha'), (2, 'Beta')) source(id, chunk)")
 
-    lower_prompt = duckdb.FunctionExpression(
+    lower_prompt = vane.FunctionExpression(
         "lower",
         vane.ai.prompt(
             vane.col("chunk"),
@@ -82,16 +81,16 @@ def test_python_vllm_expressions_support_multiple_nested_outputs(monkeypatch):
             do_prefix_routing=False,
         ),
     ).alias("lowered")
-    wrapped_prompt = duckdb.FunctionExpression(
+    wrapped_prompt = vane.FunctionExpression(
         "concat",
-        duckdb.ConstantExpression("["),
+        vane.ConstantExpression("["),
         vane.ai.prompt(
             vane.col("chunk"),
             provider="vllm",
             model="py-wrapped",
             do_prefix_routing=False,
         ),
-        duckdb.ConstantExpression("]"),
+        vane.ConstantExpression("]"),
     ).alias("wrapped")
 
     result = rel.select(vane.col("id"), lower_prompt, wrapped_prompt).order("id")

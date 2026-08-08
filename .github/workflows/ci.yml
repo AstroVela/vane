@@ -214,6 +214,10 @@ jobs:
         timeout-minutes: 12
         run: timeout --signal=INT --kill-after=30s 600s scripts/run_release_tests.sh
 
+      - name: Verify coexistence with the official DuckDB distribution
+        if: matrix.python-version == '3.12'
+        run: python scripts/verify_duckdb_coexistence.py dist/*.whl
+
       - name: Upload validated artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -255,7 +259,6 @@ jobs:
             process_timeout: 900
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      VANE_FAST_TEST_ARTIFACT_MODE: "1"
       VANE_FAST_TEST_EXCLUDE_GPU: "1"
       VANE_FAST_TEST_JUNIT_DIR: ${{ github.workspace }}/test-results
       VANE_FAST_TEST_NON_RAY_SHARD_COUNT: ${{ matrix.shard_count }}
@@ -288,7 +291,7 @@ jobs:
       - name: Install the wheel and CPU test dependencies
         run: |
           python -m pip install --upgrade pip uv
-          uv pip install --system --group build --group test dist/*.whl
+          uv pip install --system --group build --group test duckdb dist/*.whl
           uv pip check
 
       - name: Verify the artifact-installed CPU environment
@@ -299,16 +302,20 @@ jobs:
           import pathlib
           import sys
 
-          import _duckdb
+          import _duckdb as official_native
           import duckdb
           import torch
           import vane
+          from vane import _native
 
           distribution = importlib.metadata.distribution("vane-ai")
-          extension_path = pathlib.Path(_duckdb.__file__).resolve()
+          extension_path = pathlib.Path(_native.__file__).resolve()
+          official_extension_path = pathlib.Path(official_native.__file__).resolve()
           environment_root = pathlib.Path(sys.prefix).resolve()
           if not extension_path.is_relative_to(environment_root):
-              raise RuntimeError(f"_duckdb was not installed from the wheel: {extension_path}")
+              raise RuntimeError(f"vane._native was not installed from the wheel: {extension_path}")
+          if extension_path == official_extension_path:
+              raise RuntimeError("Vane and DuckDB resolved to the same native extension")
           for package in (duckdb, vane):
               package_path = pathlib.Path(package.__file__).resolve()
               if not package_path.is_relative_to(environment_root):
@@ -317,7 +324,10 @@ jobs:
           if torch.version.cuda is not None or torch.cuda.is_available():
               raise RuntimeError("fast-test jobs must use the CPU-only PyTorch build")
           print(f"installed {distribution.metadata['Name']} {distribution.version}")
-          print(f"native extension: {extension_path}")
+          print(f"Vane native extension: {extension_path}")
+          print(f"DuckDB native extension: {official_extension_path}")
+          print(f"Vane query: {vane.connect().execute('SELECT 42').fetchone()}")
+          print(f"DuckDB query: {duckdb.connect().execute('SELECT 43').fetchone()}")
           print(f"PyTorch {torch.__version__}; CUDA unavailable as expected")
           PY
 
@@ -405,15 +415,14 @@ jobs:
           import pathlib
           import sys
 
-          import _duckdb
           import anthropic
-          import duckdb
           import google.genai
           import openai
           import vane
+          from vane import _native
 
           environment_root = pathlib.Path(sys.prefix).resolve()
-          for package in (_duckdb, duckdb, vane):
+          for package in (_native, vane):
               package_path = pathlib.Path(package.__file__).resolve()
               if not package_path.is_relative_to(environment_root):
                   raise RuntimeError(f"{package.__name__} was not imported from the wheel: {package_path}")

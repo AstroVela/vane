@@ -331,7 +331,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDataSource(py::object &sour
 
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
-	auto ds_module = py::module::import("duckdb.datasource");
+	auto ds_module = py::module::import("vane.datasource");
 	auto arrow_schema = ds_module.attr("_schema_to_arrow")(schema_dict);
 
 	// 2. Get tasks and serialize them for worker processes

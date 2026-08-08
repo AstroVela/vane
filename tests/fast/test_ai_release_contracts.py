@@ -114,10 +114,10 @@ def test_non_pydantic_schema_class_is_rejected_without_optional_dependency(monke
 
 
 def test_non_capability_provider_failures_are_safe_before_execution_wires(monkeypatch):
-    from duckdb.execution.udf_ray_stream_protocol import make_stream_error_pair
-    from duckdb.execution.udf_subprocess_worker import _format_exception
     from vane.ai.functions import _EmbedTextBatch, _PromptBatch
     from vane.ai.providers.openai import OpenAITextEmbedder
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
+    from vane.execution.udf_subprocess_worker import _format_exception
 
     secret = "AIzaSyD4n0m5M_NTpvI_GlTgQeX82aBcDeFgHi"
 
@@ -208,9 +208,9 @@ def test_non_capability_provider_failures_are_safe_before_execution_wires(monkey
 
 
 def test_custom_capability_error_chain_is_rebuilt_before_execution_wires():
-    from duckdb.execution.udf_subprocess_worker import _format_exception
     from vane.ai.functions import _PromptBatch
     from vane.ai.provider import ProviderCapabilityError
+    from vane.execution.udf_subprocess_worker import _format_exception
 
     secret = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
@@ -303,7 +303,7 @@ def test_transient_provider_error_is_not_attached_to_backoff_cancellation(monkey
 
 
 def test_vllm_engine_initialization_error_is_credential_safe(monkeypatch):
-    from duckdb.execution.vllm import LocalVLLMExecutor
+    from vane.execution.vllm import LocalVLLMExecutor
 
     secret = "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 

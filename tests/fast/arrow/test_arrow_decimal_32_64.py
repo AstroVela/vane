@@ -1,15 +1,21 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from decimal import Decimal
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
 
 class TestArrowDecimalTypes:
     def test_decimal_32(self, duckdb_cursor):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_output_version = 1.5")
         decimal_32 = pa.Table.from_pylist(
             [
@@ -38,7 +44,7 @@ class TestArrowDecimalTypes:
         assert arrow_table.equals(decimal_32)
 
     def test_decimal_64(self, duckdb_cursor):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_output_version = 1.5")
         decimal_64 = pa.Table.from_pylist(
             [

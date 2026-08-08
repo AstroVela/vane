@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
@@ -189,7 +195,7 @@ class TestArrowNested:
         values = [[(3, 12), (3, 21)], [(5, 42)]]
         arrow_table = pa.table({"detail": pa.array(values, map_type)})
         with pytest.raises(
-            duckdb.InvalidInputException,
+            vane.InvalidInputException,
             match="Arrow map contains duplicate key, which isn't supported by DuckDB map type",
         ):
             duckdb_cursor.from_arrow(arrow_table).fetchall()

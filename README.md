@@ -69,6 +69,26 @@ Install the `vane-ai` package from PyPI:
 pip install vane-ai
 ```
 
+Vane owns only the `vane` Python namespace. It does not install `duckdb`,
+`_duckdb`, or `adbc_driver_duckdb`, so the official `duckdb` distribution can
+be installed in the same environment and both engines can be imported in the
+same process. Vane code must use `import vane`; `import duckdb` always refers
+to the separately installed official package. Vane does not provide a legacy
+`duckdb` alias or fall back to an official DuckDB native module.
+
+```python
+import duckdb
+import vane
+
+assert vane.connect().execute("SELECT 42").fetchone() == (42,)
+assert duckdb.connect().execute("SELECT 43").fetchone() == (43,)
+```
+
+Vane's ADBC driver is exposed as `vane.adbc`; the official driver's
+`adbc_driver_duckdb` namespace remains owned by the official distribution.
+Install `adbc-driver-manager` (also included by `vane-ai[all]`) to use either
+ADBC facade.
+
 Optional features are provided as extras:
 
 ```bash

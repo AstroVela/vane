@@ -615,8 +615,8 @@ static void RejectNonStaticRayExtensions(const std::vector<string> &extension_na
 }
 
 static bool VaneRaySessionLifecycleEnabled() {
-	auto duckdb_module = py::module_::import("duckdb");
-	auto runner = py::str(duckdb_module.attr("vane_runners_cpp").attr("get_or_infer_runner_type")()).cast<string>();
+	auto native_module = py::module_::import("vane._native");
+	auto runner = py::str(native_module.attr("get_or_infer_runner_type")()).cast<string>();
 	duckdb::StringUtil::Trim(runner);
 	runner = duckdb::StringUtil::Lower(runner);
 	return runner == "ray";

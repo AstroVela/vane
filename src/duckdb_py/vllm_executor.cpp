@@ -343,9 +343,9 @@ static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context,
 
 	py::object module;
 	try {
-		module = py::module_::import("duckdb.execution.vllm");
+		module = py::module_::import("vane.execution.vllm");
 	} catch (const py::error_already_set &ex) {
-		throw InvalidInputException("Failed to import duckdb.execution.vllm: %s", ex.what());
+		throw InvalidInputException("Failed to import vane.execution.vllm: %s", ex.what());
 	}
 
 	py::object normalized_obj;

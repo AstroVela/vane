@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import os
 
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 # We only run this test if this env var is set
 # TODO: we can add a custom command line argument to pytest to provide an extension directory  # noqa: TD002, TD003
@@ -21,7 +27,7 @@ class TestHTTPFS:
         try:
             res = connection.read_json("https://jsonplaceholder.typicode.com/todos")
             assert len(res.types) == 4
-        except duckdb.Error as e:
+        except vane.Error as e:
             if "403" in e:
                 pytest.skip(reason="Test is flaky, sometimes returns 403")
             else:
@@ -63,7 +69,7 @@ class TestHTTPFS:
         connection = require("httpfs")
 
         # Read from a bogus HTTPS url, assert that it errors with a non-successful status code
-        with pytest.raises(duckdb.HTTPException) as exc:
+        with pytest.raises(vane.HTTPException) as exc:
             connection.execute("SELECT * FROM PARQUET_SCAN('https://example.com/userdata1.parquet')")
 
         value = exc.value

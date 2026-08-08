@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import platform
 import queue as Queue
 import threading
@@ -7,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 pytestmark = pytest.mark.xfail(
     condition=platform.system() == "Emscripten",
@@ -31,7 +37,7 @@ class DuckDBThreaded:
         self.thread_function = thread_function
 
     def multithread_test(self, result_verification=everything_succeeded):
-        duckdb_conn = duckdb.connect()
+        duckdb_conn = vane.connect()
         queue = Queue.Queue()
 
         # Create all threads
@@ -65,7 +71,7 @@ def execute_query_same_connection(duckdb_conn, queue):
 
 def execute_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)")
         queue.put(True)
@@ -75,7 +81,7 @@ def execute_query(duckdb_conn, queue):
 
 def insert_runtime_error(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("insert into T values (42), (84), (NULL), (128)")
         queue.put(False)
@@ -85,7 +91,7 @@ def insert_runtime_error(duckdb_conn, queue):
 
 def execute_many_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         # from python docs
         duckdb_conn.execute(
@@ -118,7 +124,7 @@ def execute_many_query(duckdb_conn, queue):
 
 def fetchone_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").fetchone()
         queue.put(True)
@@ -128,7 +134,7 @@ def fetchone_query(duckdb_conn, queue):
 
 def fetchall_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").fetchall()
         queue.put(True)
@@ -138,7 +144,7 @@ def fetchall_query(duckdb_conn, queue):
 
 def conn_close(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.close()
         queue.put(True)
@@ -148,7 +154,7 @@ def conn_close(duckdb_conn, queue):
 
 def fetchnp_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").fetchnumpy()
         queue.put(True)
@@ -158,7 +164,7 @@ def fetchnp_query(duckdb_conn, queue):
 
 def fetchdf_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").fetchdf()
         queue.put(True)
@@ -168,7 +174,7 @@ def fetchdf_query(duckdb_conn, queue):
 
 def fetchdf_chunk_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").fetch_df_chunk()
         queue.put(True)
@@ -178,7 +184,7 @@ def fetchdf_chunk_query(duckdb_conn, queue):
 
 def arrow_table_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").to_arrow_table()
         queue.put(True)
@@ -188,7 +194,7 @@ def arrow_table_query(duckdb_conn, queue):
 
 def fetch_record_batch_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.execute("select i from (values (42), (84), (NULL), (128)) tbl(i)").to_arrow_reader()
         queue.put(True)
@@ -198,7 +204,7 @@ def fetch_record_batch_query(duckdb_conn, queue):
 
 def transaction_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute("CREATE TABLE T ( i INTEGER)")
     try:
         duckdb_conn.begin()
@@ -213,7 +219,7 @@ def transaction_query(duckdb_conn, queue):
 
 def df_append(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute("CREATE TABLE T ( i INTEGER)")
     df = pd.DataFrame(np.random.randint(0, 100, size=15), columns=["A"])
     try:
@@ -225,7 +231,7 @@ def df_append(duckdb_conn, queue):
 
 def df_register(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     df = pd.DataFrame(np.random.randint(0, 100, size=15), columns=["A"])
     try:
         duckdb_conn.register("T", df)
@@ -236,7 +242,7 @@ def df_register(duckdb_conn, queue):
 
 def df_unregister(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     df = pd.DataFrame(np.random.randint(0, 100, size=15), columns=["A"])
     try:
         duckdb_conn.register("T", df)
@@ -249,7 +255,7 @@ def df_unregister(duckdb_conn, queue):
 def arrow_register_unregister(duckdb_conn, queue):
     # Get a new connection
     pa = pytest.importorskip("pyarrow")
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     arrow_tbl = pa.Table.from_pydict({"my_column": pa.array([1, 2, 3, 4, 5], type=pa.int64())})
     try:
         duckdb_conn.register("T", arrow_tbl)
@@ -261,7 +267,7 @@ def arrow_register_unregister(duckdb_conn, queue):
 
 def table(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute("CREATE TABLE T ( i INTEGER)")
     try:
         duckdb_conn.table("T")
@@ -272,7 +278,7 @@ def table(duckdb_conn, queue):
 
 def view(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute("CREATE TABLE T ( i INTEGER)")
     duckdb_conn.execute("CREATE VIEW V as (SELECT * FROM T)")
     try:
@@ -284,7 +290,7 @@ def view(duckdb_conn, queue):
 
 def values(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.values([5, "five"])
         queue.put(True)
@@ -294,7 +300,7 @@ def values(duckdb_conn, queue):
 
 def from_query(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     try:
         duckdb_conn.from_query("select i from (values (42), (84), (NULL), (128)) tbl(i)")
         queue.put(True)
@@ -304,7 +310,7 @@ def from_query(duckdb_conn, queue):
 
 def from_df(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     df = pd.DataFrame(["bla", "blabla"] * 10, columns=["A"])  # noqa: F841
     try:
         duckdb_conn.execute("select * from df").fetchall()
@@ -316,7 +322,7 @@ def from_df(duckdb_conn, queue):
 def from_arrow(duckdb_conn, queue):
     # Get a new connection
     pa = pytest.importorskip("pyarrow")
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     arrow_tbl = pa.Table.from_pydict({"my_column": pa.array([1, 2, 3, 4, 5], type=pa.int64())})
     try:
         duckdb_conn.from_arrow(arrow_tbl)
@@ -327,7 +333,7 @@ def from_arrow(duckdb_conn, queue):
 
 def from_csv_auto(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     filename = str(Path(__file__).parent / "data" / "integers.csv")
     try:
         duckdb_conn.from_csv_auto(filename)
@@ -338,7 +344,7 @@ def from_csv_auto(duckdb_conn, queue):
 
 def from_parquet(duckdb_conn, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     filename = str(Path(__file__).parent / "data" / "binary_string.parquet")
     try:
         duckdb_conn.from_parquet(filename)
@@ -349,7 +355,7 @@ def from_parquet(duckdb_conn, queue):
 
 def description(_, queue):
     # Get a new connection
-    duckdb_conn = duckdb.connect()
+    duckdb_conn = vane.connect()
     duckdb_conn.execute("CREATE TABLE test (i bool, j TIME, k VARCHAR)")
     duckdb_conn.execute("INSERT INTO test VALUES (TRUE, '01:01:01', 'bla' )")
     rel = duckdb_conn.table("test")
