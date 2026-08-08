@@ -162,6 +162,19 @@ def test_public_vllm_rejects_guided_decoding_alias_mapping():
         _plan_from_prompt_options({"generate_args": {"sampling_params": {"guided_decoding": {"regex": ".*"}}}})
 
 
+@pytest.mark.parametrize("sampling_params", [{"temperature": -0.1}, '{"temperature":-0.1}'])
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(_plan_from_prompt_options, id="prompt-entry-point"),
+        pytest.param(lambda options: VLLMProvider().get_prompter(options=options), id="provider-factory"),
+    ],
+)
+def test_public_vllm_rejects_negative_nested_temperature_during_planning(sampling_params, factory):
+    with pytest.raises(ValueError, match=r"sampling_params\.temperature.*>= 0"):
+        factory({"generate_args": {"sampling_params": sampling_params}})
+
+
 @pytest.mark.parametrize(
     "engine_args",
     [

@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections.abc import Mapping
@@ -21,8 +20,10 @@ VLLMJSONValue: TypeAlias = VLLMJSONPrimitive | list["VLLMJSONValue"] | dict[str,
 class PromptOptions(TypedDict, total=False):
     """Closed keyword surface shared by the Python Prompt entry points."""
 
-    # Common generation and execution options.
+    # Provider request option shared by every built-in Prompt adapter.
     temperature: float | None
+
+    # Vane Prompt execution options.
     batch_size: int
     actor_number: int
     max_concurrency_per_actor: int
@@ -41,7 +42,7 @@ class PromptOptions(TypedDict, total=False):
     max_tokens: int | None
     top_k: int | None
 
-    # Native vLLM execution options.
+    # Native vLLM provider options.
     gpus_per_actor: float
     engine_args: Mapping[str, VLLMJSONValue]
     generate_args: Mapping[str, VLLMJSONValue]
@@ -118,17 +119,6 @@ _GOOGLE_EMBED_TASK_TYPES = frozenset(
 _EXECUTION_BACKENDS = frozenset({"subprocess_task", "subprocess_actor", "ray_task", "ray_actor"})
 _OPENAI_EXTRA_SENSITIVE_KEYS = frozenset({"organization"})
 _HUGGING_FACE_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
-_VLLM_REMOTE_CODE_SPECULATIVE_METHODS = frozenset(
-    {
-        "mtp",
-        "deepseek_mtp",
-        "mimo_mtp",
-        "glm4_moe_mtp",
-        "ernie_mtp",
-        "qwen3_next_mtp",
-        "longcat_flash_mtp",
-    }
-)
 
 
 def _is_hugging_face_commit_sha(value: Any) -> bool:
@@ -273,9 +263,10 @@ def validate_embed_options(
     return copied
 
 
-_PROMPT_COMMON_OPTIONS = frozenset({"temperature", "batch_size", "actor_number", "max_retries"})
-_PROMPT_RELATION_OPTIONS = frozenset({"execution_backend"})
-_PROMPT_REMOTE_OPTIONS = frozenset({"max_concurrency_per_actor"})
+_PROMPT_SHARED_PROVIDER_OPTIONS = frozenset({"temperature"})
+_PROMPT_BASE_EXECUTION_OPTIONS = frozenset({"batch_size", "actor_number", "max_retries"})
+_PROMPT_RELATION_EXECUTION_OPTIONS = frozenset({"execution_backend"})
+_PROMPT_REMOTE_EXECUTION_OPTIONS = frozenset({"max_concurrency_per_actor"})
 _PROMPT_PROVIDER_OPTIONS = {
     "openai": frozenset(
         {"use_chat_completions", "max_output_tokens", "top_p", "stop_sequences", "base_url", "timeout"}
@@ -361,51 +352,37 @@ def _validate_prompt_stop_sequences(options: Mapping[str, Any]) -> None:
         raise ValueError("Prompt option 'stop_sequences' must contain only non-empty strings")
 
 
-def _validate_vllm_json(value: Any, path: str) -> None:
-    if value is None or isinstance(value, (str, bool, int)):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError(f"Prompt option {path} must contain only finite numbers")
-        return
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(f"Prompt option {path} must use string keys; got {type(key).__name__}")
-            if key in {"structured_outputs", "guided_decoding"}:
-                raise ValueError(f"Prompt option generate_args cannot configure {key} directly; use return_format")
-            _validate_vllm_json(item, f"{path}.{key}")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_vllm_json(item, f"{path}[{index}]")
-        return
-    raise TypeError(f"Prompt option {path} must be JSON-compatible; got {type(value).__name__}")
-
-
-def validate_prompt_options(
+def normalize_prompt_options(
     provider_family: str | None,
     options: Mapping[str, Any],
     *,
     relation: bool,
 ) -> dict[str, Any]:
-    """Validate and copy the closed Prompt options for one entry point."""
+    """Copy and validate the outer Prompt option envelope.
+
+    Provider adapters own the semantics of every option they consume. This
+    outer normalization boundary only applies Vane-wide safety and closed-key
+    checks, then validates the execution fields consumed by Prompt planning.
+    """
 
     copied = dict(options)
     _reject_sensitive_prompt_options(copied)
     family = (provider_family or "").casefold()
-    allowed = _PROMPT_COMMON_OPTIONS | _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
+    allowed = (
+        _PROMPT_SHARED_PROVIDER_OPTIONS
+        | _PROMPT_BASE_EXECUTION_OPTIONS
+        | _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
+    )
     if family != "vllm":
-        allowed |= _PROMPT_REMOTE_OPTIONS
+        allowed |= _PROMPT_REMOTE_EXECUTION_OPTIONS
     if relation and family != "vllm":
-        allowed |= _PROMPT_RELATION_OPTIONS
+        allowed |= _PROMPT_RELATION_EXECUTION_OPTIONS
     unknown = sorted(set(copied) - allowed)
     if unknown:
         raise TypeError(
             f"Unsupported Prompt option(s) for provider {provider_family or 'custom'!r}: " + ", ".join(unknown)
         )
 
-    _require_prompt_number(copied, "temperature", nullable=True)
     for name in ("batch_size", "actor_number", "max_concurrency_per_actor"):
         _require_prompt_int(copied, name, minimum=1)
     _require_prompt_int(copied, "max_retries", minimum=0)
@@ -420,83 +397,7 @@ def validate_prompt_options(
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Prompt option 'actor_number' requires an actor execution backend")
 
-    if family == "openai":
-        if "use_chat_completions" in copied and not isinstance(copied["use_chat_completions"], bool):
-            raise ValueError("Prompt option 'use_chat_completions' must be a bool")
-        _require_prompt_int(copied, "max_output_tokens", minimum=1, nullable=True)
-    elif family == "anthropic":
-        _require_prompt_int(copied, "max_tokens", minimum=0, nullable=True)
-        _require_prompt_int(copied, "top_k", minimum=0, nullable=True)
-    elif family == "google":
-        _require_prompt_int(copied, "max_output_tokens", minimum=1, nullable=True)
-        _require_prompt_int(copied, "top_k", minimum=0, nullable=True)
-    elif family == "vllm":
-        _require_prompt_int(copied, "max_tokens", minimum=1, nullable=True)
-        for name in ("max_buffer_size", "min_bucket_size", "load_balance_threshold", "inflight_limit"):
-            _require_prompt_int(copied, name, minimum=0)
-        _require_prompt_number(copied, "prefix_match_threshold", minimum=0, maximum=1)
-        _require_prompt_number(copied, "engine_init_timeout_s", minimum=0, nullable=True)
-        if "gpus_per_actor" in copied:
-            _require_prompt_number(copied, "gpus_per_actor", minimum=0)
-            value = float(copied["gpus_per_actor"])
-            if value <= 0 or (value >= 1 and not value.is_integer()):
-                raise ValueError("Prompt option 'gpus_per_actor' must be positive and must be an integer when >= 1")
-        if "do_prefix_routing" in copied and not isinstance(copied["do_prefix_routing"], bool):
-            raise ValueError("Prompt option 'do_prefix_routing' must be a bool")
-        for name in ("engine_args", "generate_args"):
-            if name in copied:
-                value = copied[name]
-                if not isinstance(value, Mapping):
-                    raise TypeError(f"Prompt option {name!r} must be a mapping")
-                _validate_vllm_json(value, name)
-        generate_args = copied.get("generate_args", {})
-        sampling_params = generate_args.get("sampling_params")
-        if isinstance(sampling_params, str):
-            try:
-                decoded_sampling_params = json.loads(sampling_params)
-            except json.JSONDecodeError as exc:
-                raise ValueError("Prompt option 'generate_args.sampling_params' must be valid JSON") from exc
-            if not isinstance(decoded_sampling_params, Mapping):
-                raise ValueError("Prompt option 'generate_args.sampling_params' JSON must decode to a mapping")
-            _reject_sensitive_prompt_options(
-                decoded_sampling_params,
-                path="options.generate_args.sampling_params",
-            )
-            _validate_vllm_json(decoded_sampling_params, "generate_args.sampling_params")
-        engine_args = copied.get("engine_args", {})
-        if "trust_remote_code" in engine_args and not isinstance(engine_args["trust_remote_code"], bool):
-            raise ValueError("Prompt option 'engine_args.trust_remote_code' must be a bool")
-        if engine_args.get("trust_remote_code") is True:
-            for revision_name in ("code_revision", "tokenizer_revision"):
-                if not _is_hugging_face_commit_sha(engine_args.get(revision_name)):
-                    raise ValueError(
-                        "Prompt option 'engine_args.trust_remote_code=True' requires "
-                        f"engine_args.{revision_name} as a full 40-character commit SHA"
-                    )
-            speculative_config = engine_args.get("speculative_config")
-            speculative_model = speculative_config.get("model") if isinstance(speculative_config, Mapping) else None
-            speculative_method = speculative_config.get("method") if isinstance(speculative_config, Mapping) else None
-            if (
-                isinstance(speculative_config, Mapping)
-                and (
-                    (speculative_model is not None and speculative_model not in {"ngram", "[ngram]"})
-                    or speculative_method in _VLLM_REMOTE_CODE_SPECULATIVE_METHODS
-                )
-                and not _is_hugging_face_commit_sha(speculative_config.get("code_revision"))
-            ):
-                raise ValueError(
-                    "Prompt option 'engine_args.trust_remote_code=True' with a speculative model requires "
-                    "engine_args.speculative_config.code_revision as a full 40-character commit SHA"
-                )
-        if copied.get("max_retries", 0) != 0:
-            raise ValueError("native vLLM prompting only accepts max_retries=0")
-
-    if family in {"openai", "anthropic", "google"}:
-        _require_prompt_number(copied, "top_p", minimum=0, maximum=1, nullable=True)
-        _validate_prompt_stop_sequences(copied)
-        _validate_base_url_option(copied, api="Prompt")
-        _require_prompt_number(copied, "timeout", minimum=0, nullable=True)
-        if copied.get("timeout") == 0:
-            raise ValueError("Prompt option 'timeout' must be a finite positive number or None")
+    if family == "vllm" and copied.get("max_retries", 0) != 0:
+        raise ValueError("native vLLM prompting only accepts max_retries=0")
 
     return copied

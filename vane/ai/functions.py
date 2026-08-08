@@ -52,8 +52,8 @@ from vane.ai._schema import (
 from vane.ai.options import (
     EmbedOptions,
     PromptOptions,
+    normalize_prompt_options,
     validate_embed_options,
-    validate_prompt_options,
 )
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import (
@@ -1487,7 +1487,7 @@ def _prepare_prompt_call(
     if not isinstance(resolved_provider, Provider):
         raise TypeError("provider must be a provider name or Provider object")
     family = _prompt_provider_family(resolved_provider)
-    prepared = validate_prompt_options(family, options, relation=relation)
+    prepared = normalize_prompt_options(family, options, relation=relation)
 
     execution_backend = prepared.pop("execution_backend", None)
     batch_size = prepared.pop("batch_size", None)

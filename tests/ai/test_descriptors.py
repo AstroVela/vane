@@ -101,6 +101,25 @@ class TestProviderLoading:
         with pytest.raises(ValueError, match=message):
             OpenAIProvider().get_prompter(model=model, options=options)
 
+    def test_builtin_provider_factories_reject_negative_temperature(self):
+        from vane.ai.providers.anthropic import AnthropicProvider
+        from vane.ai.providers.google import GoogleProvider
+        from vane.ai.providers.openai import OpenAIProvider
+        from vane.ai.providers.vllm import VLLMProvider
+
+        factories = [
+            lambda: OpenAIProvider().get_prompter(options={"temperature": -0.1}),
+            lambda: AnthropicProvider(prompt_model="claude-test").get_prompter(
+                options={"max_tokens": 8, "temperature": -0.1}
+            ),
+            lambda: GoogleProvider(prompt_model="gemini-test").get_prompter(options={"temperature": -0.1}),
+            lambda: VLLMProvider().get_prompter(options={"temperature": -0.1}),
+        ]
+
+        for factory in factories:
+            with pytest.raises(ValueError, match=r"Prompt option 'temperature' must be >= 0"):
+                factory()
+
     @pytest.mark.parametrize(
         ("operation", "options"),
         [
