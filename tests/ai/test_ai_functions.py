@@ -1269,6 +1269,72 @@ class TestRetryAfterError:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
+    @pytest.mark.parametrize("bad", [-1.0, -0.001, float("nan"), float("inf"), 10**400, -(10**400)])
+    def test_retry_wait_seconds_rejects_malformed_retry_after(self, bad):
+        """A non-finite or negative retry_after never becomes the sleep value (issue #469)."""
+        from vane.ai.functions import RetryAfterError, _retry_wait_seconds
+
+        # Falls back to exponential backoff (1, 2, 4, ... capped at 30) rather
+        # than passing a value that time.sleep/asyncio.sleep would choke on.
+        # The 10**400 cases also pin that the guard itself must not raise
+        # OverflowError converting an int beyond float range.
+        assert _retry_wait_seconds(RetryAfterError(retry_after=bad), attempt=0) == 1
+        assert _retry_wait_seconds(RetryAfterError(retry_after=bad), attempt=2) == 4
+
+    def test_retry_wait_seconds_honors_valid_retry_after(self):
+        from vane.ai.functions import RetryAfterError, _retry_wait_seconds
+
+        assert _retry_wait_seconds(RetryAfterError(retry_after=7.0), attempt=0) == 7.0
+        assert _retry_wait_seconds(RetryAfterError(retry_after=0.0), attempt=0) == 0.0
+        assert _retry_wait_seconds(RetryAfterError(retry_after=999.0), attempt=0) == 120  # capped
+
+    @pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+    def test_retry_call_malformed_retry_after_does_not_break_sleep(self, monkeypatch, bad):
+        """Sync retry with a malformed delay retries and honours on_error, never ValueError."""
+        from vane.ai import functions
+        from vane.ai.functions import RetryAfterError, _retry_call
+
+        slept: list[float] = []
+        monkeypatch.setattr(functions.time, "sleep", lambda seconds: slept.append(seconds))
+
+        calls: list[int] = []
+
+        def fn():
+            calls.append(1)
+            raise RetryAfterError(retry_after=bad, original=RuntimeError("429"))
+
+        result = _retry_call(fn, max_retries=3, on_error="ignore", default="fallback")
+
+        assert result == "fallback"  # on_error honoured, not bypassed by a sleep crash
+        assert len(calls) == 4  # first attempt + 3 retries all ran
+        assert slept == [1, 2, 4]  # fell back to exponential backoff
+
+    def test_retry_call_async_malformed_retry_after_does_not_hang(self, monkeypatch):
+        """Async retry with retry_after=NaN must not deadlock on asyncio.sleep(nan) (issue #469)."""
+        import asyncio
+
+        from vane.ai import functions
+        from vane.ai.functions import RetryAfterError, _retry_call_async
+
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(functions.asyncio, "sleep", fake_sleep)
+
+        calls: list[int] = []
+
+        async def fn():
+            calls.append(1)
+            raise RetryAfterError(retry_after=float("nan"), original=ValueError("503"))
+
+        result = asyncio.run(_retry_call_async(fn, max_retries=3, on_error="ignore", default="fb"))
+
+        assert result == "fb"
+        assert len(calls) == 4
+        assert slept == [1, 2, 4]
+
 
 class TestGoogleRetryHandling:
     """Tests for Google provider 429/503 → RetryAfterError conversion."""
@@ -1337,6 +1403,43 @@ class TestGoogleRetryHandling:
         exc = RuntimeError("random error")
         # No .code attribute → should not raise
         _raise_retry_after_on_google_error(exc)
+
+    @pytest.mark.parametrize("bad_header", ["-1", "-0.5", "nan", "NaN", "inf", "1e999"])
+    def test_google_malformed_retry_after_header_uses_default(self, bad_header):
+        """Parseable-but-invalid Retry-After (negative/NaN/inf) falls back to 5s (issue #469)."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.google import _raise_retry_after_on_google_error
+
+        mock_response = MagicMock()
+        mock_response.headers = {"Retry-After": bad_header}
+
+        exc = Exception("rate limited")
+        exc.code = 429
+        exc.response = mock_response
+
+        with pytest.raises(RetryAfterError) as ctx:
+            _raise_retry_after_on_google_error(exc)
+        assert ctx.value.retry_after == 5.0
+
+    def test_google_valid_decimal_retry_after_header(self):
+        """A well-formed fractional Retry-After is still honoured verbatim."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.google import _raise_retry_after_on_google_error
+
+        mock_response = MagicMock()
+        mock_response.headers = {"Retry-After": "3.5"}
+
+        exc = Exception("rate limited")
+        exc.code = 429
+        exc.response = mock_response
+
+        with pytest.raises(RetryAfterError) as ctx:
+            _raise_retry_after_on_google_error(exc)
+        assert ctx.value.retry_after == 3.5
 
 
 class TestEmbedProviderCapabilityErrors:

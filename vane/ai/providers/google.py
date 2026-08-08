@@ -18,6 +18,7 @@ Requires::
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -63,8 +64,9 @@ _IMAGE_MIME_POLICY = ImageMimePolicy(
 def _retry_after_error_from_google_error(exc: Exception) -> Exception | None:
     """Build a safe retry signal for Google 429/503 responses, if applicable.
 
-    Parses the ``Retry-After`` header if present; otherwise falls back to
-    a 5-second default wait.
+    Parses the ``Retry-After`` header if present; a missing, unparseable, or
+    malformed (negative or non-finite) header falls back to a 5-second
+    default wait.
     """
     from vane.ai.functions import RetryAfterError
 
@@ -80,9 +82,15 @@ def _retry_after_error_from_google_error(exc: Exception) -> Exception | None:
         raw = headers.get("Retry-After") or headers.get("retry-after")
         if raw is not None:
             try:
-                retry_after = float(raw)
+                parsed = float(raw)
             except (TypeError, ValueError):
-                pass
+                parsed = None
+            # A negative, NaN, or infinite header (all parseable by float(),
+            # e.g. "-1", "nan", "1e999") is malformed: ignore it and fall back
+            # to the default wait rather than passing it to a retry sleep that
+            # would raise or hang (issue #469).
+            if parsed is not None and math.isfinite(parsed) and parsed >= 0:
+                retry_after = parsed
     if retry_after is None:
         retry_after = 5.0  # default wait for 429/503
 
