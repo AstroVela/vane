@@ -249,7 +249,7 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
     backend.register_query_owner("query-a", "query-a")
 
     assert backend.worker_snapshots() == [{"worker_id": "worker-1"}]
-    submitted = backend.submit_tasks(({"query_id": "query-a"},))
+    submitted = backend.submit_tasks(({"query_id": "query-a", "resource_query_id": "query-a"},))
     assert len(submitted) == 1
     assert submitted[0].poll().output == "submitted"
 
@@ -265,7 +265,7 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
 
     assert coordinator.calls == [
         ("worker_snapshots", ()),
-        ("submit_tasks", ([{"query_id": "query-a"}],)),
+        ("submit_tasks", ([{"query_id": "query-a", "resource_query_id": "query-a"}],)),
         ("task_input_stream_exhausted_for_query", ("query-a", ["source-a"])),
         ("materialization_barrier_completed", ("query-a", "7")),
         ("wait_fte_query", ("query-a", 2.0)),
@@ -273,6 +273,37 @@ def test_ray_worker_manager_backend_delegates_and_collects_result_handles():
         ("fte_drop_query", ("query-a",)),
         ("shutdown", ()),
     ]
+
+
+def test_ray_worker_manager_backend_requires_fte_drop_query_contract():
+    coordinator = _FakeCoordinator()
+    setattr(coordinator, "fte_drop_query", None)
+    backend = RayWorkerManagerBackend(coordinator)
+    backend.register_query_owner("query-a", "query-a")
+
+    with pytest.raises(TypeError, match="callable fte_drop_query"):
+        backend.drop_query("query-a")
+
+    setattr(
+        coordinator,
+        "fte_drop_query",
+        lambda query_id: coordinator.calls.append(("fte_drop_query", (query_id,))),
+    )
+    backend.drop_query("query-a")
+    assert coordinator.calls == [("fte_drop_query", ("query-a",))]
+
+
+def test_ray_worker_manager_backend_requires_shutdown_contract():
+    coordinator = _FakeCoordinator()
+    setattr(coordinator, "shutdown", None)
+    backend = RayWorkerManagerBackend(coordinator)
+
+    with pytest.raises(TypeError, match="callable shutdown"):
+        backend.shutdown()
+
+    setattr(coordinator, "shutdown", lambda: coordinator.calls.append(("shutdown", ())))
+    backend.shutdown()
+    assert coordinator.calls == [("shutdown", ())]
 
 
 def test_ray_worker_manager_backend_exposes_cxx_query_status_contract():
@@ -447,7 +478,7 @@ def test_ray_worker_manager_backend_releases_handles_returned_after_drop(produce
     def produce_handles() -> None:
         try:
             if producer == "submit":
-                result.extend(backend.submit_tasks(({"query_id": "query-a"},)))
+                result.extend(backend.submit_tasks(({"query_id": "query-a", "resource_query_id": "query-a"},)))
             elif producer == "exhaustion":
                 result.extend(backend.task_input_stream_exhausted("query-a", ("source-a",)))
             else:
@@ -491,12 +522,12 @@ def test_ray_worker_manager_backend_reuses_query_id_after_quiescent_drop():
     backend.drop_query("query-a")
     backend.register_query_owner("query-a", "query-a")
 
-    handles = backend.submit_tasks(({"query_id": "query-a"},))
+    handles = backend.submit_tasks(({"query_id": "query-a", "resource_query_id": "query-a"},))
 
     assert len(handles) == 1
     assert coordinator.calls == [
         ("fte_drop_query", ("query-a",)),
-        ("submit_tasks", ([{"query_id": "query-a"}],)),
+        ("submit_tasks", ([{"query_id": "query-a", "resource_query_id": "query-a"}],)),
     ]
     assert backend._closed_queries == set()
     assert backend._closed_query_owners == set()
@@ -590,7 +621,7 @@ def test_ray_worker_manager_backend_rejects_submission_while_drop_is_in_progress
     assert coordinator.drop_started.wait(timeout=5.0)
     second_drop.start()
 
-    assert backend.submit_tasks(({"query_id": "query-a"},)) == []
+    assert backend.submit_tasks(({"query_id": "query-a", "resource_query_id": "query-a"},)) == []
     assert first_drop.is_alive()
     assert second_drop.is_alive()
 
@@ -679,9 +710,9 @@ def test_ray_worker_manager_backend_drop_fans_out_and_retries_owner_group():
     backend.register_query_owner("query-child", "query-root")
 
     with pytest.raises(RuntimeError, match="failed to drop 1 execution query lifecycle"):
-        backend.drop_query_owner("query-root")
+        backend.drop_query("query-root")
 
-    backend.drop_query_owner("query-root")
+    backend.drop_query("query-root")
 
     drop_calls = [call for call in coordinator.calls if call[0] == "fte_drop_query"]
     assert drop_calls == [
@@ -703,7 +734,7 @@ def test_ray_worker_manager_backend_retries_failed_late_release_during_shutdown(
 
     def submit() -> None:
         try:
-            backend.submit_tasks(({"query_id": "query-a"},))
+            backend.submit_tasks(({"query_id": "query-a", "resource_query_id": "query-a"},))
         except BaseException as exc:
             error.append(exc)
 
@@ -764,11 +795,58 @@ def test_ray_worker_manager_backend_shutdown_is_serialized_and_idempotent():
     assert coordinator.calls == [("shutdown", ())]
 
 
+def test_ray_worker_manager_backend_preserves_owner_state_until_shutdown_retry():
+    class FailShutdownOnceCoordinator(_FakeCoordinator):
+        def __init__(self):
+            super().__init__()
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            super().shutdown()
+            self.shutdown_calls += 1
+            if self.shutdown_calls == 1:
+                raise RuntimeError("planned coordinator shutdown failure")
+
+    coordinator = FailShutdownOnceCoordinator()
+    backend = RayWorkerManagerBackend(coordinator)
+    backend.register_query_owner("query-a", "query-a")
+
+    with pytest.raises(RuntimeError, match="planned coordinator shutdown failure"):
+        backend.shutdown()
+
+    assert backend._query_owner_by_query == {"query-a": "query-a"}
+    with pytest.raises(RuntimeError, match="after Ray backend shutdown failed"):
+        backend.drop_query("query-a")
+    assert not any(call[0] == "fte_drop_query" for call in coordinator.calls)
+
+    backend.shutdown()
+
+    assert coordinator.shutdown_calls == 2
+    assert backend._query_owner_by_query == {}
+
+
 def test_ray_worker_manager_backend_rejects_mixed_query_submit_batch():
     coordinator = _FakeCoordinator()
     backend = RayWorkerManagerBackend(coordinator)
 
     with pytest.raises(ValueError, match="multiple query_id"):
-        backend.submit_tasks(({"query_id": "query-a"}, {"query_id": "query-b"}))
+        backend.submit_tasks(
+            (
+                {"query_id": "query-a", "resource_query_id": "query-a"},
+                {"query_id": "query-b", "resource_query_id": "query-b"},
+            )
+        )
+
+    assert coordinator.calls == []
+
+
+@pytest.mark.parametrize("resource_query_id", [None, "", "   "])
+def test_ray_worker_manager_backend_requires_explicit_resource_query_owner(resource_query_id):
+    coordinator = _FakeCoordinator()
+    backend = RayWorkerManagerBackend(coordinator)
+    backend.register_query_owner("query-a", "query-a")
+
+    with pytest.raises(ValueError, match="non-empty resource_query_id"):
+        backend.submit_tasks(({"query_id": "query-a", "resource_query_id": resource_query_id},))
 
     assert coordinator.calls == []

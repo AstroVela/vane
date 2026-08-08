@@ -356,8 +356,8 @@ class RayWorkerManagerBackend:
                 raw_handles = list(pop_handles(query_id) or [])
             handles = self._accept_handles(active_owner, raw_handles)
             if allowed is not None:
-                selected_handles = []
-                discarded_handles = []
+                selected_handles: list[RayTaskResultHandleAdapter] = []
+                discarded_handles: list[RayTaskResultHandleAdapter] = []
                 try:
                     for handle in handles:
                         target = (
@@ -411,15 +411,11 @@ class RayWorkerManagerBackend:
         owner_query_id, execution_query_ids, drop_token = drop_lifecycle
         try:
             drop_error: BaseException | None = None
-            drop_query = getattr(self._coordinator, "fte_drop_query", None)
-            drop_query_fragments = getattr(self._coordinator, "drop_query_fragments", None)
+            drop_query = _required_method(self._coordinator, "fte_drop_query")
             drop_errors: list[BaseException] = []
             for execution_query_id in execution_query_ids:
                 try:
-                    if callable(drop_query):
-                        drop_query(execution_query_id)
-                    elif callable(drop_query_fragments):
-                        drop_query_fragments(execution_query_id)
+                    drop_query(execution_query_id)
                 except BaseException as exc:
                     drop_errors.append(exc)
             if drop_errors:
@@ -436,19 +432,14 @@ class RayWorkerManagerBackend:
         finally:
             self._end_query_drop(owner_query_id, drop_token)
 
-    def drop_query_owner(self, owner_query_id: str) -> None:
-        self.drop_query(owner_query_id)
-
     def shutdown(self) -> None:
         if not self._begin_shutdown():
             return
         succeeded = False
         try:
             shutdown_error: BaseException | None = None
-            shutdown = getattr(self._coordinator, "shutdown", None)
             try:
-                if callable(shutdown):
-                    shutdown()
+                _required_method(self._coordinator, "shutdown")()
             except BaseException as exc:
                 shutdown_error = exc
             self._wait_for_all_query_operations()
@@ -463,7 +454,7 @@ class RayWorkerManagerBackend:
                     f"failed to release cleanup handles for {len(cleanup_errors)} query(s) during shutdown"
                 )
                 cleanup_error.__cause__ = cleanup_errors[0]
-            if cleanup_error is None:
+            if shutdown_error is None and cleanup_error is None:
                 with self._lifecycle_condition:
                     self._query_owner_by_query.clear()
                     self._closed_queries.clear()
@@ -596,7 +587,11 @@ class RayWorkerManagerBackend:
                 if owner_query_id in self._dropping_query_owners:
                     return None
             if self._shutdown:
-                return None
+                while self._shutdown_running:
+                    self._lifecycle_condition.wait()
+                if self._shutdown_complete:
+                    return None
+                raise RuntimeError(f"cannot drop FTE query after Ray backend shutdown failed: {query_id}")
             self._closed_queries.add(query_id)
             self._closed_query_owners.add(owner_query_id)
             drop_token = object()
@@ -702,7 +697,9 @@ class RayWorkerManagerBackend:
             if query_id and query_id != task_query_id:
                 raise ValueError("FTE submit batch contains multiple query_id values")
             query_id = task_query_id
-            task_owner_query_id = str(context.get("resource_query_id") or task_query_id).strip()
+            task_owner_query_id = str(context.get("resource_query_id") or "").strip()
+            if not task_owner_query_id:
+                raise ValueError("FTE task requires non-empty resource_query_id")
             if owner_query_id and owner_query_id != task_owner_query_id:
                 raise ValueError("FTE submit batch contains multiple resource_query_id values")
             owner_query_id = task_owner_query_id

@@ -1071,8 +1071,10 @@ public:
 	template <class T>
 	using DuckDBResult = duckdb::distributed::DuckDBResult<T>;
 	using DuckDBError = duckdb::distributed::DuckDBError;
+	using QueryCleanup = std::function<void(const string &)>;
 
-	explicit PyBackendWorkerManager(py::object backend) : backend_(std::move(backend)) {
+	explicit PyBackendWorkerManager(py::object backend, QueryCleanup query_cleanup)
+	    : backend_(std::move(backend)), query_cleanup_(std::move(query_cleanup)) {
 	}
 
 	void register_query_owner(const string &query_id, const string &owner_query_id) {
@@ -1082,12 +1084,9 @@ public:
 		{
 			lock_guard<mutex> guard(mutex_);
 			auto existing_owner = result_handle_owner_by_query_.find(query_id);
-			if (existing_owner != result_handle_owner_by_query_.end()) {
-				if (existing_owner->second != owner_query_id) {
-					throw std::runtime_error("FTE query result owner changed while active: query=" + query_id +
-					                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
-				}
-				return;
+			if (existing_owner != result_handle_owner_by_query_.end() && existing_owner->second != owner_query_id) {
+				throw std::runtime_error("FTE query result owner changed while active: query=" + query_id +
+				                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
 			}
 			if (all_result_handle_ingress_closed_ ||
 			    closed_result_handle_queries_.find(query_id) != closed_result_handle_queries_.end() ||
@@ -1095,6 +1094,9 @@ public:
 			    dropping_result_handle_query_owners_.find(owner_query_id) !=
 			        dropping_result_handle_query_owners_.end()) {
 				throw std::runtime_error("cannot register closing FTE query lifecycle: " + query_id);
+			}
+			if (existing_owner != result_handle_owner_by_query_.end()) {
+				return;
 			}
 			if (registering_result_handle_owner_by_query_.find(query_id) !=
 			    registering_result_handle_owner_by_query_.end()) {
@@ -1195,6 +1197,27 @@ public:
 		if (initial_cleanup_error) {
 			final_cleanup_error = clear_handles("cleanup retry");
 		}
+		std::vector<string> owner_cleanup_errors;
+		if (!backend_shutdown_error && !final_cleanup_error) {
+			std::unordered_set<string> owner_query_ids;
+			{
+				lock_guard<mutex> guard(mutex_);
+				for (const auto &entry : result_handle_owner_by_query_) {
+					owner_query_ids.insert(entry.second);
+				}
+			}
+			std::vector<string> ordered_owner_query_ids(owner_query_ids.begin(), owner_query_ids.end());
+			std::sort(ordered_owner_query_ids.begin(), ordered_owner_query_ids.end());
+			for (const auto &owner_query_id : ordered_owner_query_ids) {
+				try {
+					query_cleanup_(owner_query_id);
+				} catch (const std::exception &ex) {
+					owner_cleanup_errors.push_back(owner_query_id + ": " + ex.what());
+				} catch (...) {
+					owner_cleanup_errors.push_back(owner_query_id + ": unknown cleanup error");
+				}
+			}
+		}
 		std::vector<string> errors;
 		if (backend_shutdown_error) {
 			errors.push_back(*backend_shutdown_error);
@@ -1202,6 +1225,9 @@ public:
 		if (initial_cleanup_error && final_cleanup_error) {
 			errors.push_back(*initial_cleanup_error);
 			errors.push_back(*final_cleanup_error);
+		}
+		for (const auto &owner_cleanup_error : owner_cleanup_errors) {
+			errors.push_back("query owner cleanup: " + owner_cleanup_error);
 		}
 		if (!errors.empty()) {
 			string message = "Python backend shutdown failed";
@@ -1461,20 +1487,12 @@ public:
 			try {
 				auto backend = backend_.get();
 				std::vector<std::pair<string, std::exception_ptr>> backend_drop_errors;
-				if (py::hasattr(backend, "drop_query_owner")) {
+				auto drop_query = backend.attr("drop_query");
+				for (const auto &execution_query_id : backend_drop_query_ids) {
 					try {
-						backend.attr("drop_query_owner")(owner_query_id);
+						drop_query(execution_query_id);
 					} catch (...) {
-						backend_drop_errors.emplace_back(owner_query_id, std::current_exception());
-					}
-				} else {
-					auto drop_query = backend.attr("drop_query");
-					for (const auto &execution_query_id : backend_drop_query_ids) {
-						try {
-							drop_query(execution_query_id);
-						} catch (...) {
-							backend_drop_errors.emplace_back(execution_query_id, std::current_exception());
-						}
+						backend_drop_errors.emplace_back(execution_query_id, std::current_exception());
 					}
 				}
 				if (backend_drop_errors.size() == 1) {
@@ -1501,6 +1519,7 @@ public:
 		}
 		std::exception_ptr initial_cleanup_error;
 		std::exception_ptr final_cleanup_error;
+		std::exception_ptr owner_cleanup_error;
 		if (!backend_drop_error) {
 			WaitForResultHandleOperations(owner_query_id);
 			submission_errors_.Discard(owner_query_id);
@@ -1518,6 +1537,13 @@ public:
 			}
 		}
 		if (!backend_drop_error && !final_cleanup_error) {
+			try {
+				query_cleanup_(owner_query_id);
+			} catch (...) {
+				owner_cleanup_error = std::current_exception();
+			}
+		}
+		if (!backend_drop_error && !final_cleanup_error && !owner_cleanup_error) {
 			FinishResultHandleIngress(owner_query_id, drop_token);
 			return;
 		}
@@ -1530,6 +1556,9 @@ public:
 		}
 		if (final_cleanup_error) {
 			errors.emplace_back("final result cleanup", final_cleanup_error);
+		}
+		if (owner_cleanup_error) {
+			errors.emplace_back("query owner cleanup", owner_cleanup_error);
 		}
 		if (errors.size() == 1) {
 			std::rethrow_exception(errors.front().second);
@@ -1602,6 +1631,7 @@ private:
 	mutable mutex mutex_;
 	std::condition_variable result_handle_condition_;
 	duckdb::distributed::python::ray::SafePyObject backend_;
+	QueryCleanup query_cleanup_;
 	duckdb::distributed::python::ray::PythonExceptionStore submission_errors_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
 	    result_handles_by_query_;
@@ -1795,7 +1825,13 @@ private:
 			}
 		}
 		if (all_result_handle_ingress_closed_) {
-			return std::nullopt;
+			while (result_handle_shutdown_running_) {
+				result_handle_condition_.wait(guard);
+			}
+			if (result_handle_shutdown_finished_) {
+				return std::nullopt;
+			}
+			throw std::runtime_error("cannot drop FTE query after Python backend shutdown failed: " + query_id);
 		}
 		closed_result_handle_queries_.insert(query_id);
 		closed_result_handle_query_owners_.insert(owner_query_id);
@@ -2371,6 +2407,19 @@ private:
 	}
 };
 
+static void CleanupQueryOwnedPythonState(const string &query_id) {
+	std::exception_ptr datasource_cleanup_error;
+	try {
+		ReleaseDataSourceFactoriesForQuery(query_id);
+	} catch (...) {
+		datasource_cleanup_error = std::current_exception();
+	}
+	CleanupQueryPythonReplayState(query_id);
+	if (datasource_cleanup_error) {
+		std::rethrow_exception(datasource_cleanup_error);
+	}
+}
+
 struct PyPhysicalPlanWrapperRunner {
 	std::shared_ptr<duckdb::distributed::WorkerManager> worker_manager_;
 	std::shared_ptr<duckdb::distributed::python::ray::RayWorkerManager> ray_worker_manager_;
@@ -2393,7 +2442,8 @@ struct PyPhysicalPlanWrapperRunner {
 			worker_manager_ = ray_worker_manager_;
 			return;
 		}
-		py_backend_worker_manager_ = std::make_shared<PyBackendWorkerManager>(std::move(backend));
+		py_backend_worker_manager_ =
+		    std::make_shared<PyBackendWorkerManager>(std::move(backend), CleanupQueryOwnedPythonState);
 		worker_manager_ = py_backend_worker_manager_;
 	}
 
@@ -2417,15 +2467,23 @@ struct PyPhysicalPlanWrapperRunner {
 		} catch (...) {
 			teardown_error = std::current_exception();
 		}
-		try {
-			ReleaseDataSourceFactoriesForQuery(query_id);
-		} catch (...) {
-			if (!teardown_error) {
-				teardown_error = std::current_exception();
+		if (!teardown_error && ray_worker_manager_) {
+			// Teardown completed (active result-handle operations were drained by the
+			// backend), so it is safe to release the cached datasource factories and
+			// Python replay state for this query.
+			try {
+				CleanupQueryOwnedPythonState(query_id);
+			} catch (...) {
+				if (!teardown_error) {
+					teardown_error = std::current_exception();
+				}
 			}
 		}
-		CleanupQueryPythonReplayState(query_id);
 		if (teardown_error) {
+			// Teardown failed before draining active operations. Keep the outer
+			// datasource factories and Python replay state attached to this query so
+			// that any still-running submit can keep using them; a successful retry or
+			// shutdown will release them once in-flight work has quiesced.
 			std::rethrow_exception(teardown_error);
 		}
 	}
