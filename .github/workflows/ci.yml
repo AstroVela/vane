@@ -166,9 +166,9 @@ jobs:
             "pydantic>=2" \
             pytest
 
-      - name: Build and run native distributed tests
+      - name: Build and run DuckDB unit tests
         if: matrix.python-version == '3.12'
-        run: scripts/run_native_tests.sh "[distributed]"
+        run: scripts/run_native_tests.sh
 
       - name: Build release artifacts
         env:

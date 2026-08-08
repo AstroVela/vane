@@ -89,6 +89,8 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"max_expression_depth", {50}},
 	    {"max_memory", {"4.0 GiB"}},
 	    {"max_temp_directory_size", {"10.0 GiB"}},
+	    {"local_exchange_buffer_bytes", {"64.0 MiB"}},
+	    {"local_exchange_streaming", {false}},
 	    {"merge_join_threshold", {73}},
 	    {"nested_loop_join_threshold", {73}},
 	    {"memory_limit", {"4.0 GiB"}},

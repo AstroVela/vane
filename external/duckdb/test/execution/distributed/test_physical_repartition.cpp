@@ -23,5 +23,7 @@ TEST_CASE("PhysicalRepartition: basic construction", "[execution]") {
 	REQUIRE(rep_ptr != nullptr);
 
 	REQUIRE(rep_ptr->repartition_spec != nullptr);
-	REQUIRE(rep_ptr->ParamsToString().contains("__repartition_spec__"));
+	auto params = rep_ptr->ParamsToString();
+	REQUIRE(params.at("repartition_type") == "Random");
+	REQUIRE(params.at("lazy_ref_local_exchange") == "whole_block");
 }

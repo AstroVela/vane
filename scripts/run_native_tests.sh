@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
   echo "Usage: scripts/run_native_tests.sh [unittest arguments...]"
   echo
-  echo "Build Vane's Arrow/Flight native tests with pinned dependencies and C++20."
+  echo "Build and run Vane's complete DuckDB unit test suite with pinned Arrow/Flight dependencies and C++20."
 }
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -78,7 +78,12 @@ cmake --fresh \
   -B "$build_dir" \
   -G "$generator" \
   "${cmake_args[@]}"
-cmake --build "$build_dir" --target unittest --parallel "$build_jobs"
+cmake --build "$build_dir" \
+  --target \
+  unittest \
+  loadable_extension_demo_loadable_extension \
+  loadable_extension_optimizer_demo_loadable_extension \
+  --parallel "$build_jobs"
 
 test_binary="$build_dir/test/unittest"
 if [[ ! -x "$test_binary" ]]; then
