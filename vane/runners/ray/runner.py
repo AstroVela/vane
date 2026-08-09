@@ -19,7 +19,7 @@ from vane.runners.runner import Runner
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     import vane
 

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 class UDFExecutor(ABC):

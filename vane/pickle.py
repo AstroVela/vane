@@ -3,6 +3,6 @@
 
 from __future__ import annotations
 
-from cloudpickle import dumps, loads
+from cloudpickle import dumps, loads  # type: ignore[import-untyped, unused-ignore]
 
 __all__ = ["dumps", "loads"]

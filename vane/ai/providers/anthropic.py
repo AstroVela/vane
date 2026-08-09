@@ -191,7 +191,7 @@ class AnthropicPrompter:
         return_raw_response: bool = False,
         provider_name: str = "anthropic",
     ) -> None:
-        from anthropic import AsyncAnthropic
+        from anthropic import AsyncAnthropic  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name

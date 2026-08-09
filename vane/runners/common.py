@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 class QueryDeadlineExceeded(TimeoutError):

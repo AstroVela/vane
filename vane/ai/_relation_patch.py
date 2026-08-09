@@ -29,7 +29,7 @@ from vane.ai.provider import Provider
 from vane.ai.typing import JSONSchema
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
+    from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 else:
     BaseModel = Any
 

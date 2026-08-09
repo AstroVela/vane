@@ -42,7 +42,7 @@ def _unsupported_dtype(dtype: Any) -> vane.InvalidInputException:
 
 
 def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     primitive_types = (
         (pa.types.is_boolean, "BOOLEAN"),

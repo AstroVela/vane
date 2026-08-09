@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 def _arrow_type_from_name(type_name: str) -> pa.DataType:

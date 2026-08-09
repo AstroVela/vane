@@ -32,7 +32,7 @@ from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     from vane import DuckDBPyConnection, DuckDBPyRelation
     from vane.sqltypes import DuckDBPyType

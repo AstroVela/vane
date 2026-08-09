@@ -14,8 +14,11 @@ from __future__ import annotations
 import io
 import typing
 
-from fsspec import AbstractFileSystem
-from fsspec.implementations.memory import MemoryFile, MemoryFileSystem
+from fsspec import AbstractFileSystem  # type: ignore[import-not-found, import-untyped, unused-ignore]
+from fsspec.implementations.memory import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    MemoryFile,
+    MemoryFileSystem,
+)
 
 from .bytes_io_wrapper import BytesIOWrapper
 

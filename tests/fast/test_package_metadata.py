@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import os
 import platform
 import subprocess
@@ -60,12 +61,22 @@ def test_vane_public_exports_are_unique_and_resolvable():
 
 
 def test_vane_adbc_public_exports_are_explicit():
+    pytest.importorskip("adbc_driver_manager")
     import vane.adbc
 
     assert vane.adbc.__all__ == ["StatementOptions", "connect", "driver_path"]
     wildcard_namespace: dict[str, object] = {}
     exec("from vane.adbc import *", wildcard_namespace)
     assert {name for name in wildcard_namespace if name != "__builtins__"} == set(vane.adbc.__all__)
+
+
+def test_vane_lazily_exposes_owned_public_submodules():
+    for name in ("ai", "runners", "sqltypes", "udf"):
+        assert getattr(vane, name) is importlib.import_module(f"vane.{name}")
+        assert name in dir(vane)
+
+    with pytest.raises(AttributeError, match="has no attribute 'not_a_vane_submodule'"):
+        getattr(vane, "not_a_vane_submodule")
 
 
 def test_native_submodules_share_the_public_runtime_identity():

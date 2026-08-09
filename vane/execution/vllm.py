@@ -19,7 +19,7 @@ from decimal import Decimal
 from numbers import Integral, Real
 from typing import Any, Callable, overload
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
@@ -242,7 +242,7 @@ class LocalVLLMExecutor(VLLMExecutor):
         engine_init_timeout_s: float | None = None,
         force_background_thread: bool = False,
     ):
-        from vllm import SamplingParams
+        from vllm import SamplingParams  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         self.model = model
         self.engine_args = dict(engine_args)
@@ -265,7 +265,9 @@ class LocalVLLMExecutor(VLLMExecutor):
             if isinstance(sampling_params, dict):
                 structured_outputs = sampling_params.get("structured_outputs")
                 if isinstance(structured_outputs, Mapping):
-                    from vllm.sampling_params import StructuredOutputsParams
+                    from vllm.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                        StructuredOutputsParams,
+                    )
 
                     sampling_params = dict(sampling_params)
                     sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
@@ -343,7 +345,10 @@ class LocalVLLMExecutor(VLLMExecutor):
         until the engine is fully initialized.
         """
         try:
-            from vllm import AsyncEngineArgs, AsyncLLMEngine
+            from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                AsyncEngineArgs,
+                AsyncLLMEngine,
+            )
 
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
@@ -359,7 +364,10 @@ class LocalVLLMExecutor(VLLMExecutor):
 
     async def _init_engine(self) -> None:
         try:
-            from vllm import AsyncEngineArgs, AsyncLLMEngine
+            from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                AsyncEngineArgs,
+                AsyncLLMEngine,
+            )
 
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)

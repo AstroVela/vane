@@ -31,7 +31,7 @@ See Also:
     - DuckDB Type System: https://vane.org/docs/sql/data_types/overview
 """
 
-from vane import sqltypes
+import vane.sqltypes as sqltypes
 
 
 class DBAPITypeObject:

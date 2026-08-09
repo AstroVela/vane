@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution.ray_stream_adapter import TaskLeaseObjectRefGenerator

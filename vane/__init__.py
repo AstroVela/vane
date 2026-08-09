@@ -12,6 +12,7 @@ Vane owns this package and its native extension.  The separately distributed
 the two distributions do not share Python modules or extension names.
 """
 
+import importlib as _importlib
 import typing as _typing
 
 from vane._dbapi_type_object import (
@@ -27,6 +28,10 @@ from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
 
 if _typing.TYPE_CHECKING:
+    from vane import ai as ai
+    from vane import runners as runners
+    from vane import sqltypes as sqltypes
+    from vane import udf as udf
     from vane.runners.runner import Runner as _Runner
 else:
     _Runner = _typing.Any
@@ -260,6 +265,37 @@ Relation = DuckDBPyRelation
 
 # Install Vane's relation conveniences after the native relation class exists.
 from vane.ai import _relation_patch as _relation_patch
+
+_VANE_SUBMODULES = frozenset(
+    {
+        "adbc",
+        "ai",
+        "datasource",
+        "execution",
+        "experimental",
+        "expressions",
+        "filesystem",
+        "query_graph",
+        "runners",
+        "sqltypes",
+        "udf",
+        "value",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    """Lazily expose Vane-owned public submodules."""
+    if name in _VANE_SUBMODULES:
+        module = _importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _VANE_SUBMODULES)
+
 
 __all__: list[str] = [
     "BINARY",

@@ -26,7 +26,7 @@ import enum
 import functools
 import importlib.util
 
-import adbc_driver_manager
+import adbc_driver_manager  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 __all__ = ["StatementOptions", "connect", "driver_path"]
 

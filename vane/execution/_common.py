@@ -11,7 +11,7 @@ import threading
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 if TYPE_CHECKING:
     from collections.abc import Iterable

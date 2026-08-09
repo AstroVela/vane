@@ -238,7 +238,7 @@ def _build_token_estimator(model: str, *, use_openai_tokenizer: bool) -> _TokenE
     if not use_openai_tokenizer:
         return _TokenEstimator()
 
-    import tiktoken
+    import tiktoken  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     return _TokenEstimator(tiktoken.encoding_for_model(model))
 
@@ -548,7 +548,7 @@ class OpenAITextEmbedder:
         dimensions: int | None = None,
         provider_name: str = "openai",
     ):
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         encoding_format = options.get("encoding_format", "float")
@@ -639,7 +639,7 @@ class OpenAITextEmbedder:
         return embeddings
 
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
-        from openai import OpenAIError
+        from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
         try:
@@ -791,7 +791,7 @@ class OpenAIPrompter:
         provider_name: str = "openai",
         strict_structured_outputs: bool | None = None,
     ) -> None:
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name

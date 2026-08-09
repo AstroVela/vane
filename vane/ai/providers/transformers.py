@@ -144,7 +144,9 @@ class TransformersTextEmbedder:
         provider_name: str = "transformers",
         **model_options: Any,
     ):
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            SentenceTransformer,
+        )
 
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
@@ -175,7 +177,7 @@ class TransformersTextEmbedder:
         self.dimensions = dimensions
 
     def embed_text(self, text: list[str]) -> list[Embedding]:
-        import torch
+        import torch  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
         with torch.inference_mode():

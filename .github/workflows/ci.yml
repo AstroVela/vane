@@ -202,15 +202,22 @@ jobs:
             "$RUNNER_TEMP/"
           cd "$RUNNER_TEMP"
           env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
-            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/installed_mypy.ini" \
             --no-incremental \
             --python-version 3.10 \
             --strict \
-            --follow-imports silent \
-            --ignore-missing-imports \
             --disallow-any-expr \
             native_namespace.py \
             expression_udf_actor_number.py
+
+      - name: Verify the base installation is importable by mypy
+        if: matrix.python-version == '3.10'
+        run: |
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/base_import_mypy.ini" \
+            --no-incremental \
+            -c 'import vane'
 
       - name: Verify the installed AI typing contract
         if: matrix.python-version == '3.10'

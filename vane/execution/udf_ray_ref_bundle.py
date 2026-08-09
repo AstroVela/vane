@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution.udf_output_schema import (

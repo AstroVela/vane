@@ -103,8 +103,11 @@ bool PreparedStatementVerifier::Run(
 		}
 		failed = true;
 	}
+	// Materializing EXECUTE can cancel unfinished executor tasks and leave an internal interrupt behind. Do not let
+	// that cleanup signal interrupt DEALLOCATE and invalidate an explicit user transaction.
+	context.ClearInterrupt();
 	run(string(), std::move(dealloc_statement), parameters);
-	context.interrupted = false;
+	context.ClearInterrupt();
 
 	return failed;
 }

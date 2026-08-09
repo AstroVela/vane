@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 _MISSING_ARG_COUNT = "map_batches_rows requires scalar_arg_count > 0"
 _BAD_OUTPUT_COLUMN_COUNT = "map_batches_rows output must have exactly one column"

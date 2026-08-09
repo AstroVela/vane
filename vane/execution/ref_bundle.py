@@ -17,7 +17,7 @@ from multiprocessing import resource_tracker as _resource_tracker
 from multiprocessing import shared_memory
 from typing import Any, Protocol
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._common import estimate_table_bytes

@@ -18,7 +18,7 @@ from vane.runners.common import PartitionMetadata as PartitionMetadata
 from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 if TYPE_CHECKING:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 class RayMaterializedResult(MaterializedResult):

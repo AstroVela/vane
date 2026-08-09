@@ -24,7 +24,7 @@ from vane.runners.runner import Runner
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 _ARROW_DATASET_PRELOAD_LOCK = threading.Lock()
@@ -45,7 +45,7 @@ def _preload_arrow_dataset_imports() -> None:
         # DuckDB may lazily import pyarrow.dataset while native worker threads
         # are submitting local-shm ref bundles. Do the import once on the caller
         # thread so pyarrow/pandas import locks are not first hit inside execution.
-        import pyarrow.dataset  # noqa: F401
+        import pyarrow.dataset  # type: ignore[import-not-found, import-untyped, unused-ignore]  # noqa: F401
 
         _ARROW_DATASET_PRELOADED = True
 

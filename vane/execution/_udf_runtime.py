@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Iterable
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane import PythonExceptionHandling
 from vane.execution._async_runtime import AsyncRuntime

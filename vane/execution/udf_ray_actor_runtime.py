@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
@@ -144,7 +144,7 @@ def _reconstructed_actor_location_report(
         query_runtime_actor_name(ray_runtime_job_id(runtime_context)),
         namespace=RAY_QUERY_RUNTIME_ACTOR_NAMESPACE,
     )
-    report_ref = driver.report_query_udf_actor_location.remote(
+    report_ref: Any = driver.report_query_udf_actor_location.remote(
         {
             "query_id": values["query_id"],
             "resource_unit_id": values["resource_unit_id"],

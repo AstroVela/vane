@@ -86,6 +86,8 @@ null_handling_members: tuple[_func.FunctionNullHandling, ...] = (
 
 assert_type(public_udf.NATIVE, public_udf.PythonUDFType)
 assert_type(public_sqltypes.INTEGER, public_sqltypes.DuckDBPyType)
+assert_type(vane.runners.get_or_create_runner(), vane.runners.runner.Runner)
+assert_type(vane.sqltypes.FLOAT, public_sqltypes.DuckDBPyType)
 assert_type(_func.NATIVE, _func.PythonUDFType)
 assert_type(_sqltypes.INTEGER, _sqltypes.DuckDBPyType)
 assert_type(_sqltypes.DuckDBPyType("INTEGER", None), _sqltypes.DuckDBPyType)
@@ -95,6 +97,8 @@ public_type: public_sqltypes.DuckDBPyType = private_type
 assert_type(public_type, public_sqltypes.DuckDBPyType)
 
 connection = vane.connect()
+assert_type(connection.sql("SELECT 1").repartition(4, "1"), vane.DuckDBPyRelation)
+assert_type(connection.sql("SELECT 1").repartition("1", num_partitions=4), vane.DuckDBPyRelation)
 assert_type(
     connection.description,
     list[tuple[str, public_sqltypes.DuckDBPyType, None, None, None, None, None]] | None,

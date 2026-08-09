@@ -22,10 +22,10 @@
 
 from typing import Any
 
-import adbc_driver_manager
-import adbc_driver_manager.dbapi
+import adbc_driver_manager  # type: ignore[import-not-found, import-untyped, unused-ignore]
+import adbc_driver_manager.dbapi  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-from vane import adbc
+import vane.adbc as adbc
 
 __all__ = [
     "BINARY",

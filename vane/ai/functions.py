@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard, cast, overload
 
 import numpy as np
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 from typing_extensions import Unpack
 
 import vane
@@ -70,7 +70,7 @@ from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_opti
 from vane.ai.typing import JSONSchema, UDFOptions
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel
+    from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     from vane.ai.protocols import Prompter, TextEmbedder
 else:
@@ -219,7 +219,7 @@ def _is_transient_provider_error(exc: Exception) -> bool:
         # error as the cause.  Avoid importing an optional SDK just to classify
         # it; httpx itself is likewise optional for non-network providers.
         try:
-            import httpx
+            import httpx  # type: ignore[import-not-found, import-untyped, unused-ignore]
         except ImportError:
             pass
         else:
@@ -227,7 +227,7 @@ def _is_transient_provider_error(exc: Exception) -> bool:
                 return True
 
         try:
-            import aiohttp
+            import aiohttp  # type: ignore[import-not-found, import-untyped, unused-ignore]
         except ImportError:
             pass
         else:

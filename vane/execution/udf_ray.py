@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from typing import Any
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
 from vane.execution._common import ensure_table as _ensure_table

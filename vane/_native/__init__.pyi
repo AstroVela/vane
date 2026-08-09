@@ -17,15 +17,15 @@ if typing.TYPE_CHECKING:
     from builtins import list as lst  # needed to avoid mypy error on DuckDBPyRelation.list method shadowing
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
-    import fsspec
+    import fsspec  # type: ignore[import-not-found, import-untyped, unused-ignore]
     import numpy as np
-    import pandas
-    import polars
-    import pyarrow.lib
-    from pydantic import BaseModel as _PydanticModel
+    import pandas  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    import polars  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    import pyarrow.lib  # type: ignore[import-untyped, unused-ignore]
+    from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-    from vane import sqltypes
-    from vane import udf as func
+    import vane.sqltypes as sqltypes
+    import vane.udf as func
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
@@ -680,10 +680,13 @@ class DuckDBPyRelation:
         projected_columns: str = "",
     ) -> DuckDBPyRelation: ...
     def query(self, virtual_table_name: str, sql_query: str) -> DuckDBPyRelation: ...
+    @typing.overload
     def repartition(
-        self,
-        *partition_by: Expression | str | typing.SupportsInt,
-        num_partitions: typing.SupportsInt | None = None,
+        self, num_partitions: typing.SupportsInt, /, *partition_by: Expression | str
+    ) -> DuckDBPyRelation: ...
+    @typing.overload
+    def repartition(
+        self, *partition_by: Expression | str, num_partitions: typing.SupportsInt | None = None
     ) -> DuckDBPyRelation: ...
     def rank(self, window_spec: str, projected_columns: str = "") -> DuckDBPyRelation: ...
     def rank_dense(self, window_spec: str, projected_columns: str = "") -> DuckDBPyRelation: ...
