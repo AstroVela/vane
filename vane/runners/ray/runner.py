@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
-
 from vane.runners.ray.admission_ledger import BoundedReplayMap
 from vane.runners.ray.driver import RayQueryDriverClient
 from vane.runners.runner import Runner

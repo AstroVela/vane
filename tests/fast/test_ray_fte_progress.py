@@ -8,17 +8,19 @@ import io
 import pytest
 
 import vane
-import vane.runners.progress as shared_progress_mod
 import vane.runners.progress as progress_mod
+import vane.runners.progress as shared_progress_mod
 from vane.runners.fte import FteTaskExecution
 from vane.runners.progress import (
     LocalProgressSnapshotStore,
+    ProgressRenderer,
     _format_bytes,
     _format_count,
     build_local_progress_snapshot,
+    build_progress_snapshot,
+    format_progress_snapshot,
     progress_enabled,
 )
-from vane.runners.progress import ProgressRenderer, build_progress_snapshot, format_progress_snapshot
 from vane.runners.ray.query_resource_graph import (
     QueryAllocation,
     QueryResourceGraph,
