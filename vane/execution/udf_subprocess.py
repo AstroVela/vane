@@ -2169,7 +2169,6 @@ class LocalSubprocessActorPool:
         try:
             while True:
                 replacement: tuple[int, int, _SingleSubprocessExecutor] | None = None
-                stateful_loss: tuple[int, _SingleSubprocessExecutor] | None = None
                 with self._cond:
                     scope.raise_if_cancelled("local subprocess actor acquisition")
                     self._raise_if_unavailable_locked()
@@ -2184,30 +2183,13 @@ class LocalSubprocessActorPool:
                             self._active += 1
                             self._active_scopes[worker_idx] = scope
                             return worker_idx, worker_generation, worker
-                        if self.payload.get("stateful"):
-                            stateful_loss = (worker_idx, worker)
-                        elif worker_idx not in self._replacing_workers:
+                        if worker_idx not in self._replacing_workers:
                             self._replacing_workers.add(worker_idx)
                             replacement = (worker_idx, worker_generation, worker)
                         break
-                    if replacement is None and stateful_loss is None:
+                    if replacement is None:
                         self._cond.wait()
                         continue
-                if stateful_loss is not None:
-                    worker_idx, worker = stateful_loss
-                    worker_pid = getattr(getattr(worker, "_proc", None), "pid", None)
-                    udf_name = str(self.payload.get("udf_name") or "udf")
-                    actor_id = "unknown" if worker_pid is None else str(worker_pid)
-                    terminal_error = RuntimeError(
-                        f"stateful UDF {udf_name!r} lost local actor pid {actor_id}; "
-                        "state was not recoverable; side effects may already have occurred"
-                    )
-                    self._set_terminal_error(terminal_error)
-                    try:
-                        worker.close(kill=True)
-                    except BaseException as exc:
-                        self._record_replacement_cleanup_error(worker_idx, "lost stateful worker", exc)
-                    raise RuntimeError(f"local subprocess actor pool failed: {terminal_error}") from terminal_error
                 assert replacement is not None
                 self._replace_worker(*replacement)
         finally:
@@ -2238,7 +2220,6 @@ class LocalSubprocessActorPool:
         worker_pid = None
         reusable = False
         replace_worker = False
-        terminal_error: BaseException | None = None
         result: Any | None = None
         result_ready = False
         try:
@@ -2255,15 +2236,6 @@ class LocalSubprocessActorPool:
             scope.raise_if_cancelled("local subprocess actor task")
             result = worker._run_in_execution_scope(scope, fn)
             result_ready = True
-        except BaseException as exc:
-            if self.payload.get("stateful") and worker is not None and getattr(worker, "_actor_lost", False):
-                udf_name = str(self.payload.get("udf_name") or "udf")
-                actor_id = "unknown" if worker_pid is None else str(worker_pid)
-                raise RuntimeError(
-                    f"stateful UDF {udf_name!r} lost local actor pid {actor_id}; "
-                    "state was not recoverable; side effects may already have occurred"
-                ) from exc
-            raise
         finally:
             scope.finish()
             try:
@@ -2279,20 +2251,11 @@ class LocalSubprocessActorPool:
                         active_after = self._active
                         if not self._closed and reusable and not abort_requested:
                             self._idle_workers.append((worker_idx, worker_generation))
-                        elif not self._closed and self.payload.get("stateful"):
-                            udf_name = str(self.payload.get("udf_name") or "udf")
-                            actor_id = "unknown" if worker_pid is None else str(worker_pid)
-                            terminal_error = RuntimeError(
-                                f"stateful UDF {udf_name!r} lost local actor pid {actor_id}; "
-                                "state was not recoverable; side effects may already have occurred"
-                            )
                         elif not self._closed and worker_idx not in self._replacing_workers:
                             self._replacing_workers.add(worker_idx)
                             replace_worker = True
                         self._cond.notify_all()
-                    if terminal_error is not None:
-                        self._set_terminal_error(terminal_error)
-                    elif replace_worker:
+                    if replace_worker:
                         self._replace_worker(worker_idx, worker_generation, worker)
                 if _should_debug_submit(debug_seq):
                     _subprocess_debug_log(
@@ -2465,16 +2428,6 @@ def _local_actor_pool_size_from_pool(actor_pool: Any) -> int:
     return pool_size
 
 
-def _validate_stateful_local_actor_contract(payload: dict[str, Any], pool_size: int) -> None:
-    if not payload.get("stateful"):
-        return
-    actor_number = payload.get("actor_number")
-    if type(actor_number) is not int or actor_number != 1 or pool_size != 1:
-        raise ValueError(
-            "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined"
-        )
-
-
 _LOCAL_ACTOR_POOL_CONTRACT_ERROR = (
     "local_actor_pool must expose submit(), create_admission_authority(), pool_size, stats(), "
     "cancel_output_grants(), abort_scopes(), first_proc(), and worker_pids()"
@@ -2538,7 +2491,6 @@ def ensure_local_subprocess_actor_pools_for_nodes(
 
             node_id = str(node.get("node_id"))
             pool_size = _local_actor_pool_size_from_node(node, raw_payload)
-            _validate_stateful_local_actor_contract(raw_payload, pool_size)
             if float(raw_payload.get("gpus") or 0.0) > 0.0:
                 raise ValueError("GPU resources require a Ray UDF backend")
             executor_options = dict(node.get("executor_options") or {})
@@ -2590,10 +2542,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         session_config = _normalize_session_config_option(options)
         self._subprocess_mode = _payload_subprocess_mode(payload)
         self._pool_size = _payload_subprocess_pool_size(payload, self._subprocess_mode)
-        if payload.get("stateful"):
-            if self._subprocess_mode != "actor":
-                raise ValueError("stateful expression UDFs require an actor execution backend")
-            _validate_stateful_local_actor_contract(payload, self._pool_size)
         _subprocess_debug_log(
             "executor_init "
             f"mode={self._subprocess_mode} backend={payload.get('execution_backend')!r} "
@@ -2669,7 +2617,6 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     "call ensure_local_subprocess_actor_pools_for_plan before execution"
                 )
             actor_pool_size = _validate_local_actor_pool_contract(actor_pool)
-            _validate_stateful_local_actor_contract(payload, actor_pool_size)
             if getattr(actor_pool, "session_config", None) != session_config:
                 raise ValueError("local_actor_pool belongs to a different Vane session")
             worker_pids = actor_pool.worker_pids()

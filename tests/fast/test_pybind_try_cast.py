@@ -43,6 +43,7 @@ def test_read_csv_rejects_null_type_holder(duckdb_cursor, dtype):
         duckdb_cursor.read_csv(csv_path, dtype=dtype)
 
 
+@pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
 def test_none_parameter_annotation_uses_explicit_udf_type(duckdb_cursor):
     def add_one(value: None):
         return value + 1

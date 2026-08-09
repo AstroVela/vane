@@ -220,9 +220,9 @@ static Value BuildAISQLPayload(ClientContext &context, const py::dict &spec) {
 	auto return_type = py::cast<string>(spec[py::str("return_type")]);
 
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
-	auto payload = BuildExpressionMapBatchesUDFPayload(name, udf, schema, "subprocess_actor", default_parallelism,
-	                                                   input_names, batch_size, /*row_preserving=*/true, gpus,
-	                                                   actor_number, /*stateful=*/false, py::none());
+	auto payload =
+	    BuildExpressionMapBatchesUDFPayload(name, udf, schema, "subprocess_actor", default_parallelism, input_names,
+	                                        batch_size, /*row_preserving=*/true, gpus, actor_number, py::none());
 	return AddAISQLPayloadMetadata(payload, provider, model, return_type, dimensions);
 }
 

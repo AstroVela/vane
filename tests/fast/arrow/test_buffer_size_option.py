@@ -36,6 +36,7 @@ class TestArrowBufferSize:
         res = con.query("select 'bla'").to_arrow_reader()
         assert res.schema[0].type == pa.string()
 
+    @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
     def test_arrow_buffer_size_udf(self):
         def just_return(x):
             return x

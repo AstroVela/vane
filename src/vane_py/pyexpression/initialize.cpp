@@ -47,8 +47,7 @@ void InitializeStaticMethods(py::module_ &m) {
 	m.def("_VaneUDFMapBatchesExpression", &DuckDBPyExpression::UDFMapBatchesExpression, py::arg("function"),
 	      py::arg("name"), py::arg("schema"), py::arg("execution_backend"), py::arg("input_names"),
 	      py::arg("batch_size") = py::none(), py::arg("row_preserving") = false, py::arg("gpus") = py::none(),
-	      py::arg("actor_number") = py::none(), py::arg("stateful") = false, py::arg("expression_id") = py::none(),
-	      docs);
+	      py::arg("actor_number") = py::none(), py::arg("expression_id") = py::none(), docs);
 
 	// Coalesce Operator
 	docs = "";

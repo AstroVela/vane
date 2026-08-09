@@ -407,24 +407,15 @@ def test_replace_rejects_vane_alias_owned_by_another_cursor():
     assert owner.sql("SELECT cursor_owned_sql(1)").fetchall() == [(2,)]
 
 
-def test_replace_rejects_non_vane_python_udf_owned_by_same_connection():
+def test_native_udf_registration_public_apis_are_disabled():
     conn = vane.connect()
-    conn.create_function("ordinary_python_sql", lambda value: value + 1, ["INTEGER"], "INTEGER")
 
-    @vane.func(return_dtype="INTEGER")
-    def add_ten(value):
-        return value + 10
-
-    with pytest.raises(vane.InvalidInputException, match="not a registered Vane SQL alias"):
-        vane.attach_function(
-            add_ten,
-            connection=conn,
-            alias="ordinary_python_sql",
-            parameters=["INTEGER"],
-            replace=True,
-        )
-
-    assert conn.sql("SELECT ordinary_python_sql(1)").fetchall() == [(2,)]
+    assert "create_function" not in vane.__all__
+    assert not hasattr(vane, "create_function")
+    assert not hasattr(conn, "create_function")
+    assert "create_table_function" not in vane.__all__
+    assert not hasattr(vane, "create_table_function")
+    assert not hasattr(conn, "create_table_function")
 
 
 def test_attach_function_replace_tolerates_missing_alias():

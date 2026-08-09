@@ -4207,7 +4207,7 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     failed_worker = FakeWorker("failed")
     replacement = FakeWorker("replacement")
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": False}
+    pool.payload = {}
     pool.pool_size = 1
     pool.name = "replacement-shutdown-race"
     pool._closed = False
@@ -4324,7 +4324,7 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
     failed_worker = FailedWorker()
     provisional_worker = ProvisionalWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": False}
+    pool.payload = {}
     pool.pool_size = 1
     pool.name = "provisional-replacement-shutdown"
     pool._closed = False
@@ -4396,7 +4396,7 @@ def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(mon
             pass
 
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": False}
+    pool.payload = {}
     pool.pool_size = 1
     pool.name = "unpublished-replacement-shutdown"
     pool._closed = False
@@ -4458,7 +4458,7 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
 
     workers = [FakeWorker("w0"), FakeWorker("w1")]
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": False}
+    pool.payload = {}
     pool.pool_size = 2
     pool.name = "abort-cleanup-failure"
     pool._closed = False
@@ -4496,170 +4496,32 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
     assert pool._shutdown_finished
 
 
-def test_local_subprocess_actor_abort_fences_generation_from_idle_reuse():
+def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
     import vane.execution.udf_subprocess as subprocess_exec
     from vane.execution.udf_lifecycle import ExecutionCancellationScope
-
-    task_started = threading.Event()
-    finish_task = threading.Event()
-    close_started = threading.Event()
-    allow_close = threading.Event()
 
     class FakeWorker:
-        def __init__(self):
-            self._closed = False
-            self._proc = types.SimpleNamespace(pid=4242)
+        def __init__(self, name, *, reusable):
+            self.name = name
+            self.reusable = reusable
+            self.close_calls = []
+            self._proc = types.SimpleNamespace(pid=4242 if name == "lost" else 4343)
 
         def is_reusable(self):
-            return not self._closed
+            return self.reusable
 
         def _run_in_execution_scope(self, _scope, fn):
             return fn(self)
-
-        def close(self, *, kill=False):
-            assert kill
-            close_started.set()
-            assert allow_close.wait(timeout=5.0)
-            self._closed = True
-
-    class FakeAdmissionSlots:
-        def __init__(self):
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-
-    worker = FakeWorker()
-    scope = ExecutionCancellationScope("executor-a", 1)
-    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": True, "udf_name": "stateful_abort_race"}
-    pool.pool_size = 1
-    pool.name = "abort-reuse-race"
-    pool._closed = False
-    pool._lock = threading.RLock()
-    pool._cond = threading.Condition(pool._lock)
-    pool._active = 0
-    pool._terminal_error = None
-    pool._active_scopes = {}
-    pool._worker_generations = [0]
-    pool._replacing_workers = set()
-    pool._aborting_workers = set()
-    pool._idle_workers = deque([(0, 0)])
-    pool._workers = [worker]
-    pool.admission_slots = FakeAdmissionSlots()
-
-    def run_task(_worker):
-        task_started.set()
-        assert finish_task.wait(timeout=5.0)
-
-    run_thread = threading.Thread(target=lambda: pool._run(run_task, scope), daemon=True)
-    run_thread.start()
-    assert task_started.wait(timeout=5.0)
-
-    abort_thread = threading.Thread(target=lambda: pool.abort_scopes({scope}), daemon=True)
-    abort_thread.start()
-    assert close_started.wait(timeout=5.0)
-    finish_task.set()
-    with pool._cond:
-        assert pool._cond.wait_for(lambda: pool._active == 0, timeout=5.0)
-        assert not pool._idle_workers
-        assert pool._terminal_error is not None
-
-    allow_close.set()
-    run_thread.join(timeout=5.0)
-    abort_thread.join(timeout=5.0)
-    assert not run_thread.is_alive()
-    assert not abort_thread.is_alive()
-    assert pool.admission_slots.closed
-    pool._closed = True
-
-
-def test_stateful_actor_preserves_structured_udf_error_before_terminal_failure():
-    import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution.udf_lifecycle import ExecutionCancellationScope
-
-    class FailedWorker:
-        def __init__(self):
-            self._actor_lost = False
-            self._proc = types.SimpleNamespace(pid=4242)
-            self.failed = False
-
-        def is_reusable(self):
-            return not self.failed
-
-        def _run_in_execution_scope(self, _scope, fn):
-            return fn(self)
-
-    class FakeAdmissionSlots:
-        def __init__(self):
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-
-    worker = FailedWorker()
-    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": True, "udf_name": "stateful_structured_error"}
-    pool.pool_size = 1
-    pool.name = "stateful-structured-error"
-    pool._closed = False
-    pool._lock = threading.RLock()
-    pool._cond = threading.Condition(pool._lock)
-    pool._active = 0
-    pool._terminal_error = None
-    pool._active_scopes = {}
-    pool._worker_generations = [0]
-    pool._replacing_workers = set()
-    pool._aborting_workers = set()
-    pool._idle_workers = deque([(0, 0)])
-    pool._workers = [worker]
-    pool.admission_slots = FakeAdmissionSlots()
-
-    def fail_with_structured_udf_error(_worker):
-        worker.failed = True
-        raise ValueError("TIMESTAMP is timezone-naive")
-
-    with pytest.raises(ValueError, match="TIMESTAMP is timezone-naive"):
-        pool._run(
-            fail_with_structured_udf_error,
-            ExecutionCancellationScope("test-executor", 1),
-        )
-
-    assert pool._terminal_error is not None
-    assert "state was not recoverable" in str(pool._terminal_error)
-    assert pool.admission_slots.closed
-    pool._closed = True
-
-
-def test_stateful_actor_idle_loss_fails_pool_without_replacement():
-    import vane.execution.udf_subprocess as subprocess_exec
-    from vane.execution.udf_lifecycle import ExecutionCancellationScope
-
-    replacement_attempted = False
-
-    class LostWorker:
-        def __init__(self):
-            self._proc = types.SimpleNamespace(pid=4242)
-            self.close_calls: list[bool] = []
-
-        def is_reusable(self):
-            return False
 
         def close(self, *, kill=False):
             self.close_calls.append(bool(kill))
 
-    class FakeAdmissionSlots:
-        def __init__(self):
-            self.closed = False
-
-        def close(self):
-            self.closed = True
-
-    worker = LostWorker()
+    lost_worker = FakeWorker("lost", reusable=True)
+    replacement = FakeWorker("replacement", reusable=True)
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": True, "udf_name": "stateful_idle_loss"}
+    pool.payload = {"udf_name": "reconstructible_local_actor"}
     pool.pool_size = 1
-    pool.name = "stateful-idle-loss"
+    pool.name = "reconstructible-local-actor"
     pool._closed = False
     pool._lock = threading.RLock()
     pool._cond = threading.Condition(pool._lock)
@@ -4668,35 +4530,32 @@ def test_stateful_actor_idle_loss_fails_pool_without_replacement():
     pool._active_scopes = {}
     pool._worker_generations = [0]
     pool._replacing_workers = set()
+    pool._replacing_executors = {}
     pool._replacement_cleanup_errors = []
     pool._aborting_workers = set()
     pool._idle_workers = deque([(0, 0)])
-    pool._workers = [worker]
-    pool.admission_slots = FakeAdmissionSlots()
+    pool._workers = [lost_worker]
+    pool._spawn_worker = lambda worker_idx: replacement
 
-    def fail_if_replaced(_worker_idx):
-        nonlocal replacement_attempted
-        replacement_attempted = True
-        raise AssertionError("stateful actor must not be replaced after losing state")
+    def lose_actor(worker):
+        worker.reusable = False
+        raise RuntimeError("planned actor loss")
 
-    pool._spawn_worker = fail_if_replaced
-    scope = ExecutionCancellationScope("test-executor", 1)
+    first_scope = ExecutionCancellationScope("test-executor", 1)
+    with pytest.raises(RuntimeError, match="planned actor loss"):
+        pool._run(lose_actor, first_scope)
 
-    with pytest.raises(
-        RuntimeError,
-        match="stateful UDF 'stateful_idle_loss' lost local actor pid 4242",
-    ):
-        pool._run(lambda _worker: None, scope)
+    assert first_scope.finished
+    assert lost_worker.close_calls == [True]
+    assert pool._workers == [replacement]
+    assert pool._worker_generations == [1]
+    assert list(pool._idle_workers) == [(0, 1)]
+    assert pool._terminal_error is None
 
-    assert not replacement_attempted
-    assert worker.close_calls == [True]
-    assert pool._terminal_error is not None
-    assert "state was not recoverable" in str(pool._terminal_error)
-    assert pool.admission_slots.closed
-    assert pool._replacing_workers == set()
-    assert not pool._idle_workers
-    assert scope.finished
-    pool._closed = True
+    second_scope = ExecutionCancellationScope("test-executor", 2)
+    assert pool._run(lambda worker: worker.name, second_scope) == "replacement"
+    assert second_scope.finished
+    assert list(pool._idle_workers) == [(0, 1)]
 
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_failure(monkeypatch):
@@ -5803,7 +5662,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 
     worker = FakeWorker()
     pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
-    pool.payload = {"stateful": False}
+    pool.payload = {}
     pool.pool_size = 1
     pool.name = "post-call-cancel"
     pool._closed = True
@@ -8841,13 +8700,13 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
                     ref.release()
 
 
-def test_subprocess_stateful_actor_destructor_finishes_before_graceful_close_ack(monkeypatch, tmp_path):
+def test_subprocess_actor_destructor_finishes_before_graceful_close_ack(monkeypatch, tmp_path):
     import vane.execution.udf_subprocess as subprocess_exec
 
-    marker_path = tmp_path / "stateful-cleanup.txt"
-    monkeypatch.setenv("VANE_TEST_STATEFUL_CLEANUP_MARKER", str(marker_path))
+    marker_path = tmp_path / "actor-cleanup.txt"
+    monkeypatch.setenv("VANE_TEST_ACTOR_CLEANUP_MARKER", str(marker_path))
 
-    class StatefulCleanup:
+    class ActorCleanup:
         def __call__(self, table):
             return table
 
@@ -8857,18 +8716,17 @@ def test_subprocess_stateful_actor_destructor_finishes_before_graceful_close_ack
             from pathlib import Path
 
             time.sleep(0.05)
-            Path(os.environ["VANE_TEST_STATEFUL_CLEANUP_MARKER"]).write_text("cleaned")
+            Path(os.environ["VANE_TEST_ACTOR_CLEANUP_MARKER"]).write_text("cleaned")
 
     pool = subprocess_exec.LocalSubprocessActorPool(
         _subprocess_map_payload(
-            StatefulCleanup,
+            ActorCleanup,
             execution_backend="subprocess_actor",
             actor_number=1,
-            stateful=True,
-            udf_name="stateful_cleanup",
+            udf_name="actor_cleanup",
         ),
         1,
-        name="stateful-cleanup-test",
+        name="actor-cleanup-test",
     )
     try:
         pool.shutdown(kill=False)

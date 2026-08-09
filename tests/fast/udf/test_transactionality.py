@@ -8,6 +8,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
+
 
 class TestUDFTransactionality:
     @pytest.mark.xfail(reason="fetchone() does not realize the stream result was closed before completion")

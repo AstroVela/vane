@@ -2692,16 +2692,11 @@ private:
 		if (!udf_stream_result_collector) {
 			throw InvalidInputException("udf stream result collector is unavailable");
 		}
-		py::object error_context = py::none();
-		if (py::hasattr(slot.py_executor->obj, "error_context")) {
-			error_context = slot.py_executor->obj.attr("error_context")();
-		}
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			DiscardSubmittedPythonRef_WithGIL(slot, ref);
 			return;
 		}
-		udf_stream_result_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref,
-		                                                             error_context);
+		udf_stream_result_collector->obj.attr("track_generator_ref")(py::int_(slot.id), py::int_(submit_id), ref);
 		if (!IsActiveSlotGeneration(slot, generation)) {
 			return;
 		}

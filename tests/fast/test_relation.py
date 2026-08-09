@@ -497,6 +497,7 @@ class TestRelation:
             # invalid conversion of negative integer to UINTEGER
             rel.project("CAST(a as UINTEGER)").fetchnumpy()
 
+    @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
     def test_close(self):
         def counter() -> int:
             counter.count += 1

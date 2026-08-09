@@ -325,8 +325,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 		                           actor_number, ray_actor_thread_policy, target_max_batch_bytes, task_input_max_bytes,
 		                           output_target_max_bytes);
 	    },
-	    "Apply a Python function to batches of rows and return the resulting relation", py::arg("function"),
-	    py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
+	    "Apply a Python function or callable class to batches of rows. Callable classes use Actor backends: "
+	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
+	    "failures may reconstruct an Actor and replay a call. Exactly-once execution is not provided; external "
+	    "effects must be idempotent.",
+	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
 	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
 	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),
 	    py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(), py::arg("execution_backend") = py::none(),
@@ -348,7 +351,10 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 		                        preserve_compute_batch_boundaries, cpus, gpus, memory_bytes, execution_backend,
 		                        actor_number, target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes);
 	    },
-	    "Apply a Python function per-row that yields multiple output rows (flat_map / one-to-many)",
+	    "Apply a Python function or callable class as a one-to-many transform. Callable classes use Actor backends: "
+	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
+	    "failures may reconstruct an Actor and replay a call. Exactly-once execution is not provided; external "
+	    "effects must be idempotent.",
 	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
 	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
 	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),
@@ -422,7 +428,10 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    .def("map", &DuckDBPyRelation::Map, py::arg("map_function"), py::kw_only(), py::arg("return_type").none(false),
 	         py::arg("batch_size") = py::none(), py::arg("cpus") = py::none(), py::arg("gpus") = py::none(),
 	         py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
-	         py::arg("side_effects") = false, "Apply a row-wise scalar Python UDF through the unified UDF executor")
+	         "Apply a row-wise scalar Python UDF through the unified UDF executor. Callable classes use Actor "
+	         "backends: actor_number creates independent ephemeral instances, work has no Actor affinity or global "
+	         "ordering, and failures may reconstruct an Actor and replay a call. Exactly-once execution is not "
+	         "provided; external effects must be idempotent.")
 	    .def("show", &DuckDBPyRelation::Print, "Display a summary of the data", py::kw_only(),
 	         py::arg("max_width") = py::none(), py::arg("max_rows") = py::none(), py::arg("max_col_width") = py::none(),
 	         py::arg("null_value") = py::none(), py::arg("render_mode") = py::none())

@@ -219,19 +219,6 @@ def _has_expression(values: Any) -> bool:
     return any(is_expression(value) for value in values)
 
 
-def _validate_actor_number(actor_number: Any) -> int:
-    if isinstance(actor_number, bool):
-        raise _invalid_input(
-            "actor_number must be exactly 1 for stateful vane.cls UDFs; bool is not accepted and "
-            "multi-actor state semantics are not defined"
-        )
-    if type(actor_number) is not int or actor_number != 1:
-        raise _invalid_input(
-            "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined"
-        )
-    return int(actor_number)
-
-
 def _validate_positive_actor_number(actor_number: Any) -> int:
     if isinstance(actor_number, bool):
         raise _invalid_input("actor_number must be a positive integer; bool is not accepted")
@@ -760,8 +747,9 @@ class VaneFunction:
     """Synchronous Python function or bound-method scalar UDF wrapper.
 
     When used as an instance-method descriptor, the serialized callable
-    captures that instance's current snapshot. Persistent cross-batch state is
-    intentionally provided only by :func:`vane.cls`.
+    captures that instance's current snapshot. Reusable instance-local state is
+    provided by :func:`vane.cls`; it is neither shared nor durable and may be
+    reset by Actor reconstruction.
     """
 
     def __init__(
@@ -940,11 +928,11 @@ class VaneClass:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
         self._class = class_
-        self._actor_number = _validate_actor_number(actor_number)
+        self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
         self._name = _resolve_udf_name(name, lambda: _class_name(class_))
-        self._gpus = 0 if gpus is None else gpus
+        self._gpus = 0.0 if gpus is None else _normalize_gpus(gpus)
         functools.update_wrapper(self, class_, updated=())
 
     @property
@@ -1048,7 +1036,6 @@ class VaneClassInstance:
             row_preserving=True,
             actor_number=self.actor_number,
             gpus=self.gpus,
-            stateful=True,
         )
 
 
@@ -1086,7 +1073,7 @@ class VaneClassBatch:
             raise _invalid_input(f"batch UDF signatures cannot use *args or **kwargs: {names}")
         self._class = class_
         self._signature = signature
-        self._actor_number = _validate_actor_number(actor_number)
+        self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
         self._return_arrow_dtype = return_arrow_dtype
         self._name = _resolve_udf_name(name, lambda: _class_name(class_))
@@ -1225,7 +1212,6 @@ class VaneClassBatchInstance:
             row_preserving=True,
             actor_number=self.actor_number,
             gpus=self.gpus,
-            stateful=True,
         )
         return _expand_batch_expression(expression, unnest=self.unnest)
 
@@ -1348,7 +1334,6 @@ def _build_map_batches_expression(
     gpus: float | None,
     execution_backend: str | None = None,
     actor_number: int | None = None,
-    stateful: bool = False,
 ) -> vane.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
@@ -1363,7 +1348,6 @@ def _build_map_batches_expression(
         bool(row_preserving),
         gpus,
         actor_number,
-        stateful,
         uuid.uuid4().hex,
         *exprs,
     )
@@ -1379,11 +1363,8 @@ def _build_actor_map_batches_expression(
     row_preserving: bool,
     actor_number: int,
     gpus: float | None,
-    stateful: bool = False,
 ) -> vane.Expression:
-    normalized_actor_number = (
-        _validate_actor_number(actor_number) if stateful else _validate_positive_actor_number(actor_number)
-    )
+    normalized_actor_number = _validate_positive_actor_number(actor_number)
     return _build_map_batches_expression(
         fn,
         name=name,
@@ -1394,7 +1375,6 @@ def _build_actor_map_batches_expression(
         gpus=0 if gpus is None else gpus,
         execution_backend=_runner_to_actor_backend(),
         actor_number=normalized_actor_number,
-        stateful=stateful,
     )
 
 
@@ -1447,6 +1427,16 @@ def _cls(
     name: str | None = None,
     gpus: float | None = 0,
 ) -> VaneClass | Callable[[type], VaneClass]:
+    """Decorate a callable class as an Actor-backed scalar expression UDF.
+
+    ``actor_number`` creates that many independent class instances. Batches
+    are assigned to available Actors without affinity or global ordering, so
+    instance state is local and must not be used as shared query state. An
+    Actor may be reconstructed and an in-flight call may be retried after a
+    failure, which can reset local state or replay user code. External side
+    effects must therefore be idempotent; exactly-once execution is not
+    provided.
+    """
     if class_ is None:
         return lambda actual_class: VaneClass(
             actual_class,
@@ -1455,7 +1445,13 @@ def _cls(
             name=name,
             gpus=gpus,
         )
-    return VaneClass(class_, actor_number=actor_number, return_dtype=return_dtype, name=name, gpus=gpus)
+    return VaneClass(
+        class_,
+        actor_number=actor_number,
+        return_dtype=return_dtype,
+        name=name,
+        gpus=gpus,
+    )
 
 
 def _cls_batch(
@@ -1467,7 +1463,14 @@ def _cls_batch(
     unnest: bool = False,
     gpus: float | None = 0,
 ) -> Callable[[type], VaneClassBatch]:
-    """Decorate a stateful row-preserving Arrow column batch class."""
+    """Decorate an Actor-backed row-preserving Arrow column batch class.
+
+    Each Actor owns an independent class instance. Batches have no Actor
+    affinity or global ordering, and failures may reconstruct an Actor and
+    retry an in-flight call. Instance state is consequently local,
+    reconstructible cache state rather than durable query state; external
+    side effects must be idempotent because execution is not exactly once.
+    """
     return lambda actual_class: VaneClassBatch(
         actual_class,
         actor_number=actor_number,
@@ -1511,7 +1514,6 @@ class _PreparedBatchSQLRegistration:
     batch_size: int | None
     gpus: float | None
     actor_number: int | None
-    stateful: bool
     row_preserving: bool
     replace: bool
 
@@ -1525,7 +1527,6 @@ class _PreparedBatchSQLRegistration:
             batch_size=self.batch_size,
             gpus=self.gpus,
             actor_number=self.actor_number,
-            stateful=self.stateful,
             row_preserving=self.row_preserving,
             replace=self.replace,
         )
@@ -1566,7 +1567,6 @@ def _preflight_vane_class_instance(
         raise _invalid_input("schema is not valid for SQL vane.cls registration; use return_dtype on @vane.cls")
     _reject_attach_override("gpus", gpus, kind="vane.cls", decorator="vane.cls")
     _reject_attach_override("actor_number", actor_number, kind="vane.cls", decorator="vane.cls")
-
     normalized_parameters = _require_sql_type_list(
         parameters,
         "parameters is required for SQL vane.cls registration",
@@ -1588,8 +1588,7 @@ def _preflight_vane_class_instance(
         parameters=normalized_parameters,
         batch_size=_normalize_batch_size(batch_size),
         gpus=_normalize_gpus(fn_or_instance.gpus),
-        actor_number=_validate_actor_number(fn_or_instance.actor_number),
-        stateful=True,
+        actor_number=_validate_positive_actor_number(fn_or_instance.actor_number),
         row_preserving=True,
         replace=replace,
     )
@@ -1653,8 +1652,7 @@ def _preflight_vane_class_batch_instance(
         parameters=normalized_parameters,
         batch_size=fn_or_instance.batch_size,
         gpus=_normalize_gpus(fn_or_instance.gpus),
-        actor_number=_validate_actor_number(fn_or_instance.actor_number),
-        stateful=True,
+        actor_number=_validate_positive_actor_number(fn_or_instance.actor_number),
         row_preserving=True,
         replace=replace,
     )
@@ -1716,7 +1714,6 @@ def _preflight_vane_batch_function(
         batch_size=fn_or_function.batch_size,
         gpus=_normalize_gpus(fn_or_function.gpus),
         actor_number=None,
-        stateful=False,
         row_preserving=True,
         replace=replace,
     )
@@ -1813,7 +1810,6 @@ def _preflight_raw_callable(
             batch_size=_normalize_batch_size(batch_size),
             gpus=_normalize_gpus(gpus),
             actor_number=normalized_actor_number,
-            stateful=False,
             row_preserving=True,
             replace=replace,
         )

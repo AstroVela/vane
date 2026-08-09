@@ -113,13 +113,13 @@ def test_vane_cls_batch_instances_do_not_share_state():
     assert second(pa.array([1])).to_pylist() == [1]
 
 
-@pytest.mark.parametrize("actor_number", [None, 0, 2, True, 1.0, "1"])
-def test_vane_cls_batch_requires_exactly_one_strict_integer_actor(actor_number):
+@pytest.mark.parametrize("actor_number", [None, 0, -1, True, 1.0, "1"])
+def test_vane_cls_batch_requires_positive_strict_integer_actor(actor_number):
     import pyarrow as pa
 
     import vane
 
-    with pytest.raises(vane.InvalidInputException, match="actor_number must be exactly 1"):
+    with pytest.raises(vane.InvalidInputException, match="actor_number must be a positive integer"):
 
         @vane.cls.batch(actor_number=actor_number, return_dtype=pa.int64())
         class Identity:
@@ -205,7 +205,7 @@ def test_vane_cls_batch_struct_unnest_executes_one_actor_udf():
     assert selected.fetchall() == [(0, 0, "value=0"), (1, 1, "value=1")]
 
 
-def test_vane_cls_batch_physical_payload_marks_stateful_side_effects(monkeypatch):
+def test_vane_cls_batch_physical_payload_supports_multiple_independent_actors(monkeypatch):
     import uuid
 
     import pyarrow as pa
@@ -214,7 +214,7 @@ def test_vane_cls_batch_physical_payload_marks_stateful_side_effects(monkeypatch
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
-    @vane.cls.batch(actor_number=1, return_dtype=pa.int32(), batch_size=2, gpus=0)
+    @vane.cls.batch(actor_number=3, return_dtype=pa.int32(), batch_size=2, gpus=0)
     class Identity:
         def __call__(self, values):
             return values
@@ -230,9 +230,9 @@ def test_vane_cls_batch_physical_payload_marks_stateful_side_effects(monkeypatch
     assert len(nodes) == 1
     payload = nodes[0]["payload"]
     assert payload["execution_backend"] == "subprocess_actor"
-    assert payload["actor_number"] == 1
-    assert payload["stateful"] is True
-    assert payload["side_effects"] is True
+    assert payload["actor_number"] == 3
+    assert "stateful" not in payload
+    assert "side_effects" not in payload
     assert payload["row_preserving"] is True
     assert payload["call_mode"] == "map_batches_rows"
     assert payload["expression_id"]

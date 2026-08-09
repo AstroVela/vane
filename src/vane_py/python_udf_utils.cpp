@@ -95,7 +95,7 @@ static std::pair<bool, idx_t> ParseOptionalPositiveIdx(const py::object &value, 
 	if (value.is_none()) {
 		return std::make_pair(false, idx_t(0));
 	}
-	if (py::isinstance<py::bool_>(value)) {
+	if (!PyLong_CheckExact(value.ptr())) {
 		throw InvalidInputException("%s must be a positive integer", label);
 	}
 	auto parsed = py::cast<int64_t>(value);
@@ -198,32 +198,6 @@ static idx_t ResolveActorNumber(const string &backend, const std::pair<bool, idx
 		    "actor_number is only supported for execution_backend='subprocess_actor' or 'ray_actor'");
 	}
 	return idx_t(0);
-}
-
-static void ValidateStatefulActorContract(const string &backend, const Optional<py::object> &actor_number,
-                                          bool stateful) {
-	if (!stateful) {
-		return;
-	}
-	if (!IsActorExecutionBackend(backend)) {
-		throw InvalidInputException("stateful expression UDFs require an actor execution backend");
-	}
-	if (actor_number.is_none() || py::isinstance<py::bool_>(actor_number)) {
-		throw InvalidInputException(
-		    "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined");
-	}
-	auto parsed = ParseOptionalPositiveIdx(actor_number, "actor_number");
-	if (!parsed.first || parsed.second != 1) {
-		throw InvalidInputException(
-		    "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined");
-	}
-}
-
-static void ValidateActorGpusConfigured(const string &backend, const std::pair<bool, double> &gpus_value,
-                                        const char *label) {
-	if (IsActorExecutionBackend(backend) && !gpus_value.first) {
-		throw InvalidInputException("%s is required for execution_backend='%s'", label, backend);
-	}
 }
 
 static Value StringListValue(const vector<string> &strings) {
@@ -358,7 +332,7 @@ Value BuildPythonUDFPayload(
     const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
     const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &actor_number,
     const Optional<py::object> &target_max_batch_bytes, const Optional<py::object> &task_input_max_bytes,
-    const Optional<py::object> &output_target_max_bytes, bool side_effects, bool flat_map) {
+    const Optional<py::object> &output_target_max_bytes, bool flat_map) {
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);
@@ -380,7 +354,6 @@ Value BuildPythonUDFPayload(
 	    execution_backend != "ray_actor") {
 		throw InvalidInputException("GPU resources require a Ray UDF backend");
 	}
-	ValidateActorGpusConfigured(execution_backend, gpus_value, "map_batches(gpus=...)");
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	auto output_batch_size_value = ParseOptionalPositiveIdx(output_batch_size, "output_batch_size");
 	auto min_task_batch_size_value = ParseOptionalPositiveIdx(min_task_batch_size, "min_task_batch_size");
@@ -442,9 +415,6 @@ Value BuildPythonUDFPayload(
 	children.emplace_back("output_schema", BuildOutputSchemaValue(output_names, output_logical_types));
 	children.emplace_back("ref_output_types", LogicalTypeStringListValue(output_logical_types));
 
-	if (side_effects) {
-		children.emplace_back("side_effects", Value::BOOLEAN(true));
-	}
 	if (IsActorExecutionBackend(execution_backend)) {
 		children.emplace_back("actor_number", Value::BIGINT(static_cast<int64_t>(resolved_actor_number)));
 	}
@@ -486,7 +456,7 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
                             const string &execution_backend, idx_t default_parallelism,
                             const vector<LogicalType> &passthrough_types, const Optional<py::object> &cpus,
                             const Optional<py::object> &gpus, const Optional<py::object> &batch_size,
-                            const Optional<py::object> &actor_number, bool side_effects) {
+                            const Optional<py::object> &actor_number) {
 	PythonGILWrapper acquire;
 	ValidateExecutionBackend(execution_backend);
 	ValidateUDFCallableShape(udf, execution_backend);
@@ -506,7 +476,6 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	    execution_backend != "ray_actor") {
 		throw InvalidInputException("GPU resources require a Ray UDF backend");
 	}
-	ValidateActorGpusConfigured(execution_backend, gpus_value, "map(gpus=...)");
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	const auto resolved_target_max_batch_bytes = ResolveTargetMaxBatchBytes(std::make_pair(false, idx_t(0)));
 
@@ -527,9 +496,6 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	children.emplace_back("function_pickle", Value::BLOB_RAW(pickled_str));
 	children.emplace_back("function_pickle_size_bytes", Value::BIGINT(NumericCast<int64_t>(pickled_str.size())));
 	children.emplace_back("method_return_type", Value(return_type->Type().ToString()));
-	if (side_effects) {
-		children.emplace_back("side_effects", Value::BOOLEAN(true));
-	}
 	if (IsActorExecutionBackend(execution_backend)) {
 		children.emplace_back("actor_number", Value::BIGINT(static_cast<int64_t>(resolved_actor_number)));
 	}
@@ -568,8 +534,7 @@ Value BuildExpressionScalarUDFPayload(const string &name, const py::function &ud
                                       const Optional<py::object> &expression_id) {
 	vector<LogicalType> passthrough_types;
 	auto payload = BuildScalarUDFPayload(name, udf, return_type, execution_backend, default_parallelism,
-	                                     passthrough_types, py::none(), py::none(), py::none(), py::none(),
-	                                     /*side_effects=*/false);
+	                                     passthrough_types, py::none(), py::none(), py::none(), py::none());
 
 	child_list_t<Value> fields;
 	fields.emplace_back("payload_version", Value::BIGINT(1));
@@ -584,15 +549,12 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
                                           const string &execution_backend, idx_t default_parallelism,
                                           const vector<string> &input_names, const Optional<py::object> &batch_size,
                                           bool row_preserving, const Optional<py::object> &gpus,
-                                          const Optional<py::object> &actor_number, bool stateful,
+                                          const Optional<py::object> &actor_number,
                                           const Optional<py::object> &expression_id) {
-	ValidateStatefulActorContract(execution_backend, actor_number, stateful);
 	auto payload =
 	    BuildPythonUDFPayload(name, udf, schema, shared_ptr<DuckDBPyType>(), execution_backend, default_parallelism,
 	                          py::none(), gpus, py::none(), batch_size, py::none(), py::none(), py::none(),
-	                          actor_number, py::none(), py::none(), py::none(), /*side_effects=*/stateful,
-	                          /*flat_map=*/false);
-	auto gpus_value = ParseOptionalNonNegativeDouble(gpus, "map_batches(gpus=...)");
+	                          actor_number, py::none(), py::none(), py::none(), /*flat_map=*/false);
 	const bool ray_backend = execution_backend == "ray_task" || execution_backend == "ray_actor";
 
 	child_list_t<Value> fields;
@@ -603,9 +565,6 @@ Value BuildExpressionMapBatchesUDFPayload(const string &name, const py::function
 	fields.emplace_back("row_preserving", Value::BOOLEAN(row_preserving));
 	fields.emplace_back("prebatched_input", Value::BOOLEAN(false));
 	AppendExpressionIdField(fields, expression_id);
-	if (stateful) {
-		fields.emplace_back("stateful", Value::BOOLEAN(true));
-	}
 	if (row_preserving) {
 		fields.emplace_back("call_mode", Value("map_batches_rows"));
 		fields.emplace_back("produce_ray_block_stream", Value::BOOLEAN(ray_backend));

@@ -65,26 +65,6 @@ def _with_actor_thread_env(
     return merged_runtime_env
 
 
-def _validate_stateful_actor_pool_contract(
-    payload: dict[str, Any] | None,
-    concurrency: int,
-    *,
-    max_restarts: int | None = None,
-    max_task_retries: int | None = None,
-) -> None:
-    if not payload or not payload.get("stateful"):
-        return
-    actor_number = payload.get("actor_number")
-    if type(actor_number) is not int or actor_number != 1 or concurrency != 1:
-        raise ValueError(
-            "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined"
-        )
-    if max_restarts is not None and max_restarts != 0:
-        raise ValueError("stateful UDF actor pools require max_restarts=0")
-    if max_task_retries is not None and max_task_retries != 0:
-        raise ValueError("stateful UDF actor pools require max_task_retries=0")
-
-
 class UDFActorPoolBase:
     def __init__(
         self,
@@ -95,12 +75,6 @@ class UDFActorPoolBase:
         max_restarts: int = MAX_ACTOR_RESTARTS,
         max_task_retries: int = MAX_ACTOR_TASK_RETRIES,
     ) -> None:
-        _validate_stateful_actor_pool_contract(
-            payload,
-            concurrency,
-            max_restarts=max_restarts,
-            max_task_retries=max_task_retries,
-        )
         Actor = self._actor_class(max_restarts, max_task_retries)
         options = dict(ray_options or {})
         if "scheduling_strategy" in options:
@@ -187,7 +161,6 @@ class UDFActorPoolBase:
         actor_dispatch_indices: list[int] | tuple[int, ...] | set[int] | None = None,
         actor_init_refs: list[Any] | tuple[Any, ...] | None = None,
     ) -> UDFActorPoolBase:
-        _validate_stateful_actor_pool_contract(payload, len(actors))
         if actor_dispatch_indices is None:
             raise ValueError("pre-created Ray UDF actor handles require explicit actor_dispatch_indices")
         instance = cls.__new__(cls)
@@ -628,7 +601,6 @@ def _create_actor_pools_for_nodes(
             if not query_id:
                 raise RuntimeError(f"Ray actor UDF node {node_id} is missing query_id")
             concurrency = required_positive_int(node, "actor_pool_size")
-            _validate_stateful_actor_pool_contract(payload, concurrency)
             cpus = resolve_actor_num_cpus(payload)
             actor_location_nonce = secrets.token_urlsafe(32)
             ray_options = {
@@ -644,19 +616,11 @@ def _create_actor_pools_for_nodes(
                 },
             }
 
-            fault_tolerance_options: dict[str, int] = {}
-            if payload.get("side_effects"):
-                fault_tolerance_options["max_task_retries"] = 0
-            if payload.get("stateful"):
-                fault_tolerance_options["max_restarts"] = 0
-                fault_tolerance_options["max_task_retries"] = 0
-
             actors_obj = actor_pool_cls(
                 payload=payload,
                 concurrency=concurrency,
                 gpus_per_actor=gpus,
                 ray_options=ray_options,
-                **fault_tolerance_options,
             )
             actors_obj._vane_location_nonce = actor_location_nonce
             created.append(actors_obj)

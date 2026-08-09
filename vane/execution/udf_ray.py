@@ -48,9 +48,6 @@ from vane.execution.udf_ray_actor_pool import (
 from vane.execution.udf_ray_actor_runtime import (
     _actor_class as _actor_runtime_class,
 )
-from vane.execution.udf_ray_actor_state import (
-    build_stateful_actor_error_context as _build_stateful_actor_error_context,
-)
 from vane.execution.udf_ray_config import (
     MAX_ACTOR_TASK_RETRIES,
 )
@@ -565,12 +562,6 @@ class RemoteUDFExecutor(
 
     def close(self) -> None:
         self.shutdown()
-
-    def error_context(self) -> dict[str, Any] | None:
-        """Describe the exact stateful actor for centralized loss errors."""
-        if not self._payload.get("stateful"):
-            return None
-        return _build_stateful_actor_error_context(self._payload, list(self.actors))
 
 
 def _build_ray_actor_executor(payload: dict[str, Any], options: dict[str, Any]) -> UDFExecutor:
@@ -1113,8 +1104,6 @@ def _build_ray_task_executor(payload: dict[str, Any], options: dict[str, Any]) -
     memory_bytes = ray_udf_task_memory_bytes(payload)
     configured_max_retries = options["max_task_retries"]
     max_retries = MAX_ACTOR_TASK_RETRIES if configured_max_retries is None else configured_max_retries
-    if payload.get("side_effects"):
-        max_retries = 0
 
     return RayTaskUDFExecutor(
         payload,

@@ -39,10 +39,7 @@ def collect_actor_env_overrides() -> dict[str, str]:
 def normalize_actor_pool_payload(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize distributed actor-pool payloads before actor creation/use.
-
-    Ordinary stateful UDFs use direct actor calls.
-    """
+    """Normalize distributed actor-pool payloads before actor creation/use."""
     normalized = dict(payload or {})
     if normalized.get("ray_actor_pool_name") is not None:
         raise ValueError("Ray UDF named actor pools have been removed; ray_actor_pool_name is unsupported")

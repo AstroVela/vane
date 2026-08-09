@@ -600,7 +600,7 @@ def test_native_dispatcher_terminal_shutdown_uses_one_aggregate_collector_deadli
             def fatal_error(self):
                 return None
 
-            def track_generator_ref(self, _slot_id, _submit_id, _source, _error_context):
+            def track_generator_ref(self, _slot_id, _submit_id, _source):
                 global tracked_count
                 with state_lock:
                     tracked_count += 1
@@ -781,7 +781,7 @@ def test_native_dispatcher_pending_collector_handoff_releases_local_executor():
             def fatal_error(self):
                 return None
 
-            def track_generator_ref(self, slot_id, submit_id, _source, _error_context):
+            def track_generator_ref(self, slot_id, submit_id, _source):
                 self._events.append((int(slot_id), int(submit_id), "complete", None))
                 tracked.set()
                 if self._wakeup is not None:
@@ -953,7 +953,7 @@ def test_native_dispatcher_rebuilds_failed_ray_stream_collector():
             def fatal_error(self):
                 return self._fatal_error
 
-            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+            def track_generator_ref(self, slot_id, submit_id, source):
                 slot_id = int(slot_id)
                 submit_id = int(submit_id)
                 if self._index == 0:
@@ -1497,7 +1497,7 @@ def test_pending_ray_slot_cleanup_does_not_spin_or_block_healthy_slot():
             def fatal_error(self):
                 return None
 
-            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+            def track_generator_ref(self, slot_id, submit_id, source):
                 slot_id = int(slot_id)
                 submit_id = int(submit_id)
                 if source.value == 1:
@@ -1746,7 +1746,7 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
             def fatal_error(self):
                 return None
 
-            def track_generator_ref(self, slot_id, submit_id, source, _error_context):
+            def track_generator_ref(self, slot_id, submit_id, source):
                 slot_id = int(slot_id)
                 submit_id = int(submit_id)
                 value = int(source.value)
@@ -2374,33 +2374,6 @@ def test_mixed_streaming_inputs_preserve_task_admission_owner():
         env=os.environ.copy(),
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-
-
-def test_create_function_rejects_removed_process_and_ray_args():
-    con = vane.connect()
-
-    def add_one(value):
-        return value + 1
-
-    with pytest.raises(TypeError):
-        con.create_function(
-            "bad_process_arg",
-            add_one,
-            ["BIGINT"],
-            "BIGINT",
-            type="native",
-            use_process=True,
-        )
-
-    with pytest.raises(TypeError):
-        con.create_function(
-            "bad_ray_arg",
-            add_one,
-            ["BIGINT"],
-            "BIGINT",
-            type="native",
-            ray=True,
-        )
 
 
 def test_map_batches_rejects_removed_process_and_actor_count_args():

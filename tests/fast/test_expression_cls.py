@@ -17,8 +17,8 @@ def test_vane_cls_public_api():
     assert isinstance(vane.col("x"), vane.Expression)
 
 
-@pytest.mark.parametrize("actor_number", [None, False, True, 0, 1.0, 2])
-def test_vane_cls_requires_exactly_one_strict_integer_actor(actor_number):
+@pytest.mark.parametrize("actor_number", [None, False, True, 0, -1, 1.0, "1"])
+def test_vane_cls_requires_positive_strict_integer_actor(actor_number):
     import vane
 
     class Prefixer:
@@ -27,7 +27,7 @@ def test_vane_cls_requires_exactly_one_strict_integer_actor(actor_number):
 
     with pytest.raises(
         vane.InvalidInputException,
-        match=r"actor_number must be exactly 1.*multi-actor state",
+        match=r"actor_number must be a positive integer",
     ):
         vane.cls(actor_number=actor_number, return_dtype="VARCHAR")(Prefixer)
 
@@ -43,6 +43,18 @@ def test_vane_cls_requires_return_dtype():
         vane.cls(actor_number=1)(Prefixer)
 
 
+@pytest.mark.parametrize("gpus", [False, -1, float("inf"), "0"])
+def test_vane_cls_rejects_invalid_gpu_resource(gpus):
+    import vane
+
+    class Prefixer:
+        def __call__(self, text):
+            return text
+
+    with pytest.raises(vane.InvalidInputException, match="gpus must be a non-negative number"):
+        vane.cls(actor_number=1, return_dtype="VARCHAR", gpus=gpus)(Prefixer)
+
+
 def test_vane_cls_rejects_empty_explicit_name_without_defaulting():
     import vane
 
@@ -54,14 +66,14 @@ def test_vane_cls_rejects_empty_explicit_name_without_defaulting():
                 return text
 
 
-def test_vane_cls_physical_payload_marks_stateful_side_effects(monkeypatch):
+def test_vane_cls_physical_payload_supports_multiple_independent_actors(monkeypatch):
     import uuid
 
     import vane
 
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
-    @vane.cls(actor_number=1, return_dtype="INTEGER", name="stateful_counter")
+    @vane.cls(actor_number=2, return_dtype="INTEGER", name="replicated_model")
     class Counter:
         def __call__(self, value):
             return value
@@ -79,10 +91,11 @@ def test_vane_cls_physical_payload_marks_stateful_side_effects(monkeypatch):
 
     assert len(nodes) == 1
     payload = nodes[0]["payload"]
-    assert payload["udf_name"] == "stateful_counter"
-    assert payload.get("stateful") is True
-    assert payload.get("side_effects") is True
-    assert payload["actor_number"] == 1
+    assert payload["udf_name"] == "replicated_model"
+    assert "stateful" not in payload
+    assert "side_effects" not in payload
+    assert payload["actor_number"] == 2
+    assert nodes[0]["actor_pool_size"] == 2
     assert payload["expression_id"]
     assert "state_scope" not in payload
 
@@ -336,7 +349,7 @@ def test_vane_cls_rejects_actor_number_bool(actor_number):
 
     with pytest.raises(
         vane.InvalidInputException,
-        match=r"actor_number.*bool|actor_number.*exactly 1|actor_number.*integer",
+        match=r"actor_number.*bool|actor_number.*integer",
     ):
         vane.cls(actor_number=actor_number, return_dtype="INTEGER")(Identity)
 

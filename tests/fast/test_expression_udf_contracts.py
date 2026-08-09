@@ -28,8 +28,8 @@ def sql_udf_contract_connection():
         values = table.column("value").to_pylist()
         return pa.table({"result": [value + 1 for value in values]})
 
-    @vane.cls(actor_number=1, return_dtype="INTEGER", name="stateful_contract")
-    class StatefulContract:
+    @vane.cls(actor_number=2, return_dtype="INTEGER", name="actor_contract")
+    class ActorContract:
         def __call__(self, value):
             return value
 
@@ -48,8 +48,8 @@ def sql_udf_contract_connection():
         schema={"result": "INTEGER"},
     )
     vane.attach_function(
-        StatefulContract(),
-        alias="stateful_contract",
+        ActorContract(),
+        alias="actor_contract",
         connection=con,
         parameters=["INTEGER"],
     )
@@ -64,11 +64,11 @@ def sql_udf_contract_connection():
     [
         "SELECT i FROM range(3) t(i) WHERE scalar_contract(i::INTEGER) > 0",
         "SELECT sum(batch_contract(i::INTEGER)) FROM range(3) t(i)",
-        "SELECT * FROM range(3) a(i) JOIN range(3) b(j) ON stateful_contract(a.i::INTEGER) = b.j",
+        "SELECT * FROM range(3) a(i) JOIN range(3) b(j) ON actor_contract(a.i::INTEGER) = b.j",
         "SELECT ai_prompt(text), count(*) FROM (VALUES ('x')) t(text) GROUP BY ai_prompt(text)",
         "SELECT count(*) FROM (VALUES (1), (2)) t(i) HAVING scalar_contract(count(*)::INTEGER) > 0",
     ],
-    ids=["where-scalar", "aggregate-batch", "join-stateful-class", "group-by-ai", "having-scalar"],
+    ids=["where-scalar", "aggregate-batch", "join-actor-class", "group-by-ai", "having-scalar"],
 )
 def test_expression_udfs_reject_non_projection_positions(sql_udf_contract_connection, sql):
     message = "udf can only be used in a projection and must be planned as a UDF operator"
@@ -268,6 +268,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     import vane
     import vane.execution.udf_ray as udf_ray
     import vane.execution.udf_subprocess as udf_subprocess
+    from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
     monkeypatch.setenv("VANE_RUNNER", decorator_runner)
 
@@ -280,7 +281,7 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         DecoratedBatch = vane.cls.batch(
-            actor_number=1,
+            actor_number=2,
             return_dtype=pa.int32(),
             gpus=gpus,
         )(IdentityBatch)
@@ -303,8 +304,9 @@ def test_actor_gpu_reservation_follows_resolved_backend(
     payload = nodes[0]["payload"]
     assert payload["execution_backend"] == expected_backend
     assert payload["gpus"] == gpus
-    assert payload["actor_number"] == 1
-    assert payload["stateful"] is True
+    assert payload["actor_number"] == 2
+    assert "stateful" not in payload
+    assert "side_effects" not in payload
 
     if expected_backend == "subprocess_actor":
         created = []
@@ -336,8 +338,8 @@ def test_actor_gpu_reservation_follows_resolved_backend(
             concurrency,
             gpus_per_actor,
             ray_options=None,
-            max_restarts=None,
-            max_task_retries=None,
+            max_restarts=MAX_ACTOR_RESTARTS,
+            max_task_retries=MAX_ACTOR_TASK_RETRIES,
         ):
             self.actor_node_ids = ["node-a"] * concurrency
             ray_pool_calls.append(
@@ -375,10 +377,10 @@ def test_actor_gpu_reservation_follows_resolved_backend(
 
     assert len(pools) == 1
     assert len(ray_pool_calls) == 1
-    assert ray_pool_calls[0]["concurrency"] == 1
+    assert ray_pool_calls[0]["concurrency"] == 2
     assert ray_pool_calls[0]["gpus_per_actor"] == gpus
-    assert ray_pool_calls[0]["max_restarts"] == 0
-    assert ray_pool_calls[0]["max_task_retries"] == 0
+    assert ray_pool_calls[0]["max_restarts"] == MAX_ACTOR_RESTARTS
+    assert ray_pool_calls[0]["max_task_retries"] == MAX_ACTOR_TASK_RETRIES
 
 
 def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
@@ -402,7 +404,7 @@ def test_actor_gpu_is_rejected_when_resolved_backend_is_local(monkeypatch):
         IdentityBatch()(vane.col("value"))
 
 
-def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch):
+def test_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch):
     import ray
 
     import vane
@@ -438,7 +440,8 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     assert len(nodes) == 1
     assert nodes[0]["actor_pool_size"] == 3
     assert nodes[0]["payload"]["actor_number"] == 3
-    assert not nodes[0]["payload"].get("stateful", False)
+    assert "stateful" not in nodes[0]["payload"]
+    assert "side_effects" not in nodes[0]["payload"]
     assert nodes[0]["payload"]["expression_id"]
 
     calls = []
@@ -485,3 +488,164 @@ def test_stateless_ray_actor_pool_size_and_gpu_options_follow_physical_payload(m
     assert len(pools) == 1
     assert calls[0]["concurrency"] == 3
     assert calls[0]["gpus_per_actor"] == 1.25
+
+
+def test_expression_and_relation_class_udfs_share_actor_resource_contract(monkeypatch):
+    import uuid
+
+    import pyarrow as pa
+
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    class RelationIdentity:
+        def __call__(self, table):
+            return table
+
+    @vane.cls.batch(actor_number=3, return_dtype=pa.int32(), batch_size=17, gpus=0.25)
+    class ExpressionIdentity:
+        def __call__(self, values):
+            return values
+
+    con = vane.connect()
+    try:
+        source = con.sql("SELECT i::INTEGER AS value FROM range(3) t(i)")
+        relation_udf = source.map_batches(
+            RelationIdentity,
+            schema={"value": vane.sqltypes.INTEGER},
+            batch_size=17,
+            gpus=0.25,
+            actor_number=3,
+        )
+        expression_udf = source.select(ExpressionIdentity()(vane.col("value")).alias("value"))
+
+        relation_node = (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                relation_udf,
+                str(uuid.uuid4()),
+            )
+            .to_physical_plan(con)
+            .collect_udf_nodes(conn=con)[0]
+        )
+        expression_node = (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                expression_udf,
+                str(uuid.uuid4()),
+            )
+            .to_physical_plan(con)
+            .collect_udf_nodes(conn=con)[0]
+        )
+    finally:
+        con.close()
+
+    relation_payload = relation_node["payload"]
+    expression_payload = expression_node["payload"]
+    for field in ("execution_backend", "actor_number", "gpus", "batch_size"):
+        assert relation_payload[field] == expression_payload[field]
+    assert relation_node["actor_pool_size"] == expression_node["actor_pool_size"] == 3
+    assert relation_payload["call_mode"] == "map_batches"
+    assert expression_payload["call_mode"] == "map_batches_rows"
+    assert relation_payload["row_preserving"] is False
+    assert expression_payload["row_preserving"] is True
+    for payload in (relation_payload, expression_payload):
+        assert "stateful" not in payload
+        assert "side_effects" not in payload
+
+
+def test_direct_udf_operator_and_attached_expression_aliases_are_volatile():
+    import vane
+
+    @vane.func(return_dtype="INTEGER")
+    def identity(value):
+        return value
+
+    @vane.cls(actor_number=2, return_dtype="INTEGER")
+    class ActorIdentity:
+        def __call__(self, value):
+            return value
+
+    con = vane.connect()
+    try:
+        vane.attach_function(
+            identity,
+            alias="volatile_scalar_alias",
+            connection=con,
+            parameters=["INTEGER"],
+        )
+        vane.attach_function(
+            ActorIdentity(),
+            alias="volatile_actor_alias",
+            connection=con,
+            parameters=["INTEGER"],
+        )
+        stability = dict(
+            con.execute(
+                """
+                SELECT function_name, has_side_effects
+                FROM duckdb_functions()
+                WHERE function_type = 'scalar'
+                  AND function_name IN ('udf', 'volatile_scalar_alias', 'volatile_actor_alias')
+                """
+            ).fetchall()
+        )
+    finally:
+        con.close()
+
+    assert stability == {
+        "udf": True,
+        "volatile_scalar_alias": True,
+        "volatile_actor_alias": True,
+    }
+
+
+def test_attached_expression_udfs_resolve_the_same_ray_backends_as_direct_udfs(monkeypatch):
+    import uuid
+
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    @vane.func(return_dtype="INTEGER")
+    def scalar_identity(value):
+        return value
+
+    @vane.cls(actor_number=2, return_dtype="INTEGER")
+    class ActorIdentity:
+        def __call__(self, value):
+            return value
+
+    con = vane.connect()
+    try:
+        vane.attach_function(
+            scalar_identity,
+            alias="ray_scalar_alias",
+            connection=con,
+            parameters=["INTEGER"],
+        )
+        vane.attach_function(
+            ActorIdentity(),
+            alias="ray_actor_alias",
+            connection=con,
+            parameters=["INTEGER"],
+        )
+
+        scalar_relation = con.sql("SELECT ray_scalar_alias(i::INTEGER) FROM range(2) t(i)")
+        actor_relation = con.sql("SELECT ray_actor_alias(i::INTEGER) FROM range(2) t(i)")
+        scalar_node = (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(scalar_relation, str(uuid.uuid4()))
+            .to_physical_plan(con)
+            .collect_udf_nodes(conn=con)[0]
+        )
+        actor_node = (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(actor_relation, str(uuid.uuid4()))
+            .to_physical_plan(con)
+            .collect_udf_nodes(conn=con)[0]
+        )
+    finally:
+        con.close()
+
+    assert scalar_node["payload"]["execution_backend"] == "ray_task"
+    assert actor_node["payload"]["execution_backend"] == "ray_actor"
+    assert actor_node["payload"]["actor_number"] == 2
+    assert actor_node["actor_pool_size"] == 2

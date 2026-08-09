@@ -140,17 +140,11 @@ def udf_callable_cache_stats() -> dict[str, int]:
 
 
 def callable_cache_enabled(payload: dict[str, Any]) -> bool:
-    if payload.get("side_effects"):
-        return False
     return os.getenv("VANE_CPU_UDF_CALLABLE_CACHE", "").strip().lower() not in _TRUTHY_FALSE_VALUES
 
 
 def load_udf_from_payload_cached(payload: dict[str, Any], max_entries: int | None = None) -> Any:
     """Deserialize a UDF callable with a process-local LRU cache."""
-    if payload.get("side_effects"):
-        with _UDF_CALLABLE_CACHE_LOCK:
-            _UDF_CALLABLE_STATS["python_udf_callable_cache_bypass"] += 1
-        return load_udf_from_payload(payload)
     if max_entries is None:
         max_entries = 64
     if max_entries <= 0:

@@ -229,24 +229,6 @@ def test_relation_actor_udfs_reject_async_call_methods(method):
             getattr(source, method)(_AsyncCallable, **kwargs)
 
 
-def test_connection_udf_registration_rejects_async_functions():
-    with vane.connect() as connection:
-        with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-            connection.create_function(
-                "async_scalar",
-                _async_value,
-                [vane.sqltypes.INTEGER],
-                vane.sqltypes.INTEGER,
-            )
-
-        with pytest.raises(TypeError, match=_ASYNC_CALLABLE_ERROR):
-            connection.create_table_function(
-                "async_batches",
-                _async_value,
-                schema={"value": vane.sqltypes.INTEGER},
-            )
-
-
 def test_attach_function_rejects_raw_async_callables():
     connection = vane.connect()
     try:
@@ -282,34 +264,6 @@ def test_attach_function_rejects_raw_async_callables():
             )
     finally:
         connection.close()
-
-
-@pytest.mark.parametrize("udf_type", ["native", "arrow"])
-@pytest.mark.parametrize("exception_handling", ["default", "return_null"])
-@pytest.mark.parametrize(
-    "target",
-    [
-        pytest.param(_returns_awaitable, id="awaitable"),
-        pytest.param(_returns_async_iterable, id="async-iterable"),
-    ],
-)
-def test_scalar_registration_rejects_async_results_without_leaking_coroutines(udf_type, exception_handling, target):
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with vane.connect() as connection:
-            connection.create_function(
-                "returns_async_result",
-                target,
-                [vane.sqltypes.INTEGER],
-                vane.sqltypes.INTEGER,
-                type=udf_type,
-                exception_handling=exception_handling,
-            )
-            with pytest.raises(vane.Error, match=_AWAITABLE_RESULT_ERROR):
-                connection.execute("SELECT returns_async_result(1)").fetchall()
-        gc.collect()
-
-    assert not [warning for warning in caught if "was never awaited" in str(warning.message)]
 
 
 @pytest.mark.parametrize("call_mode", ["map", "map_batches", "flat_map"])

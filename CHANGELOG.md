@@ -21,6 +21,23 @@ All notable user-visible changes are documented here. Vane is currently in alpha
 
 ### Changed
 
+- Class UDFs now accept any positive `actor_number`. Each Actor owns an
+  independent, ephemeral class instance; work is routed to available Actors
+  without key affinity, shared state, or global ordering. Actor reconstruction
+  and call or batch replay may occur after failures, so class UDFs provide no
+  exactly-once guarantee and external effects must be idempotent. This contract
+  is shared by local and Ray execution and is intended for reconstructible
+  models, tokenizers, and read-only caches.
+- Removed `stateful` and `side_effects` from Vane's distributed Expression and
+  Relation UDF contract. Actor UDFs now use the same reconstruction and retry
+  policy regardless of API, and Relation Actor UDFs default omitted `gpus` to
+  zero like `vane.cls` and `vane.cls.batch`. The internal direct-UDF operator
+  and SQL aliases registered through `vane.attach_function` are always
+  `VOLATILE`; the physical UDF planner resolves attached aliases through the
+  same local-versus-Ray backend contract as direct Expression UDFs.
+- Disabled the public `create_function` and `create_table_function` Python
+  bindings. Use `vane.func`, `vane.cls`, their batch variants, Relation UDF
+  methods, and `vane.attach_function` for SQL registration.
 - Positioned the current project as the Vane Data developer preview.
 - Prompt uses ordered `messages`, first-class call parameters, and the closed
   `PromptOptions` keyword surface. OpenAI Responses is the default endpoint.

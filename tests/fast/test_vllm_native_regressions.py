@@ -437,11 +437,18 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
     import vane.execution.vllm as vllm
 
     executor = _ChunkedBatchResultExecutor()
-    observed_chunk_sizes = []
+    observed_type = pa.struct([pa.field("value", pa.string()), pa.field("chunk_size", pa.int64())])
 
+    @vane.func.batch(return_dtype=observed_type)
     def observe_chunk(values):
-        observed_chunk_sizes.append(len(values))
-        return values
+        chunk_size = len(values)
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(values.to_pylist(), type=pa.string()),
+                pa.array([chunk_size] * chunk_size, type=pa.int64()),
+            ],
+            fields=list(observed_type),
+        )
 
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
     prompts = [f"shared-prefix-{row_id:05d}" for row_id in range(row_count)]
@@ -457,18 +464,15 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
                 }
             ),
         )
-        con.create_function(
-            "observe_vllm_chunk",
+        vane.attach_function(
             observe_chunk,
-            ["VARCHAR"],
-            "VARCHAR",
-            type="arrow",
-            null_handling="special",
-            side_effects=True,
+            alias="observe_vllm_chunk",
+            connection=con,
+            parameters=["VARCHAR"],
         )
         rows = con.execute(
             """
-            SELECT id, observe_vllm_chunk(generated)
+            SELECT id, observe_vllm_chunk(generated) AS observed
             FROM (
                 SELECT id, vllm(prompt, 'recording-model', ?) AS generated
                 FROM vllm_input
@@ -490,12 +494,11 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
         con.close()
 
     vector_size = vane.__standard_vector_size__
-    assert observed_chunk_sizes
-    assert sum(observed_chunk_sizes) == row_count
-    assert max(observed_chunk_sizes) <= vector_size
+    assert len(rows) == row_count
+    assert max(observed["chunk_size"] for _, observed in rows) <= vector_size
     assert [len(submitted) for _, submitted in executor.submissions] == [row_count]
     assert executor.returned_arrow_batch_counts[0] > 1
-    assert dict(rows) == {
+    assert {row_id: observed["value"] for row_id, observed in rows} == {
         row_id: None if row_id % 7 == 0 else f"generated:{prompts[row_id]}" for row_id in range(row_count)
     }
 

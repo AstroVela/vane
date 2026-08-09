@@ -163,38 +163,6 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Disable profiling for the current connection", py::kw_only(), py::arg("connection") = py::none());
 	m.def(
-	    "create_function",
-	    [](const string &name, const py::function &udf, const py::object &arguments = py::none(),
-	       const shared_ptr<DuckDBPyType> &return_type = nullptr, PythonUDFType type = PythonUDFType::NATIVE,
-	       FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING,
-	       PythonExceptionHandling exception_handling = PythonExceptionHandling::FORWARD_ERROR,
-	       bool side_effects = false, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->RegisterScalarUDF(name, udf, arguments, return_type, type, null_handling, exception_handling,
-		                                   side_effects);
-	    },
-	    "Create a DuckDB function out of the passing in Python function so it can be used in queries", py::arg("name"),
-	    py::arg("function"), py::arg("parameters") = py::none(), py::arg("return_type") = py::none(), py::kw_only(),
-	    py::arg("type") = PythonUDFType::NATIVE, py::arg("null_handling") = FunctionNullHandling::DEFAULT_NULL_HANDLING,
-	    py::arg("exception_handling") = PythonExceptionHandling::FORWARD_ERROR, py::arg("side_effects") = false,
-	    py::arg("connection") = py::none());
-	m.def(
-	    "create_table_function",
-	    [](const string &name, const py::function &udf, const py::object &schema = py::none(),
-	       const shared_ptr<DuckDBPyType> &return_type = nullptr, const Optional<py::object> &batch_size = py::none(),
-	       bool side_effects = false, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->RegisterTableUDF(name, udf, schema, return_type, batch_size, side_effects);
-	    },
-	    "Create a DuckDB table function out of the passing in Python function so it can be used in queries",
-	    py::arg("name"), py::arg("function"), py::arg("schema") = py::none(), py::arg("return_type") = py::none(),
-	    py::kw_only(), py::arg("batch_size") = py::none(), py::arg("side_effects") = false,
-	    py::arg("connection") = py::none());
-	m.def(
 	    "remove_function",
 	    [](const string &name, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
