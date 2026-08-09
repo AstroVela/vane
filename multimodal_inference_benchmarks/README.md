@@ -21,6 +21,11 @@ source .venv-system/bin/activate
 cd multimodal_inference_benchmarks
 ```
 
+The Vane entrypoints use the installed `vane-ai` distribution from this
+environment. Install or reinstall the project wheel before running them; the
+benchmark scripts do not import Vane directly from the source checkout because
+the native extension is provided by the installed wheel.
+
 Install the dependencies for each benchmark. The Tsinghua PyPI mirror is used here to speed up installation:
 
 ```bash

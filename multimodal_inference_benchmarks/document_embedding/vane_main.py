@@ -15,10 +15,6 @@ import torch
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 import vane
 
 DATA_ROOT = Path("/data/multimodal_inference_benchmarks/digitalcorpora")
