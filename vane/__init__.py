@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
@@ -12,6 +12,8 @@ Vane owns this package and its native extension.  The separately distributed
 the two distributions do not share Python modules or extension names.
 """
 
+import typing as _typing
+
 from vane._dbapi_type_object import (
     BINARY,
     DATETIME,
@@ -23,6 +25,11 @@ from vane._dbapi_type_object import (
 from vane._env import EnvRegistry, env
 from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
+
+if _typing.TYPE_CHECKING:
+    from vane.runners.runner import Runner as _Runner
+else:
+    _Runner = _typing.Any
 from vane._native import (
     BinderException,
     CaseExpression,
@@ -154,8 +161,6 @@ from vane._native import (
     row_type,
     rowcount,
     set_default_connection,
-    set_runner_local,
-    set_runner_ray,
     sql,
     sqltype,
     string_type,
@@ -220,6 +225,34 @@ from vane.value.constant import (
     UUIDValue,
     Value,
 )
+
+
+def set_runner_local(
+    num_workers: int | None = 1,
+    *,
+    max_running_tasks: _typing.Any = None,
+    execution_mode: str | None = "in_process",
+) -> "_Runner":
+    """Configure Vane to execute through the local FTE runner."""
+    from vane.runners.local import set_runner_local as _set_runner_local
+
+    return _set_runner_local(
+        num_workers,
+        max_running_tasks=max_running_tasks,
+        execution_mode=execution_mode,
+    )
+
+
+def set_runner_ray(
+    address: str | None = None,
+    noop_if_initialized: bool = False,
+    max_task_backlog: int | None = None,
+) -> "_Runner":
+    """Configure Vane to execute through the Ray runner."""
+    from vane.runners.ray import set_runner_ray as _set_runner_ray
+
+    return _set_runner_ray(address, noop_if_initialized, max_task_backlog)
+
 
 # Short public aliases for the native classes.
 Connection = DuckDBPyConnection

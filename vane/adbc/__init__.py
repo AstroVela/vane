@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modified by Vane contributors.
 
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -25,6 +27,8 @@ import functools
 import importlib.util
 
 import adbc_driver_manager
+
+__all__ = ["StatementOptions", "connect", "driver_path"]
 
 
 class StatementOptions(enum.Enum):

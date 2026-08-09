@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
 import os
 import platform
 import subprocess
@@ -60,60 +59,106 @@ def test_vane_public_exports_are_unique_and_resolvable():
     assert not hasattr(vane, "vane_runners_cpp")
 
 
-def test_vane_native_extensions_are_declared_in_package_stubs():
+def test_vane_adbc_public_exports_are_explicit():
+    import vane.adbc
+
+    assert vane.adbc.__all__ == ["StatementOptions", "connect", "driver_path"]
+    wildcard_namespace: dict[str, object] = {}
+    exec("from vane.adbc import *", wildcard_namespace)
+    assert {name for name in wildcard_namespace if name != "__builtins__"} == set(vane.adbc.__all__)
+
+
+def test_native_submodules_share_the_public_runtime_identity():
+    import vane.sqltypes as vane_sqltypes
+    import vane.udf as vane_udf
     from vane import _native
 
-    stub_path = REPOSITORY_ROOT / "vane" / "_native.pyi"
-    module = ast.parse(stub_path.read_text(encoding="utf-8"))
-    classes = {node.name: node for node in module.body if isinstance(node, ast.ClassDef)}
-    stub_functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+    assert _native._func.FunctionNullHandling is vane_udf.FunctionNullHandling
+    assert _native._func.PythonUDFType is vane_udf.PythonUDFType
+    assert _native._sqltypes.DuckDBPyType is vane_sqltypes.DuckDBPyType
+    assert Path(_native.__file__).name.startswith("_native.")
+    assert Path(_native.__file__).suffix in {".pyd", ".so"}
 
-    expected_methods = {
-        "DuckDBPyConnection": {
-            "_create_vane_batch_function",
-            "_create_vane_function",
-            "create_table_function",
-            "from_datasource",
-            "tensor_type",
-        },
-        "DuckDBPyRelation": {"explode", "local_exchange", "repartition"},
+
+def test_native_enum_members_match_the_public_contract():
+    import vane.udf as vane_udf
+
+    expected_members = {
+        vane.StatementType: (
+            "INVALID",
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "CREATE",
+            "DELETE",
+            "PREPARE",
+            "EXECUTE",
+            "ALTER",
+            "TRANSACTION",
+            "COPY",
+            "ANALYZE",
+            "VARIABLE_SET",
+            "CREATE_FUNC",
+            "EXPLAIN",
+            "DROP",
+            "EXPORT",
+            "PRAGMA",
+            "VACUUM",
+            "CALL",
+            "SET",
+            "LOAD",
+            "RELATION",
+            "EXTENSION",
+            "LOGICAL_PLAN",
+            "ATTACH",
+            "DETACH",
+            "MULTI",
+            "COPY_DATABASE",
+            "MERGE_INTO",
+        ),
+        vane.ExpectedResultType: ("QUERY_RESULT", "CHANGED_ROWS", "NOTHING"),
+        vane.ExplainType: ("STANDARD", "ANALYZE"),
+        vane.CSVLineTerminator: ("LINE_FEED", "CARRIAGE_RETURN_LINE_FEED"),
+        vane.PythonExceptionHandling: ("DEFAULT", "RETURN_NULL"),
+        vane.RenderMode: ("ROWS", "COLUMNS"),
+        vane.token_type: ("identifier", "numeric_const", "string_const", "operator", "keyword", "comment"),
+        vane_udf.PythonUDFType: ("NATIVE", "ARROW"),
+        vane_udf.FunctionNullHandling: ("DEFAULT", "SPECIAL"),
     }
-    for class_name, method_names in expected_methods.items():
-        runtime_class = getattr(_native, class_name)
-        stub_methods = {node.name for node in classes[class_name].body if isinstance(node, ast.FunctionDef)}
-        assert method_names <= set(dir(runtime_class))
-        assert method_names <= stub_methods
 
-    native_functions = {
-        "create_table_function",
-        "get_or_create_runner",
-        "get_or_infer_runner_type",
-        "get_runner",
-        "set_runner_local",
-        "set_runner_ray",
-        "teardown_runner",
-        "tensor_type",
+    for enum_type, members in expected_members.items():
+        assert tuple(enum_type.__members__) == members
+
+
+def test_native_runtime_edge_cases_match_the_typing_contract():
+    from vane import _native
+
+    for runtime_class in (_native.DuckDBPyConnection, _native.DuckDBPyRelation, _native.Statement):
+        with pytest.raises(TypeError, match="No constructor defined"):
+            runtime_class()
+
+    with pytest.raises(TypeError):
+        _native._sqltypes.DuckDBPyType(type_str="INTEGER", connection=None)
+    with pytest.raises(TypeError):
+        _native._sqltypes.DuckDBPyType(obj="INTEGER")
+
+    connection = vane.connect()
+    assert connection.description is None
+    connection.execute("SELECT 1 AS value")
+    assert connection.description == [("value", vane.sqltypes.INTEGER, None, None, None, None, None)]
+
+    children_by_type = {
+        "array": vane.array_type(vane.sqltypes.INTEGER, 3).children,
+        "decimal": vane.decimal_type(10, 2).children,
+        "enum": connection.sql("SELECT 'sad'::ENUM('sad', 'ok')").types[0].children,
+        "tensor": vane.tensor_type(vane.sqltypes.FLOAT, [2, 3]).children,
     }
-    assert native_functions <= set(dir(_native))
-    assert native_functions <= set(stub_functions)
-
-    annotations = {
-        node.target.id for node in module.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    assert children_by_type == {
+        "array": [("child", vane.sqltypes.INTEGER), ("size", 3)],
+        "decimal": [("precision", 10), ("scale", 2)],
+        "enum": [("values", ["sad", "ok"])],
+        "tensor": [("dtype", vane.sqltypes.FLOAT), ("shape", (2, 3))],
     }
-    assert "ray_cxx" in annotations
-
-    for function_name in ("read_json", "write_csv"):
-        keyword_names = {argument.arg for argument in stub_functions[function_name].args.kwonlyargs}
-        assert "connection" in keyword_names
-
-    sqltypes_path = REPOSITORY_ROOT / "vane" / "sqltypes" / "__init__.pyi"
-    sqltypes_module = ast.parse(sqltypes_path.read_text(encoding="utf-8"))
-    sqltypes_all = next(
-        ast.literal_eval(node.value)
-        for node in sqltypes_module.body
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "__all__"
-    )
-    assert "TIME_NS" in sqltypes_all
 
 
 def _expected_duckdb_source_id(repository_root: Path) -> str:

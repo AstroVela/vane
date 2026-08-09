@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Convenient type aliases for the most commonly used DuckDB types.
+"""Convenient aliases for Vane's native connection and relation types.
 
-These give shorter, more Pythonic names while preserving full compatibility
-with the original DuckDB types (they are the same classes, just re-exported).
+These are the same classes as :class:`vane.DuckDBPyConnection` and
+:class:`vane.DuckDBPyRelation`. The official ``duckdb`` distribution exposes
+distinct native classes.
 
 Usage::
 

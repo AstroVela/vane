@@ -4,7 +4,7 @@
 
 """Run Vane TPC-H benchmarks with true Ray distributed execution via Relation API.
 
-Unlike run_tpch_vane_ray.py (which uses con.execute(sql).fetchall() — always local),
+Unlike run_tpch_vane_ray.py (which exercises execute/fetchall with optional fallback),
 this script uses con.sql(sql).write_parquet(path) which triggers the VANE_RUNNER=ray
 dispatch path: pyrelation.cpp → runner.run_write() → PyLogicalPlan →
 to_physical_plan() → RayQueryDriverClient on Ray.

@@ -16,8 +16,8 @@ import vane
 # TODO: we can add a custom command line argument to pytest to provide an extension directory  # noqa: TD002, TD003
 # We can use that instead of checking this environment variable inside of conftest.py's 'require' method
 pytestmark = pytest.mark.skipif(
-    not os.getenv("DUCKDB_PYTHON_TEST_EXTENSION_REQUIRED", False),
-    reason="DUCKDB_PYTHON_TEST_EXTENSION_REQUIRED is not set",
+    not os.getenv("VANE_PYTHON_TEST_EXTENSION_REQUIRED", False),
+    reason="VANE_PYTHON_TEST_EXTENSION_REQUIRED is not set",
 )
 
 

@@ -25,7 +25,7 @@ def test_require_loads_present_extension(require, tmp_path, monkeypatch):
         connect_calls.append((db_name, config))
         return connection
 
-    monkeypatch.setenv("DUCKDB_PYTHON_TEST_EXTENSION_PATH", str(tmp_path))
+    monkeypatch.setenv("VANE_PYTHON_TEST_EXTENSION_PATH", str(tmp_path))
     monkeypatch.setattr(vane, "connect", connect)
 
     assert require("fixture_test", "fixture.db") is connection
@@ -36,7 +36,7 @@ def test_require_loads_present_extension(require, tmp_path, monkeypatch):
 def test_require_skips_only_when_extension_is_absent(require, tmp_path, monkeypatch):
     unrelated_extension = tmp_path / "unrelated.duckdb_extension"
     unrelated_extension.touch()
-    monkeypatch.setenv("DUCKDB_PYTHON_TEST_EXTENSION_PATH", str(tmp_path))
+    monkeypatch.setenv("VANE_PYTHON_TEST_EXTENSION_PATH", str(tmp_path))
 
     def unexpected_connect(*_args, **_kwargs):
         pytest.fail("require should not connect without a matching extension")

@@ -108,7 +108,8 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     if type_id == "map":
         children = dict(dt.children)
         return pa.map_(
-            _arrow_type_from_duckdb_pytype(children["key"]), _arrow_type_from_duckdb_pytype(children["value"])
+            _arrow_type_from_duckdb_pytype(children["key"]),
+            _arrow_type_from_duckdb_pytype(children["value"]),
         )
 
     raise ValueError(f"unsupported DuckDB type id for empty UDF output: {type_id!r}")

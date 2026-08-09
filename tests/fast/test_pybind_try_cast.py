@@ -22,7 +22,7 @@ def test_struct_type_rejects_null_type_holder(fields):
 def test_execute_rejects_null_statement_holder(duckdb_cursor):
     with pytest.raises(
         vane.InvalidInputException,
-        match="Please provide either a DuckDBPyStatement or a string representing the query",
+        match="Please provide either a Vane DuckDBPyStatement or a string representing the query",
     ):
         duckdb_cursor.execute(None)
 

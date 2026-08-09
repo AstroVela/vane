@@ -37,10 +37,3 @@ def ray_log_to_driver_default() -> bool:
         return _env_truthy(ray_override, default=True)
 
     return not dynamic_ray_progress_enabled()
-
-
-def configure_ray_progress_logging_defaults() -> None:
-    """Compatibility no-op for imports that previously set global Ray defaults.
-
-    ``RayRunner`` passes Vane's preference directly to ``ray.init`` instead.
-    """

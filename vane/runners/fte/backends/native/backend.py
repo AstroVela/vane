@@ -20,6 +20,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
 
+from vane._native import ray_cxx
 from vane.runners.fte.backend import TaskResultPoll, TaskResultState
 from vane.runners.fte.dynamic_inputs import (
     prepare_fte_dynamic_inputs,
@@ -615,15 +616,6 @@ def _task_context_info(task_context: Any) -> dict[str, Any]:
     }
 
 
-def _ray_cxx_attr(name: str) -> Any:
-    # The current C++ task-result classes live under vane.ray_cxx even when
-    # used by the Ray-free native backend. This imports the compiled binding,
-    # not the Ray Python runtime.
-    from vane._ray_cxx import require_ray_cxx_attr
-
-    return require_ray_cxx_attr(name)
-
-
 def _stats_from_payload(stats: Any) -> list[int]:
     if stats is None:
         return []
@@ -698,7 +690,7 @@ def _native_result_tuple(value: Any) -> tuple[Any, Any, Any, Any, int, Any]:
 
 
 def _normalize_result_for_cxx(value: Any) -> Any:
-    RayTaskResult = _ray_cxx_attr("RayTaskResult")
+    RayTaskResult = ray_cxx.RayTaskResult
     if isinstance(value, RayTaskResult):
         return value
     if value is None:
@@ -713,7 +705,7 @@ def _normalize_result_for_cxx(value: Any) -> Any:
     if not _is_native_distributed_task_result(value) and not isinstance(value, (tuple, list)):
         return RayTaskResult.success([], [], None)
 
-    RayResultPartitionRef = _ray_cxx_attr("RayResultPartitionRef")
+    RayResultPartitionRef = ray_cxx.RayResultPartitionRef
     payloads, metadatas, result_schema, stats, flight_port, exchange_sink_instance = _native_result_tuple(value)
     partition_refs = []
     for index, payload in enumerate(payloads or []):

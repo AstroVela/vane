@@ -18,7 +18,7 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from multiprocessing import shared_memory
 
-from vane import pickle as duckdb_pickle
+from vane import pickle as vane_pickle
 from vane.execution._common import callable_cache_enabled as _callable_cache_enabled
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ref_bundle import (
@@ -239,7 +239,7 @@ def _send_input_consumed(
         "rows": int(input_table.num_rows),
         "bytes": int(getattr(input_table, "nbytes", 0) or 0),
     }
-    _send_message(sock, _MSG_INPUT_CONSUMED, duckdb_pickle.dumps(payload))
+    _send_message(sock, _MSG_INPUT_CONSUMED, vane_pickle.dumps(payload))
 
 
 def _send_input_consume_failed(
@@ -255,7 +255,7 @@ def _send_input_consume_failed(
         "worker_pid": os.getpid(),
         "error": _format_exception(exc),
     }
-    _send_message(sock, _MSG_INPUT_CONSUME_FAILED, duckdb_pickle.dumps(payload))
+    _send_message(sock, _MSG_INPUT_CONSUME_FAILED, vane_pickle.dumps(payload))
 
 
 def _request_output_grant(
@@ -273,21 +273,21 @@ def _request_output_grant(
     }
     if input_lease_id is not None:
         payload["input_lease_id"] = int(input_lease_id)
-    _send_message(sock, _MSG_OUTPUT_GRANT_REQUEST, duckdb_pickle.dumps(payload))
+    _send_message(sock, _MSG_OUTPUT_GRANT_REQUEST, vane_pickle.dumps(payload))
     msg_type, payload_data = _recv_message(sock)
     if msg_type == _MSG_OUTPUT_GRANT_CANCELLED:
         error = payload_data.decode("utf-8", errors="replace") or "local_shm output grant cancelled"
         raise _TaskCancelledError(error)
     if msg_type != _MSG_OUTPUT_GRANT_GRANTED:
         raise RuntimeError(f"unexpected output grant response: {msg_type:#x}")
-    response = duckdb_pickle.loads(payload_data)
+    response = vane_pickle.loads(payload_data)
     return int(response["grant_id"])
 
 
 def _release_output_grant(sock: socket.socket, grant_id: int) -> None:
     if int(grant_id) <= 0:
         return
-    _send_message(sock, _MSG_OUTPUT_GRANT_RELEASE, duckdb_pickle.dumps({"grant_id": int(grant_id)}))
+    _send_message(sock, _MSG_OUTPUT_GRANT_RELEASE, vane_pickle.dumps({"grant_id": int(grant_id)}))
 
 
 def _payload_subprocess_mode(payload: dict[str, Any]) -> str:
@@ -394,7 +394,7 @@ def _execute_submit(
         descriptor = None
         try:
             descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(output_tables, grant_id=grant_id)
-            result_payload = duckdb_pickle.dumps(descriptor)
+            result_payload = vane_pickle.dumps(descriptor)
         except Exception:
             if descriptor is not None:
                 try:
@@ -461,7 +461,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
     executor: RuntimeUDFExecutor | None = None
     try:
         payload_bytes = _read_ipc_from_shm(payload_shm, payload_size)
-        payload = duckdb_pickle.loads(payload_bytes)
+        payload = vane_pickle.loads(payload_bytes)
         configure_loaded_torch_threads()
         produce_ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
         subprocess_mode = _payload_subprocess_mode(payload)
@@ -521,7 +521,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     input_ipc = _read_ipc_from_shm(data_shm, input_size)
                     input_table = _arrow_table_from_ipc_bytes(input_ipc)
                 else:
-                    ref_bundle = duckdb_pickle.loads(payload_data)
+                    ref_bundle = vane_pickle.loads(payload_data)
                     lease_id_raw = ref_bundle.get("input_lease_id")
                     input_lease_id = int(lease_id_raw) if lease_id_raw is not None else None
                     try:

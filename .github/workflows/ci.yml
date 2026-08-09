@@ -83,7 +83,7 @@ jobs:
 
       - name: Build and validate source package
         run: |
-          python -m pip install --upgrade build pip "tomli>=1.1; python_version < '3.11'"
+          python -m pip install --upgrade build packaging pip "tomli>=1.1; python_version < '3.11'"
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
@@ -193,14 +193,37 @@ jobs:
       - name: Install the built wheel
         run: python -m pip install --force-reinstall dist/*.whl
 
+      - name: Verify the installed native namespace typing contract
+        if: matrix.python-version == '3.10'
+        run: |
+          cp \
+            "$GITHUB_WORKSPACE/tests/typing/native_namespace.py" \
+            "$GITHUB_WORKSPACE/tests/typing/expression_udf_actor_number.py" \
+            "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+            --no-incremental \
+            --python-version 3.10 \
+            --strict \
+            --follow-imports silent \
+            --ignore-missing-imports \
+            --disallow-any-expr \
+            native_namespace.py \
+            expression_udf_actor_number.py
+
       - name: Verify the installed AI typing contract
         if: matrix.python-version == '3.10'
         run: |
-          cd "$RUNNER_TEMP"
-          python -m mypy \
-            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+          cp \
             "$GITHUB_WORKSPACE/tests/typing/ai_prompt.py" \
-            "$GITHUB_WORKSPACE/tests/typing/ai_embed.py"
+            "$GITHUB_WORKSPACE/tests/typing/ai_embed.py" \
+            "$RUNNER_TEMP/"
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH -u MYPYPATH python -I -m mypy \
+            --config-file "$GITHUB_WORKSPACE/tests/typing/ai_mypy.ini" \
+            ai_prompt.py \
+            ai_embed.py
 
       - name: Verify the base installation Quickstart outside the checkout
         run: |

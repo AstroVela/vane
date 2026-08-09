@@ -22,13 +22,13 @@ way the identities of the classes defined here are fixed and will remain so
 even if vane spark itself is reloaded. In particular, a function like the following
 will still work correctly after vane spark is reloaded:
 
-    def foo(arg=pyducdkb.spark._NoValue):
-        if arg is pyducdkb.spark._NoValue:
+    def foo(arg=vane.experimental.spark._NoValue):
+        if arg is vane.experimental.spark._NoValue:
             ...
 
 See gh-7844 for a discussion of the reload problem that motivated this module.
 
-Note that this approach is taken after from NumPy.
+This approach is adapted from NumPy.
 """
 
 __ALL__ = ["_NoValue"]

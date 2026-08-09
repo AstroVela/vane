@@ -317,13 +317,13 @@ def test_ref_bundle_submission_uses_direct_object_refs_without_registry():
 
 def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
     import vane.execution.udf_ray as fur
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     def identity(table):
         return table
 
     payload = _distributed_payload(
-        function_pickle=duckdb_pickle.dumps(identity),
+        function_pickle=vane_pickle.dumps(identity),
         null_handling=1,
         task_lease_id="lease-1",
         attempt_id="attempt-1",
@@ -357,13 +357,13 @@ def test_task_stream_producer_yields_direct_block_then_bounded_metadata():
 
 def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
     import vane.execution.udf_ray as fur
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     def plus_one(value):
         return value + 1
 
     payload = _distributed_payload(
-        function_pickle=duckdb_pickle.dumps(plus_one),
+        function_pickle=vane_pickle.dumps(plus_one),
         call_mode="map",
         scalar_arg_count=1,
         scalar_udf_type="native",
@@ -382,13 +382,13 @@ def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
 
 def test_materialized_task_splits_every_block_before_generator_publication():
     import vane.execution.udf_ray as fur
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     def plus_one(value):
         return value + 1
 
     payload = _distributed_payload(
-        function_pickle=duckdb_pickle.dumps(plus_one),
+        function_pickle=vane_pickle.dumps(plus_one),
         call_mode="map",
         scalar_arg_count=1,
         scalar_udf_type="native",
@@ -414,13 +414,13 @@ def test_materialized_task_splits_every_block_before_generator_publication():
 
 def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
     import vane.execution.udf_ray as fur
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     def identity(table):
         return table
 
     payload = _distributed_payload(
-        function_pickle=duckdb_pickle.dumps(identity),
+        function_pickle=vane_pickle.dumps(identity),
         call_mode="map_batches",
         task_lease_id="lease-oversized",
         attempt_id="attempt-oversized",

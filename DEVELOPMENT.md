@@ -42,7 +42,7 @@ Do not use `pip install -e`. An editable install can cause Ray workers to invoke
 
 Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
-`src/duckdb_py/` or `external/duckdb/src/` require an incremental native build.
+`src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
 ## Native C++ tests
 

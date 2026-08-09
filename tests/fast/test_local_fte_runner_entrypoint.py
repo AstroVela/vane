@@ -31,6 +31,30 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_root_set_runner_local_configures_the_execution_mode_in_subprocess():
+    script = """
+import os
+import vane
+import vane.runners as runners
+from typing import Any, get_type_hints
+from vane.runners.local import set_runner_local as set_runner_local_from_package
+from vane.runners.ray import set_runner_ray as set_runner_ray_from_package
+from vane.runners.runner import Runner
+
+os.environ.pop("VANE_RUNNER", None)
+runner = vane.set_runner_local(num_workers=1, max_running_tasks=1)
+assert runner.name == "local"
+assert os.environ["VANE_RUNNER"] == "local"
+assert vane.sql("SELECT 42").fetchall() == [(42,)]
+assert get_type_hints(vane.set_runner_local)["return"] is Any
+assert get_type_hints(vane.set_runner_ray)["return"] is Any
+assert get_type_hints(runners.get_or_create_runner)["return"] is Runner
+assert get_type_hints(set_runner_local_from_package)["return"] is Runner
+assert get_type_hints(set_runner_ray_from_package)["return"] is Runner
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_get_or_create_runner_accepts_local_env_in_subprocess():
     script = """
 import os

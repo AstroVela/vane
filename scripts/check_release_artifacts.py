@@ -18,11 +18,15 @@ import stat
 import subprocess
 import sys
 import tarfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass, field
 from email.parser import BytesParser
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
+
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 
 try:
     import tomllib
@@ -39,6 +43,11 @@ DUCKDB_FORK_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:-dirty)?")
 DUCKDB_UPSTREAM_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 FORBIDDEN_DISTRIBUTION_ROOTS = {"adbc_driver_duckdb", "duckdb"}
+WHEEL_DISTRIBUTION = re.sub(r"[-_.]+", "_", EXPECTED_NAME)
+WHEEL_VERSION = re.sub(r"[^A-Za-z0-9.]+", "_", EXPECTED_VERSION)
+EXPECTED_ARCHIVE_ROOT = f"{WHEEL_DISTRIBUTION}-{WHEEL_VERSION}"
+EXPECTED_DIST_INFO_ROOT = f"{EXPECTED_ARCHIVE_ROOT}.dist-info"
+EXPECTED_LIBRARY_ROOT = f"{WHEEL_DISTRIBUTION}.libs"
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -48,6 +57,7 @@ BANNED_PATH_PARTS = (
     "/external/duckdb/extension/tpcds/",
     "/external/duckdb/extension/tpch/",
     "/external/duckdb/third_party/tpce-tool/",
+    "/vane/_native.pyi",
     "/vane/session_",
     "/vcpkg_installed/",
 )
@@ -140,18 +150,31 @@ class SdistArtifact:
 
 
 def _normalized(name: str) -> str:
-    return "/" + name.replace("\\", "/").lstrip("/")
+    return "/" + name.rstrip("/")
+
+
+def _archive_path_key(name: str, artifact: Path) -> str:
+    if not name or "\\" in name or name.startswith("/") or PureWindowsPath(name).drive:
+        raise ValueError(f"{artifact}: unsafe archive path {name!r}")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ValueError(f"{artifact}: unsafe archive path {name!r}")
+
+    path_without_directory_marker = name[:-1] if name.endswith("/") else name
+    parts = path_without_directory_marker.split("/")
+    if not path_without_directory_marker or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{artifact}: unsafe archive path {name!r}")
+    return unicodedata.normalize("NFC", path_without_directory_marker).casefold()
 
 
 def _is_forbidden_import_root(path_component: str) -> bool:
-    import_name = path_component.partition(".")[0]
+    import_name = path_component.partition(".")[0].lower()
     return import_name in FORBIDDEN_DISTRIBUTION_ROOTS or import_name.startswith("_duckdb")
 
 
-def _require_suffix(names: list[str], suffix: str, artifact: Path) -> str:
-    matches = [name for name in names if _normalized(name).endswith(suffix)]
+def _require_exact_path(names: list[str], expected: str, artifact: Path) -> str:
+    matches = [name for name in names if name == expected]
     if len(matches) != 1:
-        raise ValueError(f"{artifact}: expected one *{suffix}, found {matches}")
+        raise ValueError(f"{artifact}: expected one archive member {expected!r}, found {matches}")
     return matches[0]
 
 
@@ -165,14 +188,29 @@ def _require_sdist_path(names: list[str], relative_path: str, artifact: Path) ->
 
 def _check_paths(artifact: Artifact) -> None:
     names = artifact.path_names()
-    if len(names) != len(set(names)):
-        raise ValueError(f"{artifact.path}: duplicate archive paths are not allowed")
+    canonical_paths: dict[str, str] = {}
+    canonical_files = {_archive_path_key(name, artifact.path): name for name in artifact.names()}
 
     for name in names:
-        normalized = _normalized(name)
-        pure_path = PurePosixPath(normalized)
-        if ".." in pure_path.parts:
-            raise ValueError(f"{artifact.path}: unsafe archive path {name}")
+        canonical_path = _archive_path_key(name, artifact.path)
+        previous = canonical_paths.get(canonical_path)
+        if previous is not None:
+            raise ValueError(
+                f"{artifact.path}: duplicate or cross-platform-colliding archive paths are not allowed: "
+                f"{previous!r}, {name!r}"
+            )
+        canonical_paths[canonical_path] = name
+
+        path_parts = canonical_path.split("/")
+        for depth in range(1, len(path_parts)):
+            ancestor = "/".join(path_parts[:depth])
+            ancestor_file = canonical_files.get(ancestor)
+            if ancestor_file is not None:
+                raise ValueError(
+                    f"{artifact.path}: archive file cannot be the parent of another member: {ancestor_file!r}, {name!r}"
+                )
+
+        normalized = _normalized(name).casefold()
         if any(part in normalized for part in BANNED_PATH_PARTS):
             raise ValueError(f"{artifact.path}: banned release path {name}")
         if normalized.endswith(BANNED_PATH_SUFFIXES):
@@ -281,13 +319,13 @@ def _load_content_rule_manifest(
     return _parse_content_rule_manifest(raw_manifest, source=source_name)
 
 
-def _metadata(artifact: Artifact, suffix: str):
-    name = _require_suffix(artifact.names(), suffix, artifact.path)
+def _metadata(artifact: Artifact, path: str):
+    name = _require_exact_path(artifact.names(), path, artifact.path)
     return BytesParser().parsebytes(artifact.read(name))
 
 
-def _check_metadata(artifact: Artifact, suffix: str):
-    metadata = _metadata(artifact, suffix)
+def _check_metadata(artifact: Artifact, path: str):
+    metadata = _metadata(artifact, path)
     if metadata["Name"] != EXPECTED_NAME:
         raise ValueError(f"{artifact.path}: unexpected project name {metadata['Name']!r}")
     if metadata["License-Expression"] != "Apache-2.0":
@@ -295,6 +333,16 @@ def _check_metadata(artifact: Artifact, suffix: str):
     if metadata["Version"] != EXPECTED_VERSION:
         raise ValueError(f"{artifact.path}: expected version {EXPECTED_VERSION!r}, found {metadata['Version']!r}")
     return metadata
+
+
+def _check_no_official_duckdb_dependency(artifact: Artifact, metadata) -> None:
+    for raw_requirement in metadata.get_all("Requires-Dist", []):
+        try:
+            requirement = Requirement(raw_requirement)
+        except InvalidRequirement:
+            raise ValueError(f"{artifact.path}: invalid Requires-Dist metadata {raw_requirement!r}") from None
+        if canonicalize_name(requirement.name) == "duckdb":
+            raise ValueError(f"{artifact.path}: vane-ai must not depend on the official duckdb distribution")
 
 
 def _check_sdist_license_files(artifact: SdistArtifact, metadata) -> None:
@@ -340,7 +388,7 @@ def _checkout_duckdb_fork_revision() -> str | None:
 
 
 def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
-    metadata_name = _require_suffix(artifact.names(), ".dist-info/METADATA", artifact.path)
+    metadata_name = _require_exact_path(artifact.names(), f"{EXPECTED_DIST_INFO_ROOT}/METADATA", artifact.path)
     license_root = PurePosixPath(metadata_name).parent / "licenses"
     names = artifact.names()
     for relative_path in metadata.get_all("License-File", []):
@@ -357,11 +405,11 @@ def _check_sdist(artifact: SdistArtifact) -> None:
     names = artifact.names()
     for name in names:
         parts = PurePosixPath(name).parts
-        if len(parts) < 2:
-            continue
-        source_root = parts[1]
-        if _is_forbidden_import_root(source_root):
+        possible_source_roots = parts[:2]
+        if any(_is_forbidden_import_root(source_root) for source_root in possible_source_roots):
             raise ValueError(f"{artifact.path}: Vane sdist contains conflicting Python package path {name!r}")
+        if not parts or parts[0] != EXPECTED_ARCHIVE_ROOT:
+            raise ValueError(f"{artifact.path}: Vane sdist contains an unexpected archive root: {name!r}")
 
     required_paths = (
         "DUCKDB_FORK_REVISION",
@@ -383,6 +431,12 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
+        "vane/_native/__init__.pyi",
+        "vane/_native/_func.pyi",
+        "vane/_native/_sqltypes.pyi",
+        "vane/_native/ray_cxx.pyi",
+        "vane/sqltypes/__init__.pyi",
+        "vane/udf.pyi",
     )
     for relative_path in required_paths:
         _require_sdist_path(names, relative_path, artifact.path)
@@ -419,7 +473,8 @@ def _check_sdist(artifact: SdistArtifact) -> None:
             f"does not match checkout {checkout_upstream_version!r}"
         )
 
-    metadata = _check_metadata(artifact, "/PKG-INFO")
+    metadata = _check_metadata(artifact, f"{EXPECTED_ARCHIVE_ROOT}/PKG-INFO")
+    _check_no_official_duckdb_dependency(artifact, metadata)
     _check_sdist_license_files(artifact, metadata)
 
 
@@ -429,18 +484,31 @@ def _urlsafe_sha256(data: bytes) -> str:
 
 
 def _check_wheel_record(artifact: WheelArtifact) -> None:
-    record_name = _require_suffix(artifact.names(), ".dist-info/RECORD", artifact.path)
-    rows = csv.reader(io.StringIO(artifact.read(record_name).decode("utf-8")))
+    record_name = _require_exact_path(artifact.names(), f"{EXPECTED_DIST_INFO_ROOT}/RECORD", artifact.path)
+    try:
+        rows = csv.reader(io.StringIO(artifact.read(record_name).decode("utf-8")))
+    except UnicodeError:
+        raise ValueError(f"{artifact.path}: RECORD is not valid UTF-8") from None
     recorded: set[str] = set()
-    for name, digest, size in rows:
+    artifact_names = set(artifact.names())
+    for row in rows:
+        if len(row) != 3:
+            raise ValueError(f"{artifact.path}: invalid RECORD row {row!r}")
+        name, digest, size = row
+        if name in recorded:
+            raise ValueError(f"{artifact.path}: duplicate RECORD entry for {name!r}")
+        if name not in artifact_names:
+            raise ValueError(f"{artifact.path}: RECORD names a missing file {name!r}")
         recorded.add(name)
         if name == record_name:
+            if digest or size:
+                raise ValueError(f"{artifact.path}: RECORD must not hash or size itself")
             continue
         data = artifact.read(name)
         expected_digest = f"sha256={_urlsafe_sha256(data)}"
         if digest != expected_digest or size != str(len(data)):
             raise ValueError(f"{artifact.path}: invalid RECORD entry for {name}")
-    missing = set(artifact.names()) - recorded
+    missing = artifact_names - recorded
     if missing:
         raise ValueError(f"{artifact.path}: files missing from RECORD: {sorted(missing)}")
 
@@ -449,12 +517,10 @@ def _check_wheel(artifact: WheelArtifact) -> None:
     names = artifact.names()
     for name in names:
         parts = PurePosixPath(name).parts
-        import_parts = parts
-        if len(parts) >= 3 and parts[0].endswith(".data") and parts[1] in {"platlib", "purelib"}:
-            import_parts = parts[2:]
-        import_root = import_parts[0]
-        if _is_forbidden_import_root(import_root):
-            raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
+        root = parts[0]
+        if root in {"vane", EXPECTED_DIST_INFO_ROOT, EXPECTED_LIBRARY_ROOT}:
+            continue
+        raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
 
     native_extensions = [
         name
@@ -468,24 +534,22 @@ def _check_wheel(artifact: WheelArtifact) -> None:
             f"{artifact.path}: expected one platform extension under vane/_native.*, found {native_extensions}"
         )
 
-    required_suffixes = (
-        "/vane/py.typed",
-        ".dist-info/licenses/LICENSE",
-        ".dist-info/licenses/NOTICE",
-        ".dist-info/licenses/LICENSES/DuckDB-MIT.txt",
-        ".dist-info/licenses/LICENSES/vcpkg-binary-dependencies.txt",
-        ".dist-info/licenses/vane/experimental/spark/LICENSE",
-        ".dist-info/licenses/external/duckdb/LICENSE",
-        ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE",
-        ".dist-info/licenses/external/duckdb/src/include/duckdb/storage/compression/alprd/algorithm/LICENSE",
+    required_paths = (
+        "vane/py.typed",
+        "vane/_native/__init__.pyi",
+        "vane/_native/_func.pyi",
+        "vane/_native/_sqltypes.pyi",
+        "vane/_native/ray_cxx.pyi",
+        "vane/sqltypes/__init__.pyi",
+        "vane/udf.pyi",
+        f"{EXPECTED_DIST_INFO_ROOT}/METADATA",
+        f"{EXPECTED_DIST_INFO_ROOT}/WHEEL",
+        f"{EXPECTED_DIST_INFO_ROOT}/RECORD",
     )
-    for suffix in required_suffixes:
-        _require_suffix(names, suffix, artifact.path)
-    metadata = _check_metadata(artifact, ".dist-info/METADATA")
-    for requirement in metadata.get_all("Requires-Dist", []):
-        requirement_name = re.split(r"[ ;(<=>!~\[]", requirement, maxsplit=1)[0].lower().replace("_", "-")
-        if requirement_name == "duckdb":
-            raise ValueError(f"{artifact.path}: vane-ai must not depend on the official duckdb distribution")
+    for required_path in required_paths:
+        _require_exact_path(names, required_path, artifact.path)
+    metadata = _check_metadata(artifact, f"{EXPECTED_DIST_INFO_ROOT}/METADATA")
+    _check_no_official_duckdb_dependency(artifact, metadata)
     _check_wheel_license_files(artifact, metadata)
     _check_wheel_record(artifact)
 

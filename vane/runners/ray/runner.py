@@ -10,10 +10,8 @@ import weakref
 from typing import TYPE_CHECKING, Any
 
 from vane._ray_cxx import require_ray_cxx_attr
-from vane._ray_progress_env import configure_ray_progress_logging_defaults, ray_log_to_driver_default
+from vane._ray_progress_env import ray_log_to_driver_default
 from vane._vane_session import ensure_vane_session_dir
-
-configure_ray_progress_logging_defaults()
 
 from vane.runners.ray.admission_ledger import BoundedReplayMap
 from vane.runners.ray.driver import RayQueryDriverClient

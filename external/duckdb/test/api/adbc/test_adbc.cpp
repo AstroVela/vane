@@ -1033,7 +1033,7 @@ TEST_CASE("Test Not-Implemented Partition Functions", "[adbc]") {
 
 	auto status = AdbcConnectionReadPartition(&adbc_connection, nullptr, 0, nullptr, &adbc_error);
 	REQUIRE((status == ADBC_STATUS_NOT_IMPLEMENTED));
-	REQUIRE((std::strcmp(adbc_error.message, "Read Partitions are not supported in DuckDB") == 0));
+	REQUIRE((std::strcmp(adbc_error.message, "Read Partitions are not supported in Vane") == 0));
 	adbc_error.release(&adbc_error);
 
 	AdbcStatement adbc_statement;
@@ -1041,7 +1041,7 @@ TEST_CASE("Test Not-Implemented Partition Functions", "[adbc]") {
 
 	status = AdbcStatementExecutePartitions(&adbc_statement, nullptr, nullptr, nullptr, &adbc_error);
 	REQUIRE((status == ADBC_STATUS_NOT_IMPLEMENTED));
-	REQUIRE((std::strcmp(adbc_error.message, "Execute Partitions are not supported in DuckDB") == 0));
+	REQUIRE((std::strcmp(adbc_error.message, "Execute Partitions are not supported in Vane") == 0));
 	adbc_error.release(&adbc_error);
 	REQUIRE(SUCCESS(AdbcStatementRelease(&adbc_statement, &adbc_error)));
 	REQUIRE(SUCCESS(AdbcConnectionRelease(&adbc_connection, &adbc_error)));

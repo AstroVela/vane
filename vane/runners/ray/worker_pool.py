@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from vane._ray_cxx import require_ray_cxx_attr
+from vane._native.ray_cxx import RayWorkerRuntime
 from vane.runners.ray.fragment_worker_client import RayWorkerActorHandle
 from vane.runners.ray.fte_fragment_scheduler import (
     _collect_vane_env_overrides,
@@ -17,11 +17,6 @@ from vane.runners.ray.fte_scheduler_config import _is_ray_worker_context
 from vane.runners.ray.safe_get import resolve_object_refs_blocking
 from vane.runners.ray.worker import RayWorkerActor
 from vane.runners.ray.worker_memory import build_ray_node_memory_layout
-
-RayWorkerRuntime: Any = require_ray_cxx_attr(
-    "RayWorkerRuntime",
-    hint="Ensure the C++ ray extension is built and importable in the driver process.",
-)
 
 
 def _persistent_worker_runtime_env(env_vars: dict[str, str]) -> dict[str, Any]:

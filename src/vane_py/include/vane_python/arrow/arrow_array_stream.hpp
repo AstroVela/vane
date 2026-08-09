@@ -1,0 +1,131 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
+//===----------------------------------------------------------------------===//
+#include "vane_python/pybind11/gil_wrapper.hpp"
+//                         DuckDB
+//
+// vane_python/arrow/arrow_array_stream.hpp
+//
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/common/constants.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/config.hpp"
+#include "vane_python/pybind11/pybind_wrapper.hpp"
+
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/main/client_properties.hpp"
+
+namespace duckdb {
+
+namespace pyarrow {
+
+class RecordBatchReader : public py::object {
+public:
+	RecordBatchReader(const py::object &o) : py::object(o, borrowed_t {}) {
+	}
+	using py::object::object;
+
+public:
+	static bool check_(const py::handle &object) {
+		return !py::none().is(object);
+	}
+};
+
+class Table : public py::object {
+public:
+	Table(const py::object &o) : py::object(o, borrowed_t {}) {
+	}
+	using py::object::object;
+
+public:
+	static bool check_(const py::handle &object) {
+		return !py::none().is(object);
+	}
+};
+
+} // namespace pyarrow
+
+enum class PyArrowObjectType {
+	Invalid,
+	Table,
+	Scanner,
+	Dataset,
+	PyCapsule,
+	PyCapsuleInterface,
+	MessageReader,
+	PolarsLazyFrame
+};
+
+void TransformDuckToArrowChunk(ArrowSchema &arrow_schema, ArrowArray &data, py::list &batches);
+
+PyArrowObjectType GetArrowType(const py::handle &obj);
+
+class PythonTableArrowArrayStreamFactory {
+public:
+	explicit PythonTableArrowArrayStreamFactory(PyObject *arrow_table, const ClientProperties &client_properties_p,
+	                                            PyArrowObjectType arrow_type_p)
+	    : arrow_object(arrow_table), client_properties(client_properties_p), cached_arrow_type(arrow_type_p) {
+		cached_schema.release = nullptr;
+	}
+
+	~PythonTableArrowArrayStreamFactory() {
+		if (cached_arrow_table.ptr() != nullptr) {
+			PythonGILWrapper acquire;
+			cached_arrow_table = py::object();
+		}
+		if (cached_schema.release) {
+			cached_schema.release(&cached_schema);
+		}
+	}
+
+	//! Produces an Arrow Scanner, should be only called once when initializing Scan States
+	static unique_ptr<ArrowArrayStreamWrapper> Produce(uintptr_t factory, ArrowStreamParameters &parameters);
+
+	//! Get the schema of the arrow object
+	static void GetSchemaInternal(py::handle arrow_object, ArrowSchemaWrapper &schema);
+	static void GetSchema(uintptr_t factory_ptr, ArrowSchemaWrapper &schema);
+
+	//! Arrow Object (i.e., Scanner, Record Batch Reader, Table, Dataset)
+	PyObject *arrow_object;
+
+	const ClientProperties client_properties;
+	const PyArrowObjectType cached_arrow_type;
+
+	//! Cached Arrow table from an unfiltered .collect().to_arrow() on a LazyFrame.
+	//! Avoids re-reading from source and re-converting on repeated scans without filters.
+	py::object cached_arrow_table;
+
+private:
+	ArrowSchema cached_schema;
+	bool schema_cached = false;
+
+	static py::object ProduceScanner(py::object &arrow_scanner, py::handle &arrow_obj_handle,
+	                                 ArrowStreamParameters &parameters, const ClientProperties &client_properties);
+};
+} // namespace duckdb
+
+namespace pybind11 {
+namespace detail {
+template <>
+struct handle_type_name<duckdb::pyarrow::RecordBatchReader> {
+	static constexpr auto name = _("pyarrow.lib.RecordBatchReader");
+};
+template <>
+struct handle_type_name<duckdb::pyarrow::Table> {
+	static constexpr auto name = _("pyarrow.lib.Table");
+};
+} // namespace detail
+} // namespace pybind11

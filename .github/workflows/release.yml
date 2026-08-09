@@ -45,7 +45,7 @@ jobs:
 
       - name: Build and validate the source package
         run: |
-          python -m pip install --upgrade build pip
+          python -m pip install --upgrade build packaging pip
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
@@ -78,6 +78,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --upgrade packaging
+
       - name: Download the exact source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -102,6 +110,13 @@ jobs:
         run: |
           test "$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
           python scripts/check_release_artifacts.py wheelhouse/*.whl
+
+      - name: Verify the final CPython 3.12 wheel coexists with DuckDB
+        run: |
+          wheel="$(find wheelhouse -maxdepth 1 -type f -name '*-cp312-cp312-*.whl' -print)"
+          test -n "$wheel"
+          test "$(printf '%s\n' "$wheel" | wc -l)" -eq 1
+          python scripts/verify_duckdb_coexistence.py "$wheel"
 
       - name: Apply private content rules to wheels
         if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
@@ -136,6 +151,14 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --upgrade packaging
 
       - name: Download source package
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0

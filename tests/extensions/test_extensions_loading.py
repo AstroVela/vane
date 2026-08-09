@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_extension_loading(require):
-    if not os.getenv("DUCKDB_PYTHON_TEST_EXTENSION_REQUIRED", False):
+    if not os.getenv("VANE_PYTHON_TEST_EXTENSION_REQUIRED", False):
         return
     extensions_list = ["json", "excel", "httpfs", "tpch", "tpcds", "icu", "fts"]
     for extension in extensions_list:

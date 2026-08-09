@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
     from multiprocessing import shared_memory
 
-from vane import pickle as duckdb_pickle
+from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
@@ -371,7 +371,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         *,
         startup_observer: Callable[[_SingleSubprocessExecutor], None] | None = None,
     ) -> None:
-        payload_bytes = duckdb_pickle.dumps(payload)
+        payload_bytes = vane_pickle.dumps(payload)
         payload_size = _IPC_HEADER.size + len(payload_bytes)
         payload_shm = _create_shm(max(payload_size, 4096), track=False)
         data_shm = _create_shm(_DEFAULT_SHM_SIZE, track=False)
@@ -792,21 +792,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _handle_submit_control_message(self, msg_type: int, payload: bytes) -> bool:
         if msg_type == _MSG_INPUT_CONSUMED:
-            event = duckdb_pickle.loads(payload)
+            event = vane_pickle.loads(payload)
             lease_id = int(event["input_lease_id"])
             consume_local_shm_input_lease(lease_id, name="udf-input")
             self._untrack_input_lease(lease_id)
             self._notify_wakeup()
             return True
         if msg_type == _MSG_INPUT_CONSUME_FAILED:
-            event = duckdb_pickle.loads(payload)
+            event = vane_pickle.loads(payload)
             lease_id = int(event["input_lease_id"])
             cancel_local_shm_input_lease(lease_id, name="udf-input")
             self._untrack_input_lease(lease_id)
             self._notify_wakeup()
             return True
         if msg_type == _MSG_OUTPUT_GRANT_REQUEST:
-            event = duckdb_pickle.loads(payload)
+            event = vane_pickle.loads(payload)
             request_id = int(event.get("request_id", 0))
             size = int(event["size_bytes"])
             priority = str(event.get("priority") or "consumer")
@@ -835,7 +835,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 return True
             response = {"request_id": request_id, "grant_id": int(grant_id)}
             try:
-                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, duckdb_pickle.dumps(response))
+                _send_message(self._require_socket(), _MSG_OUTPUT_GRANT_GRANTED, vane_pickle.dumps(response))
             except BaseException as exc:
                 self._release_output_grant(grant_id, name=f"udf-output-{request_id}-send-failed")
                 self._mark_broken(f"UDF subprocess output grant response failed: {exc}", actor_lost=True)
@@ -843,7 +843,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._notify_wakeup()
             return True
         if msg_type == _MSG_OUTPUT_GRANT_RELEASE:
-            event = duckdb_pickle.loads(payload)
+            event = vane_pickle.loads(payload)
             grant_id = int(event["grant_id"])
             self._release_output_grant(grant_id, name="udf-output-worker-release")
             self._notify_wakeup()
@@ -888,7 +888,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._mark_broken(f"UDF subprocess unexpectedly cancelled a task: {error}")
                 raise RuntimeError(self._broken_error)
             if msg_type == _MSG_REF_BUNDLE_RESULT:
-                descriptor = duckdb_pickle.loads(payload)
+                descriptor = vane_pickle.loads(payload)
                 grant_id_raw = descriptor.get("grant_id") if isinstance(descriptor, dict) else None
                 grant_id = int(grant_id_raw) if grant_id_raw is not None else None
                 scope = self._current_execution_scope()
@@ -967,7 +967,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self._untrack_input_lease(lease_id)
                 scope.raise_if_cancelled("UDF subprocess submit")
         try:
-            payload_bytes = duckdb_pickle.dumps(payload)
+            payload_bytes = vane_pickle.dumps(payload)
             _send_message(sock, _MSG_SUBMIT_REF_BUNDLE, payload_bytes)
         except Exception as exc:
             broken_error = f"UDF subprocess ref-bundle submit failed: {exc}"
@@ -1339,7 +1339,7 @@ def _payload_task_key(
         if session_config is None
         else tuple(sorted((str(key), str(value)) for key, value in session_config.items())),
     )
-    return hashlib.sha256(duckdb_pickle.dumps(identity)).hexdigest()
+    return hashlib.sha256(vane_pickle.dumps(identity)).hexdigest()
 
 
 def _worker_is_reusable(worker: Any) -> bool:

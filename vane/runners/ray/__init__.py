@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
 
 from vane.runners.copy_outcome import CopyOutcomeUnknownError
 from vane.runners.ray.committed_copy import (
@@ -16,10 +15,7 @@ from vane.runners.ray.committed_copy import (
 )
 from vane.runners.ray.lifecycle import cleanup_copy_direct_write_lifecycle_once
 from vane.runners.ray.runner import RayRunner
-
-if TYPE_CHECKING:
-    from vane.runners.runner import Runner
-
+from vane.runners.runner import Runner
 
 __all__ = [
     "CopyOutcomeUnknownError",
@@ -40,9 +36,17 @@ def set_runner_ray(
     """Configure Vane to use the Ray distributed computing framework."""
     from vane import _native
 
+    previous_runner = os.environ.get("VANE_RUNNER")
     os.environ["VANE_RUNNER"] = "ray"
-    return _native.set_runner_ray(
-        address,
-        noop_if_initialized,
-        max_task_backlog,
-    )
+    try:
+        return _native.set_runner_ray(
+            address,
+            noop_if_initialized,
+            max_task_backlog,
+        )
+    except BaseException:
+        if previous_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = previous_runner
+        raise

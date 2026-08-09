@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._ray_errors import restore_remote_ray_exception
-from vane._ray_progress_env import configure_ray_progress_logging_defaults
 
 RayResultPartitionRef = require_ray_cxx_attr(
     "RayResultPartitionRef",
@@ -34,8 +33,6 @@ RayTaskResult = require_ray_cxx_attr(
     "RayTaskResult",
     hint="Ensure the C++ ray extension is built and importable in the driver process.",
 )
-
-configure_ray_progress_logging_defaults()
 
 from vane.event_loop import set_event_loop
 from vane.runners.copy_outcome import CopyOutcomeUnknownError

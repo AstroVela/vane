@@ -1,12 +1,41 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
 # Modified by Vane contributors.
 
-import typing
-
-import vane
+from vane._native._sqltypes import (
+    BIGINT as BIGINT,
+    BIT as BIT,
+    BLOB as BLOB,
+    BOOLEAN as BOOLEAN,
+    DATE as DATE,
+    DOUBLE as DOUBLE,
+    FLOAT as FLOAT,
+    HUGEINT as HUGEINT,
+    INTEGER as INTEGER,
+    INTERVAL as INTERVAL,
+    SMALLINT as SMALLINT,
+    SQLNULL as SQLNULL,
+    TIME as TIME,
+    TIME_NS as TIME_NS,
+    TIME_TZ as TIME_TZ,
+    TIMESTAMP as TIMESTAMP,
+    TIMESTAMP_MS as TIMESTAMP_MS,
+    TIMESTAMP_NS as TIMESTAMP_NS,
+    TIMESTAMP_S as TIMESTAMP_S,
+    TIMESTAMP_TZ as TIMESTAMP_TZ,
+    TINYINT as TINYINT,
+    UBIGINT as UBIGINT,
+    UHUGEINT as UHUGEINT,
+    UINTEGER as UINTEGER,
+    USMALLINT as USMALLINT,
+    UTINYINT as UTINYINT,
+    UUID as UUID,
+    VARCHAR as VARCHAR,
+    VARIANT as VARIANT,
+    DuckDBPyType as DuckDBPyType,
+)
 
 __all__: list[str] = [
     "BIGINT",
@@ -40,47 +69,3 @@ __all__: list[str] = [
     "VARIANT",
     "DuckDBPyType",
 ]
-
-class DuckDBPyType:
-    def __eq__(self, other: object) -> bool: ...
-    def __getattr__(self, name: str) -> DuckDBPyType: ...
-    def __getitem__(self, name: str) -> DuckDBPyType: ...
-    def __hash__(self) -> int: ...
-    @typing.overload
-    def __init__(self, type_str: str, connection: vane.DuckDBPyConnection) -> None: ...
-    @typing.overload
-    def __init__(self, obj: object) -> None: ...
-    @property
-    def children(self) -> list[tuple[str, DuckDBPyType | int | list[str]]]: ...
-    @property
-    def id(self) -> str: ...
-
-BIGINT: DuckDBPyType  # value = BIGINT
-BIT: DuckDBPyType  # value = BIT
-BLOB: DuckDBPyType  # value = BLOB
-BOOLEAN: DuckDBPyType  # value = BOOLEAN
-DATE: DuckDBPyType  # value = DATE
-DOUBLE: DuckDBPyType  # value = DOUBLE
-FLOAT: DuckDBPyType  # value = FLOAT
-HUGEINT: DuckDBPyType  # value = HUGEINT
-INTEGER: DuckDBPyType  # value = INTEGER
-INTERVAL: DuckDBPyType  # value = INTERVAL
-SMALLINT: DuckDBPyType  # value = SMALLINT
-SQLNULL: DuckDBPyType  # value = "NULL"
-TIME: DuckDBPyType  # value = TIME
-TIME_NS: DuckDBPyType  # value = TIME_NS
-TIMESTAMP: DuckDBPyType  # value = TIMESTAMP
-TIMESTAMP_MS: DuckDBPyType  # value = TIMESTAMP_MS
-TIMESTAMP_NS: DuckDBPyType  # value = TIMESTAMP_NS
-TIMESTAMP_S: DuckDBPyType  # value = TIMESTAMP_S
-TIMESTAMP_TZ: DuckDBPyType  # value = TIMESTAMP WITH TIME ZONE
-TIME_TZ: DuckDBPyType  # value = TIME WITH TIME ZONE
-TINYINT: DuckDBPyType  # value = TINYINT
-UBIGINT: DuckDBPyType  # value = UBIGINT
-UHUGEINT: DuckDBPyType  # value = UHUGEINT
-UINTEGER: DuckDBPyType  # value = UINTEGER
-USMALLINT: DuckDBPyType  # value = USMALLINT
-UTINYINT: DuckDBPyType  # value = UTINYINT
-UUID: DuckDBPyType  # value = UUID
-VARCHAR: DuckDBPyType  # value = VARCHAR
-VARIANT: DuckDBPyType  # value = VARIANT

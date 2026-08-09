@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
@@ -159,9 +159,9 @@ def require():
             (build / "debug", "extension/*/*.duckdb_extension"),
         ]
 
-        # DUCKDB_PYTHON_TEST_EXTENSION_PATH can be used to add a path for the extension test to search for extensions
-        if "DUCKDB_PYTHON_TEST_EXTENSION_PATH" in os.environ:
-            env_extension_path = Path(os.environ["DUCKDB_PYTHON_TEST_EXTENSION_PATH"])
+        # VANE_PYTHON_TEST_EXTENSION_PATH can be used to add a path for the extension test to search for extensions
+        if "VANE_PYTHON_TEST_EXTENSION_PATH" in os.environ:
+            env_extension_path = Path(os.environ["VANE_PYTHON_TEST_EXTENSION_PATH"])
             extension_search_patterns.append((env_extension_path, "*/*.duckdb_extension"))
             extension_search_patterns.append((env_extension_path, "*.duckdb_extension"))
 
@@ -383,7 +383,7 @@ def pytest_configure(config):
         timeout = int(os.getenv("TEST_TIMEOUT", "300"))
         faulthandler.dump_traceback_later(timeout, repeat=False)
         # record that we scheduled a dump so we can cancel it in pytest_unconfigure
-        config._duckdb_faulthandler_dump_scheduled = True
+        config._vane_faulthandler_dump_scheduled = True
     except Exception:
         # best-effort; don't fail pytest initialization if this doesn't work
         pass
@@ -391,7 +391,7 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     try:
-        if getattr(config, "_duckdb_faulthandler_dump_scheduled", False):
+        if getattr(config, "_vane_faulthandler_dump_scheduled", False):
             faulthandler.cancel_dump_traceback_later()
     except Exception:
         pass

@@ -362,15 +362,18 @@ assert vane_runners.get_runner() is results[0]
 
 def test_ray_noop_does_not_reuse_local_runner():
     script = """
-import vane.runners as runners
+import os
+import vane
 
-runners.set_runner_local()
+vane.set_runner_local()
 try:
-    runners.set_runner_ray(noop_if_initialized=True)
+    vane.set_runner_ray(noop_if_initialized=True)
 except RuntimeError as exc:
     assert "Cannot set runner more than once" in str(exc)
 else:
     raise AssertionError("expected Ray setup to reject existing local runner")
+assert os.environ["VANE_RUNNER"] == "local"
+assert vane.sql("SELECT 42").fetchall() == [(42,)]
 """
     subprocess.run([sys.executable, "-c", script], check=True)
 

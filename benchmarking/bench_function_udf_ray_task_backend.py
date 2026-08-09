@@ -53,7 +53,7 @@ def _parse_backends(raw: str) -> list[str]:
 
 
 def _make_payload(work_iterations: int, execution_backend: str) -> dict:
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     def cpu_udf(value: object) -> int:
         acc = int(value)
@@ -62,7 +62,7 @@ def _make_payload(work_iterations: int, execution_backend: str) -> dict:
         return acc
 
     return {
-        "function_pickle": duckdb_pickle.dumps(cpu_udf),
+        "function_pickle": vane_pickle.dumps(cpu_udf),
         "call_mode": "map",
         "execution_backend": execution_backend,
     }

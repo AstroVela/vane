@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 #
 # SPDX-FileCopyrightText: 2026 Vane contributors
 #
@@ -131,6 +131,14 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE
       CACHE BOOL "Use Arrow/Flight static libs from external/duckdb/installed")
 endif()
 
+# The engine is linked into Vane's extension rather than built as a DuckDB DLL.
+# On Windows this disables DuckDB's and ADBC's __declspec(dllexport) annotations
+# so object-file directives cannot bypass the extension's explicit export list.
+# ADBC_EXPORT is intentionally defined as an empty replacement.
+if(WIN32)
+  add_compile_definitions(DUCKDB_STATIC_BUILD ADBC_EXPORT=)
+endif()
+
 duckdb_add_library(duckdb_target)
 
 # Vane embeds DuckDB statically, but its shared library is not the official
@@ -142,20 +150,24 @@ target_compile_definitions(duckdb_adbc PRIVATE duckdb_adbc_init=vane_adbc_init)
 add_library(vane_python_dependencies INTERFACE)
 target_link_libraries(vane_python_dependencies INTERFACE pybind11::pybind11
                                                          duckdb_target)
+# Give every Vane binding translation unit a private pybind ABI identity. This
+# prevents the conduit and module-local capsule protocols from exchanging C++
+# objects with a separately installed DuckDB extension.
+target_compile_definitions(vane_python_dependencies
+                           INTERFACE PYBIND11_COMPILER_TYPE="vane")
 # Also add include directory
 target_include_directories(
   vane_python_dependencies
-  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/duckdb_py/include>
-)
+  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/vane_py/include>)
 
 # ────────────────────────────────────────────
-# Descend into the real DuckDB‑Python sources
+# Descend into Vane's DuckDB-derived Python binding sources
 # ────────────────────────────────────────────
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-add_subdirectory(src/duckdb_py)
+add_subdirectory(src/vane_py)
 
 pybind11_add_module(
   _native
@@ -181,14 +193,13 @@ duckdb_link_extensions(_native)
 # ────────────────────────────────────────────
 # Controlling symbol export
 #
-# We export exactly two Vane-owned symbols: - PyInit__native: this allows
-# CPython to load ``vane._native`` - vane_adbc_init: the Vane ADBC driver
+# We export exactly two Vane-owned symbols: - PyInit__native: allows CPython to
+# load ``vane._native`` - vane_adbc_init: initializes the Vane ADBC driver
 #
-# The export of symbols on OSX and Linux is controlled by: - Visibility
-# annotations in the code (for this lib we use the PYBIND11_EXPORT macro) -
-# Telling the linker which symbols we want exported, which we do below
-#
-# For Windows, we rely on just the visbility annotations.
+# The extension uses hidden visibility by default. On macOS and Linux the linker
+# allowlists only these entry points. On Windows DUCKDB_STATIC_BUILD and the
+# empty ADBC_EXPORT definition suppress embedded export directives; explicit
+# /EXPORT options expose the two entry points.
 # ────────────────────────────────────────────
 set_target_properties(
   _native

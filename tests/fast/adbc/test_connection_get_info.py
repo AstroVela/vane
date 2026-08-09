@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
@@ -31,9 +31,9 @@ class TestADBCConnectionGetInfo:
 
         expected_result = pa.array(
             [
-                "duckdb",
+                "Vane",
                 "v" + vane.__engine_version__,  # don't hardcode this, as it will change every version
-                "ADBC DuckDB Driver",
+                "ADBC Vane Driver",
                 "v" + vane.__engine_version__,  # don't hardcode this, as it will change every version
                 "(unknown)",
                 None,
@@ -65,7 +65,7 @@ class TestADBCConnectionGetInfo:
         table = reader.read_all()
         values = table["info_value"]
 
-        expected_result = pa.array(["duckdb"], type=pa.string())
+        expected_result = pa.array(["Vane"], type=pa.string())
 
         assert values.num_chunks == 1
         chunk = values.chunk(0)

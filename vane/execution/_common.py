@@ -69,11 +69,11 @@ def iter_table_batches(table: pa.Table, batch_size: int | None) -> Iterable[pa.T
 
 def load_udf_from_payload(payload: dict[str, Any]) -> Any:
     """Deserialize the UDF callable from a payload's function_pickle field."""
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     function_pickle = _payload_pickle_bytes(payload)
     _record_udf_callable_load(payload)
-    return duckdb_pickle.loads(function_pickle)
+    return vane_pickle.loads(function_pickle)
 
 
 def _record_udf_callable_load(payload: dict[str, Any]) -> None:

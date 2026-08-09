@@ -30,7 +30,7 @@ class TestMultiStatement:
         assert results == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
         # test export/import
-        export_location = Path.cwd() / "duckdb_pytest_dir_export"
+        export_location = Path.cwd() / "vane_pytest_dir_export"
         with contextlib.suppress(Exception):
             shutil.rmtree(export_location)
         con.execute("CREATE TABLE integers2(i INTEGER)")

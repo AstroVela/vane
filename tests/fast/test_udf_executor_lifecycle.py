@@ -3596,7 +3596,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     executor._active_output_grants_lock = threading.Lock()
     executor._recv_expected = lambda _expected: (
         subprocess_exec._MSG_REF_BUNDLE_RESULT,
-        subprocess_exec.duckdb_pickle.dumps(descriptor),
+        subprocess_exec.vane_pickle.dumps(descriptor),
     )
 
     released = []
@@ -4056,7 +4056,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", fake_request)
 
     try:
-        payload = subprocess_exec.duckdb_pickle.dumps(
+        payload = subprocess_exec.vane_pickle.dumps(
             {
                 "request_id": 9,
                 "size_bytes": 128,
@@ -4067,7 +4067,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
         assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
 
         msg_type, response_payload = subprocess_exec._recv_message(child_sock)
-        response = subprocess_exec.duckdb_pickle.loads(response_payload)
+        response = subprocess_exec.vane_pickle.loads(response_payload)
         assert msg_type == subprocess_exec._MSG_OUTPUT_GRANT_GRANTED
         assert response["grant_id"] == 77
         assert captured == {
@@ -6831,7 +6831,7 @@ def test_ref_bundle_slices_apply_projection_and_names():
 
 def test_callable_cache_reuses_deserialized_callable(monkeypatch):
     import vane.execution._common as common
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     common.clear_udf_callable_cache()
     calls = []
@@ -6840,7 +6840,7 @@ def test_callable_cache_reuses_deserialized_callable(monkeypatch):
         calls.append(data)
         return object()
 
-    monkeypatch.setattr(duckdb_pickle, "loads", _fake_loads)
+    monkeypatch.setattr(vane_pickle, "loads", _fake_loads)
 
     payload = {
         "function_pickle": b"function-a",
@@ -6883,7 +6883,7 @@ def test_runtime_callable_cache_contract_applies_to_every_udf_type(
     load_stat,
 ):
     import vane.execution._common as common
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
     from vane.execution._udf_runtime import UDFExecutor
 
     common.clear_udf_callable_cache()
@@ -6896,7 +6896,7 @@ def test_runtime_callable_cache_contract_applies_to_every_udf_type(
         calls.append(data)
         return udf
 
-    monkeypatch.setattr(duckdb_pickle, "loads", fake_loads)
+    monkeypatch.setattr(vane_pickle, "loads", fake_loads)
     payload = {
         "function_pickle": f"{call_mode}-{scalar_udf_type}".encode(),
         "call_mode": call_mode,
@@ -7641,7 +7641,7 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
 
 def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     import vane.execution.udf_subprocess as subprocess_exec
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
     from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
@@ -7670,7 +7670,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     executor._sock = _FakeControlSocket()
     executor._proc = None
 
-    payload = duckdb_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
     assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] >= before + 4096
 
@@ -7903,7 +7903,7 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
 
 def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch):
     import vane.execution.udf_subprocess_worker as worker
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     class FakeExecutor:
         def submit(self, _table):
@@ -7916,7 +7916,7 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
         assert grant_id is None
         raise RuntimeError("descriptor failed")
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 7, "grant_id": 99})
+    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", fail_descriptor)
@@ -7934,13 +7934,13 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
     messages = _decode_control_messages(bytes(sock.sent), worker._HEADER)
     release_type = getattr(worker, "_MSG_OUTPUT_GRANT_RELEASE", 0x0F)
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST, release_type]
-    release_payload = duckdb_pickle.loads(messages[1][1])
+    release_payload = vane_pickle.loads(messages[1][1])
     assert release_payload == {"grant_id": 99}
 
 
 def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):
     import vane.execution.udf_subprocess_worker as worker
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     class FakeExecutor:
         def submit(self, _table):
@@ -7952,7 +7952,7 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
                 pa.table({"payload": [b"b" * 64]}),
             ]
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 11, "grant_id": 101})
+    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
 
@@ -7966,7 +7966,7 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
     )
 
     assert msg_type == worker._MSG_REF_BUNDLE_RESULT
-    descriptor = duckdb_pickle.loads(payload)
+    descriptor = vane_pickle.loads(payload)
     assert len(descriptor["block_refs"]) == 2
     assert [meta["num_rows"] for meta in descriptor["metadata"]] == [1, 1]
     assert [meta["size_bytes"] for meta in descriptor["metadata"]] == [
@@ -7977,14 +7977,14 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
 
     messages = _decode_control_messages(bytes(sock.sent), worker._HEADER)
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST]
-    request_payload = duckdb_pickle.loads(messages[0][1])
+    request_payload = vane_pickle.loads(messages[0][1])
     assert request_payload["request_id"] == 11
     assert request_payload["size_bytes"] >= sum(meta["ipc_size_bytes"] for meta in descriptor["metadata"])
 
 
 def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     import vane.execution.udf_subprocess_worker as worker
-    from vane import pickle as duckdb_pickle
+    from vane import pickle as vane_pickle
 
     created = []
 
@@ -8017,7 +8017,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
             "names": list(table.schema.names),
         }
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 3, "grant_id": 88})
+    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
@@ -8035,7 +8035,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     )
 
     assert msg_type == worker._MSG_REF_BUNDLE_RESULT
-    descriptor = duckdb_pickle.loads(payload)
+    descriptor = vane_pickle.loads(payload)
     assert descriptor["grant_id"] == 88
     assert descriptor["metadata"] == [{"rows": [3], "num_rows": 1, "ipc_size_bytes": 1}]
     assert descriptor["names"] == ["rows"]
