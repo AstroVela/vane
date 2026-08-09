@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
+import vane
 
 
 def assert_create(internal_data, expected_result, data_type):
-    conn = duckdb.connect()
+    conn = vane.connect()
     df_in = pd.DataFrame(data=internal_data, dtype=data_type)  # noqa: F841
 
     conn.execute("CREATE TABLE t AS SELECT * FROM df_in")
@@ -14,7 +20,7 @@ def assert_create(internal_data, expected_result, data_type):
 
 
 def assert_create_register(internal_data, expected_result, data_type):
-    conn = duckdb.connect()
+    conn = vane.connect()
     df_in = pd.DataFrame(data=internal_data, dtype=data_type)
     conn.register("dataframe", df_in)
     conn.execute("CREATE TABLE t AS SELECT * FROM dataframe")

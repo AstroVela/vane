@@ -11,17 +11,17 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb
-from duckdb._ray_cxx import validate_plan_serialization_for_submission
-from duckdb._ray_errors import RemoteRayException
-from duckdb.runners.ray.cluster_resource_coordinator import NodeCapacity
-from duckdb.runners.ray.query_resource_graph import (
+import vane
+from vane._ray_cxx import validate_plan_serialization_for_submission
+from vane._ray_errors import RemoteRayException
+from vane.runners.ray.cluster_resource_coordinator import NodeCapacity
+from vane.runners.ray.query_resource_graph import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     get_query_resource_manager,
 )
@@ -224,7 +224,7 @@ def _clean_query_runtime():
 
 
 def _runner(events, coordinator):
-    from duckdb.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor, _DriverSession
+    from vane.runners.ray.driver import BoundedReplayMap, RayQueryDriverActor, _DriverSession
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -606,8 +606,8 @@ def test_driver_rolls_back_graph_and_cluster_allocation_when_actor_initializatio
 def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_is_delayed(
     monkeypatch,
 ):
-    from duckdb.runners.ray import driver as driver_module
-    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
+    from vane.runners.ray import driver as driver_module
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     events: list[str] = []
     coordinator = _FakeCoordinator(events)
@@ -834,7 +834,7 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
     coordinator = _FakeCoordinator(events)
     runner_cls, runner = _runner(events, coordinator)
     query_id = f"query-plan-serialization-failure-{entrypoint}"
-    physical_plan = duckdb.ray_cxx._make_non_serializable_physical_plan_for_test(query_id)
+    physical_plan = vane.ray_cxx._make_non_serializable_physical_plan_for_test(query_id)
 
     with pytest.raises(
         RuntimeError,
@@ -849,7 +849,7 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
         asyncio.run(coroutine)
 
     assert isinstance(exc_info.value, RemoteRayException)
-    assert isinstance(exc_info.value.__cause__, duckdb.NotImplementedException)
+    assert isinstance(exc_info.value.__cause__, vane.NotImplementedException)
     assert "INTENTIONALLY_NON_SERIALIZABLE operator cannot be serialized" in str(exc_info.value.__cause__)
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
@@ -864,7 +864,7 @@ def test_driver_rejects_non_serializable_plan_before_query_registration(entrypoi
 
 
 def test_driver_exposes_query_task_and_output_lease_api():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     required = {
@@ -879,17 +879,17 @@ def test_driver_exposes_query_task_and_output_lease_api():
 
 
 def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomically():
-    from duckdb.runners.ray.cluster_resource_coordinator import (
+    from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
-    from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_resource_graph_builder import (
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_resource_graph_builder import (
         build_query_demand,
         build_query_resource_graph,
     )
-    from duckdb.runners.ray.query_resource_manager import TaskRequest
-    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -1004,8 +1004,8 @@ def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomicall
 
 
 def test_driver_maintenance_reuses_a_valid_empty_capacity_snapshot_after_gcs_failure():
-    from duckdb.runners.ray.cluster_resource_coordinator import ClusterQueryResourceCoordinator
-    from duckdb.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.cluster_resource_coordinator import ClusterQueryResourceCoordinator
+    from vane.runners.ray.driver import RayQueryDriverActor
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -1033,16 +1033,16 @@ def test_driver_maintenance_reuses_a_valid_empty_capacity_snapshot_after_gcs_fai
 
 
 def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
-    from duckdb.runners.ray.cluster_resource_coordinator import (
+    from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,
         NodeCapacity,
     )
-    from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_resource_graph_builder import (
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_resource_graph_builder import (
         build_query_demand,
         build_query_resource_graph,
     )
-    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)
@@ -1093,9 +1093,9 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
 
 
 def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():
-    from duckdb.runners.ray.driver import RayQueryDriverActor
-    from duckdb.runners.ray.query_resource_manager import TaskRequest
-    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
     runner = object.__new__(runner_cls)

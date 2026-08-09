@@ -20,7 +20,7 @@ single source of truth consumed by C++ and Python code.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vane._env import _PUBLIC_RUNNER_ERROR, _PUBLIC_RUNNER_VALUES, EnvRegistry, _Var, env
 
@@ -55,7 +55,24 @@ def _make_config_class() -> type:
     return cls
 
 
-VaneConfig = _make_config_class()
+if TYPE_CHECKING:
+
+    @dataclasses.dataclass
+    class VaneConfig:
+        """Statically typed view of the runtime-generated configuration."""
+
+        local_exchange_buffer: str = "32MB"
+        ray_init_sql: str = ""
+        ray_max_task_backlog: int = 0
+        ray_scan_task_min_partition_num: int = 0
+        ray_scan_task_open_cost_bytes: int = 4 * 1024 * 1024
+        ray_scan_task_size_grouping: bool = True
+        runner: str = "ray"
+        udf_arrow_fastpath: bool = True
+        udf_parallel: bool = False
+
+else:
+    VaneConfig = _make_config_class()
 
 
 def configure(**kw: Any) -> VaneConfig:
@@ -79,7 +96,7 @@ def configure(**kw: Any) -> VaneConfig:
         if runner not in _PUBLIC_RUNNER_VALUES:
             raise ValueError(_PUBLIC_RUNNER_ERROR)
         kw["runner"] = runner
-    cfg = VaneConfig(**kw)  # type: ignore[call-arg]
+    cfg = VaneConfig(**kw)
     # Apply only the explicitly passed keys (not defaults)
     env.set(**kw)
     return cfg
@@ -90,4 +107,4 @@ def current_config() -> VaneConfig:
 
     Returns a :class:`VaneConfig` snapshot of every registered variable.
     """
-    return VaneConfig(**env.as_dict())  # type: ignore[call-arg]
+    return VaneConfig(**env.as_dict())

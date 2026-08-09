@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 pyarrow = pytest.importorskip("pyarrow")
 
 
 def test_6796():
-    conn = duckdb.connect()
+    conn = vane.connect()
     input_df = pd.DataFrame({"foo": ["bar"]})
     conn.register("input_df", input_df)
 

@@ -1,9 +1,15 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 
 import pytest
 import pytz
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -22,7 +28,7 @@ class TestArrowTimestampsTimezone:
     def test_timestamp_timezone(self, duckdb_cursor):
         precisions = ["us", "s", "ns", "ms"]
         current_time = datetime.datetime(2017, 11, 28, 23, 55, 59, tzinfo=pytz.UTC)
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("SET TimeZone = 'UTC'")
         for precision in precisions:
             arrow_table = generate_table(current_time, precision, "UTC")
@@ -34,13 +40,13 @@ class TestArrowTimestampsTimezone:
         current_time = 9223372036854775807
         for precision in precisions:
             arrow_table = generate_table(current_time, precision, "UTC")
-            with pytest.raises(duckdb.ConversionException, match="Could not convert"):
-                duckdb.from_arrow(arrow_table).execute().fetchall()
+            with pytest.raises(vane.ConversionException, match="Could not convert"):
+                vane.from_arrow(arrow_table).execute().fetchall()
 
     def test_timestamp_tz_to_arrow(self, duckdb_cursor):
         precisions = ["us", "s", "ns", "ms"]
         current_time = datetime.datetime(2017, 11, 28, 23, 55, 59)
-        con = duckdb.connect()
+        con = vane.connect()
         for precision in precisions:
             for timezone in timezones:
                 con.execute("SET TimeZone = '" + timezone + "'")
@@ -50,7 +56,7 @@ class TestArrowTimestampsTimezone:
                 assert res == generate_table(current_time, "us", timezone)
 
     def test_timestamp_tz_with_null(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("create table t (i timestamptz)")
         con.execute("insert into t values (NULL),('2021-11-15 02:30:00'::timestamptz)")
         rel = con.table("t")
@@ -60,7 +66,7 @@ class TestArrowTimestampsTimezone:
         assert con.execute("select * from t").fetchall() == con.execute("select * from t2").fetchall()
 
     def test_timestamp_stream(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("create table t (i timestamptz)")
         con.execute("insert into t values (NULL),('2021-11-15 02:30:00'::timestamptz)")
         rel = con.table("t")

@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # ruff: noqa: E402, B018
 import pyarrow
 import pyarrow.dataset
@@ -112,11 +118,11 @@ polars.LazyFrame
 polars.col
 polars.lit
 
-import duckdb
-import duckdb.filesystem
+import vane
+import vane.filesystem
 
-duckdb.filesystem.ModifiedMemoryFileSystem
-duckdb.Value
+vane.filesystem.ModifiedMemoryFileSystem
+vane.Value
 
 import pytz
 
@@ -143,6 +149,6 @@ import collections.abc
 collections.abc.Iterable
 collections.abc.Mapping
 
-import duckdb.polars_io
+import vane.polars_io
 
-duckdb.polars_io.duckdb_source
+vane.polars_io.duckdb_source

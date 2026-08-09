@@ -23,9 +23,9 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
             calls.append(relation)
             return {"ok": True}
 
-    runners = types.ModuleType("duckdb.runners")
+    runners = types.ModuleType("vane.runners")
     runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "duckdb.runners", runners)
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
 
     target = tmp_path / "distributed.parquet"
     vane.connect().sql("select 1 as x").write_parquet(str(target))
@@ -36,10 +36,9 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
 
 def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    import duckdb
-    import duckdb.runners as runners_module
-    import duckdb.runners.ray.runner as ray_runner_module
     import vane
+    import vane.runners as runners_module
+    import vane.runners.ray.runner as ray_runner_module
 
     created_runners = []
     set_runner_calls = 0
@@ -59,7 +58,7 @@ def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp
         def close(self):
             self.close_calls += 1
 
-    vane_runners = duckdb.vane_runners_cpp
+    vane_runners = vane
     vane_runners.teardown_runner()
     monkeypatch.setattr(ray_runner_module, "RayRunner", FailingRayRunner)
     configured_runner = runners_module.set_runner_ray(
@@ -98,8 +97,8 @@ def test_write_failure_cleanup_survives_closed_connection(tmp_path):
 import os
 import sys
 
-import duckdb
-import duckdb.runners.ray.runner as ray_runner_module
+import vane
+import vane.runners.ray.runner as ray_runner_module
 import vane
 
 os.environ["VANE_RUNNER"] = "ray"
@@ -118,7 +117,7 @@ class ClosingFailingRayRunner:
         pass
 
 
-duckdb.vane_runners_cpp.teardown_runner()
+vane.teardown_runner()
 ray_runner_module.RayRunner = ClosingFailingRayRunner
 connection = vane.connect()
 
@@ -129,7 +128,7 @@ except RuntimeError as exc:
 else:
     raise AssertionError("expected the injected write failure")
 
-assert isinstance(duckdb.vane_runners_cpp.get_runner(), ClosingFailingRayRunner)
+assert isinstance(vane.get_runner(), ClosingFailingRayRunner)
 """
     subprocess.run([sys.executable, "-c", script, str(target)], check=True, timeout=20)
 

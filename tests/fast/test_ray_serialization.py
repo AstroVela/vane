@@ -15,7 +15,7 @@ except Exception:
 
 import pickle
 
-import duckdb
+import vane
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -24,14 +24,14 @@ def test_logical_plan_serialization():
     """Test that LogicalPlan serialization works in same process."""
     # Create a simple SQL relation (no pandas to avoid serialization issues)
     sql = "SELECT * FROM (VALUES (0,0), (1,10), (2,20)) AS t(a, b)"
-    df = duckdb.sql(sql)
+    df = vane.sql(sql)
 
-    # duckdb.sql(...) returns a DuckDB relation
+    # vane.sql(...) returns a DuckDB relation
     rel = df
 
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "test-query-id")
 
     assert plan.idx() == "test-query-id"
@@ -54,23 +54,23 @@ def test_logical_plan_serialization_across_ray_workers():
     """Test that LogicalPlan can be serialized and sent to Ray workers."""
     # Create a simple SQL relation
     sql = "SELECT * FROM (VALUES (0,0), (1,10), (2,20)) AS t(a, b)"
-    df = duckdb.sql(sql)
+    df = vane.sql(sql)
 
-    # duckdb.sql(...) returns a DuckDB relation
+    # vane.sql(...) returns a DuckDB relation
     rel = df
 
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "test-ray-serialization")
 
     # Define a remote function that receives the plan
     @ray.remote
     def verify_plan_in_worker(plan):
         """Verify that plan can be received and accessed in worker."""
-        import duckdb
+        import vane
 
-        conn = duckdb.connect()
+        conn = vane.connect()
         dist_plan = plan.to_physical_plan(conn)
         # Plan should be deserialized successfully
         assert plan.idx() == "test-ray-serialization"

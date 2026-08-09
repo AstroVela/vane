@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: MIT AND Apache-2.0
 #
@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-import duckdb
+import vane
 
 try:
     # need to ignore warnings that might be thrown deep inside pandas's import tree (from dateutil in this case)
@@ -111,7 +111,7 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture
 def duckdb_empty_cursor():
-    connection = duckdb.connect("")
+    connection = vane.connect("")
     cursor = connection.cursor()
     return cursor
 
@@ -150,7 +150,7 @@ def pandas_2_or_higher():
 
 @pytest.fixture
 def require():
-    def _require(extension_name, db_name="") -> duckdb.DuckDBPyConnection | None:
+    def _require(extension_name, db_name="") -> vane.DuckDBPyConnection | None:
         # Paths to search for extensions
 
         build = Path(__file__).parent.parent / "build"
@@ -159,9 +159,9 @@ def require():
             (build / "debug", "extension/*/*.duckdb_extension"),
         ]
 
-        # DUCKDB_PYTHON_TEST_EXTENSION_PATH can be used to add a path for the extension test to search for extensions
-        if "DUCKDB_PYTHON_TEST_EXTENSION_PATH" in os.environ:
-            env_extension_path = Path(os.environ["DUCKDB_PYTHON_TEST_EXTENSION_PATH"])
+        # VANE_PYTHON_TEST_EXTENSION_PATH can be used to add a path for the extension test to search for extensions
+        if "VANE_PYTHON_TEST_EXTENSION_PATH" in os.environ:
+            env_extension_path = Path(os.environ["VANE_PYTHON_TEST_EXTENSION_PATH"])
             extension_search_patterns.append((env_extension_path, "*/*.duckdb_extension"))
             extension_search_patterns.append((env_extension_path, "*.duckdb_extension"))
 
@@ -172,7 +172,7 @@ def require():
         for path in extension_paths_found:
             print(path)
             if path.name == extension_name + ".duckdb_extension":
-                conn = duckdb.connect(db_name, config={"allow_unsigned_extensions": "true"})
+                conn = vane.connect(db_name, config={"allow_unsigned_extensions": "true"})
                 conn.execute(f"LOAD '{path}'")
                 return conn
         pytest.skip(f"could not load {extension_name}")
@@ -194,7 +194,7 @@ def spark():
 
 @pytest.fixture
 def duckdb_cursor():
-    connection = duckdb.connect("")
+    connection = vane.connect("")
     yield connection
     connection.close()
 
@@ -276,22 +276,11 @@ def _ray_local_cluster():
             warning_filter = r"ignore:\s*Prefer using device seq_lens directly.*:DeprecationWarning"
             accelerator_override = os.environ.get("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
             pythonpath = os.environ.get("PYTHONPATH", "")
-            try:
-                import _duckdb as duckdb_ext
-
-                duckdb_pkg_root = os.path.dirname(duckdb.__file__)
-                duckdb_parent = os.path.dirname(duckdb_pkg_root)
-                duckdb_ext_root = os.path.dirname(duckdb_ext.__file__)
-                pythonpath_entries = []
-                if duckdb_ext_root:
-                    pythonpath_entries.append(duckdb_ext_root)
-                if duckdb_parent:
-                    pythonpath_entries.append(duckdb_parent)
-                if pythonpath:
-                    pythonpath_entries.append(pythonpath)
-                pythonpath = os.pathsep.join(dict.fromkeys(pythonpath_entries))
-            except Exception:
-                pythonpath = os.environ.get("PYTHONPATH", "")
+            vane_package_parent = os.path.dirname(os.path.dirname(vane.__file__))
+            pythonpath_entries = [vane_package_parent]
+            if pythonpath:
+                pythonpath_entries.append(pythonpath)
+            pythonpath = os.pathsep.join(dict.fromkeys(pythonpath_entries))
             env_vars = {
                 "PYTHONWARNINGS": warning_filter,
                 "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": accelerator_override,
@@ -350,13 +339,13 @@ def ray_local(_ray_local_cluster):
         yield
     finally:
         try:
-            vane_mod = getattr(duckdb, "vane_runners_cpp", None)
+            vane_mod = vane
             if vane_mod is not None and hasattr(vane_mod, "teardown_runner"):
                 vane_mod.teardown_runner()
         except Exception as e:
             print(f"WARNING: Exception during Vane runner teardown: {e}", file=sys.stderr)
         try:
-            from duckdb.runners.ray import driver as ray_driver
+            from vane.runners.ray import driver as ray_driver
 
             ray_driver.shutdown_background_event_loop()
         except Exception:
@@ -394,7 +383,7 @@ def pytest_configure(config):
         timeout = int(os.getenv("TEST_TIMEOUT", "300"))
         faulthandler.dump_traceback_later(timeout, repeat=False)
         # record that we scheduled a dump so we can cancel it in pytest_unconfigure
-        config._duckdb_faulthandler_dump_scheduled = True
+        config._vane_faulthandler_dump_scheduled = True
     except Exception:
         # best-effort; don't fail pytest initialization if this doesn't work
         pass
@@ -402,7 +391,7 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     try:
-        if getattr(config, "_duckdb_faulthandler_dump_scheduled", False):
+        if getattr(config, "_vane_faulthandler_dump_scheduled", False):
             faulthandler.cancel_dump_traceback_later()
     except Exception:
         pass

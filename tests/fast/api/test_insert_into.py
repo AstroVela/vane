@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 from pandas import DataFrame
 
-import duckdb
+import vane
 
 
 class TestInsertInto:
     def test_insert_into_schema(self, duckdb_cursor):
         # open connection
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("CREATE SCHEMA s")
         con.execute("CREATE TABLE s.t (id INTEGER PRIMARY KEY)")
 
@@ -20,7 +26,7 @@ class TestInsertInto:
         assert con.execute("select * from s.t").fetchall() == [(1,)]
 
         # This should fail since this will go to default schema
-        with pytest.raises(duckdb.CatalogException):
+        with pytest.raises(vane.CatalogException):
             rel.insert_into("t")
 
         # If we add t in the default schema it should work.
@@ -32,7 +38,7 @@ class TestInsertInto:
         """insert_into must preserve catalog qualification when writing to a catalog-qualified table name."""
         import pandas as pd
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("ATTACH ':memory:' AS cat_a")
         con.execute("ATTACH ':memory:' AS cat_b")
         con.execute("CREATE TABLE cat_a.main.t (x INT)")
@@ -51,7 +57,7 @@ class TestInsertInto:
         """insert_into must preserve catalog qualification with quoted identifiers."""
         import pandas as pd
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("ATTACH ':memory:' AS \"my.catalog\"")
         con.execute("ATTACH ':memory:' AS other_cat")
         con.execute('CREATE TABLE "my.catalog".main.t (x INT)')
@@ -69,7 +75,7 @@ class TestInsertInto:
         """create must preserve catalog qualification when creating a table with a catalog-qualified name."""
         import pandas as pd
 
-        con = duckdb.connect()
+        con = vane.connect()
         con.execute("ATTACH ':memory:' AS cat_a")
         con.execute("ATTACH ':memory:' AS cat_b")
         con.execute("CREATE TABLE cat_a.main.t (x INT)")

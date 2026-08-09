@@ -12,11 +12,48 @@ import tarfile
 import traceback
 import zipfile
 from collections.abc import Callable
+from email.message import Message
 from pathlib import Path
 
 import pytest
 
-from scripts import check_release_artifacts
+from scripts import check_release_artifacts, verify_duckdb_coexistence
+
+WHEEL_DATA_ROOT = f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}.data"
+REQUIRED_WHEEL_PATHS = (
+    "vane/py.typed",
+    "vane/_native/__init__.pyi",
+    "vane/_native/_func.pyi",
+    "vane/_native/_sqltypes.pyi",
+    "vane/_native/ray_cxx.pyi",
+    "vane/sqltypes/__init__.pyi",
+    "vane/udf.pyi",
+    f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/METADATA",
+    f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/WHEEL",
+    f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/RECORD",
+)
+
+
+class _NamesOnlyArtifact:
+    path = Path("vane_ai-test.whl")
+
+    def __init__(self, names: list[str]):
+        self._names = names
+
+    def names(self) -> list[str]:
+        return self._names
+
+    def path_names(self) -> list[str]:
+        return self._names
+
+
+class _MemoryWheelArtifact(_NamesOnlyArtifact):
+    def __init__(self, members: dict[str, bytes]):
+        super().__init__(list(members))
+        self._members = members
+
+    def read(self, name: str) -> bytes:
+        return self._members[name]
 
 
 def _runtime_sentinel() -> bytes:
@@ -116,6 +153,206 @@ def test_literal_rule_repr_does_not_expose_value():
     rule = check_release_artifacts.LiteralContentRule("runtime-sensitive-content", sentinel)
 
     _assert_no_recoverable_value(sentinel, repr(rule))
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "/duckdb/__init__.py",
+        "duckdb\\__init__.py",
+        "C:/duckdb/__init__.py",
+        "C:duckdb/__init__.py",
+        "vane//module.py",
+        "vane/./module.py",
+        "vane/../duckdb.py",
+        "vane/module\n.py",
+    ],
+)
+def test_release_rejects_non_relative_non_posix_archive_paths(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="unsafe archive path"):
+        check_release_artifacts._check_paths(artifact)
+
+
+@pytest.mark.parametrize(
+    "member_names",
+    [
+        ["vane/module.py", "VANE/MODULE.PY"],
+        ["vane/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py", "vane/cafe\N{COMBINING ACUTE ACCENT}.py"],
+        ["vane/module.py", "vane/module.py"],
+    ],
+)
+def test_release_rejects_cross_platform_archive_path_collisions(member_names):
+    artifact = _NamesOnlyArtifact(member_names)
+
+    with pytest.raises(ValueError, match="colliding archive paths"):
+        check_release_artifacts._check_paths(artifact)
+
+
+@pytest.mark.parametrize(
+    "member_names",
+    [
+        ["vane", "vane/__init__.py"],
+        ["vane/module.py", "vane/module.py/child"],
+        ["VANE", "vane/__init__.py"],
+    ],
+)
+def test_release_rejects_archive_file_parent_conflicts(member_names):
+    artifact = _NamesOnlyArtifact(member_names)
+
+    with pytest.raises(ValueError, match="file cannot be the parent"):
+        check_release_artifacts._check_paths(artifact)
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "duckdb/__init__.py",
+        "DuckDB/__init__.py",
+        "duckdb.py",
+        "_duckdb.cpython-312-x86_64-linux-gnu.so",
+        "adbc_driver_duckdb/dbapi.py",
+        f"{WHEEL_DATA_ROOT}/purelib/duckdb/__init__.py",
+        f"{WHEEL_DATA_ROOT}/platlib/_duckdb.pyd",
+    ],
+)
+def test_wheel_rejects_every_official_duckdb_import_location(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="conflicting Python package path"):
+        check_release_artifacts._check_wheel(artifact)
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "another_namespace/__init__.py",
+        "another_module.py",
+        "VANE/__init__.py",
+        f"{WHEEL_DATA_ROOT}/purelib/vane/__init__.py",
+        f"{WHEEL_DATA_ROOT}/platlib/vane/_native.so",
+        f"{WHEEL_DATA_ROOT}/purelib/another_namespace/__init__.py",
+        f"{WHEEL_DATA_ROOT}/scripts/vane",
+        "other_distribution-1.0.dist-info/METADATA",
+    ],
+)
+def test_wheel_rejects_every_import_or_distribution_root_not_owned_by_vane(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="conflicting Python package path"):
+        check_release_artifacts._check_wheel(artifact)
+
+
+@pytest.mark.parametrize("required_path", REQUIRED_WHEEL_PATHS)
+def test_wheel_required_files_must_use_their_exact_install_paths(required_path):
+    decoy = (
+        f"vane/decoy/{required_path}"
+        if required_path.startswith("vane/")
+        else (f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/decoy/{required_path}")
+    )
+    members = ["vane/_native.so", *REQUIRED_WHEEL_PATHS]
+    members[members.index(required_path)] = decoy
+    artifact = _NamesOnlyArtifact(members)
+
+    with pytest.raises(ValueError, match="expected one archive member"):
+        check_release_artifacts._check_wheel(artifact)
+
+
+@pytest.mark.parametrize("required_path", ["vane/sqltypes/__init__.pyi", "vane/udf.pyi"])
+def test_sdist_public_stubs_must_use_their_exact_project_paths(required_path):
+    decoy = f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}/decoy/{required_path}"
+
+    with pytest.raises(ValueError, match="expected one project file"):
+        check_release_artifacts._require_sdist_path([decoy], required_path, Path("test.tar.gz"))
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "vane/_native.pyi",
+        f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}/vane/_native.pyi",
+    ],
+)
+def test_release_rejects_the_legacy_flat_native_stub(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="banned release path"):
+        check_release_artifacts._check_paths(artifact)
+
+
+def test_sdist_metadata_must_use_the_root_project_path():
+    root = check_release_artifacts.EXPECTED_ARCHIVE_ROOT
+    artifact = _NamesOnlyArtifact([f"{root}/decoy/PKG-INFO"])
+
+    with pytest.raises(ValueError, match="expected one archive member"):
+        check_release_artifacts._check_metadata(artifact, f"{root}/PKG-INFO")
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        'duckdb\t; python_version > "3"',
+        "duckdb @ https://example.invalid/duckdb.whl",
+        "DuckDB[httpfs]>=1.5",
+    ],
+)
+def test_release_metadata_rejects_every_official_duckdb_requirement(requirement):
+    metadata = Message()
+    metadata["Requires-Dist"] = requirement
+    artifact = _NamesOnlyArtifact([])
+
+    with pytest.raises(ValueError, match="must not depend on the official duckdb distribution"):
+        check_release_artifacts._check_no_official_duckdb_dependency(artifact, metadata)
+
+
+def test_release_metadata_rejects_invalid_requirements():
+    metadata = Message()
+    metadata["Requires-Dist"] = "duckdb (>=1.0"
+    artifact = _NamesOnlyArtifact([])
+
+    with pytest.raises(ValueError, match="invalid Requires-Dist metadata"):
+        check_release_artifacts._check_no_official_duckdb_dependency(artifact, metadata)
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "duckdb/__init__.py",
+        "DuckDB/__init__.py",
+        f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}/duckdb/__init__.py",
+        f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}/_duckdb.so",
+        f"{check_release_artifacts.EXPECTED_ARCHIVE_ROOT}/adbc_driver_duckdb/dbapi.py",
+    ],
+)
+def test_sdist_rejects_every_official_duckdb_import_location(member_name):
+    artifact = _NamesOnlyArtifact([member_name])
+
+    with pytest.raises(ValueError, match="conflicting Python package path"):
+        check_release_artifacts._check_sdist(artifact)
+
+
+def test_wheel_record_rejects_duplicate_rows():
+    record_name = f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/RECORD"
+    artifact = _MemoryWheelArtifact({record_name: f"{record_name},,\n{record_name},,\n".encode()})
+
+    with pytest.raises(ValueError, match="duplicate RECORD entry"):
+        check_release_artifacts._check_wheel_record(artifact)
+
+
+def test_wheel_record_must_not_hash_or_size_itself():
+    record_name = f"{check_release_artifacts.EXPECTED_DIST_INFO_ROOT}/RECORD"
+    artifact = _MemoryWheelArtifact({record_name: f"{record_name},sha256=bogus,1\n".encode()})
+
+    with pytest.raises(ValueError, match="must not hash or size itself"):
+        check_release_artifacts._check_wheel_record(artifact)
+
+
+def test_coexistence_subprocess_keeps_validation_assertions_under_pythonoptimize(monkeypatch, tmp_path):
+    monkeypatch.setenv("PYTHONOPTIMIZE", "1")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        verify_duckdb_coexistence._python(Path(sys.executable), "assert False", cwd=tmp_path)
 
 
 @pytest.mark.parametrize(

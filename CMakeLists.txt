@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 #
 # SPDX-FileCopyrightText: 2026 Vane contributors
 #
@@ -8,7 +8,7 @@
 
 cmake_minimum_required(VERSION 3.29)
 
-project(duckdb_py LANGUAGES CXX)
+project(vane_python LANGUAGES CXX)
 
 # Arrow 24 requires C++20. Use the same standard for the complete Vane native
 # build so Python bindings, distributed exchange, and their consumers cannot
@@ -21,9 +21,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # manylinux_2_28, so keep the scan disabled for all targets.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
-# Set the library name
-set(DUCKDB_PYTHON_LIB_NAME "_duckdb")
 
 # Detect CCache
 include(cmake/compiler_launcher.cmake)
@@ -134,29 +131,46 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE
       CACHE BOOL "Use Arrow/Flight static libs from external/duckdb/installed")
 endif()
 
+# The engine is linked into Vane's extension rather than built as a DuckDB DLL.
+# On Windows this disables DuckDB's and ADBC's __declspec(dllexport) annotations
+# so object-file directives cannot bypass the extension's explicit export list.
+# ADBC_EXPORT is intentionally defined as an empty replacement.
+if(WIN32)
+  add_compile_definitions(DUCKDB_STATIC_BUILD ADBC_EXPORT=)
+endif()
+
 duckdb_add_library(duckdb_target)
 
+# Vane embeds DuckDB statically, but its shared library is not the official
+# DuckDB ADBC driver. Give the compiled entrypoint a Vane-owned symbol instead
+# of retaining a hidden duckdb_adbc_init implementation behind a wrapper.
+target_compile_definitions(duckdb_adbc PRIVATE duckdb_adbc_init=vane_adbc_init)
+
 # Bundle in INTERFACE library
-add_library(_duckdb_dependencies INTERFACE)
-target_link_libraries(_duckdb_dependencies INTERFACE pybind11::pybind11
-                                                     duckdb_target)
+add_library(vane_python_dependencies INTERFACE)
+target_link_libraries(vane_python_dependencies INTERFACE pybind11::pybind11
+                                                         duckdb_target)
+# Give every Vane binding translation unit a private pybind ABI identity. This
+# prevents the conduit and module-local capsule protocols from exchanging C++
+# objects with a separately installed DuckDB extension.
+target_compile_definitions(vane_python_dependencies
+                           INTERFACE PYBIND11_COMPILER_TYPE="vane")
 # Also add include directory
 target_include_directories(
-  _duckdb_dependencies
-  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/duckdb_py/include>
-)
+  vane_python_dependencies
+  INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/vane_py/include>)
 
 # ────────────────────────────────────────────
-# Descend into the real DuckDB‑Python sources
+# Descend into Vane's DuckDB-derived Python binding sources
 # ────────────────────────────────────────────
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-add_subdirectory(src/duckdb_py)
+add_subdirectory(src/vane_py)
 
 pybind11_add_module(
-  _duckdb
+  _native
   $<TARGET_OBJECTS:python_src>
   $<TARGET_OBJECTS:python_arrow>
   $<TARGET_OBJECTS:python_common>
@@ -172,45 +186,43 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_type>
   $<TARGET_OBJECTS:python_ray>
   $<TARGET_OBJECTS:python_vane_runners>)
-# add _duckdb_dependencies
-target_link_libraries(_duckdb PRIVATE _duckdb_dependencies)
-duckdb_link_extensions(_duckdb)
+# Add Vane's Python and engine dependencies.
+target_link_libraries(_native PRIVATE vane_python_dependencies)
+duckdb_link_extensions(_native)
 
 # ────────────────────────────────────────────
 # Controlling symbol export
 #
-# We want to export exactly two symbols: - PyInit__duckdb: this allows CPython
-# to load the module - duckdb_adbc_init: the DuckDB ADBC driver
+# We export exactly two Vane-owned symbols: - PyInit__native: allows CPython to
+# load ``vane._native`` - vane_adbc_init: initializes the Vane ADBC driver
 #
-# The export of symbols on OSX and Linux is controlled by: - Visibility
-# annotations in the code (for this lib we use the PYBIND11_EXPORT macro) -
-# Telling the linker which symbols we want exported, which we do below
-#
-# For Windows, we rely on just the visbility annotations.
+# The extension uses hidden visibility by default. On macOS and Linux the linker
+# allowlists only these entry points. On Windows DUCKDB_STATIC_BUILD and the
+# empty ADBC_EXPORT definition suppress embedded export directives; explicit
+# /EXPORT options expose the two entry points.
 # ────────────────────────────────────────────
 set_target_properties(
-  _duckdb
+  _native
   PROPERTIES CXX_VISIBILITY_PRESET hidden
              C_VISIBILITY_PRESET hidden
              VISIBILITY_INLINES_HIDDEN ON)
 
 if(APPLE)
-  target_link_options(
-    _duckdb PRIVATE "LINKER:-exported_symbol,_duckdb_adbc_init"
-    "LINKER:-exported_symbol,_PyInit__duckdb")
+  target_link_options(_native PRIVATE "LINKER:-exported_symbol,_vane_adbc_init"
+                      "LINKER:-exported_symbol,_PyInit__native")
 elseif(UNIX AND NOT APPLE)
   # Use a version script to export only the two required symbols. This hides all
   # internal symbols (including statically-linked OpenSSL from httpfs) from the
   # dynamic symbol table, preventing SIGSEGV crashes caused by symbol conflicts
   # with system OpenSSL loaded by Ray/Python/gRPC in the same process.
   target_link_options(
-    _duckdb
+    _native
     PRIVATE
     "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/exported_symbols.version"
   )
 elseif(WIN32)
-  target_link_options(_duckdb PRIVATE "/EXPORT:duckdb_adbc_init"
-                      "/EXPORT:PyInit__duckdb")
+  target_link_options(_native PRIVATE "/EXPORT:vane_adbc_init"
+                      "/EXPORT:PyInit__native")
 endif()
 
 # ────────────────────────────────────────────
@@ -221,15 +233,15 @@ endif()
 # different dest dir
 include(GNUInstallDirs)
 if(DEFINED SKBUILD_PLATLIB_DIR)
-  set(_DUCKDB_PY_INSTALL_DIR "${SKBUILD_PLATLIB_DIR}")
+  set(_VANE_PY_INSTALL_DIR "${SKBUILD_PLATLIB_DIR}/vane")
 elseif(DEFINED Python_SITEARCH)
-  set(_DUCKDB_PY_INSTALL_DIR "${Python_SITEARCH}")
+  set(_VANE_PY_INSTALL_DIR "${Python_SITEARCH}/vane")
 else()
   message(
     WARNING
       "Could not determine Python install dir. Falling back to CMAKE_INSTALL_LIBDIR."
   )
-  set(_DUCKDB_PY_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}")
+  set(_VANE_PY_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/vane")
 endif()
 
-install(TARGETS _duckdb LIBRARY DESTINATION "${_DUCKDB_PY_INSTALL_DIR}")
+install(TARGETS _native LIBRARY DESTINATION "${_VANE_PY_INSTALL_DIR}")

@@ -1,19 +1,25 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 
 class TestParameterList:
     def test_bool(self, duckdb_cursor):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.execute("create table bool_table (a bool)")
         conn.execute("insert into bool_table values (TRUE)")
         res = conn.execute("select count(*) from bool_table where a =?", [True])
         assert res.fetchone()[0] == 1
 
     def test_exception(self, duckdb_cursor):
-        conn = duckdb.connect()
+        conn = vane.connect()
         df_in = pd.DataFrame(
             {
                 "numbers": [1, 2, 3, 4, 5],
@@ -21,16 +27,16 @@ class TestParameterList:
         )
         conn.execute("create table bool_table (a bool)")
         conn.execute("insert into bool_table values (TRUE)")
-        with pytest.raises(duckdb.NotImplementedException, match="Unable to transform"):
+        with pytest.raises(vane.NotImplementedException, match="Unable to transform"):
             conn.execute("select count(*) from bool_table where a =?", [df_in])
 
     def test_explicit_nan_param(self):
-        con = duckdb.default_connection()
+        con = vane.default_connection()
         res = con.execute("select isnan(cast(? as double))", (float("nan"),))
         assert res.fetchone()[0]
 
     def test_string_parameter(self, duckdb_cursor):
-        conn = duckdb.connect()
+        conn = vane.connect()
         conn.execute("create table orders (o_orderdate date)")
         conn.execute("insert into orders values (date '1992-01-01'), (date '1994-01-01')")
         conn.execute(

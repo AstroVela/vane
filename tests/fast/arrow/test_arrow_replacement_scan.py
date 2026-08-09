@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from pathlib import Path
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
@@ -15,7 +21,7 @@ class TestArrowReplacementScan:
         userdata_parquet_table = pq.read_table(parquet_filename)
         df = userdata_parquet_table.to_pandas()  # noqa: F841
 
-        con = duckdb.connect()
+        con = vane.connect()
 
         for _i in range(5):
             assert con.execute("select count(*) from userdata_parquet_table").fetchone() == (1000,)
@@ -42,13 +48,13 @@ class TestArrowReplacementScan:
         rel = duckdb_cursor.sql("select b, d from capsule")
         assert rel.fetchall() == [(i, i + 6) for i in range(4, 7)]
 
-        with pytest.raises(duckdb.InvalidInputException, match="The ArrowArrayStream was already released"):
+        with pytest.raises(vane.InvalidInputException, match="The ArrowArrayStream was already released"):
             duckdb_cursor.sql("select b, d from capsule")
 
         schema_obj = tbl.schema
         schema_capsule = schema_obj.__arrow_c_schema__()  # noqa: F841
         with pytest.raises(
-            duckdb.InvalidInputException, match="""Expected a 'arrow_array_stream' PyCapsule, got: arrow_schema"""
+            vane.InvalidInputException, match="""Expected a 'arrow_array_stream' PyCapsule, got: arrow_schema"""
         ):
             duckdb_cursor.sql("select b, d from schema_capsule")
 
@@ -56,11 +62,11 @@ class TestArrowReplacementScan:
         parquet_filename = str(Path(__file__).parent / "data" / "userdata1.parquet")
         userdata_parquet_table = pq.read_table(parquet_filename)
 
-        con = duckdb.connect()
+        con = vane.connect()
 
         con.execute("create view x as select * from userdata_parquet_table")
         del userdata_parquet_table
-        with pytest.raises(duckdb.CatalogException, match="Table with name userdata_parquet_table does not exist"):
+        with pytest.raises(vane.CatalogException, match="Table with name userdata_parquet_table does not exist"):
             assert con.execute("select count(*) from x").fetchone()
 
     def test_arrow_dataset_replacement_scan(self, duckdb_cursor):
@@ -68,5 +74,5 @@ class TestArrowReplacementScan:
         pq.read_table(parquet_filename)
         userdata_parquet_dataset = ds.dataset(parquet_filename)  # noqa: F841
 
-        con = duckdb.connect()
+        con = vane.connect()
         assert con.execute("select count(*) from userdata_parquet_dataset").fetchone() == (1000,)

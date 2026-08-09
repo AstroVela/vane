@@ -30,7 +30,7 @@ def _packed_native_vllm_options(options):
 
 
 def test_subprocess_actor_warmup_attribute_error_fails_startup():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class BrokenWarmup:
         def warm_up(self):
@@ -49,9 +49,9 @@ def test_subprocess_actor_warmup_attribute_error_fails_startup():
 
 
 def test_udf_resource_and_layout_validation_has_no_silent_fallbacks():
-    from duckdb.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
-    from duckdb.execution.udf_ray_config import payload_num_cpus, payload_num_gpus, stream_output_enabled
-    from duckdb.execution.udf_threading import payload_cpu_thread_count
+    from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
+    from vane.execution.udf_ray_config import payload_num_cpus, payload_num_gpus, stream_output_enabled
+    from vane.execution.udf_threading import payload_cpu_thread_count
 
     with pytest.raises(ValueError, match="cpus"):
         payload_num_cpus({"cpus": -1})
@@ -82,7 +82,7 @@ def test_udf_resource_and_layout_validation_has_no_silent_fallbacks():
 
 
 def test_subprocess_backend_rejects_unreserved_gpu_request():
-    from duckdb.execution.udf import build_executor
+    from vane.execution.udf import build_executor
 
     def identity(table):
         return table
@@ -272,7 +272,7 @@ def _make_subprocess_actor_executor(
 
 
 def test_ray_get_uses_query_deadline_timeout(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     class FakeFuture:
         def __init__(self):
@@ -314,8 +314,8 @@ def test_ray_get_uses_query_deadline_timeout(monkeypatch):
     ],
 )
 def test_timeout_env_parsers_reject_non_finite_negative_and_invalid(monkeypatch, env_name, raw):
-    from duckdb.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
-    from duckdb.runners.ray import safe_get
+    from vane.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
+    from vane.runners.ray import safe_get
 
     for name in (
         "VANE_QUERY_DEADLINE_EPOCH_S",
@@ -356,7 +356,7 @@ def test_timeout_env_parsers_reject_non_finite_negative_and_invalid(monkeypatch,
     ],
 )
 def test_positive_timeout_env_parsers_reject_zero(monkeypatch, env_name):
-    from duckdb.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
+    from vane.execution import udf_ray_actor_pool, udf_stream_result_collector, udf_subprocess
 
     for name in (
         "VANE_QUERY_DEADLINE_EPOCH_S",
@@ -392,7 +392,7 @@ def test_positive_timeout_env_parsers_reject_zero(monkeypatch, env_name):
     ],
 )
 def test_ray_safe_get_timeout_envs_preserve_zero(monkeypatch, env_name):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
@@ -406,7 +406,7 @@ def test_ray_safe_get_timeout_envs_preserve_zero(monkeypatch, env_name):
 
 
 def test_ray_get_explicit_timeout_can_ignore_global_wait_limits(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     class FakeFuture:
         def __init__(self):
@@ -440,7 +440,7 @@ def test_ray_get_explicit_timeout_can_ignore_global_wait_limits(monkeypatch):
 
 
 def test_ray_get_in_async_actor_background_thread_uses_object_ref_future(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     class FakeFuture:
         def __init__(self):
@@ -464,7 +464,7 @@ def test_ray_get_in_async_actor_background_thread_uses_object_ref_future(monkeyp
 
 
 def test_ray_get_heartbeat_runs_between_bounded_waits(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     class FakeFuture:
         def __init__(self):
@@ -505,7 +505,7 @@ def test_ray_get_heartbeat_runs_between_bounded_waits(monkeypatch):
 
 
 def test_ray_get_heartbeat_preserves_one_total_timeout(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     clock = [10.0]
 
@@ -547,7 +547,7 @@ def test_ray_get_heartbeat_preserves_one_total_timeout(monkeypatch):
 
 
 def test_ray_get_in_async_actor_event_loop_rejects_sync_wait(monkeypatch):
-    from duckdb.runners.ray import safe_get
+    from vane.runners.ray import safe_get
 
     class AwaitableRef:
         def __await__(self):
@@ -564,7 +564,7 @@ def test_ray_get_in_async_actor_event_loop_rejects_sync_wait(monkeypatch):
 
 
 def test_udf_actor_pool_init_timeout_kills_owned_actors(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     class FakeRay:
         def __init__(self):
@@ -613,7 +613,7 @@ def test_udf_actor_pool_init_timeout_kills_owned_actors(monkeypatch):
 
 
 def test_udf_actor_pool_init_failure_preserves_root_cause():
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     class FakeRay:
         def kill(self, _actor, **_kwargs):
@@ -642,7 +642,7 @@ def test_udf_actor_pool_init_failure_preserves_root_cause():
 
 
 def test_udf_actor_pool_init_cleanup_retains_only_failed_handles_for_retry():
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     class FakeRay:
         def __init__(self):
@@ -682,7 +682,7 @@ def test_udf_actor_pool_init_cleanup_retains_only_failed_handles_for_retry():
 
 
 def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeReady:
         def __init__(self):
@@ -710,7 +710,7 @@ def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
 
 
 def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRemoteMethod:
         def __init__(self, result=None, exc: Exception | None = None):
@@ -762,7 +762,7 @@ def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
 
 
 def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRef:
         def __init__(self, value=None, exc: Exception | None = None):
@@ -828,7 +828,7 @@ def test_vllm_remote_submit_async_ref_failure_becomes_executor_error(monkeypatch
 
 
 def test_vllm_remote_observes_router_lifecycle_refs(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     observed: list[str] = []
 
@@ -872,7 +872,7 @@ def test_vllm_remote_observes_router_lifecycle_refs(monkeypatch):
 
 
 def test_vllm_remote_shutdown_reports_completion_once_and_clears_wait_refs(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     observed: list[str] = []
 
@@ -936,7 +936,7 @@ def test_vllm_remote_shutdown_reports_completion_once_and_clears_wait_refs(monke
 
 
 def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
     executor.completed_tasks = deque()
@@ -963,7 +963,7 @@ def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish()
 
 
 def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     rows = pa.table({"x": [1, 2]})
     wait_ref = None
@@ -1048,7 +1048,7 @@ def test_vllm_remote_wait_for_result_drains_ready_actor(monkeypatch):
 
 
 def test_vllm_remote_wait_callback_queues_work_without_clearing_the_actor_ref():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRef:
         pass
@@ -1108,7 +1108,7 @@ def _new_remote_vllm_error_executor(vllm, monkeypatch, *, release_count=0):
 
 
 def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     cancelled = []
 
@@ -1170,7 +1170,7 @@ def test_vllm_remote_wait_deadline_resolves_submits_before_cancelling_wait_refs(
 
 
 def test_vllm_remote_wait_without_pending_ref_before_completion_is_error(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=1)
     executor._finished_submitting_flag = True
@@ -1188,7 +1188,7 @@ def test_vllm_remote_wait_without_pending_ref_before_completion_is_error(monkeyp
 
 
 def test_vllm_remote_actor_without_results_after_executor_finish_is_error(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = _new_remote_vllm_error_executor(vllm, monkeypatch)
     executor._finished_submitting_flag = True
@@ -1204,7 +1204,7 @@ def test_vllm_remote_actor_without_results_after_executor_finish_is_error(monkey
 
 
 def test_vllm_remote_actor_missing_results_releases_outstanding_reservation(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = _new_remote_vllm_error_executor(vllm, monkeypatch, release_count=3)
     executor._finished_submitting_flag = True
@@ -1220,7 +1220,7 @@ def test_vllm_remote_actor_missing_results_releases_outstanding_reservation(monk
 
 
 def test_vllm_router_completion_never_finishes_shared_actors_globally():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeActor:
         @property
@@ -1235,8 +1235,8 @@ def test_vllm_router_completion_never_finishes_shared_actors_globally():
 
 
 def test_vllm_query_owned_actors_receive_explicit_session_environment(monkeypatch):
-    import duckdb.execution.vllm as vllm
-    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+    import vane.execution.vllm as vllm
+    from vane.runners.ray.ray_env import build_session_runtime_env_vars
 
     creations = []
 
@@ -1310,7 +1310,7 @@ def test_vllm_query_owned_actors_receive_explicit_session_environment(monkeypatc
 
 
 def test_vllm_actor_entrypoints_install_explicit_session_environment(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     events = []
 
@@ -1330,7 +1330,7 @@ def test_vllm_actor_entrypoints_install_explicit_session_environment(monkeypatch
 
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
 def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch, failure_type):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRay(types.ModuleType):
         def __init__(self):
@@ -1366,7 +1366,7 @@ def test_vllm_actor_shutdown_retains_failed_handles_for_retry(monkeypatch, failu
 
 
 def test_vllm_worker_borrow_does_not_kill_driver_owned_named_pool(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRay(types.ModuleType):
         def __init__(self):
@@ -1393,7 +1393,7 @@ def test_vllm_worker_borrow_does_not_kill_driver_owned_named_pool(monkeypatch):
 
 
 def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
-    from duckdb.execution.udf_ray_actor_pool import UDFActorPoolBase
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
 
     class FakeRay(types.ModuleType):
         def __init__(self):
@@ -1431,8 +1431,8 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
 def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypatch):
     import os
 
-    import duckdb.execution.udf_ray as udf_ray
-    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+    import vane.execution.udf_ray as udf_ray
+    from vane.runners.ray.ray_env import build_session_runtime_env_vars
 
     stale_key = "AWS_ISSUE75_STALE_TASK_SECRET"
     session_key = "AWS_ISSUE75_CURRENT_TASK_SECRET"
@@ -1457,7 +1457,7 @@ def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypat
 
 
 def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class FakeRay:
         def __init__(self):
@@ -1502,7 +1502,7 @@ def test_vllm_named_actor_pool_partial_lookup_fails_without_creation_fallback(mo
 def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
     import ray
 
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
@@ -1511,7 +1511,7 @@ def test_vllm_ray_execution_requires_runner_owned_runtime(monkeypatch):
 
 
 def test_vllm_remote_construction_base_exception_rolls_back_start_and_pool(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     events = []
 
@@ -1558,7 +1558,7 @@ def test_vllm_remote_construction_base_exception_rolls_back_start_and_pool(monke
 
 
 def test_vllm_remote_construction_cleanup_failures_preserve_base_exception(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     events = []
     primary_error = KeyboardInterrupt("construction interrupted")
@@ -1612,7 +1612,7 @@ def test_vllm_remote_construction_cleanup_failures_preserve_base_exception(monke
 
 
 def test_unified_executor_passes_local_subprocess_actor_pool_option():
-    from duckdb.execution.unified_executor import build_unified_executor
+    from vane.execution.unified_executor import build_unified_executor
 
     class Identity:
         def __call__(self, table):
@@ -1623,7 +1623,7 @@ def test_unified_executor_passes_local_subprocess_actor_pool_option():
         name = "fake-local-actor-pool"
 
         def __init__(self):
-            from duckdb.execution.udf_admission import LocalExecutionSlotPool
+            from vane.execution.udf_admission import LocalExecutionSlotPool
 
             self.admission_slots = LocalExecutionSlotPool(
                 max_slots=self.pool_size,
@@ -1669,7 +1669,7 @@ def test_unified_executor_passes_local_subprocess_actor_pool_option():
 
 
 def test_subprocess_actor_requires_precreated_local_actor_pool(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -1691,7 +1691,7 @@ def test_subprocess_actor_requires_precreated_local_actor_pool(monkeypatch):
 
 
 def test_subprocess_actor_rejects_local_actor_pool_name():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -1709,7 +1709,7 @@ def test_subprocess_actor_rejects_local_actor_pool_name():
 
 
 def test_subprocess_actor_invalid_local_actor_pool_size_preserves_validation_error():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -1732,7 +1732,7 @@ def test_subprocess_actor_invalid_local_actor_pool_size_preserves_validation_err
 
 
 def test_subprocess_actor_local_actor_pool_requires_full_runtime_contract():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -1755,7 +1755,7 @@ def test_subprocess_actor_local_actor_pool_requires_full_runtime_contract():
 
 
 def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     created_args = []
 
@@ -1811,7 +1811,7 @@ def test_ensure_local_subprocess_actor_pools_for_plan_injects_by_udf_node(monkey
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     created_args = []
     injected = []
@@ -1875,7 +1875,7 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_injects_with_callback(mon
 
 
 def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     session_config = {"AWS_ACCESS_KEY_ID": "session-key"}
 
@@ -1940,7 +1940,7 @@ def test_ensure_local_subprocess_actor_pools_for_nodes_reuses_injected_pool(monk
 
 
 def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reuse():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class ExistingPool:
         pool_size = 1
@@ -1987,7 +1987,7 @@ def test_ensure_local_subprocess_actor_pools_rejects_implicit_cross_session_reus
 
 
 def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class ExistingPool:
         pool_size = 1
@@ -2030,7 +2030,7 @@ def test_subprocess_actor_executor_rejects_cross_session_pool_attachment():
 
 
 def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_errors():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class BrokenPlan:
         def collect_udf_nodes(self, conn=None):
@@ -2041,7 +2041,7 @@ def test_ensure_local_subprocess_actor_pools_for_plan_propagates_collection_erro
 
 
 def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_on_failure(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     created = []
 
@@ -2083,8 +2083,8 @@ def test_ensure_local_subprocess_actor_pools_for_plan_rolls_back_created_pools_o
 
 
 def test_subprocess_actor_fail_fast_unregisters_local_shm_budget_wakeup():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     class Identity:
         def __call__(self, table):
@@ -2111,7 +2111,7 @@ def test_subprocess_actor_fail_fast_unregisters_local_shm_budget_wakeup():
 
 
 def test_unified_executor_routes_subprocess_scalar_native():
-    from duckdb.execution.unified_executor import build_unified_executor
+    from vane.execution.unified_executor import build_unified_executor
 
     def add_two(value):
         return value + 2
@@ -2129,7 +2129,7 @@ def test_unified_executor_routes_subprocess_scalar_native():
 
 
 def test_udf_runtime_rejects_record_batch_reader_input_without_consuming_it():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         return table
@@ -2154,7 +2154,7 @@ def test_udf_runtime_rejects_record_batch_reader_input_without_consuming_it():
     ],
 )
 def test_udf_runtime_rejects_record_batch_reader_output_without_consuming_it(call_mode, scalar_udf_type):
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(value):
         return value
@@ -2174,7 +2174,7 @@ def test_udf_runtime_rejects_record_batch_reader_output_without_consuming_it(cal
 
 
 def test_udf_runtime_map_batches_stream_output_buffers_compute_subbatches_until_submit_flush():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -2202,7 +2202,7 @@ def test_udf_runtime_map_batches_stream_output_buffers_compute_subbatches_until_
 
 
 def test_udf_runtime_iter_submit_stream_output_buffers_until_output_batch_size():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -2229,7 +2229,7 @@ def test_udf_runtime_iter_submit_stream_output_buffers_until_output_batch_size()
 
 
 def test_udf_runtime_can_flush_stream_output_at_each_compute_batch_end():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -2256,7 +2256,7 @@ def test_udf_runtime_can_flush_stream_output_at_each_compute_batch_end():
 
 
 def test_udf_runtime_output_buffer_flushes_by_target_bytes():
-    from duckdb.execution._udf_runtime import RuntimeOutputBuffer
+    from vane.execution._udf_runtime import RuntimeOutputBuffer
 
     table = pa.table({"payload": [b"x" * 64, b"y" * 64, b"z" * 64]})
     buffer = RuntimeOutputBuffer(target_rows=2048, target_bytes=1)
@@ -2273,7 +2273,7 @@ def test_udf_runtime_output_buffer_flushes_by_target_bytes():
 
 
 def test_udf_runtime_output_buffer_accepts_zero_byte_null_tables():
-    from duckdb.execution._udf_runtime import RuntimeOutputBuffer
+    from vane.execution._udf_runtime import RuntimeOutputBuffer
 
     table = pa.table({"payload": [None, None, None]})
     buffer = RuntimeOutputBuffer(target_rows=2048, target_bytes=1)
@@ -2286,7 +2286,7 @@ def test_udf_runtime_output_buffer_accepts_zero_byte_null_tables():
 
 
 def test_udf_runtime_iter_submit_stream_output_flushes_by_target_bytes():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def make_payload(table):
         values = table.column("x").to_pylist()
@@ -2313,7 +2313,7 @@ def test_udf_runtime_iter_submit_stream_output_flushes_by_target_bytes():
 
 
 def test_udf_runtime_iter_submit_stream_output_accepts_all_null_output():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def make_nulls(table):
         return pa.table({"payload": [None for _ in range(table.num_rows)]})
@@ -2332,7 +2332,7 @@ def test_udf_runtime_iter_submit_stream_output_accepts_all_null_output():
 
 
 def test_udf_runtime_map_batches_buffers_input_until_compute_batch_size():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def report_compute_batch(table):
         values = table.column("x").to_pylist()
@@ -2365,7 +2365,7 @@ def test_udf_runtime_map_batches_buffers_input_until_compute_batch_size():
 
 
 def test_udf_runtime_map_batches_finished_submitting_flushes_compute_tail():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def report_compute_batch(table):
         values = table.column("x").to_pylist()
@@ -2397,7 +2397,7 @@ def test_udf_runtime_map_batches_finished_submitting_flushes_compute_tail():
 
 
 def test_udf_runtime_close_flushes_compute_tail_before_releasing_callable():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def report_compute_batch(table):
         values = table.column("x").to_pylist()
@@ -2429,7 +2429,7 @@ def test_udf_runtime_close_flushes_compute_tail_before_releasing_callable():
 
 
 def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class ReportComputeBatch:
         def __call__(self, table):
@@ -2461,7 +2461,7 @@ def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():
 
 
 def test_udf_runtime_stream_output_empty_result_supports_nested_schema():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     feature_type = pa.struct(
         [
@@ -2499,7 +2499,7 @@ def test_udf_runtime_stream_output_empty_result_supports_nested_schema():
 
 
 def test_udf_runtime_map_batches_without_batch_size_passes_entire_block():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def report_batch_size(table):
         return pa.table({"rows": [table.num_rows]})
@@ -2518,7 +2518,7 @@ def test_udf_runtime_map_batches_without_batch_size_passes_entire_block():
 
 
 def test_udf_runtime_callable_class_actor_backend_reuses_instance_state():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class StatefulBatchUDF:
         def __init__(self):
@@ -2550,7 +2550,7 @@ def test_udf_runtime_callable_class_actor_backend_reuses_instance_state():
 
 
 def test_udf_runtime_callable_class_rejects_task_backend():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class StatefulBatchUDF:
         def __call__(self, table):
@@ -2561,7 +2561,7 @@ def test_udf_runtime_callable_class_rejects_task_backend():
 
 
 def test_udf_runtime_function_rejects_actor_backend():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         return table
@@ -2571,7 +2571,7 @@ def test_udf_runtime_function_rejects_actor_backend():
 
 
 def test_udf_runtime_callable_class_constructor_must_be_zero_argument():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class NeedsModelName:
         def __init__(self, _model_name):
@@ -2585,7 +2585,7 @@ def test_udf_runtime_callable_class_constructor_must_be_zero_argument():
 
 
 def test_udf_runtime_scalar_callable_class_actor_backend():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class AddOffset:
         def __init__(self):
@@ -2604,7 +2604,7 @@ def test_udf_runtime_scalar_callable_class_actor_backend():
 
 
 def test_udf_runtime_stream_output_default_uses_runtime_batch_size():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         values = table.column("x").to_pylist()
@@ -2629,7 +2629,7 @@ def test_udf_runtime_stream_output_default_uses_runtime_batch_size():
 
 
 def test_udf_runtime_stream_output_default_ignores_submit_and_method_batch_size():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         values = table.column("x").to_pylist()
@@ -2653,7 +2653,7 @@ def test_udf_runtime_stream_output_default_ignores_submit_and_method_batch_size(
 
 
 def test_udf_runtime_stream_output_default_has_no_implicit_system_batch_size():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         values = table.column("x").to_pylist()
@@ -2677,7 +2677,7 @@ def test_udf_runtime_stream_output_default_has_no_implicit_system_batch_size():
 
 
 def test_udf_runtime_stream_output_batch_size_is_independent():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def identity(table):
         values = table.column("x").to_pylist()
@@ -2705,7 +2705,7 @@ def test_udf_runtime_stream_output_batch_size_is_independent():
 
 
 def test_udf_runtime_flat_map_stream_output_yields_per_output_batch(tmp_path):
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     marker = tmp_path / "flat-map-seen.txt"
 
@@ -2738,7 +2738,7 @@ def test_udf_runtime_flat_map_stream_output_yields_per_output_batch(tmp_path):
 
 
 def test_udf_runtime_flat_map_stream_output_returns_empty_schema_when_all_rows_skip():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     def skip(_row):
         return None
@@ -2761,7 +2761,7 @@ def test_udf_runtime_flat_map_stream_output_returns_empty_schema_when_all_rows_s
 
 
 def test_ray_task_streaming_payload_enables_flat_map_stream_output():
-    from duckdb.execution.udf_ray import _streaming_task_payload
+    from vane.execution.udf_ray import _streaming_task_payload
 
     payload = {
         "call_mode": "flat_map",
@@ -2776,7 +2776,7 @@ def test_ray_task_streaming_payload_enables_flat_map_stream_output():
 
 
 def test_ray_task_ref_bundle_stream_flushes_compute_tail_after_finished_submitting(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     monkeypatch.setattr(
         udf_ray,
@@ -2829,7 +2829,7 @@ def test_ray_task_ref_bundle_stream_flushes_compute_tail_after_finished_submitti
 
 
 def test_ray_task_ref_bundle_map_batches_without_batch_size_passes_entire_block(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     monkeypatch.setattr(
         udf_ray,
@@ -2872,7 +2872,7 @@ def test_ray_task_ref_bundle_map_batches_without_batch_size_passes_entire_block(
 
 
 def test_subprocess_map_batches_concatenates_stream_output():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -2896,7 +2896,7 @@ def test_subprocess_map_batches_concatenates_stream_output():
 
 
 def test_subprocess_error_propagates_and_closes_worker():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Fail:
         def __call__(self, table):
@@ -2930,7 +2930,7 @@ def test_subprocess_error_propagates_and_closes_worker():
 
 
 def test_subprocess_close_is_idempotent():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return table
@@ -2943,7 +2943,7 @@ def test_subprocess_close_is_idempotent():
 
 
 def test_subprocess_resizes_shared_memory_for_large_output():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     large_value = "x" * (2 * 1024 * 1024)
 
@@ -2962,7 +2962,7 @@ def test_subprocess_resizes_shared_memory_for_large_output():
 
 
 def test_subprocess_map_batches_none_output_returns_empty_table():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def no_output(_table):
         return None
@@ -2984,7 +2984,7 @@ def test_subprocess_map_batches_none_output_returns_empty_table():
 
 
 def test_subprocess_flat_map_all_skipped_rows_returns_empty_table():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def skip_all(_row):
         return None
@@ -3007,7 +3007,7 @@ def test_subprocess_flat_map_all_skipped_rows_returns_empty_table():
 
 
 def test_local_shm_ref_bundle_roundtrip():
-    from duckdb.execution.ref_bundle import (
+    from vane.execution.ref_bundle import (
         REF_BUNDLE_RESULT_MARKER,
         make_local_shm_ref_bundle_result,
         materialize_ref_bundle,
@@ -3027,8 +3027,8 @@ def test_local_shm_ref_bundle_roundtrip():
 
 
 def test_local_shm_ref_bundle_byte_metadata_is_positive_for_all_null_nonempty_tables():
-    import duckdb.execution.ref_bundle as ref_bundle
-    from duckdb.execution._common import estimate_table_bytes
+    import vane.execution.ref_bundle as ref_bundle
+    from vane.execution._common import estimate_table_bytes
 
     table = pa.table({"payload": [None, None, None]})
     empty = table.slice(0, 0)
@@ -3064,7 +3064,7 @@ def test_local_shm_ref_bundle_byte_metadata_is_positive_for_all_null_nonempty_ta
 
 
 def test_local_shm_multi_block_descriptor_splits_single_output_grant_budget(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
     before = ref_bundle.local_shm_ref_budget_snapshot()["allocated_bytes"]
@@ -3097,7 +3097,7 @@ def test_local_shm_multi_block_descriptor_splits_single_output_grant_budget(monk
 
 
 def test_materialize_ref_bundle_accepts_ray_object_ref(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     class FakeObjectRef:
         pass
@@ -3113,7 +3113,7 @@ def test_materialize_ref_bundle_accepts_ray_object_ref(monkeypatch):
 
 
 def test_materialize_ref_bundle_rejects_unresolved_refs_without_ray_fallback(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     class UnresolvedRef:
         pass
@@ -3121,7 +3121,7 @@ def test_materialize_ref_bundle_rejects_unresolved_refs_without_ray_fallback(mon
     def fail_ray_materialize(*_args, **_kwargs):
         raise AssertionError("materialize_ref_bundle must not fall back to Ray materialization")
 
-    import duckdb.execution.udf_ray_actor_runtime as actor_runtime
+    import vane.execution.udf_ray_actor_runtime as actor_runtime
 
     monkeypatch.setattr(actor_runtime, "_materialize_ref_bundle", fail_ray_materialize)
 
@@ -3130,7 +3130,7 @@ def test_materialize_ref_bundle_rejects_unresolved_refs_without_ray_fallback(mon
 
 
 def test_local_shm_descriptor_requires_current_schema():
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     with pytest.raises(ValueError, match="missing shm_name"):
         ref_bundle._local_shm_descriptor_from_mapping(
@@ -3146,7 +3146,7 @@ def test_local_shm_descriptor_requires_current_schema():
 
 
 def test_local_shm_ref_bundle_release_is_idempotent_and_observable():
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     before = ref_bundle.local_shm_ref_lifecycle_snapshot()
     _marker, refs, _metadata, _names = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2, 3]}))
@@ -3163,7 +3163,7 @@ def test_local_shm_ref_bundle_release_is_idempotent_and_observable():
 
 
 def test_local_shm_ref_bundle_materialize_avoids_bytes_copy(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     def fail_bytes_copy(*_args, **_kwargs):
         raise AssertionError("local_shm materialization should not copy IPC payload into bytes")
@@ -3180,7 +3180,7 @@ def test_local_shm_ref_bundle_materialize_avoids_bytes_copy(monkeypatch):
 
 
 def test_local_shm_ref_bundle_slice_retains_consumer_mapping_after_ref_release():
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     _marker, refs, metadata, names = ref_bundle.make_local_shm_ref_bundle_result(
         pa.table({"x": [1, 2, 3], "y": ["a", "b", "c"]})
@@ -3196,7 +3196,7 @@ def test_local_shm_ref_bundle_slice_retains_consumer_mapping_after_ref_release()
 
 
 def test_local_shm_ref_bundle_arrow_column_outlives_materialized_table():
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     tensor = pa.FixedShapeTensorArray.from_numpy_ndarray(
         __import__("numpy").arange(24, dtype="float32").reshape(2, 3, 4)
@@ -3216,7 +3216,7 @@ def test_local_shm_ref_bundle_arrow_column_outlives_materialized_table():
 
 
 def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 100 * ref_bundle._GIB)
@@ -3231,7 +3231,7 @@ def test_local_shm_ref_bundle_auto_budget_uses_ray_like_capacity(monkeypatch):
 
 
 def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     shm_capacity = 256 * ref_bundle._MIB
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 80 * ref_bundle._GIB)
@@ -3241,7 +3241,7 @@ def test_local_shm_ref_bundle_auto_budget_never_exceeds_small_shm_capacity(monke
 
 
 def test_local_shm_ref_bundle_acquires_budget_before_creating_shm(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     events = []
     acquire = ref_bundle._acquire_local_shm_ref_budget
@@ -3267,7 +3267,7 @@ def test_local_shm_ref_bundle_acquires_budget_before_creating_shm(monkeypatch):
 
 
 def test_local_shm_budget_manager_auto_limit_does_not_shrink_after_first_resolution(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     monkeypatch.delenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raising=False)
     available_system = [100 * ref_bundle._GIB]
@@ -3285,7 +3285,7 @@ def test_local_shm_budget_manager_auto_limit_does_not_shrink_after_first_resolut
 
 
 def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -3299,7 +3299,7 @@ def test_local_shm_ref_bundle_can_claim_output_budget_matches_claim_semantics(mo
 
 
 def test_local_shm_ref_bundle_submit_admission_allows_small_consumer_when_hard_budget_full(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -3313,7 +3313,7 @@ def test_local_shm_ref_bundle_submit_admission_allows_small_consumer_when_hard_b
 
 
 def test_local_shm_ref_bundle_submit_admission_throttles_large_producer_at_soft_watermark(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -3328,7 +3328,7 @@ def test_local_shm_ref_bundle_submit_admission_throttles_large_producer_at_soft_
 
 
 def test_local_shm_ref_bundle_submit_admission_counts_projected_inflight_output(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -3342,7 +3342,7 @@ def test_local_shm_ref_bundle_submit_admission_counts_projected_inflight_output(
 
 
 def test_local_shm_ref_output_budget_cancel_wait_is_event_driven(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     cancel_event = threading.Event()
 
@@ -3382,7 +3382,7 @@ def test_local_shm_ref_output_budget_cancel_wait_is_event_driven(monkeypatch):
 
 
 def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
@@ -3428,7 +3428,7 @@ def test_local_shm_ref_bundle_budget_blocks_until_release(monkeypatch):
 
 
 def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
+    import vane.execution.ref_bundle as ref_bundle
 
     table = pa.table({"x": ["x" * 4096]})
     required = ref_bundle._IPC_HEADER_SIZE + len(ref_bundle._arrow_table_to_ipc_bytes(table))
@@ -3474,8 +3474,8 @@ def test_local_shm_ref_bundle_descriptor_wrap_can_overcommit_without_block(monke
 
 
 def test_subprocess_ref_bundle_output_materializes():
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, SUBMIT_RESULT_MARKER, materialize_ref_bundle
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, SUBMIT_RESULT_MARKER, materialize_ref_bundle
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -3507,8 +3507,8 @@ def test_subprocess_ref_bundle_output_materializes():
 
 
 def test_subprocess_ref_bundle_output_avoids_parent_table_roundtrip(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, materialize_ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER, materialize_ref_bundle
 
     def fail_parent_deserialize(*_args, **_kwargs):
         raise AssertionError("subprocess parent should not deserialize worker output IPC")
@@ -3544,7 +3544,7 @@ def test_subprocess_ref_bundle_output_avoids_parent_table_roundtrip(monkeypatch)
 
 
 def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -3570,8 +3570,8 @@ def test_subprocess_ref_bundle_mode_rejects_direct_ipc(monkeypatch):
 
 
 def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     descriptor = {
         "block_refs": [
@@ -3596,7 +3596,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
     executor._active_output_grants_lock = threading.Lock()
     executor._recv_expected = lambda _expected: (
         subprocess_exec._MSG_REF_BUNDLE_RESULT,
-        subprocess_exec.duckdb_pickle.dumps(descriptor),
+        subprocess_exec.vane_pickle.dumps(descriptor),
     )
 
     released = []
@@ -3631,7 +3631,7 @@ def test_subprocess_ref_bundle_wrap_failure_releases_descriptor_and_grant(monkey
 
 
 def test_subprocess_ref_bundle_contract_requires_output_mode():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -3642,7 +3642,7 @@ def test_subprocess_ref_bundle_contract_requires_output_mode():
 
 
 def test_subprocess_ref_bundle_contract_requires_produce_flag():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -3653,8 +3653,8 @@ def test_subprocess_ref_bundle_contract_requires_produce_flag():
 
 
 def test_subprocess_materialized_input_releases_budget_before_output_grant(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     def identity(table):
         return pa.table({"y": table.column("x")})
@@ -3686,8 +3686,8 @@ def test_subprocess_materialized_input_releases_budget_before_output_grant(monke
 
 
 def test_subprocess_consumes_local_shm_ref_bundle_with_id_without_parent_materialize(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -3716,8 +3716,8 @@ def test_subprocess_consumes_local_shm_ref_bundle_with_id_without_parent_materia
 
 
 def test_subprocess_actor_pool_submit_with_id_uses_multiple_workers():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
 
     class WorkerPID:
         def __call__(self, table):
@@ -3754,7 +3754,7 @@ def test_subprocess_actor_pool_submit_with_id_uses_multiple_workers():
 
 
 def test_subprocess_task_rejects_callable_instance():
-    from duckdb.execution._udf_runtime import UDFExecutor
+    from vane.execution._udf_runtime import UDFExecutor
 
     class StatefulBatchUDF:
         def __init__(self):
@@ -3775,8 +3775,8 @@ def test_subprocess_task_rejects_callable_instance():
 
 
 def test_subprocess_actor_reuses_callable_class_state():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
 
     class StatefulBatchUDF:
         def __init__(self):
@@ -3819,8 +3819,8 @@ def test_subprocess_actor_reuses_callable_class_state():
 
 
 def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def worker_pid(table):
         import os
@@ -3856,7 +3856,7 @@ def test_subprocess_task_worker_slots_control_pool_size(monkeypatch):
 
 
 def test_subprocess_task_stats_report_worker_slot_admission():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
 
@@ -3899,7 +3899,7 @@ def test_subprocess_task_stats_report_worker_slot_admission():
 
 
 def test_subprocess_task_ref_bundle_output_claims_schema_budget(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
     claims = []
@@ -3944,7 +3944,7 @@ def test_subprocess_task_ref_bundle_output_claims_schema_budget(monkeypatch):
 
 
 def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
     monkeypatch.setattr(
@@ -3997,7 +3997,7 @@ def test_subprocess_ref_bundle_output_stats_report_budget_availability(monkeypat
 
 
 def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def make_output(table):
         return pa.table({"blob": table.column("x")})
@@ -4027,8 +4027,8 @@ def test_subprocess_ref_bundle_blob_output_schema_has_initial_budget_estimate():
 
 
 def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     parent_sock, child_sock = subprocess_exec.socket.socketpair()
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
@@ -4056,7 +4056,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
     monkeypatch.setattr(subprocess_exec, "request_local_shm_output_grant", fake_request)
 
     try:
-        payload = subprocess_exec.duckdb_pickle.dumps(
+        payload = subprocess_exec.vane_pickle.dumps(
             {
                 "request_id": 9,
                 "size_bytes": 128,
@@ -4067,7 +4067,7 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
         assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
 
         msg_type, response_payload = subprocess_exec._recv_message(child_sock)
-        response = subprocess_exec.duckdb_pickle.loads(response_payload)
+        response = subprocess_exec.vane_pickle.loads(response_payload)
         assert msg_type == subprocess_exec._MSG_OUTPUT_GRANT_GRANTED
         assert response["grant_id"] == 77
         assert captured == {
@@ -4083,8 +4083,8 @@ def test_subprocess_output_grant_request_uses_active_execution_scope(monkeypatch
 
 
 def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     events: list[object] = []
     executor = subprocess_exec._SingleSubprocessExecutor.__new__(subprocess_exec._SingleSubprocessExecutor)
@@ -4124,7 +4124,7 @@ def test_single_subprocess_close_without_kill_cancels_output_grant_wait(monkeypa
 
 
 def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_wait():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -4171,7 +4171,7 @@ def test_local_subprocess_actor_pool_shutdown_fences_admission_before_executor_w
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 @pytest.mark.parametrize("kill", [False, True])
 def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_cleanup(kill, cleanup_fails):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     spawn_entered = threading.Event()
     allow_spawn_return = threading.Event()
@@ -4298,7 +4298,7 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
 
 @pytest.mark.parametrize("kill", [False, True])
 def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement(monkeypatch, kill):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     startup_observed = threading.Event()
     startup_cancelled = threading.Event()
@@ -4380,7 +4380,7 @@ def test_local_subprocess_actor_pool_shutdown_interrupts_provisional_replacement
 
 
 def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class FailedWorker:
         def close(self, *, kill: bool = False) -> None:
@@ -4428,7 +4428,7 @@ def test_local_subprocess_actor_pool_shutdown_bounds_unpublished_replacement(mon
 
 
 def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
     scopes = [
@@ -4497,8 +4497,8 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
 
 
 def test_local_subprocess_actor_abort_fences_generation_from_idle_reuse():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     task_started = threading.Event()
     finish_task = threading.Event()
@@ -4575,8 +4575,8 @@ def test_local_subprocess_actor_abort_fences_generation_from_idle_reuse():
 
 
 def test_stateful_actor_preserves_structured_udf_error_before_terminal_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     class FailedWorker:
         def __init__(self):
@@ -4632,8 +4632,8 @@ def test_stateful_actor_preserves_structured_udf_error_before_terminal_failure()
 
 
 def test_stateful_actor_idle_loss_fails_pool_without_replacement():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     replacement_attempted = False
 
@@ -4700,7 +4700,7 @@ def test_stateful_actor_idle_loss_fails_pool_without_replacement():
 
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_failure(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -4741,7 +4741,7 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_f
 
 
 def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_init_failure(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -4781,7 +4781,7 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
 
 
 def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_executor():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -4836,7 +4836,7 @@ def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_exe
 
 
 def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failures():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -4902,7 +4902,7 @@ def test_global_subprocess_task_runtime_close_attempts_all_cleanup_after_failure
 
 
 def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     shutdown_started = threading.Event()
     allow_shutdown = threading.Event()
@@ -4947,7 +4947,7 @@ def test_global_subprocess_task_runtime_concurrent_close_waits_for_cleanup():
 
 
 def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -4996,7 +4996,7 @@ def test_global_subprocess_task_runtime_releases_worker_when_debug_logging_fails
 
 
 def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -5054,7 +5054,7 @@ def test_subprocess_task_completion_cleanup_survives_debug_and_admission_errors(
 
 
 def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -5096,7 +5096,7 @@ def test_subprocess_failed_submit_retires_scope_after_admission_cleanup_failure(
 
 
 def test_udf_executor_close_without_kill_cancels_local_shm_waits_before_waiting(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
 
@@ -5143,7 +5143,7 @@ def test_udf_executor_close_without_kill_cancels_local_shm_waits_before_waiting(
 
 
 def test_subprocess_wakeup_callback_errors_are_reported_on_ready_result_take():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
     executor._wakeup = lambda: (_ for _ in ()).throw(RuntimeError("wakeup failed"))
@@ -5158,7 +5158,7 @@ def test_subprocess_wakeup_callback_errors_are_reported_on_ready_result_take():
 
 
 def test_subprocess_submit_without_worker_owner_fails_fast():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     executor = subprocess_exec.UDFExecutor.__new__(subprocess_exec.UDFExecutor)
     executor._closed = False
@@ -5185,7 +5185,7 @@ def test_subprocess_submit_without_worker_owner_fails_fast():
 
 
 def test_subprocess_ref_bundle_output_stats_include_pending_projected_bytes(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     calls = []
 
@@ -5238,7 +5238,7 @@ def test_subprocess_ref_bundle_output_stats_include_pending_projected_bytes(monk
 
 
 def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
     monkeypatch.setattr(subprocess_exec.os, "cpu_count", lambda: 1)
@@ -5290,8 +5290,8 @@ def test_subprocess_task_runtime_keeps_cpu_count_worker_cap(monkeypatch):
 
 
 def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
 
@@ -5325,7 +5325,7 @@ def test_subprocess_task_pool_kill_closes_active_worker(monkeypatch):
 
 
 def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
     calls: list[str] = []
@@ -5367,8 +5367,8 @@ def test_subprocess_task_pool_release_attempts_all_idle_worker_cleanup_after_fai
 
 
 def test_subprocess_task_pool_abort_fences_worker_from_idle_reuse(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
     close_started = threading.Event()
@@ -5430,8 +5430,8 @@ def test_subprocess_task_pool_abort_fences_worker_from_idle_reuse(monkeypatch):
 
 
 def test_subprocess_task_pool_abort_attempts_every_matching_worker_after_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     calls: list[str] = []
 
@@ -5466,7 +5466,7 @@ def test_subprocess_task_pool_abort_attempts_every_matching_worker_after_failure
 
 
 def test_subprocess_task_pool_nonfinal_release_does_not_join_shared_worker_spawn():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     runtime = types.SimpleNamespace(
         cond=threading.Condition(),
@@ -5497,8 +5497,8 @@ def test_subprocess_task_pool_nonfinal_release_does_not_join_shared_worker_spawn
 @pytest.mark.parametrize("kill", [False, True])
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_subprocess_task_close_joins_worker_spawned_during_close(monkeypatch, kill, close_owner, cleanup_fails):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
     spawn_started = threading.Event()
@@ -5593,7 +5593,7 @@ def test_subprocess_task_close_joins_worker_spawned_during_close(monkeypatch, ki
 
 
 def test_subprocess_task_close_bounds_unpublished_worker_startup(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     runtime = subprocess_exec._GlobalSubprocessTaskRuntime()
     pool = subprocess_exec._TaskWorkerPool(
@@ -5629,7 +5629,7 @@ def test_subprocess_task_close_bounds_unpublished_worker_startup(monkeypatch):
 
 
 def test_single_subprocess_startup_can_be_cancelled_before_ready_wait():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     startup_observed = threading.Event()
     allow_startup_to_continue = threading.Event()
@@ -5671,7 +5671,7 @@ def test_single_subprocess_startup_can_be_cancelled_before_ready_wait():
 
 
 def test_single_subprocess_startup_can_be_cancelled_during_ready_wait(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     ready_wait_started = threading.Event()
     allow_ready_wait = threading.Event()
@@ -5721,9 +5721,9 @@ def test_single_subprocess_startup_can_be_cancelled_during_ready_wait(monkeypatc
 
 
 def test_subprocess_task_releases_result_cancelled_after_worker_call():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
 
     released = 0
     events: list[str] = []
@@ -5775,9 +5775,9 @@ def test_subprocess_task_releases_result_cancelled_after_worker_call():
 
 
 def test_subprocess_actor_releases_result_cancelled_after_worker_call():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope, ExecutionCancelledError
 
     released = 0
 
@@ -5830,7 +5830,7 @@ def test_subprocess_actor_releases_result_cancelled_after_worker_call():
 
 
 def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
 
@@ -5887,7 +5887,7 @@ def test_subprocess_task_shared_payload_pool_keeps_worker_slots_global(monkeypat
 
 
 def test_subprocess_task_pool_identity_includes_session_config():
-    from duckdb.execution.udf_subprocess import _payload_task_key
+    from vane.execution.udf_subprocess import _payload_task_key
 
     payload = {
         "execution_backend": "subprocess_task",
@@ -5917,7 +5917,7 @@ def test_subprocess_task_pool_identity_includes_session_config():
 
 
 def test_subprocess_task_workers_receive_exact_session_environment(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "inherited-key")
@@ -5979,7 +5979,7 @@ def test_subprocess_task_workers_receive_exact_session_environment(monkeypatch):
 
 
 def test_subprocess_actor_number_controls_pool_size(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class Identity:
         def __call__(self, table):
@@ -6002,8 +6002,8 @@ def test_subprocess_actor_number_controls_pool_size(monkeypatch):
 
 
 def test_subprocess_actor_number_controls_parallel_workers(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
 
     class WorkerPID:
         def __call__(self, table):
@@ -6043,7 +6043,7 @@ def test_subprocess_actor_number_controls_parallel_workers(monkeypatch):
 
 
 def test_subprocess_actor_requires_actor_number():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     class Identity:
         def __call__(self, table):
@@ -6054,8 +6054,8 @@ def test_subprocess_actor_requires_actor_number():
 
 
 def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materialize(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
 
     def add_one(table):
         values = table.column("x").to_pylist()
@@ -6093,8 +6093,8 @@ def test_subprocess_pool_consumes_local_shm_ref_bundle_without_parent_materializ
 def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
     from multiprocessing import shared_memory
 
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER, make_local_shm_ref_bundle_result
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def maybe_sleep_add_one(table):
         import time
@@ -6148,8 +6148,8 @@ def test_subprocess_pool_ref_bundle_retains_local_shm_until_background_submit():
 
 
 def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return table
@@ -6193,8 +6193,8 @@ def test_subprocess_pool_zero_row_submit_wakeup_sees_no_inflight():
 
 
 def test_subprocess_zero_row_ref_bundle_releases_input_lease(monkeypatch):
-    from duckdb.execution import ref_bundle
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution import ref_bundle
+    from vane.execution.udf_subprocess import UDFExecutor
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1 << 30)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -6250,8 +6250,8 @@ def test_subprocess_zero_row_ref_bundle_releases_input_lease(monkeypatch):
 
 
 def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
     monkeypatch.setattr(ref_bundle, "_LOCAL_SHM_BUDGET_MANAGER", manager)
@@ -6333,8 +6333,8 @@ def test_zero_row_ref_bundle_release_is_idempotent_with_outer_close_cleanup(monk
 
 
 def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consumed():
-    from duckdb.execution.ref_bundle import SUBMIT_RESULT_MARKER
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.ref_bundle import SUBMIT_RESULT_MARKER
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return table
@@ -6373,7 +6373,7 @@ def test_subprocess_admission_holds_worker_slot_until_completed_result_is_consum
 
 
 def test_subprocess_worker_env_does_not_assign_cuda_devices(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     payload = {"execution_backend": "subprocess_actor", "gpus": 1.0}
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -6390,7 +6390,7 @@ def test_subprocess_worker_env_does_not_assign_cuda_devices(monkeypatch):
 
 
 def test_subprocess_task_worker_env_defaults_omp_num_threads_from_assigned_cpus(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     thread_env_names = (
         "OMP_NUM_THREADS",
@@ -6422,7 +6422,7 @@ def test_subprocess_task_worker_env_defaults_omp_num_threads_from_assigned_cpus(
 
 
 def test_subprocess_task_worker_env_defaults_omp_num_threads_to_one_without_cpus(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         monkeypatch.delenv(name, raising=False)
@@ -6440,7 +6440,7 @@ def test_subprocess_task_worker_env_defaults_omp_num_threads_to_one_without_cpus
 
 
 def test_subprocess_task_worker_env_defaults_fractional_cpus_to_one(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         monkeypatch.delenv(name, raising=False)
@@ -6458,7 +6458,7 @@ def test_subprocess_task_worker_env_defaults_fractional_cpus_to_one(monkeypatch)
 
 
 def test_subprocess_task_worker_env_preserves_explicit_omp_num_threads(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     monkeypatch.setenv("OMP_NUM_THREADS", "8")
     for name in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VANE_TORCH_NUM_THREADS"):
@@ -6478,7 +6478,7 @@ def test_subprocess_task_worker_env_preserves_explicit_omp_num_threads(monkeypat
 
 
 def test_subprocess_actor_worker_env_defaults_omp_num_threads(monkeypatch):
-    from duckdb.execution.udf_subprocess import _worker_env_for_pool_index
+    from vane.execution.udf_subprocess import _worker_env_for_pool_index
 
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         monkeypatch.delenv(name, raising=False)
@@ -6498,7 +6498,7 @@ def test_subprocess_actor_worker_env_defaults_omp_num_threads(monkeypatch):
 def test_udf_threading_configures_loaded_torch_once(monkeypatch):
     import sys
 
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     class FakeTorch:
         def __init__(self) -> None:
@@ -6532,7 +6532,7 @@ def test_udf_threading_configures_loaded_torch_once(monkeypatch):
 def test_udf_threading_accepts_matching_preconfigured_torch_threads(monkeypatch):
     import sys
 
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     class FakeTorch:
         @staticmethod
@@ -6562,7 +6562,7 @@ def test_udf_threading_accepts_matching_preconfigured_torch_threads(monkeypatch)
 def test_ray_native_actor_thread_policy_leaves_torch_defaults_untouched(monkeypatch):
     import sys
 
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     class FakeTorch:
         num_threads = 1
@@ -6595,7 +6595,7 @@ def test_ray_native_actor_thread_policy_leaves_torch_defaults_untouched(monkeypa
 
 
 def test_ray_actor_thread_policy_defaults_to_ray_native(monkeypatch):
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     monkeypatch.delenv(udf_threading.RAY_ACTOR_THREAD_POLICY_ENV, raising=False)
 
@@ -6604,7 +6604,7 @@ def test_ray_actor_thread_policy_defaults_to_ray_native(monkeypatch):
 
 
 def test_ray_actor_thread_policy_reads_actor_runtime_marker(monkeypatch):
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     monkeypatch.setenv(udf_threading.RAY_ACTOR_THREAD_POLICY_ENV, "ray_native")
 
@@ -6612,14 +6612,14 @@ def test_ray_actor_thread_policy_reads_actor_runtime_marker(monkeypatch):
 
 
 def test_ray_actor_thread_policy_rejects_unknown_value():
-    from duckdb.execution import udf_threading
+    from vane.execution import udf_threading
 
     with pytest.raises(ValueError, match="Ray actor thread policy"):
         udf_threading.ray_actor_thread_policy({"ray_actor_thread_policy": "different"})
 
 
 def test_subprocess_worker_receives_worker_env_without_cuda_assignment(monkeypatch):
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def worker_env(_table):
         import os
@@ -6652,7 +6652,7 @@ def test_subprocess_worker_receives_worker_env_without_cuda_assignment(monkeypat
 def test_unified_subprocess_does_not_import_ray(monkeypatch):
     import builtins
 
-    from duckdb.execution.unified_executor import build_unified_executor
+    from vane.execution.unified_executor import build_unified_executor
 
     original_import = builtins.__import__
 
@@ -6676,7 +6676,7 @@ def test_unified_subprocess_does_not_import_ray(monkeypatch):
 
 
 def test_subprocess_direct_ref_bundle_submit_without_admission_is_rejected():
-    from duckdb.execution.unified_executor import build_unified_executor
+    from vane.execution.unified_executor import build_unified_executor
 
     def identity(table):
         return table
@@ -6700,7 +6700,7 @@ class _FakeStreamRemote:
 
 
 def _ray_task_executor(*, stream_result="stream-ref", ref_stream_result="ref-stream-ref"):
-    from duckdb.execution.udf_ray import RayTaskUDFExecutor
+    from vane.execution.udf_ray import RayTaskUDFExecutor
 
     run_stream = _FakeStreamRemote(stream_result)
     run_ref_stream = _FakeStreamRemote(ref_stream_result)
@@ -6723,7 +6723,7 @@ def _ray_task_executor(*, stream_result="stream-ref", ref_stream_result="ref-str
 
 
 def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     captured = {}
 
@@ -6766,7 +6766,7 @@ def test_ray_task_submit_with_id_uses_generator_remote_with_pregranted_lease(mon
 
 
 def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
-    import duckdb.execution.udf_ray as udf_ray
+    import vane.execution.udf_ray as udf_ray
 
     captured = {}
 
@@ -6815,7 +6815,7 @@ def test_ray_task_submit_ref_bundle_with_id_uses_pregranted_lease(monkeypatch):
 
 
 def test_ref_bundle_slices_apply_projection_and_names():
-    import duckdb.execution.udf_ray as ray_exec
+    import vane.execution.udf_ray as ray_exec
 
     block = pa.table({"id": [1, 2, 3], "path": ["a", "b", "c"], "ok": [True, False, True]})
 
@@ -6830,8 +6830,8 @@ def test_ref_bundle_slices_apply_projection_and_names():
 
 
 def test_callable_cache_reuses_deserialized_callable(monkeypatch):
-    import duckdb.execution._common as common
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution._common as common
+    from vane import pickle as vane_pickle
 
     common.clear_udf_callable_cache()
     calls = []
@@ -6840,7 +6840,7 @@ def test_callable_cache_reuses_deserialized_callable(monkeypatch):
         calls.append(data)
         return object()
 
-    monkeypatch.setattr(duckdb_pickle, "loads", _fake_loads)
+    monkeypatch.setattr(vane_pickle, "loads", _fake_loads)
 
     payload = {
         "function_pickle": b"function-a",
@@ -6882,9 +6882,9 @@ def test_runtime_callable_cache_contract_applies_to_every_udf_type(
     scalar_udf_type,
     load_stat,
 ):
-    import duckdb.execution._common as common
-    from duckdb import pickle as duckdb_pickle
-    from duckdb.execution._udf_runtime import UDFExecutor
+    import vane.execution._common as common
+    from vane import pickle as vane_pickle
+    from vane.execution._udf_runtime import UDFExecutor
 
     common.clear_udf_callable_cache()
     calls = []
@@ -6896,7 +6896,7 @@ def test_runtime_callable_cache_contract_applies_to_every_udf_type(
         calls.append(data)
         return udf
 
-    monkeypatch.setattr(duckdb_pickle, "loads", fake_loads)
+    monkeypatch.setattr(vane_pickle, "loads", fake_loads)
     payload = {
         "function_pickle": f"{call_mode}-{scalar_udf_type}".encode(),
         "call_mode": call_mode,
@@ -6923,7 +6923,7 @@ def test_runtime_callable_cache_contract_applies_to_every_udf_type(
 
 
 def test_local_shm_budget_manager_input_lease_is_diagnostic_only(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
 
@@ -6967,7 +6967,7 @@ def test_local_shm_budget_manager_input_lease_is_diagnostic_only(monkeypatch):
 
 
 def test_local_shm_budget_manager_defers_shared_input_ref_release_until_last_lease():
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
 
@@ -7000,7 +7000,7 @@ def test_local_shm_budget_manager_defers_shared_input_ref_release_until_last_lea
 
 
 def test_local_shm_input_ack_does_not_fallback_to_destructive_release():
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
 
@@ -7028,7 +7028,7 @@ def test_local_shm_input_ack_does_not_fallback_to_destructive_release():
 
 
 def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
     marker, refs, metadata, names = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2, 3]}))
@@ -7056,7 +7056,7 @@ def test_local_shm_input_ack_releases_budget_without_invalidating_descriptor(mon
 def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
     import threading
 
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
 
@@ -7106,7 +7106,7 @@ def test_local_shm_budget_manager_reserves_consumed_input_for_matching_output():
 def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_credits():
     import threading
 
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
 
@@ -7164,7 +7164,7 @@ def test_local_shm_budget_manager_matching_output_grant_waits_for_other_input_cr
 
 
 def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit():
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
 
@@ -7189,7 +7189,7 @@ def test_local_shm_budget_manager_cancel_releases_consumed_input_output_credit()
 
 
 def test_local_shm_budget_manager_can_consume_input_without_output_credit():
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1000)
 
@@ -7215,7 +7215,7 @@ def test_local_shm_budget_manager_can_consume_input_without_output_credit():
 
 
 def test_local_shm_budget_manager_output_grant_converts_to_allocation():
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 1024)
     grant_id = manager.request_output_grant(256, name="grant-a", priority="consumer")
@@ -7239,7 +7239,7 @@ def test_local_shm_budget_manager_output_grant_converts_to_allocation():
 def test_local_shm_budget_manager_output_grant_waits_until_allocation_released():
     import threading
 
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 512)
     manager.acquire_allocation(512, name="full")
@@ -7261,7 +7261,7 @@ def test_local_shm_budget_manager_output_grant_waits_until_allocation_released()
 
 @pytest.mark.parametrize("raw", ["not-a-byte-size", "-1", "-1g"])
 def test_local_shm_budget_invalid_env_raises_without_fallback(monkeypatch, raw):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", raw)
 
@@ -7280,7 +7280,7 @@ def test_local_shm_budget_invalid_env_raises_without_fallback(monkeypatch, raw):
 
 
 def test_local_shm_auto_budget_rejects_missing_capacity_instead_of_ignoring_it(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     monkeypatch.setattr(ref_bundle, "_available_system_memory_bytes", lambda: 16 * ref_bundle._GIB)
     monkeypatch.setattr(ref_bundle, "_available_local_shm_bytes", lambda: 0)
@@ -7290,7 +7290,7 @@ def test_local_shm_auto_budget_rejects_missing_capacity_instead_of_ignoring_it(m
 
 
 def test_local_ref_bundle_worker_payload_carries_input_lease_id():
-    from duckdb.execution.ref_bundle import make_local_ref_bundle_worker_payload, make_local_shm_ref_bundle_result
+    from vane.execution.ref_bundle import make_local_ref_bundle_worker_payload, make_local_shm_ref_bundle_result
 
     marker, refs, metadata, names = make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
     try:
@@ -7303,7 +7303,7 @@ def test_local_ref_bundle_worker_payload_carries_input_lease_id():
 
 
 def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_monkeypatch(monkeypatch):
-    from duckdb.execution import ref_bundle
+    from vane.execution import ref_bundle
 
     shared_registers = []
     shared_unregisters = []
@@ -7337,8 +7337,8 @@ def test_local_shm_descriptor_wrap_balances_resource_tracking_without_global_mon
 
 
 def test_subprocess_ref_bundle_input_ack_releases_upstream_before_result(monkeypatch):
-    from duckdb.execution import ref_bundle
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution import ref_bundle
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return pa.table({"y": table.column("x").to_pylist()})
@@ -7371,8 +7371,8 @@ def test_subprocess_ref_bundle_input_ack_releases_upstream_before_result(monkeyp
 
 
 def test_subprocess_ref_bundle_consumer_can_start_when_output_budget_full(monkeypatch):
-    from duckdb.execution import ref_bundle
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution import ref_bundle
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return pa.table({"y": table.column("x").to_pylist()})
@@ -7418,7 +7418,7 @@ def _timeout_test_executor(subprocess_exec, sock):
 @pytest.mark.parametrize("initial_timeout", [None, 5.0, 0.0], ids=["blocking", "finite", "nonblocking"])
 @pytest.mark.parametrize("handshake_result", ["ready", "error"])
 def test_recv_expected_restores_socket_timeout_after_handshake(monkeypatch, initial_timeout, handshake_result):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     parent_sock, child_sock = socket.socketpair()
     parent_sock.settimeout(initial_timeout)
@@ -7442,7 +7442,7 @@ def test_recv_expected_restores_socket_timeout_after_handshake(monkeypatch, init
 
 
 def test_recv_expected_restores_socket_timeout_before_marking_broken(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     parent_sock, child_sock = socket.socketpair()
     executor = _timeout_test_executor(subprocess_exec, parent_sock)
@@ -7563,7 +7563,7 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
 
 
 def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     ack = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
     sock = _GracefulShutdownSocket(ack)
@@ -7582,7 +7582,7 @@ def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():
 
 
 def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     payload = b"cleanup failed"
     response = subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(payload)) + payload
@@ -7599,7 +7599,7 @@ def test_single_subprocess_graceful_close_reports_cleanup_error_after_exit():
 
 
 def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
     sock = _GracefulShutdownSocket(time_out_on_recv=True)
@@ -7620,7 +7620,7 @@ def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch
 
 
 def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
     sock = _GracefulShutdownSocket()
@@ -7640,9 +7640,9 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
 
 
 def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb import pickle as duckdb_pickle
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane import pickle as vane_pickle
+    from vane.execution import ref_bundle
 
     monkeypatch.setenv("VANE_LOCAL_SHM_REF_BUDGET_BYTES", "1g")
     before = ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"]
@@ -7670,7 +7670,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
     executor._sock = _FakeControlSocket()
     executor._proc = None
 
-    payload = duckdb_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
+    payload = vane_pickle.dumps({"request_id": 1, "size_bytes": 4096, "priority": "consumer"})
     assert executor._handle_submit_control_message(subprocess_exec._MSG_OUTPUT_GRANT_REQUEST, payload)
     assert ref_bundle.local_shm_ref_budget_snapshot()["output_grant_bytes"] >= before + 4096
 
@@ -7680,7 +7680,7 @@ def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
 
 
 def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_failures(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
     sock = _FakeControlSocket()
@@ -7737,7 +7737,7 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
 
 
 def test_single_subprocess_execution_scope_is_cleared_after_cleanup_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
     executor._execution_scope_lock = threading.Lock()
@@ -7761,9 +7761,9 @@ def test_single_subprocess_execution_scope_is_cleared_after_cleanup_failure():
 
 
 def test_single_subprocess_execution_scope_releases_post_call_cancelled_result():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
-    from duckdb.execution.udf_lifecycle import ExecutionCancelledError
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution.ref_bundle import REF_BUNDLE_RESULT_MARKER
+    from vane.execution.udf_lifecycle import ExecutionCancelledError
 
     released = 0
 
@@ -7791,7 +7791,7 @@ def test_single_subprocess_execution_scope_releases_post_call_cancelled_result()
 
 
 def test_single_subprocess_execution_scope_is_cleared_when_wakeup_registration_fails():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
     executor._execution_scope_lock = threading.Lock()
@@ -7816,7 +7816,7 @@ def test_single_subprocess_execution_scope_is_cleared_when_wakeup_registration_f
 
 
 def test_single_subprocess_cancel_wakeup_cleanup_failure_breaks_worker():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
     executor._execution_scope_lock = threading.Lock()
@@ -7846,7 +7846,7 @@ def test_single_subprocess_cancel_wakeup_cleanup_failure_breaks_worker():
 
 
 def test_single_subprocess_submit_transport_failure_breaks_worker_before_fallible_lease_cleanup(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     sock = _FakeControlSocket()
     executor = _bare_shutdown_executor(subprocess_exec, sock, None)
@@ -7876,7 +7876,7 @@ def test_single_subprocess_submit_transport_failure_breaks_worker_before_fallibl
 
 
 def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     sock = _FakeControlSocket()
     executor = _bare_shutdown_executor(subprocess_exec, sock, None)
@@ -7902,8 +7902,8 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
 
 
 def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch):
-    import duckdb.execution.udf_subprocess_worker as worker
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_subprocess_worker as worker
+    from vane import pickle as vane_pickle
 
     class FakeExecutor:
         def submit(self, _table):
@@ -7916,7 +7916,7 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
         assert grant_id is None
         raise RuntimeError("descriptor failed")
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 7, "grant_id": 99})
+    grant_payload = vane_pickle.dumps({"request_id": 7, "grant_id": 99})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "make_local_shm_ref_bundle_descriptor", fail_descriptor)
@@ -7934,13 +7934,13 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
     messages = _decode_control_messages(bytes(sock.sent), worker._HEADER)
     release_type = getattr(worker, "_MSG_OUTPUT_GRANT_RELEASE", 0x0F)
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST, release_type]
-    release_payload = duckdb_pickle.loads(messages[1][1])
+    release_payload = vane_pickle.loads(messages[1][1])
     assert release_payload == {"grant_id": 99}
 
 
 def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):
-    import duckdb.execution.udf_subprocess_worker as worker
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_subprocess_worker as worker
+    from vane import pickle as vane_pickle
 
     class FakeExecutor:
         def submit(self, _table):
@@ -7952,7 +7952,7 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
                 pa.table({"payload": [b"b" * 64]}),
             ]
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 11, "grant_id": 101})
+    grant_payload = vane_pickle.dumps({"request_id": 11, "grant_id": 101})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
 
@@ -7966,7 +7966,7 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
     )
 
     assert msg_type == worker._MSG_REF_BUNDLE_RESULT
-    descriptor = duckdb_pickle.loads(payload)
+    descriptor = vane_pickle.loads(payload)
     assert len(descriptor["block_refs"]) == 2
     assert [meta["num_rows"] for meta in descriptor["metadata"]] == [1, 1]
     assert [meta["size_bytes"] for meta in descriptor["metadata"]] == [
@@ -7977,14 +7977,14 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
 
     messages = _decode_control_messages(bytes(sock.sent), worker._HEADER)
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST]
-    request_payload = duckdb_pickle.loads(messages[0][1])
+    request_payload = vane_pickle.loads(messages[0][1])
     assert request_payload["request_id"] == 11
     assert request_payload["size_bytes"] >= sum(meta["ipc_size_bytes"] for meta in descriptor["metadata"])
 
 
 def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
-    import duckdb.execution.udf_subprocess_worker as worker
-    from duckdb import pickle as duckdb_pickle
+    import vane.execution.udf_subprocess_worker as worker
+    from vane import pickle as vane_pickle
 
     created = []
 
@@ -8017,7 +8017,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
             "names": list(table.schema.names),
         }
 
-    grant_payload = duckdb_pickle.dumps({"request_id": 3, "grant_id": 88})
+    grant_payload = vane_pickle.dumps({"request_id": 3, "grant_id": 88})
     recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
     sock = _FakeControlSocket(recv_payload)
     monkeypatch.setattr(worker, "RuntimeUDFExecutor", FakeRuntimeExecutor)
@@ -8035,7 +8035,7 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     )
 
     assert msg_type == worker._MSG_REF_BUNDLE_RESULT
-    descriptor = duckdb_pickle.loads(payload)
+    descriptor = vane_pickle.loads(payload)
     assert descriptor["grant_id"] == 88
     assert descriptor["metadata"] == [{"rows": [3], "num_rows": 1, "ipc_size_bytes": 1}]
     assert descriptor["names"] == ["rows"]
@@ -8052,14 +8052,14 @@ def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):
     ],
 )
 def test_subprocess_worker_row_preserving_ref_bundle_requires_scalar_arg_count(payload):
-    import duckdb.execution.udf_subprocess_worker as worker
+    import vane.execution.udf_subprocess_worker as worker
 
     with pytest.raises(RuntimeError, match="map_batches_rows requires scalar_arg_count > 0"):
         worker.split_row_preserving_input(payload, pa.table({"arg": [1], "passthrough": [2]}))
 
 
 def test_subprocess_executor_close_escalates_scoped_pending_work(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     class FakeWorker:
         def __init__(self) -> None:
@@ -8109,7 +8109,7 @@ def test_subprocess_executor_close_escalates_scoped_pending_work(monkeypatch):
 
 
 def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -8150,7 +8150,7 @@ def test_subprocess_executor_close_releases_task_pool_after_abort_failure():
 
 
 def test_subprocess_executor_close_continues_after_front_half_cleanup_failures():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -8246,7 +8246,7 @@ def test_subprocess_executor_close_continues_after_front_half_cleanup_failures()
 
 
 def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_failure(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     calls: list[tuple[int, str]] = []
 
@@ -8273,7 +8273,7 @@ def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_fail
 
 
 def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_release():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
     scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
@@ -8336,7 +8336,7 @@ def test_subprocess_executor_timeout_cleanup_errors_do_not_skip_task_pool_releas
 
 
 def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     release_started = threading.Event()
     allow_release = threading.Event()
@@ -8386,7 +8386,7 @@ def test_subprocess_executor_concurrent_close_waits_for_task_pool_release():
 
 
 def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     submit_started = threading.Event()
     release_submit = threading.Event()
@@ -8470,8 +8470,8 @@ def test_subprocess_executor_close_fences_submit_before_cancelling_scopes(monkey
 
 
 def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     result = ref_bundle.make_local_shm_ref_bundle_result(pa.table({"x": [1, 2]}))
     refs = list(result[1])
@@ -8507,8 +8507,8 @@ def test_subprocess_executor_releases_ref_bundle_result_completed_after_close():
 
 
 def test_subprocess_executor_close_releases_queued_ref_bundle_results():
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     class FakeAdmission:
         def __init__(self):
@@ -8553,7 +8553,7 @@ def test_subprocess_executor_close_releases_queued_ref_bundle_results():
 
 
 def test_ray_actor_init_waits_for_ray_core_capacity_without_default_timeout(monkeypatch):
-    import duckdb.execution.udf_ray_actor_pool as actor_pool_mod
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
     monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
@@ -8563,8 +8563,8 @@ def test_ray_actor_init_waits_for_ray_core_capacity_without_default_timeout(monk
 
 
 def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     class SlowIdentity:
         def __call__(self, table):
@@ -8597,7 +8597,7 @@ def test_subprocess_close_kill_releases_active_local_shm_leases(monkeypatch):
 
 
 def test_subprocess_stats_expose_local_shm_budget_keys():
-    from duckdb.execution.udf_subprocess import UDFExecutor
+    from vane.execution.udf_subprocess import UDFExecutor
 
     def identity(table):
         return pa.table({"y": table.column("x").to_pylist()})
@@ -8633,8 +8633,8 @@ def test_subprocess_stats_expose_local_shm_budget_keys():
 
 
 def test_local_shm_allocation_wait_is_cancelled_by_execution_scope(monkeypatch):
-    import duckdb.execution.ref_bundle as ref_bundle
-    from duckdb.execution.udf_lifecycle import ExecutionCancellationScope
+    import vane.execution.ref_bundle as ref_bundle
+    from vane.execution.udf_lifecycle import ExecutionCancellationScope
 
     manager = ref_bundle.LocalShmBudgetManager(limit_factory=lambda: 100)
     manager.acquire_allocation(90, name="existing")
@@ -8682,8 +8682,8 @@ def test_local_shm_allocation_wait_is_cancelled_by_execution_scope(monkeypatch):
 
 
 def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     subprocess_exec._shutdown_global_task_runtime()
     grant_started = threading.Event()
@@ -8762,8 +8762,8 @@ def test_subprocess_task_shared_pool_close_is_scoped_to_own_executor(monkeypatch
 
 
 def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatch):
-    import duckdb.execution.udf_subprocess as subprocess_exec
-    from duckdb.execution import ref_bundle
+    import vane.execution.udf_subprocess as subprocess_exec
+    from vane.execution import ref_bundle
 
     grant_started = threading.Event()
     release_grant = threading.Event()
@@ -8842,7 +8842,7 @@ def test_subprocess_actor_shared_pool_close_is_scoped_to_own_executor(monkeypatc
 
 
 def test_subprocess_stateful_actor_destructor_finishes_before_graceful_close_ack(monkeypatch, tmp_path):
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     marker_path = tmp_path / "stateful-cleanup.txt"
     monkeypatch.setenv("VANE_TEST_STATEFUL_CLEANUP_MARKER", str(marker_path))

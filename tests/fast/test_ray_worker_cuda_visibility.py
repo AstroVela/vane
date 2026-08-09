@@ -9,8 +9,8 @@ ray = pytest.importorskip("ray")
 
 from ray_test_profile import ray_test_object_store_options
 
-import duckdb.runners.ray.worker as worker_mod
-from duckdb.runners.ray.worker_pool import _persistent_worker_runtime_env
+import vane.runners.ray.worker as worker_mod
+from vane.runners.ray.worker_pool import _persistent_worker_runtime_env
 
 
 class _RuntimeContext:

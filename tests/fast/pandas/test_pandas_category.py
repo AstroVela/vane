@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import numpy
 import pandas as pd
 import pytest
 
-import duckdb
+import vane
 
 
 def check_category_equal(category):
@@ -11,7 +17,7 @@ def check_category_equal(category):
             "x": pd.Categorical(category, ordered=True),
         }
     )
-    df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+    df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
     assert df_in.equals(df_out)
 
 
@@ -21,12 +27,12 @@ def check_result_list(category, res):
 
 
 def check_create_table(category):
-    conn = duckdb.connect()
+    conn = vane.connect()
 
     conn.execute("PRAGMA enable_verification")
     df_in = pd.DataFrame({"x": pd.Categorical(category, ordered=True), "y": pd.Categorical(category, ordered=True)})
 
-    df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+    df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
     assert df_in.equals(df_out)
 
     conn.execute("CREATE TABLE t1 AS SELECT * FROM df_in")
@@ -59,16 +65,16 @@ class TestCategory:
     def test_category_simple(self, duckdb_cursor):
         df_in = pd.DataFrame({"float": [1.0, 2.0, 1.0], "int": pd.Series([1, 2, 1], dtype="category")})
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
-        print(duckdb.query_df(df_in, "data", "SELECT * FROM data").fetchall())
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
+        print(vane.query_df(df_in, "data", "SELECT * FROM data").fetchall())
         print(df_out["int"])
         assert numpy.all(df_out["float"] == numpy.array([1.0, 2.0, 1.0]))
         assert numpy.all(df_out["int"] == numpy.array([1, 2, 1]))
 
     def test_category_nulls(self, duckdb_cursor):
         df_in = pd.DataFrame({"int": pd.Series([1, 2, None], dtype="category")})
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
-        print(duckdb.query_df(df_in, "data", "SELECT * FROM data").fetchall())
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
+        print(vane.query_df(df_in, "data", "SELECT * FROM data").fetchall())
         assert df_out["int"][0] == 1
         assert df_out["int"][1] == 2
         assert pd.isna(df_out["int"][2])
@@ -88,7 +94,7 @@ class TestCategory:
                 "x": pd.Categorical(["foo", "bla", None, "zoo", "foo", "foo", None, "bla"], ordered=True),
             }
         )
-        assert duckdb.query_df(df_in, "data", "SELECT * FROM data").fetchall() == [
+        assert vane.query_df(df_in, "data", "SELECT * FROM data").fetchall() == [
             ("foo",),
             ("bla",),
             (None,),
@@ -109,14 +115,14 @@ class TestCategory:
         res = duckdb_cursor.table("test").fetchall()
         assert res == []
 
-        with pytest.raises(duckdb.ConversionException, match="Could not convert string 'test' to UINT8"):
+        with pytest.raises(vane.ConversionException, match="Could not convert string 'test' to UINT8"):
             duckdb_cursor.execute("insert into test VALUES('test')")
         duckdb_cursor.execute("insert into test VALUES(NULL)")
         res = duckdb_cursor.table("test").fetchall()
         assert res == [(None,)]
 
     def test_category_fetch_df_chunk(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         categories = ["foo", "bla", None, "zoo", "foo", "foo", None, "bla"]
         result = categories * 256
         categories = result * 2
@@ -150,5 +156,5 @@ class TestCategory:
             }
         )
 
-        df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data").df()
+        df_out = vane.query_df(df_in, "data", "SELECT * FROM data").df()
         assert df_out.equals(df_in)

@@ -3,7 +3,7 @@
 
 import pytest
 
-import duckdb
+import vane
 
 EXPECTED_COLUMNS = ["x", "a", "y"]
 EXPECTED_ROWS = [(10, 20, 30), (10, 21, 30)]
@@ -46,7 +46,7 @@ def test_explode_unique_target_name_is_case_insensitive(duckdb_cursor, collectio
 def test_explode_case_insensitive_target_requires_unique_match(duckdb_cursor):
     relation = duckdb_cursor.sql('SELECT [20, 21]::INTEGER[] AS target, [30, 31]::INTEGER[] AS "TARGET"')
 
-    with pytest.raises(duckdb.BinderException, match="Ambiguous reference to column"):
+    with pytest.raises(vane.BinderException, match="Ambiguous reference to column"):
         relation.explode("Target")
 
 

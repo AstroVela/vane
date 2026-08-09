@@ -70,7 +70,7 @@ def generate_tpch(scale_factor: int, output_dir: str, threads: int | None, child
 
     Peak memory ≈ full_dataset_size / children.
     """
-    print(f"DuckDB version: {vane.__duckdb_version__}")
+    print(f"DuckDB version: {vane.__engine_version__}")
     print(f"Scale factor: {scale_factor}")
     print(f"Output directory: {output_dir}")
     print(f"Chunks (children): {children}")

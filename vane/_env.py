@@ -55,11 +55,11 @@ class _Var(Generic[T]):
     # -- read ----------------------------------------------------------------
 
     @overload
-    def __get__(self, obj: None, _objtype: type) -> _Var[T]: ...
+    def __get__(self, obj: None, _objtype: type[Any] | None = None) -> _Var[T]: ...
     @overload
-    def __get__(self, obj: Any, _objtype: type) -> T: ...
+    def __get__(self, obj: object, _objtype: type[Any] | None = None) -> T: ...
 
-    def __get__(self, obj: Any, _objtype: type = None) -> Any:
+    def __get__(self, obj: object | None, _objtype: type[Any] | None = None) -> _Var[T] | T:
         if obj is None:
             return self  # class-level access returns the descriptor itself
         raw = os.environ.get(self.env_name)
@@ -120,7 +120,7 @@ class EnvRegistry:
 
     # -- Runner selection ---------------------------------------------------
 
-    runner: str = _RunnerVar(
+    runner = _RunnerVar(
         "VANE_RUNNER",
         str,
         "ray",
@@ -129,32 +129,32 @@ class EnvRegistry:
 
     # -- Ray runner ---------------------------------------------------------
 
-    ray_scan_task_size_grouping: bool = _Var(
+    ray_scan_task_size_grouping = _Var(
         "VANE_RAY_SCAN_TASK_SIZE_GROUPING",
         bool,
         True,
         "Enable size-based scan task grouping (merges small files into 96-384MB tasks). "
         "Set to false/0 to disable and get one task per file.",
     )
-    ray_max_task_backlog: int = _Var(
+    ray_max_task_backlog = _Var(
         "VANE_RAY_MAX_TASK_BACKLOG",
         int,
         0,
         "Max pending tasks before back-pressure. 0 = unlimited.",
     )
-    ray_scan_task_open_cost_bytes: int = _Var(
+    ray_scan_task_open_cost_bytes = _Var(
         "VANE_RAY_SCAN_TASK_OPEN_COST_BYTES",
         int,
         4 * 1024 * 1024,
         "Virtual per-file I/O cost (bytes) for Spark-style partition sizing. Default 4 MB.",
     )
-    ray_scan_task_min_partition_num: int = _Var(
+    ray_scan_task_min_partition_num = _Var(
         "VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM",
         int,
         0,
         "Minimum number of scan partitions. 0 = use worker_slots.",
     )
-    ray_init_sql: str = _Var(
+    ray_init_sql = _Var(
         "VANE_RAY_INIT_SQL",
         str,
         "",
@@ -165,13 +165,13 @@ class EnvRegistry:
 
     # -- UDF ----------------------------------------------------------
 
-    udf_parallel: bool = _Var(
+    udf_parallel = _Var(
         "VANE_UDF_PARALLEL",
         bool,
         False,
         "Enable parallel UDF execution.",
     )
-    udf_arrow_fastpath: bool = _Var(
+    udf_arrow_fastpath = _Var(
         "VANE_UDF_ARROW_FASTPATH",
         bool,
         True,
@@ -180,7 +180,7 @@ class EnvRegistry:
 
     # -- Local exchange -----------------------------------------------------
 
-    local_exchange_buffer: str = _Var(
+    local_exchange_buffer = _Var(
         "VANE_LOCAL_EXCHANGE_BUFFER",
         str,
         "32MB",

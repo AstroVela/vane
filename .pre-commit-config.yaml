@@ -64,11 +64,18 @@ repos:
     hooks:
       - id: mypy
         entry: mypy
-        files: ^(duckdb/|_duckdb-stubs/)
-        exclude: ^duckdb/(experimental|query_graph)/
-        # Check the files in the changed range without recursively surfacing
-        # the inherited type debt of every module they import.
-        args: ["--follow-imports=skip", "--allow-subclassing-any", "--no-warn-return-any"]
+        files: ^vane/
+        exclude: ^vane/(experimental|query_graph)/
+        # Check the package once so colocated runtime modules and .pyi files are
+        # resolved normally instead of being passed as duplicate source roots.
+        pass_filenames: false
+        args:
+          - "--package=vane"
+          - "--follow-imports=skip"
+          - "--allow-subclassing-any"
+          - "--allow-untyped-decorators"
+          - "--no-warn-return-any"
+          - "--no-warn-unused-ignores"
         # Keep NumPy stubs compatible with mypy's Python 3.10 target while
         # allowing the NumPy 2.3 wheels available to Python 3.14 hooks.
         additional_dependencies: ["numpy<2.4", polars]

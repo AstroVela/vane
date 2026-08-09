@@ -21,6 +21,21 @@ TEST_CASE("Test comment in CPP API", "[api]") {
 	REQUIRE(1);
 }
 
+TEST_CASE("Prepared statement verification clears stale execution interrupts", "[api][verification]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("PRAGMA enable_verification"));
+	REQUIRE_NO_FAIL(con.Query("BEGIN TRANSACTION"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE product_sales(category VARCHAR, product VARCHAR, id INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO product_sales VALUES ('Game', 'Mobo', 1), ('Fashion', 'Shirt', 2)"));
+
+	for (idx_t iteration = 0; iteration < 100; iteration++) {
+		REQUIRE_NO_FAIL(con.Query("SELECT GROUPING(category, product, id), GROUPING(id, category, product) "
+		                          "FROM product_sales GROUP BY ROLLUP(category, product, id)"));
+	}
+	REQUIRE_NO_FAIL(con.Query("ROLLBACK"));
+}
+
 TEST_CASE("Test StarExpression replace_list parameter", "[api]") {
 	DuckDB db(nullptr);
 	Connection con(db);

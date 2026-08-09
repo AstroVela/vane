@@ -1,0 +1,134 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Modified by Vane contributors.
+
+#include "vane_python/pyconnection/pyconnection.hpp"
+
+namespace duckdb {
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::MapType(const shared_ptr<DuckDBPyType> &key_type,
+                                                     const shared_ptr<DuckDBPyType> &value_type) {
+	auto map_type = LogicalType::MAP(key_type->Type(), value_type->Type());
+	return make_shared_ptr<DuckDBPyType>(map_type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::ListType(const shared_ptr<DuckDBPyType> &type) {
+	auto array_type = LogicalType::LIST(type->Type());
+	return make_shared_ptr<DuckDBPyType>(array_type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::ArrayType(const shared_ptr<DuckDBPyType> &type, idx_t size) {
+	auto array_type = LogicalType::ARRAY(type->Type(), size);
+	return make_shared_ptr<DuckDBPyType>(array_type);
+}
+
+static vector<idx_t> ParseTensorShapeObject(const py::object &shape_obj) {
+	if (shape_obj.is_none()) {
+		throw InvalidInputException("tensor_type requires a non-empty shape");
+	}
+	vector<idx_t> shape;
+	for (auto &item : shape_obj) {
+		auto dim = py::cast<int64_t>(item);
+		if (dim <= 0) {
+			throw InvalidInputException("tensor_type shape dimensions must be positive, got %lld", (long long)dim);
+		}
+		shape.push_back(NumericCast<idx_t>(dim));
+	}
+	if (shape.empty()) {
+		throw InvalidInputException("tensor_type requires a non-empty shape");
+	}
+	return shape;
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::TensorType(const shared_ptr<DuckDBPyType> &type, const py::object &shape) {
+	auto tensor_type = duckdb::TensorType::Create(type->Type(), ParseTensorShapeObject(shape));
+	return make_shared_ptr<DuckDBPyType>(tensor_type);
+}
+
+static child_list_t<LogicalType> GetChildList(const py::object &container) {
+	child_list_t<LogicalType> types;
+	if (py::isinstance<py::list>(container)) {
+		const py::list &fields = container;
+		idx_t i = 1;
+		for (auto &item : fields) {
+			shared_ptr<DuckDBPyType> pytype;
+			if (!py::try_cast<shared_ptr<DuckDBPyType>>(item, pytype)) {
+				string actual_type = py::str(py::type::of(item));
+				throw InvalidInputException("object has to be a list of DuckDBPyType's, not '%s'", actual_type);
+			}
+			types.push_back(std::make_pair(StringUtil::Format("v%d", i++), pytype->Type()));
+		}
+		return types;
+	} else if (py::isinstance<py::dict>(container)) {
+		const py::dict &fields = container;
+		for (auto &item : fields) {
+			auto &name_p = item.first;
+			auto &type_p = item.second;
+			string name = py::cast<string>(name_p);
+			shared_ptr<DuckDBPyType> pytype;
+			if (!py::try_cast<shared_ptr<DuckDBPyType>>(type_p, pytype)) {
+				string actual_type = py::str(py::type::of(type_p));
+				throw InvalidInputException("object has to be a list of DuckDBPyType's, not '%s'", actual_type);
+			}
+			types.push_back(std::make_pair(name, pytype->Type()));
+		}
+		return types;
+	} else {
+		string actual_type = py::str(py::type::of(container));
+		throw InvalidInputException(
+		    "Can not construct a child list from object of type '%s', only dict/list is supported", actual_type);
+	}
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::StructType(const py::object &fields) {
+	child_list_t<LogicalType> types = GetChildList(fields);
+	if (types.empty()) {
+		throw InvalidInputException("Can not create an empty struct type!");
+	}
+	auto struct_type = LogicalType::STRUCT(std::move(types));
+	return make_shared_ptr<DuckDBPyType>(struct_type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::UnionType(const py::object &members) {
+	child_list_t<LogicalType> types = GetChildList(members);
+
+	if (types.empty()) {
+		throw InvalidInputException("Can not create an empty union type!");
+	}
+	auto union_type = LogicalType::UNION(std::move(types));
+	return make_shared_ptr<DuckDBPyType>(union_type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::EnumType(const string &name, const shared_ptr<DuckDBPyType> &type,
+                                                      const py::list &values_p) {
+	throw NotImplementedException("enum_type creation method is not implemented yet");
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::DecimalType(int width, int scale) {
+	auto decimal_type = LogicalType::DECIMAL(width, scale);
+	return make_shared_ptr<DuckDBPyType>(decimal_type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::StringType(const string &collation) {
+	LogicalType type;
+	if (collation.empty()) {
+		type = LogicalType::VARCHAR;
+	} else {
+		type = LogicalType::VARCHAR_COLLATION(collation);
+	}
+	return make_shared_ptr<DuckDBPyType>(type);
+}
+
+shared_ptr<DuckDBPyType> DuckDBPyConnection::Type(const string &type_str) {
+	auto &connection = con.GetConnection();
+	auto &context = *connection.context;
+	shared_ptr<DuckDBPyType> result;
+	context.RunFunctionInTransaction([&result, &type_str, &context]() {
+		result = make_shared_ptr<DuckDBPyType>(TransformStringToLogicalType(type_str, context));
+	});
+	return result;
+}
+
+} // namespace duckdb

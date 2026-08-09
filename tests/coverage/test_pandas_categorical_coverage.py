@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 
-import duckdb
+import vane
 
 
 def check_result_list(res):
@@ -9,7 +15,7 @@ def check_result_list(res):
 
 
 def check_create_table(category):
-    conn = duckdb.connect()
+    conn = vane.connect()
 
     conn.execute("PRAGMA enable_verification")
     df_in = pd.DataFrame(
@@ -28,7 +34,7 @@ def check_create_table(category):
         }
     )
 
-    df_out = duckdb.query_df(df_in, "data", "SELECT * FROM data")
+    df_out = vane.query_df(df_in, "data", "SELECT * FROM data")
     df_out = df_out.df()
     assert df_in.equals(df_out)
 

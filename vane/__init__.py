@@ -1,130 +1,511 @@
+# SPDX-FileCopyrightText: 2018-2026 Stichting DuckDB Foundation
 # SPDX-FileCopyrightText: 2026 Vane contributors
-# SPDX-License-Identifier: Apache-2.0
-# ruff: noqa: F405  # DuckDB symbols are intentionally re-exported below.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
 
-"""Vane — Distributed DuckDB powered by Ray.
+# ruff: noqa: F401
+"""The public Python API for the Vane data engine.
 
-Vane is a thin wrapper around DuckDB that adds distributed execution
-capabilities via Ray.  All DuckDB symbols are re-exported, so you can use
-``import vane`` as a drop-in replacement for ``import duckdb``.
-
-Quick start::
-
-    import vane
-
-    # Programmatic configuration (optional — env vars also work)
-    vane.configure(runner="ray", ray_scan_task_size_grouping=False)
-
-    conn: vane.Connection = vane.connect()
-    rel: vane.Relation = conn.sql("SELECT 42")
-    rel.show()
-
-Submodules like ``vane.runners``, ``vane.experimental``, and ``vane.sqltypes``
-are automatically delegated to the underlying ``duckdb`` package.
+Vane owns this package and its native extension.  The separately distributed
+``duckdb`` package may be installed and imported in the same Python process;
+the two distributions do not share Python modules or extension names.
 """
 
 import importlib as _importlib
+import typing as _typing
 
-import duckdb
-from duckdb import *  # noqa: F403
-from duckdb._ray_progress_env import configure_ray_progress_logging_defaults as _configure_ray_progress_logging_defaults
-from duckdb._vane_version import get_vane_version
+from vane._dbapi_type_object import (
+    BINARY,
+    DATETIME,
+    NUMBER,
+    ROWID,
+    STRING,
+    DBAPITypeObject,
+)
+from vane._env import EnvRegistry, env
+from vane._expression_udf import attach_function, cls, detach_function, func
+from vane._expressions import col, lit, sql_expr
 
-_configure_ray_progress_logging_defaults()
+if _typing.TYPE_CHECKING:
+    from vane import ai as ai
+    from vane import runners as runners
+    from vane import sqltypes as sqltypes
+    from vane import udf as udf
+    from vane.runners.runner import Runner as _Runner
+else:
+    _Runner = _typing.Any
+from vane._native import (
+    BinderException,
+    CaseExpression,
+    CatalogException,
+    CoalesceOperator,
+    ColumnExpression,
+    ConnectionException,
+    ConstantExpression,
+    ConstraintException,
+    ConversionException,
+    CSVLineTerminator,
+    DatabaseError,
+    DataError,
+    DefaultExpression,
+    DependencyException,
+    DuckDBPyConnection,
+    DuckDBPyRelation,
+    Error,
+    ExpectedResultType,
+    ExplainType,
+    Expression,
+    FatalException,
+    FunctionExpression,
+    HTTPException,
+    IntegrityError,
+    InternalError,
+    InternalException,
+    InterruptException,
+    InvalidInputException,
+    InvalidTypeException,
+    IOException,
+    LambdaExpression,
+    NotImplementedException,
+    NotSupportedError,
+    OperationalError,
+    OutOfMemoryException,
+    OutOfRangeException,
+    ParserException,
+    PermissionException,
+    ProgrammingError,
+    PythonExceptionHandling,
+    RenderMode,
+    SequenceException,
+    SerializationException,
+    SQLExpression,
+    StarExpression,
+    Statement,
+    StatementType,
+    SyntaxException,
+    TransactionException,
+    TypeMismatchException,
+    Warning,
+    __formatted_python_version__,
+    __git_revision__,
+    __interactive__,
+    __jupyter__,
+    __standard_vector_size__,
+    _clean_default_connection,
+    aggregate,
+    alias,
+    apilevel,
+    append,
+    array_type,
+    arrow,
+    begin,
+    checkpoint,
+    close,
+    commit,
+    connect,
+    create_function,
+    create_table_function,
+    cursor,
+    decimal_type,
+    default_connection,
+    description,
+    df,
+    disable_profiling,
+    distinct,
+    dtype,
+    duplicate,
+    enable_profiling,
+    enum_type,
+    execute,
+    executemany,
+    extract_statements,
+    fetch_arrow_table,
+    fetch_df,
+    fetch_df_chunk,
+    fetch_record_batch,
+    fetchall,
+    fetchdf,
+    fetchmany,
+    fetchnumpy,
+    fetchone,
+    filesystem_is_registered,
+    filter,
+    from_arrow,
+    from_csv_auto,
+    from_df,
+    from_parquet,
+    from_query,
+    get_or_create_runner,
+    get_or_infer_runner_type,
+    get_profiling_information,
+    get_runner,
+    get_table_names,
+    install_extension,
+    interrupt,
+    limit,
+    list_filesystems,
+    list_type,
+    load_extension,
+    map_type,
+    order,
+    paramstyle,
+    pl,
+    project,
+    query,
+    query_df,
+    query_progress,
+    ray_cxx,
+    read_csv,
+    read_json,
+    read_parquet,
+    register,
+    register_filesystem,
+    remove_function,
+    rollback,
+    row_type,
+    rowcount,
+    set_default_connection,
+    sql,
+    sqltype,
+    string_type,
+    struct_type,
+    table,
+    table_function,
+    teardown_runner,
+    tensor_type,
+    tf,
+    threadsafety,
+    to_arrow_reader,
+    to_arrow_table,
+    token_type,
+    tokenize,
+    torch,
+    type,
+    union_type,
+    unregister,
+    unregister_filesystem,
+    values,
+    view,
+    write_csv,
+)
+from vane._version import (
+    __engine_version__,
+    __version__,
+    version,
+)
+from vane.config import VaneConfig, configure, current_config
+from vane.value.constant import (
+    BinaryValue,
+    BitValue,
+    BlobValue,
+    BooleanValue,
+    DateValue,
+    DecimalValue,
+    DoubleValue,
+    FloatValue,
+    HugeIntegerValue,
+    IntegerValue,
+    IntervalValue,
+    ListValue,
+    LongValue,
+    MapValue,
+    NullValue,
+    ShortValue,
+    StringValue,
+    StructValue,
+    TimestampMillisecondValue,
+    TimestampNanosecondValue,
+    TimestampSecondValue,
+    TimestampTimeZoneValue,
+    TimestampValue,
+    TimeTimeZoneValue,
+    TimeValue,
+    UnionType,
+    UnsignedBinaryValue,
+    UnsignedHugeIntegerValue,
+    UnsignedIntegerValue,
+    UnsignedLongValue,
+    UnsignedShortValue,
+    UUIDValue,
+    Value,
+)
 
-# Extend __path__ so that ``import vane.runners`` (and all other submodules)
-# transparently resolves to the corresponding ``duckdb.*`` subpackage.
-__path__.extend(duckdb.__path__)
 
-# ---------------------------------------------------------------------------
-# Version info
-# ---------------------------------------------------------------------------
+def set_runner_local(
+    num_workers: int | None = 1,
+    *,
+    max_running_tasks: _typing.Any = None,
+    execution_mode: str | None = "in_process",
+) -> "_Runner":
+    """Configure Vane to execute through the local FTE runner."""
+    from vane.runners.local import set_runner_local as _set_runner_local
 
-__duckdb_version__ = duckdb.__duckdb_version__
-__vane_version__ = get_vane_version()
-__version__ = __vane_version__
+    return _set_runner_local(
+        num_workers,
+        max_running_tasks=max_running_tasks,
+        execution_mode=execution_mode,
+    )
 
-# ---------------------------------------------------------------------------
-# Vane-specific public API
-# ---------------------------------------------------------------------------
 
-# Patch DuckDBPyRelation with AI convenience methods (.embed(), etc.)
-import vane.ai._relation_patch  # noqa: E402,F401
-from vane._env import EnvRegistry, env  # noqa: E402
-from vane._expression_udf import attach_function, cls, detach_function, func  # noqa: E402
-from vane._expressions import col, lit, sql_expr  # noqa: E402
-from vane._typing import Connection, Expression, Relation, Statement  # noqa: E402
-from vane.config import VaneConfig, configure, current_config  # noqa: E402
+def set_runner_ray(
+    address: str | None = None,
+    noop_if_initialized: bool = False,
+    max_task_backlog: int | None = None,
+) -> "_Runner":
+    """Configure Vane to execute through the Ray runner."""
+    from vane.runners.ray import set_runner_ray as _set_runner_ray
 
-# ---------------------------------------------------------------------------
-# Submodule lazy-loading
-# ---------------------------------------------------------------------------
+    return _set_runner_ray(address, noop_if_initialized, max_task_backlog)
 
-_SUBMODULES = frozenset(
+
+# Short public aliases for the native classes.
+Connection = DuckDBPyConnection
+Relation = DuckDBPyRelation
+
+# Install Vane's relation conveniences after the native relation class exists.
+from vane.ai import _relation_patch as _relation_patch
+
+_VANE_SUBMODULES = frozenset(
     {
+        "adbc",
+        "ai",
         "datasource",
         "execution",
         "experimental",
+        "expressions",
+        "filesystem",
         "query_graph",
         "runners",
         "sqltypes",
+        "udf",
         "value",
     }
 )
 
-# Submodules that live under vane/ directly (not delegated to duckdb).
-_VANE_SUBMODULES = frozenset(
-    {
-        "ai",
-    }
-)
 
-
-def __getattr__(name: str):
+def __getattr__(name: str) -> object:
+    """Lazily expose Vane-owned public submodules."""
     if name in _VANE_SUBMODULES:
-        mod = _importlib.import_module(f"vane.{name}")
-        globals()[name] = mod
-        return mod
-    if name in _SUBMODULES:
-        mod = _importlib.import_module(f"duckdb.{name}")
-        globals()[name] = mod
-        return mod
-    raise AttributeError(f"module 'vane' has no attribute {name!r}")
+        module = _importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# ---------------------------------------------------------------------------
-# __all__ — curated public API
-# ---------------------------------------------------------------------------
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _VANE_SUBMODULES)
 
-__all__ = [
-    # --- vane-specific additions ---
-    "env",
-    "EnvRegistry",
+
+__all__: list[str] = [
+    "BINARY",
+    "BinaryValue",
+    "BinderException",
+    "BitValue",
+    "BlobValue",
+    "BooleanValue",
+    "CSVLineTerminator",
+    "CaseExpression",
+    "CatalogException",
+    "CoalesceOperator",
+    "ColumnExpression",
     "Connection",
-    "Relation",
-    "Expression",
-    "Statement",
-    "VaneConfig",
-    "configure",
-    "current_config",
-    "col",
-    "lit",
-    "sql_expr",
-    "attach_function",
-    "detach_function",
-    "func",
-    "cls",
-    # --- version ---
-    "__duckdb_version__",
-    "__vane_version__",
-    "__version__",
-    # --- everything from duckdb (via star import) ---
-    "connect",
-    "sql",
-    "execute",
-    "executemany",
-    "default_connection",
-    "set_default_connection",
+    "ConnectionException",
+    "ConstantExpression",
+    "ConstraintException",
+    "ConversionException",
+    "DataError",
+    "DatabaseError",
+    "DATETIME",
+    "DateValue",
+    "DecimalValue",
+    "DefaultExpression",
+    "DependencyException",
+    "DBAPITypeObject",
+    "DoubleValue",
     "DuckDBPyConnection",
     "DuckDBPyRelation",
+    "EnvRegistry",
+    "Error",
+    "ExpectedResultType",
+    "ExplainType",
+    "Expression",
+    "FatalException",
+    "FloatValue",
+    "FunctionExpression",
+    "HTTPException",
+    "HugeIntegerValue",
+    "IOException",
+    "IntegerValue",
+    "IntegrityError",
+    "InternalError",
+    "InternalException",
+    "InterruptException",
+    "IntervalValue",
+    "InvalidInputException",
+    "InvalidTypeException",
+    "LambdaExpression",
+    "ListValue",
+    "LongValue",
+    "MapValue",
+    "NUMBER",
+    "NotImplementedException",
+    "NotSupportedError",
+    "NullValue",
+    "OperationalError",
+    "OutOfMemoryException",
+    "OutOfRangeException",
+    "ParserException",
+    "PermissionException",
+    "ProgrammingError",
+    "PythonExceptionHandling",
+    "RenderMode",
+    "Relation",
+    "ROWID",
+    "SQLExpression",
+    "SequenceException",
+    "SerializationException",
+    "ShortValue",
+    "StarExpression",
+    "Statement",
+    "StatementType",
+    "STRING",
+    "StringValue",
+    "StructValue",
+    "SyntaxException",
+    "TimeTimeZoneValue",
+    "TimeValue",
+    "TimestampMillisecondValue",
+    "TimestampNanosecondValue",
+    "TimestampSecondValue",
+    "TimestampTimeZoneValue",
+    "TimestampValue",
+    "TransactionException",
+    "TypeMismatchException",
+    "UUIDValue",
+    "UnionType",
+    "UnsignedBinaryValue",
+    "UnsignedHugeIntegerValue",
+    "UnsignedIntegerValue",
+    "UnsignedLongValue",
+    "UnsignedShortValue",
+    "Value",
+    "Warning",
+    "__formatted_python_version__",
+    "__git_revision__",
+    "__interactive__",
+    "__jupyter__",
+    "__standard_vector_size__",
+    "__engine_version__",
+    "__version__",
+    "_clean_default_connection",
+    "aggregate",
+    "alias",
+    "apilevel",
+    "append",
+    "array_type",
+    "arrow",
+    "begin",
+    "checkpoint",
+    "close",
+    "commit",
+    "connect",
+    "configure",
+    "create_function",
+    "create_table_function",
+    "current_config",
+    "cursor",
+    "decimal_type",
+    "default_connection",
+    "description",
+    "df",
+    "disable_profiling",
+    "distinct",
+    "dtype",
+    "duplicate",
+    "enable_profiling",
+    "enum_type",
+    "execute",
+    "executemany",
+    "extract_statements",
+    "fetch_arrow_table",
+    "fetch_df",
+    "fetch_df_chunk",
+    "fetch_record_batch",
+    "fetchall",
+    "fetchdf",
+    "fetchmany",
+    "fetchnumpy",
+    "fetchone",
+    "filesystem_is_registered",
+    "filter",
+    "from_arrow",
+    "from_csv_auto",
+    "from_df",
+    "from_parquet",
+    "from_query",
+    "get_or_create_runner",
+    "get_or_infer_runner_type",
+    "get_profiling_information",
+    "get_runner",
+    "get_table_names",
+    "install_extension",
+    "interrupt",
+    "limit",
+    "list_filesystems",
+    "list_type",
+    "load_extension",
+    "map_type",
+    "order",
+    "paramstyle",
+    "pl",
+    "project",
+    "query",
+    "query_df",
+    "query_progress",
+    "ray_cxx",
+    "read_csv",
+    "read_json",
+    "read_parquet",
+    "register",
+    "register_filesystem",
+    "remove_function",
+    "rollback",
+    "row_type",
+    "rowcount",
+    "set_default_connection",
+    "set_runner_local",
+    "set_runner_ray",
+    "sql",
+    "sqltype",
+    "string_type",
+    "struct_type",
+    "table",
+    "table_function",
+    "teardown_runner",
+    "tensor_type",
+    "tf",
+    "threadsafety",
+    "to_arrow_reader",
+    "to_arrow_table",
+    "token_type",
+    "tokenize",
+    "torch",
+    "type",
+    "union_type",
+    "unregister",
+    "unregister_filesystem",
+    "values",
+    "view",
+    "version",
+    "write_csv",
+    "VaneConfig",
+    "attach_function",
+    "cls",
+    "col",
+    "detach_function",
+    "env",
+    "func",
+    "lit",
+    "sql_expr",
 ]

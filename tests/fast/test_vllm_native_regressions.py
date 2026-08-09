@@ -129,12 +129,12 @@ class _ChunkedBatchResultExecutor(_RecordingExecutor):
 
 
 def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=1, query_suffix=""):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = executor or _RecordingExecutor()
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute(f"PRAGMA threads={threads}")
         con.register(
@@ -179,8 +179,8 @@ def test_native_vllm_propagates_null_prompts_without_submitting_them(monkeypatch
 
 
 def test_native_vllm_all_null_prompts_do_not_build_an_executor(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     builds = 0
 
@@ -190,7 +190,7 @@ def test_native_vllm_all_null_prompts_do_not_build_an_executor(monkeypatch):
         return _RecordingExecutor()
 
     monkeypatch.setattr(vllm, "build_executor", build_executor)
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.register(
             "vllm_input",
@@ -243,15 +243,15 @@ def test_native_bucket_prefix_ends_on_a_complete_utf8_character(monkeypatch, pro
 
 
 def test_native_bridge_rejects_zero_batch_size_even_if_python_normalization_is_bypassed(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     invalid = vllm.normalize_options(_packed_native_vllm_options({}))
     invalid["batch_size"] = 0
     monkeypatch.setattr(vllm, "normalize_options", lambda _options: invalid)
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: _RecordingExecutor())
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match="batch_size"):
             con.execute(f"SELECT vllm('hello', 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})").fetchall()
@@ -260,8 +260,8 @@ def test_native_bridge_rejects_zero_batch_size_even_if_python_normalization_is_b
 
 
 def test_native_bridge_normalizes_json_numeric_options(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = _RecordingExecutor()
     normalized = {}
@@ -272,7 +272,7 @@ def test_native_bridge_normalizes_json_numeric_options(monkeypatch):
 
     monkeypatch.setattr(vllm, "build_executor", build_executor)
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         row = con.execute(
             """
@@ -301,8 +301,8 @@ def test_native_bridge_normalizes_json_numeric_options(monkeypatch):
 
 
 def test_native_bridge_preserves_json_boolean_options(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = _RecordingExecutor()
     normalized = {}
@@ -320,7 +320,7 @@ def test_native_bridge_preserves_json_boolean_options(monkeypatch):
         "ray_worker_only",
     )
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         row = con.execute(
             """
@@ -351,12 +351,12 @@ def test_native_bridge_preserves_json_boolean_options(monkeypatch):
     ],
 )
 def test_native_bridge_rejects_non_boolean_execution_options(monkeypatch, name):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: _RecordingExecutor())
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match=rf"vllm {name} must be a boolean"):
             con.execute(
@@ -433,8 +433,8 @@ def test_native_downstream_limit_retires_producer_when_final_execute_is_skipped(
 
 @pytest.mark.parametrize("row_count", [2049, 6144])
 def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(monkeypatch, row_count):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = _ChunkedBatchResultExecutor()
     observed_chunk_sizes = []
@@ -445,7 +445,7 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
 
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
     prompts = [f"shared-prefix-{row_id:05d}" for row_id in range(row_count)]
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.execute("PRAGMA threads=1")
         con.register(
@@ -489,7 +489,7 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
     finally:
         con.close()
 
-    vector_size = duckdb.__standard_vector_size__
+    vector_size = vane.__standard_vector_size__
     assert observed_chunk_sizes
     assert sum(observed_chunk_sizes) == row_count
     assert max(observed_chunk_sizes) <= vector_size
@@ -501,23 +501,23 @@ def test_native_vllm_splits_oversized_ready_results_before_downstream_operators(
 
 
 def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         explicit_pool_name = "explicit-shared-vllm-pool"
         options = _packed_native_vllm_options({"use_ray": True, "ray_actor_pool_name": explicit_pool_name})
 
         def collect_node(query_id):
             source = con.sql("SELECT prompt FROM (VALUES ('hello')) input(prompt)")
-            generated = duckdb.FunctionExpression(
+            generated = vane.FunctionExpression(
                 "vllm",
-                duckdb.ColumnExpression("prompt"),
-                duckdb.ConstantExpression("model"),
-                duckdb.ConstantExpression(options),
+                vane.ColumnExpression("prompt"),
+                vane.ConstantExpression("model"),
+                vane.ConstantExpression(options),
             ).alias("generated")
             relation = source.select(generated)
-            plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, query_id).to_physical_plan(con)
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, query_id).to_physical_plan(con)
             nodes = plan.collect_vllm_nodes(conn=con)
             assert len(nodes) == 1
             return nodes[0]
@@ -537,9 +537,9 @@ def test_distributed_collection_keeps_explicit_pool_names_query_scoped():
 
 
 def test_native_vllm_rejects_bare_json_options_at_bind_time():
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match="versioned STRUCT envelope"):
             con.execute("SELECT vllm('hello', 'model', '{}')")
@@ -548,9 +548,9 @@ def test_native_vllm_rejects_bare_json_options_at_bind_time():
 
 
 def test_native_vllm_rejects_missing_or_null_options_at_bind_time():
-    import duckdb
+    import vane
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match="vllm"):
             con.execute("SELECT vllm('hello', 'model')")
@@ -561,15 +561,15 @@ def test_native_vllm_rejects_missing_or_null_options_at_bind_time():
 
 
 def test_distributed_collection_preserves_the_versioned_envelope():
-    import duckdb
-    from duckdb.execution.vllm import normalize_options
+    import vane
+    from vane.execution.vllm import normalize_options
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         relation = con.sql(
             f"SELECT vllm(prompt, 'model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL}) FROM (VALUES ('hello')) input(prompt)"
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "default-options").to_physical_plan(con)
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "default-options").to_physical_plan(con)
         nodes = plan.collect_vllm_nodes(conn=con)
     finally:
         con.close()
@@ -591,8 +591,8 @@ def test_distributed_collection_preserves_the_versioned_envelope():
 )
 @pytest.mark.timeout(30)
 def test_native_finalizer_has_scheduler_wakeup_in_materialized_and_nested_contexts(monkeypatch, context):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     executor = _DeferredWakeupExecutor()
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: executor)
@@ -608,7 +608,7 @@ def test_native_finalizer_has_scheduler_wakeup_in_materialized_and_nested_contex
 
     publisher = threading.Thread(target=publish_after_arm, name=f"vllm-{context}-result-publisher")
     publisher.start()
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         con.register("vllm_input", pa.table({"prompt": ["hello"]}))
         expression = f"vllm(prompt, 'recording-model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})"
@@ -644,12 +644,12 @@ def test_native_finalizer_has_scheduler_wakeup_in_materialized_and_nested_contex
 
 
 def test_native_bridge_rejects_executor_without_wakeup_callback(monkeypatch):
-    import duckdb
-    import duckdb.execution.vllm as vllm
+    import vane
+    import vane.execution.vllm as vllm
 
     monkeypatch.setattr(vllm, "build_executor", lambda *_args, **_kwargs: object())
 
-    con = duckdb.connect()
+    con = vane.connect()
     try:
         with pytest.raises(Exception, match="vllm executor must implement register_wakeup_callback"):
             con.execute(f"SELECT vllm('hello', 'model', {_EMPTY_NATIVE_VLLM_OPTIONS_SQL})").fetchall()

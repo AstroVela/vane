@@ -1,15 +1,21 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 from decimal import Decimal
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
 
 class TestArrowDecimalTypes:
     def test_decimal_v1_5(self, duckdb_cursor):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_output_version = 1.5")
         decimal_32 = pa.Table.from_pylist(  # noqa: F841
             [
@@ -55,12 +61,12 @@ class TestArrowDecimalTypes:
             }
 
     def test_invalide_opt(self, duckdb_cursor):
-        duckdb_cursor = duckdb.connect()
-        with pytest.raises(duckdb.NotImplementedException, match="unrecognized"):
+        duckdb_cursor = vane.connect()
+        with pytest.raises(vane.NotImplementedException, match="unrecognized"):
             duckdb_cursor.execute("SET arrow_output_version = 999.9")
 
     def test_view_v1_4(self, duckdb_cursor):
-        duckdb_cursor = duckdb.connect()
+        duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_output_version = 1.5")
         duckdb_cursor.execute("SET produce_arrow_string_view=True")
         duckdb_cursor.execute("SET arrow_output_list_view=True")

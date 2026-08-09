@@ -6,7 +6,7 @@
 
 import pytest
 
-import duckdb
+import vane
 
 
 @pytest.fixture(autouse=True)
@@ -182,7 +182,7 @@ class TestRAPIWindows:
     def test_window_order_rejects_later_projection_alias(self, duckdb_cursor):
         relation = duckdb_cursor.sql("SELECT 1 AS a")
 
-        with pytest.raises(duckdb.BinderException, match="cannot be referenced before it is defined"):
+        with pytest.raises(vane.BinderException, match="cannot be referenced before it is defined"):
             relation.project("row_number() OVER (ORDER BY x), a + 1 AS x")
 
     def test_projection_resolves_prior_alias_without_window(self, duckdb_cursor):
@@ -269,7 +269,7 @@ class TestRAPIWindows:
 
         assert plan_node in result.explain()
         assert result.fetchall() == [(1, 10, 2, 10, 1)]
-        with pytest.raises(duckdb.BinderException, match='Referenced table "left_data" not found'):
+        with pytest.raises(vane.BinderException, match='Referenced table "left_data" not found'):
             wrapped.project("left_data.left_value")
 
     @pytest.mark.parametrize(
@@ -672,7 +672,7 @@ class TestRAPIWindows:
         assert all(r == e for r, e in zip(result, expected, strict=False))
 
     def test_bitstring_agg(self, table):
-        with pytest.raises(duckdb.BinderException, match="Could not retrieve required statistics"):
+        with pytest.raises(vane.BinderException, match="Could not retrieve required statistics"):
             table.bitstring_agg(
                 "v",
                 window_spec="over (partition by id order by t asc rows between unbounded preceding and current row)",

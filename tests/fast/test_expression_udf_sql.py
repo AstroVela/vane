@@ -8,7 +8,6 @@ import uuid
 
 import pytest
 
-import duckdb
 import vane
 
 
@@ -20,7 +19,7 @@ def _assert_sql_alias_absent(conn, alias):
 
 
 def _fresh_physical_udf_payload(relation):
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     )

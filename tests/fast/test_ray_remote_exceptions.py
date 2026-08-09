@@ -9,17 +9,17 @@ from typing import Any
 
 import pytest
 
-import duckdb
-import duckdb._ray_errors as ray_errors
-from duckdb._ray_errors import RemoteRayException
-from duckdb.runners.ray import driver
-from duckdb.runners.ray.safe_get import resolve_object_refs_blocking
+import vane
+import vane._ray_errors as ray_errors
+from vane._ray_errors import RemoteRayException
+from vane.runners.ray import driver
+from vane.runners.ray.safe_get import resolve_object_refs_blocking
 
 
 def _chained_error(label: str) -> RuntimeError:
     try:
-        raise duckdb.NotImplementedException(f"{label} original")
-    except duckdb.NotImplementedException as cause:
+        raise vane.NotImplementedException(f"{label} original")
+    except vane.NotImplementedException as cause:
         try:
             raise RuntimeError(f"{label} outer") from cause
         except RuntimeError as outer:
@@ -28,9 +28,9 @@ def _chained_error(label: str) -> RuntimeError:
 
 def _assert_restored_chain(exc: RuntimeError, label: str) -> None:
     assert str(exc) == f"{label} outer"
-    assert isinstance(exc.__cause__, duckdb.NotImplementedException)
+    assert isinstance(exc.__cause__, vane.NotImplementedException)
     assert str(exc.__cause__) == f"{label} original"
-    assert exc.__cause__.remote_exception_type == "_duckdb.NotImplementedException"
+    assert exc.__cause__.remote_exception_type == "vane._native.NotImplementedException"
     assert f"NotImplementedException: {label} original" in exc.__cause__.remote_traceback
 
 
@@ -44,7 +44,7 @@ def test_remote_ray_exception_pickle_round_trip_restores_cause_chain():
 
 
 def test_remote_ray_exception_preserves_unknown_copy_recovery_context():
-    from duckdb.runners import CopyOutcomeUnknownError
+    from vane.runners import CopyOutcomeUnknownError
 
     original = CopyOutcomeUnknownError(
         "copy-operation",
@@ -258,7 +258,7 @@ def test_real_ray_preserves_implicit_context_and_constructor_state(ray_local):
 
     @ray.remote
     def fail_with_implicit_context():
-        from duckdb._ray_errors import RemoteRayException as RemoteCarrier
+        from vane._ray_errors import RemoteRayException as RemoteCarrier
 
         try:
             try:
@@ -271,7 +271,7 @@ def test_real_ray_preserves_implicit_context_and_constructor_state(ray_local):
 
     @ray.remote
     def fail_with_structured_exception():
-        from duckdb._ray_errors import RemoteRayException as RemoteCarrier
+        from vane._ray_errors import RemoteRayException as RemoteCarrier
 
         original = FileNotFoundError(2, "No such file", "/tmp/input.parquet")
         raise RemoteCarrier.from_exception(original)
@@ -293,12 +293,12 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
 
     @ray.remote
     def fail_with_chain(label: str) -> None:
-        import duckdb as remote_duckdb
-        from duckdb._ray_errors import remote_ray_exception as build_remote_ray_exception
+        import vane as remote_vane
+        from vane._ray_errors import remote_ray_exception as build_remote_ray_exception
 
         try:
-            raise remote_duckdb.NotImplementedException(f"{label} original")
-        except remote_duckdb.NotImplementedException as cause:
+            raise remote_vane.NotImplementedException(f"{label} original")
+        except remote_vane.NotImplementedException as cause:
             raise build_remote_ray_exception(f"{label} outer", cause) from cause
 
     @ray.remote
@@ -307,13 +307,13 @@ def test_ray_driver_client_restores_preflight_stream_and_copy_causes(ray_local, 
 
     @ray.remote
     def recover_failure_with_chain(label: str, operation_id: str) -> Any:
-        import duckdb as remote_duckdb
-        from duckdb._ray_errors import remote_ray_exception as build_remote_ray_exception
-        from duckdb.runners.ray.driver import CopyPlanRecovery
+        import vane as remote_vane
+        from vane._ray_errors import remote_ray_exception as build_remote_ray_exception
+        from vane.runners.ray.driver import CopyPlanRecovery
 
         try:
-            raise remote_duckdb.NotImplementedException(f"{label} original")
-        except remote_duckdb.NotImplementedException as cause:
+            raise remote_vane.NotImplementedException(f"{label} original")
+        except remote_vane.NotImplementedException as cause:
             return CopyPlanRecovery(
                 operation_id=operation_id,
                 error=build_remote_ray_exception(f"{label} outer", cause),

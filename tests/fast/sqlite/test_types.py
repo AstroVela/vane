@@ -1,4 +1,10 @@
 # -*- coding: iso-8859-1 -*-
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 # pysqlite2/test/types.py: tests for type conversion and detection
 #
 # Copyright (C) 2005 Gerhard Häring <gh@ghaering.de>
@@ -28,12 +34,12 @@ import datetime
 import decimal
 import unittest
 
-import duckdb
+import vane
 
 
 class DuckDBTypeTests(unittest.TestCase):
     def setUp(self):
-        self.con = duckdb.connect(":memory:")
+        self.con = vane.connect(":memory:")
         self.cur = self.con.cursor()
         self.cur.execute("create table test(i bigint, s varchar, f double, b BLOB)")
 
@@ -144,7 +150,7 @@ class DuckDBTypeTests(unittest.TestCase):
 
 class CommonTableExpressionTests(unittest.TestCase):
     def setUp(self):
-        self.con = duckdb.connect(":memory:")
+        self.con = vane.connect(":memory:")
         self.cur = self.con.cursor()
         self.cur.execute("create table test(x int)")
 
@@ -176,7 +182,7 @@ class CommonTableExpressionTests(unittest.TestCase):
 
 class DateTimeTests(unittest.TestCase):
     def setUp(self):
-        self.con = duckdb.connect(":memory:")
+        self.con = vane.connect(":memory:")
         self.cur = self.con.cursor()
         self.cur.execute("create table test(d date, t time, ts timestamp)")
 
@@ -238,7 +244,7 @@ class DateTimeTests(unittest.TestCase):
 
 class ListTests(unittest.TestCase):
     def setUp(self):
-        self.con = duckdb.connect(":memory:")
+        self.con = vane.connect(":memory:")
         self.cur = self.con.cursor()
         self.cur.execute("create table test(single INTEGER[], nested INTEGER[][])")
 

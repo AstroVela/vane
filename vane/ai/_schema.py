@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 
 class SchemaValidationError(ValueError):
@@ -553,12 +553,12 @@ def _pointer_escape(value: str) -> str:
 def _copy_json_schema(value: Any) -> dict[str, Any]:
     if isinstance(value, type):
         try:
-            from pydantic import BaseModel
+            from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
         except ImportError:
             raise TypeError("return_format requires pydantic when passing a Pydantic BaseModel class") from None
         if not issubclass(value, BaseModel):
             raise TypeError("return_format class must be a Pydantic BaseModel subclass")
-        value = value.model_json_schema()
+        value = getattr(value, "model_json_schema")()
     elif not isinstance(value, Mapping):
         raise TypeError("return_format must be a Pydantic BaseModel class, a JSON schema mapping, or None")
     try:

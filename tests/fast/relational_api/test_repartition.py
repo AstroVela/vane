@@ -6,7 +6,7 @@ import weakref
 
 import pytest
 
-import duckdb
+import vane
 
 
 def test_repartition_random(duckdb_cursor):
@@ -29,7 +29,7 @@ def test_repartition_kwargs(duckdb_cursor):
 
 def test_repartition_invalid_partitions(duckdb_cursor):
     rel = duckdb_cursor.query("select i from range(5) t(i)")
-    with pytest.raises(duckdb.InvalidInputException):
+    with pytest.raises(vane.InvalidInputException):
         rel.repartition(0)
 
 
@@ -79,7 +79,7 @@ def test_exchange_chain_executes_with_query_verification(duckdb_cursor, exchange
     [("repartition", "REPARTITION"), ("local_exchange", "LOCAL_EXCHANGE")],
 )
 def test_exchange_relation_keeps_connection_alive(exchange_method, plan_node):
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection_ref = weakref.ref(connection)
     source = connection.sql("SELECT i FROM range(3) data(i)")
     derived = getattr(source, exchange_method)(2).project("i + 1 AS value")
@@ -95,7 +95,7 @@ def test_exchange_relation_keeps_connection_alive(exchange_method, plan_node):
 
 @pytest.mark.parametrize("exchange_method", ["repartition", "local_exchange"])
 def test_exchange_relation_rejects_closed_connection(exchange_method):
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection_ref = weakref.ref(connection)
     source = connection.sql("SELECT i FROM range(3) data(i)")
     derived = getattr(source, exchange_method)(2)
@@ -106,7 +106,7 @@ def test_exchange_relation_rejects_closed_connection(exchange_method):
     gc.collect()
 
     assert connection_ref() is not None
-    with pytest.raises(duckdb.ConnectionException, match="Connection has already been closed"):
+    with pytest.raises(vane.ConnectionException, match="Connection has already been closed"):
         derived.fetchall()
 
 
@@ -222,7 +222,7 @@ def test_binary_relational_operations_fail_before_discarding_exchange(duckdb_cur
     right = duckdb_cursor.sql("SELECT 1 AS i").set_alias("right_data")
     exchanged = getattr(left, exchange_method)(2)
 
-    with pytest.raises(duckdb.NotImplementedException, match="would discard"):
+    with pytest.raises(vane.NotImplementedException, match="would discard"):
         if operation == "join":
             exchanged.join(right, "left_data.i = right_data.i")
         elif operation == "cross":
@@ -239,7 +239,7 @@ def test_binary_relational_operations_fail_before_discarding_exchange(duckdb_cur
 def test_python_replacement_scan_fails_before_discarding_exchange(duckdb_cursor, exchange_method):
     relation_with_exchange = getattr(duckdb_cursor.sql("SELECT 1 AS i"), exchange_method)(2)  # noqa: F841
 
-    with pytest.raises(duckdb.NotImplementedException, match="would discard"):
+    with pytest.raises(vane.NotImplementedException, match="would discard"):
         duckdb_cursor.sql("SELECT * FROM relation_with_exchange")
 
 
@@ -258,5 +258,5 @@ def test_sql_terminal_operations_fail_before_discarding_exchange(duckdb_cursor, 
     if operation == "insert_into":
         duckdb_cursor.execute(f"CREATE TABLE {target} (i INTEGER)")
 
-    with pytest.raises(duckdb.NotImplementedException, match="discard the exchange"):
+    with pytest.raises(vane.NotImplementedException, match="discard the exchange"):
         getattr(relation, operation)(target)

@@ -1,8 +1,14 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -24,7 +30,7 @@ def test_5547():
         )
     )
 
-    con = duckdb.connect()
+    con = vane.connect()
     expected = tbl.to_pandas()
     result = con.execute(
         """

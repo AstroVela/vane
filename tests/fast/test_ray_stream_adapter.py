@@ -11,13 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from duckdb.execution.ray_stream_adapter import (
+from vane.execution.ray_stream_adapter import (
     RayStreamAdapter,
     RayStreamCleanupWait,
     TaskLeaseObjectRefGenerator,
     validate_ray_stream_contract,
 )
-from duckdb.execution.udf_task_admission import TaskAdmission
+from vane.execution.udf_task_admission import TaskAdmission
 
 
 class _Ref:
@@ -194,7 +194,7 @@ def test_contract_rejects_missing_generator_capability_with_version_context():
 
 def test_stream_blocks_never_exceed_duckdb_vector_size():
     pa = pytest.importorskip("pyarrow")
-    from duckdb.execution.udf_ray_stream_protocol import (
+    from vane.execution.udf_ray_stream_protocol import (
         DUCKDB_STANDARD_VECTOR_SIZE,
         iter_bounded_stream_blocks,
     )
@@ -217,8 +217,8 @@ def test_stream_blocks_never_exceed_duckdb_vector_size():
 
 def test_stream_blocks_keep_unsplittable_rows_as_complete_soft_target_blocks():
     pa = pytest.importorskip("pyarrow")
-    from duckdb.execution._common import estimate_table_bytes
-    from duckdb.execution.udf_ray_stream_protocol import iter_bounded_stream_blocks
+    from vane.execution._common import estimate_table_bytes
+    from vane.execution.udf_ray_stream_protocol import iter_bounded_stream_blocks
 
     target_bytes = 32
     payload = {

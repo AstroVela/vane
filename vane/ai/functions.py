@@ -32,14 +32,14 @@ import asyncio
 import inspect
 import math
 import time
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal, overload
+from collections.abc import Awaitable, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Literal, TypeGuard, cast, overload
 
 import numpy as np
-import pyarrow as pa
+import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 from typing_extensions import Unpack
 
-import duckdb
+import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
@@ -70,7 +70,9 @@ from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_opti
 from vane.ai.typing import JSONSchema, UDFOptions
 
 if TYPE_CHECKING:
-    from pydantic import BaseModel  # type: ignore[import-not-found]
+    from pydantic import BaseModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+    from vane.ai.protocols import Prompter, TextEmbedder
 else:
     BaseModel = Any
 
@@ -131,9 +133,10 @@ def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
 _OnError = Literal["raise", "ignore"]
 
 
-def _validate_on_error(on_error: object) -> None:
+def _validate_on_error(on_error: object) -> _OnError:
     if not isinstance(on_error, str) or on_error not in ("raise", "ignore"):
         raise ValueError("on_error must be 'raise' or 'ignore'")
+    return cast(_OnError, on_error)
 
 
 class RetryAfterError(Exception):
@@ -183,7 +186,7 @@ def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
                 wait = math.inf
             if math.isfinite(wait) and wait >= 0:
                 return min(wait, 120)
-    return min(2**attempt, 30)  # 1, 2, 4, 8, ... capped at 30s
+    return float(min(2**attempt, 30))  # 1, 2, 4, 8, ... capped at 30s
 
 
 _TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429})
@@ -216,7 +219,7 @@ def _is_transient_provider_error(exc: Exception) -> bool:
         # error as the cause.  Avoid importing an optional SDK just to classify
         # it; httpx itself is likewise optional for non-network providers.
         try:
-            import httpx
+            import httpx  # type: ignore[import-not-found, import-untyped, unused-ignore]
         except ImportError:
             pass
         else:
@@ -224,7 +227,7 @@ def _is_transient_provider_error(exc: Exception) -> bool:
                 return True
 
         try:
-            import aiohttp
+            import aiohttp  # type: ignore[import-not-found, import-untyped, unused-ignore]
         except ImportError:
             pass
         else:
@@ -272,7 +275,8 @@ def _retry_call(
                 if on_awaitable is not None:
                     on_awaitable()
                 if run_async is None:
-                    result.close()
+                    if inspect.iscoroutine(result):
+                        result.close()
                     raise _missing_async_runtime()
                 result = run_async(result)
             return result
@@ -427,7 +431,7 @@ def _prepare_embed_call(
     model: str | None,
     dimensions: int | None,
     on_error: str,
-    options: dict[str, Any],
+    options: Mapping[str, Any],
     *,
     relation: bool,
 ) -> tuple[Any, int, UDFOptions, bool, int | None, int, str | None]:
@@ -438,7 +442,7 @@ def _prepare_embed_call(
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ValueError("model must be a non-empty string or None")
     explicit_dimensions = _validate_embedding_dimension(dimensions)
-    _validate_on_error(on_error)
+    on_error = _validate_on_error(on_error)
 
     resolved_provider = _resolve_provider(provider)
     if not isinstance(resolved_provider, Provider):
@@ -654,15 +658,15 @@ class _EmbedTextBatch:
         self._on_error: _OnError = on_error
         self._normalize = normalize
         self._arrow_type = pa.list_(pa.float32(), dimensions)
-        self._embedder = None  # lazy: instantiate on first __call__
-        self._run_async: Any = None  # executor-bound capability
+        self._embedder: TextEmbedder | None = None  # lazy: instantiate on first __call__
+        self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._embedder_loop_bound = False  # set once the embedder is known loop-bound
 
-    def bind_async_runtime(self, run_async: Any) -> None:
+    def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
         self._run_async = run_async
 
-    def _require_run_async(self) -> Any:
+    def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:
         if self._run_async is None:
             raise _missing_async_runtime()
         return self._run_async
@@ -670,7 +674,7 @@ class _EmbedTextBatch:
     def _mark_loop_bound(self) -> None:
         self._embedder_loop_bound = True
 
-    def _ensure_embedder(self) -> Any:
+    def _ensure_embedder(self) -> TextEmbedder:
         if self._embedder is None:
             run_async = self._require_run_async()
 
@@ -935,15 +939,15 @@ class _PromptBatch:
         self._return_raw_response = return_raw_response
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
-        self._prompter = None  # lazy: instantiate on first __call__
-        self._run_async: Any = None  # executor-bound capability
+        self._prompter: Prompter | None = None  # lazy: instantiate on first __call__
+        self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._prompter_loop_bound = False  # set once the prompter is known loop-bound
 
-    def bind_async_runtime(self, run_async: Any) -> None:
+    def bind_async_runtime(self, run_async: Callable[[Awaitable[Any]], Any]) -> None:
         """Receive the executor-owned async driver (see UDFExecutor)."""
         self._run_async = run_async
 
-    def _require_run_async(self) -> Any:
+    def _require_run_async(self) -> Callable[[Awaitable[Any]], Any]:
         if self._run_async is None:
             raise _missing_async_runtime()
         return self._run_async
@@ -951,7 +955,7 @@ class _PromptBatch:
     def _mark_loop_bound(self) -> None:
         self._prompter_loop_bound = True
 
-    def _ensure_prompter(self) -> Any:
+    def _ensure_prompter(self) -> Prompter:
         if self._prompter is None:
             run_async = self._require_run_async()
 
@@ -1194,7 +1198,7 @@ def _build_ai_batch_expression(
     name: str,
     execution_backend: str | None = None,
     force_actor: bool = True,
-) -> Any:
+) -> Expression:
     actor_backend = execution_backend in {"subprocess_actor", "ray_actor"}
     if execution_backend is None and force_actor:
         actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
@@ -1232,19 +1236,19 @@ def _build_ai_batch_expression(
 # ---------------------------------------------------------------------------
 
 
-def _validated_embed_text(text: Any) -> Any:
+def _validated_embed_text(text: Any) -> Expression:
     """Add a bind-only VARCHAR guard that is removed during planning."""
-    return duckdb.FunctionExpression("__vane_ai_embed", text)
+    return vane.FunctionExpression("__vane_ai_embed", text)
 
 
-def _star_excluding_existing_output_column(rel: Any, output_column: str) -> Any:
+def _star_excluding_existing_output_column(rel: Relation, output_column: str) -> Expression:
     existing_output_column = next(
         (column for column in rel.columns if column.casefold() == output_column.casefold()),
         None,
     )
     if existing_output_column is None:
-        return duckdb.StarExpression()
-    return duckdb.StarExpression(exclude=[existing_output_column])
+        return vane.StarExpression()
+    return vane.StarExpression(exclude=[existing_output_column])
 
 
 def _embed_expression(
@@ -1253,9 +1257,9 @@ def _embed_expression(
     provider: Any,
     model: str | None,
     dimensions: int | None,
-    on_error: str,
-    options: dict[str, Any],
-) -> Any:
+    on_error: _OnError,
+    options: Mapping[str, Any],
+) -> Expression:
     if not is_expression(text):
         raise TypeError("vane.ai.embed expression API requires a text Expression")
     descriptor, resolved_dimensions, udf_opts, normalize, _, _, _ = _prepare_embed_call(
@@ -1293,10 +1297,10 @@ def _embed_relation(
     provider: Any,
     model: str | None,
     dimensions: int | None,
-    on_error: str,
+    on_error: _OnError,
     output_column: str,
-    options: dict[str, Any],
-) -> Any:
+    options: Mapping[str, Any],
+) -> Relation:
     if not _is_relation_like(rel):
         raise TypeError("vane.ai.embed relation API requires a Relation")
     if not is_expression(text):
@@ -1358,6 +1362,7 @@ _EMBED_OUTPUT_COLUMN_DEFAULT = _DefaultEmbedOutputColumn("embedding")
 @overload
 def embed(
     text: Expression,
+    /,
     *,
     provider: str | Provider = "openai",
     model: str | None = None,
@@ -1382,6 +1387,7 @@ def embed(
 @overload
 def embed(
     rel: Relation,
+    /,
     text: Expression,
     *,
     provider: str | Provider = "openai",
@@ -1488,7 +1494,7 @@ def _prepare_prompt_call(
     system_message: str | None,
     return_raw_response: bool,
     on_error: str,
-    options: dict[str, Any],
+    options: Mapping[str, Any],
     *,
     relation: bool,
 ) -> tuple[Any, UDFOptions, str | None, StructuredOutputSpec | None]:
@@ -1502,7 +1508,7 @@ def _prepare_prompt_call(
         raise TypeError("system_message must be a string or None")
     if not isinstance(return_raw_response, bool):
         raise TypeError("return_raw_response must be a bool")
-    _validate_on_error(on_error)
+    on_error = _validate_on_error(on_error)
     structured_output = compile_return_format(return_format)
 
     resolved_provider = _resolve_provider(provider)
@@ -1546,7 +1552,7 @@ def _prepare_prompt_call(
         family == "openai"
         and structured_output is not None
         and type(descriptor).__module__ == "vane.ai.providers.openai"
-        and descriptor.supports_strict_structured_outputs()
+        and getattr(descriptor, "supports_strict_structured_outputs", lambda: False)()
     ):
         structured_output.validate_openai_gpt_contract(descriptor.get_model())
 
@@ -1570,7 +1576,7 @@ def _prepare_prompt_call(
     return descriptor, udf_options, execution_backend, structured_output
 
 
-def _normalize_prompt_messages(messages: Any) -> tuple[list[Any], bool]:
+def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool]:
     if is_expression(messages):
         return [messages], True
     if not isinstance(messages, list):
@@ -1583,7 +1589,7 @@ def _normalize_prompt_messages(messages: Any) -> tuple[list[Any], bool]:
     return list(messages), False
 
 
-def _prompt_relation_types(rel: Any, messages: list[Any]) -> list[str]:
+def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[str]:
     types = [str(value).upper() for value in rel.select(*messages).types]
     allowed = {"VARCHAR", "BLOB", "BLOB[]"}
     for index, value in enumerate(types):
@@ -1592,14 +1598,14 @@ def _prompt_relation_types(rel: Any, messages: list[Any]) -> list[str]:
     return types
 
 
-def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Any:
+def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Expression:
     """Add a bind-only Prompt type guard that is removed during planning."""
     if text_only:
-        return duckdb.FunctionExpression("__vane_ai_prompt", message, duckdb.ConstantExpression(True))
-    return duckdb.FunctionExpression("__vane_ai_prompt", message)
+        return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(True))
+    return vane.FunctionExpression("__vane_ai_prompt", message)
 
 
-def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> duckdb.Expression:
+def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> vane.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
     message_expressions = [as_expression(message) for message in messages]
     if len(message_expressions) == 1:
@@ -1608,23 +1614,23 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPro
         any_present = message_expressions[0].isnotnull()
         for expression in message_expressions[1:]:
             any_present = any_present | expression.isnotnull()
-        combined = duckdb.FunctionExpression("concat", *message_expressions)
-        messages_expr = duckdb.CaseExpression(any_present, combined)
+        combined = vane.FunctionExpression("concat", *message_expressions)
+        messages_expr = vane.CaseExpression(any_present, combined)
     if descriptor.system_message:
         # Unlike concat(), the || operator propagates NULL inputs.
-        messages_expr = duckdb.FunctionExpression(
+        messages_expr = vane.FunctionExpression(
             "||",
-            duckdb.ConstantExpression(f"{descriptor.system_message}\n\n"),
+            vane.ConstantExpression(f"{descriptor.system_message}\n\n"),
             messages_expr,
         )
 
     options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
 
-    return duckdb.FunctionExpression(
+    return vane.FunctionExpression(
         "vllm",
         messages_expr,
-        duckdb.ConstantExpression(descriptor.model_name),
-        duckdb.ConstantExpression(options_argument),
+        vane.ConstantExpression(descriptor.model_name),
+        vane.ConstantExpression(options_argument),
     )
 
 
@@ -1637,10 +1643,10 @@ def _prompt_relation(
     return_format: Any = None,
     system_message: str | None = None,
     return_raw_response: bool = False,
-    on_error: str = "raise",
+    on_error: _OnError = "raise",
     output_column: str = "response",
-    options: dict[str, Any],
-) -> Any:
+    options: Mapping[str, Any],
+) -> Relation:
     if not _is_relation_like(rel):
         raise TypeError("vane.ai.prompt relation API requires a Relation")
     message_expressions, single_message = _normalize_prompt_messages(messages)
@@ -1727,9 +1733,9 @@ def _prompt_expression(
     return_format: Any = None,
     system_message: str | None = None,
     return_raw_response: bool = False,
-    on_error: str = "raise",
-    options: dict[str, Any],
-) -> Any:
+    on_error: _OnError = "raise",
+    options: Mapping[str, Any],
+) -> Expression:
     message_expressions, single_message = _normalize_prompt_messages(messages)
     descriptor, udf_options, _, structured_output = _prepare_prompt_call(
         provider,
@@ -1795,7 +1801,7 @@ def _prompt_expression(
     ).cast(output_type)
 
 
-def _is_relation_like(value: Any) -> bool:
+def _is_relation_like(value: Any) -> TypeGuard[Relation]:
     return hasattr(value, "map_batches") and hasattr(value, "select")
 
 
@@ -1812,6 +1818,7 @@ _PROMPT_OUTPUT_COLUMN_DEFAULT = _DefaultPromptOutputColumn("response")
 @overload
 def prompt(
     messages: Expression | list[Expression],
+    /,
     *,
     return_format: type[BaseModel] | JSONSchema | None = None,
     system_message: str | None = None,
@@ -1840,6 +1847,7 @@ def prompt(
 @overload
 def prompt(
     rel: Relation,
+    /,
     messages: Expression | list[Expression],
     *,
     return_format: type[BaseModel] | JSONSchema | None = None,

@@ -17,13 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import duckdb
-from duckdb.runners.common import PartitionMetadata
-from duckdb.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
-from duckdb.runners.ray import driver
-from duckdb.runners.ray.partition_metadata import PartitionMetadataAccessor
-from duckdb.runners.ray.safe_get import QueryDeadlineExceeded
-from duckdb.runners.ray.worker import (
+import vane
+from vane.runners.common import PartitionMetadata
+from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
+from vane.runners.ray import driver, partition_metadata
+from vane.runners.ray.partition_metadata import PartitionMetadataAccessor
+from vane.runners.ray.safe_get import QueryDeadlineExceeded
+from vane.runners.ray.worker import (
     _normalize_native_task_result,
     _validate_fte_output_publication,
 )
@@ -38,12 +38,12 @@ def _registered_low_level_plan(
     refresh_phase_allocation=False,
 ):
     """Exercise the internal C++ runner under the mandatory graph contract."""
-    from duckdb.runners.ray.query_resource_graph import (
+    from vane.runners.ray.query_resource_graph import (
         QueryAllocation,
         ResourceVector,
     )
-    from duckdb.runners.ray.query_resource_graph_builder import build_query_resource_graph
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_graph_builder import build_query_resource_graph
+    from vane.runners.ray.query_resource_runtime import (
         register_query_resource_graph,
         release_query_resource_manager,
     )
@@ -107,9 +107,9 @@ def _registered_low_level_plan(
 
 
 def _make_test_physical_plan(con=None):
-    con = duckdb.connect() if con is None else con
+    con = vane.connect() if con is None else con
     relation = con.sql("SELECT 1 AS i")
-    return duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    return vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -341,14 +341,14 @@ def test_driver_connection_applies_duckdb_execution_width(monkeypatch):
 
 
 def test_driver_reconciles_reconstructed_actor_location_and_public_leases():
-    from duckdb.runners.ray.query_resource_graph import (
+    from vane.runners.ray.query_resource_graph import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
         ResourceVector,
     )
-    from duckdb.runners.ray.query_resource_manager import TaskRequest
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import (
         register_query_resource_graph,
         release_query_resource_manager,
     )
@@ -594,13 +594,13 @@ def _bind_test_query_resource_owner(
     *,
     query_id: str | None = None,
 ):
-    from duckdb.runners.ray.query_resource_graph import (
+    from vane.runners.ray.query_resource_graph import (
         QueryAllocation,
         QueryResourceGraph,
         ResourceUnitSpec,
         ResourceVector,
     )
-    from duckdb.runners.ray.query_resource_runtime import register_query_resource_graph
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
 
     query_id = str(plan_id if query_id is None else query_id)
     unit = ResourceUnitSpec(
@@ -1395,7 +1395,7 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
 
 
 def test_copy_outcome_unknown_error_is_exported_from_ray_runner_package():
-    from duckdb.runners.ray import CopyOutcomeUnknownError
+    from vane.runners.ray import CopyOutcomeUnknownError
 
     assert CopyOutcomeUnknownError is driver.CopyOutcomeUnknownError
 
@@ -2757,7 +2757,7 @@ def test_query_actor_pool_cleanup_retains_failed_pool_for_retry(cleanup_method, 
 
 
 def test_failed_execution_owner_cleanup_blocks_query_resource_release(monkeypatch):
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
         release_query_resource_manager,
     )
@@ -2801,7 +2801,7 @@ def test_failed_execution_owner_cleanup_blocks_query_resource_release(monkeypatc
 
 
 def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_runtime import (
         get_query_resource_manager,
         release_query_resource_manager,
     )
@@ -3224,7 +3224,7 @@ def test_expired_client_reclamation_cancels_owned_active_operation():
 
 
 def test_expired_client_reclamation_cancels_blocked_partition_read():
-    from duckdb.runners.ray.query_resource_runtime import (
+    from vane.runners.ray.query_resource_runtime import (
         release_query_resource_manager,
     )
 
@@ -3326,7 +3326,7 @@ def test_open_session_revalidates_owner_inside_registry_lock(monkeypatch):
 
 
 def test_open_session_defers_credential_resolution_until_plan_preparation(monkeypatch):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     cls, runner = _make_local_query_driver_actor()
     runner._sessions = {}
@@ -3669,7 +3669,7 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
 
 @pytest.mark.parametrize("copy_plan", [False, True])
 def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkeypatch, copy_plan):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
@@ -3728,7 +3728,7 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
 
 
 def test_copy_session_refresh_does_not_block_actor_loop(monkeypatch):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
@@ -3946,7 +3946,7 @@ def test_driver_revalidates_physical_plan_session(
 
 
 def test_normalize_native_task_result_preserves_schema_and_stats():
-    m = duckdb.ray_cxx
+    m = vane.ray_cxx
     result = m.NativeDistributedTaskResult(
         ["payload"],
         [m.NativePartitionMetadata(3, 42)],
@@ -3980,7 +3980,7 @@ def test_normalize_native_task_result_preserves_schema_and_stats():
 
 
 def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     events: list[tuple[str, str]] = []
     original_require = worker_module.require_ray_cxx_attr
@@ -3998,7 +3998,7 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
         "attempt_id": 2,
         "flight_server_epoch": "worker-epoch",
     }
-    native_result = duckdb.ray_cxx.NativeDistributedTaskResult(
+    native_result = vane.ray_cxx.NativeDistributedTaskResult(
         [],
         [],
         None,
@@ -4073,7 +4073,7 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
 
 
 def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
-    from duckdb.runners.ray import worker as worker_module
+    from vane.runners.ray import worker as worker_module
 
     events: list[tuple[str, str]] = []
     native_started = threading.Event()
@@ -4087,7 +4087,7 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
             return lambda query_id: events.append(("end", query_id))
         raise AssertionError(f"unexpected C++ binding lookup: {name}")
 
-    native_result = duckdb.ray_cxx.NativeDistributedTaskResult(
+    native_result = vane.ray_cxx.NativeDistributedTaskResult(
         [],
         [],
         None,
@@ -4605,7 +4605,7 @@ def test_fte_worker_task_handle_rolls_back_new_output_owners_when_replacing_owne
 
     worker = _TrackingWorker()
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    previous_ref = duckdb.ray_cxx.RayResultPartitionRef(
+    previous_ref = vane.ray_cxx.RayResultPartitionRef(
         "payload",
         5,
         64,
@@ -4942,7 +4942,7 @@ def test_fte_worker_task_handle_preserves_ray_oom_type_when_publishing_worker_fa
     assert worker_id == "worker-oom-status"
     assert "status wait failed" in str(published_error)
     assert published_error.__cause__ is oom_error
-    from duckdb.runners.ray.fte_fragment_scheduler import _worker_failure_payload
+    from vane.runners.ray.fte_fragment_scheduler import _worker_failure_payload
 
     assert (
         _worker_failure_payload(
@@ -5291,7 +5291,7 @@ def test_get_next_partition_wraps_metadata_aware_fragment(monkeypatch):
     plan_id = "plan-ok"
     manager = _bind_test_query_resource_owner(runner, plan_id)
     payload = object()
-    fragment = duckdb.ray_cxx.RayResultPartitionRef(payload, 7, 99, _FakeOutputLeaseOwner())
+    fragment = vane.ray_cxx.RayResultPartitionRef(payload, 7, 99, _FakeOutputLeaseOwner())
     runner.curr_streams[plan_id] = _DummyStream([fragment])
     runner.curr_plans[plan_id] = object()
 
@@ -5306,6 +5306,11 @@ def test_get_next_partition_wraps_metadata_aware_fragment(monkeypatch):
         PartitionMetadataAccessor,
         "from_metadata_list",
         classmethod(lambda _cls, meta: _LocalMetadataAccessor(meta)),
+    )
+    monkeypatch.setattr(
+        partition_metadata,
+        "resolve_object_refs_blocking",
+        lambda value, **_kwargs: value,
     )
 
     result = asyncio.run(
@@ -5330,7 +5335,7 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
     _bind_test_query_resource_owner(runner, plan_id)
     payload = object()
     output_owner = _FakeOutputLeaseOwner()
-    fragment = duckdb.ray_cxx.RayResultPartitionRef(payload, 7, 99, output_owner)
+    fragment = vane.ray_cxx.RayResultPartitionRef(payload, 7, 99, output_owner)
     runner.curr_streams[plan_id] = _DummyStream([fragment])
     runner.curr_plans[plan_id] = object()
 
@@ -5369,7 +5374,11 @@ def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypa
         "from_metadata_list",
         classmethod(lambda _cls, meta: _LocalMetadataAccessor(meta)),
     )
-    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda value, **_kwargs: value)
+    monkeypatch.setattr(
+        partition_metadata,
+        "resolve_object_refs_blocking",
+        lambda value, **_kwargs: value,
+    )
 
     result = asyncio.run(
         cls.get_next_partition(
@@ -5405,7 +5414,7 @@ def test_get_next_partition_rejects_result_with_released_output_lease():
             release_calls.append("release")
             return False
 
-    fragment = duckdb.ray_cxx.RayResultPartitionRef(payload, 7, 99, _ReleasedOutputLeaseOwner())
+    fragment = vane.ray_cxx.RayResultPartitionRef(payload, 7, 99, _ReleasedOutputLeaseOwner())
     runner.curr_streams[plan_id] = _DummyStream([fragment])
     runner.curr_plans[plan_id] = object()
 
@@ -5430,7 +5439,7 @@ def test_get_next_partition_releases_by_lease_id_not_object_ref(monkeypatch):
     _bind_test_query_resource_owner(runner, plan_id)
     payload = object()
     output_owner = _FakeOutputLeaseOwner()
-    fragment = duckdb.ray_cxx.RayResultPartitionRef(payload, 7, 99, output_owner)
+    fragment = vane.ray_cxx.RayResultPartitionRef(payload, 7, 99, output_owner)
     runner.curr_streams[plan_id] = _DummyStream([fragment])
     runner.curr_plans[plan_id] = object()
 
@@ -5474,7 +5483,11 @@ def test_get_next_partition_releases_by_lease_id_not_object_ref(monkeypatch):
         "from_metadata_list",
         classmethod(lambda _cls, meta: _LocalMetadataAccessor(meta)),
     )
-    monkeypatch.setattr(driver, "resolve_object_refs_blocking", lambda value, **_kwargs: value)
+    monkeypatch.setattr(
+        partition_metadata,
+        "resolve_object_refs_blocking",
+        lambda value, **_kwargs: value,
+    )
 
     result = asyncio.run(
         cls.get_next_partition(
@@ -5651,7 +5664,7 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
 
     assert teardown_calls == [(plan_id, query_id, True)]
     assert runner.curr_streams[plan_id].items == [undelivered]
-    from duckdb.runners.ray.query_resource_runtime import release_query_resource_manager
+    from vane.runners.ray.query_resource_runtime import release_query_resource_manager
 
     release_query_resource_manager(query_id, reason="test_complete")
 
@@ -5784,7 +5797,7 @@ def test_fragment_stats_runs_worker_observation_off_actor_event_loop():
 
 
 def test_progress_snapshot_build_runs_off_actor_event_loop(monkeypatch):
-    from duckdb.runners.ray import fte_fragment_scheduler
+    from vane.runners.ray import fte_fragment_scheduler
 
     cls, runner = _make_local_query_driver_actor()
     _bind_test_plan_session(runner, "query-progress")
@@ -5940,19 +5953,19 @@ def test_progress_snapshot_state_is_cancelled_and_dropped_with_query():
 
 
 def test_execute_native_empty_result_returns_typed_contract():
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("CREATE TABLE a AS SELECT i FROM range(10) tbl(i)")
     relation = con.sql("SELECT * FROM a WHERE 1=0")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     cursor = con.cursor()
     result = runner.execute_native(cursor, plan, None, None)
 
-    assert isinstance(result, duckdb.ray_cxx.NativeDistributedTaskResult)
+    assert isinstance(result, vane.ray_cxx.NativeDistributedTaskResult)
     assert result.completion_status == "empty"
     assert list(result.partition_payloads) == []
     assert list(result.partition_metadatas) == []
@@ -5962,18 +5975,18 @@ def test_execute_native_empty_result_returns_typed_contract():
 def test_describe_native_progress_materializes_deferred_clone_without_execution(tmp_path):
     import ray
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "progress_topology_input.parquet"
     con.execute(f"COPY (SELECT i::INTEGER AS i FROM range(10) tbl(i)) TO '{src}' (FORMAT PARQUET)")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         con.sql(f"SELECT i * 2 AS value FROM read_parquet('{src}')"),
         str(uuid.uuid4()),
     ).to_physical_plan(con)
     deferred = ray.cloudpickle.loads(ray.cloudpickle.dumps(plan))
     assert deferred.has_root() is False
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
-    topology = duckdb.ray_cxx.describe_native_progress(con.cursor(), deferred)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    topology = vane.ray_cxx.describe_native_progress(con.cursor(), deferred)
 
     assert deferred.has_root() is False
     assert set(topology) == {"schema", "pipelines"}
@@ -6012,10 +6025,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
     monkeypatch,
     request,
 ):
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
-    duckdb.ray_cxx.shutdown_local_flight_service()
-    request.addfinalizer(duckdb.ray_cxx.shutdown_local_flight_service)
+    vane.ray_cxx.shutdown_local_flight_service()
+    request.addfinalizer(vane.ray_cxx.shutdown_local_flight_service)
     monkeypatch.setenv("VANE_FLIGHT_BIND_HOST", "127.0.0.1")
     monkeypatch.setenv("VANE_FLIGHT_ADVERTISE_HOST", "127.0.0.1")
 
@@ -6064,20 +6077,20 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("node-a", worker, 4.0, 0.0, 8 << 30)
+            vane.ray_cxx.RayWorkerRuntime("node-a", worker, 4.0, 0.0, 8 << 30)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "remote_exchange_progress.parquet"
     con.sql("SELECT i::INTEGER AS i FROM range(32) tbl(i)").write_parquet(str(src))
     relation = con.read_parquet(str(src)).repartition(2)
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
 
     sink_topologies = []
     sink_results = []
@@ -6088,7 +6101,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
         for task in worker.tasks:
             task_plan = task.plan()
-            topology = duckdb.ray_cxx.describe_native_progress(con.cursor(), task_plan)
+            topology = vane.ray_cxx.describe_native_progress(con.cursor(), task_plan)
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
                 native_sink_instance = task.exchange_sink_instance()
@@ -6144,10 +6157,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
 
 
 def test_distributed_physical_plan_clone_executes_on_worker_connection():
-    driver_con = duckdb.connect()
-    worker_con = duckdb.connect()
+    driver_con = vane.connect()
+    worker_con = vane.connect()
     relation = driver_con.sql("SELECT 42::INTEGER AS i")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(driver_con)
@@ -6159,7 +6172,7 @@ def test_distributed_physical_plan_clone_executes_on_worker_connection():
     assert clone.has_root() is True
     assert plan.has_root() is True
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     clone_result = runner.execute_native(worker_con.cursor(), clone, None, None)
     original_result = runner.execute_native(driver_con.cursor(), plan, None, None)
 
@@ -6170,15 +6183,15 @@ def test_distributed_physical_plan_clone_executes_on_worker_connection():
 
 
 def test_execute_native_repartition_uses_local_exchange_not_passthrough():
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=4")
     relation = con.sql("SELECT i::INTEGER AS i FROM range(32) tbl(i)").repartition(4)
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     result = runner.execute_native(con.cursor(), plan, None, None)
 
     assert result.completion_status == "ok"
@@ -6192,15 +6205,15 @@ def test_execute_native_repartition_uses_local_exchange_not_passthrough():
 
 
 def test_execute_native_hash_repartition_uses_resolved_partition_expressions():
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=4")
     relation = con.sql("SELECT i::INTEGER AS i, (i % 2)::INTEGER AS k FROM range(1000) tbl(i)").repartition(4, "k")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     result = runner.execute_native(con.cursor(), plan, None, None)
 
     assert result.completion_status == "ok"
@@ -6213,7 +6226,7 @@ def test_execute_native_hash_repartition_uses_resolved_partition_expressions():
 def test_execute_native_applies_dynamic_filter_domains_to_table_scan(tmp_path):
     pa = pytest.importorskip("pyarrow")
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "dynamic_filter_input.parquet"
     con.sql(
         """
@@ -6222,19 +6235,19 @@ def test_execute_native_applies_dynamic_filter_domains_to_table_scan(tmp_path):
         """
     ).write_parquet(str(src))
     relation = con.sql(f"select id, value from read_parquet('{src}') order by id")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     result = runner.execute_native(
         con.cursor(),
         plan,
         dynamic_filter_domains={"df0": {"column": "id", "range": [2, 4]}},
     )
 
-    assert isinstance(result, duckdb.ray_cxx.NativeDistributedTaskResult)
+    assert isinstance(result, vane.ray_cxx.NativeDistributedTaskResult)
     payloads = list(result.partition_payloads)
     assert len(payloads) == 1
     table = payloads[0]
@@ -6244,20 +6257,20 @@ def test_execute_native_applies_dynamic_filter_domains_to_table_scan(tmp_path):
 
 
 def test_execute_native_rejects_invalid_positional_exchange_sink_instance():
-    con = duckdb.connect()
+    con = vane.connect()
     cursor = con.cursor()
     plan = _make_test_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
 
     with pytest.raises(ValueError, match="exchange_sink_instance must be bytes or dict"):
         runner.execute_native(cursor, plan, None, None, None, [object()])
 
 
 def test_execute_native_rejects_legacy_copy_output_string():
-    con = duckdb.connect()
+    con = vane.connect()
     cursor = con.cursor()
     plan = _make_test_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
 
     with pytest.raises(ValueError, match="copy_output_info must be a dict"):
         runner.execute_native(cursor, plan, None, None, "/tmp/out")
@@ -6268,12 +6281,12 @@ def test_run_plan_uses_distributed_worker_path(tmp_path):
     pa = pytest.importorskip("pyarrow")
     ray = pytest.importorskip("ray")
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "scan_typed_input.parquet"
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
 
     relation = con.sql(f"select * from read_parquet('{src}')")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -6281,12 +6294,12 @@ def test_run_plan_uses_distributed_worker_path(tmp_path):
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         parts = list(iter(runner.run_plan(plan, con)))
 
         assert len(parts) == 1
-        assert isinstance(parts[0], duckdb.ray_cxx.RayResultPartitionRef)
+        assert isinstance(parts[0], vane.ray_cxx.RayResultPartitionRef)
         payload = ray.get(parts[0].object_ref)
     assert isinstance(payload, pa.Table)
     assert payload.to_pylist() == [{"c0": 1}, {"c0": 2}, {"c0": 3}]
@@ -6299,15 +6312,15 @@ def test_run_plan_continues_with_final_tasks_after_order_by_barrier(tmp_path):
     pa = pytest.importorskip("pyarrow")
     ray = pytest.importorskip("ray")
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "barrier_order_input.parquet"
     con.sql("SELECT i::BIGINT AS x FROM range(32) tbl(i)").write_parquet(str(src))
     relation = con.read_parquet(str(src)).repartition(4).order("x DESC")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
 
     with _registered_low_level_plan(
         plan,
@@ -6333,11 +6346,11 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_scan_typed_input.parquet"
     dst = tmp_path / "copy_scan_typed_output.parquet"
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
@@ -6347,7 +6360,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -6355,7 +6368,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6373,7 +6386,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     assert result["copy_output_manifest_path"].endswith(
         f"{dst.name}.duckdb_commit/{result['copy_output_run_id']}/manifest.txt"
     )
-    committed = duckdb.ray_cxx.read_committed_copy_direct_write_result(
+    committed = vane.ray_cxx.read_committed_copy_direct_write_result(
         result["copy_output_base_path"],
         result["copy_output_run_id"],
     )
@@ -6396,11 +6409,11 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_trailing_separator_input.parquet"
     dst = tmp_path / "copy_trailing_separator_output"
     dst.mkdir()
@@ -6411,11 +6424,11 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     con.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6427,7 +6440,7 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     assert committed_paths
     assert all(path.is_file() for path in committed_paths)
 
-    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+    cleanup = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(
         raw_dst,
         min_age_ms=0,
     )
@@ -6449,11 +6462,11 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_tmp_file_input.parquet"
     dst = tmp_path / "copy_tmp_file_output.parquet"
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
@@ -6463,11 +6476,11 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6486,7 +6499,7 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     assert sorted(row[0] for row in con.read_parquet([str(path) for path in committed_paths]).fetchall()) == [1, 2]
     assert con.read_parquet(str(dst)).fetchall() == [(0,)]
 
-    cleanup = duckdb.ray_cxx.cleanup_expired_copy_direct_write_runs(
+    cleanup = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(
         str(dst),
         min_age_ms=0,
     )
@@ -6509,12 +6522,12 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
-    from duckdb.runners.ray import cleanup_copy_direct_write_lifecycle_once
+    import vane.runners as runners_mod
+    from vane.runners.ray import cleanup_copy_direct_write_lifecycle_once
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_explicit_cleanup_input.parquet"
     dst = tmp_path / "copy_explicit_cleanup_output"
     dst.mkdir()
@@ -6524,13 +6537,13 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
     stale_run_id = "run-explicit-cleanup"
-    stale_lifecycle = duckdb.ray_cxx.register_copy_direct_write_run_lifecycle(
+    stale_lifecycle = vane.ray_cxx.register_copy_direct_write_run_lifecycle(
         str(dst),
         stale_run_id,
         created_epoch_ms=1,
@@ -6539,7 +6552,7 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     stale_file.parent.mkdir(parents=True)
     stale_file.write_bytes(b"stale")
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6572,11 +6585,11 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_staging_input.parquet"
     dst = tmp_path / "copy_staging_output.parquet"
     con.sql("select 10 as x union all select 20 as x").write_parquet(str(src))
@@ -6585,12 +6598,12 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6615,11 +6628,11 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_fte_input.parquet"
     dst = tmp_path / "copy_fte_output"
     dst.mkdir()
@@ -6629,7 +6642,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -6637,7 +6650,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6660,11 +6673,11 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
             captured.append(relation)
             return {"ok": True}
 
-    import duckdb.runners as runners_mod
+    import vane.runners as runners_mod
 
     monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_direct_success_input.parquet"
     dst = tmp_path / "copy_direct_success_output"
     con.sql("select 1 as x union all select 2 as x union all select 3 as x").write_parquet(str(src))
@@ -6673,7 +6686,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -6681,7 +6694,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
         result = runner.run_copy_plan(plan, con)
 
@@ -6695,7 +6708,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     assert Path(result["copy_output_committed_marker_path"]).is_file()
     assert not Path(str(dst) + ".duckdb_staging").exists()
 
-    committed = duckdb.ray_cxx.read_committed_copy_direct_write_result(
+    committed = vane.ray_cxx.read_committed_copy_direct_write_result(
         result["copy_output_base_path"],
         result["copy_output_run_id"],
     )
@@ -6715,7 +6728,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     all_run_files = [*committed_paths, str(loser_file)]
     assert con.read_parquet(all_run_files).aggregate("count(*)").fetchone()[0] == 4
 
-    from duckdb.runners.ray import read_committed_copy_direct_write_parquet
+    from vane.runners.ray import read_committed_copy_direct_write_parquet
 
     committed_rel = read_committed_copy_direct_write_parquet(
         result["copy_output_base_path"],
@@ -6816,8 +6829,8 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners as runners_mod
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners as runners_mod
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     captured = []
 
@@ -6832,12 +6845,12 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-fail", failing_worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-fail", failing_worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_failure_input.parquet"
     dst = tmp_path / "copy_failure_output.parquet"
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
@@ -6847,14 +6860,14 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con, node_id="node-a"):
         with pytest.raises(ValueError, match="planned worker failure"):
             runner.run_copy_plan(plan, con)
@@ -6955,8 +6968,8 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners as runners_mod
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners as runners_mod
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     captured = []
 
@@ -6971,12 +6984,12 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-direct-fail", failing_worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-direct-fail", failing_worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "copy_direct_failure_input.parquet"
     dst = tmp_path / "copy_direct_failure_output.parquet"
     con.sql("select 1 as x union all select 2 as x").write_parquet(str(src))
@@ -6986,14 +6999,14 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
     scan_task_descriptors = dict(plan.scan_task_descriptor_map())
     assert scan_task_descriptors
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con, node_id="node-a"):
         with pytest.raises(ValueError, match="planned direct worker failure"):
             runner.run_copy_plan(plan, con)
@@ -7031,19 +7044,19 @@ def test_wait_fte_query_propagates_status_errors(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     failing_worker = _StatusFailingWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-status-fail", failing_worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-status-fail", failing_worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="status exploded"):
@@ -7091,14 +7104,14 @@ def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _ThreadProgressWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-gil-wait", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-gil-wait", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
@@ -7112,7 +7125,7 @@ def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
     thread = threading.Thread(target=finish_after_first_status_poll, daemon=True)
     thread.start()
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         manager.wait_fte_query("query-gil-wait", 1.0)
@@ -7150,19 +7163,19 @@ def test_wait_fte_query_rejects_malformed_query_status(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _MalformedStatusWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-status-malformed", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-status-malformed", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="FTE query status must include boolean 'failed'"):
@@ -7188,7 +7201,7 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
             return True
 
         def get_result_sync(self):
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
     class _MalformedHandleWorker:
         def __init__(self):
@@ -7220,19 +7233,19 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _MalformedHandleWorker()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-handle-malformed", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-handle-malformed", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="FTE result handle must provide task_id"):
@@ -7259,7 +7272,7 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
             return True
 
         def get_result_sync(self):
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
     class _MalformedHandleWorker:
         def __init__(self):
@@ -7291,19 +7304,19 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _MalformedHandleWorker()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-coordinator", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-coordinator", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="worker_id"):
@@ -7384,19 +7397,19 @@ def test_wait_fte_query_propagates_selected_attempt_handle_errors(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _StatusSupportedWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-selected", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-selected", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="selected attempt failed"):
@@ -7444,7 +7457,7 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self._is_done = True
-            self._result = duckdb.ray_cxx.RayTaskResult.no_output()
+            self._result = vane.ray_cxx.RayTaskResult.no_output()
             self._error = None
             self._future = None
             self.task = None
@@ -7456,7 +7469,7 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
             return True
 
         def get_result_sync(self):
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
         def release_result_payload(self):
             return None
@@ -7509,19 +7522,19 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _StatusSupportedWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-retry", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-retry", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         manager.wait_fte_query("query-retry-loser", 1.0)
@@ -7542,7 +7555,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
         def __init__(self, task_id, *, fail_release_once=False):
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
-            self._result = duckdb.ray_cxx.RayTaskResult.no_output()
+            self._result = vane.ray_cxx.RayTaskResult.no_output()
             self.fail_release_once = fail_release_once
             self.release_calls = 0
 
@@ -7616,14 +7629,14 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _Worker()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime(
+            vane.ray_cxx.RayWorkerRuntime(
                 "worker-release-failure",
                 worker,
                 1.0,
@@ -7634,7 +7647,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="planned result payload release failure"):
@@ -7685,7 +7698,7 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self._is_done = True
-            self._result = duckdb.ray_cxx.RayTaskResult.no_output()
+            self._result = vane.ray_cxx.RayTaskResult.no_output()
             self._error = None
             self._future = None
             self.task = None
@@ -7697,7 +7710,7 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
             return True
 
         def get_result_sync(self):
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
         def release_result_payload(self):
             return None
@@ -7750,19 +7763,19 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _StatusSupportedWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-retry-pending", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-retry-pending", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         manager.wait_fte_query("query-retry-pending", 0.1)
@@ -7853,19 +7866,19 @@ def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _StatusFailsAfterCollectWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-stale-failed", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-stale-failed", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="FTE query failed"):
@@ -7903,7 +7916,7 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
 
         def get_result_sync(self):
             self.get_result_sync_calls += 1
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
         def release_result_payload(self):
             return None
@@ -7949,19 +7962,19 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _TimeoutThenFinishedWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-timeout-preserve", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-timeout-preserve", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="timed out waiting for FTE query"):
@@ -8001,7 +8014,7 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
 
         def get_result_sync(self):
             self.get_result_sync_calls += 1
-            return duckdb.ray_cxx.RayTaskResult.no_output()
+            return vane.ray_cxx.RayTaskResult.no_output()
 
         def release_result_payload(self):
             return None
@@ -8047,19 +8060,19 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
         def abort_shutdown(self):
             return None
 
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     worker = _SlowResultWorkerHandle()
     monkeypatch.setattr(
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-drain-timeout", worker, 1.0, 0.0, 1024)
+            vane.ray_cxx.RayWorkerRuntime("worker-drain-timeout", worker, 1.0, 0.0, 1024)
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    manager = duckdb.ray_cxx.RayWorkerManager()
+    manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
         with pytest.raises(Exception, match="timed out draining FTE result handles"):
@@ -8077,7 +8090,7 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
 
 
 def test_worker_manager_close_session_attempts_every_worker_before_retry(monkeypatch):
-    import duckdb.runners.ray.worker_handle as ray_worker_handle
+    import vane.runners.ray.worker_handle as ray_worker_handle
 
     calls = []
 
@@ -8106,13 +8119,13 @@ def test_worker_manager_close_session_attempts_every_worker_before_retry(monkeyp
         ray_worker_handle,
         "start_ray_workers",
         lambda _existing_ids, _manager_instance_id: [
-            duckdb.ray_cxx.RayWorkerRuntime("worker-a", first, 1.0, 0.0, 1024),
-            duckdb.ray_cxx.RayWorkerRuntime("worker-b", second, 1.0, 0.0, 1024),
+            vane.ray_cxx.RayWorkerRuntime("worker-a", first, 1.0, 0.0, 1024),
+            vane.ray_cxx.RayWorkerRuntime("worker-b", second, 1.0, 0.0, 1024),
         ],
     )
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     try:
         runner.warm_up()
         with pytest.raises(Exception, match="planned close failure on worker-a"):
@@ -8471,7 +8484,7 @@ def test_failed_attach_cleanup_skips_detach_for_actor_init_failure():
 
 
 def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     created = []
 
@@ -8505,7 +8518,7 @@ def test_ray_runner_creates_one_driver_client_for_concurrent_sessions(monkeypatc
 
 
 def test_ray_runner_close_before_session_registration_is_terminal(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     ray_runner = object.__new__(runner_module.RayRunner)
     ray_runner.query_driver_client = None
@@ -8527,7 +8540,7 @@ def test_ray_runner_close_before_session_registration_is_terminal(monkeypatch):
 
 
 def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     closed_clients = []
 
@@ -8560,7 +8573,7 @@ def test_ray_runner_close_is_terminal_and_idempotent(monkeypatch):
 
 
 def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     calls = []
     expected = {
@@ -8587,7 +8600,7 @@ def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
 
 
 def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     target_session_id = "reentrant-session"
     calls = []
@@ -8615,7 +8628,7 @@ def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch
 
 
 def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     target_session_id = "session-a"
     calls = []
@@ -8654,7 +8667,7 @@ def test_connection_close_notification_attempts_every_live_runner(monkeypatch):
 
 
 def test_ray_runner_session_start_and_close_are_serialized(monkeypatch):
-    from duckdb.runners.ray import runner as runner_module
+    from vane.runners.ray import runner as runner_module
 
     client_init_started = threading.Event()
     client_init_release = threading.Event()

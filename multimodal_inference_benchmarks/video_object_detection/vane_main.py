@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import os
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -14,13 +13,6 @@ import numpy as np
 import pyarrow as pa
 from PIL import Image
 from ultralytics import YOLO
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from vane.datasource import read_datasource
-from vane.datasource.video_reader import VideoFrameSource
 from video_kernels import (
     crop_bbox_to_png,
     frames_to_torch_tensor,
@@ -28,6 +20,8 @@ from video_kernels import (
 )
 
 import vane
+from vane.datasource import read_datasource
+from vane.datasource.video_reader import VideoFrameSource
 
 INPUT_PATH = Path(
     os.environ.get(

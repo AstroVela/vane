@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import datetime
 import decimal
 import uuid
 
 import pytest
 
-import duckdb
-from duckdb import InvalidInputException, NotImplementedException
-from duckdb.sqltypes import (
+import vane
+from vane import InvalidInputException, NotImplementedException
+from vane.sqltypes import (
     BIGINT,
     BIT,
     BLOB,
@@ -30,7 +36,7 @@ from duckdb.sqltypes import (
     UUID,
     VARCHAR,
 )
-from duckdb.value.constant import (
+from vane.value.constant import (
     BinaryValue,
     BitValue,
     BlobValue,
@@ -80,7 +86,7 @@ class TestValue:
             (FLOAT, FloatValue(1.8349000215530396), 1.8349000215530396),
             (DOUBLE, DoubleValue(0.23234234234), 0.23234234234),
             (
-                duckdb.decimal_type(12, 8),
+                vane.decimal_type(12, 8),
                 DecimalValue(decimal.Decimal("1234.12345678"), 12, 8),
                 decimal.Decimal("1234.12345678"),
             ),
@@ -108,7 +114,7 @@ class TestValue:
         value_object = item[1]
         expected_value = item[2]
 
-        con = duckdb.connect()
+        con = vane.connect()
         observed_type = con.execute("select typeof(a) from (select $1) tbl(a)", [value_object]).fetchall()[0][0]
         assert observed_type == str(expected_type)
 
@@ -120,8 +126,8 @@ class TestValue:
     def test_float_to_decimal_prevention(self):
         value = DecimalValue(1.2345, 12, 8)
 
-        con = duckdb.connect()
-        with pytest.raises(duckdb.ConversionException, match="Can't losslessly convert"):
+        con = vane.connect()
+        with pytest.raises(vane.ConversionException, match="Can't losslessly convert"):
             con.execute("select $1", [value]).fetchall()
 
     @pytest.mark.parametrize(
@@ -133,9 +139,9 @@ class TestValue:
         ],
     )
     def test_timestamp_sec_not_supported(self, value):
-        con = duckdb.connect()
+        con = vane.connect()
         with pytest.raises(
-            duckdb.NotImplementedException, match=r"Conversion from 'datetime' to type .* is not implemented yet"
+            vane.NotImplementedException, match=r"Conversion from 'datetime' to type .* is not implemented yet"
         ):
             con.execute("select $1", [value]).fetchall()
 
@@ -178,7 +184,7 @@ class TestValue:
     )
     def test_numeric_values(self, target_type, test_value, expected_conversion_success):
         value = Value(test_value, target_type)
-        con = duckdb.connect()
+        con = vane.connect()
 
         def work():
             return con.execute("select typeof(a) from (select $1) tbl(a)", [value]).fetchall()

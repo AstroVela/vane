@@ -16,7 +16,7 @@ import pytest
 
 
 def _pickle_function(fn: Any) -> bytes:
-    from duckdb.pickle import dumps
+    from vane.pickle import dumps
 
     return dumps(fn)
 
@@ -127,8 +127,8 @@ class _FakeRayModule(types.ModuleType):
 def fake_ray(monkeypatch: pytest.MonkeyPatch) -> _FakeRayModule:
     # Load the actor runtime and its runner dependencies against real Ray.
     # The fake only needs to replace Ray while the actor class itself runs.
-    import duckdb.execution.udf_ray_actor_runtime  # noqa: F401
-    from duckdb.runners.ray.ray_env import build_session_runtime_env_vars
+    import vane.execution.udf_ray_actor_runtime  # noqa: F401
+    from vane.runners.ray.ray_env import build_session_runtime_env_vars
 
     module = _FakeRayModule()
     monkeypatch.setitem(sys.modules, "ray", module)
@@ -144,7 +144,7 @@ class _AddOne:
 
 
 def _make_actor(payload: dict[str, Any]):
-    from duckdb.execution.udf_ray_actor_runtime import _actor_class
+    from vane.execution.udf_ray_actor_runtime import _actor_class
 
     actor_cls = _actor_class(max_restarts=0, max_task_retries=0)
     actor = actor_cls()
@@ -229,7 +229,7 @@ def test_actor_rows_mode_reuses_executor_across_calls(fake_ray):
 
 
 def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):
-    from duckdb.runners.ray.query_runtime_protocol import (
+    from vane.runners.ray.query_runtime_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,
         RAY_ACTOR_INDEX_ENV,
         RAY_ACTOR_POOL_NONCE_ENV,
@@ -264,8 +264,8 @@ def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monk
 
 
 def test_reconstructed_actor_reconciles_new_node_before_ref_bundle_materialization(fake_ray, monkeypatch):
-    import duckdb.execution.udf_ray_actor_runtime as actor_runtime
-    from duckdb.runners.ray.query_runtime_protocol import (
+    import vane.execution.udf_ray_actor_runtime as actor_runtime
+    from vane.runners.ray.query_runtime_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,
         RAY_ACTOR_INDEX_ENV,
         RAY_ACTOR_POOL_NONCE_ENV,

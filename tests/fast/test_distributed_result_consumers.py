@@ -11,16 +11,16 @@ from collections.abc import Iterator
 import pyarrow as pa
 import pytest
 
-import duckdb
+import vane
 
 
 class _FakeRayRunner:
     def __init__(self, tables: list[pa.Table]) -> None:
         self.tables = tables
-        self.calls: list[duckdb.DuckDBPyRelation] = []
+        self.calls: list[vane.DuckDBPyRelation] = []
         self.closed_iterators = 0
 
-    def run_iter_tables(self, relation: duckdb.DuckDBPyRelation) -> Iterator[pa.Table]:
+    def run_iter_tables(self, relation: vane.DuckDBPyRelation) -> Iterator[pa.Table]:
         self.calls.append(relation)
         try:
             yield from self.tables
@@ -30,7 +30,7 @@ class _FakeRayRunner:
 
 def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) -> list[tuple[object, bool]]:
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    runners = types.ModuleType("duckdb.runners")
+    runners = types.ModuleType("vane.runners")
     factory_calls: list[tuple[object, bool]] = []
 
     def set_runner_ray(address=None, noop_if_initialized=False):
@@ -38,12 +38,12 @@ def _install_fake_ray_runner(monkeypatch: pytest.MonkeyPatch, runner: object) ->
         return runner
 
     runners.set_runner_ray = set_runner_ray
-    monkeypatch.setitem(sys.modules, "duckdb.runners", runners)
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
     return factory_calls
 
 
-def _two_column_relation() -> duckdb.DuckDBPyRelation:
-    return duckdb.connect().sql("SELECT 999::BIGINT AS value, 'local'::VARCHAR AS label")
+def _two_column_relation() -> vane.DuckDBPyRelation:
+    return vane.connect().sql("SELECT 999::BIGINT AS value, 'local'::VARCHAR AS label")
 
 
 def _two_column_tables() -> list[pa.Table]:
@@ -67,7 +67,7 @@ def _assert_typed_empty_bulk_result(result, consumer: str) -> None:
 @pytest.mark.parametrize("consumer", ["fetchdf", "fetchnumpy"])
 def test_local_bulk_result_preserves_schema_after_row_cursor_exhaustion(monkeypatch, consumer):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
     assert relation.fetchmany(2) == [(1,)]
 
@@ -78,7 +78,7 @@ def test_local_bulk_result_preserves_schema_after_row_cursor_exhaustion(monkeypa
 def test_distributed_bulk_result_preserves_schema_after_row_cursor_exhaustion(monkeypatch, consumer):
     runner = _FakeRayRunner([pa.table({"c0": pa.array([1], pa.int64())})])
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT 999::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 999::BIGINT AS value")
 
     assert relation.fetchmany(2) == [(1,)]
 
@@ -163,14 +163,14 @@ def test_distributed_result_reports_midstream_runner_error(monkeypatch):
 
     runner = _MidstreamFailRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
-    with pytest.raises(duckdb.InvalidInputException, match="runner failed after first partition"):
+    with pytest.raises(vane.InvalidInputException, match="runner failed after first partition"):
         relation.fetchall()
 
     assert runner.closed_iterators == 1
 
-    with pytest.raises(duckdb.InvalidInputException, match="runner failed after first partition"):
+    with pytest.raises(vane.InvalidInputException, match="runner failed after first partition"):
         relation.fetchall()
 
     assert runner.closed_iterators == 1
@@ -241,7 +241,7 @@ def test_distributed_tensor_consumers_receive_numpy_results(monkeypatch, consume
     framework = types.ModuleType(module_name)
     setattr(framework, converter_name, lambda array: array.tolist())
     monkeypatch.setitem(sys.modules, module_name, framework)
-    relation = duckdb.connect().sql("SELECT 999::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 999::BIGINT AS value")
 
     assert getattr(relation, consumer)() == {"value": [1, 2, 3]}
     assert len(runner.calls) == 1
@@ -292,7 +292,7 @@ def test_distributed_df_chunks_preserve_cursor_state(monkeypatch):
     assert len(runner.calls) == 1
 
     relation.close()
-    with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+    with pytest.raises(vane.InvalidInputException, match="result closed"):
         relation.fetch_df_chunk()
 
 
@@ -314,7 +314,7 @@ def test_distributed_arrow_table_and_reader_stream_partitions(monkeypatch):
 @pytest.mark.parametrize("consumer", ["to_arrow_reader", "to_arrow_table"])
 def test_local_arrow_consumers_reject_zero_batch_size_without_consuming_result(monkeypatch, consumer):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.execute("SELECT 1::BIGINT AS value")
 
     with pytest.raises(RuntimeError, match="Approximate Batch Size of Record Batch MUST be higher than 0"):
@@ -326,7 +326,7 @@ def test_local_arrow_consumers_reject_zero_batch_size_without_consuming_result(m
 @pytest.mark.parametrize("consumer", ["to_arrow_reader", "to_arrow_table"])
 def test_fresh_local_relation_arrow_consumers_reject_zero_batch_size_without_consuming_result(monkeypatch, consumer):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
     with pytest.raises(RuntimeError, match="Approximate Batch Size of Record Batch MUST be higher than 0"):
         getattr(relation, consumer)(batch_size=0)
@@ -368,7 +368,7 @@ def test_distributed_result_rejects_switching_cursor_modes(monkeypatch):
     relation = _two_column_relation()
 
     assert relation.fetchone() == (1, "one")
-    with pytest.raises(duckdb.InvalidInputException, match="partially consumed row result"):
+    with pytest.raises(vane.InvalidInputException, match="partially consumed row result"):
         relation.to_arrow_table()
 
 
@@ -377,7 +377,7 @@ def test_distributed_result_preserves_duplicate_names(monkeypatch):
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS a, 2::BIGINT AS a")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS a, 2::BIGINT AS a")
     result = relation.to_arrow_table()
 
     assert result.schema.names == ["a", "a"]
@@ -389,10 +389,10 @@ def test_distributed_empty_result_keeps_schema(monkeypatch):
     runner = _FakeRayRunner([])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    row_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
+    row_relation = vane.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
     assert row_relation.fetchall() == []
 
-    arrow_relation = duckdb.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
+    arrow_relation = vane.connect().sql("SELECT NULL::VARCHAR AS name WHERE FALSE")
     result = arrow_relation.to_arrow_table()
     assert result.schema.names == ["name"]
     assert result.schema.types == [pa.string()]
@@ -402,18 +402,18 @@ def test_distributed_empty_result_keeps_schema(monkeypatch):
 def test_distributed_result_rejects_partition_schema_mismatch(monkeypatch):
     runner = _FakeRayRunner([pa.table({"c0": ["wrong type"]})])
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
-    with pytest.raises(duckdb.InvalidInputException, match="has Arrow type string, expected int64"):
+    with pytest.raises(vane.InvalidInputException, match="has Arrow type string, expected int64"):
         relation.fetchall()
 
 
 def test_distributed_result_rejects_safe_but_noncanonical_partition_type(monkeypatch):
     runner = _FakeRayRunner([pa.table({"c0": pa.array([1], pa.int32())})])
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
-    with pytest.raises(duckdb.InvalidInputException, match="has Arrow type int32, expected int64"):
+    with pytest.raises(vane.InvalidInputException, match="has Arrow type int32, expected int64"):
         relation.fetchall()
 
 
@@ -434,10 +434,10 @@ def test_distributed_result_rejects_lossy_types_before_starting_runner(monkeypat
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
 
     with pytest.raises(
-        duckdb.NotImplementedException,
+        vane.NotImplementedException,
         match="cannot preserve result type.*arrow_lossless_conversion",
     ):
-        duckdb.connect().sql(query).fetchall()
+        vane.connect().sql(query).fetchall()
 
     assert factory_calls == []
     assert runner.calls == []
@@ -470,7 +470,7 @@ def test_distributed_result_accepts_lossless_arrow_extension_types(
     monkeypatch, partition_query, relation_query, expected
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.execute("SET arrow_lossless_conversion = true")
     table = connection.sql(partition_query).to_arrow_table()
 
@@ -516,14 +516,14 @@ def test_distributed_result_normalizes_nested_lossless_arrow_extension_storage(
     monkeypatch, partition_query, relation_query, expected
 ):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    producer = duckdb.connect()
+    producer = vane.connect()
     producer.execute("SET arrow_lossless_conversion = true")
     producer.execute("SET arrow_large_buffer_size = true")
     table = producer.sql(partition_query).to_arrow_table()
 
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
-    consumer = duckdb.connect()
+    consumer = vane.connect()
     consumer.execute("SET arrow_lossless_conversion = true")
 
     assert consumer.sql(relation_query).fetchone() == (expected,)
@@ -532,7 +532,7 @@ def test_distributed_result_normalizes_nested_lossless_arrow_extension_storage(
 
 def test_distributed_result_normalizes_sliced_sparse_union_children(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    producer = duckdb.connect()
+    producer = vane.connect()
     producer.execute("SET arrow_large_buffer_size = true")
     table = producer.sql("""
         SELECT
@@ -548,21 +548,21 @@ def test_distributed_result_normalizes_sliced_sparse_union_children(monkeypatch)
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    relation = duckdb.connect().sql("SELECT NULL::UNION(s VARCHAR, i BIGINT) AS value")
+    relation = vane.connect().sql("SELECT NULL::UNION(s VARCHAR, i BIGINT) AS value")
     assert relation.fetchall() == [(1,), ("ray-2",), (3,), ("ray-4",)]
     assert len(runner.calls) == 1
 
 
 def test_distributed_result_normalizes_timestamp_timezone_metadata(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    producer = duckdb.connect()
+    producer = vane.connect()
     producer.execute("SET TimeZone = 'UTC'")
     table = producer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS c0").to_arrow_table()
     assert table.schema.field(0).type.tz == "UTC"
 
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
-    consumer = duckdb.connect()
+    consumer = vane.connect()
     consumer.execute("SET TimeZone = 'America/New_York'")
 
     value = consumer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS value").fetchone()[0]
@@ -572,16 +572,16 @@ def test_distributed_result_normalizes_timestamp_timezone_metadata(monkeypatch):
 
 def test_distributed_result_does_not_reinterpret_naive_timestamp_as_timestamp_timezone(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    table = duckdb.connect().sql("SELECT TIMESTAMP '2024-01-01 12:00:00' AS c0").to_arrow_table()
+    table = vane.connect().sql("SELECT TIMESTAMP '2024-01-01 12:00:00' AS c0").to_arrow_table()
 
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
-    consumer = duckdb.connect()
+    consumer = vane.connect()
     consumer.execute("SET TimeZone = 'America/New_York'")
 
     relation = consumer.sql("SELECT TIMESTAMPTZ '2024-01-01 12:00:00+00' AS value")
     with pytest.raises(
-        duckdb.InvalidInputException,
+        vane.InvalidInputException,
         match=r"has Arrow type timestamp\[us\], expected timestamp\[us, tz=America/New_York\]",
     ):
         relation.fetchall()
@@ -596,13 +596,13 @@ def test_distributed_result_does_not_reinterpret_naive_timestamp_as_timestamp_ti
     ],
 )
 def test_distributed_result_rejects_untransportable_types_before_starting_runner_even_when_lossless(monkeypatch, query):
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.execute("SET arrow_lossless_conversion = true")
     runner = _FakeRayRunner([])
     factory_calls = _install_fake_ray_runner(monkeypatch, runner)
 
     with pytest.raises(
-        duckdb.NotImplementedException,
+        vane.NotImplementedException,
         match="cannot preserve result type.*Arrow transport",
     ):
         connection.sql(query).fetchall()
@@ -648,7 +648,7 @@ def test_distributed_result_normalizes_arrow_offset_widths(monkeypatch, query, t
     runner = _FakeRayRunner([table])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    assert duckdb.connect().sql(query).fetchall() == expected
+    assert vane.connect().sql(query).fetchall() == expected
 
 
 def test_distributed_partition_error_is_terminal_and_closes_iterator(monkeypatch):
@@ -659,14 +659,14 @@ def test_distributed_partition_error_is_terminal_and_closes_iterator(monkeypatch
         ]
     )
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT 1::BIGINT AS value")
+    relation = vane.connect().sql("SELECT 1::BIGINT AS value")
 
-    with pytest.raises(duckdb.InvalidInputException, match="has Arrow type string, expected int64"):
+    with pytest.raises(vane.InvalidInputException, match="has Arrow type string, expected int64"):
         relation.fetchall()
 
     assert runner.closed_iterators == 1
 
-    with pytest.raises(duckdb.InvalidInputException, match="has Arrow type string, expected int64"):
+    with pytest.raises(vane.InvalidInputException, match="has Arrow type string, expected int64"):
         relation.fetchall()
 
     assert runner.closed_iterators == 1
@@ -684,7 +684,7 @@ def test_distributed_runner_error_does_not_fall_back_to_local(monkeypatch):
 
     runner = _UnsupportedPlanRunner()
     _install_fake_ray_runner(monkeypatch, runner)
-    relation = duckdb.connect().sql("SELECT source_id FROM pragma_version()")
+    relation = vane.connect().sql("SELECT source_id FROM pragma_version()")
 
     with pytest.raises(NotImplementedError, match="unsupported distributed plan"):
         relation.fetchone()
@@ -701,7 +701,7 @@ def test_distributed_result_close_closes_runner_iterator(monkeypatch):
     relation.close()
 
     assert runner.closed_iterators == 1
-    with pytest.raises(duckdb.InvalidInputException, match="result closed"):
+    with pytest.raises(vane.InvalidInputException, match="result closed"):
         relation.fetchall()
 
 
@@ -750,7 +750,7 @@ def test_distributed_repr_uses_common_result_source(monkeypatch):
     runner = _FakeRayRunner([pa.table({"c0": pa.array([41, 42], pa.int64())})])
     _install_fake_ray_runner(monkeypatch, runner)
 
-    output = repr(duckdb.connect().sql("SELECT 999::BIGINT AS value"))
+    output = repr(vane.connect().sql("SELECT 999::BIGINT AS value"))
 
     assert "41" in output
     assert "42" in output

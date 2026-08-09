@@ -8,15 +8,14 @@ import uuid
 
 import pytest
 
-import duckdb
 import vane
-from duckdb import runners as _runners
+from vane import runners as _runners
 
 
 def _table_from_native_result(result):
     pa = pytest.importorskip("pyarrow")
 
-    assert isinstance(result, duckdb.ray_cxx.NativeDistributedTaskResult)
+    assert isinstance(result, vane.ray_cxx.NativeDistributedTaskResult)
     payloads = list(result.partition_payloads)
     assert payloads
     if len(payloads) == 1:
@@ -25,19 +24,19 @@ def _table_from_native_result(result):
 
 
 def _round_trip_to_fresh_physical_plan(relation):
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     serialized = pickle.dumps(logical)
     restored = pickle.loads(serialized)
-    target = duckdb.connect()
+    target = vane.connect()
     return target, restored.to_physical_plan(target), serialized
 
 
 def _execute_fresh_physical_plan(target, physical):
-    from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
     pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
     try:
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
         result = runner.execute_native(target.cursor(), physical, None, None)
         return _table_from_native_result(result)
     finally:
@@ -46,7 +45,7 @@ def _execute_fresh_physical_plan(target, physical):
 
 
 def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
-    source = duckdb.connect()
+    source = vane.connect()
     target = None
     try:
         left = source.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
@@ -65,7 +64,7 @@ def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connect
 
 
 def test_repartition_projection_survives_logical_plan_pickle_to_fresh_connection():
-    source = duckdb.connect()
+    source = vane.connect()
     target = None
     try:
         relation = (
@@ -134,7 +133,7 @@ def test_physical_udf_deserialize_rejects_corrupt_metadata(monkeypatch, corrupti
         return_dtype="INTEGER",
     )
     relation = source.sql("SELECT physical_payload_version_sql(1::INTEGER) AS value")
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     physical = logical.to_physical_plan(source)
 
     monkeypatch.setenv("VANE_ENABLE_UDF_TEST_HOOKS", "1")
@@ -143,7 +142,7 @@ def test_physical_udf_deserialize_rejects_corrupt_metadata(monkeypatch, corrupti
     monkeypatch.delenv("VANE_TEST_CORRUPT_UDF_PHYSICAL_PAYLOAD")
 
     restored = pickle.loads(serialized)
-    target = duckdb.connect()
+    target = vane.connect()
     with pytest.raises(Exception, match=error):
         restored.clone(target)
 
@@ -292,15 +291,15 @@ def test_attached_vane_cls_batch_alias_survives_logical_plan_pickle_to_fresh_con
 
 
 def _reset_udf_executor_counters():
-    import _duckdb
+    from vane import _native
 
-    _duckdb._reset_udf_executor_debug_counters()
+    _native._reset_udf_executor_debug_counters()
 
 
 def _udf_executor_counters():
-    import _duckdb
+    from vane import _native
 
-    return dict(_duckdb._udf_executor_debug_counters())
+    return dict(_native._udf_executor_debug_counters())
 
 
 def _assert_no_udf_direct_output_conversion():
@@ -316,7 +315,7 @@ def test_execute_native_rejects_ray_scalar_without_registered_query_resource_gra
 
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
-    con = duckdb.connect()
+    con = vane.connect()
     parquet_path = tmp_path / "udf_input.parquet"
     con.execute(
         f"""
@@ -339,15 +338,15 @@ def test_execute_native_rejects_ray_scalar_without_registered_query_resource_gra
             ORDER BY a
             """
         )
-        .map(plus_one, return_type=duckdb.sqltype("INTEGER"), execution_backend="ray_task")
+        .map(plus_one, return_type=vane.sqltype("INTEGER"), execution_backend="ray_task")
         .project("a, value AS out")
     )
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with pytest.raises(ValueError, match="requires query_id"):
         runner.execute_native(con.cursor(), plan, None, None)
     del runner, plan, relation
@@ -358,11 +357,11 @@ def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
     pytest.importorskip("pyarrow")
     import pyarrow as pa
 
-    import duckdb.execution.udf_subprocess as subprocess_exec
+    import vane.execution.udf_subprocess as subprocess_exec
 
     subprocess_exec._shutdown_global_task_runtime()
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.execute("SET threads=2")
     parquet_path = tmp_path / "subprocess_udf_admission_input.parquet"
     con.execute(
@@ -387,17 +386,17 @@ def test_execute_native_subprocess_udf_reports_admission_task_stats(tmp_path):
             """
         ).map_batches(
             double_values,
-            schema={"x": duckdb.sqltype("INTEGER")},
+            schema={"x": vane.sqltype("INTEGER")},
             execution_backend="subprocess_task",
             batch_size=1,
         )
-        plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             str(uuid.uuid4()),
         ).to_physical_plan(con)
 
         _reset_udf_executor_counters()
-        runner = duckdb.ray_cxx.DistributedPhysicalPlanRunner()
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
         result = runner.execute_native(con.cursor(), plan, None, None)
         table = _table_from_native_result(result)
         stats = result.task_stats
@@ -423,7 +422,7 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
 
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
-    con = duckdb.connect()
+    con = vane.connect()
     parquet_path = tmp_path / "table_udf_pickled_input.parquet"
     con.execute(
         f"""
@@ -447,7 +446,7 @@ def test_ray_runner_replays_map_batches_udf_via_task_plan_pickle(tmp_path, monke
         """
     ).map_batches(
         double_values,
-        schema={"x": duckdb.sqltype("INTEGER")},
+        schema={"x": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     )
@@ -469,7 +468,7 @@ def test_map_batches_ray_task_rejects_direct_execution_without_query_resource_gr
 
     monkeypatch.setenv("RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0")
 
-    con = duckdb.connect()
+    con = vane.connect()
     parquet_path = tmp_path / "table_udf_direct_input.parquet"
     con.execute(
         f"""
@@ -493,7 +492,7 @@ def test_map_batches_ray_task_rejects_direct_execution_without_query_resource_gr
         """
     ).map_batches(
         double_values,
-        schema={"x": duckdb.sqltype("INTEGER")},
+        schema={"x": vane.sqltype("INTEGER")},
         execution_backend="ray_task",
         batch_size=64,
     )

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -14,10 +13,6 @@ import pyarrow as pa
 import torch
 from PIL import Image
 from torchvision.models import ResNet18_Weights, resnet18
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 import vane
 

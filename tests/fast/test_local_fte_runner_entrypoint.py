@@ -10,8 +10,8 @@ import sys
 def test_set_runner_local_entrypoint_in_subprocess():
     script = """
 import os
-import duckdb.runners as runners
-from duckdb.runners.local import LocalRunner
+import vane.runners as runners
+from vane.runners.local import LocalRunner
 
 os.environ.pop("VANE_RUNNER", None)
 runner = runners.set_runner_local(num_workers=1, max_running_tasks=1)
@@ -31,10 +31,34 @@ else:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_root_set_runner_local_configures_the_execution_mode_in_subprocess():
+    script = """
+import os
+import vane
+import vane.runners as runners
+from typing import Any, get_type_hints
+from vane.runners.local import set_runner_local as set_runner_local_from_package
+from vane.runners.ray import set_runner_ray as set_runner_ray_from_package
+from vane.runners.runner import Runner
+
+os.environ.pop("VANE_RUNNER", None)
+runner = vane.set_runner_local(num_workers=1, max_running_tasks=1)
+assert runner.name == "local"
+assert os.environ["VANE_RUNNER"] == "local"
+assert vane.sql("SELECT 42").fetchall() == [(42,)]
+assert get_type_hints(vane.set_runner_local)["return"] is Any
+assert get_type_hints(vane.set_runner_ray)["return"] is Any
+assert get_type_hints(runners.get_or_create_runner)["return"] is Runner
+assert get_type_hints(set_runner_local_from_package)["return"] is Runner
+assert get_type_hints(set_runner_ray_from_package)["return"] is Runner
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 def test_get_or_create_runner_accepts_local_env_in_subprocess():
     script = """
 import os
-import duckdb.runners as runners
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "local"
 runner = runners.get_or_create_runner()
@@ -47,13 +71,13 @@ assert runners.get_or_infer_runner_type() == "local"
 def test_get_or_create_runner_rejects_native_fte_env_in_subprocess():
     script = """
 import os
-import duckdb
-import duckdb.runners as runners
+import vane
+import vane.runners as runners
 
 os.environ["VANE_RUNNER"] = "native-fte"
 try:
     runners.get_or_create_runner()
-except duckdb.InvalidInputException as exc:
+except vane.InvalidInputException as exc:
     assert "Please use 'local' or 'ray'" in str(exc)
 else:
     raise AssertionError("native-fte should no longer be a public runner")
@@ -62,15 +86,15 @@ else:
 
 
 def test_local_runner_preloads_arrow_dataset_imports():
-    from duckdb.runners.local.runner import _preload_arrow_dataset_imports
+    from vane.runners.local.runner import _preload_arrow_dataset_imports
 
     _preload_arrow_dataset_imports()
     _preload_arrow_dataset_imports()
 
 
 def test_local_runner_rejects_unknown_native_copy_outcome():
-    from duckdb.runners import CopyOutcomeUnknownError
-    from duckdb.runners.local.runner import _require_known_copy_outcome
+    from vane.runners import CopyOutcomeUnknownError
+    from vane.runners.local.runner import _require_known_copy_outcome
 
     result = {
         "copy_output_committed": False,
@@ -93,8 +117,8 @@ def test_local_runner_rejects_unknown_native_copy_outcome():
 
 
 def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
-    from duckdb.runners import CopyOutcomeUnknownError
-    from duckdb.runners.local.runner import _record_unknown_copy_cleanup_errors
+    from vane.runners import CopyOutcomeUnknownError
+    from vane.runners.local.runner import _record_unknown_copy_cleanup_errors
 
     error = CopyOutcomeUnknownError(
         "local-copy",
@@ -120,8 +144,8 @@ def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
 
 
 def test_local_runner_rejects_invalid_num_workers():
-    from duckdb.runners.local import _normalize_num_workers
-    from duckdb.runners.local.runner import _normalize_num_workers as normalize_runner
+    from vane.runners.local import _normalize_num_workers
+    from vane.runners.local.runner import _normalize_num_workers as normalize_runner
 
     for normalize in (_normalize_num_workers, normalize_runner):
         for value in (0, -1, 1.5, True, "2"):
@@ -138,18 +162,18 @@ def test_local_runner_smoke_writes_parquet_in_subprocess():
 import pathlib
 import tempfile
 
-import duckdb
-from duckdb.runners.local import set_runner_local
+import vane
+from vane.runners.local import set_runner_local
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 src = tmp / "input.parquet"
 dst = tmp / "output.parquet"
 
-setup_conn = duckdb.connect()
+setup_conn = vane.connect()
 setup_conn.execute(f"COPY (SELECT i::integer as x FROM range(3) tbl(i)) TO '{src}' (FORMAT PARQUET)")
 
 set_runner_local(num_workers=1, max_running_tasks=1)
-conn = duckdb.connect()
+conn = vane.connect()
 conn.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
 assert dst.exists()
@@ -163,20 +187,20 @@ def test_local_runner_repartition_write_uses_local_exchange_node_in_subprocess()
 import pathlib
 import tempfile
 
-import duckdb
-from duckdb.runners.local import set_runner_local
+import vane
+from vane.runners.local import set_runner_local
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 src = tmp / "input.parquet"
 dst = tmp / "output.parquet"
 
-setup_conn = duckdb.connect()
+setup_conn = vane.connect()
 setup_conn.execute(
     f"COPY (SELECT i::integer as x, (i % 3)::integer as k FROM range(20) tbl(i)) TO '{src}' (FORMAT PARQUET)"
 )
 
 set_runner_local(num_workers=1, max_running_tasks=1)
-conn = duckdb.connect()
+conn = vane.connect()
 conn.read_parquet(str(src)).repartition(4).write_parquet(str(dst))
 
 rows = conn.sql(f"select count(*), sum(x) from read_parquet('{dst}')").fetchone()
@@ -186,7 +210,7 @@ assert rows == (20, 190)
 
 
 def test_local_runner_collects_udf_actor_shutdown_errors_after_attempting_every_pool():
-    from duckdb.runners.local.runner import _shutdown_udf_actor_pools
+    from vane.runners.local.runner import _shutdown_udf_actor_pools
 
     calls = []
 
@@ -217,7 +241,7 @@ def test_local_runner_collects_udf_actor_shutdown_errors_after_attempting_every_
 
 
 def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
-    from duckdb.runners.local.runner import _shutdown_local_write_resources
+    from vane.runners.local.runner import _shutdown_local_write_resources
 
     events = []
     backend_timeouts = []
@@ -273,7 +297,7 @@ def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
 
 
 def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
-    from duckdb.runners.local.runner import _shutdown_local_write_resources
+    from vane.runners.local.runner import _shutdown_local_write_resources
 
     events = []
 
@@ -315,7 +339,7 @@ def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
 
 
 def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
-    from duckdb.runners.local.runner import _shutdown_local_write_resources
+    from vane.runners.local.runner import _shutdown_local_write_resources
 
     events = []
 

@@ -12,7 +12,7 @@ try:
 except Exception:
     ray = None
 
-import duckdb
+import vane
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -24,15 +24,15 @@ def test_ray_plan_serialization_core():
     values_list = [f"({i}, {i * 10})" for i in range(n)]
     values_clause = ", ".join(values_list)
     sql = f"SELECT * FROM (VALUES {values_clause}) AS t(a, b)"
-    df = duckdb.sql(sql)
+    df = vane.sql(sql)
 
-    # duckdb.sql(...) returns a DuckDB relation
+    # vane.sql(...) returns a DuckDB relation
     rel = df
 
     # Create PyLogicalPlan (this triggers LogicalPlan serialization)
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(rel, "test-e2e-query")
 
     assert plan.idx() == "test-e2e-query"
@@ -47,7 +47,7 @@ def test_ray_plan_serialization_core():
     # Test unpickling in same process
     restored_plan = pickle.loads(serialized)
     assert restored_plan.idx() == "test-e2e-query"
-    conn = duckdb.connect()
+    conn = vane.connect()
     restored_dist_plan = restored_plan.to_physical_plan(conn)
     assert restored_dist_plan.num_partitions() >= 1
 
@@ -55,10 +55,10 @@ def test_ray_plan_serialization_core():
     @ray.remote
     def verify_plan_in_worker(plan):
         """Verify plan can be received and accessed in Ray worker."""
-        import duckdb
+        import vane
 
         assert plan.idx() == "test-e2e-query"
-        conn = duckdb.connect()
+        conn = vane.connect()
         dist_plan = plan.to_physical_plan(conn)
         assert dist_plan.num_partitions() >= 1
         return {"success": True, "idx": plan.idx(), "num_partitions": dist_plan.num_partitions()}
@@ -78,7 +78,7 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
     import pyarrow as pa
 
     input_path = tmp_path / "ray_serialization_execution.parquet"
-    connection = duckdb.connect()
+    connection = vane.connect()
     connection.execute(
         f"""
         COPY (
@@ -89,7 +89,7 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
     )
     relation = connection.sql(f"SELECT value, scaled FROM read_parquet('{input_path}') WHERE value % 2 = 0")
 
-    from duckdb import runners
+    from vane import runners
 
     runners.set_runner_ray(noop_if_initialized=True)
     runner = runners.get_or_create_runner()

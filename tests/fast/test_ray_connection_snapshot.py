@@ -6,13 +6,13 @@ import pickle
 
 import pytest
 
-import duckdb
+import vane
 
 
 def _require_ray_cxx():
-    ray_cxx = getattr(duckdb, "ray_cxx", None)
+    ray_cxx = getattr(vane, "ray_cxx", None)
     if ray_cxx is None or not hasattr(ray_cxx, "PyLogicalPlan"):
-        pytest.skip("duckdb.ray_cxx.PyLogicalPlan not available in this environment")
+        pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     return ray_cxx
 
 
@@ -30,11 +30,11 @@ def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
     ray_cxx = _require_ray_cxx()
 
     monkeypatch.setenv("AWS_REVIEW_SESSION_SECRET_75", "session-a-secret")
-    connection_a = duckdb.connect()
+    connection_a = vane.connect()
     cursor_a = connection_a.cursor()
 
     monkeypatch.delenv("AWS_REVIEW_SESSION_SECRET_75")
-    connection_b = duckdb.connect()
+    connection_b = vane.connect()
 
     plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection_a.sql("SELECT 1"), "session-a")
     cursor_plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(cursor_a.sql("SELECT 1"), "session-a-cursor")
@@ -46,7 +46,7 @@ def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
     assert plan_a.session_config()["AWS_REVIEW_SESSION_SECRET_75"] == "session-a-secret"
     assert "AWS_REVIEW_SESSION_SECRET_75" not in plan_b.session_config()
 
-    restored_plan = pickle.loads(pickle.dumps(plan_a.to_physical_plan(duckdb.connect())))
+    restored_plan = pickle.loads(pickle.dumps(plan_a.to_physical_plan(vane.connect())))
     assert restored_plan.session_id() == plan_a.session_id()
     assert restored_plan.session_config() == plan_a.session_config()
 
@@ -55,18 +55,18 @@ def test_vllm_named_actor_pool_identity_includes_connection_session():
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     ray_cxx = _require_ray_cxx()
-    connection_a = duckdb.connect()
-    connection_b = duckdb.connect()
+    connection_a = vane.connect()
+    connection_b = vane.connect()
     query_id = "reused-query-id"
     options = _build_native_vllm_options_argument({"use_ray": True})
 
     def build_relation(connection):
         source = connection.sql("SELECT 'hello' AS prompt")
-        generated = duckdb.FunctionExpression(
+        generated = vane.FunctionExpression(
             "vllm",
-            duckdb.ColumnExpression("prompt"),
-            duckdb.ConstantExpression("test-model"),
-            duckdb.ConstantExpression(options),
+            vane.ColumnExpression("prompt"),
+            vane.ConstantExpression("test-model"),
+            vane.ConstantExpression(options),
         ).alias("generated")
         return source.select(generated)
 
@@ -90,7 +90,7 @@ def test_vllm_named_actor_pool_identity_includes_connection_session():
 
 
 def test_datasource_relation_retains_connection_scoped_vane_session(monkeypatch):
-    from duckdb.datasource import DataSource, DataSourceTask, read_datasource
+    from vane.datasource import DataSource, DataSourceTask, read_datasource
 
     ray_cxx = _require_ray_cxx()
 
@@ -107,7 +107,7 @@ def test_datasource_relation_retains_connection_scoped_vane_session(monkeypatch)
             return iter((SnapshotTask(),))
 
     monkeypatch.setenv("AWS_DATASOURCE_SESSION_SECRET_75", "datasource-secret")
-    connection = duckdb.connect()
+    connection = vane.connect()
     relation = read_datasource(SnapshotSource(), con=connection)
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "datasource-session")
 
@@ -121,18 +121,18 @@ def test_session_aws_settings_replay_only_on_the_target_connection_context(monke
     monkeypatch.setenv("AWS_ENDPOINT_URL", "http://minio-a.internal:9000")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "session-a-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "session-a-secret")
-    connection_a = duckdb.connect()
+    connection_a = vane.connect()
     plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection_a.sql("SELECT 1"), "session-a-settings")
 
     monkeypatch.setenv("AWS_ENDPOINT_URL", "https://minio-b.internal:9443")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "session-b-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "session-b-secret")
-    connection_b = duckdb.connect()
+    connection_b = vane.connect()
     plan_b = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection_b.sql("SELECT 1"), "session-b-settings")
 
     for key in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.delenv(key)
-    target_root = duckdb.connect()
+    target_root = vane.connect()
     target_a = target_root.cursor()
     target_b = target_root.cursor()
 
@@ -152,11 +152,11 @@ def test_cursor_plan_marks_owning_connection_session_for_close(monkeypatch):
     closed_session_ids = []
     monkeypatch.setenv("VANE_RUNNER", "ray")
     monkeypatch.setattr(
-        "duckdb.runners.ray.runner.notify_connection_closed",
+        "vane.runners.ray.runner.notify_connection_closed",
         closed_session_ids.append,
     )
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     cursor = connection.cursor()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(cursor.sql("SELECT 1"), "cursor-session-close")
     session_id = plan.session_id()
@@ -173,11 +173,11 @@ def test_cursor_keeps_vane_session_alive_after_root_connection_is_collected(monk
     closed_session_ids = []
     monkeypatch.setenv("VANE_RUNNER", "ray")
     monkeypatch.setattr(
-        "duckdb.runners.ray.runner.notify_connection_closed",
+        "vane.runners.ray.runner.notify_connection_closed",
         closed_session_ids.append,
     )
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     cursor = connection.cursor()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(cursor.sql("SELECT 1"), "cursor-session-gc")
     session_id = plan.session_id()
@@ -201,11 +201,11 @@ def test_connection_close_notification_failure_remains_retryable(monkeypatch):
             raise RuntimeError("planned session close notification failure")
 
     monkeypatch.setattr(
-        "duckdb.runners.ray.runner.notify_connection_closed",
+        "vane.runners.ray.runner.notify_connection_closed",
         _notify,
     )
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "session-close-retry")
     session_id = plan.session_id()
 
@@ -221,11 +221,11 @@ def test_local_plan_snapshot_does_not_open_a_ray_session(monkeypatch):
     closed_session_ids = []
     monkeypatch.setenv("VANE_RUNNER", "local")
     monkeypatch.setattr(
-        "duckdb.runners.ray.runner.notify_connection_closed",
+        "vane.runners.ray.runner.notify_connection_closed",
         closed_session_ids.append,
     )
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "local-session")
 
     assert plan.session_id()
@@ -250,16 +250,16 @@ def test_plan_snapshot_uses_configured_runner_for_session_lifecycle(
     closed_session_ids = []
     monkeypatch.setenv("VANE_RUNNER", environment_runner)
     monkeypatch.setattr(
-        duckdb.vane_runners_cpp,
+        vane._native,
         "get_or_infer_runner_type",
         lambda: configured_runner,
     )
     monkeypatch.setattr(
-        "duckdb.runners.ray.runner.notify_connection_closed",
+        "vane.runners.ray.runner.notify_connection_closed",
         closed_session_ids.append,
     )
 
-    connection = duckdb.connect()
+    connection = vane.connect()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "configured-runner-session")
     session_id = plan.session_id()
 
@@ -270,7 +270,7 @@ def test_plan_snapshot_uses_configured_runner_for_session_lifecycle(
 
 def test_deserialized_plan_rejects_missing_session_config():
     ray_cxx = _require_ray_cxx()
-    connection = duckdb.connect()
+    connection = vane.connect()
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "missing-session-config")
     state = list(plan.__getstate__())
     state[3] = {"vane_session": {"id": plan.session_id()}}
@@ -282,7 +282,7 @@ def test_deserialized_plan_rejects_missing_session_config():
 
 def test_plan_pickles_reject_pre_session_state_shapes():
     ray_cxx = _require_ray_cxx()
-    connection = duckdb.connect()
+    connection = vane.connect()
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), "strict-session-state")
     logical_state = logical_plan.__getstate__()
     malformed_logical = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
@@ -290,7 +290,7 @@ def test_plan_pickles_reject_pre_session_state_shapes():
     with pytest.raises(Exception, match="Invalid state for PyLogicalPlan"):
         malformed_logical.__setstate__(logical_state[:3])
 
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     physical_state = physical_plan.__getstate__()
     malformed_physical = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
 
@@ -308,18 +308,18 @@ def test_physical_plan_replay_state_has_query_lifecycle(monkeypatch):
     query_id = "query-replay-lifecycle"
 
     monkeypatch.setenv("AWS_QUERY_REPLAY_SECRET", "session-a")
-    connection_a = duckdb.connect()
+    connection_a = vane.connect()
     plan_a = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         connection_a.sql("SELECT 1"),
         "plan-replay-source-a",
-    ).to_physical_plan(duckdb.connect())
+    ).to_physical_plan(vane.connect())
 
     monkeypatch.setenv("AWS_QUERY_REPLAY_SECRET", "session-b")
-    connection_b = duckdb.connect()
+    connection_b = vane.connect()
     plan_b = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         connection_b.sql("SELECT 1"),
         "plan-replay-source-b",
-    ).to_physical_plan(duckdb.connect())
+    ).to_physical_plan(vane.connect())
 
     restored_plan_a = pickle.loads(pickle.dumps(plan_a))
     assert restored_plan_a.idx() != query_id
@@ -344,11 +344,11 @@ def test_physical_plan_replay_state_has_query_lifecycle(monkeypatch):
 
 def test_query_replay_state_rejects_different_python_runtime_fields():
     ray_cxx = _require_ray_cxx()
-    connection = duckdb.connect()
+    connection = vane.connect()
     source_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         connection.sql("SELECT 1"),
         "plan-replay-runtime-fields",
-    ).to_physical_plan(duckdb.connect())
+    ).to_physical_plan(vane.connect())
     source_state = list(source_plan.__getstate__())
 
     def plan_with(*, registrations, actor_handles):
@@ -383,14 +383,14 @@ def test_query_replay_state_rejects_different_python_runtime_fields():
 def test_logical_plan_replays_connection_snapshot_on_to_physical_plan():
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("SET threads=3")
     source_conn.execute("SET TimeZone='UTC'")
     relation = source_conn.sql("SELECT * FROM (VALUES (1), (2), (3)) AS t(a)")
 
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "snapshot-to-physical")
 
-    target_conn = duckdb.connect()
+    target_conn = vane.connect()
     assert target_conn.execute("SELECT current_setting('threads')").fetchone()[0] != 3
     assert target_conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
 
@@ -403,16 +403,16 @@ def test_logical_plan_replays_connection_snapshot_on_to_physical_plan():
 def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("SET threads=3")
     source_conn.execute("SET TimeZone='UTC'")
     relation = source_conn.sql("SELECT * FROM (VALUES (1), (2), (3)) AS t(a)")
 
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "snapshot-execute-native")
-    physical_plan = plan.to_physical_plan(duckdb.connect())
+    physical_plan = plan.to_physical_plan(vane.connect())
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
 
-    worker_cursor = duckdb.connect().cursor()
+    worker_cursor = vane.connect().cursor()
     assert worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0] != 3
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
 
@@ -427,12 +427,12 @@ def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
 def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_path):
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_conn.sql("SELECT 1"),
         "snapshot-missing-extension",
     )
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     state = list(physical_plan.__getstate__())
     snapshot = dict(state[6])
     snapshot["extensions"] = ["sqlite_scanner"]
@@ -442,7 +442,7 @@ def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_pa
     replay_plan.__setstate__(tuple(state))
 
     extension_directory = tmp_path / "extensions"
-    worker_connection = duckdb.connect(
+    worker_connection = vane.connect(
         config={
             "autoinstall_known_extensions": "false",
             "autoload_known_extensions": "false",
@@ -467,12 +467,12 @@ def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_pa
 def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_conn.sql("SELECT 1"),
         "snapshot-bootstrap-extension-security",
     )
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     state = list(physical_plan.__getstate__())
     snapshot = dict(state[6])
     extension_directory = tmp_path / "bootstrap-extensions"
@@ -496,7 +496,7 @@ def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
 
     with pytest.raises(Exception) as exc_info:
         ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-            duckdb.connect().cursor(),
+            vane.connect().cursor(),
             replay_plan,
         )
 
@@ -510,7 +510,7 @@ def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
 def test_snapshot_bootstrap_applies_static_extension_settings_after_connect(tmp_path):
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_conn.sql(
             """
@@ -545,10 +545,10 @@ def test_snapshot_bootstrap_applies_static_extension_settings_after_connect(tmp_
 
     replay_logical_plan = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
     replay_logical_plan.__setstate__(tuple(state))
-    physical_plan = replay_logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = replay_logical_plan.to_physical_plan(vane.connect())
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        duckdb.connect().cursor(),
+        vane.connect().cursor(),
         restored_plan,
     )
 
@@ -579,14 +579,14 @@ def test_snapshot_replay_keeps_extension_security_settings_disabled():
         ORDER BY name
     """
 
-    source_connection = duckdb.connect()
+    source_connection = vane.connect()
     for name in snapshot_setting_names:
         source_connection.execute(f"SET {name} = true")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_connection.sql("SELECT 1"),
         "snapshot-extension-security-settings",
     )
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     state = list(physical_plan.__getstate__())
     snapshot = dict(state[6])
     captured_setting_names = {setting["name"].lower() for setting in snapshot["settings"]}
@@ -599,7 +599,7 @@ def test_snapshot_replay_keeps_extension_security_settings_disabled():
     replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
     replay_plan.__setstate__(tuple(state))
 
-    worker_connection = duckdb.connect(config={name: "true" for name in setting_names})
+    worker_connection = vane.connect(config={name: "true" for name in setting_names})
     assert dict(worker_connection.execute(settings_query).fetchall()) == {name: "true" for name in setting_names}
 
     ray_cxx.DistributedPhysicalPlanRunner().execute_native(
@@ -613,13 +613,13 @@ def test_snapshot_replay_keeps_extension_security_settings_disabled():
 def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot():
     ray_cxx = _require_ray_cxx()
 
-    source_conn = duckdb.connect(config={"custom_user_agent": "snapshot-test"})
+    source_conn = vane.connect(config={"custom_user_agent": "snapshot-test"})
     source_conn.execute("SET TimeZone='UTC'")
     relation = source_conn.sql(
         "SELECT current_setting('custom_user_agent') AS user_agent, current_setting('TimeZone') AS timezone"
     )
 
-    target_conn = duckdb.connect()
+    target_conn = vane.connect()
     assert target_conn.execute("SELECT current_setting('custom_user_agent')").fetchone()[0] == ""
     assert target_conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
 
@@ -627,7 +627,7 @@ def test_pickled_physical_plan_replays_bootstrap_and_runtime_connection_snapshot
     physical_plan = plan.to_physical_plan(target_conn)
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
 
-    worker_cursor = duckdb.connect().cursor()
+    worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, restored_plan)
     table = _table_from_native_result(result)
 
@@ -649,7 +649,7 @@ def test_logical_plan_capture_planning_and_execution_preserve_file_database_secu
         WHERE name IN ({", ".join(repr(name) for name in setting_names)})
         ORDER BY name
     """
-    source_conn = duckdb.connect(
+    source_conn = vane.connect(
         database_path,
         config={name: "true" for name in setting_names},
     )
@@ -663,7 +663,7 @@ def test_logical_plan_capture_planning_and_execution_preserve_file_database_secu
     assert logical_plan.idx() == "file-security-setting"
     assert source_settings == {name: "true" for name in setting_names}
 
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
 
     assert physical_plan.idx() == "file-security-setting"
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
@@ -673,7 +673,7 @@ def test_logical_plan_capture_planning_and_execution_preserve_file_database_secu
     del physical_plan
     gc.collect()
 
-    worker_conn = duckdb.connect(config={name: "true" for name in setting_names})
+    worker_conn = vane.connect(config={name: "true" for name in setting_names})
     assert dict(worker_conn.execute(settings_query).fetchall()) == {name: "true" for name in setting_names}
 
     restored_result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
@@ -687,18 +687,18 @@ def test_logical_plan_capture_planning_and_execution_preserve_file_database_secu
 def test_file_database_table_scan_reopens_bootstrap_on_worker(tmp_path):
     ray_cxx = _require_ray_cxx()
     database_path = str(tmp_path / "table-scan-bootstrap.duckdb")
-    source_conn = duckdb.connect(database_path)
+    source_conn = vane.connect(database_path)
     source_conn.execute("CREATE TABLE numbers AS SELECT i AS value FROM range(10) data(i)")
 
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_conn.sql("SELECT sum(value) AS total FROM numbers"),
         "snapshot-file-table-scan",
     )
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
 
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        duckdb.connect().cursor(),
+        vane.connect().cursor(),
         restored_plan,
     )
 
@@ -708,7 +708,7 @@ def test_file_database_table_scan_reopens_bootstrap_on_worker(tmp_path):
 def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_path):
     ray_cxx = _require_ray_cxx()
     database_path = str(tmp_path / "session-bootstrap.duckdb")
-    source_conn = duckdb.connect(database_path)
+    source_conn = vane.connect(database_path)
     source_conn.execute("LOAD httpfs")
     source_conn.execute("SET GLOBAL s3_access_key_id='database-key'")
     source_conn.execute("SET GLOBAL s3_secret_access_key='database-secret'")
@@ -738,12 +738,12 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
     }
 
     physical_plan = logical_plan.to_physical_plan(
-        duckdb.connect(),
+        vane.connect(),
         effective_session_config=effective_config,
     )
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        duckdb.connect().cursor(),
+        vane.connect().cursor(),
         restored_plan,
         effective_session_config=effective_config,
     )
@@ -759,8 +759,8 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
 def test_file_database_snapshot_baseline_ignores_database_target_settings(tmp_path):
     ray_cxx = _require_ray_cxx()
     database_path = str(tmp_path / "read-only-bootstrap.duckdb")
-    duckdb.connect(database_path).close()
-    source_conn = duckdb.connect(database_path, config={"access_mode": "READ_ONLY"})
+    vane.connect(database_path).close()
+    source_conn = vane.connect(database_path, config={"access_mode": "READ_ONLY"})
 
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
         source_conn.sql("SELECT 1 AS value"),
@@ -769,9 +769,9 @@ def test_file_database_snapshot_baseline_ignores_database_target_settings(tmp_pa
     snapshot_setting_names = {setting["name"].lower() for setting in logical_plan.__getstate__()[3]["settings"]}
 
     assert snapshot_setting_names.isdisjoint({"access_mode", "temp_directory"})
-    physical_plan = logical_plan.to_physical_plan(duckdb.connect())
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        duckdb.connect().cursor(),
+        vane.connect().cursor(),
         physical_plan,
     )
     assert _table_from_native_result(result).column(0).to_pylist() == [1]
@@ -779,7 +779,7 @@ def test_file_database_snapshot_baseline_ignores_database_target_settings(tmp_pa
 
 def test_explicit_connection_s3_settings_override_effective_session_config():
     ray_cxx = _require_ray_cxx()
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     source_conn.execute("SET s3_access_key_id='explicit-key'")
     source_conn.execute("SET s3_secret_access_key='explicit-secret'")
@@ -800,7 +800,7 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
         "AWS_SESSION_TOKEN": "environment-token",
     }
 
-    planning_conn = duckdb.connect()
+    planning_conn = vane.connect()
     physical_plan = logical_plan.to_physical_plan(
         planning_conn,
         effective_session_config=effective_config,
@@ -809,7 +809,7 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
 
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
-    worker_cursor = duckdb.connect().cursor()
+    worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
         worker_cursor,
         restored_plan,
@@ -826,7 +826,7 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
 
 def test_connection_snapshot_requires_both_explicit_s3_credential_settings():
     ray_cxx = _require_ray_cxx()
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     source_conn.execute("SET s3_access_key_id='explicit-key'")
 
@@ -854,7 +854,7 @@ def test_connection_snapshot_rejects_explicit_s3_key_pair_with_one_empty_value(
     secret_key,
 ):
     ray_cxx = _require_ray_cxx()
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     source_conn.execute(f"SET s3_access_key_id='{access_key}'")
     source_conn.execute(f"SET s3_secret_access_key='{secret_key}'")
@@ -873,7 +873,7 @@ def test_connection_snapshot_rejects_explicit_s3_key_pair_with_one_empty_value(
 
 def test_connection_snapshot_rejects_explicit_s3_session_token_without_key_pair():
     ray_cxx = _require_ray_cxx()
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     source_conn.execute("SET s3_session_token='explicit-token'")
 
@@ -891,7 +891,7 @@ def test_connection_snapshot_rejects_explicit_s3_session_token_without_key_pair(
 
 def test_connection_snapshot_recognizes_explicit_empty_s3_credentials():
     ray_cxx = _require_ray_cxx()
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     source_conn.execute("SET s3_access_key_id=''")
     source_conn.execute("SET s3_secret_access_key=''")
@@ -910,7 +910,7 @@ def test_effective_session_config_overrides_stale_captured_environment(monkeypat
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "stale-secret")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "stale-token")
 
-    source_conn = duckdb.connect()
+    source_conn = vane.connect()
     source_conn.execute("LOAD httpfs")
     relation = source_conn.sql(
         "SELECT current_setting('s3_access_key_id') AS access_key, "
@@ -927,7 +927,7 @@ def test_effective_session_config_overrides_stale_captured_environment(monkeypat
         "AWS_SESSION_TOKEN": "refreshed-token",
     }
 
-    planning_conn = duckdb.connect()
+    planning_conn = vane.connect()
     physical_plan = logical_plan.to_physical_plan(
         planning_conn,
         effective_session_config=effective_config,
@@ -935,7 +935,7 @@ def test_effective_session_config_overrides_stale_captured_environment(monkeypat
     assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "refreshed-key"
 
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
-    worker_cursor = duckdb.connect().cursor()
+    worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
         worker_cursor,
         restored_plan,

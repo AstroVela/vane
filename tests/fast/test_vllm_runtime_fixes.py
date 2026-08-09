@@ -54,8 +54,8 @@ def _packed_native_vllm_secret_options():
 
 
 def test_native_vllm_options_without_secrets_use_the_versioned_envelope():
-    from duckdb.execution.vllm import normalize_options
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
+    from vane.execution.vllm import normalize_options
 
     packed = _build_native_vllm_options_argument({"batch_size": 4})
 
@@ -71,7 +71,7 @@ def test_native_vllm_options_without_secrets_use_the_versioned_envelope():
 
 
 def test_native_vllm_struct_wire_rejects_legacy_naked_options():
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match="versioned envelope"):
         normalize_options({"batch_size": 4})
@@ -82,7 +82,7 @@ def test_native_vllm_struct_wire_rejects_legacy_naked_options():
 
 
 def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     monkeypatch.delenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", raising=False)
     assert vllm._vllm_control_rpc_timeout_s() == 30.0
@@ -101,7 +101,7 @@ def test_vllm_control_rpc_timeout_is_configurable(monkeypatch):
 
 @pytest.mark.parametrize("configured", ["not-a-number", "0", "-1", "nan", "inf"])
 def test_vllm_control_rpc_timeout_falls_back_for_invalid_values(monkeypatch, configured):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     monkeypatch.setenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", configured)
     assert vllm._vllm_control_rpc_timeout_s() == 30.0
@@ -129,14 +129,14 @@ def test_vllm_control_rpc_timeout_falls_back_for_invalid_values(monkeypatch, con
     ],
 )
 def test_vllm_numeric_options_are_strict(options, message):
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=message):
         normalize_options(_native_vllm_envelope(json.dumps(options, default=float)))
 
 
 def test_vllm_fractional_gpu_option_is_preserved():
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     assert normalize_options(_packed_native_vllm_options({"gpus_per_actor": 0.25}))["gpus_per_actor"] == pytest.approx(
         0.25
@@ -144,7 +144,7 @@ def test_vllm_fractional_gpu_option_is_preserved():
 
 
 def test_vllm_decimal_options_are_normalized_to_floats():
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     normalized = normalize_options(
         _native_vllm_envelope(
@@ -178,7 +178,7 @@ def test_vllm_decimal_options_are_normalized_to_floats():
     ],
 )
 def test_vllm_execution_boolean_options_are_strict(name):
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=rf"vllm {name} must be a boolean"):
         normalize_options(_packed_native_vllm_options({name: "false"}))
@@ -187,14 +187,14 @@ def test_vllm_execution_boolean_options_are_strict(name):
 
 
 def test_vllm_unknown_top_level_options_are_rejected():
-    from duckdb.execution.vllm import normalize_options
+    from vane.execution.vllm import normalize_options
 
     with pytest.raises(ValueError, match=r"unknown vllm option.*gpus_per_actorr"):
         normalize_options(_packed_native_vllm_options({"gpus_per_actorr": 0.25}))
 
 
 def test_vllm_opaque_secrets_restore_only_when_local_executor_is_created(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     packed = _packed_native_vllm_secret_options()
     assert isinstance(packed, dict)
@@ -224,7 +224,7 @@ def test_vllm_opaque_secrets_restore_only_when_local_executor_is_created(monkeyp
 
 
 def test_vllm_opaque_secrets_restore_on_driver_before_named_pool_creation(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     packed = _packed_native_vllm_secret_options()
     assert isinstance(packed, dict)
@@ -280,7 +280,7 @@ def test_vllm_opaque_secrets_restore_on_driver_before_named_pool_creation(monkey
     ],
 )
 def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, message):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     public_options = {
         "engine_args": {
@@ -299,7 +299,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
 
 
 def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
     from vane.ai.providers.vllm import NativeVLLMPromptPlan
 
     fake_vllm = types.ModuleType("vllm")
@@ -328,7 +328,7 @@ def test_native_descriptor_forces_background_loop_inside_ray_actor(monkeypatch):
 
 
 def test_native_executor_materializes_structured_outputs_params(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     fake_vllm = types.ModuleType("vllm")
     fake_sampling_params = types.ModuleType("vllm.sampling_params")
@@ -371,7 +371,7 @@ def test_native_executor_materializes_structured_outputs_params(monkeypatch):
 
 
 def test_ray_actor_releases_only_terminal_per_executor_state():
-    from duckdb.execution.vllm import RayLocalVLLMExecutor
+    from vane.execution.vllm import RayLocalVLLMExecutor
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
@@ -409,7 +409,7 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
 
 
 def test_ray_actor_batches_ready_results_to_standard_vector_size():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     vector_size = vllm.DUCKDB_STANDARD_VECTOR_SIZE
     source_rows = pa.table({"id": range(vector_size + 3)})
@@ -448,7 +448,7 @@ def test_ray_actor_batches_ready_results_to_standard_vector_size():
 
 
 def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity():
-    from duckdb.execution.vllm import RayLocalVLLMExecutor
+    from vane.execution.vllm import RayLocalVLLMExecutor
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
@@ -505,7 +505,7 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
 
 
 def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
-    from duckdb.execution.vllm import RayLocalVLLMExecutor
+    from vane.execution.vllm import RayLocalVLLMExecutor
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
@@ -550,7 +550,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
     executor.llm = None
@@ -589,7 +589,7 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
 
 
 def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
-    from duckdb.execution.vllm import RayLocalVLLMExecutor
+    from vane.execution.vllm import RayLocalVLLMExecutor
 
     abort_started = asyncio.Event()
     allow_abort = asyncio.Event()
@@ -662,7 +662,7 @@ def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
 
 
 def test_prefix_router_serializes_global_reservations_and_releases_exactly_once():
-    from duckdb.execution.vllm import PrefixRouter
+    from vane.execution.vllm import PrefixRouter
 
     router = PrefixRouter([object(), object()], load_balance_threshold=0)
     executor_ids = [f"executor-{index}" for index in range(32)]
@@ -693,7 +693,7 @@ def test_prefix_router_serializes_global_reservations_and_releases_exactly_once(
 
 
 def test_prefix_router_keeps_affinity_until_load_threshold_is_exceeded():
-    from duckdb.execution.vllm import PrefixRouter
+    from vane.execution.vllm import PrefixRouter
 
     router = PrefixRouter([object(), object()], load_balance_threshold=1)
     router.report_start("executor")
@@ -789,7 +789,7 @@ class _FakeVLLMActor:
 
 
 def test_remote_reservation_rpc_does_not_block_submit_and_serializes_shutdown(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     complete_entered = threading.Event()
     allow_complete = threading.Event()
@@ -866,7 +866,7 @@ def test_remote_reservation_rpc_does_not_block_submit_and_serializes_shutdown(mo
 
 
 def test_remote_executor_uses_router_reservation_and_one_shot_wakeup(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     actors = [_FakeVLLMActor(), _FakeVLLMActor()]
     router = vllm.PrefixRouter(actors, load_balance_threshold=32)
@@ -910,7 +910,7 @@ def test_remote_executor_uses_router_reservation_and_one_shot_wakeup(monkeypatch
 
 
 def test_remote_executor_consumes_multi_reservation_actor_batch_in_one_rpc(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     actor = _FakeVLLMActor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -952,7 +952,7 @@ def test_remote_executor_consumes_multi_reservation_actor_batch_in_one_rpc(monke
 
 
 def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     actor = _FakeVLLMActor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -979,7 +979,7 @@ def test_remote_executor_rejects_actor_result_without_reservation_id(monkeypatch
 
 
 def test_remote_executor_rejects_legacy_named_pool_actor_result(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     actor = _FakeVLLMActor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -1009,7 +1009,7 @@ def test_remote_executor_rejects_legacy_named_pool_actor_result(monkeypatch):
 
 
 def test_remote_executor_validates_batch_reservations_before_completion(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     actor = _FakeVLLMActor()
     router = vllm.PrefixRouter([actor], load_balance_threshold=0)
@@ -1045,7 +1045,7 @@ def test_remote_executor_validates_batch_reservations_before_completion(monkeypa
 
 
 def test_remote_success_shutdown_retries_terminal_cleanup_without_warning(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class Actor(_FakeVLLMActor):
         def __init__(self):
@@ -1100,7 +1100,7 @@ def test_remote_success_shutdown_retries_terminal_cleanup_without_warning(monkey
 
 
 def test_remote_success_warns_after_final_cleanup_attempt_fails(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class Actor(_FakeVLLMActor):
         def __init__(self):
@@ -1151,7 +1151,7 @@ def test_remote_success_warns_after_final_cleanup_attempt_fails(monkeypatch):
 
 
 def test_remote_cleanup_does_not_retry_terminal_rpcs_after_owned_pool_is_killed(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class Actor(_FakeVLLMActor):
         @staticmethod
@@ -1182,7 +1182,7 @@ def test_remote_cleanup_does_not_retry_terminal_rpcs_after_owned_pool_is_killed(
 
 
 def test_remote_executor_rearms_wait_for_already_buffered_actor_result(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class ReadyAwareActor(_FakeVLLMActor):
         def _wait(self, executor_id, wait_token):
@@ -1221,7 +1221,7 @@ def test_remote_executor_rearms_wait_for_already_buffered_actor_result(monkeypat
 
 
 def test_remote_executor_acknowledges_submissions_before_finishing_actor(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     events = []
 
@@ -1270,7 +1270,7 @@ def test_remote_executor_acknowledges_submissions_before_finishing_actor(monkeyp
 
 
 def test_remote_executor_consumes_all_submit_acks_before_aborting(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     events = []
 
@@ -1332,7 +1332,7 @@ def test_remote_executor_consumes_all_submit_acks_before_aborting(monkeypatch):
 
 
 def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class LostRouteAckRef(_Ref):
         def resolve(self):
@@ -1386,7 +1386,7 @@ def test_remote_executor_terminalizes_after_both_route_ack_attempts_fail(monkeyp
     ],
 )
 def test_remote_executor_terminalizes_and_reconciles_malformed_route_decision(monkeypatch, override):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class MalformedRouteMethod:
         def __init__(self, router):
@@ -1425,7 +1425,7 @@ def test_remote_executor_terminalizes_and_reconciles_malformed_route_decision(mo
 
 
 def test_pending_submit_acknowledgements_each_use_full_control_timeout(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     first_ref = object()
     second_ref = object()
@@ -1457,7 +1457,7 @@ def test_pending_submit_acknowledgements_each_use_full_control_timeout(monkeypat
 
 
 def test_remote_executor_reports_router_completion_when_actor_finish_ack_fails_once(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     class Actor(_FakeVLLMActor):
         def __init__(self):
@@ -1493,7 +1493,7 @@ def test_remote_executor_reports_router_completion_when_actor_finish_ack_fails_o
 
 
 def test_remote_shutdown_ignores_expired_query_deadline_for_control_rpcs(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
     monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
@@ -1530,7 +1530,7 @@ def test_remote_shutdown_ignores_expired_query_deadline_for_control_rpcs(monkeyp
 
 
 def test_remote_wait_marks_finished_after_releasing_result_condition():
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     executor = vllm.RemoteVLLMExecutor.__new__(vllm.RemoteVLLMExecutor)
     executor._error_message = None
@@ -1564,7 +1564,7 @@ def test_remote_wait_marks_finished_after_releasing_result_condition():
 
 
 def test_remote_ref_cleanup_does_not_initialize_ray(monkeypatch):
-    import duckdb.execution.vllm as vllm
+    import vane.execution.vllm as vllm
 
     calls = []
     fake_ray = types.ModuleType("ray")

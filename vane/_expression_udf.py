@@ -16,12 +16,11 @@ from numbers import Real
 from types import CodeType
 from typing import Any, Protocol
 
-import _duckdb
-
-import duckdb
-from duckdb.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+import vane
+from vane import _native
 from vane._expressions import as_expression, is_expression
 from vane.config import current_config
+from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 
 
 class _PythonFunction(Protocol):
@@ -34,16 +33,16 @@ class _PythonFunction(Protocol):
     def __get__(self, instance: Any, owner: Any | None = None) -> _PythonFunction: ...
 
 
-def _invalid_input(message: str) -> duckdb.InvalidInputException:
-    return duckdb.InvalidInputException(message)
+def _invalid_input(message: str) -> vane.InvalidInputException:
+    return vane.InvalidInputException(message)
 
 
-def _unsupported_dtype(dtype: Any) -> duckdb.InvalidInputException:
+def _unsupported_dtype(dtype: Any) -> vane.InvalidInputException:
     return _invalid_input(f"dtype {str(dtype)!r} is not supported for expression UDF output")
 
 
 def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
-    import pyarrow as pa
+    import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     primitive_types = (
         (pa.types.is_boolean, "BOOLEAN"),
@@ -63,23 +62,23 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
     )
     for predicate, duckdb_name in primitive_types:
         if predicate(dtype):
-            return duckdb.sqltype(duckdb_name)
+            return vane.sqltype(duckdb_name)
 
     if pa.types.is_decimal128(dtype):
-        return duckdb.sqltype(f"DECIMAL({dtype.precision},{dtype.scale})")
+        return vane.sqltype(f"DECIMAL({dtype.precision},{dtype.scale})")
     if pa.types.is_list(dtype):
         child_type = _arrow_to_duckdb_type(dtype.value_type, original=original)
-        return duckdb.list_type(child_type)
+        return vane.list_type(child_type)
     if pa.types.is_fixed_size_list(dtype):
         child_type = _arrow_to_duckdb_type(dtype.value_type, original=original)
-        return duckdb.array_type(child_type, dtype.list_size)
+        return vane.array_type(child_type, dtype.list_size)
     if pa.types.is_struct(dtype):
         field_names = [field.name for field in dtype]
         if len(field_names) != len({name.casefold() for name in field_names}):
             raise _invalid_input(
                 f"dtype {str(original)!r} is not supported; Struct field names must be unique case-insensitively"
             )
-        return duckdb.struct_type({field.name: _arrow_to_duckdb_type(field.type, original=original) for field in dtype})
+        return vane.struct_type({field.name: _arrow_to_duckdb_type(field.type, original=original) for field in dtype})
     if pa.types.is_timestamp(dtype):
         if dtype.tz is not None:
             raise _invalid_input(
@@ -93,7 +92,7 @@ def _arrow_to_duckdb_type(dtype: Any, *, original: Any) -> Any:
             "ns": "TIMESTAMP_NS",
         }
         try:
-            return duckdb.sqltype(timestamp_types[dtype.unit])
+            return vane.sqltype(timestamp_types[dtype.unit])
         except KeyError as exc:
             raise _unsupported_dtype(original) from exc
     raise _unsupported_dtype(original)
@@ -159,8 +158,8 @@ def _canonicalize_dtype(dtype: Any) -> tuple[Any, Any]:
     if isinstance(dtype, str):
         if not dtype.strip():
             raise _invalid_input("dtype must not be empty")
-        duckdb_type = duckdb.sqltype(dtype)
-    elif isinstance(dtype, duckdb.sqltypes.DuckDBPyType):
+        duckdb_type = vane.sqltype(dtype)
+    elif isinstance(dtype, vane.sqltypes.DuckDBPyType):
         duckdb_type = dtype
     else:
         raise _invalid_input(
@@ -256,7 +255,7 @@ def _call_or_build_expression(
     *,
     has_expression: bool,
     call_immediately: Callable[[], Any],
-    build_expression: Callable[[], duckdb.Expression],
+    build_expression: Callable[[], vane.Expression],
 ) -> Any:
     if has_expression:
         return build_expression()
@@ -455,10 +454,10 @@ def _build_batch_function_adapter(
     return batch_adapter
 
 
-def _expand_batch_expression(expression: duckdb.Expression, *, unnest: bool) -> duckdb.Expression:
+def _expand_batch_expression(expression: vane.Expression, *, unnest: bool) -> vane.Expression:
     if not unnest:
         return expression
-    return duckdb.FunctionExpression("unnest", expression)
+    return vane.FunctionExpression("unnest", expression)
 
 
 def _build_map_expression(
@@ -467,7 +466,7 @@ def _build_map_expression(
     return_dtype: Any,
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
-) -> duckdb.Expression:
+) -> vane.Expression:
     if _has_expression(kwargs.values()):
         raise _invalid_input(
             "Expression keyword arguments are not supported for vane.func; pass UDF input expressions positionally"
@@ -477,7 +476,7 @@ def _build_map_expression(
 
     bound_fn = _bind_literal_kwargs(fn, kwargs)
     expr_args = tuple(as_expression(arg) for arg in args)
-    return _duckdb._VaneUDFMapExpression(
+    return _native._VaneUDFMapExpression(
         bound_fn,
         name,
         _duckdb_type(return_dtype),
@@ -892,7 +891,7 @@ class VaneBatchFunction:
             build_expression=lambda: self._build_expression(args, kwargs),
         )
 
-    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> duckdb.Expression:
+    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> vane.Expression:
         layout = _batch_call_layout(
             self.signature,
             args,
@@ -1033,7 +1032,7 @@ class VaneClassInstance:
             build_expression=lambda: self._build_expression(args, kwargs),
         )
 
-    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> duckdb.Expression:
+    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> vane.Expression:
         if _has_expression(kwargs.values()):
             raise _invalid_input(
                 "Expression keyword arguments are not supported for vane.cls; pass UDF input expressions positionally"
@@ -1210,7 +1209,7 @@ class VaneClassBatchInstance:
             build_expression=lambda: self._build_expression(args, kwargs),
         )
 
-    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> duckdb.Expression:
+    def _build_expression(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> vane.Expression:
         layout = _batch_call_layout(
             self.signature,
             args,
@@ -1262,8 +1261,8 @@ def _normalize_sql_type_list(parameters: Any) -> list[Any] | None:
         if isinstance(parameter, pa.DataType):
             normalized.append(_canonicalize_dtype(parameter)[0])
         elif isinstance(parameter, str):
-            normalized.append(duckdb.sqltype(parameter))
-        elif isinstance(parameter, duckdb.sqltypes.DuckDBPyType):
+            normalized.append(vane.sqltype(parameter))
+        elif isinstance(parameter, vane.sqltypes.DuckDBPyType):
             normalized.append(parameter)
         else:
             raise _invalid_input(
@@ -1328,10 +1327,10 @@ def _normalize_input_mapping(inputs: Mapping[str, Any]) -> dict[str, Any]:
     return {str(name): value for name, value in inputs.items()}
 
 
-def _normalize_inputs(inputs: Mapping[str, Any]) -> tuple[list[str], tuple[duckdb.Expression, ...]]:
+def _normalize_inputs(inputs: Mapping[str, Any]) -> tuple[list[str], tuple[vane.Expression, ...]]:
     normalized = _normalize_input_mapping(inputs)
     names: list[str] = []
-    exprs: list[duckdb.Expression] = []
+    exprs: list[vane.Expression] = []
     for name, value in normalized.items():
         names.append(name)
         exprs.append(as_expression(value))
@@ -1350,11 +1349,11 @@ def _build_map_batches_expression(
     execution_backend: str | None = None,
     actor_number: int | None = None,
     stateful: bool = False,
-) -> duckdb.Expression:
+) -> vane.Expression:
     input_names, exprs = _normalize_inputs(inputs)
     normalized_schema = _normalize_schema(schema)
     resolved_backend = _runner_to_task_backend() if execution_backend is None else execution_backend
-    return _duckdb._VaneUDFMapBatchesExpression(
+    return _native._VaneUDFMapBatchesExpression(
         fn,
         _resolve_udf_name(name, lambda: _callable_name(fn)),
         normalized_schema,
@@ -1381,7 +1380,7 @@ def _build_actor_map_batches_expression(
     actor_number: int,
     gpus: float | None,
     stateful: bool = False,
-) -> duckdb.Expression:
+) -> vane.Expression:
     normalized_actor_number = (
         _validate_actor_number(actor_number) if stateful else _validate_positive_actor_number(actor_number)
     )
@@ -1976,12 +1975,12 @@ def attach_function(
         gpus=gpus,
         actor_number=actor_number,
     )
-    conn = connection if connection is not None else duckdb.default_connection()
+    conn = connection if connection is not None else vane.default_connection()
     prepared.apply(conn)
 
 
 def detach_function(alias: str, *, connection: Any | None = None) -> None:
-    conn = connection if connection is not None else duckdb.default_connection()
+    conn = connection if connection is not None else vane.default_connection()
     conn.remove_function(alias)
 
 

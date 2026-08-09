@@ -12,7 +12,6 @@ import pytest
 
 
 def test_expression_helpers_and_vane_func_are_public():
-    import duckdb
     import vane
 
     assert "func" in vane.__all__
@@ -23,9 +22,9 @@ def test_expression_helpers_and_vane_func_are_public():
     assert callable(vane.func)
     assert callable(vane.func.batch)
 
-    assert isinstance(vane.col("x"), duckdb.Expression)
-    assert isinstance(vane.lit(1), duckdb.Expression)
-    assert isinstance(vane.sql_expr("x + 1"), duckdb.Expression)
+    assert isinstance(vane.col("x"), vane.Expression)
+    assert isinstance(vane.lit(1), vane.Expression)
+    assert isinstance(vane.sql_expr("x + 1"), vane.Expression)
 
     con = vane.connect()
     out = con.sql("select 2::INTEGER as x").select((vane.col("x") + vane.lit(3)).alias("y"))
@@ -51,7 +50,6 @@ def test_vane_function_scalar_map_expression_local():
 def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
     import pyarrow as pa
 
-    import duckdb
     import vane
 
     calls_path = tmp_path / "func_struct_calls"
@@ -65,7 +63,7 @@ def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
 
     con = vane.connect()
     relation = con.sql("SELECT 42::BIGINT AS value").select(
-        duckdb.FunctionExpression("unnest", describe(vane.col("value")))
+        vane.FunctionExpression("unnest", describe(vane.col("value")))
     )
 
     assert relation.explain().count("STREAMING_UDF") == 1
@@ -76,7 +74,6 @@ def test_vane_function_struct_unnest_executes_one_logical_call(tmp_path):
 def test_vane_function_separate_struct_calls_have_separate_expression_ids():
     import pyarrow as pa
 
-    import duckdb
     import vane
 
     result_type = pa.struct([pa.field("value", pa.int64())])
@@ -88,8 +85,8 @@ def test_vane_function_separate_struct_calls_have_separate_expression_ids():
     con = vane.connect()
     source = con.sql("SELECT 42::BIGINT AS value")
     relation = source.select(
-        duckdb.FunctionExpression("unnest", wrap(vane.col("value"))),
-        duckdb.FunctionExpression("unnest", wrap(vane.col("value"))),
+        vane.FunctionExpression("unnest", wrap(vane.col("value"))),
+        vane.FunctionExpression("unnest", wrap(vane.col("value"))),
     )
 
     assert relation.explain().count("STREAMING_UDF") == 2
@@ -271,7 +268,7 @@ def test_vane_function_bound_instance_method_allows_literal_keyword_arguments():
 
 def test_vane_function_bound_instance_method_pickle_round_trip():
     import vane
-    from duckdb.pickle import dumps, loads
+    from vane.pickle import dumps, loads
 
     class Scaler:
         def __init__(self, factor: int) -> None:

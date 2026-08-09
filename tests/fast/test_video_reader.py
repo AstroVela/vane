@@ -14,8 +14,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from duckdb.datasource import _schema_to_arrow
-from duckdb.datasource.video_reader import (
+from vane.datasource import _schema_to_arrow
+from vane.datasource.video_reader import (
     LimitedVideoFrameTask,
     VideoFrameSource,
     VideoFrameTask,
@@ -88,7 +88,7 @@ def test_video_s3_reader_uses_default_aws_sdk_chain_and_exact_locator(
     recording_s3_filesystem,
     tmp_path,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     monkeypatch.setattr(
@@ -115,7 +115,7 @@ def test_video_s3_reader_uses_default_aws_sdk_chain_and_exact_locator(
 def test_remote_video_materialization_reads_bounded_chunks_and_cleans_up(monkeypatch, tmp_path):
     import pyarrow.fs as pa_fs
 
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     chunk_bytes = video_reader._REMOTE_VIDEO_READ_CHUNK_BYTES
     object_size = 2 * chunk_bytes + 17
@@ -170,7 +170,7 @@ def test_remote_video_materialization_reads_bounded_chunks_and_cleans_up(monkeyp
 def test_remote_video_materialization_rejects_oversized_stream_and_cleans_up(monkeypatch, tmp_path):
     import pyarrow.fs as pa_fs
 
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     limit = 1024
 
@@ -216,7 +216,7 @@ def test_remote_video_materialization_rejects_oversized_stream_and_cleans_up(mon
 
 
 def test_remote_video_materialization_allows_unknown_size_metadata(monkeypatch, tmp_path):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class UnknownSizeFileInfo:
         size = None
@@ -242,7 +242,7 @@ def test_remote_video_materialization_allows_unknown_size_metadata(monkeypatch, 
 
 @pytest.mark.parametrize("failure_point", ["metadata", "open", "read"])
 def test_remote_video_source_io_errors_are_video_read_errors(monkeypatch, tmp_path, failure_point):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     failure = OSError(f"planned {failure_point} failure")
     temporary_files = []
@@ -297,7 +297,7 @@ def test_remote_video_tempfile_errors_are_not_classified_as_bad_input(
     recording_s3_filesystem,
     tmp_path,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     missing_temp_dir = tmp_path / "missing"
 
@@ -313,7 +313,7 @@ def test_remote_video_tempfile_errors_are_not_classified_as_bad_input(
 
 
 def test_video_source_identity_distinguishes_same_basename_sources(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path_a, source_id_a = _source_identity(video_reader, "s3://bucket-a/train/clip.mp4")
@@ -327,7 +327,7 @@ def test_video_source_identity_distinguishes_same_basename_sources(monkeypatch):
 
 
 def test_video_source_identity_preserves_exact_s3_locator_and_case(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path, source_id = _source_identity(video_reader, "s3://MEDIA-BUCKET/a//../Clip.mp4")
@@ -341,7 +341,7 @@ def test_video_source_identity_preserves_exact_s3_locator_and_case(monkeypatch):
 
 
 def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     decoded_root = tmp_path / "decoded"
     decoded_dir = decoded_root / "nested"
@@ -362,7 +362,7 @@ def test_video_source_identity_resolves_symlink_before_parent_component(tmp_path
 
 
 def test_video_decode_opens_the_resolved_local_source(monkeypatch, tmp_path):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     decoded_root = tmp_path / "decoded"
     decoded_dir = decoded_root / "nested"
@@ -397,7 +397,7 @@ def test_video_decode_opens_the_resolved_local_source(monkeypatch, tmp_path):
 def test_video_read_errors_are_pickle_safe():
     import pickle
 
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     for error_type in (
         video_reader.VideoReadError,
@@ -523,7 +523,7 @@ def test_video_s3_reader_normalizes_endpoint_override(
 
 
 def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
@@ -560,7 +560,7 @@ def test_video_s3_source_identity_is_versioned_and_endpoint_scoped(monkeypatch):
 
 
 def test_video_s3_source_identity_canonicalizes_ipv6_endpoint_literals(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path = "s3://media-bucket/clips/example.mp4"
@@ -578,7 +578,7 @@ def test_video_s3_source_identity_canonicalizes_ipv6_endpoint_literals(monkeypat
 
 
 def test_video_s3_default_source_identity_is_partition_scoped(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path = "s3://shared-name/clips/example.mp4"
@@ -607,7 +607,7 @@ def test_video_s3_profile_region_is_reused_for_identity_and_io(
     recording_s3_filesystem,
     tmp_path,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     config_path = tmp_path / "aws-config"
@@ -634,7 +634,7 @@ def test_video_s3_region_snapshot_is_reused_after_environment_changes(
     monkeypatch,
     recording_s3_filesystem,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     source_path = video_reader._video_source_path("s3://shared-name/clips/example.mp4")
@@ -654,7 +654,7 @@ def test_video_s3_region_snapshot_is_reused_after_environment_changes(
 
 
 def test_video_s3_unknown_default_region_fails_closed(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     monkeypatch.setenv("AWS_REGION", "future-moon-1")
@@ -664,7 +664,7 @@ def test_video_s3_unknown_default_region_fails_closed(monkeypatch):
 
 
 def test_video_s3_source_identity_excludes_credentials_and_request_options(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     path = "s3://media-bucket/clips/example.mp4"
@@ -680,7 +680,7 @@ def test_video_s3_source_identity_excludes_credentials_and_request_options(monke
 
 
 def test_video_s3_endpoint_rejects_embedded_credentials(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
     monkeypatch.setenv("AWS_ENDPOINT_URL", "https://user:secret@objects.example.test")
@@ -720,7 +720,7 @@ def test_max_concurrent_decodes_accepts_positive_integers(configured, expected):
     else:
         env["VANE_MAX_CONCURRENT_DECODES"] = configured
     script = f"""
-import duckdb.datasource.video_reader as video_reader
+import vane.datasource.video_reader as video_reader
 
 assert video_reader._MAX_CONCURRENT_DECODES == {expected}
 for _ in range({expected}):
@@ -737,7 +737,7 @@ def test_max_concurrent_decodes_rejects_invalid_values(configured):
     env["VANE_MAX_CONCURRENT_DECODES"] = configured
 
     result = subprocess.run(
-        [sys.executable, "-c", "import duckdb.datasource.video_reader"],
+        [sys.executable, "-c", "import vane.datasource.video_reader"],
         check=False,
         capture_output=True,
         text=True,
@@ -789,7 +789,7 @@ def test_video_frame_source_manifest_groups_paths_like_ray_read_tasks():
 
 
 def test_video_frame_source_manifest_preserves_exact_s3_locator(monkeypatch, duckdb_cursor):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     source_path = "s3://MEDIA-BUCKET/a//../Clip.mp4"
     source = VideoFrameSource([source_path], height=8, width=8)
@@ -828,7 +828,7 @@ def test_video_source_uses_ray_soft_block_row_boundary():
 
 
 def test_video_source_batch_size_accounts_for_provenance_columns():
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     target_bytes = 1024
     max_source_path_bytes = 100
@@ -877,7 +877,7 @@ def test_video_source_batch_size_accounts_for_provenance_columns():
 
 
 def test_video_source_batch_size_respects_arrow_string_offset_limit():
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     max_source_path_bytes = 1024
     expected_limit = video_reader._ARROW_STRING_DATA_MAX_BYTES // max_source_path_bytes
@@ -899,7 +899,7 @@ def test_video_source_batch_size_respects_arrow_string_offset_limit():
 
 
 def test_video_source_transport_does_not_resplit_ray_soft_block(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     target_bytes = 128 * 1024**2
@@ -934,7 +934,7 @@ def test_video_source_coalesces_file_tails_within_one_read_task():
 
 
 def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         def __init__(self, value):
@@ -976,7 +976,7 @@ def test_video_decode_batches_do_not_mutate_emitted_arrow_buffers(monkeypatch):
 
 
 def test_video_decoder_uses_one_thread_for_bounded_native_buffering(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     calls = []
 
@@ -997,7 +997,7 @@ def test_video_decoder_uses_one_thread_for_bounded_native_buffering(monkeypatch)
 
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])
 def test_video_decoder_open_errors_use_public_source_identity(monkeypatch, error_type):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     failure = error_type("planned decoder open failure")
 
@@ -1023,7 +1023,7 @@ def test_video_decoder_open_errors_use_public_source_identity(monkeypatch, error
 
 
 def test_video_decoder_iteration_wraps_direct_decord_errors(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeDecordError(Exception):
         pass
@@ -1068,7 +1068,7 @@ def test_video_decoder_iteration_wraps_direct_decord_errors(monkeypatch):
 
 
 def test_video_frame_conversion_does_not_wrap_generic_runtime_errors(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     failure = RuntimeError("planned frame conversion invariant failure")
 
@@ -1085,7 +1085,7 @@ def test_video_frame_conversion_does_not_wrap_generic_runtime_errors(monkeypatch
 
 
 def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         shape = (2, 32, 3)
@@ -1117,7 +1117,7 @@ def test_video_decode_aligns_narrow_decord_output_before_exact_resize(monkeypatc
 
 
 def test_video_decode_does_not_advance_reader_past_frame_limit(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         shape = (2, 32, 3)
@@ -1160,7 +1160,7 @@ def test_remote_video_decode_uses_temporary_path_and_preserves_remote_identity(
     recording_s3_filesystem,
     tmp_path,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     _clear_s3_environment(monkeypatch)
 
@@ -1219,7 +1219,7 @@ def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
     recording_s3_filesystem,
     tmp_path,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         def asnumpy(self):
@@ -1263,7 +1263,7 @@ def test_remote_video_decode_cleans_temporary_path_when_consumer_stops_early(
 
 
 def test_video_decode_keeps_raw_resize_window_bounded(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         def __init__(self, value):
@@ -1309,7 +1309,7 @@ def test_video_decode_keeps_raw_resize_window_bounded(monkeypatch):
 
 
 def test_video_decode_rejects_frame_bound_before_opening_decoder(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     def fail_open(*_args, **_kwargs):
         pytest.fail("decoder must not open when its requested frame exceeds the cap")
@@ -1355,8 +1355,8 @@ def test_video_frame_source_schema_declares_typed_frame_not_blob():
 
 
 def test_read_datasource_uses_datasource_udf_relation_hook():
-    import duckdb
-    from duckdb.datasource import DataSource, read_datasource
+    import vane
+    from vane.datasource import DataSource, read_datasource
 
     class HookSource(DataSource):
         @property
@@ -1369,17 +1369,17 @@ def test_read_datasource_uses_datasource_udf_relation_hook():
         def to_udf_relation(self, con):
             return con.sql("select 42::INTEGER as value")
 
-    con = duckdb.connect()
+    con = vane.connect()
 
     assert read_datasource(HookSource(), con=con).fetchall() == [(42,)]
 
 
 def test_video_frame_source_read_datasource_builds_hidden_udf_plan(monkeypatch):
-    import duckdb
-    from duckdb.datasource import read_datasource
+    import vane
+    from vane.datasource import read_datasource
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    con = duckdb.connect()
+    con = vane.connect()
 
     plan = read_datasource(VideoFrameSource(["a.avi"], height=8, width=9), con=con).explain()
     compact_plan = "".join(ch for ch in plan if ch.isalnum() or ch == "_")
@@ -1394,7 +1394,7 @@ def test_video_frame_source_read_datasource_builds_hidden_udf_plan(monkeypatch):
 
 
 def test_video_source_udf_identity_is_assigned_by_physical_graph(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_VIDEOS_PER_TASK", "1")
@@ -1411,7 +1411,7 @@ def test_video_source_udf_identity_is_assigned_by_physical_graph(monkeypatch):
 
 
 def test_video_source_udf_cpu_default_accounts_for_resize_pool(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_CPUS", raising=False)
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 3)
@@ -1420,7 +1420,7 @@ def test_video_source_udf_cpu_default_accounts_for_resize_pool(monkeypatch):
 
 
 def test_video_source_udf_cpu_allocation_is_overridable(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "2.5")
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 4)
@@ -1429,7 +1429,7 @@ def test_video_source_udf_cpu_allocation_is_overridable(monkeypatch):
 
 
 def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "0")
 
@@ -1438,7 +1438,7 @@ def test_video_source_udf_cpu_allocation_must_be_positive(monkeypatch):
 
 
 def test_video_source_udf_memory_is_source_specific(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "268435456")
@@ -1457,7 +1457,7 @@ def test_video_source_udf_memory_is_source_specific(monkeypatch):
 
 
 def test_video_source_udf_memory_covers_large_output_partition(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", raising=False)
@@ -1481,7 +1481,7 @@ def test_video_source_udf_memory_covers_large_output_partition(monkeypatch):
 
 
 def test_video_source_peak_memory_accounts_for_provenance_and_decord_copy_overlap(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
     height = 2
@@ -1524,7 +1524,7 @@ def test_video_source_peak_memory_accounts_for_provenance_and_decord_copy_overla
 
 
 def test_video_source_udf_memory_must_be_positive(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "0")
@@ -1534,7 +1534,7 @@ def test_video_source_udf_memory_must_be_positive(monkeypatch):
 
 
 def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     calls = []
     frames = np.arange(2 * 8 * 9 * 3, dtype=np.uint8).reshape(2, 8, 9, 3)
@@ -1584,7 +1584,7 @@ def test_video_frame_source_map_batches_reads_manifest(monkeypatch):
 
 
 def test_video_frame_source_map_batches_honors_global_frame_limit(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     calls = []
 
@@ -1633,7 +1633,7 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
     monkeypatch,
     caplog,
 ):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     frames = np.zeros((2, 2, 2, 3), dtype=np.uint8)
 
@@ -1690,7 +1690,7 @@ def test_video_frame_source_map_batches_skips_bad_file_and_continues(
 
 
 def test_video_read_error_mode_raise_preserves_decoder_boundary_failure(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     failure = OSError("corrupt video")
 
@@ -1725,7 +1725,7 @@ def test_video_read_error_mode_raise_preserves_decoder_boundary_failure(monkeypa
 
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
 def test_video_skip_mode_propagates_non_video_read_errors(monkeypatch, caplog, error_type):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     failure = error_type("planned internal failure")
 
@@ -1758,7 +1758,7 @@ def test_video_skip_mode_propagates_non_video_read_errors(monkeypatch, caplog, e
 
 
 def test_video_skip_mode_propagates_resize_invariant(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     class FakeFrame:
         shape = (2, 32, 3)
@@ -1786,7 +1786,7 @@ def test_video_skip_mode_propagates_resize_invariant(monkeypatch):
 
 
 def test_resize_frame_batch_preserves_order_and_uses_configured_threads(monkeypatch):
-    import duckdb.datasource.video_reader as video_reader
+    import vane.datasource.video_reader as video_reader
 
     monkeypatch.setattr(video_reader, "_VIDEO_RESIZE_THREADS", 2)
     frame_a = np.zeros((2, 3, 3), dtype=np.uint8)

@@ -6,15 +6,15 @@ import random
 
 import pytest
 
-from duckdb.runners.ray import query_resource_manager as manager_module
-from duckdb.runners.ray.query_resource_graph import (
+from vane.runners.ray import query_resource_manager as manager_module
+from vane.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_manager import (
+from vane.runners.ray.query_resource_manager import (
     OutputBlockRequest,
     RayQueryResourceManager,
     TaskRequest,

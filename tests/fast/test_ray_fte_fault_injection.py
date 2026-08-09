@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from ray_test_profile import ray_test_object_store_options
 
-import duckdb
+import vane
 
 ray = pytest.importorskip("ray")
 Cluster = pytest.importorskip("ray.cluster_utils").Cluster
@@ -24,25 +24,25 @@ pytestmark = [
 
 _FAULT_RAY_CLUSTER = None
 
-import duckdb.runners.ray.worker_handle as worker_handle_mod
-from duckdb.runners.ray import driver as ray_driver
-from duckdb.runners.ray import worker as worker_mod
-from duckdb.runners.ray.fte_fragment_scheduler import (
+import vane.runners.ray.worker_handle as worker_handle_mod
+from vane.runners.ray import driver as ray_driver
+from vane.runners.ray import worker as worker_mod
+from vane.runners.ray.fte_fragment_scheduler import (
     _stop_fte_status_watchers,
     ensure_fte_fragment_progress_topology,
 )
-from duckdb.runners.ray.query_resource_graph import (
+from vane.runners.ray.query_resource_graph import (
     QueryAllocation,
     QueryResourceGraph,
     ResourceUnitSpec,
     ResourceVector,
 )
-from duckdb.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
-from duckdb.runners.ray.query_resource_runtime import (
+from vane.runners.ray.query_resource_graph_builder import native_fragment_unit_id_for_fragment
+from vane.runners.ray.query_resource_runtime import (
     clear_query_resource_managers,
     register_query_resource_graph,
 )
-from duckdb.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
+from vane.runners.ray.worker_handle import RayWorkerActorHandle as _ProductionRayWorkerActorHandle
 
 
 class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
@@ -334,15 +334,8 @@ def _init_ray_for_fault_test(monkeypatch) -> None:
 
     test_file = Path(__file__).resolve()
     pythonpath_entries = [str(test_file.parent), str(test_file.parents[1])]
-    try:
-        import _duckdb as duckdb_ext
-
-        duckdb_pkg_root = Path(duckdb.__file__).resolve().parent
-        duckdb_parent = str(duckdb_pkg_root.parent)
-        duckdb_ext_root = str(Path(duckdb_ext.__file__).resolve().parent)
-        pythonpath_entries.extend([duckdb_ext_root, duckdb_parent])
-    except Exception:
-        pass
+    vane_package_parent = str(Path(vane.__file__).resolve().parent.parent)
+    pythonpath_entries.append(vane_package_parent)
     existing_pythonpath = os.environ.get("PYTHONPATH")
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
@@ -443,7 +436,7 @@ def _build_native_scan_task(
         """
     )
     relation = con.sql(f"SELECT i FROM read_parquet('{src}')")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -586,7 +579,7 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
     _init_ray_for_fault_test(monkeypatch)
     _clear_fte_state()
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "native_dynamic_scan_retry.parquet"
     con.execute(
         f"""
@@ -597,7 +590,7 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
         """
     )
     relation = con.sql(f"SELECT sum(i) AS total FROM read_parquet('{src}')")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -684,7 +677,7 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
     _init_ray_for_fault_test(monkeypatch)
     _clear_fte_state()
 
-    con = duckdb.connect()
+    con = vane.connect()
     src = tmp_path / "full_query_retry_input.parquet"
     con.execute(
         f"""
@@ -695,7 +688,7 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
         """
     )
     relation = con.sql(f"SELECT i FROM read_parquet('{src}')")
-    plan = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -759,7 +752,7 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
 
         retry_tables = [ray.get(ref) for ref in output_refs]
         retry_table = pa.concat_tables(retry_tables)
-        downstream = duckdb.connect()
+        downstream = vane.connect()
         try:
             downstream.register("retry_output", retry_table)
             count, total = downstream.execute("SELECT count(*)::BIGINT, sum(c0)::BIGINT FROM retry_output").fetchone()
@@ -793,7 +786,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
     _init_ray_for_fault_test(monkeypatch)
     _clear_fte_state()
 
-    con = duckdb.connect()
+    con = vane.connect()
     query_id = "query-host-full-kill"
     task_a, source_a = _build_native_scan_task(
         con,
@@ -881,7 +874,7 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
         assert total_rows_from_metadata == 8
 
         retry_table = pa.concat_tables(retry_tables)
-        downstream = duckdb.connect()
+        downstream = vane.connect()
         try:
             downstream.register("retry_output", retry_table)
             count, total, min_value, max_value = downstream.execute(

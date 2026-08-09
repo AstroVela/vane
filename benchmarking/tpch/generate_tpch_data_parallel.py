@@ -128,7 +128,7 @@ def main():
     sys.path.insert(0, "/tmp/duckdb_stock")
     import vane
 
-    print(vane.__duckdb_version__)
+    print(vane.__engine_version__)
     print(f"Scale factor: {args.scale_factor}")
     print(f"Output directory: {args.output_dir}")
     print(f"Chunks: {args.children}, Parallel workers: {args.parallel}")

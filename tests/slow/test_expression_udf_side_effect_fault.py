@@ -26,8 +26,8 @@ import uuid
 
 import ray
 
-import duckdb.execution.udf_ray as udf_ray
-from duckdb.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
+import vane.execution.udf_ray as udf_ray
+from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
 
 CONTROL_NAMESPACE = f"vane-side-effect-fault-{uuid.uuid4().hex}"

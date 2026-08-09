@@ -5,7 +5,7 @@ from collections import Counter
 
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
@@ -34,7 +34,7 @@ def test_arrow_scan_preserves_insertion_order(threads, batch_size, preserve_inse
     if preserve_insertion_order is not None:
         config["preserve_insertion_order"] = preserve_insertion_order
 
-    with duckdb.connect(config=config) as connection:
+    with vane.connect(config=config) as connection:
         setting = connection.execute("SELECT current_setting('preserve_insertion_order')").fetchone()[0]
         actual = connection.from_arrow(make_batched_table(batch_size)).execute().fetchall()
 
@@ -44,7 +44,7 @@ def test_arrow_scan_preserves_insertion_order(threads, batch_size, preserve_inse
 
 @pytest.mark.parametrize("threads,batch_size", ORDER_CASES)
 def test_arrow_scan_can_disable_insertion_order_preservation(threads, batch_size):
-    with duckdb.connect(config={"threads": threads, "preserve_insertion_order": False}) as connection:
+    with vane.connect(config={"threads": threads, "preserve_insertion_order": False}) as connection:
         setting = connection.execute("SELECT current_setting('preserve_insertion_order')").fetchone()[0]
         actual = connection.from_arrow(make_batched_table(batch_size)).execute().fetchall()
 

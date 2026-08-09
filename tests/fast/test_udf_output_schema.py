@@ -11,7 +11,7 @@ import pyarrow as pa
 
 
 def test_empty_output_table_from_schema_supports_nested_duckdb_types():
-    from duckdb.execution.udf_output_schema import empty_output_table_from_schema
+    from vane.execution.udf_output_schema import empty_output_table_from_schema
 
     feature_type = pa.struct(
         [

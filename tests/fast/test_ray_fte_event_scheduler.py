@@ -9,8 +9,8 @@ from collections import deque
 
 import pytest
 
-from duckdb.runners.ray.fte import FteTaskAttemptId, FteTaskId
-from duckdb.runners.ray.fte_events import (
+from vane.runners.fte import FteTaskAttemptId, FteTaskId
+from vane.runners.fte.fte_events import (
     MemoryPressureDetected,
     QueryAbort,
     ResourceAdmissionChanged,
@@ -21,14 +21,14 @@ from duckdb.runners.ray.fte_events import (
     WorkerFailed,
     WorkerReservationCompleted,
 )
-from duckdb.runners.ray.fte_scheduler import (
+from vane.runners.fte.fte_scheduler import (
     FteAttemptStatusWatcher,
     FteEventDrivenTaskSource,
     FteEventHandlers,
     FteQueryScheduler,
     FteSchedulerRegistry,
 )
-from duckdb.runners.ray.safe_get import QueryDeadlineExceeded
+from vane.runners.ray.safe_get import QueryDeadlineExceeded
 
 
 def test_event_scheduler_dispatches_events_in_order():

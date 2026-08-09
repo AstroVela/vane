@@ -1,13 +1,19 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 pa = pytest.importorskip("pyarrow")
 
 
 class TestArrowBatchIndex:
     def test_arrow_batch_index(self, duckdb_cursor):
-        con = duckdb.connect()
+        con = vane.connect()
         df = con.execute("SELECT * FROM range(10000000) t(i)").df()
         arrow_tbl = pa.Table.from_pandas(df)  # noqa: F841
 

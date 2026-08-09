@@ -1,10 +1,16 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import gc
 import platform
 import sys
 
 import pytest
 
-import duckdb
+import vane
 
 
 @pytest.mark.parametrize(("rows", "iters"), [(1000, 20)])
@@ -20,7 +26,7 @@ def test_python_scalar_udf_return_value_refcount_does_not_leak(rows, iters):
     # Baseline refcount (note: getrefcount adds a temporary ref)
     baseline = sys.getrefcount(payload)
 
-    con = duckdb.connect()
+    con = vane.connect()
     con.create_function("udf_bytes", udf_bytes, ["BIGINT"], "VARCHAR")
 
     for _ in range(iters):

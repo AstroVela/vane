@@ -21,7 +21,7 @@ pytestmark = [pytest.mark.real_ray, pytest.mark.ray_cluster_owner]
 ray = pytest.importorskip("ray")
 pa = pytest.importorskip("pyarrow")
 
-from duckdb.execution.vllm import PrefixRouter, RayLocalVLLMExecutor, RemoteVLLMExecutor
+from vane.execution.vllm import PrefixRouter, RayLocalVLLMExecutor, RemoteVLLMExecutor
 
 
 @pytest.fixture(scope="module")

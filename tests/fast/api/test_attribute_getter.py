@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestGetAttribute:
@@ -30,13 +36,13 @@ class TestGetAttribute:
         rel = duckdb_cursor.sql("select i as df from range(100) tbl(i)")
 
         # 'df' also exists as a method on DuckDBPyRelation
-        assert rel.df.__class__ != duckdb.DuckDBPyRelation
+        assert rel.df.__class__ != vane.DuckDBPyRelation
 
     def test_getitem_collision(self, duckdb_cursor):
         rel = duckdb_cursor.sql("select i as df from range(100) tbl(i)")
 
         # this case is not an issue on __getitem__
-        assert rel["df"].__class__ == duckdb.DuckDBPyRelation
+        assert rel["df"].__class__ == vane.DuckDBPyRelation
 
     def test_getitem_struct(self, duckdb_cursor):
         rel = duckdb_cursor.sql("select {'a':5, 'b':6} as a, 5 as b")

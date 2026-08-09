@@ -1,0 +1,361 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from vane.runners.fte import (
+    FteTaskState,
+    FteWorkerControlFailure,
+    FteWorkerReservationUnavailable,
+)
+from vane.runners.fte.fte_events import WorkerFailed
+from vane.runners.fte.fte_scheduler import FteEventHandlers
+from vane.runners.ray.fragment_registry import (
+    _FTE_CLOSING_QUERIES,
+    _FTE_FRAGMENT_EXECUTIONS,
+    _FTE_FRAGMENT_STATES,
+    _FTE_PENDING_WORKER_RESERVATIONS,
+    _FTE_REGISTRY_LOCK,
+    _FTE_SCHEDULERS,
+    _FTE_STATUS_WATCHERS,
+)
+from vane.runners.ray.fragment_worker_exchange import apply_exchange_selector_update
+from vane.runners.ray.fragment_worker_failures import (
+    mark_fte_worker_failed_for_event,
+)
+from vane.runners.ray.fragment_worker_ordering import fragment_execution_key_for_fte_attempt
+from vane.runners.ray.fragment_worker_reservations import (
+    fte_worker_reservation_event_state,
+    remove_pending_fte_worker_reservation_if_current,
+)
+from vane.runners.ray.fte_fragment_scheduler import (
+    FteWorkerPlacementManager,
+    _sync_write_sink_unit_for_fragment,
+    request_fte_pending_task_drain,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from vane.runners.fte.fte_events import ExchangeSelectorUpdated, TaskStatusChanged, WorkerReservationCompleted
+
+
+class FteWorkerEventHandlingMixin:
+    if TYPE_CHECKING:
+        # Supplied by the other mixins on the composed Ray worker handle.
+        _drain_fte_pending_tasks: Any
+        _execute_fte_fragment_execution_mutation_result: Any
+        _execute_fte_fragment_execution_outbox: Any
+        _execute_fte_fragment_execution_worker_commands: Any
+        _handles_for_fte_scheduled_attempts: Any
+        _revoke_fte_speculative_tasks_for_memory_pressure_direct: Any
+        _submit_fte_pending_tasks: Any
+        _task_input_stream_exhausted_direct: Callable[..., list[Any]]
+        _try_reserve_fte_partition_for_node_wait: Any
+        manager_instance_id: str
+
+    def _handles_for_fte_worker_control_failure(
+        self,
+        failure: FteWorkerControlFailure,
+    ) -> list[Any]:
+        """Fence a failed worker before queued work can observe it as live."""
+
+        try:
+            return self._handles_for_worker_failed_event(
+                WorkerFailed(
+                    query_id=failure.attempt_id.task_id.query_id,
+                    worker_id=failure.worker_id,
+                    worker_incarnation_id=failure.worker_incarnation_id,
+                    manager_instance_id=self.manager_instance_id,
+                    error=failure,
+                )
+            )
+        except Exception as exc:
+            scheduler = _FTE_SCHEDULERS.get(failure.attempt_id.task_id.query_id)
+            if scheduler is not None and scheduler.is_owned_by_manager_instance(self.manager_instance_id):
+                scheduler.fail(f"FTE worker failure handling failed: {exc}")
+            return request_fte_pending_task_drain()
+
+    def _handles_for_marked_fte_worker_failed(
+        self,
+        scheduled_by_fragment: list[tuple[str, str, list[Any], list[Any]]],
+    ) -> list[Any]:
+        handles: list[Any] = []
+        for query_id, fragment_id, scheduled_attempts, _ in scheduled_by_fragment:
+            with _FTE_REGISTRY_LOCK:
+                if query_id in _FTE_CLOSING_QUERIES:
+                    continue
+                fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
+            if fragment_execution is not None:
+                dispatch = self._execute_fte_fragment_execution_outbox(fragment_execution)
+                handles.extend(dispatch.recovery_handles)
+                scheduled_attempts = list(dispatch.scheduled_attempts)
+            handles.extend(
+                self._handles_for_fte_scheduled_attempts(
+                    query_id,
+                    fragment_id,
+                    scheduled_attempts,
+                )
+            )
+        return handles
+
+    def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
+        handles: list[Any] = []
+        try:
+            scheduled_by_fragment = mark_fte_worker_failed_for_event(event)
+            if scheduled_by_fragment:
+                handles.extend(self._handles_for_marked_fte_worker_failed(scheduled_by_fragment))
+        finally:
+            handles.extend(request_fte_pending_task_drain())
+        return handles
+
+    def _handles_for_worker_reservation_completed_event(self, event: WorkerReservationCompleted) -> list[Any]:
+        with _FTE_REGISTRY_LOCK:
+            if str(event.query_id) in _FTE_CLOSING_QUERIES:
+                return []
+        key, future, fragment_execution = fte_worker_reservation_event_state(event)
+        if future is None or fragment_execution is None:
+            return []
+        try:
+            reservation_error = event.error
+            if reservation_error is None:
+                try:
+                    future.result()
+                except Exception as exc:
+                    reservation_error = exc
+            if reservation_error is not None:
+                failure = RuntimeError(f"FTE worker reservation failed: {reservation_error}")
+                with _FTE_REGISTRY_LOCK:
+                    if (
+                        str(event.query_id) in _FTE_CLOSING_QUERIES
+                        or _FTE_PENDING_WORKER_RESERVATIONS.get(key) is not future
+                    ):
+                        return []
+                if not remove_pending_fte_worker_reservation_if_current(key, future):
+                    return []
+                try:
+                    FteWorkerPlacementManager.release_owner(
+                        query_id=key[0],
+                        fragment_id=key[1],
+                        partition_id=key[2],
+                    )
+                finally:
+                    scheduler = _FTE_SCHEDULERS.get(event.query_id)
+                    if scheduler is not None:
+                        scheduler.fail(failure)
+                    request_fte_pending_task_drain()
+                if isinstance(reservation_error, BaseException):
+                    raise failure from reservation_error
+                raise failure
+            released_invalid_reservation = False
+            with fragment_execution._attempt_scheduling_lock:
+                with _FTE_REGISTRY_LOCK:
+                    if (
+                        str(event.query_id) in _FTE_CLOSING_QUERIES
+                        or _FTE_PENDING_WORKER_RESERVATIONS.get(key) is not future
+                    ):
+                        return []
+                with fragment_execution._state_lock:
+                    partition = fragment_execution.partitions.get(int(event.partition_id))
+                    if (
+                        partition is None
+                        or partition.running_attempt is not None
+                        or partition.finished
+                        or partition.failed
+                    ):
+                        released_invalid_reservation = remove_pending_fte_worker_reservation_if_current(key, future)
+                        scheduled = None
+                        worker_commands = []
+                    else:
+                        if not remove_pending_fte_worker_reservation_if_current(key, future):
+                            return []
+                        scheduled = fragment_execution.start_attempt_with_worker(partition)
+                        worker_commands = fragment_execution.pop_worker_commands()
+            if scheduled is None:
+                if released_invalid_reservation:
+                    try:
+                        FteWorkerPlacementManager.release_owner(
+                            query_id=key[0],
+                            fragment_id=key[1],
+                            partition_id=key[2],
+                        )
+                    finally:
+                        request_fte_pending_task_drain()
+                return []
+            dispatch = self._execute_fte_fragment_execution_worker_commands(
+                fragment_execution,
+                worker_commands,
+            )
+            handles = list(dispatch.recovery_handles)
+            handles.extend(
+                self._handles_for_fte_scheduled_attempts(
+                    event.query_id,
+                    str(event.fragment_id),
+                    list(dispatch.scheduled_attempts),
+                )
+            )
+        except FteWorkerReservationUnavailable:
+            return request_fte_pending_task_drain()
+        except Exception:
+            with _FTE_REGISTRY_LOCK:
+                if str(event.query_id) in _FTE_CLOSING_QUERIES:
+                    return []
+            raise
+        handles.extend(request_fte_pending_task_drain())
+        return handles
+
+    def _handles_for_task_status_changed_event(self, event: TaskStatusChanged) -> list[Any]:
+        raw_state = event.status.get("state")
+        state = raw_state if isinstance(raw_state, FteTaskState) else FteTaskState(str(raw_state))
+        terminal = state in {
+            FteTaskState.FINISHED,
+            FteTaskState.FAILED,
+            FteTaskState.CANCELED,
+            FteTaskState.ABORTED,
+        }
+        if terminal:
+            with _FTE_REGISTRY_LOCK:
+                watcher = _FTE_STATUS_WATCHERS.get(str(event.attempt_id))
+            if watcher is not None:
+                watcher.stop()
+        fragment_execution_key = fragment_execution_key_for_fte_attempt(event.attempt_id)
+        if fragment_execution_key is None:
+            return []
+        query_id, fragment_id = fragment_execution_key
+        with _FTE_REGISTRY_LOCK:
+            if query_id in _FTE_CLOSING_QUERIES:
+                return []
+            fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get(fragment_execution_key)
+        if fragment_execution is None:
+            return []
+        if state in {FteTaskState.CANCELED, FteTaskState.ABORTED}:
+            worker_incarnation = fragment_execution.running_attempt_worker_incarnation(event.attempt_id)
+            scheduler = _FTE_SCHEDULERS.get(query_id)
+            if (
+                worker_incarnation is not None
+                and scheduler is not None
+                and scheduler.worker_failure_is_recorded(
+                    worker_incarnation[0],
+                    worker_incarnation_id=worker_incarnation[1],
+                )
+            ):
+                # Worker quiescence cancels every task on the shared actor.
+                # The globally claimed worker-failure transition owns these
+                # attempts and will reconcile them after the barrier completes.
+                return request_fte_pending_task_drain()
+        handles: list[Any] = []
+        try:
+            scheduled = fragment_execution.handle_task_status(
+                event.status,
+                schedule_retry=False,
+            )
+            with _FTE_REGISTRY_LOCK:
+                closing = query_id in _FTE_CLOSING_QUERIES
+            if not closing and scheduled is not None:
+                dispatch = self._execute_fte_fragment_execution_outbox(fragment_execution)
+                handles.extend(dispatch.recovery_handles)
+                handles.extend(
+                    self._handles_for_fte_scheduled_attempts(
+                        query_id,
+                        fragment_id,
+                        list(dispatch.scheduled_attempts),
+                    )
+                )
+        except Exception:
+            with _FTE_REGISTRY_LOCK:
+                if query_id not in _FTE_CLOSING_QUERIES:
+                    raise
+        finally:
+            if terminal:
+                try:
+                    # A terminal status can leave no pending descriptor for the
+                    # admission scanner to revisit.  Publish the sink lifecycle
+                    # directly before waking work made eligible by completion.
+                    _sync_write_sink_unit_for_fragment(fragment_execution)
+                finally:
+                    handles.extend(request_fte_pending_task_drain())
+        return handles
+
+    def _handles_for_exchange_selector_updated_event(self, event: ExchangeSelectorUpdated) -> list[Any]:
+        query_id = str(event.query_id)
+        fragment_id = str(event.consumer_fragment_id)
+        source_node_id = str(event.source_node_id)
+        with _FTE_REGISTRY_LOCK:
+            if query_id in _FTE_CLOSING_QUERIES:
+                return []
+            fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((query_id, fragment_id))
+            fragment_state = _FTE_FRAGMENT_STATES.get((query_id, fragment_id))
+        if fragment_execution is None or fragment_state is None or fragment_state.assigner is None:
+            return []
+
+        selector_update = apply_exchange_selector_update(fragment_state, event)
+        if selector_update is None:
+            return []
+        selector_snapshot, splits = selector_update
+        result = fragment_state.assigner.assign(
+            source_node_id,
+            [split.to_dict() for split in splits],
+            no_more_inputs=selector_snapshot.final,
+        )
+        for partition_info in result.partitions_added:
+            partition = fragment_execution.add_partition(
+                partition_info.partition_id,
+                partition_info.node_requirements,
+            )
+            self._try_reserve_fte_partition_for_node_wait(
+                query_id,
+                fragment_id,
+                partition,
+                fragment_execution=fragment_execution,
+            )
+        scheduled_result = fragment_execution.apply_assignment_result(result)
+        with _FTE_REGISTRY_LOCK:
+            if query_id in _FTE_CLOSING_QUERIES:
+                return []
+        dispatch = self._execute_fte_fragment_execution_mutation_result(fragment_execution, scheduled_result)
+
+        handles = list(dispatch.recovery_handles)
+        if dispatch.query_closed:
+            return handles
+        handles.extend(
+            self._handles_for_fte_scheduled_attempts(
+                query_id,
+                fragment_id,
+                list(dispatch.scheduled_attempts),
+            )
+        )
+        if selector_snapshot.final:
+            with _FTE_REGISTRY_LOCK:
+                fragment_state.exhausted_source_node_ids.add(source_node_id)
+        return handles
+
+    def _bind_fte_scheduler_handlers(self, scheduler: Any) -> None:
+        def on_source_input_exhausted(source_ids: set[str]) -> list[Any]:
+            return self._task_input_stream_exhausted_direct(
+                source_ids,
+                query_id_filter=scheduler.query_id,
+            )
+
+        scheduler.bind_manager_instance(
+            self.manager_instance_id,
+            handlers=FteEventHandlers(
+                on_split_events=self._submit_fte_pending_tasks,
+                on_source_input_exhausted=on_source_input_exhausted,
+                on_task_status_changed=self._handles_for_task_status_changed_event,
+                on_worker_failed=self._handles_for_worker_failed_event,
+                on_memory_pressure_detected=lambda event: self._revoke_fte_speculative_tasks_for_memory_pressure_direct(
+                    max_count_per_worker=event.max_count_per_worker,
+                    query_id_filter=event.query_id,
+                ),
+                on_resource_admission_changed=lambda event: self._drain_fte_pending_tasks(
+                    query_id_filter=event.query_id,
+                    max_scheduled_attempts=1,
+                    execution_class_filter=event.execution_class,
+                ),
+                on_worker_reservation_completed=self._handles_for_worker_reservation_completed_event,
+                on_retry_delay_expired=lambda _event: request_fte_pending_task_drain(),
+                on_exchange_selector_updated=self._handles_for_exchange_selector_updated_event,
+            ),
+        )

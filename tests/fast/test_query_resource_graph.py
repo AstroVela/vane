@@ -3,7 +3,7 @@
 
 import pytest
 
-from duckdb.runners.ray.query_resource_graph import (
+from vane.runners.ray.query_resource_graph import (
     MaterializationBarrierSpec,
     QueryAllocation,
     QueryResourceGraph,

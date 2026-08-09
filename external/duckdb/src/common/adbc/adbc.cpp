@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/adbc/adbc.hpp"
 #include "duckdb/common/adbc/adbc-init.hpp"
 
@@ -259,7 +265,7 @@ AdbcStatusCode DatabaseSetOption(struct AdbcDatabase *database, const char *key,
 		return ADBC_STATUS_OK;
 	}
 	if (strcmp(key, ADBC_OPTION_USERNAME) == 0 || strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
-		SetError(error, "DuckDB does not support authentication");
+		SetError(error, "Vane does not support authentication");
 		return ADBC_STATUS_NOT_IMPLEMENTED;
 	}
 	if (strcmp(key, "uri") == 0) {
@@ -348,7 +354,7 @@ AdbcStatusCode DatabaseGetOption(struct AdbcDatabase *database, const char *key,
 		return GetOptionStringHelper(wrapper->path.c_str(), value, length, error);
 	}
 	if (strcmp(key, ADBC_OPTION_USERNAME) == 0 || strcmp(key, ADBC_OPTION_PASSWORD) == 0) {
-		SetError(error, "DuckDB does not support authentication");
+		SetError(error, "Vane does not support authentication");
 		return ADBC_STATUS_NOT_IMPLEMENTED;
 	}
 	if (strcmp(key, "uri") == 0) {
@@ -723,14 +729,14 @@ AdbcStatusCode ConnectionSetOptionDouble(struct AdbcConnection *connection, cons
 AdbcStatusCode ConnectionReadPartition(struct AdbcConnection *connection, const uint8_t *serialized_partition,
                                        size_t serialized_length, struct ArrowArrayStream *out,
                                        struct AdbcError *error) {
-	SetError(error, "Read Partitions are not supported in DuckDB");
+	SetError(error, "Read Partitions are not supported in Vane");
 	return ADBC_STATUS_NOT_IMPLEMENTED;
 }
 
 AdbcStatusCode StatementExecutePartitions(struct AdbcStatement *statement, struct ArrowSchema *schema,
                                           struct AdbcPartitions *partitions, int64_t *rows_affected,
                                           struct AdbcError *error) {
-	SetError(error, "Execute Partitions are not supported in DuckDB");
+	SetError(error, "Execute Partitions are not supported in Vane");
 	return ADBC_STATUS_NOT_IMPLEMENTED;
 }
 
@@ -864,7 +870,7 @@ AdbcStatusCode ConnectionGetInfo(struct AdbcConnection *connection, const uint32
 		auto info_code = ConvertToInfoCode(code);
 		switch (info_code) {
 		case AdbcInfoCode::VENDOR_NAME: {
-			results += duckdb::StringUtil::Format("(%u, union_value(string_value := 'duckdb')::%s),",
+			results += duckdb::StringUtil::Format("(%u, union_value(string_value := 'Vane')::%s),",
 			                                      (uint32_t)ADBC_INFO_VENDOR_NAME, INFO_UNION_TYPE);
 			break;
 		}
@@ -875,7 +881,7 @@ AdbcStatusCode ConnectionGetInfo(struct AdbcConnection *connection, const uint32
 			break;
 		}
 		case AdbcInfoCode::DRIVER_NAME: {
-			results += duckdb::StringUtil::Format("(%u, union_value(string_value := 'ADBC DuckDB Driver')::%s),",
+			results += duckdb::StringUtil::Format("(%u, union_value(string_value := 'ADBC Vane Driver')::%s),",
 			                                      (uint32_t)ADBC_INFO_DRIVER_NAME, INFO_UNION_TYPE);
 			break;
 		}
@@ -1857,7 +1863,7 @@ AdbcStatusCode StatementSetOption(struct AdbcStatement *statement, const char *k
 		}
 	}
 	duckdb::stringstream ss;
-	ss << "Statement Set Option " << key << " is not yet accepted by DuckDB";
+	ss << "Statement Set Option " << key << " is not yet accepted by Vane";
 	SetError(error, ss.str());
 	return ADBC_STATUS_INVALID_ARGUMENT;
 }

@@ -11,14 +11,14 @@ from concurrent.futures import Future
 
 import pytest
 
-import duckdb.execution.ray_control_deadline as ray_control_deadline
-import duckdb.execution.ray_control_submission as ray_control_submission
-import duckdb.execution.udf_task_admission as task_admission
-from duckdb.execution.udf_admission import (
+import vane.execution.ray_control_deadline as ray_control_deadline
+import vane.execution.ray_control_submission as ray_control_submission
+import vane.execution.udf_task_admission as task_admission
+from vane.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
-from duckdb.execution.udf_task_admission import TaskAdmissionController
+from vane.execution.udf_task_admission import TaskAdmissionController
 
 _QUERY_GENERATION_CAPABILITY = "test-query-generation-capability"
 

@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
+import vane
 
 
 class TestRAPIFunctions:
@@ -10,7 +16,7 @@ class TestRAPIFunctions:
         res.show()
 
     def test_rapi_relation_sql_query(self):
-        res = duckdb.table_function("range", [10])
+        res = vane.table_function("range", [10])
         assert res.sql_query() == 'SELECT * FROM "range"(10)'
 
     def test_rapi_relation_sql_query_after_catalog_change(self, duckdb_cursor):
@@ -19,5 +25,5 @@ class TestRAPIFunctions:
         duckdb_cursor.execute("DROP TABLE sql_query_catalog_change")
 
         assert relation.sql_query() == ""
-        with pytest.raises(duckdb.CatalogException):
+        with pytest.raises(vane.CatalogException):
             relation.fetchall()

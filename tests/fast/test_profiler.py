@@ -1,12 +1,18 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import pytest
 
-import duckdb
-from duckdb.query_graph import ProfilingInfo
+import vane
+from vane.query_graph import ProfilingInfo
 
 
 @pytest.fixture(scope="session")
 def profiling_connection():
-    con = duckdb.connect()
+    con = vane.connect()
     con.enable_profiling()
     con.execute("SELECT 42;").fetchall()
     yield con

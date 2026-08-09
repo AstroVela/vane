@@ -14,7 +14,7 @@ license-files = [
     "LICENSE",
     "NOTICE",
     "LICENSES/*.txt",
-    "duckdb/experimental/spark/LICENSE",
+    "vane/experimental/spark/LICENSE",
     "external/duckdb/LICENSE",
     "external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE",
     "external/duckdb/src/include/duckdb/storage/compression/alprd/algorithm/LICENSE",
@@ -118,10 +118,7 @@ ninja.make-fallback = false
 
 [tool.scikit-build.wheel]
 cmake = true
-packages.duckdb = "duckdb"
 packages.vane = "vane"
-packages.adbc_driver_duckdb = "adbc_driver_duckdb"
-packages._duckdb-stubs = "_duckdb-stubs"
 exclude = [
     # Runtime shuffle data can live under the Python package during local runs.
     "vane/session_*/",
@@ -197,11 +194,13 @@ include = [
     "/scripts/bootstrap_vcpkg.sh",
     "cmake/**",
     "/scripts/check_release_artifacts.py",
+    "/scripts/run_installed_pytest.sh",
     "/scripts/run_release_tests.sh",
     "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
     "/scripts/sync_vcpkg_licenses.py",
     "/scripts/verify_base_install.py",
+    "/scripts/verify_duckdb_coexistence.py",
 
     # Curated base-installation release gate. The larger inherited test tree
     # stays in the repository and is intentionally not part of the PyPI sdist.
@@ -222,10 +221,7 @@ include = [
 
     # Source code and stubs
     "src/**",
-    "duckdb/**",
     "vane/**",
-    "adbc_driver_duckdb/**",
-    "_duckdb-stubs/*.pyi",
 
     # -------------- DuckDB subtree includes
     # Core DuckDB source and build system
@@ -502,44 +498,61 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-packages = ["duckdb", "_duckdb"]
+packages = ["vane"]
 strict = true
 warn_unreachable = true
 pretty = true
 python_version = "3.10"
 exclude = [
-    "duckdb/experimental/", # not checking the pyspark API
-    "duckdb/query_graph/",  # old and unmaintained (should probably remove)
+    "vane/experimental/", # not checking the pyspark API
+    "vane/query_graph/",  # old and unmaintained (should probably remove)
     "tests", "scripts",
 ]
 
 [[tool.mypy.overrides]]
-module = "duckdb.experimental.*"
+module = "vane.experimental.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
+    "adbc_driver_manager",
+    "adbc_driver_manager.*",
+    "aiohttp",
+    "aiohttp.*",
+    "anthropic",
+    "anthropic.*",
+    "botocore.*",
     "cloudpickle",
     "fsspec.*",
+    "google",
+    "google.*",
+    "httpx",
+    "httpx.*",
+    "openai",
+    "openai.*",
     "pandas",
     "polars",
+    "pydantic",
+    "pydantic.*",
     "pyarrow.*",
     "ray",
     "ray.*",
+    "sentence_transformers",
     "torch",
     "tensorflow",
+    "tiktoken",
     "vllm",
     "vllm.*",
 ]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "duckdb.filesystem"
+module = "vane.filesystem"
 disallow_subclassing_any = false
 
 [tool.coverage.run]
 branch = true
-source = ["duckdb"]
+source = ["vane"]
 
 [tool.ruff]
 line-length = 120
@@ -559,7 +572,7 @@ select = [
     "I",  # isort
 ]
 ignore = [
-    # The imported DuckDB Python tree intentionally performs several imports
+    # The engine-derived Python tree intentionally performs several imports
     # after runtime environment setup. Track this legacy pattern separately.
     "E402",
 ]
@@ -574,7 +587,7 @@ ban-relative-imports = "all"
 strict = true
 
 [tool.ruff.lint.per-file-ignores]
-"duckdb/experimental/spark/**.py" = [
+"vane/experimental/spark/**.py" = [
     # No need for moduledocstrings for spark
     'D100',
     # Ignore boolean positional args in the Spark API

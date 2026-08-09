@@ -17,7 +17,6 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import duckdb
 import vane
 from vane.ai import provider as provider_registry
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
@@ -196,7 +195,7 @@ def mock_ai_provider(monkeypatch):
 
 
 def _round_trip_ai_plan(relation):
-    logical = duckdb.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
     serialized = pickle.dumps(logical)
     restored = pickle.loads(serialized)
     previous_runner = os.environ.get("VANE_RUNNER")
@@ -213,11 +212,11 @@ def _round_trip_ai_plan(relation):
 
 
 def _execute_ai_physical_plan(target, physical):
-    from duckdb.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
 
     pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical, conn=target)
     try:
-        result = duckdb.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(target.cursor(), physical, None, None)
         payloads = list(result.partition_payloads)
         return pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
     finally:
@@ -691,7 +690,7 @@ def test_ai_prompt_sql_on_error_does_not_hide_planning_capability_errors():
 
 
 def test_ai_prompt_sql_vllm_uses_one_native_executor_and_skips_null_rows(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor()
     builds: list[tuple[str, dict[str, object]]] = []
@@ -747,7 +746,7 @@ def test_ai_prompt_sql_vllm_rejects_raw_response_during_planning():
 
 
 def test_ai_prompt_sql_vllm_validates_structured_output(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor({"alpha": '{"answer":"ok"}', "beta": '{"answer":1}'})
     builds = []
@@ -804,7 +803,7 @@ def test_ai_prompt_sql_rejects_anthropic_zero_tokens_with_structured_output():
 
 
 def test_ai_prompt_sql_vllm_survives_plan_round_trip_as_native_operator(monkeypatch):
-    import duckdb.execution.vllm as vllm_executor
+    import vane.execution.vllm as vllm_executor
 
     executor = RecordingNativeVLLMExecutor()
     monkeypatch.setattr(vllm_executor, "build_executor", lambda model, options: executor)
