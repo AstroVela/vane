@@ -41,7 +41,9 @@ def render_bundle(share_dir: Path) -> str:
     ]
     for record in records:
         component = record.parent.name
-        content = record.read_text(encoding="utf-8", errors="replace").strip()
+        content = "\n".join(
+            line.rstrip() for line in record.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        )
         lines.extend(
             (
                 "=" * 80,

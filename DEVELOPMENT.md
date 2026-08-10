@@ -122,6 +122,27 @@ Run them explicitly when the required service and credentials are available:
 scripts/run_installed_pytest.sh -m external_service tests/fast
 ```
 
+Iceberg has three additional production gates. The first builds DuckDB's native
+SQLLogicTest runner and executes the reviewed self-contained read suite from the
+pinned `duckdb-iceberg` source. The second provisions the digest-pinned MinIO
+container and executes the distributed fixture matrix through real Ray workers
+and `s3://` paths. The third provisions digest-pinned Iceberg REST Catalog and
+MinIO containers, binds a real Catalog table, commits a newer snapshot, stops
+the Catalog, and requires the previously bound snapshot to execute in fresh Ray
+worker processes:
+
+```bash
+scripts/run_iceberg_compat_tests.sh
+scripts/run_iceberg_minio_tests.sh
+scripts/run_iceberg_rest_tests.sh
+```
+
+The compatibility gate requires the incremental package build's pinned
+extension source directories and the bootstrapped vcpkg installation. Set
+`VCPKG_INSTALLED_DIR` when dependencies are shared by multiple worktrees.
+The REST gate's coordinator-only table creation and inserts provision committed
+test snapshots; they do not exercise or imply distributed Iceberg writes.
+
 Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must
 skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local
 endpoint or credentials.

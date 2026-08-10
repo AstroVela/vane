@@ -125,7 +125,7 @@ exclude = [
 ]
 
 [tool.scikit-build.cmake.define]
-BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs"
+BUILD_EXTENSIONS = "core_functions;json;parquet;icu;jemalloc;httpfs;avro;iceberg"
 
 # Override: if COVERAGE is set then:
 # - we create a RelWithDebInfo build
@@ -195,6 +195,8 @@ include = [
     "cmake/**",
     "/scripts/check_release_artifacts.py",
     "/scripts/run_installed_pytest.sh",
+    "/scripts/run_iceberg_minio_tests.sh",
+    "/scripts/run_iceberg_rest_tests.sh",
     "/scripts/run_release_tests.sh",
     "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
@@ -213,6 +215,17 @@ include = [
     "/tests/fast/test_vane_config.py",
     "/tests/fast/test_expression_udf_contracts.py",
     "/tests/fast/test_local_e2e.py",
+    "/tests/fast/test_distributed_iceberg.py",
+    "/tests/fast/test_distributed_iceberg_rest.py",
+    "/tests/fast/data/iceberg_equality_deletes.tar.gz.b64",
+    "/tests/fast/data/iceberg_nested_defaults.tar.gz.b64",
+    "/tests/fast/data/iceberg_partition_integer.tar.gz.b64",
+    "/tests/fast/data/iceberg_partition_spec_evolution.tar.gz.b64",
+    "/tests/fast/data/iceberg_positional_deletes.tar.gz.b64",
+    "/tests/fast/data/iceberg_schema_evolution.tar.gz.b64",
+    "/tests/fast/data/iceberg_struct_filter.tar.gz.b64",
+    "/tests/fast/data/iceberg_unknown_puffin.tar.gz.b64",
+    "/tests/fast/data/iceberg_uuid.tar.gz.b64",
     "/tests/fast/test_ray_cpp_bindings.py",
     "/tests/fast/test_ray_remote_exceptions.py",
     "/tests/fast/test_ray_result_contract.py",
@@ -281,7 +294,11 @@ include = [
     "external/duckdb/tools/CMakeLists.txt",
     "external/duckdb/tools/utils/test_platform.cpp",
     "external/duckdb/.github/config/extensions/httpfs.cmake",
+    "external/duckdb/.github/config/extensions/avro.cmake",
+    "external/duckdb/.github/config/extensions/iceberg.cmake",
+    "external/duckdb/.github/patches/extensions/iceberg/vane-distributed-scan.patch",
     "external/duckdb/scripts/append_metadata.cmake",
+    "external/duckdb/scripts/apply_extension_patches.py",
     "external/duckdb/scripts/null.txt",
 
     # scikit-build-core lets include rules take precedence over exclude rules.
@@ -483,6 +500,7 @@ pythonpath = ["tests", "tests/fast"]
 markers = [
     "external_service: tests that require an externally provisioned service",
     "gpu: tests that require CUDA-capable GPU hardware",
+    "iceberg_rest: hermetic Iceberg REST Catalog integration tests",
     "real_ray: tests that connect to or own a real Ray runtime",
     "ray_cluster_owner: tests that must own a Ray cluster in an isolated pytest process",
     "ray_fault: tests that intentionally kill or restart Ray runtime components",

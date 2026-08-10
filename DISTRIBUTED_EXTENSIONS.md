@@ -91,6 +91,30 @@ transports them through normal and fault-tolerant execution. Empty assignment
 must remain an empty scan. Provider-owned state is never replaced with an
 engine-owned file list.
 
+### Iceberg read adapter
+
+The Iceberg adapter is a reviewed patch against the immutable DuckDB Iceberg
+revision selected in
+`external/duckdb/.github/config/extensions/iceberg.cmake`. Coordinator bind
+uses upstream Iceberg code to resolve metadata, schema, manifests, filters, and
+the selected snapshot. A Catalog-backed scan materializes its storage location
+as the positional `iceberg_scan` input, so workers never attach or query the
+REST Catalog.
+
+Task enumeration drains the lazy manifest reader and emits one task per
+selected data file. Each task retains its upstream Iceberg metadata, including
+file size for balancing. Before worker serialization, the adapter replaces
+timestamp or latest-snapshot selection with the coordinator's exact metadata
+JSON path and snapshot ID. Worker bind then reconstructs the Iceberg reader and
+applies the assigned data-file allowlist inside `IcebergMultiFileList`; it does
+not replace Iceberg state with a generic file list. Partition constants,
+schema evolution, and positional/equality delete semantics therefore remain
+owned by the upstream reader.
+
+If the pinned metadata, manifest, delete file, or data file becomes unreadable,
+execution fails. The adapter never moves an in-flight query to a newer
+snapshot.
+
 ## Distributed writes
 
 `ExtensionWriteTaskProvider` is the coordinator-side contract for an extension
@@ -194,3 +218,15 @@ and final marker publication.
 
 Each concrete extension adds its own adapter tests for catalog pinning, task
 semantics, object storage, commit behavior, and failure boundaries.
+
+The Iceberg read adapter has three additional production gates:
+
+- `scripts/run_iceberg_compat_tests.sh` builds DuckDB's SQLLogicTest runner and
+  executes the reviewed self-contained read suite from the pinned extension;
+- `scripts/run_iceberg_minio_tests.sh` uploads the distributed fixture matrix
+  to digest-pinned MinIO and reads every case through real Ray workers;
+- `scripts/run_iceberg_rest_tests.sh` plans a Catalog table, advances its
+  snapshot, stops the Catalog, and executes the pinned plan in fresh workers.
+
+The REST gate uses coordinator writes only to provision committed input
+snapshots; it does not exercise distributed Iceberg writes.

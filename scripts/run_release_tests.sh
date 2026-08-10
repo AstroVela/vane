@@ -28,6 +28,7 @@ release_tests=(
   "$project_root/tests/fast/test_vane_config.py"
   "$project_root/tests/fast/test_expression_udf_contracts.py"
   "$project_root/tests/fast/test_local_e2e.py"
+  "$project_root/tests/fast/test_distributed_iceberg.py"
   "$project_root/tests/fast/test_ray_cpp_bindings.py"
   "$project_root/tests/fast/test_ray_remote_exceptions.py"
   "$project_root/tests/fast/test_ray_result_contract.py"
