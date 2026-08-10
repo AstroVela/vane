@@ -30,6 +30,7 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
 #include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -728,6 +729,10 @@ void PhysicalOperator::SerializeOperatorData(Serializer &serializer) const {
 	// Default implementation: no operator-specific data
 }
 
+void PhysicalDataSink::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty<string>(103, "operation_id", operation_id);
+}
+
 unique_ptr<PhysicalOperator> PhysicalOperator::Deserialize(Deserializer &deserializer, PhysicalPlan &physical_plan) {
 	auto &data = deserializer.GetSerializationData();
 	DynamicFilterSerializationGuard guard(data);
@@ -760,6 +765,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
                                                                        vector<LogicalType> types,
                                                                        idx_t estimated_cardinality) {
 	switch (op_type) {
+	case PhysicalOperatorType::DATA_SINK: {
+		auto operation_id = deserializer.ReadProperty<string>(103, "operation_id");
+		return make_uniq<PhysicalDataSink>(physical_plan, std::move(types), std::move(operation_id),
+		                                   estimated_cardinality);
+	}
 	case PhysicalOperatorType::PROJECTION: {
 		// Read projection-specific field: select_list
 		auto select_list = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(103, "select_list");

@@ -6,13 +6,14 @@
 // file metadata from worker outputs and renames staging files to final paths.
 #pragma once
 
+#include "duckdb/execution/distributed/pipeline_node/finalizable_sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sink.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 
 namespace duckdb {
 namespace distributed {
 
-class CopyFinishNode : public PipelineNodeImpl {
+class CopyFinishNode : public FinalizableSinkNode {
 public:
 	CopyFinishNode(NodeID node_id, std::shared_ptr<CopySinkNode> copy_sink)
 	    : ctx_(InheritPipelineNodeContext(copy_sink, node_id, "CopyFinish")), copy_sink_(std::move(copy_sink)) {
@@ -21,11 +22,11 @@ public:
 	std::string name() const override {
 		return "CopyFinish";
 	}
-	bool is_sink() const override {
-		return true;
-	}
 	NodeID node_id() const override {
 		return ctx_.node_id();
+	}
+	NodeID result_node_id() const override {
+		return copy_sink_->node_id();
 	}
 	const PipelineNodeContext &context() const override {
 		return ctx_;
@@ -63,8 +64,8 @@ public:
 	/// 2. Renames staging files to final paths
 	/// 3. Cleans up staging directory
 	/// Returns the aggregated copy result.
-	DuckDBResult<DistributedCopyResult> finalize(const std::vector<ResultPartitionRef> &partitions,
-	                                             ClientContext &context) {
+	DuckDBResult<DistributedCopyResult> finalize_copy(const std::vector<ResultPartitionRef> &partitions,
+	                                                  ClientContext &context) {
 		// Step 1: parse worker output fragments → file infos
 		auto file_infos_res = ParseCopyPartitions(partitions);
 		if (file_infos_res.is_err()) {
@@ -82,6 +83,15 @@ public:
 			staging_root = fs.JoinPath(staging_root_base(), staging_run_id());
 		}
 		return FinalizeCopyFiles(spec(), staging_root, std::move(files), context, staging_run_id());
+	}
+
+	DuckDBResult<FinalizedSinkResult> finalize(const std::vector<ResultPartitionRef> &partitions,
+	                                           ClientContext &context) override {
+		auto result = finalize_copy(partitions, context);
+		if (result.is_err()) {
+			return DuckDBResult<FinalizedSinkResult>::err(result.error());
+		}
+		return DuckDBResult<FinalizedSinkResult>::ok(FinalizedSinkResult::MakeCopy(std::move(result).value()));
 	}
 
 	std::vector<std::string> multiline_display(bool /*verbose*/) const override {

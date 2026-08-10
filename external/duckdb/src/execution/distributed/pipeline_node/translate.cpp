@@ -17,6 +17,7 @@
 #include "duckdb/execution/operator/projection/physical_vllm.hpp"
 
 #include "duckdb/execution/operator/helper/physical_limit.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
@@ -312,6 +313,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			auto &batch_op = static_cast<PhysicalBatchCopyToFile &>(op);
 			node_impl = TranslateBatchCopyToFile(batch_op, children);
 		}
+		break;
+	}
+	case PhysicalOperatorType::DATA_SINK: {
+		auto &data_sink = static_cast<PhysicalDataSink &>(op);
+		node_impl = TranslateDataSink(data_sink, children);
 		break;
 	}
 	case PhysicalOperatorType::TABLE_SCAN: {

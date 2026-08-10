@@ -39,3 +39,8 @@ class Runner:
     def run_write(self, relation: Any) -> dict[str, Any]:
         """Execute a COPY/write relation through the runner."""
         ...
+
+    @abstractmethod
+    def run_data_sink(self, relation: Any) -> dict[str, Any]:
+        """Execute a first-class DataSink terminal relation."""
+        ...

@@ -35,6 +35,7 @@
 #include "duckdb/execution/distributed/pipeline_node/translator_api.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
+#include "duckdb/execution/distributed/pipeline_node/finalizable_sink.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
@@ -469,13 +470,14 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
-	/// Unified result type: streaming (SELECT) or finalized (COPY).
+	/// Unified result type: streaming (SELECT) or a finalized terminal sink.
 	struct PlanResult {
-		enum Tag { STREAMING, COPY };
+		enum Tag { STREAMING, COPY, DATA_SINK };
 		Tag tag;
-		// Only one of these is valid depending on tag
+		// Only one result field is valid depending on tag.
 		PlanResultStream stream;
 		DistributedCopyResult copy_result;
+		DistributedDataSinkResult data_sink_result;
 
 		// Streaming constructor
 		static PlanResult make_streaming(std::shared_ptr<PlanTaskExecutor> te,
@@ -493,11 +495,17 @@ public:
 			r.copy_result = std::move(cr);
 			return r;
 		}
+		static PlanResult make_data_sink(DistributedDataSinkResult result) {
+			PlanResult r;
+			r.tag = DATA_SINK;
+			r.data_sink_result = std::move(result);
+			return r;
+		}
 	};
 
 	/// Unified run_plan: auto-detects sink nodes and handles both streaming and finalize paths.
 	/// - Non-sink plans → returns PlanResultStream (streaming pull)
-	/// - Sink plans (CopyFinish) → collects all outputs, calls finalize(), returns DistributedCopyResult
+	/// - Sink plans → collect bounded worker results and call the sink's coordinator finalizer
 	DuckDBResult<PlanResult> run_plan(std::shared_ptr<DistributedPhysicalPlan> plan, TaskInputs initial_inputs = {}) {
 		if (!client_context_) {
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a ClientContext"));
@@ -557,47 +565,60 @@ public:
 		auto pipeline_node = pipeline_res.value();
 
 		// ── Step 2: Find sink node (if any) ──
-		std::shared_ptr<CopyFinishNode> sink_node;
+		std::shared_ptr<FinalizableSinkNode> sink_node;
+		bool multiple_sinks = false;
+		bool unsupported_sink = false;
 		std::function<void(const DistributedPipelineNodeRef &)> find_sink = [&](const DistributedPipelineNodeRef &n) {
-			if (!n || sink_node)
+			if (!n)
 				return;
 			auto impl = n->inner();
 			if (impl && impl->is_sink()) {
-				if (auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(impl)) {
-					sink_node = copy_finish;
-					return;
+				auto finalizable = std::dynamic_pointer_cast<FinalizableSinkNode>(impl);
+				if (!finalizable) {
+					unsupported_sink = true;
+				} else if (sink_node && sink_node.get() != finalizable.get()) {
+					multiple_sinks = true;
+				} else {
+					sink_node = std::move(finalizable);
 				}
 			}
 			for (auto &c : n->arc_children()) {
 				find_sink(c);
-				if (sink_node)
-					return;
 			}
 		};
 		find_sink(pipeline_node);
+		if (unsupported_sink) {
+			return DuckDBResult<PlanResult>::err(
+			    DuckDBError::invalid_state_error("pipeline contains a sink without a coordinator finalizer"));
+		}
+		if (multiple_sinks) {
+			return DuckDBResult<PlanResult>::err(
+			    DuckDBError::invalid_state_error("pipeline contains more than one terminal sink"));
+		}
+		auto copy_sink_node = std::dynamic_pointer_cast<CopyFinishNode>(sink_node);
 
 		std::string sink_base_path;
 		std::string sink_worker_base_path;
-		if (sink_node) {
+		if (copy_sink_node) {
 			auto &fs = FileSystem::GetFileSystem(*client_context_);
-			auto canonical_res = CanonicalDistributedCopyBasePath(fs, sink_node->spec());
+			auto canonical_res = CanonicalDistributedCopyBasePath(fs, copy_sink_node->spec());
 			if (canonical_res.is_err()) {
 				return DuckDBResult<PlanResult>::err(canonical_res.error());
 			}
 			sink_base_path = std::move(canonical_res).value();
-			auto worker_base_res = CanonicalDistributedCopyBasePath(fs, sink_node->spec().file_path);
+			auto worker_base_res = CanonicalDistributedCopyBasePath(fs, copy_sink_node->spec().file_path);
 			if (worker_base_res.is_err()) {
 				return DuckDBResult<PlanResult>::err(worker_base_res.error());
 			}
 			sink_worker_base_path = std::move(worker_base_res).value();
 		}
 
-		if (sink_node && sink_node->staging_root_base().empty()) {
+		if (copy_sink_node && copy_sink_node->staging_root_base().empty()) {
 			// Persist lifecycle metadata for explicit operator-managed cleanup. Starting a COPY must not age out
 			// other runs: elapsed time alone does not establish that another run is abandoned.
 			auto &fs = FileSystem::GetFileSystem(*client_context_);
 			auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(
-			    fs, sink_base_path, sink_node->staging_run_id(), 0, sink_worker_base_path);
+			    fs, sink_base_path, copy_sink_node->staging_run_id(), 0, sink_worker_base_path);
 			if (lifecycle_res.is_err()) {
 				return DuckDBResult<PlanResult>::err(lifecycle_res.error());
 			}
@@ -665,16 +686,19 @@ public:
 		}
 
 		// Sink path: collect all outputs, then finalize
-		auto sink_node_id = sink_node->copy_sink()->node_id();
+		auto sink_node_id = sink_node->result_node_id();
 		auto cleanup_sink_output = [&]() {
-			auto &fs = FileSystem::GetFileSystem(*client_context_);
-			if (sink_node->staging_root_base().empty()) {
-				CleanupDistributedCopyUncommittedDirectWriteRun(fs, sink_base_path, sink_node->staging_run_id());
+			if (!copy_sink_node) {
 				return;
 			}
-			auto staging_root = fs.JoinPath(sink_node->staging_root_base(), sink_node->staging_run_id());
+			auto &fs = FileSystem::GetFileSystem(*client_context_);
+			if (copy_sink_node->staging_root_base().empty()) {
+				CleanupDistributedCopyUncommittedDirectWriteRun(fs, sink_base_path, copy_sink_node->staging_run_id());
+				return;
+			}
+			auto staging_root = fs.JoinPath(copy_sink_node->staging_root_base(), copy_sink_node->staging_run_id());
 			RemoveDistributedCopyDirectoryTree(fs, staging_root);
-			RemoveDistributedCopyDirectoryIfEmpty(fs, sink_node->staging_root_base());
+			RemoveDistributedCopyDirectoryIfEmpty(fs, copy_sink_node->staging_root_base());
 		};
 		std::vector<ResultPartitionRef> partitions;
 		auto staging_write_started = std::chrono::steady_clock::now();
@@ -694,6 +718,11 @@ public:
 			}
 		}
 
+		// Closing the result channel means the root control task has stopped producing
+		// output, but a nested coordinator may still be recording its terminal error.
+		// Join the bounded set of plan-control tasks before deciding that a sink run
+		// succeeded, otherwise a failed shuffle can be mistaken for an empty result.
+		task_executor->WaitUntilIdle();
 		if (auto execute_error = execute_status->GetError()) {
 			cleanup_sink_output();
 			return DuckDBResult<PlanResult>::err(*execute_error);
@@ -704,9 +733,15 @@ public:
 		if (finalize_res.is_err()) {
 			return DuckDBResult<PlanResult>::err(finalize_res.error());
 		}
-		auto copy_result = std::move(finalize_res).value();
-		copy_result.staging_write_ms = staging_write_ms;
-		return DuckDBResult<PlanResult>::ok(PlanResult::make_copy(std::move(copy_result)));
+		auto finalized = std::move(finalize_res).value();
+		switch (finalized.tag) {
+		case FinalizedSinkResult::COPY:
+			finalized.copy_result.staging_write_ms = staging_write_ms;
+			return DuckDBResult<PlanResult>::ok(PlanResult::make_copy(std::move(finalized.copy_result)));
+		case FinalizedSinkResult::DATA_SINK:
+			return DuckDBResult<PlanResult>::ok(PlanResult::make_data_sink(std::move(finalized.data_sink_result)));
+		}
+		return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error("unknown finalized sink result"));
 	}
 
 	/// Legacy finalize_copy — kept for Python callers that use the streaming + manual finalize path.

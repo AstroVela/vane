@@ -67,6 +67,7 @@ Changelog = "https://github.com/AstroVela/vane/releases"
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
+turbopuffer = ["turbopuffer>=2.8.0,<3"]
 transformers = [
     "sentence-transformers",
     "torch",
@@ -90,6 +91,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "fsspec",  # used in filesystem support
     "openai>=1.66.0",
     "tiktoken",
+    "turbopuffer>=2.8.0,<3", # used by TurbopufferSink
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
     "pillow>=10", # used for image inputs and video frames
@@ -216,6 +218,7 @@ include = [
     "/tests/fast/test_ray_remote_exceptions.py",
     "/tests/fast/test_ray_result_contract.py",
     "/tests/fast/test_fte_production_readiness.py",
+    "/tests/fast/test_datasink.py",
     "/multimodal_inference_benchmarks/check_fte_production_readiness.py",
 
     # Source code and stubs
@@ -540,6 +543,8 @@ module = [
     "torch",
     "tensorflow",
     "tiktoken",
+    "turbopuffer",
+    "turbopuffer.*",
     "vllm",
     "vllm.*",
 ]

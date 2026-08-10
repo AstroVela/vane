@@ -49,6 +49,7 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/translate.cpp
     pipeline_node/translator_aggregate.cpp
     pipeline_node/translator_copy.cpp
+    pipeline_node/translator_data_sink.cpp
     pipeline_node/translator_join.cpp
     pipeline_node/translator_misc_unary.cpp
     pipeline_node/translator_order_limit.cpp

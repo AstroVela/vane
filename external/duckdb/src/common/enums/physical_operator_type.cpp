@@ -53,6 +53,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "FILTER";
 	case PhysicalOperatorType::PROJECTION:
 		return "PROJECTION";
+	case PhysicalOperatorType::DATA_SINK:
+		return "DATA_SINK";
 	case PhysicalOperatorType::VLLM_PROJECT:
 		return "VLLM_PROJECT";
 	case PhysicalOperatorType::COPY_TO_FILE:

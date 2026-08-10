@@ -95,6 +95,7 @@ Optional features are provided as extras:
 pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
+pip install 'vane-ai[turbopuffer]'  # Turbopuffer DataSink
 ```
 
 The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
@@ -104,6 +105,46 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
+
+### Turbopuffer writes
+
+`TurbopufferSink` performs columnar, ID-keyed upserts and returns a bounded
+`WriteSummary` instead of materializing the input relation on the driver:
+
+```python
+import pyarrow as pa
+import vane
+
+documents = vane.from_arrow(
+    pa.table(
+        {
+            "document_id": [1, 2],
+            "vector": [[0.1, 0.2], [0.3, 0.4]],
+            "text": ["first", "second"],
+        }
+    )
+)
+sink = vane.TurbopufferSink(
+    namespace="documents-v1",
+    id_column="document_id",
+    distance_metric="cosine_distance",
+    schema={"vector": {"type": "[2]f32", "ann": True}},
+)
+summary = documents.write_sink(sink, operation_id="documents-2026-08-10")
+assert summary.outcome is vane.WriteOutcome.COMMITTED
+```
+
+Set `TURBOPUFFER_API_KEY` in every worker process before execution. The secret
+is read lazily on the worker and is never embedded in the serialized query
+plan. A distributed task may be retried, so custom sinks must declare
+idempotent replay semantics; Turbopuffer writes satisfy this contract through
+ID-keyed upserts. Vane validates global ID uniqueness in the same lazy plan
+before sending each affected batch, because distributed batch completion order
+is unspecified. Reuse the same
+explicit `operation_id` when retrying an operation whose outcome was reported
+as unknown. A committed summary can contain bounded `summary.warnings` when the
+external write completed but internal execution resources could not be fully
+cleaned up.
 
 ### Execution Policy
 

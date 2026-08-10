@@ -6437,6 +6437,21 @@ class RayQueryDriverActor:
         )
         return await self._await_copy_operation(task)
 
+    async def run_data_sink_plan(
+        self,
+        owner_id: str,
+        session_id: str,
+        plan: Any,
+    ) -> dict[str, Any]:
+        """Run one first-class DataSink terminal plan."""
+        session = self._require_session(owner_id, session_id)
+        self._validate_plan_session(session_id, plan, session)
+        self._begin_session_operation(session, session_id)
+        try:
+            return await self._run_data_sink_plan_for_session(session_id, session, plan)
+        finally:
+            self._end_session_operation(session)
+
     async def _recover_copy_operation(
         self,
         owner_id: str,
@@ -6627,11 +6642,12 @@ class RayQueryDriverActor:
         plan_execution: asyncio.Task[Any] | None = None
         try:
             plan, query_connection = await _to_thread_with_owned_side_effects(
-                self._prepare_copy_plan_sync,
+                self._prepare_terminal_plan_sync,
                 session_id,
                 session,
                 logical_plan,
                 plan_id,
+                "COPY",
             )
             self._plan_query_ids[plan_id] = plan_id
             graph, _ = await self._register_query_resources(
@@ -6824,20 +6840,140 @@ class RayQueryDriverActor:
             cleanup_warnings=cleanup_warnings,
         )
 
-    def _prepare_copy_plan_sync(
+    async def _run_data_sink_plan_for_session(
+        self,
+        session_id: str,
+        session: _DriverSession,
+        logical_plan: Any,
+    ) -> dict[str, Any]:
+        plan_id = str(logical_plan.idx())
+        graph = None
+        plan_runner_started = False
+        plan_execution: asyncio.Task[Any] | None = None
+        try:
+            plan, query_connection = await _to_thread_with_owned_side_effects(
+                self._prepare_terminal_plan_sync,
+                session_id,
+                session,
+                logical_plan,
+                plan_id,
+                "DataSink",
+            )
+            self._plan_query_ids[plan_id] = plan_id
+            graph, _ = await self._register_query_resources(
+                plan,
+                query_connection=query_connection,
+                expected_plan_id=plan_id,
+            )
+            self._plan_query_ids[plan_id] = str(graph.query_id)
+            await _to_thread_with_owned_side_effects(
+                self._precreate_udf_actors,
+                plan,
+                graph,
+                query_connection=query_connection,
+                session_config=session.config,
+            )
+            await _to_thread_with_owned_side_effects(
+                self._precreate_vllm_actors,
+                plan,
+                query_connection=query_connection,
+                session_config=session.config,
+            )
+            plan_runner = self._get_plan_runner()
+            plan_runner_started = True
+            plan_execution = asyncio.create_task(
+                asyncio.to_thread(plan_runner.run_data_sink_plan, plan, query_connection),
+                name=f"vane-data-sink-plan:{plan_id}",
+            )
+            result = await asyncio.shield(plan_execution)
+            if not isinstance(result, Mapping):
+                raise TypeError(f"native DataSink returned {type(result).__name__}, expected a mapping")
+        except BaseException as execution_error:
+            query_id = self._plan_query_ids.get(plan_id, "")
+            teardown_error: BaseException | None = None
+            try:
+                await _to_thread_with_owned_side_effects(
+                    self._teardown_plan_resources,
+                    plan_id,
+                    query_id,
+                    drop_fragments=plan_runner_started,
+                )
+            except asyncio.CancelledError:
+                pass
+            except BaseException as error:
+                teardown_error = error
+            completed_result: Mapping[str, Any] | None = None
+            if plan_execution is not None:
+                if not plan_execution.done():
+                    try:
+                        await asyncio.shield(plan_execution)
+                    except BaseException:
+                        pass
+                # A client cancellation can win the race with native terminal
+                # completion. Always retrieve the final result or exception so
+                # the asyncio task cannot escape as an unobserved failure.
+                try:
+                    observed_result = plan_execution.result()
+                except BaseException:
+                    pass
+                else:
+                    if isinstance(observed_result, Mapping):
+                        completed_result = observed_result
+            if completed_result is not None:
+                public_result = dict(completed_result)
+                raw_warnings = public_result.get("data_sink_cleanup_warnings")
+                warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+                warnings.append(
+                    self._copy_cleanup_warning(
+                        "DataSink post-write execution finalization",
+                        execution_error,
+                    )
+                )
+                if teardown_error is not None:
+                    warnings.append(self._copy_cleanup_warning("DataSink post-write teardown", teardown_error))
+                public_result["data_sink_cleanup_warnings"] = warnings
+                return public_result
+            if teardown_error is not None:
+                raise QueryExecutionCleanupError.from_errors(
+                    f"DataSink query plan {plan_id} failed and teardown also failed",
+                    execution_error,
+                    [teardown_error],
+                ) from execution_error
+            raise
+
+        public_result = dict(result)
+        query_id = str(graph.query_id)
+        try:
+            await _to_thread_with_owned_side_effects(
+                self._teardown_plan_resources,
+                plan_id,
+                query_id,
+                drop_fragments=True,
+            )
+        except asyncio.CancelledError:
+            pass
+        except BaseException as teardown_error:
+            raw_warnings = public_result.get("data_sink_cleanup_warnings")
+            warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+            warnings.append(self._copy_cleanup_warning("DataSink post-execution teardown", teardown_error))
+            public_result["data_sink_cleanup_warnings"] = warnings
+        return public_result
+
+    def _prepare_terminal_plan_sync(
         self,
         session_id: str,
         session: _DriverSession,
         logical_plan: Any,
         plan_id: str,
+        terminal_kind: str,
     ) -> tuple[Any, Any]:
-        """Build a COPY plan on an owned thread without blocking actor control RPCs."""
+        """Build a terminal plan on an owned thread without blocking actor control RPCs."""
         with session.operation_lock:
             query_connection = session.connection.cursor()
             with self._session_lock:
                 if self._sessions.get(str(session_id)) is not session:
                     query_connection.close()
-                    raise RuntimeError(f"Vane session closed during COPY startup: {session_id}")
+                    raise RuntimeError(f"Vane session closed during {terminal_kind} startup: {session_id}")
                 if plan_id in self._plan_session_ids:
                     query_connection.close()
                     raise RuntimeError(f"query plan identity is already active: {plan_id}")
@@ -7869,5 +8005,71 @@ class RayQueryDriverClient:
                 raise cleanup_failure
             safe_message = _safe_remote_error_message(e)
             if hasattr(e, "traceback_str") or hasattr(e, "cause"):
+                raise RuntimeError(safe_message) from None
+            raise
+
+    def run_data_sink_plan(self, plan: Any) -> dict[str, Any]:
+        """Execute a first-class DataSink plan and return bounded worker results."""
+        started_at = time.time()
+        try:
+            session_id, _, runner = self._ensure_session(plan)
+            plan_id = str(plan.idx())
+            future = runner.run_data_sink_plan.remote(
+                self._owner_id,
+                session_id,
+                plan,
+            )
+            progress = _RayProgressSession(
+                runner,
+                self._owner_id,
+                session_id,
+                plan_id,
+                started_at,
+            )
+            try:
+                result = progress.resolve(future)
+                if not isinstance(result, Mapping):
+                    raise TypeError(f"Ray DataSink operation {plan_id} returned a non-mapping result")
+                public_result = dict(result)
+            except BaseException as operation_error:
+                try:
+                    progress.finish(final_state=None)
+                except BaseException as cleanup_error:
+                    raise QueryExecutionCleanupError.from_errors(
+                        f"Ray DataSink operation {plan_id} failed and progress cleanup also failed",
+                        operation_error,
+                        [cleanup_error],
+                    ) from operation_error
+                raise
+            try:
+                progress.finish(final_state="FINISHED")
+            except BaseException as cleanup_error:
+                raw_warnings = public_result.get("data_sink_cleanup_warnings")
+                warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+                try:
+                    message = str(cleanup_error)
+                except BaseException:
+                    message = "<error message unavailable>"
+                warnings.append(
+                    f"DataSink client progress finalization failed: {type(cleanup_error).__name__}: {message}"
+                )
+                public_result["data_sink_cleanup_warnings"] = warnings
+            return public_result
+        except Exception as error:
+            cleanup_failure = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(error)
+                    if isinstance(candidate, QueryExecutionCleanupError)
+                ),
+                None,
+            )
+            if cleanup_failure is not None:
+                primary_error = getattr(cleanup_failure, "primary_error", None)
+                if isinstance(primary_error, BaseException):
+                    raise cleanup_failure from primary_error
+                raise cleanup_failure
+            safe_message = _safe_remote_error_message(error)
+            if hasattr(error, "traceback_str") or hasattr(error, "cause"):
                 raise RuntimeError(safe_message) from None
             raise

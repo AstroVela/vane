@@ -193,6 +193,23 @@ from vane._version import (
     version,
 )
 from vane.config import VaneConfig, configure, current_config
+from vane.datasink import (
+    BoundDataSink,
+    CommitProtocol,
+    DataSink,
+    DataSinkCapabilities,
+    DataSinkExecutionOptions,
+    DataSinkWriteError,
+    DataSinkWriter,
+    RetryMode,
+    TurbopufferSink,
+    WriteContext,
+    WriteOutcome,
+    WriteResult,
+    WriteState,
+    WriteSummary,
+    write_datasink,
+)
 from vane.value.constant import (
     BinaryValue,
     BitValue,
@@ -260,6 +277,7 @@ def set_runner_ray(
 # Short public aliases for the native classes.
 Connection = DuckDBPyConnection
 Relation = DuckDBPyRelation
+write_sink = write_datasink
 
 # Install Vane's relation conveniences after the native relation class exists.
 from vane.ai import _relation_patch as _relation_patch
@@ -268,6 +286,7 @@ _VANE_SUBMODULES = frozenset(
     {
         "adbc",
         "ai",
+        "datasink",
         "datasource",
         "execution",
         "experimental",
@@ -302,6 +321,7 @@ __all__: list[str] = [
     "BitValue",
     "BlobValue",
     "BooleanValue",
+    "BoundDataSink",
     "CSVLineTerminator",
     "CaseExpression",
     "CatalogException",
@@ -310,9 +330,15 @@ __all__: list[str] = [
     "Connection",
     "ConnectionException",
     "ConstantExpression",
+    "CommitProtocol",
     "ConstraintException",
     "ConversionException",
     "DataError",
+    "DataSink",
+    "DataSinkCapabilities",
+    "DataSinkExecutionOptions",
+    "DataSinkWriteError",
+    "DataSinkWriter",
     "DatabaseError",
     "DATETIME",
     "DateValue",
@@ -359,6 +385,7 @@ __all__: list[str] = [
     "PythonExceptionHandling",
     "RenderMode",
     "Relation",
+    "RetryMode",
     "ROWID",
     "SQLExpression",
     "SequenceException",
@@ -379,6 +406,7 @@ __all__: list[str] = [
     "TimestampTimeZoneValue",
     "TimestampValue",
     "TransactionException",
+    "TurbopufferSink",
     "TypeMismatchException",
     "UUIDValue",
     "UnionType",
@@ -389,6 +417,11 @@ __all__: list[str] = [
     "UnsignedShortValue",
     "Value",
     "Warning",
+    "WriteContext",
+    "WriteOutcome",
+    "WriteResult",
+    "WriteState",
+    "WriteSummary",
     "__formatted_python_version__",
     "__git_revision__",
     "__interactive__",
@@ -495,6 +528,8 @@ __all__: list[str] = [
     "view",
     "version",
     "write_csv",
+    "write_datasink",
+    "write_sink",
     "VaneConfig",
     "attach_function",
     "cls",

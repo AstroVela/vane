@@ -1107,6 +1107,35 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        py::arg("plan"), py::arg("conn") = py::none())
 	    .def(
+	        "run_data_sink_plan",
+	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj) -> py::dict {
+		        if (!py::isinstance<PyPhysicalPlanWrapper>(plan_obj)) {
+			        throw py::type_error("plan must be DistributedPhysicalPlan (PyPhysicalPlanWrapper)");
+		        }
+		        const auto *plan_ptr = plan_obj.cast<PyPhysicalPlanWrapper *>();
+		        if (!plan_ptr->IsInitialized()) {
+			        throw py::value_error(
+			            "DistributedPhysicalPlan is uninitialized; construct it via constructor/helper APIs");
+		        }
+
+		        duckdb::distributed::python::ray::SafePyObject keepalive;
+		        duckdb::shared_ptr<duckdb::ClientContext> client_context;
+		        if (!plan_ptr->worker_connection_.is_none()) {
+			        auto &py_conn = ExtractPyConnectionWrapper(plan_ptr->worker_connection_);
+			        client_context = py_conn.con.GetConnection().context;
+			        keepalive = duckdb::distributed::python::ray::SafePyObject(plan_ptr->worker_connection_);
+		        } else if (plan_ptr->client_context_) {
+			        client_context = plan_ptr->client_context_;
+		        } else if (!conn_obj.is_none()) {
+			        py::object resolved_conn = py::hasattr(conn_obj, "c") ? conn_obj.attr("c") : conn_obj;
+			        auto &py_conn = resolved_conn.cast<duckdb::DuckDBPyConnection &>();
+			        client_context = py_conn.con.GetConnection().context;
+			        keepalive = duckdb::distributed::python::ray::SafePyObject(resolved_conn);
+		        }
+		        return self.run_data_sink_plan(*plan_ptr, client_context, std::move(keepalive));
+	        },
+	        py::arg("plan"), py::arg("conn") = py::none())
+	    .def(
 	        "finalize_copy",
 	        [](PyPhysicalPlanWrapperRunner &self, py::list file_infos, py::str copy_spec_key, py::str staging_root,
 	           py::object conn_obj) -> py::object {

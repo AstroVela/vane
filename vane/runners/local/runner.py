@@ -118,6 +118,25 @@ def _record_unknown_copy_cleanup_errors(
     return True
 
 
+def _append_data_sink_cleanup_errors(
+    result: dict[str, Any] | None,
+    stage: str,
+    cleanup_errors: list[BaseException],
+) -> bool:
+    if result is None or not cleanup_errors:
+        return False
+    raw_warnings = result.get("data_sink_cleanup_warnings")
+    warnings = list(raw_warnings) if isinstance(raw_warnings, list) else []
+    for error in cleanup_errors:
+        try:
+            message = str(error)
+        except BaseException:
+            message = "<error message unavailable>"
+        warnings.append(f"{stage} failed: {type(error).__name__}: {message}")
+    result["data_sink_cleanup_warnings"] = warnings
+    return True
+
+
 def _shutdown_udf_actor_pools(actor_pools: list[Any], *, kill: bool) -> list[BaseException]:
     errors: list[BaseException] = []
     for pool in reversed(actor_pools):
@@ -428,6 +447,18 @@ class LocalRunner(Runner):
         )
 
     def run_write(self, relation: Any) -> dict[str, Any]:
+        return self._run_terminal(relation, native_method="run_copy_plan", require_known_copy_outcome=True)
+
+    def run_data_sink(self, relation: Any) -> dict[str, Any]:
+        return self._run_terminal(relation, native_method="run_data_sink_plan", require_known_copy_outcome=False)
+
+    def _run_terminal(
+        self,
+        relation: Any,
+        *,
+        native_method: str,
+        require_known_copy_outcome: bool,
+    ) -> dict[str, Any]:
         import vane
 
         _preload_arrow_dataset_imports()
@@ -447,6 +478,7 @@ class LocalRunner(Runner):
         udf_actor_pools: list[Any] = []
         renderer = None
         write_succeeded = False
+        terminal_result: dict[str, Any] | None = None
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
             from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
@@ -464,32 +496,55 @@ class LocalRunner(Runner):
                 renderer = ProgressRenderer(lambda: self._progress_snapshot(backend, query_id, started_at))
 
             def execute_write() -> dict[str, Any]:
-                result = plan_runner.run_copy_plan(physical_plan, conn)
+                run_native = getattr(plan_runner, native_method)
+                result = run_native(physical_plan, conn)
                 if not isinstance(result, dict):
-                    raise TypeError("DistributedPhysicalPlanRunner.run_copy_plan() must return a dict")
+                    raise TypeError(f"DistributedPhysicalPlanRunner.{native_method}() must return a dict")
                 return result
 
-            write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-write")
+            def validate_result(result: dict[str, Any]) -> dict[str, Any]:
+                if require_known_copy_outcome:
+                    return _require_known_copy_outcome(query_id, result)
+                return result
+
+            write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-terminal")
+            progress_update_errors: list[BaseException] = []
+            progress_updates_enabled = True
             try:
                 future = write_executor.submit(execute_write)
                 if renderer is None:
-                    result = _require_known_copy_outcome(query_id, future.result())
+                    terminal_result = validate_result(future.result())
                     write_succeeded = True
-                    return result
+                    return terminal_result
                 while True:
                     try:
-                        result = _require_known_copy_outcome(
-                            query_id,
-                            future.result(timeout=renderer.interval_s),
-                        )
+                        terminal_result = validate_result(future.result(timeout=renderer.interval_s))
                         write_succeeded = True
                         break
                     except TimeoutError:
-                        renderer.update()
-                renderer.update(force=True)
-                return result
+                        if progress_updates_enabled:
+                            try:
+                                renderer.update()
+                            except Exception as error:
+                                if require_known_copy_outcome:
+                                    raise
+                                progress_update_errors.append(error)
+                                progress_updates_enabled = False
+                if progress_updates_enabled:
+                    try:
+                        renderer.update(force=True)
+                    except Exception as error:
+                        if require_known_copy_outcome:
+                            raise
+                        progress_update_errors.append(error)
+                _append_data_sink_cleanup_errors(
+                    terminal_result,
+                    "progress update",
+                    progress_update_errors,
+                )
+                return terminal_result
             except Exception:
-                if renderer is not None:
+                if renderer is not None and progress_updates_enabled:
                     try:
                         renderer.update(force=True)
                     except Exception:
@@ -504,27 +559,35 @@ class LocalRunner(Runner):
                     try:
                         renderer.finish(final_state="FINISHED" if write_succeeded else None)
                     except Exception as error:
-                        if (
-                            not _record_unknown_copy_cleanup_errors(
-                                primary_error,
+                        recorded = _record_unknown_copy_cleanup_errors(
+                            primary_error,
+                            "progress finalization",
+                            [error],
+                        )
+                        if not recorded and primary_error is None:
+                            recorded = not require_known_copy_outcome and _append_data_sink_cleanup_errors(
+                                terminal_result,
                                 "progress finalization",
                                 [error],
                             )
-                            and primary_error is None
-                        ):
+                        if not recorded and primary_error is None:
                             progress_error = error
                 shutdown_error: Exception | None = None
                 try:
                     write_executor.shutdown(wait=True)
                 except Exception as error:
-                    if (
-                        not _record_unknown_copy_cleanup_errors(
-                            primary_error,
+                    recorded = _record_unknown_copy_cleanup_errors(
+                        primary_error,
+                        "write executor shutdown",
+                        [error],
+                    )
+                    if not recorded and primary_error is None:
+                        recorded = not require_known_copy_outcome and _append_data_sink_cleanup_errors(
+                            terminal_result,
                             "write executor shutdown",
                             [error],
                         )
-                        and primary_error is None
-                    ):
+                    if not recorded and primary_error is None:
                         shutdown_error = error
                 if shutdown_error is not None:
                     raise shutdown_error
@@ -546,5 +609,13 @@ class LocalRunner(Runner):
                 cleanup_errors,
             )
             if write_succeeded and primary_error is None and cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
+                if require_known_copy_outcome:
+                    details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                    raise RuntimeError(f"failed to shut down local terminal resources: {details}") from cleanup_errors[
+                        0
+                    ]
+                _append_data_sink_cleanup_errors(
+                    terminal_result,
+                    "local DataSink resource shutdown",
+                    cleanup_errors,
+                )

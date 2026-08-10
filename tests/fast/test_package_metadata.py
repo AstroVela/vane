@@ -310,6 +310,13 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
     assert "vllm" in _requirements_for_extra("vllm")
+    assert _requirements_for_extra("turbopuffer") == {"turbopuffer"}
+
+
+def test_turbopuffer_extra_requires_the_supported_sdk_major_version():
+    turbopuffer = _requirement_for_extra("turbopuffer", "turbopuffer")
+
+    assert turbopuffer.specifier == SpecifierSet(">=2.8.0,<3")
 
 
 def test_structured_provider_extras_require_supported_sdk_versions():

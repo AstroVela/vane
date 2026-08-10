@@ -309,6 +309,14 @@ def _run_actor_copy_plan(runner, plan):
     )
 
 
+def _run_actor_data_sink_plan(runner, plan):
+    return runner.run_data_sink_plan(
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan,
+    )
+
+
 def _run_actor_stream_plan(runner, plan):
     return runner.run_plan(
         _TEST_RUNTIME_OWNER_ID,
@@ -1511,6 +1519,100 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
     assert recovered.outcome == outcome
     assert plan_calls == 1
     assert teardown_started.is_set()
+
+
+def test_query_driver_data_sink_cancellation_preserves_native_success(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "data-sink-native-success-during-cancellation"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    native_started = threading.Event()
+    native_release = threading.Event()
+    teardown_started = threading.Event()
+
+    native_result = {
+        "operation_id": "data-sink-operation",
+        "write_results": [],
+        "data_sink_cleanup_warnings": [],
+    }
+
+    class _PlanRunner:
+        @staticmethod
+        def run_data_sink_plan(_plan, _conn):
+            native_started.set()
+            assert native_release.wait(timeout=2.0)
+            return native_result
+
+    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+        assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
+        teardown_started.set()
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def _cancel_while_native_write_is_running():
+        data_sink_task = asyncio.create_task(_run_actor_data_sink_plan(runner, logical_plan))
+        assert await asyncio.to_thread(native_started.wait, 1.0)
+        data_sink_task.cancel()
+        assert await asyncio.to_thread(teardown_started.wait, 1.0)
+        native_release.set()
+        return await asyncio.wait_for(data_sink_task, timeout=1.0)
+
+    result = asyncio.run(_cancel_while_native_write_is_running())
+
+    assert result["operation_id"] == "data-sink-operation"
+    assert result["write_results"] == []
+    assert "CancelledError" in result["data_sink_cleanup_warnings"][0]
+    assert native_result["data_sink_cleanup_warnings"] == []
+    assert runner._sessions[_TEST_SESSION_ID].active_operations == 0
+    assert plan_id not in runner._plan_session_ids
+
+
+def test_ray_query_driver_client_preserves_data_sink_result_when_progress_cleanup_fails(monkeypatch):
+    result_ref = object()
+    native_result = {
+        "operation_id": "data-sink-progress-cleanup",
+        "write_results": [],
+        "data_sink_cleanup_warnings": [],
+    }
+
+    class _RemoteMethod:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return result_ref
+
+    class _ProgressSession:
+        def __init__(self, *_args):
+            pass
+
+        @staticmethod
+        def resolve(ref):
+            assert ref is result_ref
+            return native_result
+
+        @staticmethod
+        def finish(**kwargs):
+            assert kwargs == {"final_state": "FINISHED"}
+            raise RuntimeError("planned progress cleanup failure")
+
+    remote_method = _RemoteMethod()
+    monkeypatch.setattr(driver, "_RayProgressSession", _ProgressSession)
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = SimpleNamespace(run_data_sink_plan=remote_method)
+
+    result = client.run_data_sink_plan(_FakePhysicalPlanWithoutPlanAttr("data-sink-progress-cleanup"))
+
+    assert result["operation_id"] == "data-sink-progress-cleanup"
+    assert "planned progress cleanup failure" in result["data_sink_cleanup_warnings"][0]
+    assert len(remote_method.calls) == 1
 
 
 def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkeypatch):
@@ -3596,12 +3698,13 @@ def test_driver_rejects_active_plan_identity_collision(copy_plan):
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="query plan identity is already active"):
         if copy_plan:
-            cls._prepare_copy_plan_sync(
+            cls._prepare_terminal_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
                 plan_id,
+                "COPY",
             )
         else:
             cls._prepare_plan_sync(
@@ -3644,12 +3747,13 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
 
     with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
         if copy_plan:
-            cls._prepare_copy_plan_sync(
+            cls._prepare_terminal_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
                 "s3-config-plan",
+                "COPY",
             )
         else:
             cls._prepare_plan_sync(
@@ -3704,12 +3808,13 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
 
     with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
         if copy_plan:
-            cls._prepare_copy_plan_sync(
+            cls._prepare_terminal_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _LogicalPlan(),
                 "explicit-s3-config-plan",
+                "COPY",
             )
         else:
             cls._prepare_plan_sync(
@@ -3851,12 +3956,13 @@ def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="logical/physical query plan identity changed"):
         if copy_plan:
-            cls._prepare_copy_plan_sync(
+            cls._prepare_terminal_plan_sync(
                 runner,
                 _TEST_SESSION_ID,
                 session,
                 _ChangedIdentityLogicalPlan(),
                 "logical-plan",
+                "COPY",
             )
         else:
             cls._prepare_plan_sync(

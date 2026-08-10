@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -71,8 +72,13 @@ public:
 		auto task_ptr = std::make_shared<TaskFunc>(std::forward<F>(task));
 		auto client_context = client_context_;
 		auto status = status_;
+		auto task_state = task_state_;
+		{
+			std::lock_guard<std::mutex> lock(task_state->mutex);
+			task_state->active_tasks++;
+		}
 		try {
-			std::thread worker([task_ptr, client_context, status]() mutable {
+			std::thread worker([task_ptr, client_context, status, task_state]() mutable {
 				try {
 					TaskNotifier task_notifier(client_context.get());
 					(*task_ptr)();
@@ -81,18 +87,42 @@ public:
 				} catch (...) {
 					status->RecordError(DuckDBError::external_error("plan-control task threw unknown exception"));
 				}
+				{
+					std::lock_guard<std::mutex> lock(task_state->mutex);
+					D_ASSERT(task_state->active_tasks > 0);
+					task_state->active_tasks--;
+				}
+				task_state->idle.notify_all();
 			});
 			worker.detach();
 		} catch (const std::exception &ex) {
+			{
+				std::lock_guard<std::mutex> lock(task_state->mutex);
+				D_ASSERT(task_state->active_tasks > 0);
+				task_state->active_tasks--;
+			}
+			task_state->idle.notify_all();
 			status->RecordError(
 			    DuckDBError::external_error(std::string("failed to start plan-control task: ") + ex.what()));
 			throw;
 		}
 	}
 
+	void WaitUntilIdle() const {
+		std::unique_lock<std::mutex> lock(task_state_->mutex);
+		task_state_->idle.wait(lock, [&]() { return task_state_->active_tasks == 0; });
+	}
+
 private:
+	struct TaskState {
+		std::mutex mutex;
+		std::condition_variable idle;
+		idx_t active_tasks = 0;
+	};
+
 	duckdb::shared_ptr<ClientContext> client_context_;
 	std::shared_ptr<PlanExecutionStatus> status_;
+	std::shared_ptr<TaskState> task_state_ = std::make_shared<TaskState>();
 };
 
 } // namespace distributed
