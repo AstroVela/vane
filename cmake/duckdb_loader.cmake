@@ -661,6 +661,10 @@ function(duckdb_add_library target_name)
 
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
+  if(TARGET clangd_cache)
+    add_custom_target(vane_duckdb_clangd_cache ALL)
+    add_dependencies(vane_duckdb_clangd_cache clangd_cache)
+  endif()
   _duckdb_enable_identity_refresh()
 
   # Create clean interface target
