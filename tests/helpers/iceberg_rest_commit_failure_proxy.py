@@ -11,7 +11,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -33,7 +32,7 @@ class _ProxyState:
         self.upstream_port = parsed.port or 80
         self.upstream_path = parsed.path.rstrip("/")
         self.lock = threading.Lock()
-        self.reject_commits = False
+        self.commit_fault: str | None = None
         self.commit_attempts = 0
         self.get_cache: dict[str, tuple[int, str, list[tuple[str, str]], bytes]] = {}
 
@@ -82,11 +81,14 @@ class _ProxyState:
         content_length = int(handler.headers.get("Content-Length", "0"))
         body = handler.rfile.read(content_length) if content_length else b""
         with self.lock:
-            reject_commit = self.reject_commits and self.is_table_commit(handler.command, handler.path)
-            if reject_commit:
+            active_fault = self.commit_fault
+            commit_fault = active_fault if self.is_table_commit(handler.command, handler.path) else None
+            if commit_fault is not None:
                 self.commit_attempts += 1
-            cached_get = self.get_cache.get(handler.path) if self.reject_commits and handler.command == "GET" else None
-        if reject_commit:
+            cached_get = (
+                self.get_cache.get(handler.path) if active_fault == "reject" and handler.command == "GET" else None
+            )
+        if commit_fault == "reject":
             response = json.dumps(
                 {
                     "error": {
@@ -118,6 +120,18 @@ class _ProxyState:
             upstream_response = connection.getresponse()
             response = upstream_response.read()
             response_headers = upstream_response.getheaders()
+            if commit_fault == "lose-response" and upstream_response.status < 400:
+                response = json.dumps(
+                    {
+                        "error": {
+                            "message": "planned catalog commit response loss after upstream success",
+                            "type": "CommitStateUnknownException",
+                            "code": 502,
+                        }
+                    }
+                ).encode()
+                self.respond(handler, 502, "Bad Gateway", [("Content-Type", "application/json")], response)
+                return
             if handler.command == "GET" and upstream_response.status < 400:
                 with self.lock:
                     self.get_cache[handler.path] = (
@@ -175,7 +189,12 @@ def _serve(upstream_endpoint: str) -> None:
         def do_POST(self) -> None:  # noqa: N802
             if self.path == "/__vane_fault/reject":
                 with state.lock:
-                    state.reject_commits = True
+                    state.commit_fault = "reject"
+                state.respond(self, 200, "OK", [], b"")
+                return
+            if self.path == "/__vane_fault/lose-commit-response":
+                with state.lock:
+                    state.commit_fault = "lose-response"
                 state.respond(self, 200, "OK", [], b"")
                 return
             if self.path == "/__vane_fault/shutdown":

@@ -46,8 +46,28 @@ index 027f12bf..e1044c67 100644
  
  	bool IsSink() const override {
  		return true;
+diff --git a/src/include/storage/iceberg_transaction.hpp b/src/include/storage/iceberg_transaction.hpp
+index 511f1490..9763070e 100644
+--- a/src/include/storage/iceberg_transaction.hpp
++++ b/src/include/storage/iceberg_transaction.hpp
+@@ -53,6 +53,7 @@ public:
+ 	void RecordTableRequest(const string &table_key, idx_t sequence_number, idx_t snapshot_id);
+ 	void RecordTableRequest(const string &table_key);
+ 	TableInfoCache GetTableRequestResult(const string &table_key);
++	void RetainFilesOnCommitFailure();
+ 
+ private:
+ 	void CleanupFiles();
+@@ -83,6 +84,7 @@ public:
+ 
+ 	case_insensitive_set_t created_secrets;
+ 	case_insensitive_set_t looked_up_entries;
++	bool retain_files_on_commit_failure = false;
+ };
+ 
+ template <typename Callback>
 diff --git a/src/storage/iceberg_insert.cpp b/src/storage/iceberg_insert.cpp
-index 31356682..08be04de 100644
+index 31356682..7d797227 100644
 --- a/src/storage/iceberg_insert.cpp
 +++ b/src/storage/iceberg_insert.cpp
 @@ -292,7 +292,12 @@ SourceResultType IcebergInsert::GetDataInternal(ExecutionContext &context, DataC
@@ -63,7 +83,7 @@ index 31356682..08be04de 100644
  	auto &irc_table = table->Cast<IcebergTableEntry>();
  	auto &table_info = irc_table.table_info;
  	auto &transaction = IcebergTransaction::Get(context, table->catalog);
-@@ -304,7 +309,58 @@ SinkFinalizeType IcebergInsert::Finalize(Pipeline &pipeline, Event &event, Clien
+@@ -304,7 +309,60 @@ SinkFinalizeType IcebergInsert::Finalize(Pipeline &pipeline, Event &event, Clien
  			tbl.AddSnapshot(transaction, std::move(global_state.written_files));
  		});
  	}
@@ -119,11 +139,13 @@ index 31356682..08be04de 100644
 +	}
 +
 +	FinalizeWrittenFiles(global_state, context, table);
++	auto &transaction = IcebergTransaction::Get(context, table->catalog);
++	transaction.RetainFilesOnCommitFailure();
 +	return global_state.insert_count.load();
  }
  
  //===--------------------------------------------------------------------===//
-@@ -543,6 +599,7 @@ PhysicalOperator &IcebergCatalog::PlanCreateTableAs(ClientContext &context, Phys
+@@ -543,6 +601,7 @@ PhysicalOperator &IcebergCatalog::PlanCreateTableAs(ClientContext &context, Phys
  	auto &physical_copy = IcebergInsert::PlanCopyForInsert(context, planner, *info, plan);
  	physical_index_vector_t<idx_t> column_index_map;
  	auto &insert = planner.Make<IcebergInsert>(op, ic_table, column_index_map);
@@ -131,3 +153,29 @@ index 31356682..08be04de 100644
  
  	insert.children.push_back(physical_copy);
  	return insert;
+diff --git a/src/storage/iceberg_transaction.cpp b/src/storage/iceberg_transaction.cpp
+index 6e4d4d4e..b43092b3 100644
+--- a/src/storage/iceberg_transaction.cpp
++++ b/src/storage/iceberg_transaction.cpp
+@@ -350,7 +350,9 @@ void IcebergTransaction::Commit() {
+ 		DoSchemaDeletes(*temp_con_context);
+ 	} catch (std::exception &ex) {
+ 		ErrorData error(ex);
+-		CleanupFiles();
++		if (!retain_files_on_commit_failure) {
++			CleanupFiles();
++		}
+ 		DropSecrets(*temp_con_context);
+ 		temp_con.Rollback();
+ 		error.Throw("Failed to commit Iceberg transaction: ");
+@@ -483,6 +485,10 @@ void IcebergTransaction::Rollback() {
+ 	CleanupFiles();
+ }
+ 
++void IcebergTransaction::RetainFilesOnCommitFailure() {
++	retain_files_on_commit_failure = true;
++}
++
+ void IcebergTransaction::RecordTableRequest(const string &table_key, idx_t sequence_number, idx_t snapshot_id) {
+ 	requested_tables.emplace(table_key, TableInfoCache(sequence_number, snapshot_id));
+ }
