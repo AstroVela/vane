@@ -296,10 +296,10 @@ def _requirement_for_extra(extra, package, environment=None):
     return selected[0]
 
 
-def test_distribution_declares_alpha_version_and_apache_license_expression():
+def test_distribution_declares_release_version_and_apache_license_expression():
     package_metadata = metadata("vane-ai")
 
-    assert version("vane-ai") == "0.1.0a1"
+    assert version("vane-ai") == "0.1.0"
     assert package_metadata["License-Expression"] == "Apache-2.0"
     assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.15")
 

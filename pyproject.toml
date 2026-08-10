@@ -6,7 +6,7 @@
 
 [project]
 name = "vane-ai"
-version = "0.1.0a1"
+version = "0.1.0"
 description = "A distributed, multimodal data engine built on DuckDB and Ray"
 readme = "README.md"
 license = "Apache-2.0"
