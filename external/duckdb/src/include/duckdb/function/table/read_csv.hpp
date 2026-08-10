@@ -51,20 +51,41 @@ struct WriteCSVData : public BaseCSVData {
 	idx_t flush_size = 4096ULL * 8ULL;
 	//! Expressions used to convert the input into strings
 	vector<unique_ptr<Expression>> cast_expressions;
+	//! Original input types, used to reconstruct the casts after plan deserialization
+	vector<LogicalType> sql_types;
+
+	unique_ptr<FunctionData> Copy() const override;
+};
+
+struct SerializedCSVReaderOptions {
+	SerializedCSVReaderOptions() = default;
+	SerializedCSVReaderOptions(CSVReaderOptions options, MultiFileOptions file_options);
+	SerializedCSVReaderOptions(CSVOption<char> single_byte_delimiter, const CSVOption<string> &multi_byte_delimiter);
+
+	CSVReaderOptions options;
+	MultiFileOptions file_options;
+
+	void Serialize(Serializer &serializer) const;
+	static SerializedCSVReaderOptions Deserialize(Deserializer &deserializer);
 };
 
 struct ColumnInfo {
 	ColumnInfo() {
 	}
-	ColumnInfo(vector<std::string> names_p, vector<LogicalType> types_p) {
+	ColumnInfo(vector<std::string> names_p, vector<LogicalType> types_p, string file_path_p,
+	           SerializedCSVReaderOptions options_p) {
 		names = std::move(names_p);
 		types = std::move(types_p);
+		file_path = std::move(file_path_p);
+		options = std::move(options_p);
 	}
 	void Serialize(Serializer &serializer) const;
 	static ColumnInfo Deserialize(Deserializer &deserializer);
 
 	vector<std::string> names;
 	vector<LogicalType> types;
+	string file_path;
+	SerializedCSVReaderOptions options;
 };
 
 struct ReadCSVData : public BaseCSVData {
@@ -80,18 +101,7 @@ struct ReadCSVData : public BaseCSVData {
 	CSVSchema csv_schema;
 
 	void FinalizeRead(ClientContext &context);
-};
-
-struct SerializedCSVReaderOptions {
-	SerializedCSVReaderOptions() = default;
-	SerializedCSVReaderOptions(CSVReaderOptions options, MultiFileOptions file_options);
-	SerializedCSVReaderOptions(CSVOption<char> single_byte_delimiter, const CSVOption<string> &multi_byte_delimiter);
-
-	CSVReaderOptions options;
-	MultiFileOptions file_options;
-
-	void Serialize(Serializer &serializer) const;
-	static SerializedCSVReaderOptions Deserialize(Deserializer &deserializer);
+	unique_ptr<FunctionData> Copy() const override;
 };
 
 struct SerializedReadCSVData {
@@ -100,10 +110,17 @@ struct SerializedReadCSVData {
 	vector<string> csv_names;
 	vector<LogicalType> return_types;
 	vector<string> return_names;
-	idx_t filename_col_idx;
+	idx_t filename_col_idx {};
+	idx_t hive_partition_col_idx {};
 	SerializedCSVReaderOptions options;
 	MultiFileReaderBindData reader_bind;
 	vector<ColumnInfo> column_info;
+	vector<string> table_columns;
+	vector<bool> manually_set;
+	vector<string> csv_schema_names;
+	vector<LogicalType> csv_schema_types;
+	string csv_schema_path;
+	idx_t csv_schema_rows_read {};
 
 	void Serialize(Serializer &serializer) const;
 	static SerializedReadCSVData Deserialize(Deserializer &deserializer);

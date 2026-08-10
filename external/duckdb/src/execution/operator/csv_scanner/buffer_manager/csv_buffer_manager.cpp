@@ -1,5 +1,7 @@
 #include "duckdb/execution/operator/csv_scanner/csv_buffer_manager.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_buffer.hpp"
+#include "duckdb/execution/operator/csv_scanner/csv_scan_range.hpp"
+#include "duckdb/execution/operator/csv_scanner/scanner_boundary.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 namespace duckdb {
 
@@ -9,10 +11,29 @@ CSVBufferManager::CSVBufferManager(ClientContext &context_p, const CSVReaderOpti
     : context(context_p), per_file_single_threaded(per_file_single_threaded_p), file(file_p),
       buffer_size(options.buffer_size_option.GetValue()) {
 	D_ASSERT(!file.path.empty());
+	CSVScanRange scan_range;
+	const bool has_scan_range = CSVScanRange::TryGet(file, scan_range);
+	if (has_scan_range) {
+		if (!options.parallel) {
+			throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" requires parallel=true",
+			                            file.path);
+		}
+		if (options.GetSkipRows() > 0) {
+			throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" does not support skip_rows",
+			                            file.path);
+		}
+		if (options.store_rejects.GetValue()) {
+			throw InvalidInputException("Distributed CSV scanning does not support store_rejects");
+		}
+	}
 	if (file_handle_p) {
 		file_handle = std::move(file_handle_p);
 	} else {
-		file_handle = ReadCSV::OpenCSV(file, options, context);
+		file_handle = ReadCSV::OpenCSV(CSVScanRange::Strip(file), options, context);
+	}
+	if (has_scan_range) {
+		file_handle->SetScanRange(scan_range.start, scan_range.end,
+		                          MaxValue<idx_t>(2, CSVIterator::BytesPerThread(options)));
 	}
 	is_pipe = file_handle->IsPipe();
 	skip_rows = options.dialect_options.skip_rows.GetValue();
@@ -154,6 +175,18 @@ bool CSVBufferManager::IsBlockUnloaded(idx_t block_idx) {
 
 idx_t CSVBufferManager::GetBytesRead() const {
 	return bytes_read;
+}
+
+bool CSVBufferManager::HasScanRange() const {
+	return file_handle->HasScanRange();
+}
+
+idx_t CSVBufferManager::GetScanRangeStart() const {
+	return file_handle->ScanRangeStart();
+}
+
+idx_t CSVBufferManager::GetScanRangeSize() const {
+	return file_handle->FileSize();
 }
 
 } // namespace duckdb

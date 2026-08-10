@@ -4,12 +4,17 @@
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/enums/file_compression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan.hpp"
+#include "duckdb/execution/operator/csv_scanner/csv_scan_range.hpp"
+#include "duckdb/execution/operator/csv_scanner/scanner_boundary.hpp"
 #include "duckdb/function/extension_file_list_provider.hpp"
+#include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
@@ -124,6 +129,46 @@ size_t ResolveScanTaskTargetCount(size_t source_count, const DuckDBExecutionConf
 	return target;
 }
 
+size_t ResolveSingleCSVTaskCount(uint64_t file_size, const DuckDBExecutionConfig &exec_cfg,
+                                 const CSVReaderOptions &options) {
+	auto target = ResolveScanTaskTargetCount(1, exec_cfg);
+	if (target <= 1) {
+		return 1;
+	}
+	if (exec_cfg.scan_task_size_grouping_enabled() && exec_cfg.scan_task_min_partition_num() == 0 &&
+	    exec_cfg.scan_task_min_bytes() > 0) {
+		const auto size_limited_tasks = MaxValue<uint64_t>(1, file_size / exec_cfg.scan_task_min_bytes());
+		target = MinValue<uint64_t>(target, size_limited_tasks);
+	}
+	const auto minimum_range_size = MaxValue<idx_t>(2, CSVIterator::BytesPerThread(options));
+	const auto safe_range_count = MaxValue<uint64_t>(1, file_size / minimum_range_size);
+	return static_cast<size_t>(MinValue<uint64_t>(target, safe_range_count));
+}
+
+void ValidateSingleCSVSplit(const OpenFileInfo &file, const ReadCSVData &csv_data) {
+	if (!csv_data.options.parallel) {
+		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" requires parallel=true",
+		                            file.path);
+	}
+	if (csv_data.options.GetSkipRows() > 0) {
+		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" does not support skip_rows",
+		                            file.path);
+	}
+	if (StringUtil::Lower(csv_data.options.encoding) != "utf-8") {
+		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" requires UTF-8 input",
+		                            file.path);
+	}
+	const auto compression = csv_data.options.compression;
+	const bool compressed =
+	    compression == FileCompressionType::GZIP || compression == FileCompressionType::ZSTD ||
+	    (compression == FileCompressionType::AUTO_DETECT && (IsFileCompressed(file.path, FileCompressionType::GZIP) ||
+	                                                         IsFileCompressed(file.path, FileCompressionType::ZSTD)));
+	if (compressed) {
+		throw InvalidInputException("Distributed byte-range scanning requires an uncompressed CSV file: \"%s\"",
+		                            file.path);
+	}
+}
+
 std::vector<std::vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_tasks) {
 	std::vector<std::vector<idx_t>> groups;
 	if (count == 0) {
@@ -220,6 +265,24 @@ std::vector<uint64_t> GetFileSizesFromDB(const std::vector<OpenFileInfo> &files,
 	return sizes;
 }
 
+uint64_t GetRequiredFileSizeFromDB(const OpenFileInfo &file, const shared_ptr<DatabaseInstance> &db) {
+	if (!db) {
+		throw InvalidInputException("Distributed byte-range scanning requires database file-system access for \"%s\"",
+		                            file.path);
+	}
+	auto &fs = FileSystem::GetFileSystem(*db);
+	auto handle = fs.OpenFile(file, FileOpenFlags::FILE_FLAGS_READ);
+	if (!handle) {
+		throw IOException("Could not open CSV file \"%s\" while creating byte-range scan tasks", file.path);
+	}
+	const auto size = fs.GetFileSize(*handle);
+	if (size <= 0) {
+		throw InvalidInputException(
+		    "Distributed byte-range scanning requires a non-empty CSV file with a known size: \"%s\"", file.path);
+	}
+	return static_cast<uint64_t>(size);
+}
+
 } // namespace
 
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
@@ -248,6 +311,11 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 
 	vector<OpenFileInfo> files;
 	auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
+	auto *csv_data =
+	    multi_bind && multi_bind->bind_data ? dynamic_cast<ReadCSVData *>(multi_bind->bind_data.get()) : nullptr;
+	if (csv_data && csv_data->options.store_rejects.GetValue()) {
+		throw InvalidInputException("Distributed CSV scanning does not support store_rejects");
+	}
 	if (multi_bind && multi_bind->file_list) {
 		files = multi_bind->file_list->GetAllFiles();
 	} else {
@@ -317,6 +385,38 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 	};
 	if (files.size() == 1) {
 		ensure_file_sizes();
+		const auto requested_task_count = ResolveScanTaskTargetCount(1, exec_cfg);
+		if (csv_data && requested_task_count > 1) {
+			ValidateSingleCSVSplit(files.front(), *csv_data);
+			if (file_sizes.size() != 1 || total_file_bytes == 0) {
+				total_file_bytes = GetRequiredFileSizeFromDB(files.front(), db);
+				file_sizes = {total_file_bytes};
+			}
+			const auto task_count = ResolveSingleCSVTaskCount(total_file_bytes, exec_cfg, csv_data->options);
+			if (task_count > 1) {
+				const auto scan_unit_bytes = MaxValue<idx_t>(2, CSVIterator::BytesPerThread(csv_data->options));
+				const auto scan_unit_count = total_file_bytes / scan_unit_bytes;
+				const auto units_per_task = scan_unit_count / task_count;
+				const auto extra_units = scan_unit_count % task_count;
+				const auto rows_per_task = estimated_scan_rows / task_count;
+				const auto extra_rows = estimated_scan_rows % task_count;
+				uint64_t start = 0;
+				for (size_t task_idx = 0; task_idx < task_count; ++task_idx) {
+					const auto task_units = units_per_task + (task_idx < extra_units ? 1 : 0);
+					const auto end =
+					    task_idx + 1 == task_count ? total_file_bytes : start + task_units * scan_unit_bytes;
+					const auto task_bytes = end - start;
+					ScanTaskDescriptor task;
+					task.files.push_back(CSVScanRange::Set(files.front(), start, end));
+					task.estimated_cardinality = rows_per_task + (task_idx < extra_rows ? 1 : 0);
+					task.estimated_bytes = static_cast<idx_t>(task_bytes);
+					task.source_task_partition_id = task_idx;
+					tasks.push_back(std::move(task));
+					start = end;
+				}
+				return tasks;
+			}
+		}
 		ScanTaskDescriptor task;
 		task.files = std::move(files);
 		task.estimated_cardinality = estimated_scan_rows;

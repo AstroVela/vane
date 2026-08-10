@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import gzip
 import os
 
 import pytest
@@ -193,6 +194,183 @@ def test_scan_task_min_partition_num_can_exceed_worker_slots(monkeypatch, tmp_pa
         assert descriptor_counts == [8], (
             f"expected min partition count above worker slots to produce 8 descriptors, got {descriptor_counts}"
         )
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_single_csv_file_creates_byte_range_scan_tasks(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+
+    source_path = tmp_path / "single.csv"
+    source_path.write_text("id,label\n" + "".join(f"{i},value-{i}\n" for i in range(1000)), encoding="utf-8")
+
+    con = vane.connect()
+    try:
+        relation = con.sql(
+            f"""
+            SELECT *
+            FROM read_csv(
+                '{source_path}',
+                header=true,
+                auto_detect=false,
+                columns={{'id': 'INTEGER', 'label': 'VARCHAR'}},
+                buffer_size=4096,
+                max_line_size=1024
+            )
+            """
+        )
+        logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "single-csv-range-task-plan",
+        )
+        distributed_plan = logical_plan.to_physical_plan(con)
+        scan_tasks = distributed_plan.scan_task_descriptor_map()
+        assert [len(tasks) for tasks in scan_tasks.values()] == [4]
+        descriptors = next(iter(scan_tasks.values()))
+        assert [vane.ray_cxx.scan_task_source_partition_id(bytes(descriptor)) for descriptor in descriptors] == [
+            0,
+            1,
+            2,
+            3,
+        ]
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_single_compressed_csv_rejects_byte_range_scan_tasks(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "2")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
+
+    source_path = tmp_path / "single.csv.gz"
+    with gzip.open(source_path, "wt", encoding="utf-8") as csv_file:
+        csv_file.write("id,label\n1,one\n2,two\n")
+
+    con = vane.connect()
+    try:
+        relation = con.sql(f"SELECT * FROM read_csv_auto('{source_path}')")
+        logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "compressed-csv-range-task-plan",
+        )
+        distributed_plan = logical_plan.to_physical_plan(con)
+        with pytest.raises(vane.InvalidInputException, match="requires an uncompressed CSV file"):
+            distributed_plan.scan_task_descriptor_map()
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_single_csv_byte_range_scan_rejects_skip_rows(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "2")
+
+    source_path = tmp_path / "single-with-preamble.csv"
+    source_path.write_text("preamble\nid,label\n1,one\n2,two\n", encoding="utf-8")
+
+    con = vane.connect()
+    try:
+        relation = con.sql(
+            f"""
+            SELECT *
+            FROM read_csv(
+                '{source_path}',
+                skip=1,
+                header=true,
+                auto_detect=false,
+                columns={{'id': 'INTEGER', 'label': 'VARCHAR'}}
+            )
+            """
+        )
+        logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "csv-range-skip-rows-plan",
+        )
+        distributed_plan = logical_plan.to_physical_plan(con)
+        with pytest.raises(vane.InvalidInputException, match="does not support skip_rows"):
+            distributed_plan.scan_task_descriptor_map()
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize(
+    ("csv_option", "error_message"),
+    [
+        ("parallel=false", "requires parallel=true"),
+        ("encoding='utf-16'", "requires UTF-8 input"),
+    ],
+)
+def test_single_csv_byte_range_scan_rejects_unsupported_inputs(
+    monkeypatch,
+    tmp_path,
+    csv_option,
+    error_message,
+):
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "2")
+
+    source_path = tmp_path / "unsupported-range.csv"
+    source_path.write_text("id,label\n1,one\n2,two\n", encoding="utf-8")
+
+    con = vane.connect()
+    try:
+        relation = con.sql(
+            f"""
+            SELECT *
+            FROM read_csv(
+                '{source_path}',
+                header=true,
+                auto_detect=false,
+                columns={{'id': 'INTEGER', 'label': 'VARCHAR'}},
+                {csv_option}
+            )
+            """
+        )
+        logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "unsupported-csv-range-task-plan",
+        )
+        distributed_plan = logical_plan.to_physical_plan(con)
+        with pytest.raises(vane.InvalidInputException, match=error_message):
+            distributed_plan.scan_task_descriptor_map()
+    finally:
+        con.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_distributed_csv_scan_rejects_worker_local_reject_tables(tmp_path):
+    source_path = tmp_path / "malformed.csv"
+    source_path.write_text("id\n1\ninvalid\n", encoding="utf-8")
+
+    con = vane.connect()
+    try:
+        relation = con.sql(
+            f"""
+            SELECT *
+            FROM read_csv(
+                '{source_path}',
+                auto_detect=false,
+                columns={{'id': 'INTEGER'}},
+                store_rejects=true
+            )
+            """
+        )
+        logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "csv-store-rejects-plan",
+        )
+        distributed_plan = logical_plan.to_physical_plan(con)
+        with pytest.raises(vane.InvalidInputException, match="does not support store_rejects"):
+            distributed_plan.scan_task_descriptor_map()
     finally:
         con.close()
 
