@@ -8,12 +8,124 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <mutex>
 #include <unordered_map>
 
 namespace duckdb {
 namespace distributed {
+
+static bool ContainsStreamingUDF(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::STREAMING_UDF) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (ContainsStreamingUDF(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsGeneratedUDFStructProjection(const PhysicalProjection &projection, const DistributedCopySpec &spec) {
+	if (projection.children.size() != 1 || projection.children[0].get().type != PhysicalOperatorType::STREAMING_UDF ||
+	    projection.select_list.size() != spec.names.size() || spec.names.size() != spec.expected_types.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < projection.select_list.size(); i++) {
+		auto &expression = projection.select_list[i];
+		if (!expression || expression->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION ||
+		    expression->return_type != spec.expected_types[i]) {
+			return false;
+		}
+		auto &function = expression->Cast<BoundFunctionExpression>();
+		if (!StringUtil::CIEquals(function.function.name, "struct_extract") || function.children.size() != 2 ||
+		    !function.children[0] || function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+		    !function.children[1] || function.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return false;
+		}
+		auto &reference = function.children[0]->Cast<BoundReferenceExpression>();
+		auto &key = function.children[1]->Cast<BoundConstantExpression>().value;
+		if (reference.index != 0 || key.IsNull() || key.type().id() != LogicalTypeId::VARCHAR ||
+		    StringValue::Get(key) != spec.names[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static PhysicalStreamingUDF *FindTerminalStreamingUDF(PhysicalOperator &root, const DistributedCopySpec &spec) {
+	if (root.type == PhysicalOperatorType::STREAMING_UDF) {
+		return &root.Cast<PhysicalStreamingUDF>();
+	}
+	if (root.type == PhysicalOperatorType::PROJECTION) {
+		auto &projection = root.Cast<PhysicalProjection>();
+		if (IsGeneratedUDFStructProjection(projection, spec)) {
+			return &projection.children[0].get().Cast<PhysicalStreamingUDF>();
+		}
+	}
+	return nullptr;
+}
+
+static bool IsDefaultFilenamePattern(const FilenamePattern &pattern) {
+	static const string default_base = "data_";
+	return !pattern.HasUUID() && pattern.SerializeSegments().empty() && pattern.SerializeBase() == default_base &&
+	       pattern.SerializePos() == default_base.size();
+}
+
+static bool TryFuseTerminalUDFArrowSink(DuckPhysicalPlanRef &plan, DistributedCopySpec &spec,
+                                        const std::string &task_path) {
+	if (!spec.function.copy_to_get_arrow_write_options) {
+		return false;
+	}
+	auto &root = plan->Root();
+	auto terminal_udf = FindTerminalStreamingUDF(root, spec);
+	if (!terminal_udf) {
+		if (ContainsStreamingUDF(root)) {
+			throw NotImplementedException(
+			    "Arrow Parquet output requires the UDF to be the terminal relational operation");
+		}
+		return false;
+	}
+	if (spec.type != DistributedCopyType::COPY_TO_FILE) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support batch COPY");
+	}
+	if (spec.return_type == CopyFunctionReturnType::WRITTEN_FILE_STATISTICS) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support RETURN_STATS");
+	}
+	if (spec.partition_output) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support PARTITION_BY");
+	}
+	if (spec.rotate || spec.file_size_bytes.IsValid()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support file rotation");
+	}
+	if (spec.overwrite_mode == CopyOverwriteMode::COPY_APPEND) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support APPEND");
+	}
+	if (!IsDefaultFilenamePattern(spec.filename_pattern)) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support FILENAME_PATTERN");
+	}
+	if (spec.file_extension.empty()) {
+		throw InvalidInputException("terminal UDF Arrow Parquet output requires a file extension");
+	}
+	if (!spec.bind_data) {
+		throw InvalidInputException("terminal UDF Arrow Parquet output requires copy bind data");
+	}
+	if (spec.names.empty() || spec.names.size() != spec.expected_types.size()) {
+		throw InvalidInputException("terminal UDF Arrow Parquet output requires a complete output schema");
+	}
+
+	auto writer_options = spec.function.copy_to_get_arrow_write_options(*spec.bind_data);
+	terminal_udf->ConfigureTerminalArrowParquetSink(task_path, spec.file_extension, std::move(writer_options),
+	                                                spec.names, spec.expected_types, spec.write_empty_file);
+	plan->SetRoot(*terminal_udf);
+	return true;
+}
 
 static DuckPhysicalPlanRef AppendCopyOperator(DuckPhysicalPlanRef plan, DistributedCopySpec spec,
                                               const std::string &task_path) {
@@ -22,6 +134,9 @@ static DuckPhysicalPlanRef AppendCopyOperator(DuckPhysicalPlanRef plan, Distribu
 	}
 	if (!spec.bind_data) {
 		throw InvalidInputException("CopySinkNode: copy bind_data is null");
+	}
+	if (TryFuseTerminalUDFArrowSink(plan, spec, task_path)) {
+		return plan;
 	}
 	auto &old_root = plan->Root();
 	auto worker_return_type = CopyFunctionReturnType::WRITTEN_FILE_STATISTICS;

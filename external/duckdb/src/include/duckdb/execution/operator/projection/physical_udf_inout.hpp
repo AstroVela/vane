@@ -91,6 +91,13 @@ public:
 		return projected_input;
 	}
 
+	void ConfigureTerminalArrowParquetSink(string output_directory, string file_extension, Value writer_options,
+	                                       const vector<string> &expected_names,
+	                                       const vector<LogicalType> &expected_types, bool write_empty_file);
+	bool HasTerminalArrowParquetSink() const;
+	string GetTerminalArrowParquetOutputDirectory() const;
+	void SetTerminalArrowParquetOutputDirectory(string output_directory);
+
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	void SerializeOperatorData(Serializer &serializer) const override;
 

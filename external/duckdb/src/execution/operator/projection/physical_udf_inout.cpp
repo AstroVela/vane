@@ -21,6 +21,7 @@
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/external_block.hpp"
+#include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/function_serialization.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
@@ -395,15 +396,21 @@ static bool IsRowPreservingPythonUDFLayoutPayload(const Value &payload);
 struct UDFOperatorState : public OperatorState {
 	UDFOperatorState(Value payload_p, shared_ptr<void> actor_handles_p = nullptr)
 	    : payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
+		auto terminal_sink = GetStructBoolField(payload, "terminal_arrow_parquet_sink");
+		is_terminal_arrow_parquet_sink = terminal_sink.first && terminal_sink.second;
 		// is_flat_map = "result-only table UDF mode": no passthrough rows, output = UDF result only.
 		// row-preserving batch UDFs also carry output_schema, so classify by call_mode instead.
-		is_flat_map = ClassifyUDFMode(payload) == UDFMode::RESULT_ONLY_BATCH;
-		if (is_flat_map) {
+		is_flat_map = is_terminal_arrow_parquet_sink || ClassifyUDFMode(payload) == UDFMode::RESULT_ONLY_BATCH;
+		if (is_terminal_arrow_parquet_sink) {
+			output_names = GetCopyFunctionReturnNames(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+			output_types_declared = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+		} else if (is_flat_map) {
 			auto schema = ParsePayloadOutputSchema(payload);
 			output_names = std::move(schema.names);
 			output_types_declared = std::move(schema.types);
 		}
-		if (IsRowPreservingPythonUDFLayoutPayload(payload) && payload.type().id() == LogicalTypeId::STRUCT) {
+		if (!is_terminal_arrow_parquet_sink && IsRowPreservingPythonUDFLayoutPayload(payload) &&
+		    payload.type().id() == LogicalTypeId::STRUCT) {
 			auto &children = StructValue::GetChildren(payload);
 			auto child_count = StructType::GetChildCount(payload.type());
 			for (idx_t i = 0; i < child_count; i++) {
@@ -426,6 +433,7 @@ struct UDFOperatorState : public OperatorState {
 	idx_t submitted_batches = 0;
 	idx_t completed_batches = 0;
 	bool is_flat_map = false;
+	bool is_terminal_arrow_parquet_sink = false;
 	vector<string> output_names;
 	vector<LogicalType> output_types_declared;
 };
@@ -433,6 +441,9 @@ struct UDFOperatorState : public OperatorState {
 namespace {
 
 static bool UDFRequiresRowPreservingOutput(const UDFOperatorState &state) {
+	if (state.is_terminal_arrow_parquet_sink) {
+		return false;
+	}
 	if (!state.is_flat_map) {
 		return true;
 	}
@@ -2225,7 +2236,10 @@ static bool EnqueueStreamingDataEventLocked(StreamingUDFState &state, UDFOutputE
 		return false;
 	}
 
-	if (state.op->is_flat_map) {
+	if (state.op->is_terminal_arrow_parquet_sink) {
+		// The terminal writer already returns the six physical COPY statistics
+		// columns. Keep them flat so CopyFinishNode can parse them directly.
+	} else if (state.op->is_flat_map) {
 		PreserveFlatMapLazyOutputShape(*state.op, *event.ref_outputs);
 	} else {
 		PreserveScalarMapLazyOutputShape(*state.op, *event.ref_outputs);
@@ -2808,6 +2822,50 @@ static void FinishStreamingSubmissions(ClientContext &context, StreamingUDFState
 	state.op->executor->FinishedSubmitting(context);
 }
 
+static bool NeedsEmptyTerminalArrowParquetSink(const StreamingUDFState &state) {
+	if (state.submitted_batches.load(std::memory_order_relaxed) != 0 ||
+	    state.accepted_input_rows.load(std::memory_order_relaxed) != 0 || state.pending_rows != 0 ||
+	    state.reserved_rows != 0 || state.planned_submit.HasValue()) {
+		return false;
+	}
+	auto terminal_sink = GetStructBoolField(state.payload, "terminal_arrow_parquet_sink");
+	auto write_empty_file = GetStructBoolField(state.payload, "terminal_arrow_parquet_write_empty_file");
+	return terminal_sink.first && terminal_sink.second && write_empty_file.first && write_empty_file.second;
+}
+
+static bool TrySubmitEmptyTerminalArrowParquetSink(ExecutionContext &context, StreamingUDFState &state,
+                                                   const vector<LogicalType> &input_types,
+                                                   const unique_lock<mutex> &guard) {
+	state.VerifyLock(guard);
+	if (!NeedsEmptyTerminalArrowParquetSink(state)) {
+		return false;
+	}
+
+	EnsureStreamingExecutor(context, state, guard);
+	auto empty_input = make_uniq<DataChunk>();
+	empty_input->Initialize(context.client, input_types);
+	empty_input->SetCardinality(0);
+	vector<unique_ptr<DataChunk>> chunks;
+	chunks.push_back(std::move(empty_input));
+	idx_t submit_id = 0;
+	if (!TrySubmitMaterializedEnvelopeRaw(context, *state.op, chunks, 0, submit_id)) {
+		return false;
+	}
+
+	StreamingInflightBatch inflight;
+	inflight.submit_id = submit_id;
+	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
+	if (!inserted.second) {
+		throw InternalException("streaming UDF duplicate empty sink submit_id %llu",
+		                        static_cast<unsigned long long>(submit_id));
+	}
+	state.max_active_batches =
+	    MaxValue<idx_t>(state.max_active_batches, static_cast<idx_t>(state.inflight_batches.size()));
+	state.submitted_batches.fetch_add(1);
+	StreamingUDFDebugState(state, "submit_empty_terminal_arrow_parquet_sink", true);
+	return true;
+}
+
 static void DriveStreamingAfterSinkFinished(ExecutionContext &context, StreamingUDFState &state,
                                             unique_lock<mutex> &guard) {
 	state.VerifyLock(guard);
@@ -2818,7 +2876,11 @@ static void DriveStreamingAfterSinkFinished(ExecutionContext &context, Streaming
 	ThrowIfStreamingError(state);
 	DriveStreamingSubmits(context, state, guard, true);
 	ThrowIfStreamingError(state);
-	if (state.pending_rows == 0) {
+	// An empty terminal COPY still owes one synthetic submit. Admission can
+	// temporarily block that submit, and the source may run while Finalize is
+	// asleep. Do not close the executor in that window: otherwise the
+	// dispatcher can report completion before the empty-file submit exists.
+	if (state.pending_rows == 0 && !NeedsEmptyTerminalArrowParquetSink(state)) {
 		FinishStreamingSubmissions(context.client, state);
 	}
 	if (StreamingTerminalReady(state)) {
@@ -2835,6 +2897,86 @@ PhysicalStreamingUDF::PhysicalStreamingUDF(PhysicalPlan &physical_plan, vector<L
     : PhysicalOperator(physical_plan, PhysicalOperatorType::STREAMING_UDF, std::move(types), estimated_cardinality),
       function(std::move(function_p)), bind_data(std::move(bind_data_p)), column_ids(std::move(column_ids_p)),
       projected_input(std::move(project_input_p)) {
+}
+
+void PhysicalStreamingUDF::ConfigureTerminalArrowParquetSink(string output_directory, string file_extension,
+                                                             Value writer_options, const vector<string> &expected_names,
+                                                             const vector<LogicalType> &expected_types,
+                                                             bool write_empty_file) {
+	if (!bind_data) {
+		throw InvalidInputException("terminal UDF Arrow Parquet sink requires UDF bind data");
+	}
+	if (expected_names.size() != expected_types.size()) {
+		throw InvalidInputException("terminal UDF Arrow Parquet sink schema name/type count mismatch");
+	}
+	auto &udf_bind = bind_data->Cast<UDFFunctionData>();
+	if (udf_bind.payload.IsNull() || udf_bind.payload.type().id() != LogicalTypeId::STRUCT) {
+		throw InvalidInputException("terminal UDF Arrow Parquet sink requires a STRUCT UDF payload");
+	}
+
+	auto sink_names = expected_names;
+	if (ClassifyUDFMode(udf_bind.payload) == UDFMode::RESULT_ONLY_BATCH) {
+		auto output_schema = ParsePayloadOutputSchema(udf_bind.payload);
+		if (output_schema.names.size() != expected_types.size() || output_schema.types != expected_types) {
+			throw InvalidInputException("terminal UDF Arrow Parquet sink output_schema does not match COPY types");
+		}
+		// A single-column result-only UDF can reach the physical root without
+		// the generated struct-extract projection. In that shape COPY's bound
+		// name is the UDF expression text, while the actual Arrow table uses
+		// the declared output_schema name.
+		sink_names = std::move(output_schema.names);
+	}
+
+	vector<Value> name_values;
+	vector<Value> type_values;
+	name_values.reserve(sink_names.size());
+	type_values.reserve(expected_types.size());
+	for (idx_t i = 0; i < sink_names.size(); i++) {
+		name_values.emplace_back(sink_names[i]);
+		type_values.emplace_back(expected_types[i].ToString());
+	}
+
+	udf_bind.payload = ReplaceStructFields(
+	    udf_bind.payload,
+	    {{"terminal_arrow_parquet_sink", Value::BOOLEAN(true)},
+	     {"terminal_arrow_parquet_output_directory", Value(std::move(output_directory))},
+	     {"terminal_arrow_parquet_file_extension", Value(std::move(file_extension))},
+	     {"terminal_arrow_parquet_writer_options", std::move(writer_options)},
+	     {"terminal_arrow_parquet_expected_names", Value::LIST(LogicalType::VARCHAR, std::move(name_values))},
+	     {"terminal_arrow_parquet_expected_types", Value::LIST(LogicalType::VARCHAR, std::move(type_values))},
+	     {"terminal_arrow_parquet_write_empty_file", Value::BOOLEAN(write_empty_file)}});
+	types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+	lock_guard<mutex> guard(streaming_state_lock);
+	streaming_state.reset();
+}
+
+bool PhysicalStreamingUDF::HasTerminalArrowParquetSink() const {
+	if (!bind_data) {
+		return false;
+	}
+	auto &payload = bind_data->Cast<UDFFunctionData>().payload;
+	auto value = GetStructBoolField(payload, "terminal_arrow_parquet_sink");
+	return value.first && value.second;
+}
+
+string PhysicalStreamingUDF::GetTerminalArrowParquetOutputDirectory() const {
+	if (!bind_data) {
+		return string();
+	}
+	auto &payload = bind_data->Cast<UDFFunctionData>().payload;
+	auto value = GetStructStringField(payload, "terminal_arrow_parquet_output_directory");
+	return value.first ? value.second : string();
+}
+
+void PhysicalStreamingUDF::SetTerminalArrowParquetOutputDirectory(string output_directory) {
+	if (!HasTerminalArrowParquetSink()) {
+		throw InvalidInputException("cannot patch output directory on a non-terminal UDF Arrow Parquet sink");
+	}
+	auto &udf_bind = bind_data->Cast<UDFFunctionData>();
+	udf_bind.payload = ReplaceStructFields(
+	    udf_bind.payload, {{"terminal_arrow_parquet_output_directory", Value(std::move(output_directory))}});
+	lock_guard<mutex> guard(streaming_state_lock);
+	streaming_state.reset();
 }
 
 std::shared_ptr<StreamingUDFState> PhysicalStreamingUDF::GetStreamingState(ClientContext &) const {
@@ -3049,6 +3191,11 @@ SinkFinalizeType PhysicalStreamingUDF::Finalize(Pipeline &pipeline, Event &, Cli
 	ThrowIfStreamingError(state);
 	state.sink_finished = true;
 	StreamingUDFDebugState(state, "finalize_sink", true);
+	if (NeedsEmptyTerminalArrowParquetSink(state) &&
+	    !TrySubmitEmptyTerminalArrowParquetSink(execution_context, state, children[0].get().types, guard)) {
+		StreamingUDFDebugState(state, "finalize_empty_terminal_arrow_parquet_sink_blocked", true);
+		return BlockStreamingFinalize(state, guard, input.interrupt_state);
+	}
 	DriveStreamingAfterSinkFinished(execution_context, state, guard);
 	if (StreamingTerminalReady(state)) {
 		PreventStreamingBlocking(state, guard);

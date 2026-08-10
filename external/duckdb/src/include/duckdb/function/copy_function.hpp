@@ -163,6 +163,10 @@ typedef bool (*copy_rotate_next_file_t)(GlobalFunctionData &gstate, FunctionData
 typedef void (*copy_to_get_written_statistics_t)(ClientContext &context, FunctionData &bind_data,
                                                  GlobalFunctionData &gstate, CopyFunctionFileStatistics &statistics);
 
+//! Return format-specific options for a terminal Arrow writer. Formats that
+//! do not support direct Arrow output leave this callback unset.
+typedef Value (*copy_to_get_arrow_write_options_t)(const FunctionData &bind_data);
+
 typedef vector<unique_ptr<Expression>> (*copy_to_select_t)(CopyToSelectInput &input);
 
 typedef void (*copy_to_initialize_operator_t)(GlobalFunctionData &gstate, const PhysicalOperator &op);
@@ -195,6 +199,7 @@ public:
 	copy_to_initialize_local_t copy_to_initialize_local;
 	copy_to_initialize_global_t copy_to_initialize_global;
 	copy_to_get_written_statistics_t copy_to_get_written_statistics;
+	copy_to_get_arrow_write_options_t copy_to_get_arrow_write_options;
 	copy_to_sink_t copy_to_sink;
 	copy_to_combine_t copy_to_combine;
 	copy_to_finalize_t copy_to_finalize;

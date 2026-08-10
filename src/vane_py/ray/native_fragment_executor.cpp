@@ -1006,9 +1006,13 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 	// Determine which operator to modify
 	duckdb::PhysicalCopyToFile *copy_to_file = nullptr;
 	duckdb::PhysicalBatchCopyToFile *batch_copy = nullptr;
+	duckdb::PhysicalStreamingUDF *terminal_udf = nullptr;
 	std::string *file_path_ptr = nullptr;
 
-	if (root.type == duckdb::PhysicalOperatorType::COPY_TO_FILE) {
+	if (root.type == duckdb::PhysicalOperatorType::STREAMING_UDF &&
+	    root.Cast<duckdb::PhysicalStreamingUDF>().HasTerminalArrowParquetSink()) {
+		terminal_udf = &root.Cast<duckdb::PhysicalStreamingUDF>();
+	} else if (root.type == duckdb::PhysicalOperatorType::COPY_TO_FILE) {
 		copy_to_file = &root.Cast<duckdb::PhysicalCopyToFile>();
 		file_path_ptr = &copy_to_file->file_path;
 	} else if (root.type == duckdb::PhysicalOperatorType::BATCH_COPY_TO_FILE) {
@@ -1018,7 +1022,8 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 		return; // Not a COPY operator
 	}
 
-	if (!duckdb::distributed::IsDistributedCopyOutputPlaceholder(*file_path_ptr)) {
+	auto template_path = terminal_udf ? terminal_udf->GetTerminalArrowParquetOutputDirectory() : *file_path_ptr;
+	if (!duckdb::distributed::IsDistributedCopyOutputPlaceholder(template_path)) {
 		return; // Not a distributed placeholder — nothing to do
 	}
 
@@ -1035,7 +1040,17 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 
 	std::string task_dir;
 	if (direct_target_output) {
-		task_dir = info->remote_base;
+		if (terminal_udf) {
+			auto separator = std::string("/");
+			if (client_context) {
+				auto &fs = duckdb::FileSystem::GetFileSystem(*client_context);
+				separator = fs.PathSeparator(info->remote_base);
+			}
+			task_dir = duckdb::distributed::BuildCopyDirectWriteTaskDirectory(info->remote_base, info->run_id,
+			                                                                  worker_dir_name, separator);
+		} else {
+			task_dir = info->remote_base;
+		}
 	} else {
 		// Local FS: use staging directory
 		task_dir = info->base + "/" + info->run_id + "/" + worker_dir_name;
@@ -1047,6 +1062,11 @@ static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutpu
 		if (!fs.DirectoryExists(task_dir)) {
 			fs.CreateDirectoriesRecursive(task_dir);
 		}
+	}
+
+	if (terminal_udf) {
+		terminal_udf->SetTerminalArrowParquetOutputDirectory(std::move(task_dir));
+		return;
 	}
 
 	// Build the actual output path (file or directory depending on spec)
