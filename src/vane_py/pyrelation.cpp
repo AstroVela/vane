@@ -2011,6 +2011,9 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
+	if (TryDispatchToRunner(insert, connection_owner)) {
+		return;
+	}
 	PyExecuteRelation(insert);
 }
 

@@ -51,8 +51,10 @@
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 
 #include "duckdb/main/connection.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/execution/distributed/pipeline_node/grouping_set_expand.hpp"
@@ -69,6 +71,7 @@
 
 // Include distributed pipeline translator headers (lightweight declarations)
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
+#include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "test_helpers.hpp"
 
 #include <memory>
@@ -77,6 +80,35 @@
 
 using namespace duckdb;
 using namespace duckdb::distributed;
+
+static string SQLStringLiteral(const string &value);
+
+class TestExtensionWriteOperator final : public PhysicalOperator, public ExtensionWriteTaskProvider {
+public:
+	TestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
+	                           string extension_write_name_p = "test_extension_write")
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), 0),
+	      extension_write_name(std::move(extension_write_name_p)) {
+	}
+
+	optional_ptr<ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
+		return this;
+	}
+
+	string ExtensionWriteName() const override {
+		return extension_write_name;
+	}
+
+	void ValidateExtensionWrite(ClientContext &) const override {
+	}
+
+	idx_t FinalizeExtensionWrite(ClientContext &, const vector<DistributedCopyFileInfo> &files) const override {
+		return files.size();
+	}
+
+private:
+	string extension_write_name;
+};
 
 // A tiny test-only nullary aggregate operator used to construct BoundAggregateExpression
 struct TestNullaryAggOp {
@@ -120,6 +152,94 @@ static UnaryPlan MakeUnaryScanPlan() {
 	auto &scan =
 	    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0, std::move(collection));
 	return {plan, types, &scan};
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write unwraps its COPY child", "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto output_path = TestCreatePath("distributed_extension_write_translation.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+	REQUIRE(copy_root.type == PhysicalOperatorType::COPY_TO_FILE);
+	REQUIRE(copy_root.Cast<PhysicalCopyToFile>().return_type == CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(std::move(extension_types));
+	extension.children.push_back(copy_root);
+	physical_plan->SetRoot(extension);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated = physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()));
+	REQUIRE(translated.is_ok());
+	auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(translated.value()->inner());
+	REQUIRE(copy_finish != nullptr);
+	REQUIRE(copy_finish->copy_sink()->spec().return_type == CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write must be the physical plan root",
+          "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto output_path = TestCreatePath("distributed_nested_extension_write.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(extension_types);
+	extension.children.push_back(copy_root);
+
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+	auto &projection = physical_plan->Make<PhysicalProjection>(extension_types, std::move(expressions), 0);
+	projection.children.push_back(extension);
+	physical_plan->SetRoot(projection);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated = physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()));
+	REQUIRE(translated.is_err());
+	REQUIRE(StringUtil::Contains(translated.error().what(), "must be the physical plan root"));
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write requires a non-empty name", "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto output_path = TestCreatePath("distributed_unnamed_extension_write.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(extension_types, string());
+	extension.children.push_back(copy_root);
+	physical_plan->SetRoot(extension);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated = physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()));
+	REQUIRE(translated.is_err());
+	REQUIRE(StringUtil::Contains(translated.error().what(), "requires a non-empty name"));
 }
 
 static DuckPhysicalPlanRef MakeWindowPlan(bool streaming, idx_t input_partitions, bool input_hash_partitioned,
@@ -206,7 +326,7 @@ static idx_t SchemaColumnCount(const SchemaRef &schema) {
 	return GetSchemaTypes(schema).size();
 }
 
-static std::string SQLStringLiteral(const std::string &value) {
+static string SQLStringLiteral(const string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 

@@ -10,7 +10,7 @@
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/physical_plan.hpp"
-#include "duckdb/function/extension_file_list_provider.hpp"
+#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
@@ -240,10 +240,14 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 	auto table_filters = scan.table_filters ? scan.table_filters->Copy() : nullptr;
 	auto extra_info = CopyExtraOperatorInfo(scan.extra_info);
 
-	auto &scan_op = plan->Make<PhysicalTableScan>(scan.GetTypes(), scan.function, std::move(bind_data),
-	                                              scan.returned_types, scan.column_ids, scan.projection_ids, scan.names,
-	                                              std::move(table_filters), scan.estimated_cardinality,
-	                                              std::move(extra_info), scan.parameters, scan.virtual_columns);
+	auto &scan_operator = plan->Make<PhysicalTableScan>(
+	    scan.GetTypes(), scan.function, std::move(bind_data), scan.returned_types, scan.column_ids, scan.projection_ids,
+	    scan.names, std::move(table_filters), scan.estimated_cardinality, std::move(extra_info), scan.parameters,
+	    scan.virtual_columns);
+	auto &scan_op = scan_operator.Cast<PhysicalTableScan>();
+	scan_op.named_parameters = scan.named_parameters;
+	scan_op.input_table_types = scan.input_table_types;
+	scan_op.input_table_names = scan.input_table_names;
 	plan->SetRoot(scan_op);
 	return plan;
 }
@@ -259,19 +263,16 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	}
 
 	vector<OpenFileInfo> files;
+	auto provider = TryGetExtensionScanTaskProvider(*scan.bind_data);
 	auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
-	if (multi_bind && multi_bind->file_list) {
+	if (provider) {
+		files = provider->GetScanTasks();
+	} else if (multi_bind && multi_bind->file_list) {
 		files = multi_bind->file_list->GetAllFiles();
 	} else {
-		auto *ext_provider = dynamic_cast<ExtensionFileListProvider *>(scan.bind_data.get());
-		if (!ext_provider) {
-			throw NotImplementedException("Distributed execution does not support table function \"%s\": its bind data "
-			                              "does not provide a distributable file list",
-			                              scan.function.name);
-		}
-		for (auto &path : ext_provider->GetFileList()) {
-			files.emplace_back(path);
-		}
+		throw BinderException("MakeTableScanTasks: bind_data for '%s' is not MultiFileBindData or "
+		                      "ExtensionScanTaskProvider (type: %s)",
+		                      scan.function.name, typeid(*scan.bind_data).name());
 	}
 	if (files.empty()) {
 		return {std::move(tasks), true};
@@ -280,38 +281,80 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	    scan.estimated_cardinality == DConstants::INVALID_INDEX ? 0 : scan.estimated_cardinality;
 	std::vector<uint64_t> file_sizes;
 	bool file_sizes_loaded = false;
+	bool file_sizes_complete = false;
 	uint64_t total_file_bytes = 0;
 	auto ensure_file_sizes = [&]() {
 		if (file_sizes_loaded) {
 			return;
 		}
 		file_sizes_loaded = true;
+		if (provider) {
+			file_sizes_complete = true;
+			file_sizes.reserve(files.size());
+			for (const auto &file : files) {
+				auto estimate = provider->GetScanTaskEstimatedBytes(file);
+				if (!estimate.IsValid()) {
+					file_sizes_complete = false;
+				}
+				auto size = estimate.IsValid() ? static_cast<uint64_t>(estimate.GetIndex()) : 0;
+				file_sizes.push_back(size);
+				total_file_bytes += size;
+			}
+			return;
+		}
 		if (!db) {
 			return;
 		}
 		file_sizes = GetFileSizesFromDB(files, db);
+		file_sizes_complete = file_sizes.size() == files.size();
 		total_file_bytes = 0;
 		for (auto size : file_sizes) {
 			total_file_bytes += size;
 		}
 	};
-	auto estimate_rows_for_task = [&](uint64_t task_bytes, size_t task_file_count) -> idx_t {
+	auto estimate_rows_for_task = [&](const auto &task_files, uint64_t task_bytes) -> idx_t {
+		if (provider) {
+			idx_t provider_rows = 0;
+			bool complete_provider_estimate = true;
+			for (const auto &file : task_files) {
+				auto estimate = provider->GetScanTaskEstimatedCardinality(file);
+				if (!estimate.IsValid()) {
+					complete_provider_estimate = false;
+					break;
+				}
+				provider_rows += estimate.GetIndex();
+			}
+			if (complete_provider_estimate) {
+				return provider_rows;
+			}
+		}
 		if (estimated_scan_rows == 0) {
 			return 0;
 		}
-		if (total_file_bytes > 0 && task_bytes > 0) {
+		if (file_sizes_complete && total_file_bytes > 0 && task_bytes > 0) {
 			auto scaled = static_cast<long double>(estimated_scan_rows) * static_cast<long double>(task_bytes) /
 			              static_cast<long double>(total_file_bytes);
 			return static_cast<idx_t>(scaled);
 		}
-		if (!files.empty() && task_file_count > 0) {
-			auto scaled = static_cast<long double>(estimated_scan_rows) * static_cast<long double>(task_file_count) /
+		if (!files.empty() && !task_files.empty()) {
+			auto scaled = static_cast<long double>(estimated_scan_rows) * static_cast<long double>(task_files.size()) /
 			              static_cast<long double>(files.size());
 			return static_cast<idx_t>(scaled);
 		}
 		return 0;
 	};
 	auto estimate_bytes_for_group = [&](const std::vector<OpenFileInfo> &group) -> uint64_t {
+		if (provider) {
+			uint64_t bytes = 0;
+			for (const auto &group_file : group) {
+				auto estimate = provider->GetScanTaskEstimatedBytes(group_file);
+				if (!estimate.IsValid()) {
+					return 0;
+				}
+				bytes += static_cast<uint64_t>(estimate.GetIndex());
+			}
+			return bytes;
+		}
 		ensure_file_sizes();
 		if (file_sizes.size() != files.size()) {
 			return 0;
@@ -330,10 +373,10 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	if (files.size() == 1) {
 		ensure_file_sizes();
 		ScanTaskDescriptor task;
-		task.files = std::move(files);
-		task.estimated_cardinality = estimated_scan_rows;
+		task.estimated_cardinality = estimate_rows_for_task(files, total_file_bytes);
 		task.estimated_bytes = static_cast<idx_t>(total_file_bytes);
 		task.source_task_partition_id = 0;
+		task.files = std::move(files);
 		tasks.push_back(std::move(task));
 		return {std::move(tasks), false};
 	}
@@ -342,10 +385,10 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	const bool use_size_thresholds = exec_cfg.scan_task_size_grouping_enabled() &&
 	                                 (exec_cfg.scan_task_min_bytes() > 0 || exec_cfg.scan_task_max_bytes() > 0);
 	std::vector<std::vector<OpenFileInfo>> groups;
-	if (use_size_thresholds && db) {
+	if (use_size_thresholds && (provider || db)) {
 		ensure_file_sizes();
 		auto sizes = file_sizes;
-		if (!sizes.empty() && HasPositiveSizes(sizes)) {
+		if (!sizes.empty() && file_sizes_complete && HasPositiveSizes(sizes)) {
 			uint64_t total_bytes = 0;
 			for (auto size : sizes) {
 				total_bytes += size;
@@ -361,16 +404,7 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 				std::vector<uint64_t> group_weights;
 				group_weights.reserve(groups.size());
 				for (const auto &group : groups) {
-					uint64_t weight = 0;
-					for (const auto &file_info : group) {
-						for (size_t fi = 0; fi < files.size(); ++fi) {
-							if (files[fi].path == file_info.path) {
-								weight += sizes[fi];
-								break;
-							}
-						}
-					}
-					group_weights.push_back(weight);
+					group_weights.push_back(estimate_bytes_for_group(group));
 				}
 				auto merged_indexes = GroupWeightedIndexesByTargetCount(group_weights, target_task_count);
 				std::vector<std::vector<OpenFileInfo>> merged_groups;
@@ -403,7 +437,7 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 		}
 		const auto task_bytes = estimate_bytes_for_group(group);
 		task.files = std::move(task_files);
-		task.estimated_cardinality = estimate_rows_for_task(task_bytes, group.size());
+		task.estimated_cardinality = estimate_rows_for_task(group, task_bytes);
 		task.estimated_bytes = static_cast<idx_t>(task_bytes);
 		task.source_task_partition_id = tasks.size();
 		tasks.push_back(std::move(task));
