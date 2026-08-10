@@ -33,6 +33,10 @@ from vane.execution._common import (
     load_udf_from_payload_cached,
 )
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution.udf_batch_format import format_udf_input as _format_udf_input
+from vane.execution.udf_batch_format import iter_udf_output_tables as _iter_udf_output_tables
+from vane.execution.udf_batch_format import normalize_batch_format as _normalize_batch_format
+from vane.execution.udf_batch_format import resolve_udf_output_schema as _resolve_udf_output_schema
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
 from vane.udf import FunctionNullHandling
@@ -232,34 +236,6 @@ def _effective_output_batch_size(payload: dict[str, Any]) -> int | None:
     return None
 
 
-def _iter_output_tables(result: Any) -> Iterable[pa.Table]:
-    """Iterate over output batches from a stream UDF result."""
-    result = ensure_synchronous_udf_result(result)
-    if result is None:
-        return
-
-    if isinstance(result, pa.RecordBatchReader):
-        raise TypeError("UDF output must be materialized; RecordBatchReader is not supported")
-    if isinstance(result, pa.Table):
-        yield result
-        return
-    if isinstance(result, pa.RecordBatch):
-        yield pa.Table.from_batches([result])
-        return
-    if isinstance(result, dict):
-        yield pa.table(result)
-        return
-
-    if isinstance(result, Iterable) and not isinstance(result, (str, bytes, bytearray)):
-        for item in result:
-            if item is None:
-                continue
-            yield from _iter_output_tables(item)
-        return
-
-    raise TypeError("udf output must be Table/RecordBatch/dict, or an iterable yielding those types")
-
-
 def _iter_table_row_dicts(table: pa.Table) -> Iterable[dict[str, Any]]:
     names = table.schema.names
     columns = table.columns
@@ -422,7 +398,7 @@ class UDFExecutor:
     """Execute a Python UDF locally according to payload.call_mode.
 
     Supported call modes:
-    - ``map_batches``: ``fn(pa.Table) → pa.Table | Iterator[pa.Table]``
+    - ``map_batches``: formatted batch-to-batch calls selected by ``payload.batch_format``.
     - ``map_batches_rows``: ``fn(pa.Table) → pa.Table`` with one output row per input row.
     - ``flat_map``:    ``fn(dict) → dict | Iterator[dict]``
     - ``map``:
@@ -475,6 +451,12 @@ class UDFExecutor:
         self._is_map_batches_rows = self._call_mode == "map_batches_rows"
         self._is_flat_map = self._call_mode == "flat_map"
         self._is_map = False
+        self._batch_format = (
+            _normalize_batch_format(payload.get("batch_format", "pyarrow")) if self._is_map_batches else "pyarrow"
+        )
+        self._batch_output_schema = (
+            _resolve_udf_output_schema(self._batch_format, output_schema) if self._is_map_batches else None
+        )
 
         # Batch size for splitting input
         self._batch_size = _effective_batch_size(payload)
@@ -555,19 +537,14 @@ class UDFExecutor:
         return args
 
     def _iter_map_batches_output_tables(self, result: Any) -> Iterable[pa.Table]:
-        if result is None:
-            return
-
         try:
-            tables = _iter_output_tables(result)
-            for table in tables:
-                if table is not None:
-                    yield table
-            return
+            yield from _iter_udf_output_tables(
+                result,
+                batch_format=self._batch_format,
+                resolved_output_schema=self._batch_output_schema,
+            )
         except TypeError as exc:
-            raise TypeError(
-                f"map_batches UDF must return pa.Table or Iterator[pa.Table], got {type(result)}: {exc}"
-            ) from exc
+            raise TypeError(f"map_batches UDF returned an invalid {self._batch_format!r} batch: {exc}") from exc
 
     def _coerce_row_preserving_batch_output(self, result: Any, expected_rows: int) -> pa.Table:
         if isinstance(result, pa.Table):
@@ -615,7 +592,8 @@ class UDFExecutor:
         )
         for batch in batches:
             saw_compute_batch = True
-            result = ensure_synchronous_udf_result(self._map_fn(batch))
+            udf_batch = _format_udf_input(batch, self._batch_format) if self._is_map_batches else batch
+            result = ensure_synchronous_udf_result(self._map_fn(udf_batch))
             if self._is_map_batches_rows:
                 results.append(self._coerce_row_preserving_batch_output(result, batch.num_rows))
                 continue
@@ -672,7 +650,7 @@ class UDFExecutor:
             shared_output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
             for batch in batches:
                 saw_compute_batch = True
-                result = ensure_synchronous_udf_result(self._map_fn(batch))
+                result = ensure_synchronous_udf_result(self._map_fn(_format_udf_input(batch, self._batch_format)))
                 output_buffer = (
                     RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
                     if self._preserve_compute_batch_boundaries
