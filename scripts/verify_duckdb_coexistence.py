@@ -129,6 +129,9 @@ def _assert_both(python: Path, first: str, second: str, *, cwd: Path) -> None:
         duckdb_adbc = importlib.import_module("adbc_driver_duckdb.dbapi")
         vane_udf = importlib.import_module("vane.udf")
         duckdb_func = importlib.import_module("duckdb.func")
+        # This validation executes through the raw connection, without a
+        # distributed query context that could supply a Ray query_id.
+        vane.configure(runner="local")
         vane_connection = vane.connect()
         duckdb_connection = duckdb.connect()
 
