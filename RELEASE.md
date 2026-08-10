@@ -13,8 +13,10 @@ changelog or a release-notes template.
   are promoted through TestPyPI, PyPI, and the GitHub Release.
 - A GitHub Release remains a draft until PyPI publication succeeds and all
   checksums, signatures, the SBOM, and provenance are attached.
-- Published tags, releases, and artifacts are never moved or replaced. A bad
-  release is yanked when necessary and superseded by a new version.
+- A release tag cannot be updated or deleted from the moment it is created,
+  including while its GitHub Release is still a draft. Published releases and
+  artifacts are never replaced. A bad release is superseded by a new version
+  and yanked when necessary.
 
 ## One-time repository configuration
 
@@ -23,17 +25,21 @@ Repository administrators must:
 1. Keep `main` as the default branch and protect it with pull-request review,
    required CI and code-quality checks, resolved conversations, and deletion
    and non-fast-forward update protection.
-2. Enable private vulnerability reporting, the dependency graph, Dependabot
+2. Create an active tag ruleset with no bypass actors for `refs/tags/v*`. Allow
+   initial tag creation, but restrict deletion and block force pushes so the
+   tag cannot move between workflow dispatch and publication. GitHub immutable
+   releases provide an additional lock only after the draft is published.
+3. Enable private vulnerability reporting, the dependency graph, Dependabot
    alerts and security updates, secret scanning with push protection, and code
    scanning.
-3. Configure the `RELEASE_ARTIFACT_CONTENT_RULES` repository secret used by
+4. Configure the `RELEASE_ARTIFACT_CONTENT_RULES` repository secret used by
    trusted artifact validation.
-4. Create protected `testpypi` and `pypi` GitHub environments. Both accept only
+5. Create protected `testpypi` and `pypi` GitHub environments. Both accept only
    `v*` tags, require maintainer approval, and disallow administrator bypass.
-5. Register `.github/workflows/release.yml` as a trusted publisher for the
+6. Register `.github/workflows/release.yml` as a trusted publisher for the
    `vane-ai` project on TestPyPI and PyPI, using the matching `testpypi` and
    `pypi` environment names. Publishing intentionally has no API-token fallback.
-6. After the draft-first workflow has passed a build-only dry run, enable
+7. After the draft-first workflow has passed a build-only dry run, enable
    GitHub immutable releases. Draft releases must remain mutable so the
    workflow can attach their assets before publication.
 
@@ -81,9 +87,11 @@ gh workflow run release.yml \
 
 1. Confirm the recorded release commit is reachable from `main` and has not
    changed since the release pull request passed its gates.
-2. Create and push the exact `v<version>` tag at that commit. Never create the
-   tag from an unreviewed working tree.
-3. Create a draft GitHub Release for the existing tag. Copy the approved notes
+2. Confirm the active `v*` tag ruleset restricts deletion and force pushes and
+   has no bypass actors. Create and push the exact `v<version>` tag at the
+   recorded commit, then verify that the remote tag resolves to that commit.
+   Never create the tag from an unreviewed working tree.
+3. Create a draft GitHub Release for the protected tag. Copy the approved notes
    into its body without changing their meaning, and mark alpha, beta, and
    release-candidate versions as prereleases.
 4. Manually dispatch the Release workflow using that tag as the workflow ref
@@ -142,9 +150,10 @@ After publication:
 
 ## Respond to a bad release
 
-If a problem is found before either package index receives the version, cancel
-the workflow and correct the release pull request. Once TestPyPI, PyPI, or the
-GitHub Release has published an artifact, do not reuse the version or replace
-files. For a harmful PyPI release, yank it, publish a fixed version, and add a
-clear notice to the affected GitHub Release. Use the security-advisory process
-when confidentiality or coordinated disclosure is required.
+If a problem is found before the release tag is created, cancel the workflow
+and correct the release pull request. Once a `v*` tag exists, do not move,
+delete, or reuse it even if neither package index has received the version;
+abandon the draft and supersede it with a new version and tag. For a harmful
+PyPI release, yank it, publish a fixed version, and add a clear notice to the
+affected GitHub Release. Use the security-advisory process when confidentiality
+or coordinated disclosure is required.
