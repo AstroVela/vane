@@ -23,6 +23,8 @@ jobs:
   source-package:
     name: Build source package
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: Checkout the selected commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -52,8 +54,20 @@ jobs:
           git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
 
           release_id="$(
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              --jq 'if .draft and ((.body // "") | length > 0) then .id else empty end'
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq --slurp --raw-output --arg tag "$GITHUB_REF_NAME" '
+                [
+                  .[][]
+                  | select(
+                      .tag_name == $tag
+                      and .draft
+                      and ((.body // "") | length > 0)
+                    )
+                  | .id
+                ]
+                | if length == 1 then .[0] else empty end
+              '
           )"
           test -n "$release_id"
 
@@ -490,7 +504,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .draft)"
+          draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
           test "$draft" = "true"
           gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
 
