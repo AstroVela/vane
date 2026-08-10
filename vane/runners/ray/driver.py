@@ -5040,8 +5040,14 @@ class RayQueryDriverActor:
             },
         }
 
-    def get_test_udf_actor_handle(self, owner_id: str, plan_id: str, udf_name: str) -> Any:
-        """Return one query-owned stateful actor for deterministic fault tests.
+    def get_test_udf_actor_handle(
+        self,
+        owner_id: str,
+        plan_id: str,
+        udf_name: str,
+        actor_index: int = 0,
+    ) -> Any:
+        """Return one query-owned UDF actor for deterministic fault tests.
 
         This hook is deliberately environment-gated and lives on the Driver;
         it is not part of Vane's public UDF API.
@@ -5064,7 +5070,7 @@ class RayQueryDriverActor:
         matches: list[Any] = []
         for pool in pools:
             payload = getattr(pool, "_payload", None)
-            if not isinstance(payload, dict) or not payload.get("stateful"):
+            if not isinstance(payload, dict) or payload.get("execution_backend") != "ray_actor":
                 continue
             if str(payload.get("udf_name") or "") != str(udf_name):
                 continue
@@ -5072,15 +5078,15 @@ class RayQueryDriverActor:
 
         if len(matches) != 1:
             raise RuntimeError(
-                f"expected exactly one active stateful UDF pool for plan {plan_key!r} "
+                f"expected exactly one active UDF actor pool for plan {plan_key!r} "
                 f"and udf {udf_name!r}, found {len(matches)}"
             )
         actors = list(getattr(matches[0], "actors", ()))
-        if len(actors) != 1:
-            raise RuntimeError(
-                f"stateful UDF pool for {udf_name!r} must contain exactly one actor, found {len(actors)}"
+        if type(actor_index) is not int or actor_index < 0 or actor_index >= len(actors):
+            raise IndexError(
+                f"UDF actor index {actor_index!r} is out of range for {udf_name!r}; pool size is {len(actors)}"
             )
-        return actors[0]
+        return actors[actor_index]
 
     def _get_plan_runner(self) -> Any:
         with self._plan_runner_lifecycle_lock:
@@ -7498,7 +7504,7 @@ class RayQueryDriverClient:
 
     shutdown = close
 
-    def get_test_udf_actor_handle(self, plan_id: str, udf_name: str) -> Any:
+    def get_test_udf_actor_handle(self, plan_id: str, udf_name: str, actor_index: int = 0) -> Any:
         """Environment-gated client wrapper for the Driver fault-test hook."""
         runner = getattr(self, "runner", None)
         if runner is None:
@@ -7508,6 +7514,7 @@ class RayQueryDriverClient:
                 self._owner_id,
                 str(plan_id),
                 str(udf_name),
+                actor_index,
             ),
             timeout=30,
         )

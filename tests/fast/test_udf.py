@@ -1728,24 +1728,11 @@ def test_map_batches_rejects_removed_async_options():
 def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
     import vane
 
-    upstream_called = False
-
-    def fail_if_rendered(_value):
-        nonlocal upstream_called
-        upstream_called = True
-        raise RuntimeError("relation repr executed upstream UDF")
-
     def identity(table):
         return table
 
     con = vane.connect()
-    con.create_function(
-        "fail_if_rendered",
-        fail_if_rendered,
-        parameters=[vane.sqltypes.INTEGER],
-        return_type=vane.sqltypes.INTEGER,
-    )
-    rel = con.sql("select fail_if_rendered(1) as x")
+    rel = con.sql("select error('relation was executed while validating kwargs') as x")
 
     with pytest.raises(Exception, match=r"actor_locality_mode, ray_actor_pool_name"):
         rel.map_batches(
@@ -1757,8 +1744,6 @@ def test_map_batches_unknown_kwargs_fail_without_rendering_relation():
             actor_locality_mode="prefer_local",
             ray_actor_pool_name="pool-a",
         )
-
-    assert upstream_called is False
 
 
 def test_map_batches_accepts_explicit_ray_task_backend():
@@ -1850,7 +1835,30 @@ def test_map_batches_actor_backend_requires_actor_number():
         )
 
 
-def test_map_batches_actor_backend_requires_gpus():
+@pytest.mark.parametrize("method", ["map", "map_batches"])
+@pytest.mark.parametrize("actor_number", [False, 0, -1, 1.0, "1"])
+def test_relation_actor_udfs_require_positive_strict_integer_actor_number(method, actor_number):
+    import vane
+
+    class Identity:
+        def __call__(self, value):
+            return value
+
+    con = vane.connect()
+    kwargs = {
+        "execution_backend": "subprocess_actor",
+        "actor_number": actor_number,
+    }
+    if method == "map":
+        kwargs["return_type"] = vane.sqltypes.INTEGER
+    else:
+        kwargs["schema"] = {"x": vane.sqltypes.INTEGER}
+
+    with pytest.raises(Exception, match="actor_number must be a positive integer"):
+        getattr(con.sql("select 1::INTEGER as x"), method)(Identity, **kwargs)
+
+
+def test_map_batches_actor_backend_defaults_gpus_to_zero():
     import vane
 
     class Identity:
@@ -1858,20 +1866,41 @@ def test_map_batches_actor_backend_requires_gpus():
             return table
 
     con = vane.connect()
-    with pytest.raises(Exception, match=r"map_batches\(gpus=\.\.\.\) is required"):
-        con.sql("select 1 as x").map_batches(
-            Identity,
-            schema={"x": vane.sqltypes.INTEGER},
-            execution_backend="subprocess_actor",
-            actor_number=1,
-        )
-    with pytest.raises(Exception, match=r"map_batches\(gpus=\.\.\.\) is required"):
-        con.sql("select 1 as x").map_batches(
-            Identity,
-            schema={"x": vane.sqltypes.INTEGER},
-            execution_backend="ray_actor",
-            actor_number=1,
-        )
+    rel = con.sql("select i::INTEGER as x from range(4) t(i)").map_batches(
+        Identity,
+        schema={"x": vane.sqltypes.INTEGER},
+        execution_backend="subprocess_actor",
+        actor_number=2,
+        batch_size=1,
+    )
+
+    plan = rel.explain()
+    assert "subprocess_actor" in plan
+    assert "actor_number" in plan
+    assert sorted(rel.fetchall()) == [(0,), (1,), (2,), (3,)]
+
+
+def test_map_actor_backend_defaults_gpus_to_zero():
+    import vane
+
+    class AddOne:
+        def __call__(self, value):
+            return value + 1
+
+    con = vane.connect()
+    rel = con.sql("select i::INTEGER as x from range(4) t(i)").map(
+        AddOne,
+        return_type=vane.sqltypes.INTEGER,
+        execution_backend="subprocess_actor",
+        actor_number=2,
+        batch_size=1,
+    )
+
+    plan = rel.explain()
+    assert "subprocess_actor" in plan
+    assert "actor_number" in plan
+    assert "gpus" not in plan
+    assert sorted(rel.fetchall()) == [(0, 1), (1, 2), (2, 3), (3, 4)]
 
 
 def test_map_batches_accepts_explicit_cpu_resource():

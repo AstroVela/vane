@@ -321,7 +321,7 @@ static py::dict BuildDistributedScalarUDFRegistration(const string &name, const 
 static py::dict BuildDistributedTableUDFRegistration(const string &name, const py::function &udf,
                                                      const vector<string> &output_names,
                                                      const vector<LogicalType> &output_types,
-                                                     const Optional<py::object> &batch_size, bool side_effects) {
+                                                     const Optional<py::object> &batch_size) {
 	auto function_pickle = PicklePythonUDFCallable(udf);
 
 	py::dict schema;
@@ -338,7 +338,6 @@ static py::dict BuildDistributedTableUDFRegistration(const string &name, const p
 		CombineDigest(digest, output_names[i]);
 		CombineDigest(digest, output_types[i].ToString());
 	}
-	CombineDigest(digest, side_effects);
 	CombineDigest(digest, !batch_size_obj.is_none());
 	if (!batch_size_obj.is_none()) {
 		CombineDigest(digest, static_cast<idx_t>(py::cast<int64_t>(batch_size_obj)));
@@ -351,7 +350,6 @@ static py::dict BuildDistributedTableUDFRegistration(const string &name, const p
 	spec[py::str("function_pickle")] = py::bytes(function_pickle);
 	spec[py::str("schema")] = std::move(schema);
 	spec[py::str("batch_size")] = batch_size_obj;
-	spec[py::str("side_effects")] = py::bool_(side_effects);
 	return spec;
 }
 
@@ -643,12 +641,6 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "List registered filesystems, including builtin ones");
 	m.def("filesystem_is_registered", &DuckDBPyConnection::FileSystemIsRegistered,
 	      "Check if a filesystem with the provided name is currently registered", py::arg("name"));
-	m.def("create_function", &DuckDBPyConnection::RegisterScalarUDF,
-	      "Create a DuckDB function out of the passing in Python function so it can be used in queries",
-	      py::arg("name"), py::arg("function"), py::arg("parameters") = py::none(), py::arg("return_type") = py::none(),
-	      py::kw_only(), py::arg("type") = PythonUDFType::NATIVE,
-	      py::arg("null_handling") = FunctionNullHandling::DEFAULT_NULL_HANDLING,
-	      py::arg("exception_handling") = PythonExceptionHandling::FORWARD_ERROR, py::arg("side_effects") = false);
 	m.def("remove_function", &DuckDBPyConnection::UnregisterUDF, "Remove a previously created function",
 	      py::arg("name"));
 	m.def("_create_vane_function", &DuckDBPyConnection::CreateVaneFunctionInternal,
@@ -659,8 +651,7 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      "Internal helper used by vane.attach_function for row-preserving batch UDF SQL registration", py::arg("name"),
 	      py::arg("function"), py::arg("input_names"), py::arg("schema"), py::arg("parameters") = py::none(),
 	      py::kw_only(), py::arg("batch_size") = py::none(), py::arg("gpus") = py::none(),
-	      py::arg("actor_number") = py::none(), py::arg("stateful") = false, py::arg("row_preserving"),
-	      py::arg("replace"));
+	      py::arg("actor_number") = py::none(), py::arg("row_preserving"), py::arg("replace"));
 	m.def("sqltype", &DuckDBPyConnection::Type, "Create a type object by parsing the 'type_str' string",
 	      py::arg("type_str"));
 	m.def("dtype", &DuckDBPyConnection::Type, "Create a type object by parsing the 'type_str' string",
@@ -1030,9 +1021,8 @@ void DuckDBPyConnection::ApplyDistributedPythonUDFRegistrations(const py::object
 			}
 
 			auto batch_size = py::reinterpret_borrow<py::object>(spec[py::str("batch_size")]);
-			auto side_effects = py::cast<bool>(spec[py::str("side_effects")]);
 
-			RegisterTableUDF(name, udf, schema, nullptr, batch_size, side_effects);
+			RegisterTableUDF(name, udf, schema, nullptr, batch_size);
 		} else {
 			throw InvalidInputException("Unknown distributed Python UDF registration kind '%s'", kind);
 		}
@@ -1134,7 +1124,7 @@ DuckDBPyConnection::CreateVaneFunctionInternal(const string &name, const py::obj
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionInternal(
     const string &name, const py::object &udf, const py::object &input_names, const py::object &schema,
     const py::object &parameters, const Optional<py::object> &batch_size, const Optional<py::object> &gpus,
-    const Optional<py::object> &actor_number, bool stateful, bool row_preserving, bool replace) {
+    const Optional<py::object> &actor_number, bool row_preserving, bool replace) {
 	PythonGILWrapper gil;
 	if (!row_preserving) {
 		throw InvalidInputException("row_preserving=False is supported by the expression API, but SQL attach v1 "
@@ -1165,7 +1155,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 	auto default_parallelism = static_cast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 	auto payload = BuildExpressionMapBatchesUDFPayload(
 	    name, udf_function, normalized_schema, use_actor_backend ? "subprocess_actor" : "subprocess_task",
-	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, stateful, py::none());
+	    default_parallelism, parsed_input_names, batch_size, row_preserving, gpus, actor_number, py::none());
 
 	ScalarFunction scalar_function(name, std::move(parameter_types), LogicalType::ANY, RegisteredVaneUDFExecute,
 	                               RegisteredVaneUDFBind, nullptr, nullptr, nullptr, LogicalType::INVALID,
@@ -1187,8 +1177,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::CreateVaneBatchFunctionIntern
 shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string &name, const py::function &udf,
                                                                     const py::object &schema,
                                                                     const shared_ptr<DuckDBPyType> &return_type_p,
-                                                                    const Optional<py::object> &batch_size,
-                                                                    bool side_effects) {
+                                                                    const Optional<py::object> &batch_size) {
 	ValidateSynchronousUDFCallable(udf);
 	auto &connection = con.GetConnection();
 	auto &context = *connection.context;
@@ -1206,7 +1195,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
 	auto payload =
 	    BuildPythonUDFPayload(name, udf, schema, return_type_p, ResolveDefaultUDFExecutionBackend(udf),
 	                          default_parallelism, py::none(), py::none(), py::none(), batch_size, py::none(),
-	                          py::none(), py::none(), py::none(), py::none(), py::none(), py::none(), side_effects);
+	                          py::none(), py::none(), py::none(), py::none(), py::none(), py::none());
 
 	// Parse output types/names from the payload for MakeUDFRegisteredTableFunction
 	vector<LogicalType> output_types;
@@ -1218,7 +1207,7 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::RegisterTableUDF(const string
 	auto registration_output_types = output_types;
 	auto registration_output_names = output_names;
 	auto registration = BuildDistributedTableUDFRegistration(name, udf, registration_output_names,
-	                                                         registration_output_types, batch_size, side_effects);
+	                                                         registration_output_types, batch_size);
 	auto registration_digest = GetRegistrationDigest(registration);
 	payload = UpsertStructStringField(payload, "udf_id", registration_digest);
 	auto function =
@@ -1248,11 +1237,6 @@ void DuckDBPyConnection::Initialize(py::handle &m) {
 	connection_module.def("__del__", &DuckDBPyConnection::Close);
 
 	InitializeConnectionMethods(connection_module);
-	connection_module.def(
-	    "create_table_function", &DuckDBPyConnection::RegisterTableUDF,
-	    "Create a DuckDB table function out of the passing in Python function so it can be used in queries",
-	    py::arg("name"), py::arg("function"), py::arg("schema") = py::none(), py::arg("return_type") = py::none(),
-	    py::kw_only(), py::arg("batch_size") = py::none(), py::arg("side_effects") = false);
 	connection_module.def_property_readonly("description", &DuckDBPyConnection::GetDescription,
 	                                        "Get result set attributes, mainly column names");
 	connection_module.def_property_readonly("rowcount", &DuckDBPyConnection::GetRowcount, "Get result set row count");

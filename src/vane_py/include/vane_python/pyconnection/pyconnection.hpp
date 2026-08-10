@@ -267,13 +267,12 @@ public:
 	    const string &name, const py::object &udf, const py::object &input_names, const py::object &schema,
 	    const py::object &parameters = py::none(), const Optional<py::object> &batch_size = py::none(),
 	    const Optional<py::object> &gpus = py::none(), const Optional<py::object> &actor_number = py::none(),
-	    bool stateful = false, bool row_preserving = true, bool replace = false);
+	    bool row_preserving = true, bool replace = false);
 
 	shared_ptr<DuckDBPyConnection> RegisterTableUDF(const string &name, const py::function &udf,
 	                                                const py::object &schema = py::none(),
 	                                                const shared_ptr<DuckDBPyType> &return_type = nullptr,
-	                                                const Optional<py::object> &batch_size = py::none(),
-	                                                bool side_effects = false);
+	                                                const Optional<py::object> &batch_size = py::none());
 
 	shared_ptr<DuckDBPyConnection> UnregisterUDF(const string &name);
 	py::list ExportDistributedPythonUDFRegistrations() const;

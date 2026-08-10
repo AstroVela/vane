@@ -220,7 +220,7 @@ public:
 	unique_ptr<DuckDBPyRelation> Map(py::function fun, const shared_ptr<DuckDBPyType> &return_type,
 	                                 const Optional<py::object> &batch_size, const Optional<py::object> &cpus,
 	                                 const Optional<py::object> &gpus, const Optional<py::object> &execution_backend,
-	                                 const Optional<py::object> &actor_number, bool side_effects);
+	                                 const Optional<py::object> &actor_number);
 	unique_ptr<DuckDBPyRelation>
 	MapBatches(py::function fun, Optional<py::object> schema, const Optional<py::object> &batch_size,
 	           const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,

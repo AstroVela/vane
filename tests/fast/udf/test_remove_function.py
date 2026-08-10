@@ -9,6 +9,8 @@ import pytest
 import vane
 from vane.sqltypes import BIGINT, VARCHAR
 
+pytestmark = pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
+
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
 

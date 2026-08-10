@@ -23,7 +23,9 @@ class UDFRegistration:  # noqa: D101
         f: "Callable[..., Any] | UserDefinedFunctionLike",
         returnType: Optional["DataTypeOrString"] = None,
     ) -> "UserDefinedFunctionLike":
-        self.sparkSession.conn.create_function(name, f, return_type=returnType)
+        raise NotImplementedError(
+            "Spark-compatible UDF registration is disabled; use vane.func and vane.attach_function directly"
+        )
 
     def registerJavaFunction(  # noqa: D102
         self,

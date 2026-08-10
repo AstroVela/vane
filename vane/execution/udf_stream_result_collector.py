@@ -32,7 +32,6 @@ from vane.execution.ray_stream_adapter import (
     ray_object_ref_future,
     validate_ray_control_ack,
 )
-from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
 from vane.execution.udf_ray_config import REF_BUNDLE_RESULT_MARKER
 from vane.execution.udf_ray_stream_protocol import (
     validate_stream_block_metadata,
@@ -129,7 +128,6 @@ class _StreamRecord:
     output_cancel_sent: bool = False
     producer_completed: bool = False
     terminal: bool = False
-    error_context: dict[str, Any] | None = None
     wait_kind: str = ""
     wait_future: Any | None = None
     completion_future: Any | None = None
@@ -296,7 +294,6 @@ class UDFStreamResultCollector:
         slot_id: int,
         submit_id: int,
         source: Any,
-        error_context: dict[str, Any] | None = None,
     ) -> None:
         if not isinstance(source, TaskLeaseObjectRefGenerator):
             raise TypeError(
@@ -322,7 +319,6 @@ class UDFStreamResultCollector:
                         submit_id=key[1],
                         adapter=adapter,
                         sequence=self._next_sequence,
-                        error_context=dict(error_context) if error_context else None,
                     )
                     self._next_sequence += 1
                     self._records[key] = record
@@ -2304,7 +2300,6 @@ class UDFStreamResultCollector:
                 finish_retirement(None)
 
     def _fail_record(self, record: _StreamRecord, exc: BaseException) -> None:
-        exc = format_stateful_actor_loss(record.error_context, exc)
         key = (record.slot_id, record.submit_id)
         with self._cleanup_handoff_lock:
             with self._cv:

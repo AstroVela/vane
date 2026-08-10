@@ -2127,7 +2127,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
                                                    const Optional<py::object> &batch_size,
                                                    const Optional<py::object> &cpus, const Optional<py::object> &gpus,
                                                    const Optional<py::object> &execution_backend,
-                                                   const Optional<py::object> &actor_number, bool side_effects) {
+                                                   const Optional<py::object> &actor_number) {
 	AssertRelation();
 	if (!return_type) {
 		throw InvalidInputException("map requires return_type");
@@ -2141,7 +2141,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Map(py::function fun, const share
 		passthrough_types.push_back(col.GetType());
 	}
 	auto payload = BuildScalarUDFPayload("map_udf", fun, return_type, resolved_execution_backend, default_parallelism,
-	                                     passthrough_types, cpus, gpus, batch_size, actor_number, side_effects);
+	                                     passthrough_types, cpus, gpus, batch_size, actor_number);
 
 	{
 		auto &existing_children = StructValue::GetChildren(payload);
@@ -2209,8 +2209,7 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 	auto payload = BuildPythonUDFPayload("udf", fun, schema, shared_ptr<DuckDBPyType>(), resolved_execution_backend,
 	                                     default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
 	                                     min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
-	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
-	                                     /*side_effects=*/false);
+	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes);
 	// Add input_names to payload for column renaming in Python executors
 	auto &existing_children = StructValue::GetChildren(payload);
 	auto &existing_type = payload.type();
@@ -2327,7 +2326,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 	                                     default_parallelism, cpus, gpus, memory_bytes, batch_size, output_batch_size,
 	                                     min_task_batch_size, preserve_compute_batch_boundaries, actor_number,
 	                                     target_max_batch_bytes, task_input_max_bytes, output_target_max_bytes,
-	                                     /*side_effects=*/false,
 	                                     /*flat_map=*/true);
 	// Add input_names to payload for column renaming in Python executors
 	{

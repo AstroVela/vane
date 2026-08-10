@@ -11,9 +11,6 @@ if TYPE_CHECKING:
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution.ray_stream_adapter import TaskLeaseObjectRefGenerator
-from vane.execution.udf_ray_actor_state import (
-    format_stateful_actor_loss as _format_stateful_actor_loss,
-)
 from vane.execution.udf_ray_stream_protocol import RAY_UDF_GENERATOR_BACKPRESSURE_OBJECTS, task_payload_with_lease
 from vane.execution.udf_row_preserving import row_preserving_arg_count
 
@@ -31,7 +28,6 @@ class RemoteUDFSubmitMixin:
         _take_task_admission: Callable[[], Any]
         _wait_for_ready_actor: Callable[[], None]
         actors: list[Any]
-        error_context: Callable[[], dict[str, Any] | None]
 
     def _rename_args(self, args: pa.Table) -> pa.Table:
         if not self._input_names:
@@ -91,9 +87,6 @@ class RemoteUDFSubmitMixin:
                 )
             except Exception as exc:
                 self._mark_actor_unavailable(actor_idx, exc)
-                formatted = _format_stateful_actor_loss(self.error_context(), exc)
-                if formatted is not exc:
-                    raise formatted from exc
                 raise RuntimeError(f"udf ray submission failed: actor_idx={actor_idx}: {exc}") from exc
 
         admission = self._take_task_admission()

@@ -660,6 +660,7 @@ class TestExpression:
         res = rel.fetchall()
         assert res == [({"a": 1, "b": 2},)]
 
+    @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
     def test_function_expression_udf(self):
         con = vane.connect()
 

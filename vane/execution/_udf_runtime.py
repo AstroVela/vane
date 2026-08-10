@@ -60,15 +60,6 @@ def _load_runtime_callable(
     is_actor_backend = backend in ("subprocess_actor", "ray_actor")
     is_task_backend = backend in ("subprocess_task", "ray_task")
 
-    if payload.get("stateful"):
-        actor_number = payload.get("actor_number")
-        if not is_actor_backend:
-            raise ValueError("stateful expression UDFs require an actor execution backend")
-        if type(actor_number) is not int or actor_number != 1:
-            raise ValueError(
-                "actor_number must be exactly 1 for stateful vane.cls UDFs; multi-actor state semantics are not defined"
-            )
-
     if is_task_backend:
         if inspect.isclass(udf):
             raise ValueError("task UDF backends require a function, not a callable class")

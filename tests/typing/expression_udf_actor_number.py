@@ -38,7 +38,6 @@ assert_type(
         False,
         0.0,
         1,
-        False,
         None,
         value,
     ),

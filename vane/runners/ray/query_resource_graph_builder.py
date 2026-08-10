@@ -220,14 +220,10 @@ def _udf_unit(
     )
     if backend == "ray_actor":
         actor_size = _positive_int(payload.get("actor_pool_size"), "actor_pool_size")
-        actor_prefetch_depth = (
-            1
-            if bool(payload.get("stateful", False))
-            else _env_positive_int(
-                env,
-                "VANE_RAY_ACTOR_PREFETCH_DEPTH",
-                _DEFAULT_RAY_ACTOR_PREFETCH_DEPTH,
-            )
+        actor_prefetch_depth = _env_positive_int(
+            env,
+            "VANE_RAY_ACTOR_PREFETCH_DEPTH",
+            _DEFAULT_RAY_ACTOR_PREFETCH_DEPTH,
         )
         max_concurrency = None
         actor_pool_size = actor_size

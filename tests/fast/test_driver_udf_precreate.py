@@ -11,7 +11,6 @@ import textwrap
 import threading
 import types
 import uuid
-from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -536,138 +535,7 @@ def test_driver_udf_actor_handle_hook_is_disabled_by_default(monkeypatch):
     runner = runner_cls.__new__(runner_cls)
 
     with pytest.raises(RuntimeError, match="VANE_ENABLE_UDF_TEST_HOOKS=1"):
-        runner_cls.get_test_udf_actor_handle(runner, "owner-a", "plan-7", "stateful_counter")
-
-
-def test_stateful_actor_loss_error_includes_stable_query_context():
-    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
-
-    class RayActorError(RuntimeError):
-        pass
-
-    cause = RayActorError("actor process exited")
-    error = format_stateful_actor_loss(
-        {
-            "stateful": True,
-            "udf_name": "stateful_counter",
-            "actor_id": "actor-deadbeef",
-        },
-        cause,
-    )
-
-    assert isinstance(error, RuntimeError)
-    assert error is not cause
-    assert error.__cause__ is cause
-    assert "stateful_counter" in str(error)
-    assert "actor-deadbeef" in str(error)
-    assert "state was not recoverable" in str(error)
-
-
-def test_non_stateful_udf_error_is_not_rewritten():
-    from vane.execution.udf_ray_actor_state import format_stateful_actor_loss
-
-    error = RuntimeError("ordinary UDF failure")
-
-    assert format_stateful_actor_loss({"stateful": False}, error) is error
-
-
-def test_stateful_actor_loss_during_readiness_keeps_recoverability_context():
-    from vane.execution.udf_ray_remote_readiness import RemoteUDFActorReadinessMixin
-
-    class RayActorError(RuntimeError):
-        pass
-
-    class ReadinessHarness(RemoteUDFActorReadinessMixin):
-        def __init__(self):
-            self._ready_actor_indices = []
-            self._actor_init_errors = {0: RayActorError("actor died before ready")}
-            self._pending_ready_refs = {}
-            self.actors = [object()]
-
-        def _refresh_actor_readiness(self):
-            return None
-
-        def error_context(self):
-            return {
-                "stateful": True,
-                "udf_name": "readiness_counter",
-                "actor_id": "actor-readiness",
-            }
-
-    with pytest.raises(RuntimeError, match="readiness_counter.*actor-readiness.*state was not recoverable"):
-        ReadinessHarness()._wait_for_ready_actor()
-
-
-def test_stateful_actor_loss_during_synchronous_submit_keeps_recoverability_context(monkeypatch):
-    import vane.execution.udf_ray_remote_submit as remote_submit
-    from vane.execution.udf_ray_remote_submit import RemoteUDFSubmitMixin
-
-    class RayActorError(RuntimeError):
-        pass
-
-    class FailingRemoteMethod:
-        def options(self, **_kwargs):
-            return self
-
-        def remote(self, *_args, **_kwargs):
-            raise RayActorError("actor died during submit")
-
-    class Actor:
-        run_block_stream = FailingRemoteMethod()
-
-    class SubmitHarness(RemoteUDFSubmitMixin):
-        def __init__(self):
-            self.actors = [Actor()]
-            self._payload = {
-                "query_id": "query-submit",
-                "resource_unit_id": "resource:test:udf:submit",
-                "execution_backend": "ray_actor",
-                "udf_output_target_max_bytes": 1,
-            }
-            self.unavailable = []
-
-        def _wait_for_ready_actor(self):
-            return None
-
-        def _pick_ready_actor_on_node(self, node_id, actor_index):
-            assert node_id == "node-submit"
-            assert actor_index == 0
-            return 0, self.actors[0]
-
-        def _take_task_admission(self):
-            return SimpleNamespace(
-                lease={
-                    "query_id": "query-submit",
-                    "resource_unit_id": "resource:test:udf:submit",
-                    "lease_id": "lease-submit",
-                    "attempt_id": "attempt-submit",
-                    "node_id": "node-submit",
-                    "execution_slot_id": "ray_actor:resource:test:udf:submit:0",
-                    "actor_index": 0,
-                    "output_window_bytes": 2,
-                }
-            )
-
-        def _mark_actor_unavailable(self, actor_idx, exc):
-            self.unavailable.append((actor_idx, exc))
-
-        def error_context(self):
-            return {
-                "stateful": True,
-                "udf_name": "submit_counter",
-                "actor_id": "actor-submit",
-            }
-
-    monkeypatch.setattr(
-        remote_submit,
-        "TaskLeaseObjectRefGenerator",
-        lambda *, admission, submitter, **_kwargs: submitter(dict(admission.lease)),
-    )
-
-    executor = SubmitHarness()
-    with pytest.raises(RuntimeError, match="submit_counter.*actor-submit.*state was not recoverable"):
-        executor._submit_one(object(), submit_id=1)
-    assert len(executor.unavailable) == 1
+        runner_cls.get_test_udf_actor_handle(runner, "owner-a", "plan-7", "actor_udf")
 
 
 def test_precreate_udf_actors_enable_generic_async_for_distributed_pool(
@@ -831,155 +699,13 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
     ]
 
 
-def test_ensure_actor_pools_for_plan_disables_restarts_and_retries_for_stateful_udf(monkeypatch):
-    import vane.execution.udf_ray as udf_ray
-
-    calls = []
-
-    class _FakeUDFActorPool:
-        def __init__(
-            self,
-            *,
-            payload,
-            concurrency,
-            gpus_per_actor,
-            ray_options=None,
-            max_restarts=None,
-            max_task_retries=None,
-        ):
-            calls.append(
-                {
-                    "payload": dict(payload),
-                    "concurrency": concurrency,
-                    "max_restarts": max_restarts,
-                    "max_task_retries": max_task_retries,
-                }
-            )
-            self.actors = ["stateful-actor"]
-            self._init_refs = []
-            self.actor_node_ids = ["node-a"] * concurrency
-            self._confirmed_ready = {0}
-
-    fake_ray = types.ModuleType("ray")
-    fake_ray.is_initialized = lambda: True
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
-    monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
-    monkeypatch.setattr(udf_ray, "UDFActorPool", _FakeUDFActorPool)
-
-    plan = _FakePlan(
-        [
-            {
-                "node_id": 7,
-                "actor_pool_size": 1,
-                "gpus": 0.0,
-                "payload": {
-                    "udf_name": "stateful_counter",
-                    "execution_backend": "ray_actor",
-                    "stateful": True,
-                    "side_effects": True,
-                    "actor_number": 1,
-                    "query_id": _TEST_QUERY_ID,
-                    "resource_unit_id": "resource:test:stateful",
-                },
-            }
-        ]
-    )
-
-    created, handles_map = udf_ray.ensure_actor_pools_for_plan(
-        plan,
-        query_driver_handle=object(),
-        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
-        session_config={},
-        conn=object(),
-    )
-
-    assert len(created) == 1
-    assert handles_map["7"]["actor_handles"] == ["stateful-actor"]
-    assert calls == [
-        {
-            "payload": {
-                "udf_name": "stateful_counter",
-                "execution_backend": "ray_actor",
-                "stateful": True,
-                "side_effects": True,
-                "actor_number": 1,
-                "query_id": _TEST_QUERY_ID,
-                "resource_unit_id": "resource:test:stateful",
-            },
-            "concurrency": 1,
-            "max_restarts": 0,
-            "max_task_retries": 0,
-        }
-    ]
-
-
-def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(monkeypatch):
-    import vane.execution.udf_ray as udf_ray
-    from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS
-
-    calls = []
-
-    class _FakeUDFActorPool:
-        def __init__(
-            self,
-            *,
-            payload,
-            concurrency,
-            gpus_per_actor,
-            ray_options=None,
-            max_restarts=MAX_ACTOR_RESTARTS,
-            max_task_retries=None,
-        ):
-            calls.append((max_restarts, max_task_retries))
-            self.actors = ["side-effecting-actor"]
-            self._init_refs = []
-            self.actor_node_ids = ["node-a"] * concurrency
-            self._confirmed_ready = {0}
-
-    fake_ray = types.ModuleType("ray")
-    fake_ray.is_initialized = lambda: True
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
-    monkeypatch.setattr(udf_ray, "_is_vane_worker_process", lambda: False)
-    monkeypatch.setattr(udf_ray, "UDFActorPool", _FakeUDFActorPool)
-
-    plan = _FakePlan(
-        [
-            {
-                "node_id": 8,
-                "actor_pool_size": 1,
-                "gpus": 0.0,
-                "payload": {
-                    "udf_name": "external_counter",
-                    "execution_backend": "ray_actor",
-                    "stateful": False,
-                    "side_effects": True,
-                    "query_id": _TEST_QUERY_ID,
-                    "resource_unit_id": "resource:test:side-effects",
-                },
-            }
-        ]
-    )
-
-    created, _ = udf_ray.ensure_actor_pools_for_plan(
-        plan,
-        query_driver_handle=object(),
-        query_generation_capability=_QUERY_GENERATION_CAPABILITY,
-        session_config={},
-        conn=object(),
-    )
-
-    assert len(created) == 1
-    assert calls == [(MAX_ACTOR_RESTARTS, 0)]
-
-
 @pytest.mark.parametrize(
     "payload",
     [
         {
-            "udf_name": "stateless_transform",
+            "udf_name": "replicated_transform",
             "execution_backend": "ray_actor",
-            "stateful": False,
-            "side_effects": False,
+            "actor_number": 2,
             "query_id": _TEST_QUERY_ID,
             "resource_unit_id": "resource:test:retry-policy",
         },
@@ -991,9 +717,9 @@ def test_ensure_actor_pools_for_plan_disables_retries_for_side_effecting_udf(mon
             "resource_unit_id": "resource:test:retry-policy",
         },
     ],
-    ids=["stateless", "ai"],
+    ids=["class-udf", "ai"],
 )
-def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful_udf(monkeypatch, payload):
+def test_ensure_actor_pools_for_plan_keeps_default_retry_policy(monkeypatch, payload):
     import vane.execution.udf_ray as udf_ray
     from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
@@ -1043,68 +769,6 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy_for_non_stateful
 
     assert len(created) == 1
     assert calls == [(MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES)]
-
-
-def test_local_subprocess_actor_pool_rejects_multi_actor_stateful_payload():
-    from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_nodes
-
-    payload = {
-        "udf_name": "stateful_counter",
-        "execution_backend": "subprocess_actor",
-        "stateful": True,
-        "actor_number": 2,
-    }
-
-    with pytest.raises(
-        ValueError,
-        match=r"actor_number must be exactly 1.*multi-actor state",
-    ):
-        ensure_local_subprocess_actor_pools_for_nodes(
-            [{"node_id": 1, "actor_pool_size": 2, "payload": payload}],
-            plan_identity="malformed-stateful-plan",
-        )
-
-
-def test_local_stateful_actor_loss_includes_udf_pid_and_recoverability_context():
-    from vane.execution.udf_lifecycle import ExecutionCancellationScope
-    from vane.execution.udf_subprocess import LocalSubprocessActorPool
-
-    class LostWorker:
-        def __init__(self):
-            self._proc = SimpleNamespace(pid=4242)
-            self._actor_lost = False
-            self.lost = False
-
-        def is_reusable(self):
-            return not self.lost
-
-        def _run_in_execution_scope(self, scope, fn):
-            return fn(self)
-
-    pool = LocalSubprocessActorPool.__new__(LocalSubprocessActorPool)
-    pool.payload = {"udf_name": "local_counter", "stateful": True}
-    pool.pool_size = 1
-    pool.name = "local-counter-pool"
-    pool._closed = False
-    pool._lock = threading.RLock()
-    pool._cond = threading.Condition(pool._lock)
-    pool._active = 0
-    pool._terminal_error = None
-    pool._active_scopes = {}
-    pool._worker_generations = [0]
-    pool._replacing_workers = set()
-    pool._aborting_workers = set()
-    pool._idle_workers = deque([(0, 0)])
-    pool._workers = [LostWorker()]
-    pool.admission_slots = SimpleNamespace(close=lambda: None)
-
-    def fail_after_actor_loss(worker):
-        worker.lost = True
-        worker._actor_lost = True
-        raise RuntimeError("UDF subprocess communication failed")
-
-    with pytest.raises(RuntimeError, match="local_counter.*pid 4242.*state was not recoverable"):
-        pool._run(fail_after_actor_loss, ExecutionCancellationScope("test-executor", 1))
 
 
 def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):

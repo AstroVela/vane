@@ -112,7 +112,6 @@ class DuckDBPyConnection:
         batch_size: object | None = None,
         gpus: object | None = None,
         actor_number: object | None = None,
-        stateful: bool = False,
         row_preserving: bool,
         replace: bool,
     ) -> DuckDBPyConnection: ...
@@ -124,28 +123,6 @@ class DuckDBPyConnection:
         return_type: sqltypes.DuckDBPyType | None = None,
         *,
         replace: bool,
-    ) -> DuckDBPyConnection: ...
-    def create_function(
-        self,
-        name: str,
-        function: Callable[..., typing.Any],
-        parameters: lst[sqltypes.DuckDBPyType] | None = None,
-        return_type: sqltypes.DuckDBPyType | None = None,
-        *,
-        type: func.PythonUDFType | str | int = ...,
-        null_handling: func.FunctionNullHandling | str | int = ...,
-        exception_handling: PythonExceptionHandling | str | int = ...,
-        side_effects: bool = False,
-    ) -> DuckDBPyConnection: ...
-    def create_table_function(
-        self,
-        name: str,
-        function: Callable[..., typing.Any],
-        schema: object = None,
-        return_type: sqltypes.DuckDBPyType | None = None,
-        *,
-        batch_size: object | None = None,
-        side_effects: bool = False,
     ) -> DuckDBPyConnection: ...
     def cursor(self) -> DuckDBPyConnection: ...
     def decimal_type(self, width: typing.SupportsInt, scale: typing.SupportsInt) -> sqltypes.DuckDBPyType: ...
@@ -574,7 +551,6 @@ class DuckDBPyRelation:
         gpus: float | None = None,
         execution_backend: typing.Literal["subprocess_task", "subprocess_actor", "ray_task", "ray_actor"] | None = None,
         actor_number: int | None = None,
-        side_effects: bool = False,
     ) -> DuckDBPyRelation: ...
     def map_batches(
         self,
@@ -1100,7 +1076,6 @@ def _VaneUDFMapBatchesExpression(
     row_preserving: bool = False,
     gpus: float | None = None,
     actor_number: int | None = None,
-    stateful: bool = False,
     expression_id: str | None = None,
     *args: Expression,
 ) -> Expression: ...
@@ -1147,28 +1122,6 @@ def connect(
     database: str | pathlib.Path = ":memory:",
     read_only: bool = False,
     config: dict[str, str | bool | int | float | lst[str]] | None = None,
-) -> DuckDBPyConnection: ...
-def create_function(
-    name: str,
-    function: Callable[..., typing.Any],
-    parameters: lst[sqltypes.DuckDBPyType] | None = None,
-    return_type: sqltypes.DuckDBPyType | None = None,
-    *,
-    type: func.PythonUDFType | str | int = ...,
-    null_handling: func.FunctionNullHandling | str | int = ...,
-    exception_handling: PythonExceptionHandling | str | int = ...,
-    side_effects: bool = False,
-    connection: DuckDBPyConnection | None = None,
-) -> DuckDBPyConnection: ...
-def create_table_function(
-    name: str,
-    function: Callable[..., typing.Any],
-    schema: object = None,
-    return_type: sqltypes.DuckDBPyType | None = None,
-    *,
-    batch_size: object | None = None,
-    side_effects: bool = False,
-    connection: DuckDBPyConnection | None = None,
 ) -> DuckDBPyConnection: ...
 def cursor(*, connection: DuckDBPyConnection | None = None) -> DuckDBPyConnection: ...
 def decimal_type(

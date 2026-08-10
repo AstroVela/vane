@@ -10,10 +10,6 @@ if TYPE_CHECKING:
     from collections import deque
     from collections.abc import Callable
 
-from vane.execution.udf_ray_actor_state import (
-    format_stateful_actor_loss as _format_stateful_actor_loss,
-)
-
 
 class RemoteUDFActorReadinessMixin:
     if TYPE_CHECKING:
@@ -28,7 +24,6 @@ class RemoteUDFActorReadinessMixin:
         _ready_refs_cv: threading.Condition
         _resolve_object_ref: Callable[[Any], Any]
         actors: list[Any]
-        error_context: Callable[[], dict[str, Any] | None]
 
     def _mark_actor_ready(self, actor_idx: int) -> None:
         if actor_idx in self._ready_actor_set:
@@ -157,13 +152,6 @@ class RemoteUDFActorReadinessMixin:
         self._refresh_actor_readiness()
         if self._ready_actor_indices:
             return
-
-        for error in self._actor_init_errors.values():
-            if not isinstance(error, BaseException):
-                continue
-            formatted = _format_stateful_actor_loss(self.error_context(), error)
-            if formatted is not error:
-                raise formatted from error
 
         err_preview = ", ".join(f"{idx}:{msg}" for idx, msg in sorted(self._actor_init_errors.items())[:3])
         if err_preview:

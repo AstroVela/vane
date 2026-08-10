@@ -129,6 +129,9 @@ def _assert_both(python: Path, first: str, second: str, *, cwd: Path) -> None:
         duckdb_adbc = importlib.import_module("adbc_driver_duckdb.dbapi")
         vane_udf = importlib.import_module("vane.udf")
         duckdb_func = importlib.import_module("duckdb.func")
+        # This validation executes through the raw connection, without a
+        # distributed query context that could supply a Ray query_id.
+        vane.configure(runner="local")
         vane_connection = vane.connect()
         duckdb_connection = duckdb.connect()
 
@@ -199,34 +202,22 @@ def _assert_both(python: Path, first: str, second: str, *, cwd: Path) -> None:
             else:
                 raise AssertionError("one engine accepted the other engine's native object or value")
 
-        vane_udf_args = ([vane.sqltypes.INTEGER], vane.sqltypes.INTEGER)
-        assert_rejected(
-            TypeError,
-            lambda: vane_connection.create_function(
-                "reject_official_udf_type",
-                lambda value: value,
-                *vane_udf_args,
-                type=duckdb_func.PythonUDFType.NATIVE,
-            ),
+        assert not hasattr(vane, "create_function")
+        assert not hasattr(vane, "create_table_function")
+        assert not hasattr(vane_connection, "create_function")
+        assert not hasattr(vane_connection, "create_table_function")
+
+        @vane.func(return_dtype=vane.sqltypes.INTEGER)
+        def vane_identity(value):
+            return value
+
+        vane.attach_function(
+            vane_identity,
+            alias="vane_identity",
+            connection=vane_connection,
+            parameters=[vane.sqltypes.INTEGER],
         )
-        assert_rejected(
-            TypeError,
-            lambda: vane_connection.create_function(
-                "reject_official_null_handling",
-                lambda value: value,
-                *vane_udf_args,
-                null_handling=duckdb_func.FunctionNullHandling.DEFAULT,
-            ),
-        )
-        assert_rejected(
-            TypeError,
-            lambda: vane_connection.create_function(
-                "reject_official_exception_handling",
-                lambda value: value,
-                *vane_udf_args,
-                exception_handling=duckdb.PythonExceptionHandling.DEFAULT,
-            ),
-        )
+        assert vane_connection.execute("SELECT vane_identity(42)").fetchone() == (42,)
 
         vane_relation = vane_connection.sql("SELECT 1 AS value")
         duckdb_relation = duckdb_connection.sql("SELECT 1 AS value")

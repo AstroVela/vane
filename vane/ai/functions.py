@@ -3,7 +3,7 @@
 
 """High-level AI functions that wrap descriptors into map_batches calls.
 
-These functions create stateful wrapper classes that:
+These functions create Actor wrapper classes with reconstructible local state that:
 1. Accept a Descriptor (serializable, lightweight)
 2. Lazily call ``instantiate()`` on the worker to load the model once
 3. Process each batch through the loaded model
@@ -361,9 +361,6 @@ def _map_batches_kwargs(
 ) -> dict[str, Any]:
     """Build keyword arguments for ``rel.map_batches()``."""
     num_gpus = udf_opts.num_gpus
-    if udf_opts.actor_number is not None and num_gpus is None:
-        raise ValueError("UDFOptions.num_gpus is required when actor_number is set")
-
     kwargs: dict[str, Any] = {
         "batch_size": udf_opts.batch_size,
         "gpus": num_gpus,
@@ -625,14 +622,15 @@ def _normalize_embedding(value: np.ndarray) -> np.ndarray:
 
 
 class _EmbedTextBatch:
-    """Stateful wrapper — model loaded once per actor via instantiate().
+    """Actor-local wrapper — model loaded once per instance via instantiate().
 
     Async execution is driven exclusively through an executor-bound
     ``run_async`` capability (see ``UDFExecutor._bind_async_runtime``); the
     wrapper never creates event loops or threads. The provider runtime is
     instantiated inside the bound loop so its async SDK client binds to the
     loop that serves every batch, and ``close()`` releases the client on
-    that same loop at actor shutdown.
+    that same loop at actor shutdown. Actor reconstruction creates a fresh
+    wrapper and reloads the model.
     """
 
     def __init__(
@@ -913,7 +911,7 @@ class _EmbedTextBatch:
 
 
 class _PromptBatch:
-    """Stateful row-preserving wrapper for ordered text/image Prompt parts."""
+    """Actor-local row-preserving wrapper for ordered text/image Prompt parts."""
 
     def __init__(
         self,

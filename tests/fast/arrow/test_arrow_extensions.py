@@ -125,6 +125,7 @@ class TestCanonicalExtensionTypes:
             (None,),
         ]
 
+    @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
     def test_uuid_udf_registered(self):
         def test_function(x):
             print(x.type.__class__)

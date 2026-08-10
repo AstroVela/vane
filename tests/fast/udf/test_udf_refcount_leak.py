@@ -12,6 +12,8 @@ import pytest
 
 import vane
 
+pytestmark = pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
+
 
 @pytest.mark.parametrize(("rows", "iters"), [(1000, 20)])
 def test_python_scalar_udf_return_value_refcount_does_not_leak(rows, iters):

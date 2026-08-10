@@ -133,20 +133,12 @@ def test_builder_delegates_native_process_resources_and_counts_each_ray_process(
     assert gpu_udf.actor_prefetch_depth == 2
 
 
-def test_builder_configures_stateless_actor_prefetch_and_disables_it_for_stateful_udfs():
+def test_builder_configures_actor_prefetch_uniformly():
     configured = build_query_resource_graph(
         _metadata(),
         env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "3"},
     )
     assert configured.unit_by_id(udf_unit_id_for_node("query-7", "3")).actor_prefetch_depth == 3
-
-    stateful_metadata = _metadata()
-    stateful_metadata["nodes"][2]["udf_payload"]["stateful"] = True
-    stateful = build_query_resource_graph(
-        stateful_metadata,
-        env={"VANE_RAY_ACTOR_PREFETCH_DEPTH": "3"},
-    )
-    assert stateful.unit_by_id(udf_unit_id_for_node("query-7", "3")).actor_prefetch_depth == 1
 
     with pytest.raises(ValueError, match="VANE_RAY_ACTOR_PREFETCH_DEPTH"):
         build_query_resource_graph(

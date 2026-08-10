@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: MIT AND Apache-2.0
+#
+# Modified by Vane contributors.
+
 import sys
 
 # we need typing.Union in our import cache
@@ -39,6 +45,7 @@ class TestStringAnnotation:
             ("dict[Union[str, bool], str]", "MAP(UNION(u1 VARCHAR, u2 BOOLEAN), VARCHAR)"),
         ],
     )
+    @pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
     def test_string_annotations(self, duckdb_cursor, input, expected):
         from inspect import signature
 

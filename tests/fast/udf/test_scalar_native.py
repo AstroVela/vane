@@ -21,6 +21,8 @@ from vane.sqltypes import (
     VARCHAR,
 )
 
+pytestmark = pytest.mark.skip(reason="DuckDB-style create_function is not part of Vane's public UDF API")
+
 
 class TestNativeUDF:
     def test_default_conn(self):

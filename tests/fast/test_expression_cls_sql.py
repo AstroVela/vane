@@ -51,6 +51,29 @@ def test_vane_cls_registered_for_sql_projection_and_named_arguments():
     assert rows == [("p:a",), ("p:b",)]
 
 
+def test_vane_cls_sql_registration_supports_multiple_independent_actors():
+    import uuid
+
+    import vane
+
+    conn = vane.connect()
+
+    @vane.cls(actor_number=2, return_dtype="INTEGER")
+    class AddOne:
+        def __call__(self, value):
+            return value + 1
+
+    vane.attach_function(AddOne(), connection=conn, alias="replicated_add_one", parameters=["INTEGER"])
+    relation = conn.sql("SELECT replicated_add_one(i::INTEGER) AS value FROM range(4) t(i)")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4())).to_physical_plan(conn)
+    nodes = plan.collect_udf_nodes(conn=conn)
+
+    assert len(nodes) == 1
+    assert nodes[0]["payload"]["actor_number"] == 2
+    assert nodes[0]["payload"]["execution_backend"] == "subprocess_actor"
+    assert sorted(relation.fetchall()) == [(1,), (2,), (3,), (4,)]
+
+
 def test_vane_cls_sql_reuses_state_across_batches():
     import vane
 
