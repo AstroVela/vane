@@ -246,6 +246,14 @@ The Iceberg read adapter has three additional production gates:
 
 The REST gate also appends 10,000 rows through real Ray workers and requires one
 committed Iceberg snapshot to be readable from a fresh Catalog attachment. Its
-separate read case binds a table, advances the snapshot, stops the Catalog, and
-executes the coordinator's scan descriptors in fresh workers while MinIO
+write failure matrix proves that a worker conversion
+failure commits no snapshot or durable output, an injected REST Catalog commit
+rejection rolls back and removes prepared files, and a committed Catalog update
+followed by denied marker publication raises `CopyOutcomeUnknownError` while
+the new snapshot remains readable. The marker test uses a dedicated non-root
+MinIO identity that can write data and manifests but cannot publish the final
+`committed` object.
+
+Its separate read case binds a table, advances the snapshot, stops the Catalog,
+and executes the coordinator's scan descriptors in fresh workers while MinIO
 remains online. The MinIO fixture-matrix gate remains read-only.

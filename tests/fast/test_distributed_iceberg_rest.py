@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import re
+import select
 import subprocess
+import sys
 import uuid
+from pathlib import Path
+from urllib import request
 from urllib.parse import urlparse
 
 import pytest
@@ -18,6 +23,88 @@ except Exception:
     ray = None
 
 import vane
+
+
+class _RestCommitFailureProxy:
+    def __init__(self, upstream_endpoint: str) -> None:
+        helper_path = Path(__file__).resolve().parents[1] / "helpers" / "iceberg_rest_commit_failure_proxy.py"
+        self._process = subprocess.Popen(
+            [sys.executable, "-u", str(helper_path), "--upstream", upstream_endpoint],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert self._process.stdout is not None
+        ready, _, _ = select.select([self._process.stdout], [], [], 10)
+        if not ready:
+            self._stop_and_close_process()
+            raise RuntimeError("Iceberg REST fault proxy did not publish its endpoint")
+        self._endpoint = self._process.stdout.readline().strip()
+        parsed = urlparse(self._endpoint)
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or not parsed.port:
+            self._stop_and_close_process()
+            raise RuntimeError(f"Iceberg REST fault proxy published an invalid endpoint: {self._endpoint!r}")
+
+    @property
+    def endpoint(self) -> str:
+        return self._endpoint
+
+    @property
+    def commit_attempts(self) -> int:
+        return int(self._status()["commit_attempts"])
+
+    @property
+    def cached_table_get_count(self) -> int:
+        return int(self._status()["cached_table_get_count"])
+
+    def reject_commits(self) -> None:
+        self._control("/__vane_fault/reject", method="POST")
+
+    def close(self) -> None:
+        try:
+            try:
+                if self._process.poll() is None:
+                    self._control("/__vane_fault/shutdown", method="POST")
+                self._process.wait(timeout=10)
+            except Exception:
+                self._stop_process()
+                raise
+            if self._process.returncode != 0:
+                assert self._process.stderr is not None
+                raise RuntimeError(f"Iceberg REST fault proxy failed: {self._process.stderr.read().strip()}")
+        finally:
+            self._close_pipes()
+
+    def _status(self) -> dict[str, int]:
+        return self._control("/__vane_fault/status", method="GET")
+
+    def _control(self, path: str, *, method: str) -> dict[str, int]:
+        control_request = request.Request(self._endpoint + path, method=method)
+        with request.urlopen(control_request, timeout=5) as response:
+            payload = response.read()
+        return json.loads(payload) if payload else {}
+
+    def _stop_process(self) -> None:
+        if self._process.poll() is not None:
+            return
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
+
+    def _stop_and_close_process(self) -> None:
+        try:
+            self._stop_process()
+        finally:
+            self._close_pipes()
+
+    def _close_pipes(self) -> None:
+        for pipe in (self._process.stdout, self._process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def _required_service_config() -> tuple[str, str, str, str, str]:
@@ -37,8 +124,80 @@ def _required_service_config() -> tuple[str, str, str, str, str]:
     return endpoint, minio_endpoint, access_key, secret_key, region
 
 
+def _required_marker_fault_credentials() -> tuple[str, str]:
+    access_key = os.getenv("TEST_MINIO_MARKER_FAULT_ACCESS_KEY") or ""
+    secret_key = os.getenv("TEST_MINIO_MARKER_FAULT_SECRET_KEY") or ""
+    if not access_key or not secret_key:
+        message = "The hermetic REST gate's marker-failure MinIO credentials are required"
+        if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
+    return access_key, secret_key
+
+
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _minio_client(minio_endpoint: str, access_key: str, secret_key: str, region: str):
+    from botocore.config import Config
+    from botocore.session import get_session
+
+    return get_session().create_client(
+        "s3",
+        endpoint_url=minio_endpoint,
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=2,
+            read_timeout=5,
+            retries={"max_attempts": 1},
+            s3={"addressing_style": "path"},
+        ),
+    )
+
+
+def _bucket_object_keys(client, bucket: str) -> set[str]:
+    keys: set[str] = set()
+    continuation_token = None
+    while True:
+        request = {"Bucket": bucket}
+        if continuation_token is not None:
+            request["ContinuationToken"] = continuation_token
+        response = client.list_objects_v2(**request)
+        keys.update(item["Key"] for item in response.get("Contents", []))
+        if not response.get("IsTruncated"):
+            return keys
+        continuation_token = response["NextContinuationToken"]
+
+
+def _write_artifact_keys(keys: set[str]) -> set[str]:
+    return {key for key in keys if key.endswith(".parquet") or ".duckdb_commit/" in key}
+
+
+def _durable_write_artifact_keys(keys: set[str]) -> set[str]:
+    return {
+        key for key in keys if key.endswith(".parquet") or key.endswith("/manifest.txt") or key.endswith("/committed")
+    }
+
+
+def _copy_base_path_from_lifecycle_key(bucket: str, key: str) -> str:
+    commit_separator = ".duckdb_commit/"
+    if not key.endswith("/lifecycle.txt") or commit_separator not in key:
+        raise ValueError(f"Not a distributed COPY lifecycle key: {key}")
+    return f"s3://{bucket}/{key.split(commit_separator, 1)[0]}"
+
+
+def _create_parquet_input(connection, input_dir, shard_queries: list[str]):
+    input_dir.mkdir()
+    for shard, query in enumerate(shard_queries):
+        shard_path = input_dir / f"part-{shard}.parquet"
+        connection.execute(f"COPY ({query}) TO {_sql_literal(shard_path.as_posix())} (FORMAT PARQUET)")
+    return connection.sql(
+        f"SELECT event_id, category FROM read_parquet({_sql_literal((input_dir / '*.parquet').as_posix())})"
+    )
 
 
 def _configure_catalog_connection(
@@ -228,6 +387,284 @@ def test_distributed_insert_commits_one_iceberg_snapshot(monkeypatch, tmp_path):
         if verifier_connection is not None:
             verifier_connection.close()
         source_connection.close()
+        if hasattr(vane, "teardown_runner"):
+            vane.teardown_runner()
+
+
+@pytest.mark.external_service
+@pytest.mark.iceberg_rest
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
+def test_distributed_insert_worker_failure_does_not_commit_snapshot(monkeypatch, tmp_path):
+    if ray is None:
+        if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":
+            pytest.fail("ray is required by the hermetic Iceberg REST gate")
+        pytest.skip("ray not installed")
+
+    catalog_endpoint, minio_endpoint, access_key, secret_key, region = _required_service_config()
+    bucket = os.environ["TEST_MINIO_BUCKET"]
+    schema_name = f"vane_worker_failure_{uuid.uuid4().hex}"
+    table_name = f"rest_catalog.{schema_name}.events"
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+
+    s3_client = _minio_client(minio_endpoint, access_key, secret_key, region)
+    source_connection = vane.connect()
+    verifier_connection = None
+    before_objects: set[str] = set()
+    try:
+        _configure_catalog_connection(
+            source_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        source_connection.execute(f"CREATE SCHEMA rest_catalog.{schema_name}")
+        source_connection.execute(f"CREATE TABLE {table_name} (event_id INTEGER, category VARCHAR NOT NULL)")
+        before_objects = _bucket_object_keys(s3_client, bucket)
+
+        source = _create_parquet_input(
+            source_connection,
+            tmp_path / "iceberg-worker-failure-input",
+            [
+                "SELECT i::BIGINT AS event_id, 'valid'::VARCHAR AS category FROM range(0, 250) rows(i)",
+                "SELECT 2147483648::BIGINT AS event_id, 'overflow'::VARCHAR AS category",
+            ],
+        )
+        with pytest.raises(Exception) as exc_info:
+            source.insert_into(table_name)
+        error_message = str(exc_info.value).lower()
+        assert "2147483648" in error_message or "out of range" in error_message
+
+        verifier_connection = vane.connect()
+        _configure_catalog_connection(
+            verifier_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        assert verifier_connection.execute(f"SELECT count(*) FROM {table_name}").fetchone() == (0,)
+        assert verifier_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({table_name})").fetchone() == (0,)
+        after_objects = _bucket_object_keys(s3_client, bucket)
+        new_objects = after_objects - before_objects
+        assert _durable_write_artifact_keys(new_objects) == set()
+
+        # A worker can fail before its output metadata reaches the coordinator.
+        # The direct-write protocol may conservatively retain only its lifecycle
+        # registration so an operator can retry cleanup without guessing object
+        # ownership. Prove that this recovery path removes the registration and
+        # leaves no data, manifest, or committed marker behind.
+        lifecycle_keys = {key for key in new_objects if key.endswith("/lifecycle.txt")}
+        assert new_objects == lifecycle_keys
+        if lifecycle_keys:
+            from vane.runners.ray import cleanup_copy_direct_write_lifecycle_once
+
+            base_paths = sorted(_copy_base_path_from_lifecycle_key(bucket, key) for key in lifecycle_keys)
+            cleanup = cleanup_copy_direct_write_lifecycle_once(
+                base_paths,
+                min_age_ms=0,
+                fail_fast=True,
+                conn=verifier_connection,
+            )
+            assert cleanup["errors"] == 0, cleanup["error_messages"]
+            assert cleanup["cleaned_runs"] == len(lifecycle_keys)
+            assert (
+                _write_artifact_keys(_bucket_object_keys(s3_client, bucket)) - _write_artifact_keys(before_objects)
+                == set()
+            )
+    finally:
+        if verifier_connection is not None:
+            verifier_connection.close()
+        source_connection.close()
+        s3_client.close()
+        if hasattr(vane, "teardown_runner"):
+            vane.teardown_runner()
+
+
+@pytest.mark.external_service
+@pytest.mark.iceberg_rest
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
+def test_rest_catalog_commit_rejection_rolls_back_and_cleans_output(monkeypatch, tmp_path):
+    if ray is None:
+        if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":
+            pytest.fail("ray is required by the hermetic Iceberg REST gate")
+        pytest.skip("ray not installed")
+
+    catalog_endpoint, minio_endpoint, access_key, secret_key, region = _required_service_config()
+    bucket = os.environ["TEST_MINIO_BUCKET"]
+    schema_name = f"vane_commit_failure_{uuid.uuid4().hex}"
+    table_name = f"rest_catalog.{schema_name}.events"
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+
+    proxy = _RestCommitFailureProxy(catalog_endpoint)
+    s3_client = _minio_client(minio_endpoint, access_key, secret_key, region)
+    source_connection = vane.connect()
+    verifier_connection = None
+    before_artifacts: set[str] = set()
+    try:
+        _configure_catalog_connection(
+            source_connection,
+            proxy.endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        source_connection.execute(f"CREATE SCHEMA rest_catalog.{schema_name}")
+        source_connection.execute(f"CREATE TABLE {table_name} (event_id INTEGER, category VARCHAR NOT NULL)")
+        assert source_connection.execute(f"SELECT count(*) FROM {table_name}").fetchone() == (0,)
+        assert proxy.cached_table_get_count >= 1
+        before_artifacts = _write_artifact_keys(_bucket_object_keys(s3_client, bucket))
+        source = _create_parquet_input(
+            source_connection,
+            tmp_path / "iceberg-commit-failure-input",
+            [
+                "SELECT i::INTEGER AS event_id, concat('category-', i % 3)::VARCHAR AS category "
+                "FROM range(0, 500) rows(i)",
+                "SELECT i::INTEGER AS event_id, concat('category-', i % 3)::VARCHAR AS category "
+                "FROM range(500, 1000) rows(i)",
+            ],
+        )
+
+        proxy.reject_commits()
+        with pytest.raises(Exception) as commit_error:
+            source.insert_into(table_name)
+        assert "planned catalog commit failure" in str(commit_error.value)
+        assert proxy.commit_attempts >= 1
+
+        verifier_connection = vane.connect()
+        _configure_catalog_connection(
+            verifier_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        assert verifier_connection.execute(f"SELECT count(*) FROM {table_name}").fetchone() == (0,)
+        assert verifier_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({table_name})").fetchone() == (0,)
+        after_artifacts = _write_artifact_keys(_bucket_object_keys(s3_client, bucket))
+        assert after_artifacts - before_artifacts == set(), str(commit_error.value)
+    finally:
+        if verifier_connection is not None:
+            verifier_connection.close()
+        source_connection.close()
+        proxy.close()
+        s3_client.close()
+        if hasattr(vane, "teardown_runner"):
+            vane.teardown_runner()
+
+
+@pytest.mark.external_service
+@pytest.mark.iceberg_rest
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
+def test_committed_catalog_with_marker_failure_reports_unknown(monkeypatch, tmp_path):
+    if ray is None:
+        if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":
+            pytest.fail("ray is required by the hermetic Iceberg REST gate")
+        pytest.skip("ray not installed")
+
+    from botocore.exceptions import ClientError
+
+    from vane.runners import CopyOutcomeUnknownError
+
+    catalog_endpoint, minio_endpoint, access_key, secret_key, region = _required_service_config()
+    marker_fault_access_key, marker_fault_secret_key = _required_marker_fault_credentials()
+    bucket = os.environ["TEST_MINIO_BUCKET"]
+    schema_name = f"vane_marker_failure_{uuid.uuid4().hex}"
+    table_name = f"rest_catalog.{schema_name}.events"
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+
+    s3_client = _minio_client(minio_endpoint, access_key, secret_key, region)
+    marker_fault_s3_client = _minio_client(
+        minio_endpoint,
+        marker_fault_access_key,
+        marker_fault_secret_key,
+        region,
+    )
+    source_connection = vane.connect()
+    verifier_connection = None
+    before_artifacts: set[str] = set()
+    try:
+        _configure_catalog_connection(
+            source_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            marker_fault_access_key,
+            marker_fault_secret_key,
+            region,
+        )
+        source_connection.execute(f"CREATE SCHEMA rest_catalog.{schema_name}")
+        source_connection.execute(f"CREATE TABLE {table_name} (event_id INTEGER, category VARCHAR NOT NULL)")
+        probe_key = f"marker-policy-probe/{uuid.uuid4().hex}"
+        marker_fault_s3_client.put_object(Bucket=bucket, Key=probe_key, Body=b"probe")
+        marker_fault_s3_client.delete_object(Bucket=bucket, Key=probe_key)
+        with pytest.raises(ClientError) as policy_error:
+            marker_fault_s3_client.put_object(
+                Bucket=bucket,
+                Key="policy-probe/data.duckdb_commit/test/committed",
+                Body=b"probe",
+            )
+        assert policy_error.value.response["Error"]["Code"] in {"AccessDenied", "XMinioAdminAccessDenied"}
+
+        before_artifacts = _write_artifact_keys(_bucket_object_keys(s3_client, bucket))
+        source = _create_parquet_input(
+            source_connection,
+            tmp_path / "iceberg-marker-failure-input",
+            [
+                "SELECT i::INTEGER AS event_id, concat('category-', i % 5)::VARCHAR AS category "
+                "FROM range(0, 500) rows(i)",
+                "SELECT i::INTEGER AS event_id, concat('category-', i % 5)::VARCHAR AS category "
+                "FROM range(500, 1000) rows(i)",
+            ],
+        )
+
+        with pytest.raises(CopyOutcomeUnknownError) as outcome_error:
+            source.insert_into(table_name)
+        unknown_outcome = outcome_error.value
+        assert unknown_outcome.safe_to_retry is False
+        assert unknown_outcome.base_path.startswith(f"s3://{bucket}/")
+        assert unknown_outcome.run_id
+        assert unknown_outcome.manifest_path.endswith("/manifest.txt")
+        assert unknown_outcome.committed_marker_path.endswith("/committed")
+        assert "403" in unknown_outcome.detail or "AccessDenied" in unknown_outcome.detail
+
+        verifier_connection = vane.connect()
+        _configure_catalog_connection(
+            verifier_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        assert verifier_connection.execute(f"SELECT count(*) FROM {table_name}").fetchone() == (1000,)
+        assert verifier_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({table_name})").fetchone() == (1,)
+        after_artifacts = _write_artifact_keys(_bucket_object_keys(s3_client, bucket))
+        new_artifacts = after_artifacts - before_artifacts
+        assert any(key.endswith(".parquet") for key in new_artifacts)
+        assert any(key.endswith("/manifest.txt") for key in new_artifacts)
+        assert not any(key.endswith("/committed") for key in new_artifacts)
+    finally:
+        if verifier_connection is not None:
+            verifier_connection.close()
+        source_connection.close()
+        marker_fault_s3_client.close()
+        s3_client.close()
         if hasattr(vane, "teardown_runner"):
             vane.teardown_runner()
 

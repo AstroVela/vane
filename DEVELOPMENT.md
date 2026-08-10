@@ -142,8 +142,9 @@ extension source directories and the bootstrapped vcpkg installation. Set
 `VCPKG_INSTALLED_DIR` when dependencies are shared by multiple worktrees.
 The REST gate provisions tables on the coordinator, exercises append-only
 distributed `INSERT INTO` through real Ray workers, verifies the committed
-snapshot from a fresh Catalog attachment, and separately tests snapshot-pinned
-distributed reads after the Catalog stops.
+snapshot from a fresh Catalog attachment, and covers worker failure, rejected
+Catalog commit, and post-Catalog marker-publication failure boundaries. It also
+separately tests snapshot-pinned distributed reads after the Catalog stops.
 
 Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must
 skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local

@@ -14,6 +14,9 @@ minio_name="vane-iceberg-rest-minio-${resource_suffix}"
 rest_name="vane-iceberg-rest-catalog-${resource_suffix}"
 access_key="admin"
 secret_key="password"
+marker_fault_access_key="vane-marker-fault"
+marker_fault_secret_key="marker-fault-password"
+marker_fault_policy="vane-marker-fault"
 region="us-east-1"
 bucket="warehouse"
 network_created=0
@@ -130,6 +133,61 @@ PY
   docker logs "$minio_container_id" >&2 || true
   exit 1
 fi
+
+# The root MinIO identity bypasses bucket-policy denies. Provision a dedicated
+# writer identity whose only denied operation is publishing Vane's final
+# committed marker. The REST catalog keeps using the root identity so a test can
+# prove that the Iceberg catalog commit succeeded before marker publication
+# failed.
+docker exec \
+  --env "VANE_TEST_ROOT_ACCESS_KEY=$access_key" \
+  --env "VANE_TEST_ROOT_SECRET_KEY=$secret_key" \
+  --env "VANE_TEST_MARKER_FAULT_ACCESS_KEY=$marker_fault_access_key" \
+  --env "VANE_TEST_MARKER_FAULT_SECRET_KEY=$marker_fault_secret_key" \
+  --env "VANE_TEST_MARKER_FAULT_POLICY=$marker_fault_policy" \
+  --env "VANE_TEST_BUCKET=$bucket" \
+  --interactive \
+  "$minio_container_id" \
+  sh <<'SH'
+set -eu
+
+mc alias set vane-test http://127.0.0.1:9000 "$VANE_TEST_ROOT_ACCESS_KEY" "$VANE_TEST_ROOT_SECRET_KEY" >/dev/null
+mc admin user add \
+  vane-test \
+  "$VANE_TEST_MARKER_FAULT_ACCESS_KEY" \
+  "$VANE_TEST_MARKER_FAULT_SECRET_KEY" >/dev/null
+
+policy_file=/tmp/vane-marker-fault-policy.json
+cat >"$policy_file" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:*"],
+      "Resource": [
+        "arn:aws:s3:::$VANE_TEST_BUCKET",
+        "arn:aws:s3:::$VANE_TEST_BUCKET/*"
+      ]
+    },
+    {
+      "Effect": "Deny",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::$VANE_TEST_BUCKET/*data.duckdb_commit/*/committed"]
+    }
+  ]
+}
+EOF
+mc admin policy create vane-test "$VANE_TEST_MARKER_FAULT_POLICY" "$policy_file" >/dev/null
+mc admin policy attach \
+  vane-test \
+  "$VANE_TEST_MARKER_FAULT_POLICY" \
+  --user "$VANE_TEST_MARKER_FAULT_ACCESS_KEY" >/dev/null
+rm -f "$policy_file"
+SH
+
+export TEST_MINIO_MARKER_FAULT_ACCESS_KEY="$marker_fault_access_key"
+export TEST_MINIO_MARKER_FAULT_SECRET_KEY="$marker_fault_secret_key"
 
 rest_container_id="$(
   docker run \
