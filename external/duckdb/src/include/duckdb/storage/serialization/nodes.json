@@ -844,6 +844,56 @@
         "name": "buffer_size_option",
         "type": "CSVOption<idx_t>",
         "property": "options.buffer_size_option"
+      },
+      {"id": 144,
+        "name": "store_rejects",
+        "type": "CSVOption<bool>",
+        "property": "options.store_rejects"
+      },
+      {"id": 145,
+        "name": "thousands_separator",
+        "type": "char",
+        "property": "options.thousands_separator"
+      },
+      {"id": 146,
+        "name": "files_to_sniff",
+        "type": "int64_t",
+        "property": "options.files_to_sniff"
+      },
+      {"id": 147,
+        "name": "auto_type_candidates",
+        "type": "vector<LogicalType>",
+        "property": "options.auto_type_candidates"
+      },
+      {"id": 148,
+        "name": "user_defined_parameters",
+        "type": "map<string, string>",
+        "property": "options.user_defined_parameters"
+      },
+      {"id": 149,
+        "name": "prefix",
+        "type": "string",
+        "property": "options.prefix"
+      },
+      {"id": 150,
+        "name": "suffix",
+        "type": "string",
+        "property": "options.suffix"
+      },
+      {"id": 151,
+        "name": "write_newline",
+        "type": "string",
+        "property": "options.write_newline"
+      },
+      {"id": 152,
+        "name": "write_date_format",
+        "type": "map<LogicalTypeId, Value>",
+        "property": "options.write_date_format"
+      },
+      {"id": 153,
+        "name": "has_format",
+        "type": "map<LogicalTypeId, bool>",
+        "property": "options.has_format"
       }
     ],
     "constructor": ["delimiter", "multi_byte_delimiter"],
@@ -914,6 +964,41 @@
         "id": 108,
         "name": "column_info",
         "type": "vector<ColumnInfo>"
+      },
+      {
+        "id": 109,
+        "name": "hive_partition_col_idx",
+        "type": "idx_t"
+      },
+      {
+        "id": 110,
+        "name": "table_columns",
+        "type": "vector<string>"
+      },
+      {
+        "id": 111,
+        "name": "manually_set",
+        "type": "vector<bool>"
+      },
+      {
+        "id": 112,
+        "name": "csv_schema_names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 113,
+        "name": "csv_schema_types",
+        "type": "vector<LogicalType>"
+      },
+      {
+        "id": 114,
+        "name": "csv_schema_path",
+        "type": "string"
+      },
+      {
+        "id": 115,
+        "name": "csv_schema_rows_read",
+        "type": "idx_t"
       }
     ],
     "pointer_type": "none"
@@ -930,6 +1015,16 @@
         "id": 101,
         "name": "types",
         "type": "vector<LogicalType>"
+      },
+      {
+        "id": 102,
+        "name": "file_path",
+        "type": "string"
+      },
+      {
+        "id": 103,
+        "name": "options",
+        "type": "SerializedCSVReaderOptions"
       }
     ],
     "pointer_type": "none"
@@ -1124,6 +1219,16 @@
         "id": 103,
         "name": "sample_options",
         "type": "unique_ptr<SampleOptions>"
+      },
+      {
+        "id": 104,
+        "name": "scan_node_id",
+        "type": "optional_idx"
+      },
+      {
+        "id": 105,
+        "name": "scan_group_id",
+        "type": "optional_idx"
       }
     ],
     "pointer_type": "none"

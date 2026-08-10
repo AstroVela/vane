@@ -238,12 +238,16 @@ ColumnIndex ColumnIndex::Deserialize(Deserializer &deserializer) {
 void ColumnInfo::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<vector<string>>(100, "names", names);
 	serializer.WritePropertyWithDefault<vector<LogicalType>>(101, "types", types);
+	serializer.WritePropertyWithDefault<string>(102, "file_path", file_path);
+	serializer.WriteProperty<SerializedCSVReaderOptions>(103, "options", options);
 }
 
 ColumnInfo ColumnInfo::Deserialize(Deserializer &deserializer) {
 	ColumnInfo result;
 	deserializer.ReadPropertyWithDefault<vector<string>>(100, "names", result.names);
 	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(101, "types", result.types);
+	deserializer.ReadPropertyWithDefault<string>(102, "file_path", result.file_path);
+	deserializer.ReadProperty<SerializedCSVReaderOptions>(103, "options", result.options);
 	return result;
 }
 
@@ -326,8 +330,8 @@ ExtraOperatorInfo ExtraOperatorInfo::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadProperty<optional_idx>(101, "total_files", result.total_files);
 	deserializer.ReadProperty<optional_idx>(102, "filtered_files", result.filtered_files);
 	deserializer.ReadPropertyWithDefault<unique_ptr<SampleOptions>>(103, "sample_options", result.sample_options);
-	deserializer.ReadPropertyWithDefault<optional_idx>(104, "scan_node_id", result.scan_node_id);
-	deserializer.ReadPropertyWithDefault<optional_idx>(105, "scan_group_id", result.scan_group_id);
+	deserializer.ReadProperty<optional_idx>(104, "scan_node_id", result.scan_node_id);
+	deserializer.ReadProperty<optional_idx>(105, "scan_group_id", result.scan_group_id);
 	return result;
 }
 
@@ -553,6 +557,16 @@ void SerializedCSVReaderOptions::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<CSVOption<string>>(141, "multi_byte_delimiter", options.GetMultiByteDelimiter());
 	serializer.WritePropertyWithDefault<bool>(142, "multi_file_reader", options.multi_file_reader);
 	serializer.WriteProperty<CSVOption<idx_t>>(143, "buffer_size_option", options.buffer_size_option);
+	serializer.WriteProperty<CSVOption<bool>>(144, "store_rejects", options.store_rejects);
+	serializer.WriteProperty<char>(145, "thousands_separator", options.thousands_separator);
+	serializer.WritePropertyWithDefault<int64_t>(146, "files_to_sniff", options.files_to_sniff);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(147, "auto_type_candidates", options.auto_type_candidates);
+	serializer.WritePropertyWithDefault<map<string, string>>(148, "user_defined_parameters", options.user_defined_parameters);
+	serializer.WritePropertyWithDefault<string>(149, "prefix", options.prefix);
+	serializer.WritePropertyWithDefault<string>(150, "suffix", options.suffix);
+	serializer.WritePropertyWithDefault<string>(151, "write_newline", options.write_newline);
+	serializer.WritePropertyWithDefault<map<LogicalTypeId, Value>>(152, "write_date_format", options.write_date_format);
+	serializer.WritePropertyWithDefault<map<LogicalTypeId, bool>>(153, "has_format", options.has_format);
 }
 
 SerializedCSVReaderOptions SerializedCSVReaderOptions::Deserialize(Deserializer &deserializer) {
@@ -638,6 +652,16 @@ SerializedCSVReaderOptions SerializedCSVReaderOptions::Deserialize(Deserializer 
 	result.options.dialect_options.state_machine_options.strict_mode = options_dialect_options_state_machine_options_strict_mode;
 	deserializer.ReadPropertyWithDefault<bool>(142, "multi_file_reader", result.options.multi_file_reader);
 	deserializer.ReadProperty<CSVOption<idx_t>>(143, "buffer_size_option", result.options.buffer_size_option);
+	deserializer.ReadProperty<CSVOption<bool>>(144, "store_rejects", result.options.store_rejects);
+	deserializer.ReadProperty<char>(145, "thousands_separator", result.options.thousands_separator);
+	deserializer.ReadPropertyWithDefault<int64_t>(146, "files_to_sniff", result.options.files_to_sniff);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(147, "auto_type_candidates", result.options.auto_type_candidates);
+	deserializer.ReadPropertyWithDefault<map<string, string>>(148, "user_defined_parameters", result.options.user_defined_parameters);
+	deserializer.ReadPropertyWithDefault<string>(149, "prefix", result.options.prefix);
+	deserializer.ReadPropertyWithDefault<string>(150, "suffix", result.options.suffix);
+	deserializer.ReadPropertyWithDefault<string>(151, "write_newline", result.options.write_newline);
+	deserializer.ReadPropertyWithDefault<map<LogicalTypeId, Value>>(152, "write_date_format", result.options.write_date_format);
+	deserializer.ReadPropertyWithDefault<map<LogicalTypeId, bool>>(153, "has_format", result.options.has_format);
 	return result;
 }
 
@@ -651,6 +675,13 @@ void SerializedReadCSVData::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<SerializedCSVReaderOptions>(106, "options", options);
 	serializer.WriteProperty<MultiFileReaderBindData>(107, "reader_bind", reader_bind);
 	serializer.WritePropertyWithDefault<vector<ColumnInfo>>(108, "column_info", column_info);
+	serializer.WritePropertyWithDefault<idx_t>(109, "hive_partition_col_idx", hive_partition_col_idx);
+	serializer.WritePropertyWithDefault<vector<string>>(110, "table_columns", table_columns);
+	serializer.WritePropertyWithDefault<vector<bool>>(111, "manually_set", manually_set);
+	serializer.WritePropertyWithDefault<vector<string>>(112, "csv_schema_names", csv_schema_names);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(113, "csv_schema_types", csv_schema_types);
+	serializer.WritePropertyWithDefault<string>(114, "csv_schema_path", csv_schema_path);
+	serializer.WritePropertyWithDefault<idx_t>(115, "csv_schema_rows_read", csv_schema_rows_read);
 }
 
 SerializedReadCSVData SerializedReadCSVData::Deserialize(Deserializer &deserializer) {
@@ -664,6 +695,13 @@ SerializedReadCSVData SerializedReadCSVData::Deserialize(Deserializer &deseriali
 	deserializer.ReadProperty<SerializedCSVReaderOptions>(106, "options", result.options);
 	deserializer.ReadProperty<MultiFileReaderBindData>(107, "reader_bind", result.reader_bind);
 	deserializer.ReadPropertyWithDefault<vector<ColumnInfo>>(108, "column_info", result.column_info);
+	deserializer.ReadPropertyWithDefault<idx_t>(109, "hive_partition_col_idx", result.hive_partition_col_idx);
+	deserializer.ReadPropertyWithDefault<vector<string>>(110, "table_columns", result.table_columns);
+	deserializer.ReadPropertyWithDefault<vector<bool>>(111, "manually_set", result.manually_set);
+	deserializer.ReadPropertyWithDefault<vector<string>>(112, "csv_schema_names", result.csv_schema_names);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(113, "csv_schema_types", result.csv_schema_types);
+	deserializer.ReadPropertyWithDefault<string>(114, "csv_schema_path", result.csv_schema_path);
+	deserializer.ReadPropertyWithDefault<idx_t>(115, "csv_schema_rows_read", result.csv_schema_rows_read);
 	return result;
 }
 

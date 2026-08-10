@@ -44,10 +44,13 @@ void CSVGlobalState::FinishScan(unique_ptr<StringValueScanner> scanner) {
 
 unique_ptr<StringValueScanner> CSVGlobalState::Next(shared_ptr<CSVFileScan> &current_file_ptr) {
 	auto &current_file = *current_file_ptr;
+	const bool has_scan_range = current_file.buffer_manager->HasScanRange();
+	const auto buffer_size = current_file.options.buffer_size_option.GetValue();
 	if (!initialized) {
 		// initialize the boundary for this file
 		current_boundary = current_file.start_iterator;
-		current_boundary.SetCurrentBoundaryToPosition(single_threaded, current_file.options);
+		current_boundary.buffer_size = buffer_size;
+		current_boundary.SetCurrentBoundaryToPosition(single_threaded && !has_scan_range, current_file.options);
 		if (current_boundary.done && context.client_data->debug_set_max_line_length) {
 			context.client_data->debug_max_line_length =
 			    MaxValue<idx_t>(context.client_data->debug_max_line_length, current_boundary.pos.buffer_pos);
@@ -60,6 +63,17 @@ unique_ptr<StringValueScanner> CSVGlobalState::Next(shared_ptr<CSVFileScan> &cur
 		if (current_boundary.done || !current_boundary.Next(*current_file.buffer_manager, current_file.options)) {
 			// finished processing this file - return
 			return nullptr;
+		}
+	}
+	if (has_scan_range) {
+		const auto scan_end = current_file.buffer_manager->GetScanRangeSize();
+		if (current_boundary.GetGlobalCurrentPos() >= scan_end) {
+			return nullptr;
+		}
+		const auto end_buffer_idx = (scan_end - 1) / buffer_size;
+		const auto end_buffer_pos = (scan_end - 1) % buffer_size + 1;
+		if (current_boundary.GetBufferIdx() == end_buffer_idx && current_boundary.GetEndPos() > end_buffer_pos) {
+			current_boundary.SetEnd(end_buffer_pos);
 		}
 	}
 	// create the scanner for this file

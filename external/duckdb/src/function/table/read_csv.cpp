@@ -31,6 +31,8 @@
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_multi_file_info.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 SerializedCSVReaderOptions::SerializedCSVReaderOptions(CSVReaderOptions options_p, MultiFileOptions file_options_p)
@@ -48,6 +50,19 @@ unique_ptr<CSVFileHandle> ReadCSV::OpenCSV(const OpenFileInfo &file, const CSVRe
 }
 
 ReadCSVData::ReadCSVData() {
+}
+
+unique_ptr<FunctionData> ReadCSVData::Copy() const {
+	auto result = make_uniq<ReadCSVData>();
+	result->options = options;
+	result->filename_col_idx = filename_col_idx;
+	result->hive_partition_col_idx = hive_partition_col_idx;
+	result->manually_set = manually_set;
+	// The bind-time buffer manager owns mutable file position and cached buffers. A copied plan must open its own
+	// reader, especially when a distributed scan task narrows the same file to a byte range.
+	result->column_info = column_info;
+	result->csv_schema = csv_schema;
+	return std::move(result);
 }
 
 void ReadCSVData::FinalizeRead(ClientContext &context) {
@@ -101,43 +116,121 @@ void ReadCSVTableFunction::ReadCSVAddNamedParameters(TableFunction &table_functi
 
 static void CSVReaderSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                const TableFunction &function) {
-	throw NotImplementedException("CSVReaderSerialize not implemented");
-	// auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
-	// auto &csv_data = bind_data.bind_data->Cast<ReadCSVData>();
-	// serializer.WriteProperty(100, "extra_info", function.extra_info);
-	// // generate the serialized data
-	// SerializedReadCSVData serialized_data;
-	// serialized_data.return_types = serialized_data.csv_types = bind_data.types;
-	// serialized_data.return_names = serialized_data.csv_names = bind_data.names;
-	// serialized_data.files = bind_data.file_list->GetAllFiles();
-	// serialized_data.filename_col_idx = csv_data.filename_col_idx;
-	// serialized_data.options.options = csv_data.options;
-	// serialized_data.options.file_options = bind_data.file_options;
-	// serialized_data.reader_bind = bind_data.reader_bind;
-	// serializer.WriteProperty(101, "csv_data", serialized_data);
+	if (!bind_data_p) {
+		throw InternalException("Cannot serialize read_csv without bind data");
+	}
+	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
+	auto &csv_data = bind_data.bind_data->Cast<ReadCSVData>();
+
+	SerializedReadCSVData serialized_data;
+	for (auto &file : bind_data.file_list->GetAllFiles()) {
+		serialized_data.files.emplace_back(file.path);
+	}
+	serialized_data.return_types = serialized_data.csv_types = bind_data.types;
+	serialized_data.return_names = serialized_data.csv_names = bind_data.names;
+	serialized_data.filename_col_idx = csv_data.filename_col_idx;
+	serialized_data.hive_partition_col_idx = csv_data.hive_partition_col_idx;
+	serialized_data.options = SerializedCSVReaderOptions(csv_data.options, bind_data.file_options);
+	serialized_data.reader_bind = bind_data.reader_bind;
+	serialized_data.table_columns = bind_data.table_columns;
+	serialized_data.manually_set = csv_data.manually_set;
+
+	if (!csv_data.csv_schema.Empty()) {
+		serialized_data.csv_schema_names = csv_data.csv_schema.GetNames();
+		serialized_data.csv_schema_types = csv_data.csv_schema.GetTypes();
+		serialized_data.csv_schema_path = csv_data.csv_schema.GetPath();
+		serialized_data.csv_schema_rows_read = csv_data.csv_schema.GetRowsRead();
+	}
+
+	if (bind_data.file_options.union_by_name) {
+		if (csv_data.column_info.empty()) {
+			throw InternalException("Cannot serialize CSV union-by-name scan without per-file reader information");
+		}
+		for (auto &file : serialized_data.files) {
+			auto entry = std::find_if(csv_data.column_info.begin(), csv_data.column_info.end(),
+			                          [&](const ColumnInfo &info) { return info.file_path == file; });
+			if (entry == csv_data.column_info.end()) {
+				throw InternalException("Missing serialized CSV union reader information for file \"%s\"", file);
+			}
+			if (entry->options.options.encoding.empty()) {
+				throw InternalException("CSV union reader information has no encoding for file \"%s\"", file);
+			}
+			serialized_data.column_info.push_back(*entry);
+		}
+	}
+	serializer.WriteProperty(100, "csv_data", serialized_data);
 }
 
 static unique_ptr<FunctionData> CSVReaderDeserialize(Deserializer &deserializer, TableFunction &function) {
-	throw NotImplementedException("CSVReaderDeserialize not implemented");
-	// auto &context = deserializer.Get<ClientContext &>();
-	// SerializedReadCSVData serialized_data;
-	// deserializer.ReadProperty(100, "extra_info", function.extra_info);
-	// deserializer.ReadProperty(101, "csv_data", serialized_data);
-	//
-	// vector<Value> file_path;
-	// for (auto &path : serialized_data.files) {
-	// 	file_path.emplace_back(path);
-	// }
-	// auto multi_file_reader = MultiFileReader::Create(function);
-	// auto file_list = multi_file_reader->CreateFileList(context, Value::LIST(LogicalType::VARCHAR, file_path),
-	//                                                    FileGlobOptions::ALLOW_EMPTY);
-	// auto csv_options = make_uniq<CSVFileReaderOptions>();
-	// csv_options->options = std::move(serialized_data.options.options);
-	//
-	// auto bind_data = MultiFileFunction<CSVMultiFileInfo>::MultiFileBindInternal(
-	//     context, std::move(multi_file_reader), std::move(file_list), serialized_data.return_types,
-	//     serialized_data.return_names, std::move(serialized_data.options.file_options), std::move(csv_options));
-	// return bind_data;
+	auto &context = deserializer.Get<ClientContext &>();
+	auto serialized_data = deserializer.ReadProperty<SerializedReadCSVData>(100, "csv_data");
+	if (serialized_data.files.empty()) {
+		throw IOException("%s needs at least one file to read", function.name);
+	}
+
+	vector<OpenFileInfo> open_files;
+	open_files.reserve(serialized_data.files.size());
+	for (auto &path : serialized_data.files) {
+		open_files.emplace_back(path);
+	}
+	auto file_list = make_shared_ptr<SimpleMultiFileList>(std::move(open_files));
+	auto multi_file_reader = MultiFileReader::Create(function);
+	auto interface = make_uniq<CSVMultiFileInfo>();
+	interface->InitializeInterface(context, *multi_file_reader, *file_list);
+
+	auto csv_options = make_uniq<CSVFileReaderOptions>(std::move(serialized_data.options.options));
+	auto result = make_uniq<MultiFileBindData>();
+	result->multi_file_reader = std::move(multi_file_reader);
+	result->file_list = std::move(file_list);
+	result->file_options = std::move(serialized_data.options.file_options);
+	result->interface = std::move(interface);
+	result->bind_data = result->interface->InitializeBindData(*result, std::move(csv_options));
+	result->types = std::move(serialized_data.return_types);
+	result->names = std::move(serialized_data.return_names);
+	result->reader_bind = std::move(serialized_data.reader_bind);
+	result->table_columns = std::move(serialized_data.table_columns);
+	if (result->file_options.union_by_name) {
+		if (serialized_data.column_info.size() != serialized_data.files.size()) {
+			throw SerializationException("CSV union-by-name scan has %llu files but %llu per-file reader entries",
+			                             serialized_data.files.size(), serialized_data.column_info.size());
+		}
+		for (idx_t file_idx = 0; file_idx < serialized_data.files.size(); ++file_idx) {
+			if (serialized_data.column_info[file_idx].file_path != serialized_data.files[file_idx]) {
+				throw SerializationException("CSV union-by-name reader entry %llu targets \"%s\", expected \"%s\"",
+				                             file_idx, serialized_data.column_info[file_idx].file_path,
+				                             serialized_data.files[file_idx]);
+			}
+		}
+	}
+
+	auto &csv_data = result->bind_data->Cast<ReadCSVData>();
+	csv_data.filename_col_idx = serialized_data.filename_col_idx;
+	csv_data.hive_partition_col_idx = serialized_data.hive_partition_col_idx;
+	csv_data.manually_set = std::move(serialized_data.manually_set);
+	if (!serialized_data.csv_schema_names.empty()) {
+		csv_data.csv_schema = CSVSchema(serialized_data.csv_schema_names, serialized_data.csv_schema_types,
+		                                serialized_data.csv_schema_path, serialized_data.csv_schema_rows_read);
+	}
+	for (auto &info : serialized_data.column_info) {
+		if (info.options.options.encoding.empty()) {
+			throw InternalException("Deserialized CSV union reader information has no encoding for file \"%s\"",
+			                        info.file_path);
+		}
+		auto union_data = make_shared_ptr<CSVUnionData>(OpenFileInfo(info.file_path));
+		union_data->names = info.names;
+		union_data->types = info.types;
+		union_data->options = info.options.options;
+		result->union_readers.push_back(std::move(union_data));
+	}
+	csv_data.column_info = std::move(serialized_data.column_info);
+
+	result->interface->FinalizeBindData(*result);
+	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);
+	virtual_column_map_t virtual_columns;
+	MultiFileReader::GetVirtualColumns(context, result->reader_bind, virtual_columns);
+	result->interface->GetVirtualColumns(context, *result, virtual_columns);
+	result->virtual_columns = std::move(virtual_columns);
+	return std::move(result);
 }
 
 TableFunction ReadCSVTableFunction::GetFunction() {

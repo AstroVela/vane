@@ -23,6 +23,7 @@
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
+#include "duckdb/function/table/read_csv.hpp"
 
 #include <mutex>
 
@@ -42,6 +43,62 @@ struct ApplyScanTasksStats {
 	idx_t copied_tasks = 0;
 	idx_t missing_group_id = 0;
 };
+
+ReadCSVData *GetCSVBindData(MultiFileBindData &bind_data) {
+	if (!bind_data.bind_data) {
+		return nullptr;
+	}
+	return dynamic_cast<ReadCSVData *>(bind_data.bind_data.get());
+}
+
+void ResetCSVProcessLocalReaderState(MultiFileBindData &bind_data) {
+	auto *csv_data = GetCSVBindData(bind_data);
+	if (!csv_data) {
+		return;
+	}
+	bind_data.initial_reader.reset();
+	for (auto &reader : bind_data.union_readers) {
+		if (reader) {
+			reader->reader.reset();
+		}
+	}
+	csv_data->buffer_manager.reset();
+}
+
+void ReconcileCachedCSVReaders(MultiFileBindData &bind_data, const vector<OpenFileInfo> &task_files) {
+	if (!GetCSVBindData(bind_data)) {
+		return;
+	}
+	// A process-local reader may already own an open file handle and buffered bytes. Once a task supplies its own
+	// OpenFileInfo (including CSV byte ranges or remote open options), only cached metadata remains reusable.
+	ResetCSVProcessLocalReaderState(bind_data);
+	if (bind_data.union_readers.empty()) {
+		return;
+	}
+
+	vector<shared_ptr<BaseUnionData>> selected_readers;
+	selected_readers.reserve(task_files.size());
+	vector<bool> used(bind_data.union_readers.size(), false);
+	for (const auto &task_file : task_files) {
+		idx_t matching_reader = DConstants::INVALID_INDEX;
+		for (idx_t reader_idx = 0; reader_idx < bind_data.union_readers.size(); ++reader_idx) {
+			if (!used[reader_idx] && bind_data.union_readers[reader_idx] &&
+			    bind_data.union_readers[reader_idx]->GetFileName() == task_file.path) {
+				matching_reader = reader_idx;
+				break;
+			}
+		}
+		if (matching_reader == DConstants::INVALID_INDEX) {
+			bind_data.union_readers.clear();
+			return;
+		}
+		used[matching_reader] = true;
+		auto reader = bind_data.union_readers[matching_reader];
+		reader->file = task_file;
+		selected_readers.push_back(std::move(reader));
+	}
+	bind_data.union_readers = std::move(selected_readers);
+}
 
 class FteDynamicScanFileList : public MultiFileList {
 private:
@@ -290,6 +347,7 @@ static bool ApplyScanTasksToOperator(PhysicalOperator &op, const std::unordered_
 						stats.non_multi_bind++;
 					}
 				} else {
+					ReconcileCachedCSVReaders(*multi_bind, it->second.files);
 					multi_bind->file_list = duckdb::make_shared_ptr<SimpleMultiFileList>(it->second.files);
 					const idx_t file_count = it->second.file_count();
 					scan.extra_info.total_files = optional_idx(file_count);
@@ -481,6 +539,13 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 					scan.extra_info.filtered_files = optional_idx(file_count);
 					applied++;
 				} else {
+					// The queue can supply a subset of the original files or multiple byte ranges for the same
+					// file. Bind-time readers do not carry those task-specific OpenFileInfo values, so they must
+					// not be reused for a dynamic scan.
+					if (GetCSVBindData(*multi_bind)) {
+						ResetCSVProcessLocalReaderState(*multi_bind);
+						multi_bind->union_readers.clear();
+					}
 					multi_bind->file_list = make_shared_ptr<FteDynamicScanFileList>(entry->second);
 					scan.extra_info.total_files = optional_idx();
 					scan.extra_info.filtered_files = optional_idx();
