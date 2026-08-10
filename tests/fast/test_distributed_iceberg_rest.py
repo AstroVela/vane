@@ -162,6 +162,80 @@ def _execute_pickled_scan_descriptor(plan_payload: bytes, node_id: str, descript
 @pytest.mark.iceberg_rest
 @pytest.mark.real_ray
 @pytest.mark.usefixtures("ray_local")
+def test_distributed_insert_commits_one_iceberg_snapshot(monkeypatch, tmp_path):
+    if ray is None:
+        if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":
+            pytest.fail("ray is required by the hermetic Iceberg REST gate")
+        pytest.skip("ray not installed")
+
+    catalog_endpoint, minio_endpoint, access_key, secret_key, region = _required_service_config()
+    schema_name = f"vane_write_{uuid.uuid4().hex}"
+    table_name = f"rest_catalog.{schema_name}.events"
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    monkeypatch.setenv("VANE_DISTRIBUTED_NODE_COUNT", "1")
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+
+    source_connection = vane.connect()
+    verifier_connection = None
+    try:
+        _configure_catalog_connection(
+            source_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        source_connection.execute(f"CREATE SCHEMA rest_catalog.{schema_name}")
+        source_connection.execute(f"CREATE TABLE {table_name} (event_id INTEGER, category VARCHAR NOT NULL)")
+
+        input_dir = tmp_path / "iceberg-write-input"
+        input_dir.mkdir()
+        for shard in range(4):
+            shard_start = shard * 2500
+            shard_end = shard_start + 2500
+            shard_path = input_dir / f"part-{shard}.parquet"
+            source_connection.execute(
+                "COPY ("
+                "SELECT i::INTEGER AS event_id, concat('category-', i % 7)::VARCHAR AS category "
+                f"FROM range({shard_start}, {shard_end}) rows(i)"
+                f") TO {_sql_literal(shard_path.as_posix())} (FORMAT PARQUET)"
+            )
+        source = source_connection.sql(
+            f"SELECT event_id, category FROM read_parquet({_sql_literal((input_dir / '*.parquet').as_posix())})"
+        )
+        assert source.insert_into(table_name) is None
+
+        # The write is planned and committed on the distributed coordinator's
+        # replayed session. Verify through a fresh Catalog attachment so this
+        # assertion cannot pass from the source connection's cached table entry.
+        verifier_connection = vane.connect()
+        _configure_catalog_connection(
+            verifier_connection,
+            catalog_endpoint,
+            minio_endpoint,
+            access_key,
+            secret_key,
+            region,
+        )
+        assert verifier_connection.execute(f"SELECT count(*) FROM {table_name}").fetchone() == (10000,)
+        assert verifier_connection.execute(
+            f"SELECT min(event_id), max(event_id), count(DISTINCT category) FROM {table_name}"
+        ).fetchone() == (0, 9999, 7)
+        assert verifier_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({table_name})").fetchone() == (1,)
+    finally:
+        if verifier_connection is not None:
+            verifier_connection.close()
+        source_connection.close()
+        if hasattr(vane, "teardown_runner"):
+            vane.teardown_runner()
+
+
+@pytest.mark.external_service
+@pytest.mark.iceberg_rest
+@pytest.mark.real_ray
+@pytest.mark.usefixtures("ray_local")
 def test_catalog_bound_snapshot_runs_on_ray_after_rest_catalog_stops(monkeypatch):
     if ray is None:
         if os.getenv("VANE_REQUIRE_ICEBERG_REST_TEST") == "1":

@@ -7,6 +7,11 @@ DuckDB extension participate in Vane's Ray distributed execution. The engine
 owns scheduling and transport; each extension continues to own its bind state,
 scan semantics, file production, and catalog transaction.
 
+The first Iceberg write adapter supports append-only `INSERT INTO` for existing,
+unpartitioned Iceberg v2 tables. Distributed catalog DDL, CTAS,
+partitioned/sorted writes, row-level changes, and dynamically installed
+extension binaries remain outside this implementation.
+
 An extension participates only by implementing the corresponding provider
 interface. Vane does not infer extension behavior, adapt older provider types,
 or execute unsupported extension operators locally.
@@ -163,6 +168,15 @@ the generic engine. Vane retains its files and rejects automatic replay because
 it cannot prove whether a remote catalog committed before its response was
 lost. Extension-specific reconciliation may establish that outcome separately.
 
+### Iceberg write adapter
+
+For writes, `IcebergInsert` implements `ExtensionWriteTaskProvider`. It reuses
+the pinned extension's Parquet writer and upstream `AddWrittenFiles` parsing,
+including lower/upper bounds, null counts, sizes, and field IDs. The provider
+then adds one append snapshot to the existing Iceberg transaction. The normal
+REST Catalog commit remains upstream Iceberg code; Vane neither synthesizes
+Iceberg metadata nor performs a fallback local insert.
+
 ## Extension author contract
 
 For a distributed scan provider:
@@ -207,6 +221,8 @@ extension is enabled in release builds.
   finalization.
 - Extension writes reject explicit DuckDB transactions and ambiguous catalog
   commits never trigger destructive output cleanup.
+- The current Iceberg provider rejects non-v2, partitioned, sorted, CTAS,
+  targeted, `RETURNING`, `ON CONFLICT`, `DELETE`, `UPDATE`, and `MERGE` writes.
 
 ## Framework test matrix
 
@@ -228,5 +244,8 @@ The Iceberg read adapter has three additional production gates:
 - `scripts/run_iceberg_rest_tests.sh` plans a Catalog table, advances its
   snapshot, stops the Catalog, and executes the pinned plan in fresh workers.
 
-The REST gate uses coordinator writes only to provision committed input
-snapshots; it does not exercise distributed Iceberg writes.
+The REST gate also appends 10,000 rows through real Ray workers and requires one
+committed Iceberg snapshot to be readable from a fresh Catalog attachment. Its
+separate read case binds a table, advances the snapshot, stops the Catalog, and
+executes the coordinator's scan descriptors in fresh workers while MinIO
+remains online. The MinIO fixture-matrix gate remains read-only.

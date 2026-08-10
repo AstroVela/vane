@@ -297,6 +297,7 @@ include = [
     "external/duckdb/.github/config/extensions/avro.cmake",
     "external/duckdb/.github/config/extensions/iceberg.cmake",
     "external/duckdb/.github/patches/extensions/iceberg/vane-distributed-scan.patch",
+    "external/duckdb/.github/patches/extensions/iceberg/vane-distributed-write.patch",
     "external/duckdb/scripts/append_metadata.cmake",
     "external/duckdb/scripts/apply_extension_patches.py",
     "external/duckdb/scripts/null.txt",

@@ -98,10 +98,12 @@ separately during the native build. Avro is pinned to commit
 `external/duckdb/.github/config/extensions/avro.cmake`; Iceberg is pinned to
 commit `23c7cc52d84f63e9af47d0831862cfe7da3fb40f` by
 `external/duckdb/.github/config/extensions/iceberg.cmake`. Vane applies the
-reviewed patch in
+reviewed patches in
 `external/duckdb/.github/patches/extensions/iceberg/vane-distributed-scan.patch`
-to expose Iceberg's snapshot-preserving distributed scan task boundary. Both
-extension repositories are covered by the DuckDB MIT license recorded in
+and
+`external/duckdb/.github/patches/extensions/iceberg/vane-distributed-write.patch`
+to expose Iceberg's snapshot-preserving distributed scan and write boundaries.
+Both extension repositories are covered by the DuckDB MIT license recorded in
 `LICENSES/DuckDB-MIT.txt`. The compressed `partition_integer`,
 `equality_deletes`, `moved_positional_delete_path`,
 `add_columns_with_defaults`, `add_columns_with_defaults_in_struct`,

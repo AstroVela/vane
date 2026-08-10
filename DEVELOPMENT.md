@@ -140,8 +140,10 @@ scripts/run_iceberg_rest_tests.sh
 The compatibility gate requires the incremental package build's pinned
 extension source directories and the bootstrapped vcpkg installation. Set
 `VCPKG_INSTALLED_DIR` when dependencies are shared by multiple worktrees.
-The REST gate's coordinator-only table creation and inserts provision committed
-test snapshots; they do not exercise or imply distributed Iceberg writes.
+The REST gate provisions tables on the coordinator, exercises append-only
+distributed `INSERT INTO` through real Ray workers, verifies the committed
+snapshot from a fresh Catalog attachment, and separately tests snapshot-pinned
+distributed reads after the Catalog stops.
 
 Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must
 skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local

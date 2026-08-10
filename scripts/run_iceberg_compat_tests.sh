@@ -98,11 +98,15 @@ verify_extension_revision httpfs "$httpfs_source"
 verify_extension_revision avro "$avro_source"
 verify_extension_revision iceberg "$iceberg_source"
 
-iceberg_patch="$project_root/external/duckdb/.github/patches/extensions/iceberg/vane-distributed-scan.patch"
-if ! git -C "$iceberg_source" apply --reverse --check "$iceberg_patch"; then
-  echo "The reviewed Vane Iceberg patch is not applied cleanly to $iceberg_source" >&2
-  exit 1
-fi
+iceberg_patch_dir="$project_root/external/duckdb/.github/patches/extensions/iceberg"
+for iceberg_patch in \
+  "$iceberg_patch_dir/vane-distributed-scan.patch" \
+  "$iceberg_patch_dir/vane-distributed-write.patch"; do
+  if ! git -C "$iceberg_source" apply --reverse --check "$iceberg_patch"; then
+    echo "The reviewed Vane Iceberg patch is not applied cleanly to $iceberg_source: $iceberg_patch" >&2
+    exit 1
+  fi
+done
 
 mapfile -t manifest_tests < <(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$manifest_path")
 if ((${#manifest_tests[@]} != 34)); then
