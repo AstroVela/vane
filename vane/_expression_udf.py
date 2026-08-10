@@ -1384,7 +1384,11 @@ def func(
     return_dtype: Any | None = None,
     name: str | None = None,
 ) -> VaneFunction | Callable[[_PythonFunction], VaneFunction]:
-    """Decorate a synchronous Python function or bound method as a scalar expression UDF."""
+    """Decorate a synchronous Python function or bound method as a scalar expression UDF.
+
+    Retrying distributed backends may replay a call after a failure. Exactly-once
+    execution is not provided, so external effects must be idempotent.
+    """
     if fn is None:
         return lambda actual_fn: VaneFunction(actual_fn, return_dtype=return_dtype, name=name)
     return VaneFunction(fn, return_dtype=return_dtype, name=name)
@@ -1404,7 +1408,9 @@ def _func_batch(
     ``pyarrow.ChunkedArray``. The function must return one of those column
     types with the same row count. Use a Struct ``return_dtype`` for a logical
     value with multiple fields and ``unnest=True`` to project those fields as
-    separate columns.
+    separate columns. Retrying distributed backends may replay a batch after a
+    failure. Exactly-once execution is not provided, so external effects must
+    be idempotent.
     """
     return lambda actual_fn: VaneBatchFunction(
         actual_fn,
@@ -1431,10 +1437,10 @@ def _cls(
 
     ``actor_number`` creates that many independent class instances. Batches
     are assigned to available Actors without affinity or global ordering, so
-    instance state is local and must not be used as shared query state. An
-    Actor may be reconstructed and an in-flight call may be retried after a
-    failure, which can reset local state or replay user code. External side
-    effects must therefore be idempotent; exactly-once execution is not
+    instance state is local and must not be used as shared query state. Like
+    all distributed UDF calls, an Actor call may be retried after a failure;
+    Actor reconstruction can additionally reset local state. External effects
+    must therefore be idempotent because exactly-once execution is not
     provided.
     """
     if class_ is None:
@@ -1466,10 +1472,11 @@ def _cls_batch(
     """Decorate an Actor-backed row-preserving Arrow column batch class.
 
     Each Actor owns an independent class instance. Batches have no Actor
-    affinity or global ordering, and failures may reconstruct an Actor and
-    retry an in-flight call. Instance state is consequently local,
-    reconstructible cache state rather than durable query state; external
-    side effects must be idempotent because execution is not exactly once.
+    affinity or global ordering. Like all distributed UDF calls, a batch may be
+    retried after a failure; Actor reconstruction can additionally reset local
+    state. Instance state is consequently reconstructible cache state rather
+    than durable query state, and external effects must be idempotent because
+    execution is not exactly once.
     """
     return lambda actual_class: VaneClassBatch(
         actual_class,
@@ -1958,6 +1965,11 @@ def attach_function(
     same connection. Builtins, aliases owned by another connection, and
     different SQL signatures are never overwritten. The active transaction
     may be cancelled by DuckDB while registering a function.
+
+    Attached aliases use the same distributed UDF runtime as direct expression
+    UDFs. Retrying backends may replay calls after failures; ``VOLATILE``
+    prevents unsafe optimizer assumptions but does not provide exactly-once
+    execution. External effects must be idempotent.
     """
     prepared = _preflight_attach_function(
         fn_or_function,

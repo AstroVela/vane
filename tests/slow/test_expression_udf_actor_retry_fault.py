@@ -22,6 +22,7 @@ def test_ray_actor_reconstructs_and_replays_interrupted_vane_udf_call():
     script = r"""
 from concurrent.futures import ThreadPoolExecutor
 import os
+from pathlib import Path
 import tempfile
 import time
 import uuid
@@ -36,6 +37,7 @@ from vane.runners.ray.driver import RayQueryDriverClient
 CONTROL_NAMESPACE = f"vane-actor-retry-{uuid.uuid4().hex}"
 CONTROL_NAME = f"actor-retry-control-{uuid.uuid4().hex}"
 UDF_NAME = f"reconstructible_actor_{uuid.uuid4().hex}"
+RELEASE_PATH = Path(tempfile.gettempdir()) / f"vane-actor-retry-release-{uuid.uuid4().hex}"
 
 
 @ray.remote(num_cpus=0, max_concurrency=16)
@@ -44,7 +46,6 @@ class FaultControl:
         self.class_init_count = {}
         self.call_count_by_batch = {}
         self.started_batch_id = None
-        self.released = False
 
     def record_class_init(self, actor_index):
         key = str(actor_index)
@@ -55,12 +56,6 @@ class FaultControl:
         self.call_count_by_batch[key] = self.call_count_by_batch.get(key, 0) + 1
         if actor_index == 0 and self.started_batch_id is None:
             self.started_batch_id = batch_id
-
-    def should_release(self):
-        return self.released
-
-    def release(self):
-        self.released = True
 
     def snapshot(self):
         return {
@@ -81,8 +76,8 @@ class BlockingReplicatedModel:
         batch_id = str(python_values[0]) if python_values else "empty"
         ray.get(self.control.record_batch_started.remote(self.actor_index, batch_id))
         if self.actor_index == 0:
-            while not ray.get(self.control.should_release.remote()):
-                time.sleep(0.01)
+            while not RELEASE_PATH.exists():
+                time.sleep(0.05)
         return pa.array([self.actor_index] * len(values), type=pa.int32())
 
 
@@ -134,7 +129,7 @@ try:
         while time.monotonic() < deadline:
             if future.done():
                 future.result()
-            snapshot = ray.get(control.snapshot.remote())
+            snapshot = ray.get(control.snapshot.remote(), timeout=5)
             if snapshot["started_batch_id"] is not None:
                 break
             time.sleep(0.02)
@@ -158,7 +153,7 @@ try:
         while time.monotonic() < deadline:
             if future.done():
                 future.result()
-            snapshot = ray.get(control.snapshot.remote())
+            snapshot = ray.get(control.snapshot.remote(), timeout=5)
             if (
                 snapshot["class_init_count"].get("0", 0) >= initial_init_count + 1
                 and snapshot["call_count_by_batch"].get(target_key, 0) >= initial_call_count + 1
@@ -169,21 +164,25 @@ try:
             raise AssertionError(f"interrupted actor call was not reconstructed and replayed: {snapshot}")
 
         print("ACTOR_REPLAY_OBSERVED", snapshot, flush=True)
-        ray.get(control.release.remote(), timeout=5)
+        RELEASE_PATH.touch()
         print("ACTOR_RELEASED", flush=True)
-        batches = future.result(timeout=45.0)
-        assert batches
+        partitions = future.result(timeout=45.0)
+        payloads = [partition.partition() for partition in partitions]
+        assert payloads
+        table = pa.concat_tables(payloads) if len(payloads) > 1 else payloads[0]
+        table = table.rename_columns(["value", "actor_index"])
+        rows = sorted(table.to_pylist(), key=lambda row: row["value"])
+        assert table.num_rows == 4097
+        assert [row["value"] for row in rows] == list(range(4097))
+        assert {row["actor_index"] for row in rows} == {0, 1}
         print("QUERY_FINISHED", flush=True)
 
-    final_snapshot = ray.get(control.snapshot.remote())
+    final_snapshot = ray.get(control.snapshot.remote(), timeout=5)
     assert final_snapshot["class_init_count"]["0"] >= initial_init_count + 1
     assert final_snapshot["call_count_by_batch"][target_key] >= initial_call_count + 1
     print("ACTOR_REPLAY", final_snapshot, flush=True)
 finally:
-    try:
-        ray.get(control.release.remote(), timeout=5)
-    except Exception:
-        pass
+    RELEASE_PATH.touch(exist_ok=True)
     if future is not None and not future.done():
         try:
             future.result(timeout=15.0)
@@ -198,6 +197,7 @@ finally:
     print("RAY_SHUTDOWN_START", flush=True)
     ray.shutdown()
     print("RAY_SHUTDOWN_DONE", flush=True)
+    RELEASE_PATH.unlink(missing_ok=True)
 """
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"

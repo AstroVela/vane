@@ -29,12 +29,16 @@ All notable user-visible changes are documented here. Vane is currently in alpha
   is shared by local and Ray execution and is intended for reconstructible
   models, tokenizers, and read-only caches.
 - Removed `stateful` and `side_effects` from Vane's distributed Expression and
-  Relation UDF contract. Actor UDFs now use the same reconstruction and retry
-  policy regardless of API, and Relation Actor UDFs default omitted `gpus` to
-  zero like `vane.cls` and `vane.cls.batch`. The internal direct-UDF operator
-  and SQL aliases registered through `vane.attach_function` are always
-  `VOLATILE`; the physical UDF planner resolves attached aliases through the
-  same local-versus-Ray backend contract as direct Expression UDFs.
+  Relation UDF contract. Retrying Task and Actor backends may replay function
+  or class calls after failures; no distributed UDF provides exactly-once
+  execution, so external effects must be idempotent. Actor UDFs now use the
+  same reconstruction and retry policy regardless of API, and Relation Actor
+  UDFs default omitted `gpus` to zero like `vane.cls` and `vane.cls.batch`. The
+  internal direct-UDF operator and SQL aliases registered through
+  `vane.attach_function` are always `VOLATILE`; volatility prevents unsafe
+  optimizer assumptions but does not prevent failure replay. The physical UDF
+  planner resolves attached aliases through the same local-versus-Ray backend
+  contract as direct Expression UDFs.
 - Disabled the public `create_function` and `create_table_function` Python
   bindings. Use `vane.func`, `vane.cls`, their batch variants, Relation UDF
   methods, and `vane.attach_function` for SQL registration.
