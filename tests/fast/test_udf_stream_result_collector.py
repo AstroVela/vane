@@ -3136,7 +3136,14 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         collector.shutdown()
 
 
-def test_remote_provider_capability_error_preserves_safe_details():
+@pytest.mark.parametrize(
+    ("provider", "expected_provider"),
+    [
+        pytest.param("openai-compatible", "openai-compatible", id="unchanged"),
+        pytest.param("p" * 17_000, "…<truncated>", id="truncated"),
+    ],
+)
+def test_remote_provider_capability_error_preserves_safe_details(provider, expected_provider):
     from vane.ai.provider import ProviderCapabilityError
     from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
@@ -3151,7 +3158,7 @@ def test_remote_provider_capability_error_preserves_safe_details():
             "attempt_id": lease["attempt_id"],
         }
         error = ProviderCapabilityError(
-            "openai-compatible",
+            provider,
             "chat-only-model",
             "structured Prompt generation",
             original_error=RuntimeError("endpoint rejected schema"),
@@ -3174,13 +3181,55 @@ def test_remote_provider_capability_error_preserves_safe_details():
         assert [item[2] for item in events] == ["error"]
         message = events[0][3]
         assert "ProviderCapabilityError" in message
-        assert "openai-compatible" in message
+        assert expected_provider in message
         assert "chat-only-model" in message
         assert "structured Prompt generation" in message
         assert "RuntimeError" in message
         assert "endpoint rejected schema" not in message
     finally:
         collector.shutdown()
+
+
+@pytest.mark.parametrize("detail_name", ["provider", "model", "capability", "original_error_summary"])
+def test_provider_capability_error_metadata_bounds_text_details(detail_name):
+    from vane.ai.provider import ProviderCapabilityError
+    from vane.execution import udf_ray_stream_protocol as stream_protocol
+
+    payload = {
+        "query_id": "query",
+        "resource_unit_id": "resource:query:node:1:udf",
+        "task_lease_id": "lease",
+        "attempt_id": "attempt",
+    }
+
+    def encode_detail(value):
+        details = {
+            "provider": "provider",
+            "model": "model",
+            "capability": "capability",
+        }
+        original_error_summary = "RuntimeError"
+        if detail_name == "original_error_summary":
+            original_error_summary = value
+        else:
+            details[detail_name] = value
+        error = ProviderCapabilityError._from_safe_summary(
+            details["provider"],
+            details["model"],
+            details["capability"],
+            original_error_summary,
+        )
+        _, metadata = stream_protocol.make_stream_error_pair(payload, error)
+        validated = stream_protocol.validate_stream_error_metadata(metadata)
+        return validated["exception_details"][detail_name]
+
+    limit = stream_protocol._MAX_ERROR_TEXT_CHARS
+    at_limit = "a" * limit
+    assert encode_detail(at_limit) == at_limit
+
+    suffix = "…<truncated>"
+    oversized = "b" * (limit + 1)
+    assert encode_detail(oversized) == oversized[: limit - len(suffix)] + suffix
 
 
 def test_malformed_metadata_fails_only_its_stream_without_output_admission():
