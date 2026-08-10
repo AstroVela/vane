@@ -43,10 +43,7 @@ def format_udf_input(table: pa.Table, batch_format: str) -> Any:
 
     _require_unique_column_names(table.schema.names, batch_format)
     if batch_format == "numpy":
-        return {
-            name: _arrow_column_to_numpy(table.column(index))
-            for index, name in enumerate(table.schema.names)
-        }
+        return {name: _arrow_column_to_numpy(table.column(index)) for index, name in enumerate(table.schema.names)}
     if batch_format == "pandas":
         return _arrow_table_to_pandas(table)
     return _arrow_table_to_cudf(table)
@@ -246,9 +243,7 @@ def _numpy_batch_to_arrow(batch: dict[Any, Any], schema: _OutputSchema) -> pa.Ta
     for column_schema in schema:
         value = batch[column_schema.name]
         if not isinstance(value, np.ndarray):
-            raise TypeError(
-                f"numpy batch column {column_schema.name!r} must be numpy.ndarray, got {type(value)}"
-            )
+            raise TypeError(f"numpy batch column {column_schema.name!r} must be numpy.ndarray, got {type(value)}")
         if value.ndim == 0:
             raise ValueError(f"numpy batch column {column_schema.name!r} must include a row dimension")
         if row_count is None:
@@ -360,9 +355,7 @@ def _masked_tensor_values_to_arrow(
         return _tensor_values_to_arrow(rows, column_schema)
 
     if values.ndim != len(shape) + 1 or tuple(values.shape[1:]) != shape:
-        raise ValueError(
-            f"tensor output column {column_schema.name!r} has shape {values.shape[1:]}, expected {shape}"
-        )
+        raise ValueError(f"tensor output column {column_schema.name!r} has shape {values.shape[1:]}, expected {shape}")
 
     element_mask = np.ma.getmaskarray(values).reshape(  # type: ignore[no-untyped-call]
         len(values),
@@ -391,9 +384,7 @@ def _dense_tensor_values_to_arrow(
     tensor_type = column_schema.tensor_type
     assert tensor_type is not None
     if tuple(values.shape[1:]) != shape:
-        raise ValueError(
-            f"tensor output column {column_schema.name!r} has shape {values.shape[1:]}, expected {shape}"
-        )
+        raise ValueError(f"tensor output column {column_schema.name!r} has shape {values.shape[1:]}, expected {shape}")
     if len(values) == 0:
         storage = pa.array([], type=tensor_type.storage_type)
         return pa.ExtensionArray.from_storage(tensor_type, storage)
