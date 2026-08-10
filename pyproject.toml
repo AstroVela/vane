@@ -175,7 +175,6 @@ include = [
     "/SECURITY.md",
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
-    "/CHANGELOG.md",
     "/DEVELOPMENT.md",
     "/GOVERNANCE.md",
     "/MAINTAINERS.md",

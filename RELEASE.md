@@ -1,70 +1,159 @@
 # Release process
 
-Vane releases are immutable source and binary artifacts derived from a reviewed Git commit. A GitHub branch or generated archive is not a release.
+Vane releases are immutable source and binary artifacts derived from one
+reviewed commit on `main`. The GitHub Release body is the canonical public
+record of user-visible changes; the repository does not maintain a rolling
+changelog or a release-notes template.
 
-## Prepare
+## Release invariants
 
-1. Open a release pull request that sets the PEP 440 version, updates
-   `CHANGELOG.md`, and records both the exact `external/duckdb` tree ID reported
-   by `python scripts/sync_duckdb_source_id.py --print` and the full fork
-   revision reported by
-   `python scripts/resolve_duckdb_fork_version.py --print-revision`. Update
-   `DUCKDB_UPSTREAM_VERSION` and `SOURCE_PROVENANCE.md` only when the imported
-   upstream baseline, DuckDB version line, or historical mapping changes.
-2. Confirm that every imported dependency has compatible terms and that `SOURCE_PROVENANCE.md`, `THIRD_PARTY.md`, `LICENSE`, and `NOTICE` are current.
-3. Install the pinned vcpkg manifest and run `python scripts/sync_vcpkg_licenses.py --check`.
-4. Run formatting, fast tests, the relevant slow/native tests, and the package-artifact workflow.
-5. Review security-sensitive changes, known issues, and the supported platform statement.
-
-## Build and inspect
-
-Build from a clean checkout. The DuckDB source is part of the checkout. Release automation must:
-
-- build the sdist first, letting the PEP 517 backend inject
-  `DUCKDB_SOURCE_ID` and `DUCKDB_FORK_REVISION`;
-- validate it with `scripts/check_release_artifacts.py`;
-- build wheels from that exact sdist in clean manylinux environments;
-- validate wheel metadata, contents, `RECORD`, and license files;
-- install each wheel in a fresh environment and run the Quickstart smoke test;
-- produce SHA-256 checksums, a software bill of materials, build provenance, and Sigstore signatures.
-
-Trusted `main` and release validations also load exact forbidden-content rules
-from the `RELEASE_ARTIFACT_CONTENT_RULES` GitHub secret. The secret is a JSON
-manifest with `version` set to `1`; each entry in `rules` contains a public
-`id`, a `scope` of `all` or `text`, and the exact value in `value_base64`.
-Pull-request jobs intentionally do not receive this manifest. Configure the
-secret before merging or publishing; trusted validation fails when it is
-missing.
-
-Manually inspect the archive file list. TPC-H, TPC-DS, TPC-E tools, local paths, credentials, caches, logs, model weights, and build directories must not be present.
-
-## Stage and publish
-
-1. Publish the candidate to TestPyPI through the protected `testpypi` GitHub environment.
-2. Install it by version in a clean machine and run smoke tests without access to the source checkout.
-3. Record maintainer approval according to [GOVERNANCE.md](GOVERNANCE.md).
-4. Tag the reviewed commit as `vX.Y.Z` and create release notes from `CHANGELOG.md`.
-5. Publish to PyPI only through its trusted-publishing workflow and protected `pypi` environment. Do not use a long-lived PyPI token.
-6. Attach checksums, SBOM, signatures, and provenance to the GitHub release, then verify that public artifacts reproduce the candidate hashes.
-
-If any artifact is wrong, publish a new version. Never replace an existing release file or move a published tag.
-
-## After release
-
-- Verify installation and metadata from the public index.
-- Move the changelog entries to the released version and open a new `Unreleased` section.
-- Announce material known issues and security limitations.
-- Retain enough logs and provenance to audit how the artifacts were produced.
+- The package version is a valid, previously unused PEP 440 version. Its tag is
+  exactly `v<version>` and points to the reviewed commit tested for release.
+- One workflow run builds the sdist and all wheels once. The exact same files
+  are promoted through TestPyPI, PyPI, and the GitHub Release.
+- A GitHub Release remains a draft until PyPI publication succeeds and all
+  checksums, signatures, the SBOM, and provenance are attached.
+- A release tag cannot be updated or deleted from the moment it is created,
+  including while its GitHub Release is still a draft. Published releases and
+  artifacts are never replaced. A bad release is superseded by a new version
+  and yanked when necessary.
 
 ## One-time repository configuration
 
-Before the first publication, a repository administrator must confirm that
-`main` is the GitHub default branch. Protect it: require pull requests, review,
-passing CI and code-quality checks, resolved conversations, and block
-force-pushes and deletion.
+Repository administrators must:
 
-Enable private vulnerability reporting, the dependency graph, Dependabot
-alerts, and code scanning. Create protected `testpypi` and `pypi` GitHub
-environments with required maintainer approval, then register this repository's
-`release.yml` workflow as a trusted publisher on the corresponding package
-index. Publishing jobs intentionally contain no API-token fallback.
+1. Keep `main` as the default branch and protect it with pull-request review,
+   required CI and code-quality checks, resolved conversations, and deletion
+   and non-fast-forward update protection.
+2. Create an active tag ruleset with no bypass actors for `refs/tags/v*`. Allow
+   initial tag creation, but restrict deletion and block force pushes so the
+   tag cannot move between workflow dispatch and publication. GitHub immutable
+   releases provide an additional lock only after the draft is published.
+3. Enable private vulnerability reporting, the dependency graph, Dependabot
+   alerts and security updates, secret scanning with push protection, and code
+   scanning.
+4. Configure the `RELEASE_ARTIFACT_CONTENT_RULES` repository secret used by
+   trusted artifact validation.
+5. Create protected `testpypi` and `pypi` GitHub environments. Both accept only
+   `v*` tags, require maintainer approval, and disallow administrator bypass.
+6. Register `.github/workflows/release.yml` as a trusted publisher for the
+   `vane-ai` project on TestPyPI and PyPI, using the matching `testpypi` and
+   `pypi` environment names. Publishing intentionally has no API-token fallback.
+7. After the draft-first workflow has passed a build-only dry run, enable
+   GitHub immutable releases. Draft releases must remain mutable so the
+   workflow can attach their assets before publication.
+
+Review these settings before every release rather than assuming the one-time
+configuration has remained unchanged.
+
+## Prepare the release pull request
+
+1. Set the final PEP 440 version in `pyproject.toml`.
+2. Put the complete proposed GitHub Release notes in the pull-request
+   description. Reviewers approve those notes together with the code; do not
+   depend on an unreviewed local notes file.
+3. Record the exact `external/duckdb` tree ID reported by
+   `python scripts/sync_duckdb_source_id.py --print` and the full fork revision
+   reported by
+   `python scripts/resolve_duckdb_fork_version.py --print-revision` in the pull
+   request. Update `DUCKDB_UPSTREAM_VERSION` and `SOURCE_PROVENANCE.md` only
+   when the imported upstream baseline, DuckDB version line, or historical
+   mapping changes.
+4. Confirm that imported dependencies have compatible terms and that
+   `SOURCE_PROVENANCE.md`, `THIRD_PARTY.md`, `LICENSE`, and `NOTICE` are current.
+5. Install the pinned vcpkg manifest and run
+   `python scripts/sync_vcpkg_licenses.py --check`.
+6. Run formatting, fast and release tests, relevant slow and native tests, and
+   the build-only release workflow. Manually inspect the sdist and wheel file
+   lists. TPC-H, TPC-DS, TPC-E tools, local paths, credentials, caches, logs,
+   model weights, and build directories must not be present.
+7. Triage security findings. A release must not carry an unexplained
+   first-party critical or high-severity alert. Record the disposition of
+   inherited and third-party findings that affect shipped code.
+8. Confirm that the version is absent from both TestPyPI and PyPI, review known
+   issues and the supported-platform statement, merge the pull request, and
+   record its exact commit SHA.
+
+Run a build-only dry run from the reviewed commit with:
+
+```bash
+gh workflow run release.yml \
+  --repo AstroVela/vane \
+  --ref main \
+  -f operation=build-only
+```
+
+## Create the tag and draft release
+
+1. Confirm the recorded release commit is reachable from `main` and has not
+   changed since the release pull request passed its gates.
+2. Confirm the active `v*` tag ruleset restricts deletion and force pushes and
+   has no bypass actors. Create and push the exact `v<version>` tag at the
+   recorded commit, then verify that the remote tag resolves to that commit.
+   Never create the tag from an unreviewed working tree.
+3. Create a draft GitHub Release for the protected tag. Copy the approved notes
+   into its body without changing their meaning, and mark alpha, beta, and
+   release-candidate versions as prereleases.
+4. Manually dispatch the Release workflow using that tag as the workflow ref
+   and `operation=release`.
+
+The workflow rejects a release operation unless the selected ref is the
+matching version tag, the tagged commit is reachable from `main`, the GitHub
+Release exists and is still a draft, and the version is absent from both
+package indexes.
+
+## Build, stage, and publish
+
+Release automation must:
+
+- build the sdist first, letting the PEP 517 backend inject
+  `DUCKDB_SOURCE_ID` and `DUCKDB_FORK_REVISION`;
+- validate it with `scripts/check_release_artifacts.py` and the private content
+  rules;
+- build all manylinux wheels from that exact sdist in clean environments;
+- validate wheel metadata, contents, `RECORD`, license files, and coexistence
+  with the official DuckDB package;
+- install each wheel in a fresh environment and run the Quickstart smoke test;
+- generate SHA-256 checksums, a CycloneDX SBOM, GitHub build provenance, and
+  Sigstore signatures;
+- publish those distributions to TestPyPI through its protected environment;
+- install the indexed candidate in a clean job without a source checkout and
+  run the public smoke test;
+- wait for explicit approval on the protected `pypi` environment;
+- publish the same distributions to PyPI, attach all artifacts to the draft
+  GitHub Release, and only then publish the draft.
+
+Do not approve the `pypi` environment until the automated TestPyPI job has
+passed and a maintainer has independently installed the exact version in a
+clean machine, run the public Quickstart, reviewed artifact contents, and
+recorded approval according to `GOVERNANCE.md`.
+
+## Verify the public release
+
+After publication:
+
+1. Install `vane-ai==<version>` from PyPI without access to the source checkout
+   and run the Quickstart.
+2. Download the GitHub Release assets, run `sha256sum -c SHA256SUMS`, and confirm
+   the PyPI files have the same hashes.
+3. Verify build provenance for every distribution:
+
+   ```bash
+   gh attestation verify <distribution> --repo AstroVela/vane
+   ```
+
+4. Confirm the GitHub Release is immutable, the tag points to the recorded
+   release commit, PyPI metadata and provenance are correct, and public
+   documentation links resolve.
+5. Announce material known issues and security limitations, and retain the
+   workflow run, approvals, checksums, provenance, and review record for audit.
+
+## Respond to a bad release
+
+If a problem is found before the release tag is created, cancel the workflow
+and correct the release pull request. Once a `v*` tag exists, do not move,
+delete, or reuse it even if neither package index has received the version;
+abandon the draft and supersede it with a new version and tag. For a harmful
+PyPI release, yank it, publish a fixed version, and add a clear notice to the
+affected GitHub Release. Use the security-advisory process when confidentiality
+or coordinated disclosure is required.
