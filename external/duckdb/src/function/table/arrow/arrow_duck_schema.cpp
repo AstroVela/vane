@@ -351,6 +351,9 @@ LogicalType ArrowType::GetDuckType(bool use_dictionary) const {
 			auto &child_name = StructType::GetChildName(type, i);
 			new_children.emplace_back(std::make_pair(child_name, child.GetDuckType(true)));
 		}
+		if (ImageType::IsImage(type)) {
+			return ImageType::Create(ImageType::GetMode(type));
+		}
 		return LogicalType::STRUCT(std::move(new_children));
 	}
 	case LogicalTypeId::LIST: {
@@ -408,6 +411,38 @@ unique_ptr<ArrowType> ArrowType::GetTypeFromSchema(ClientContext &context, Arrow
 	// Let's first figure out if this type is an extension type
 	ArrowSchemaMetadata schema_metadata(schema.metadata);
 	auto &config = DBConfig::GetConfig(context);
+	if (schema_metadata.HasExtension() &&
+	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "vane.image") {
+		if (format != "+s" || schema.n_children != 3) {
+			throw InvalidInputException("vane.image requires three-field struct storage");
+		}
+		auto metadata_json = schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_METADATA_KEY);
+		ImageMode mode;
+		try {
+			auto image_metadata = StringUtil::ParseJSONMap(metadata_json);
+			if (!image_metadata) {
+				throw InvalidInputException("metadata is missing");
+			}
+			auto mode_name = image_metadata->GetValue("mode");
+			if (mode_name.empty()) {
+				throw InvalidInputException("mode is missing");
+			}
+			mode = ImageType::ParseMode(mode_name);
+		} catch (const std::exception &ex) {
+			throw InvalidInputException("Failed to parse vane.image metadata: %s", ex.what());
+		}
+
+		auto storage_type = GetTypeFromFormat(context, schema, format);
+		auto storage_duck_type = storage_type->GetDuckType(true);
+		static const child_list_t<LogicalType> expected_children {
+		    {"width", LogicalType::UINTEGER}, {"height", LogicalType::UINTEGER}, {"pixels", LogicalType::BLOB}};
+		auto &actual_children = StructType::GetChildTypes(storage_duck_type);
+		if (actual_children != expected_children) {
+			throw InvalidInputException(
+			    "vane.image storage must be STRUCT(width UINTEGER, height UINTEGER, pixels BLOB)");
+		}
+		return make_uniq<ArrowType>(ImageType::Create(mode), std::move(storage_type->type_info));
+	}
 	if (schema_metadata.HasExtension() &&
 	    schema_metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) == "arrow.fixed_shape_tensor") {
 		if (!(format.size() > 3 && format[0] == '+' && format[1] == 'w' && schema.n_children == 1)) {

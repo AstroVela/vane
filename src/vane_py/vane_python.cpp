@@ -233,6 +233,16 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
 	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
 	m.def(
+	    "image_type",
+	    [](const string &mode, shared_ptr<DuckDBPyConnection> conn = nullptr) {
+		    if (!conn) {
+			    conn = DuckDBPyConnection::DefaultConnection();
+		    }
+		    return conn->ImageType(mode);
+	    },
+	    "Create a dynamic-size native image type", py::arg("mode") = "RGB8", py::kw_only(),
+	    py::arg("connection") = py::none());
+	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {

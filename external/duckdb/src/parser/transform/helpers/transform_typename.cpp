@@ -1,6 +1,13 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include "duckdb/parser/transformer.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -51,9 +58,11 @@ unique_ptr<ParsedExpression> Transformer::TransformTypeExpressionInternal(duckdb
 	// The postgres parser emits a bunch of strange type names - we want to normalize them here so that the alias for
 	// columns from expressions containing these types actually use the DuckDB type name.
 	// Eventually we should make the parser emit the correct names directly.
-	auto known_type_id = TransformStringToLogicalTypeId(unbound_name);
-	if (known_type_id != LogicalTypeId::UNBOUND) {
-		unbound_name = LogicalTypeIdToString(known_type_id);
+	if (!StringUtil::CIEquals(unbound_name, ImageType::TYPE_NAME)) {
+		auto known_type_id = TransformStringToLogicalTypeId(unbound_name);
+		if (known_type_id != LogicalTypeId::UNBOUND) {
+			unbound_name = LogicalTypeIdToString(known_type_id);
+		}
 	}
 
 	// Parse type modifiers

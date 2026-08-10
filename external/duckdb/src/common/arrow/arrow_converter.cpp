@@ -121,6 +121,22 @@ static string SerializeTensorMetadata(const vector<idx_t> &shape) {
 	return result;
 }
 
+static string SerializeImageMetadata(ImageMode mode) {
+	return "{\"mode\":\"" + ImageType::ModeToString(mode) + "\"}";
+}
+
+void SetArrowImageFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
+                         ClientProperties &options, ClientContext &context) {
+	D_ASSERT(ImageType::IsImage(type));
+	SetArrowStructFormat(root_holder, child, type, options, context);
+	ArrowSchemaMetadata schema_metadata;
+	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "vane.image");
+	schema_metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY,
+	                          SerializeImageMetadata(ImageType::GetMode(type)));
+	root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+	child.metadata = root_holder.metadata_info.back().get();
+}
+
 void SetArrowTensorFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                           ClientProperties &options, ClientContext &context) {
 	D_ASSERT(TensorType::IsTensor(type));
@@ -161,6 +177,10 @@ bool SetArrowExtension(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
 
 void SetArrowFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                     ClientProperties &options, ClientContext &context) {
+	if (ImageType::IsImage(type)) {
+		SetArrowImageFormat(root_holder, child, type, options, context);
+		return;
+	}
 	if (TensorType::IsTensor(type)) {
 		SetArrowTensorFormat(root_holder, child, type, options, context);
 		return;

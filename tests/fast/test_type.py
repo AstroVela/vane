@@ -4,6 +4,7 @@
 #
 # Modified by Vane contributors.
 
+import pickle
 import sys
 
 import pytest
@@ -88,6 +89,70 @@ class TestType:
         assert str(type) == "TENSOR(FLOAT, [3, 224, 224])"
         assert type.id == "tensor"
         assert type.children == [("dtype", FLOAT), ("shape", (3, 224, 224))]
+
+    def test_image_type(self, duckdb_cursor):
+        image_type = vane.image_type()
+
+        assert str(image_type) == "IMAGE(RGB8)"
+        assert image_type.id == "image"
+        assert image_type.children == [("mode", "RGB8")]
+        assert vane.image_type("rgb8") == image_type
+        assert duckdb_cursor.image_type("RGB8") == image_type
+        assert vane.type("IMAGE") == image_type
+        assert vane.type("IMAGE(RGB8)") == image_type
+        assert vane.type("IMAGE('RGB8')") == image_type
+        assert pickle.loads(pickle.dumps(image_type)) == image_type
+        assert pickle.loads(pickle.dumps(vane.list_type(image_type))) == vane.list_type(image_type)
+        nested_type = vane.struct_type({"image": image_type})
+        assert pickle.loads(pickle.dumps(nested_type)) == nested_type
+        assert vane.type("struct(image image(rgb8))") == nested_type
+        assert vane.type('STRUCT("quoted field" IMAGE(RGB8))') == vane.struct_type({"quoted field": image_type})
+        assert vane.type("STRUCT(image IMAGE('RGB8'))") == nested_type
+        assert str(vane.type('STRUCT("image(" INTEGER)')) == 'STRUCT("image(" INTEGER)'
+        assert str(vane.type("STRUCT(image IMAGE(RGB8), amount DECIMAL(10,2))")) == (
+            "STRUCT(image IMAGE(RGB8), amount DECIMAL(10,2))"
+        )
+        assert str(vane.type("STRUCT(image IMAGE(RGB8), state ENUM('a', 'b'))")) == (
+            "STRUCT(image IMAGE(RGB8), state ENUM('a', 'b'))"
+        )
+        assert str(vane.type("UNION(image IMAGE(RGB8), amount DECIMAL(10,2))")) == (
+            "UNION(image IMAGE(RGB8), amount DECIMAL(10,2))"
+        )
+        assert str(vane.type("ENUM('image(', 'other')")) == "ENUM('image(', 'other')"
+        mixed_type = vane.struct_type({"image": image_type, "amount": vane.decimal_type(10, 2)})
+        assert pickle.loads(pickle.dumps(mixed_type)) == mixed_type
+
+        relation = duckdb_cursor.sql("SELECT NULL::IMAGE AS default_image, NULL::IMAGE('RGB8') AS rgb_image")
+        assert relation.types == [image_type, image_type]
+
+        with pytest.raises(vane.InvalidInputException, match="supported modes: RGB8"):
+            vane.image_type("RGBA8")
+        with pytest.raises(vane.InvalidInputException, match="supported modes: RGB8"):
+            vane.type("IMAGE(RGBA8)")
+
+    def test_image_type_persists_in_catalog(self, tmp_path):
+        database_path = tmp_path / "images.duckdb"
+        connection = vane.connect(str(database_path))
+        connection.execute("CREATE TABLE image_store (value IMAGE('RGB8'))")
+        connection.execute(
+            """
+            INSERT INTO image_store
+            SELECT struct_pack(
+                width := 1::UINTEGER,
+                height := 1::UINTEGER,
+                pixels := from_hex('000102')
+            )::IMAGE('RGB8')
+            """
+        )
+        connection.close()
+
+        reopened = vane.connect(str(database_path))
+        try:
+            relation = reopened.table("image_store")
+            assert relation.types == [vane.image_type()]
+            assert relation.fetchall() == [({"width": 1, "height": 1, "pixels": b"\x00\x01\x02"},)]
+        finally:
+            reopened.close()
 
     def test_struct_type(self):
         type = vane.struct_type({"a": BIGINT, "b": BOOLEAN})

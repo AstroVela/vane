@@ -380,6 +380,11 @@ string DuckDBPyType::ToString() const {
 }
 
 py::list DuckDBPyType::Children() const {
+	if (ImageType::IsImage(type)) {
+		py::list children;
+		children.append(py::make_tuple("mode", ImageType::ModeToString(ImageType::GetMode(type))));
+		return children;
+	}
 	if (TensorType::IsTensor(type)) {
 		py::list children;
 		children.append(py::make_tuple("dtype", make_shared_ptr<DuckDBPyType>(TensorType::GetChildType(type))));
@@ -449,6 +454,9 @@ py::list DuckDBPyType::Children() const {
 }
 
 string DuckDBPyType::GetId() const {
+	if (ImageType::IsImage(type)) {
+		return "image";
+	}
 	if (TensorType::IsTensor(type)) {
 		return "tensor";
 	}

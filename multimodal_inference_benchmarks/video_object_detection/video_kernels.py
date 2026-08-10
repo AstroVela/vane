@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared numerical kernels for the Vane and Ray Data video benchmarks.
+"""Numerical kernels shared by the Vane and Ray Data video benchmarks.
 
-Keep framework-specific Arrow/Ray block handling out of this module.  Both
-benchmarks call these functions so execution-engine comparisons cannot drift
-because one side silently changes image preprocessing or YOLO result handling.
+Keep framework-specific Arrow/Ray block handling out of this module. Both
+benchmarks use the tensor and YOLO conversion helpers. Ray Data also uses the
+Pillow crop/PNG helper as its reference implementation, while Vane deliberately
+composes its native image crop and encode expressions.
 """
 
 from __future__ import annotations

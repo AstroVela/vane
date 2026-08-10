@@ -29,6 +29,7 @@ endif()
 project(DuckDB)
 
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
 set(DUCKDB_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 

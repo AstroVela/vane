@@ -71,7 +71,7 @@ def test_vane_adbc_public_exports_are_explicit():
 
 
 def test_vane_lazily_exposes_owned_public_submodules():
-    for name in ("ai", "runners", "sqltypes", "udf"):
+    for name in ("ai", "image", "runners", "sqltypes", "udf"):
         assert getattr(vane, name) is importlib.import_module(f"vane.{name}")
         assert name in dir(vane)
 
@@ -162,12 +162,14 @@ def test_native_runtime_edge_cases_match_the_typing_contract():
         "array": vane.array_type(vane.sqltypes.INTEGER, 3).children,
         "decimal": vane.decimal_type(10, 2).children,
         "enum": connection.sql("SELECT 'sad'::ENUM('sad', 'ok')").types[0].children,
+        "image": vane.image_type().children,
         "tensor": vane.tensor_type(vane.sqltypes.FLOAT, [2, 3]).children,
     }
     assert children_by_type == {
         "array": [("child", vane.sqltypes.INTEGER), ("size", 3)],
         "decimal": [("precision", 10), ("scale", 2)],
         "enum": [("values", ["sad", "ok"])],
+        "image": [("mode", "RGB8")],
         "tensor": [("dtype", vane.sqltypes.FLOAT), ("shape", (2, 3))],
     }
 

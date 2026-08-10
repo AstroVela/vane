@@ -539,6 +539,21 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 
 	auto upper_type = StringUtil::Upper(type);
+	if (upper_type == "IMAGE") {
+		return ImageType::Create(ImageMode::RGB8);
+	}
+	if (StringUtil::StartsWith(upper_type, "IMAGE(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto mode = type.substr(6, type.size() - 7);
+		StringUtil::Trim(mode);
+		if (mode.empty()) {
+			throw InternalException("Ill formatted image type: '%s'", type);
+		}
+		if (mode.size() >= 2 &&
+		    ((mode.front() == '\'' && mode.back() == '\'') || (mode.front() == '"' && mode.back() == '"'))) {
+			mode = mode.substr(1, mode.size() - 2);
+		}
+		return ImageType::Create(ImageType::ParseMode(mode));
+	}
 	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
 		string tensor_args = type.substr(7, type.size() - 8);
 		idx_t split_idx = string::npos;
@@ -606,7 +621,7 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 		return TensorType::Create(ParseLogicalType(child_type_str), shape);
 	}
 
-	if (StringUtil::StartsWith(type, "MAP(") && StringUtil::EndsWith(type, ")")) {
+	if (StringUtil::StartsWith(upper_type, "MAP(") && StringUtil::EndsWith(upper_type, ")")) {
 		// map - recurse
 		string map_args = type.substr(4, type.size() - 5);
 		vector<string> map_args_vect = SplitSerializedTypeArguments(map_args, type);
@@ -620,7 +635,7 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 		return LogicalType::MAP(key_type, value_type);
 	}
 
-	if (StringUtil::StartsWith(type, "UNION(") && StringUtil::EndsWith(type, ")")) {
+	if (StringUtil::StartsWith(upper_type, "UNION(") && StringUtil::EndsWith(upper_type, ")")) {
 		// union - recurse
 		string union_members_str = type.substr(6, type.size() - 7);
 		vector<string> union_members_vect = SplitSerializedTypeArguments(union_members_str, type);
@@ -637,7 +652,7 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 		return LogicalType::UNION(union_members);
 	}
 
-	if (StringUtil::StartsWith(type, "STRUCT(") && StringUtil::EndsWith(type, ")")) {
+	if (StringUtil::StartsWith(upper_type, "STRUCT(") && StringUtil::EndsWith(upper_type, ")")) {
 		// struct - recurse
 		string struct_members_str = type.substr(7, type.size() - 8);
 		vector<string> struct_members_vect = SplitSerializedTypeArguments(struct_members_str, type);
