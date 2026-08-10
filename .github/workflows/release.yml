@@ -1,16 +1,14 @@
 name: Release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
-      destination:
-        description: Build only, or publish the candidate to TestPyPI
+      operation:
+        description: Build only, or publish an existing draft release
         type: choice
         options:
           - build-only
-          - testpypi
+          - release
         default: build-only
         required: true
 
@@ -26,7 +24,7 @@ jobs:
     name: Build source package
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout the release commit
+      - name: Checkout the selected commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
@@ -37,20 +35,54 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Require the release tag to match the package version
-        if: github.event_name == 'release'
+      - name: Install release tooling
+        run: python -m pip install --upgrade build packaging pip
+
+      - name: Validate the release request
+        if: inputs.operation == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          test "$GITHUB_REF_TYPE" = "tag"
           expected_tag="v$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
           test "$GITHUB_REF_NAME" = "$expected_tag"
 
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          release_commit="$(git rev-parse HEAD^{commit})"
+          git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+
+          release_id="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq 'if .draft and ((.body // "") | length > 0) then .id else empty end'
+          )"
+          test -n "$release_id"
+
+          python - "${GITHUB_REF_NAME#v}" <<'PY'
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          version = urllib.parse.quote(sys.argv[1], safe="")
+          for index in ("https://test.pypi.org", "https://pypi.org"):
+              url = f"{index}/pypi/vane-ai/{version}/json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30):
+                      pass
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      continue
+                  raise
+              raise SystemExit(f"vane-ai {sys.argv[1]} already exists on {index}")
+          PY
+
       - name: Build and validate the source package
         run: |
-          python -m pip install --upgrade build packaging pip
           python -m build --sdist --outdir dist
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
       - name: Apply private content rules to the source package
-        if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -66,7 +98,7 @@ jobs:
           name: release-sdist
           path: dist/*.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   wheels:
     name: Build manylinux wheels
@@ -119,7 +151,7 @@ jobs:
           python scripts/verify_duckdb_coexistence.py "$wheel"
 
       - name: Apply private content rules to wheels
-        if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -135,7 +167,7 @@ jobs:
           name: release-wheels
           path: wheelhouse/*.whl
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   assemble:
     name: Validate, attest and sign artifacts
@@ -179,7 +211,7 @@ jobs:
           python scripts/check_release_artifacts.py packages/*.tar.gz packages/*.whl
 
       - name: Apply private content rules to the distribution set
-        if: ${{ github.event_name == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -203,9 +235,15 @@ jobs:
           upload-artifact: false
 
       - name: Attest distribution provenance
+        id: provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: ${{ github.workspace }}/packages/*
+
+      - name: Preserve the provenance bundle
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" \
+            release-assets/vane-ai-build-provenance.sigstore.json
 
       - name: Sign distributions with Sigstore
         uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84 # v3.0.1
@@ -222,9 +260,9 @@ jobs:
             packages/*.tar.gz
             packages/*.whl
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
-      - name: Upload checksums, SBOM and signatures
+      - name: Upload checksums, SBOM, provenance and signatures
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-supplemental
@@ -232,14 +270,11 @@ jobs:
             release-assets/*
             packages/*.sigstore.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   publish-testpypi:
     name: Publish to TestPyPI
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      inputs.destination == 'testpypi' &&
-      github.ref == 'refs/heads/main'
+    if: inputs.operation == 'release'
     needs: assemble
     runs-on: ubuntu-24.04
     environment:
@@ -261,10 +296,82 @@ jobs:
           packages-dir: dist
           repository-url: https://test.pypi.org/legacy/
 
+  verify-testpypi:
+    name: Verify the TestPyPI candidate
+    if: inputs.operation == 'release'
+    needs:
+      - assemble
+      - publish-testpypi
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the release distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: release-files
+
+      - name: Download and install the indexed candidate
+        env:
+          INDEX_URL: https://test.pypi.org/simple/
+        run: |
+          python -m pip install --upgrade pip
+          version="${GITHUB_REF_NAME#v}"
+          indexed_wheel=""
+          for attempt in 1 2 3 4 5; do
+            candidate_dir="$RUNNER_TEMP/testpypi-candidate-$attempt"
+            mkdir -p "$candidate_dir"
+            if python -m pip download \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$candidate_dir" \
+              "vane-ai==$version"; then
+              indexed_wheel="$(find "$candidate_dir" -maxdepth 1 -type f -name '*.whl' -print)"
+              break
+            fi
+            sleep 15
+          done
+          test -n "$indexed_wheel"
+          test "$(printf '%s\n' "$indexed_wheel" | wc -l)" -eq 1
+
+          expected_wheel="$(find release-files -maxdepth 1 -type f -name '*-cp312-cp312-*.whl' -print)"
+          test -n "$expected_wheel"
+          test "$(printf '%s\n' "$expected_wheel" | wc -l)" -eq 1
+          cmp "$expected_wheel" "$indexed_wheel"
+
+          python -m pip install "$indexed_wheel"
+          python -m pip check
+
+      - name: Extract the public smoke test from the sdist
+        run: |
+          sdist="$(find release-files -maxdepth 1 -type f -name '*.tar.gz' -print)"
+          test -n "$sdist"
+          test "$(printf '%s\n' "$sdist" | wc -l)" -eq 1
+          mkdir -p "$RUNNER_TEMP/vane-smoke"
+          tar \
+            --extract \
+            --gzip \
+            --file "$sdist" \
+            --directory "$RUNNER_TEMP/vane-smoke" \
+            --strip-components=2 \
+            --wildcards \
+            '*/scripts/verify_base_install.py'
+          test -f "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+
+      - name: Run the public smoke test outside a source checkout
+        working-directory: ${{ runner.temp }}
+        run: env -u VANE_RUNNER python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+
   publish-pypi:
     name: Publish to PyPI
-    if: github.event_name == 'release'
-    needs: assemble
+    if: inputs.operation == 'release'
+    needs: verify-testpypi
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -284,10 +391,84 @@ jobs:
         with:
           packages-dir: dist
 
+  verify-pypi:
+    name: Verify the PyPI distributions
+    if: inputs.operation == 'release'
+    needs:
+      - assemble
+      - publish-pypi
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the release distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-distributions
+          path: release-files
+
+      - name: Download and install the indexed distribution
+        env:
+          INDEX_URL: https://pypi.org/simple/
+        run: |
+          python -m pip install --upgrade pip
+          version="${GITHUB_REF_NAME#v}"
+          indexed_wheel=""
+          for attempt in 1 2 3 4 5; do
+            candidate_dir="$RUNNER_TEMP/pypi-candidate-$attempt"
+            mkdir -p "$candidate_dir"
+            if python -m pip download \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$candidate_dir" \
+              "vane-ai==$version"; then
+              indexed_wheel="$(find "$candidate_dir" -maxdepth 1 -type f -name '*.whl' -print)"
+              break
+            fi
+            sleep 15
+          done
+          test -n "$indexed_wheel"
+          test "$(printf '%s\n' "$indexed_wheel" | wc -l)" -eq 1
+
+          expected_wheel="$(find release-files -maxdepth 1 -type f -name '*-cp312-cp312-*.whl' -print)"
+          test -n "$expected_wheel"
+          test "$(printf '%s\n' "$expected_wheel" | wc -l)" -eq 1
+          cmp "$expected_wheel" "$indexed_wheel"
+
+          python -m pip install "$indexed_wheel"
+          python -m pip check
+
+      - name: Extract the public smoke test from the sdist
+        run: |
+          sdist="$(find release-files -maxdepth 1 -type f -name '*.tar.gz' -print)"
+          test -n "$sdist"
+          test "$(printf '%s\n' "$sdist" | wc -l)" -eq 1
+          mkdir -p "$RUNNER_TEMP/vane-smoke"
+          tar \
+            --extract \
+            --gzip \
+            --file "$sdist" \
+            --directory "$RUNNER_TEMP/vane-smoke" \
+            --strip-components=2 \
+            --wildcards \
+            '*/scripts/verify_base_install.py'
+          test -f "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+
+      - name: Run the public smoke test outside a source checkout
+        working-directory: ${{ runner.temp }}
+        run: env -u VANE_RUNNER python "$RUNNER_TEMP/vane-smoke/verify_base_install.py"
+
   publish-github-release:
-    name: Attach release assets
-    if: github.event_name == 'release'
-    needs: assemble
+    name: Publish the draft GitHub Release
+    if: inputs.operation == 'release'
+    needs:
+      - assemble
+      - verify-pypi
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -304,7 +485,17 @@ jobs:
           name: release-supplemental
           path: release-files
 
-      - name: Attach immutable assets to the GitHub release
+      - name: Attach assets to the draft release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" release-files/*
+        run: |
+          draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .draft)"
+          test "$draft" = "true"
+          gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+
+      - name: Publish the complete draft release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

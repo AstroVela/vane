@@ -22,7 +22,9 @@ Keep each pull request focused and explain:
 - compatibility, performance, security, and license impact;
 - source and immutable revision of any imported code or generated asset.
 
-Add regression tests for behavior changes. Update public documentation and `CHANGELOG.md` when users need to know about the change. Avoid drive-by formatting or unrelated cleanup.
+Add regression tests for behavior changes. Update public documentation and call
+out user-visible changes in the pull request so maintainers can include them in
+the next GitHub Release notes. Avoid drive-by formatting or unrelated cleanup.
 
 Contributions intentionally submitted to this repository are accepted under Apache-2.0 unless explicitly stated otherwise. Preserve existing third-party notices and update [SOURCE_PROVENANCE.md](SOURCE_PROVENANCE.md) and [THIRD_PARTY.md](THIRD_PARTY.md) when importing or modifying inherited code.
 
