@@ -58,6 +58,11 @@ public:
 	ExtraOperatorInfo extra_info;
 	//! Parameters
 	vector<Value> parameters;
+	//! Named parameters retained for worker-side table-function rebinds
+	named_parameter_map_t named_parameters;
+	//! Input table schema retained for worker-side table-function rebinds
+	vector<LogicalType> input_table_types;
+	vector<string> input_table_names;
 	//! Contains a reference to dynamically generated table filters (through e.g. a join up in the tree)
 	shared_ptr<DynamicTableFilterSet> dynamic_filters;
 	//! Virtual columns

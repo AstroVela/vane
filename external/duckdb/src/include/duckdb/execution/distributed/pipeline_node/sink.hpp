@@ -9,7 +9,7 @@
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 
-#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/crypto/md5.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/exception.hpp"
@@ -60,7 +60,6 @@ public:
 		} else {
 			staging_root_base_ = spec_.file_path + ".duckdb_staging";
 		}
-		staging_run_id_ = UUID::ToString(UUID::GenerateRandomUUID());
 	}
 
 	std::string name() const override {
@@ -84,6 +83,20 @@ public:
 	}
 	const std::string &staging_run_id() const {
 		return staging_run_id_;
+	}
+	void SetOperationIdentity(const string &query_id) {
+		if (query_id.empty()) {
+			throw InvalidInputException("Distributed COPY requires a non-empty query identity");
+		}
+		MD5Context digest;
+		digest.Add("vane-distributed-copy:");
+		digest.Add(query_id);
+		digest.Add(":" + std::to_string(node_id()));
+		auto operation_run_id = digest.FinishHex();
+		if (!staging_run_id_.empty() && staging_run_id_ != operation_run_id) {
+			throw InvalidInputException("Distributed COPY sink operation identity cannot change after assignment");
+		}
+		staging_run_id_ = std::move(operation_run_id);
 	}
 
 	std::vector<PipelineNodeRef> children() const override {

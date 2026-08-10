@@ -166,7 +166,7 @@ class RayRunner(Runner):
             del relation
 
     def run_write(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
-        """Execute a distributed COPY/write plan and return file metadata."""
+        """Execute a distributed COPY or extension-write plan."""
         PyLogicalPlan = require_ray_cxx_attr(
             "PyLogicalPlan",
             hint="Ensure the C++ ray extension is built and importable in worker processes.",

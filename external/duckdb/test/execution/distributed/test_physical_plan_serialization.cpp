@@ -28,10 +28,13 @@
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+#include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
+#include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
@@ -39,6 +42,7 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -49,6 +53,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/types.hpp"
@@ -127,12 +132,161 @@ unique_ptr<FunctionData> TestInOutDeserialize(Deserializer &deserializer, TableF
 	return std::move(data);
 }
 
+unique_ptr<FunctionData> TestContextSettingDeserialize(Deserializer &deserializer, TableFunction &) {
+	auto marker = deserializer.ReadProperty<idx_t>(100, "marker");
+	auto &context = deserializer.Get<ClientContext &>();
+	Value threads;
+	if (!context.TryGetCurrentSetting("threads", threads) || threads.GetValue<idx_t>() != 3) {
+		marker = 0;
+	}
+	auto data = make_uniq<TestInOutBindData>();
+	data->marker = marker;
+	return std::move(data);
+}
+
 TableFunction MakeTestInOutFunction() {
 	TableFunction func("test_inout_serialization", {LogicalType::TABLE}, nullptr, TestInOutBind);
 	func.in_out_function = TestInOutFunction;
 	func.serialize = TestInOutSerialize;
 	func.deserialize = TestInOutDeserialize;
 	return func;
+}
+
+TableFunction MakeContextSettingTestInOutFunction() {
+	TableFunction func("test_inout_context_setting", {LogicalType::TABLE}, nullptr, TestInOutBind);
+	func.in_out_function = TestInOutFunction;
+	func.serialize = TestInOutSerialize;
+	func.deserialize = TestContextSettingDeserialize;
+	return func;
+}
+
+struct TestExtensionScanBindData : public TableFunctionData, public ExtensionScanTaskProvider {
+	idx_t marker = 0;
+	string worker_parameter;
+	vector<OpenFileInfo> tasks;
+	unordered_map<string, idx_t> task_bytes;
+	unordered_map<string, idx_t> task_cardinalities;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<TestExtensionScanBindData>();
+		copy->marker = marker;
+		copy->worker_parameter = worker_parameter;
+		copy->tasks = tasks;
+		copy->task_bytes = task_bytes;
+		copy->task_cardinalities = task_cardinalities;
+		return std::move(copy);
+	}
+
+	bool Equals(const FunctionData &other) const override {
+		auto &other_data = other.Cast<TestExtensionScanBindData>();
+		return marker == other_data.marker && worker_parameter == other_data.worker_parameter;
+	}
+
+	vector<OpenFileInfo> GetScanTasks() const override {
+		return tasks;
+	}
+
+	void SetScanTasks(const vector<OpenFileInfo> &tasks_p) override {
+		tasks = tasks_p;
+	}
+
+	optional_idx GetScanTaskEstimatedBytes(const OpenFileInfo &task) const override {
+		auto entry = task_bytes.find(task.path);
+		return entry == task_bytes.end() ? optional_idx() : optional_idx(entry->second);
+	}
+
+	optional_idx GetScanTaskEstimatedCardinality(const OpenFileInfo &task) const override {
+		auto entry = task_cardinalities.find(task.path);
+		return entry == task_cardinalities.end() ? optional_idx() : optional_idx(entry->second);
+	}
+
+	void PrepareWorkerBind(vector<Value> &parameters, named_parameter_map_t &named_parameters) const override {
+		if (!worker_parameter.empty()) {
+			parameters.clear();
+			parameters.emplace_back(worker_parameter);
+		}
+		named_parameters["marker"] = Value::UBIGINT(marker);
+	}
+};
+
+void TestExtensionScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                const TableFunction &) {
+	auto marker = bind_data ? bind_data->Cast<TestExtensionScanBindData>().marker : 0;
+	serializer.WriteProperty(100, "marker", marker);
+}
+
+unique_ptr<FunctionData> TestExtensionScanDeserializeWithoutProvider(Deserializer &deserializer, TableFunction &) {
+	auto data = make_uniq<TestInOutBindData>();
+	data->marker = deserializer.ReadProperty<idx_t>(100, "marker");
+	return std::move(data);
+}
+
+void TestEmptyScan(ClientContext &, TableFunctionInput &, DataChunk &output) {
+	output.SetCardinality(0);
+}
+
+unique_ptr<FunctionData> TestExtensionScanBind(ClientContext &, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("value");
+	auto data = make_uniq<TestExtensionScanBindData>();
+	if (!input.inputs.empty()) {
+		data->worker_parameter = input.inputs[0].GetValue<string>();
+	}
+	auto marker = input.named_parameters.find("marker");
+	if (marker != input.named_parameters.end()) {
+		data->marker = marker->second.GetValue<idx_t>();
+	}
+	data->tasks.emplace_back("test://scan-task");
+	return std::move(data);
+}
+
+TableFunction MakeTestExtensionScanFunction() {
+	TableFunction func("test_extension_scan_rebind", {}, TestEmptyScan, TestExtensionScanBind);
+	func.named_parameters["marker"] = LogicalType::UBIGINT;
+	return func;
+}
+
+TableFunction MakeTestCatalogExtensionScanFunction() {
+	TableFunction func("test_catalog_extension_scan_rebind", {LogicalType::VARCHAR}, TestEmptyScan,
+	                   TestExtensionScanBind);
+	func.named_parameters["marker"] = LogicalType::UBIGINT;
+	return func;
+}
+
+TableFunction MakeTestGenericRebindScanFunction() {
+	return TableFunction("test_generic_scan_rebind", {}, TestEmptyScan, TestInOutBind);
+}
+
+TableFunction MakeTestUncontractedScanFunction() {
+	TableFunction func("test_uncontracted_scan_rebind", {}, TestEmptyScan, TestInOutBind);
+	func.serialize = TestInOutSerialize;
+	return func;
+}
+
+TableFunction MakeTestSerializedProviderLossFunction() {
+	TableFunction func("test_extension_scan_serialized_provider_loss", {}, TestEmptyScan, TestExtensionScanBind);
+	func.serialize = TestExtensionScanSerialize;
+	func.deserialize = TestExtensionScanDeserializeWithoutProvider;
+	return func;
+}
+
+DuckPhysicalPlanRef MakeTestPhysicalTableScan(ClientContext &context, const string &function_name,
+                                              unique_ptr<FunctionData> bind_data,
+                                              named_parameter_map_t named_parameters = {}) {
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, function_name);
+	auto function = entry.functions.GetFunctionByArguments(context, {});
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<ColumnIndex> column_ids;
+	column_ids.emplace_back(0);
+	vector<string> names = {"value"};
+	auto &scan = plan->Make<PhysicalTableScan>(
+	    types, std::move(function), std::move(bind_data), types, std::move(column_ids), vector<idx_t> {}, names,
+	    unique_ptr<TableFilterSet>(), 1, ExtraOperatorInfo {}, vector<Value> {}, virtual_column_map_t {});
+	scan.Cast<PhysicalTableScan>().named_parameters = std::move(named_parameters);
+	plan->SetRoot(scan);
+	return plan;
 }
 
 void SerializePreStrictRemoteExchangeSink(Serializer &serializer) {
@@ -1675,6 +1829,251 @@ TEST_CASE("PhysicalTableInOutFunction serialization roundtrip", "[serialization]
 	REQUIRE(name_it->second == "test_inout_serialization");
 
 	std::cerr << "[test] PhysicalTableInOutFunction serialization roundtrip PASSED" << std::endl;
+	conn.Rollback();
+}
+
+TEST_CASE("Distributed physical plan clone preserves client settings for extension rebind",
+          "[serialization][physical_plan][distributed]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto set_result = conn.Query("SET threads=3");
+	REQUIRE(!set_result->HasError());
+
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto func = MakeContextSettingTestInOutFunction();
+	CreateTableFunctionInfo info(func);
+	catalog.CreateTableFunction(context, info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
+	                                                           "test_inout_context_setting");
+	auto table_func = entry.functions.GetFunctionByArguments(context, {LogicalType::TABLE});
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<ColumnIndex> column_ids;
+	column_ids.emplace_back(0);
+	auto bind_data = make_uniq<TestInOutBindData>();
+	bind_data->marker = 123;
+	vector<column_t> projected_input;
+	auto &inout =
+	    plan->Make<PhysicalTableInOutFunction>(types, table_func, std::move(bind_data), column_ids, 1, projected_input);
+	plan->SetRoot(inout);
+
+	auto cloned = distributed::ClonePhysicalPlanOrThrow(plan, "client_settings_test", conn.context.get());
+	auto &cloned_inout = cloned->Root().Cast<PhysicalTableInOutFunction>();
+	auto cloned_bind_data = cloned_inout.GetBindData();
+	REQUIRE(cloned_bind_data);
+	REQUIRE(cloned_bind_data->Cast<TestInOutBindData>().marker == 123);
+	conn.Rollback();
+}
+
+TEST_CASE("Distributed table-function rebind requires the explicit extension scan contract",
+          "[serialization][physical_plan][distributed]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto extension_function = MakeTestExtensionScanFunction();
+	CreateTableFunctionInfo extension_info(extension_function);
+	catalog.CreateTableFunction(context, extension_info);
+	auto generic_function = MakeTestGenericRebindScanFunction();
+	CreateTableFunctionInfo generic_info(generic_function);
+	catalog.CreateTableFunction(context, generic_info);
+	auto uncontracted_function = MakeTestUncontractedScanFunction();
+	CreateTableFunctionInfo uncontracted_info(uncontracted_function);
+	catalog.CreateTableFunction(context, uncontracted_info);
+	auto serialized_provider_loss_function = MakeTestSerializedProviderLossFunction();
+	CreateTableFunctionInfo serialized_provider_loss_info(serialized_provider_loss_function);
+	catalog.CreateTableFunction(context, serialized_provider_loss_info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto provider_bind = make_uniq<TestExtensionScanBindData>();
+	provider_bind->marker = 41;
+	provider_bind->tasks.emplace_back("test://scan-task");
+	named_parameter_map_t named_parameters;
+	named_parameters["marker"] = Value::UBIGINT(41);
+	auto provider_plan = MakeTestPhysicalTableScan(context, "test_extension_scan_rebind", std::move(provider_bind),
+	                                               std::move(named_parameters));
+	auto cloned = distributed::ClonePhysicalPlanOrThrow(provider_plan, "extension_provider_rebind", conn.context.get());
+	auto &cloned_scan = cloned->Root().Cast<PhysicalTableScan>();
+	auto *cloned_bind = dynamic_cast<TestExtensionScanBindData *>(cloned_scan.bind_data.get());
+	REQUIRE(cloned_bind);
+	REQUIRE(cloned_bind->marker == 41);
+
+	auto generic_bind = make_uniq<TestInOutBindData>();
+	auto generic_plan = MakeTestPhysicalTableScan(context, "test_generic_scan_rebind", std::move(generic_bind));
+	auto generic_cloned =
+	    distributed::ClonePhysicalPlanOrThrow(generic_plan, "generic_scan_rebind", conn.context.get());
+	auto &generic_scan = generic_cloned->Root().Cast<PhysicalTableScan>();
+	REQUIRE(generic_scan.bind_data->Cast<TestInOutBindData>().marker == 7);
+
+	auto uncontracted_bind = make_uniq<TestInOutBindData>();
+	auto uncontracted_plan =
+	    MakeTestPhysicalTableScan(context, "test_uncontracted_scan_rebind", std::move(uncontracted_bind));
+	REQUIRE_THROWS_WITH(
+	    distributed::ClonePhysicalPlanOrThrow(uncontracted_plan, "uncontracted_scan_rebind", conn.context.get()),
+	    Catch::Matchers::Contains("ExtensionScanTaskProvider"));
+
+	auto serialized_provider_bind = make_uniq<TestExtensionScanBindData>();
+	serialized_provider_bind->marker = 91;
+	serialized_provider_bind->tasks.emplace_back("test://serialized-provider-task");
+	auto serialized_provider_plan = MakeTestPhysicalTableScan(context, "test_extension_scan_serialized_provider_loss",
+	                                                          std::move(serialized_provider_bind));
+	REQUIRE_THROWS_WITH(
+	    distributed::ClonePhysicalPlanOrThrow(serialized_provider_plan, "serialized_provider_loss", conn.context.get()),
+	    Catch::Matchers::Contains("did not produce the required ExtensionScanTaskProvider"));
+	conn.Rollback();
+}
+
+TEST_CASE("Distributed extension scan planning uses provider estimates for opaque tasks",
+          "[serialization][physical_plan][distributed][extension-scan]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto extension_function = MakeTestExtensionScanFunction();
+	CreateTableFunctionInfo extension_info(extension_function);
+	catalog.CreateTableFunction(context, extension_info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto bind_data = make_uniq<TestExtensionScanBindData>();
+	bind_data->tasks.emplace_back("opaque-task-a");
+	bind_data->tasks.emplace_back("opaque-task-b");
+	bind_data->task_bytes["opaque-task-a"] = 100;
+	bind_data->task_bytes["opaque-task-b"] = 200;
+	bind_data->task_cardinalities["opaque-task-a"] = 3;
+	bind_data->task_cardinalities["opaque-task-b"] = 5;
+	auto plan = MakeTestPhysicalTableScan(context, "test_extension_scan_rebind", std::move(bind_data));
+
+	distributed::DuckDBExecutionConfig config;
+	config.set_distributed_worker_slots(2);
+	auto tasks =
+	    distributed::MakeTableScanTasks(plan->Root().Cast<PhysicalTableScan>(), config, shared_ptr<DatabaseInstance>());
+
+	REQUIRE(tasks.size() == 2);
+	REQUIRE(tasks[0].files.size() == 1);
+	REQUIRE(tasks[0].files[0].path == "opaque-task-a");
+	REQUIRE(tasks[0].estimated_bytes == 100);
+	REQUIRE(tasks[0].estimated_cardinality == 3);
+	REQUIRE(tasks[1].files.size() == 1);
+	REQUIRE(tasks[1].files[0].path == "opaque-task-b");
+	REQUIRE(tasks[1].estimated_bytes == 200);
+	REQUIRE(tasks[1].estimated_cardinality == 5);
+
+	auto partial_bind_data = make_uniq<TestExtensionScanBindData>();
+	partial_bind_data->tasks.emplace_back("opaque-task-a");
+	partial_bind_data->tasks.emplace_back("opaque-task-b");
+	partial_bind_data->tasks.emplace_back("opaque-task-c");
+	partial_bind_data->task_bytes["opaque-task-a"] = 1024ULL * 1024 * 1024;
+	auto partial_plan = MakeTestPhysicalTableScan(context, "test_extension_scan_rebind", std::move(partial_bind_data));
+	auto partial_tasks = distributed::MakeTableScanTasks(partial_plan->Root().Cast<PhysicalTableScan>(), config,
+	                                                     shared_ptr<DatabaseInstance>());
+
+	REQUIRE(partial_tasks.size() == 2);
+	REQUIRE(partial_tasks[0].files.size() == 2);
+	REQUIRE(partial_tasks[0].files[0].path == "opaque-task-a");
+	REQUIRE(partial_tasks[0].files[1].path == "opaque-task-b");
+	REQUIRE(partial_tasks[0].estimated_bytes == 0);
+	REQUIRE(partial_tasks[1].files.size() == 1);
+	REQUIRE(partial_tasks[1].files[0].path == "opaque-task-c");
+	REQUIRE(partial_tasks[1].estimated_bytes == 0);
+	conn.Rollback();
+}
+
+TEST_CASE("Logical extension scan replay materializes catalog positional parameters",
+          "[serialization][logical_plan][distributed]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto catalog_function = MakeTestCatalogExtensionScanFunction();
+	CreateTableFunctionInfo catalog_info(catalog_function);
+	catalog.CreateTableFunction(context, catalog_info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
+	                                                           "test_catalog_extension_scan_rebind");
+	auto function = entry.functions.GetFunctionByArguments(context, {LogicalType::VARCHAR});
+	auto bind_data = make_uniq<TestExtensionScanBindData>();
+	bind_data->marker = 73;
+	bind_data->worker_parameter = "test://catalog-backed-table";
+	bind_data->tasks.emplace_back("test://scan-task");
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<string> names = {"value"};
+	auto logical_get = make_uniq<LogicalGet>(0, std::move(function), std::move(bind_data), types, names);
+	REQUIRE(logical_get->parameters.empty());
+	REQUIRE(logical_get->named_parameters.empty());
+
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	logical_get->Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(context);
+	deserializer.Begin();
+	auto deserialized = LogicalOperator::Deserialize(deserializer);
+	deserializer.End();
+
+	auto &rebound_get = deserialized->Cast<LogicalGet>();
+	REQUIRE(rebound_get.parameters.size() == 1);
+	REQUIRE(rebound_get.parameters[0].GetValue<string>() == "test://catalog-backed-table");
+	REQUIRE(rebound_get.named_parameters.at("marker").GetValue<idx_t>() == 73);
+	auto *rebound_bind = dynamic_cast<TestExtensionScanBindData *>(rebound_get.bind_data.get());
+	REQUIRE(rebound_bind);
+	REQUIRE(rebound_bind->worker_parameter == "test://catalog-backed-table");
+	REQUIRE(rebound_bind->marker == 73);
+	conn.Rollback();
+}
+
+TEST_CASE("Logical extension scan replay requires provider recreation",
+          "[serialization][logical_plan][distributed][extension-scan]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto extension_function = MakeTestSerializedProviderLossFunction();
+	CreateTableFunctionInfo extension_info(extension_function);
+	catalog.CreateTableFunction(context, extension_info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
+	                                                           "test_extension_scan_serialized_provider_loss");
+	auto function = entry.functions.GetFunctionByArguments(context, {});
+	auto bind_data = make_uniq<TestExtensionScanBindData>();
+	bind_data->marker = 91;
+	bind_data->tasks.emplace_back("test://logical-provider-task");
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<string> names = {"value"};
+	auto logical_get = make_uniq<LogicalGet>(0, std::move(function), std::move(bind_data), types, names);
+
+	Allocator allocator;
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	logical_get->Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(context);
+	deserializer.Begin();
+	REQUIRE_THROWS_WITH(LogicalOperator::Deserialize(deserializer),
+	                    Catch::Matchers::Contains("did not produce the required ExtensionScanTaskProvider"));
 	conn.Rollback();
 }
 

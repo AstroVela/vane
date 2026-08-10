@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_serialization.hpp"
+#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -245,11 +246,19 @@ void LogicalGet::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(204, "projection_ids", projection_ids);
 	serializer.WriteProperty(205, "table_filters", table_filters);
 	FunctionSerializer::Serialize(serializer, function, bind_data.get());
-	if (!function.serialize || function.in_out_function) {
+	if (!function.HasSerializationCallbacks() || function.in_out_function) {
 		// Functions without custom serialization need these values for rebinding. In-out functions also need them
 		// during execution.
-		serializer.WriteProperty(206, "parameters", parameters);
-		serializer.WriteProperty(207, "named_parameters", named_parameters);
+		auto rebound_parameters = parameters;
+		auto rebound_named_parameters = named_parameters;
+		if (bind_data) {
+			auto provider = TryGetExtensionScanTaskProvider(*bind_data);
+			if (provider) {
+				provider->PrepareWorkerBind(rebound_parameters, rebound_named_parameters);
+			}
+		}
+		serializer.WriteProperty(206, "parameters", rebound_parameters);
+		serializer.WriteProperty(207, "named_parameters", rebound_named_parameters);
 		serializer.WriteProperty(208, "input_table_types", input_table_types);
 		serializer.WriteProperty(209, "input_table_names", input_table_names);
 	}
@@ -259,6 +268,8 @@ void LogicalGet::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<optional_idx>(213, "ordinality_idx", ordinality_idx);
 	serializer.WritePropertyWithDefault<unique_ptr<RowGroupOrderOptions>>(214, "row_group_order_options",
 	                                                                      row_group_order_options);
+	serializer.WriteProperty(215, "requires_extension_scan_task_provider",
+	                         bind_data && TryGetExtensionScanTaskProvider(*bind_data));
 }
 
 unique_ptr<LogicalOperator> LogicalGet::Deserialize(Deserializer &deserializer) {
@@ -292,6 +303,8 @@ unique_ptr<LogicalOperator> LogicalGet::Deserialize(Deserializer &deserializer) 
 	deserializer.ReadPropertyWithDefault<optional_idx>(213, "ordinality_idx", result->ordinality_idx);
 	auto row_group_order_options =
 	    deserializer.ReadPropertyWithDefault<unique_ptr<RowGroupOrderOptions>>(214, "row_group_order_options");
+	auto requires_extension_scan_task_provider =
+	    deserializer.ReadProperty<bool>(215, "requires_extension_scan_task_provider");
 	if (!legacy_column_ids.empty()) {
 		if (!result->column_ids.empty()) {
 			throw SerializationException(
@@ -348,6 +361,12 @@ unique_ptr<LogicalOperator> LogicalGet::Deserialize(Deserializer &deserializer) 
 	}
 	result->virtual_columns = std::move(virtual_columns);
 	result->bind_data = std::move(bind_data);
+	if (requires_extension_scan_task_provider &&
+	    (!result->bind_data || !TryGetExtensionScanTaskProvider(*result->bind_data))) {
+		throw SerializationException("LogicalGet deserialization for table function '%s' did not produce the required "
+		                             "ExtensionScanTaskProvider",
+		                             function.name);
+	}
 	if (row_group_order_options) {
 		result->SetScanOrder(std::move(row_group_order_options));
 	}

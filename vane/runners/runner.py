@@ -37,5 +37,5 @@ class Runner:
 
     @abstractmethod
     def run_write(self, relation: Any) -> dict[str, Any]:
-        """Execute a COPY/write relation through the runner."""
+        """Execute a COPY or extension-write relation through the runner."""
         ...
