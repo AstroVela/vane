@@ -1428,7 +1428,7 @@ public:
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("timed out waiting for Python backend FTE query: " + status_message));
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			duckdb::SleepWithGILReleasedIfHeld(std::chrono::milliseconds(10));
 		}
 
 		const double remaining_timeout_s =
@@ -2400,7 +2400,7 @@ private:
 				    DuckDBError("timed out draining Python backend FTE result handles"));
 			}
 			pending = std::move(still_pending);
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			duckdb::SleepWithGILReleasedIfHeld(std::chrono::milliseconds(1));
 		}
 		RetainPythonTaskResultHandles(query_id, std::move(retained_handles));
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
@@ -2450,6 +2450,22 @@ struct PyPhysicalPlanWrapperRunner {
 	void register_query_owner(const string &query_id, const string &owner_query_id) {
 		if (py_backend_worker_manager_) {
 			py_backend_worker_manager_->register_query_owner(query_id, owner_query_id);
+		}
+	}
+
+	// Test-only: drive the Python-backend FTE wait WITHOUT releasing the GIL.
+	// Production reaches wait_fte_query under a py::gil_scoped_release taken
+	// upstream (this file's run_plan implementation releases around
+	// runner->run_plan), which is what currently masks the poll loops' GIL
+	// retention. Entering here GIL-held lets a regression test observe
+	// whether the inter-poll sleeps still starve concurrent Python threads.
+	void wait_fte_query_gil_held_for_test(const string &query_id, double timeout_s) {
+		if (!py_backend_worker_manager_) {
+			throw std::runtime_error("wait_fte_query_gil_held_for_test requires a Python-backend runner");
+		}
+		auto res = py_backend_worker_manager_->wait_fte_query(query_id, timeout_s);
+		if (res.is_err()) {
+			throw duckdb::InternalException(res.error().what());
 		}
 	}
 

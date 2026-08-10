@@ -1141,6 +1141,10 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("drop_query_fragments", &PyPhysicalPlanWrapperRunner::drop_query_fragments, py::arg("query_id"))
 	    .def("_register_query_owner_for_test", &PyPhysicalPlanWrapperRunner::register_query_owner, py::arg("query_id"),
 	         py::arg("owner_query_id"))
+	    // timeout_s is deliberately required: 0.0 means "no deadline", and a
+	    // defaulted infinite wait against a never-finishing test fake hangs CI.
+	    .def("_wait_fte_query_gil_held_for_test", &PyPhysicalPlanWrapperRunner::wait_fte_query_gil_held_for_test,
+	         py::arg("query_id"), py::arg("timeout_s"))
 	    .def("close_session", &PyPhysicalPlanWrapperRunner::close_session, py::arg("session_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
 	    .def("shutdown",

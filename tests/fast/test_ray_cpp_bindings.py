@@ -4597,3 +4597,99 @@ def test_execute_native_roundtrip_hash_join_plan_no_crash():
     assert "rows 1" in proc.stdout
     assert "status ok" in proc.stdout
     assert "ok" in proc.stdout
+
+
+def test_python_backend_wait_releases_gil_during_poll_sleeps():
+    """Regression for #456: the Python-backend FTE poll loop must release the GIL
+    while it sleeps between polls, so a concurrent Python thread keeps running.
+
+    The wait is entered GIL-held via a test-only binding — production callers wrap
+    it in ``py::gil_scoped_release``, which is exactly what masks the bug on the
+    live path.
+
+    Making this a true discriminator requires care: CPython voluntarily hands the
+    GIL off at bytecode boundaries roughly every ``switchinterval`` seconds, so a
+    spinner thread would advance a little during the Python status callbacks even
+    if the sleeps held the GIL. We raise ``switchinterval`` far above the total
+    duration of the (short) GIL-held wait, so voluntary hand-offs never trigger:
+    the spinner can then only advance if the inter-poll sleep *explicitly* releases
+    the GIL. With the guard in place the spinner runs during the sleep; without it
+    the spinner is provably never scheduled and the delta is exactly zero.
+    """
+    spinner_counter = [0]
+    stop = threading.Event()
+
+    def spin():
+        while not stop.is_set():
+            spinner_counter[0] += 1  # pure-Python work; only advances while holding the GIL
+            # Cooperatively drop the GIL so the main thread re-acquires promptly
+            # after each released sleep; keeps the test fast despite the high
+            # switchinterval. When the GIL is held across the sleep the spinner is
+            # blocked here and this line never runs, so it cannot mask the bug.
+            time.sleep(0.0001)
+
+    class NeverFinishesBackend:
+        def __init__(self):
+            self.counter_at_first_poll = None
+            self.counter_at_last_poll = None
+
+        def register_query_owner(self, query_id, owner_query_id):
+            return None
+
+        def fte_query_status(self, query_id):
+            if self.counter_at_first_poll is None:
+                self.counter_at_first_poll = spinner_counter[0]
+            self.counter_at_last_poll = spinner_counter[0]
+            return {"failed": False, "finished": False}
+
+    backend = NeverFinishesBackend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test("query-gil-poll", "query-gil-poll")
+
+    old_interval = sys.getswitchinterval()
+    spinner = threading.Thread(target=spin, daemon=True)
+    spinner.start()
+    try:
+        # Inside the try so the long-lived shared pytest process gets the
+        # interval restored even if anything below raises.
+        sys.setswitchinterval(1.0)
+        with pytest.raises(Exception) as exc_info:
+            # Never finishes + a short deadline => the loop sleeps several times and
+            # then times out. The deadline (0.2 s) sits well above a single poll but
+            # far below switchinterval, so an unfixed loop never yields the GIL.
+            runner._wait_fte_query_gil_held_for_test("query-gil-poll", timeout_s=0.2)
+        assert "timed out" in str(exc_info.value).lower()
+    finally:
+        stop.set()
+        sys.setswitchinterval(old_interval)
+        spinner.join()
+
+    assert backend.counter_at_first_poll is not None
+    progress = backend.counter_at_last_poll - backend.counter_at_first_poll
+    assert progress > 0, "concurrent Python thread was starved: the poll loop held the GIL across its sleep"
+
+
+def test_python_backend_wait_gil_held_completes_when_backend_finishes():
+    """Entered GIL-held, the wait still completes normally once the backend reports
+    finished — exercising the status loop's sleep on the success path without
+    altering functional behavior."""
+
+    class FinishingBackend:
+        def __init__(self):
+            self.polls = 0
+
+        def register_query_owner(self, query_id, owner_query_id):
+            return None
+
+        def fte_query_status(self, query_id):
+            self.polls += 1
+            # A few not-finished polls force the loop through its inter-poll sleep
+            # before it succeeds; no stored result handles => an empty drain.
+            return {"failed": False, "finished": self.polls >= 3}
+
+    backend = FinishingBackend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test("query-gil-finish", "query-gil-finish")
+
+    runner._wait_fte_query_gil_held_for_test("query-gil-finish", timeout_s=0.0)
+    assert backend.polls >= 3
