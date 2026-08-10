@@ -443,6 +443,15 @@ def test_ray_actor_pool_size_and_gpu_options_follow_physical_payload(monkeypatch
     assert "stateful" not in nodes[0]["payload"]
     assert "side_effects" not in nodes[0]["payload"]
     assert nodes[0]["payload"]["expression_id"]
+    assert nodes[0]["payload"]["dynamic_batching"] is True
+    assert nodes[0]["payload"]["dynamic_batch_size_min_rows"] == 1
+    assert nodes[0]["payload"]["dynamic_batch_size_max_rows"] == 2
+    assert nodes[0]["payload"]["dynamic_batch_size_initial_rows"] == 2
+    assert nodes[0]["payload"]["dynamic_batch_target_latency_ms"] == 5000
+    assert nodes[0]["payload"]["dynamic_batch_latency_tolerance_ms"] == 1000
+    assert nodes[0]["payload"]["dynamic_batch_step_size"] == 16
+    assert nodes[0]["payload"]["dynamic_batch_correction"] == 4
+    assert nodes[0]["payload"]["dynamic_batch_history_size"] == 16
 
     calls = []
 
@@ -541,7 +550,21 @@ def test_expression_and_relation_class_udfs_share_actor_resource_contract(monkey
 
     relation_payload = relation_node["payload"]
     expression_payload = expression_node["payload"]
-    for field in ("execution_backend", "actor_number", "gpus", "batch_size"):
+    for field in (
+        "execution_backend",
+        "actor_number",
+        "gpus",
+        "batch_size",
+        "dynamic_batching",
+        "dynamic_batch_size_min_rows",
+        "dynamic_batch_size_max_rows",
+        "dynamic_batch_size_initial_rows",
+        "dynamic_batch_target_latency_ms",
+        "dynamic_batch_latency_tolerance_ms",
+        "dynamic_batch_step_size",
+        "dynamic_batch_correction",
+        "dynamic_batch_history_size",
+    ):
         assert relation_payload[field] == expression_payload[field]
     assert relation_node["actor_pool_size"] == expression_node["actor_pool_size"] == 3
     assert relation_payload["call_mode"] == "map_batches"

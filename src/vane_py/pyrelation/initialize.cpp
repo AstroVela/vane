@@ -329,7 +329,9 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    "a call after failure; exactly-once execution is not provided, so external effects must be idempotent. "
 	    "Callable classes use Actor backends: "
 	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
-	    "failures may reconstruct an Actor and reset its local state.",
+	    "failures may reconstruct an Actor and reset its local state. GPU UDFs use latency-constrained dynamic "
+	    "batching; batch_size is the maximum row count rather than a fixed size, and min_task_batch_size cannot be "
+	    "combined with it.",
 	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
 	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
 	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),

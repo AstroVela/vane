@@ -29,6 +29,13 @@ namespace {
 
 constexpr idx_t DEFAULT_UDF_TARGET_MAX_BATCH_BYTES = 134217728;
 constexpr const char *UDF_TARGET_MAX_BATCH_BYTES_ENV = "VANE_UDF_TARGET_MAX_BATCH_BYTES";
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_MAX_ROWS = 128 * 1024;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_INITIAL_ROWS = 256;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_TARGET_LATENCY_MS = 5000;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_LATENCY_TOLERANCE_MS = 1000;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_STEP_SIZE = 16;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_CORRECTION = 4;
+constexpr idx_t DEFAULT_DYNAMIC_BATCH_HISTORY_SIZE = 16;
 static std::atomic<uint64_t> registered_expression_sequence {0};
 
 static Value BuildShapeValue(const vector<idx_t> &shape) {
@@ -357,9 +364,16 @@ Value BuildPythonUDFPayload(
 	auto batch_size_value = ParseOptionalPositiveIdx(batch_size, "batch_size");
 	auto output_batch_size_value = ParseOptionalPositiveIdx(output_batch_size, "output_batch_size");
 	auto min_task_batch_size_value = ParseOptionalPositiveIdx(min_task_batch_size, "min_task_batch_size");
+	const bool dynamic_batching = is_ray_backend && gpus_value.first && gpus_value.second > 0.0 && !flat_map;
+	const auto dynamic_batch_max_rows =
+	    batch_size_value.first ? batch_size_value.second : DEFAULT_DYNAMIC_BATCH_MAX_ROWS;
+	const auto dynamic_batch_initial_rows = MinValue<idx_t>(DEFAULT_DYNAMIC_BATCH_INITIAL_ROWS, dynamic_batch_max_rows);
 	const bool preserve_compute_boundaries_value =
 	    !preserve_compute_batch_boundaries.is_none() && py::cast<bool>(preserve_compute_batch_boundaries);
 	if (min_task_batch_size_value.first) {
+		if (dynamic_batching) {
+			throw InvalidInputException("min_task_batch_size is not valid for dynamically batched GPU UDFs");
+		}
 		if (!batch_size_value.first) {
 			throw InvalidInputException("min_task_batch_size requires batch_size");
 		}
@@ -432,6 +446,24 @@ Value BuildPythonUDFPayload(
 	}
 	if (batch_size_value.first) {
 		children.emplace_back("batch_size", Value::BIGINT(static_cast<int64_t>(batch_size_value.second)));
+	}
+	if (dynamic_batching) {
+		children.emplace_back("dynamic_batching", Value::BOOLEAN(true));
+		children.emplace_back("dynamic_batch_size_min_rows", Value::BIGINT(1));
+		children.emplace_back("dynamic_batch_size_max_rows",
+		                      Value::BIGINT(static_cast<int64_t>(dynamic_batch_max_rows)));
+		children.emplace_back("dynamic_batch_size_initial_rows",
+		                      Value::BIGINT(static_cast<int64_t>(dynamic_batch_initial_rows)));
+		children.emplace_back("dynamic_batch_target_latency_ms",
+		                      Value::BIGINT(static_cast<int64_t>(DEFAULT_DYNAMIC_BATCH_TARGET_LATENCY_MS)));
+		children.emplace_back("dynamic_batch_latency_tolerance_ms",
+		                      Value::BIGINT(static_cast<int64_t>(DEFAULT_DYNAMIC_BATCH_LATENCY_TOLERANCE_MS)));
+		children.emplace_back("dynamic_batch_step_size",
+		                      Value::BIGINT(static_cast<int64_t>(DEFAULT_DYNAMIC_BATCH_STEP_SIZE)));
+		children.emplace_back("dynamic_batch_correction",
+		                      Value::BIGINT(static_cast<int64_t>(DEFAULT_DYNAMIC_BATCH_CORRECTION)));
+		children.emplace_back("dynamic_batch_history_size",
+		                      Value::BIGINT(static_cast<int64_t>(DEFAULT_DYNAMIC_BATCH_HISTORY_SIZE)));
 	}
 	if (output_batch_size_value.first) {
 		children.emplace_back("output_batch_size", Value::BIGINT(static_cast<int64_t>(output_batch_size_value.second)));

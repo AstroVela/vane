@@ -10,6 +10,7 @@ Supports ``map``, ``flat_map``, ``map_batches``, and ``map_batches_rows`` modes.
 from __future__ import annotations
 
 import inspect
+import math
 import os
 from collections import deque
 from collections.abc import Iterable
@@ -444,6 +445,37 @@ class UDFExecutor:
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
             raise ValueError("UDF payload.call_mode must be one of: map_batches, map_batches_rows, flat_map, map")
+        self._execution_backend = str(payload.get("execution_backend") or "").strip().lower()
+        dynamic_batching = payload.get("dynamic_batching", False)
+        if not isinstance(dynamic_batching, bool):
+            raise ValueError("UDF payload field 'dynamic_batching' must be boolean")
+        gpus = payload.get("gpus")
+        is_positive_gpu = (
+            not isinstance(gpus, bool)
+            and isinstance(gpus, (int, float))
+            and math.isfinite(float(gpus))
+            and float(gpus) > 0.0
+        )
+        if (
+            self._call_mode in ("map_batches", "map_batches_rows")
+            and self._execution_backend in ("ray_task", "ray_actor")
+            and is_positive_gpu
+            and not dynamic_batching
+        ):
+            raise ValueError("Ray GPU batch UDF payload requires dynamic_batching=True")
+        if dynamic_batching:
+            if self._call_mode not in ("map_batches", "map_batches_rows"):
+                raise ValueError("dynamic GPU UDF batching requires a batch UDF")
+            if self._execution_backend not in ("ray_task", "ray_actor"):
+                raise ValueError("dynamic GPU UDF batching requires a Ray execution backend")
+            if (
+                isinstance(gpus, bool)
+                or not isinstance(gpus, (int, float))
+                or not math.isfinite(float(gpus))
+                or float(gpus) <= 0.0
+            ):
+                raise ValueError("dynamic GPU UDF batching requires a positive 'gpus' value")
+        self._dynamic_batching = dynamic_batching
 
         if self._call_mode == "map":
             self._init_scalar(payload, cache_callable=cache_callable, cache_max_entries=cache_max_entries)
@@ -484,9 +516,10 @@ class UDFExecutor:
         if not isinstance(preserve_compute_boundaries, bool):
             raise ValueError("UDF payload field 'preserve_compute_batch_boundaries' must be boolean")
         self._preserve_compute_batch_boundaries = preserve_compute_boundaries
-        # When C++ pre-batches input, skip Python re-batching.
-        self._prebatched_input = bool(payload.get("prebatched_input", False))
-        self._execution_backend = str(payload.get("execution_backend") or "").strip().lower()
+        # Dynamic GPU batches are sized by the C++ streaming scheduler. Treat
+        # every submitted envelope as one compute batch so the Python runtime
+        # cannot split it again using the configured maximum batch size.
+        self._prebatched_input = self._dynamic_batching or bool(payload.get("prebatched_input", False))
         can_flush_compute_tail = self._execution_backend in ("ray_task", "subprocess_task")
         self._input_batcher = (
             RuntimeInputBatcher(self._batch_size)
