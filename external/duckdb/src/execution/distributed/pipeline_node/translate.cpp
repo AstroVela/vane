@@ -416,9 +416,9 @@ physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCon
 				scan.extra_info.scan_node_id = optional_idx(next_id++);
 			}
 
-			auto tasks = MakeTableScanTasks(scan, *exec_cfg, db);
-			if (!tasks.empty()) {
-				out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(tasks));
+			auto task_set = MakeTableScanTasks(scan, *exec_cfg, db);
+			if (!task_set.tasks.empty()) {
+				out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(task_set.tasks));
 			}
 		}
 		for (auto &child : op.children) {

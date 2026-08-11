@@ -248,8 +248,8 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 	return plan;
 }
 
-std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                                   const shared_ptr<DatabaseInstance> &db) {
+TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
+                                    const shared_ptr<DatabaseInstance> &db) {
 	std::vector<ScanTaskDescriptor> tasks;
 
 	if (!scan.bind_data) {
@@ -274,7 +274,7 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 		}
 	}
 	if (files.empty()) {
-		return tasks;
+		return {std::move(tasks), true};
 	}
 	const idx_t estimated_scan_rows =
 	    scan.estimated_cardinality == DConstants::INVALID_INDEX ? 0 : scan.estimated_cardinality;
@@ -335,7 +335,7 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 		task.estimated_bytes = static_cast<idx_t>(total_file_bytes);
 		task.source_task_partition_id = 0;
 		tasks.push_back(std::move(task));
-		return tasks;
+		return {std::move(tasks), false};
 	}
 
 	size_t target_task_count = ResolveScanTaskTargetCount(files.size(), exec_cfg);
@@ -409,7 +409,7 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 		tasks.push_back(std::move(task));
 	}
 
-	return tasks;
+	return {std::move(tasks), false};
 }
 
 SchemaRef MakeTableScanSchema(const PhysicalTableScan &scan, const vector<LogicalType> &output_types) {

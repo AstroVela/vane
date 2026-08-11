@@ -19,8 +19,13 @@ namespace distributed {
 
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan);
 
-std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                                   const shared_ptr<DatabaseInstance> &db);
+struct TableScanTaskSet {
+	std::vector<ScanTaskDescriptor> tasks;
+	bool known_empty;
+};
+
+TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
+                                    const shared_ptr<DatabaseInstance> &db);
 
 SchemaRef MakeTableScanSchema(const PhysicalTableScan &scan, const vector<LogicalType> &output_types);
 
