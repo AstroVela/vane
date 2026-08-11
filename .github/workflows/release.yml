@@ -504,9 +504,53 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
           draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"
           test "$draft" = "true"
-          gh release upload "$GITHUB_REF_NAME" release-files/* --clobber
+
+          # release-supplemental is packed from two source directories, so the
+          # artifact keeps its packages/ and release-assets/ prefixes. The
+          # non-recursive release-files/* used to hand gh those directories,
+          # which it rejects only after uploading the assets ahead of them.
+          mapfile -t assets < <(find release-files -type f -print | sort)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "::error::no regular files found under release-files/"
+            exit 1
+          fi
+
+          # Release assets are a flat namespace keyed by basename; the tree
+          # being flattened is not. Same-named files in different directories
+          # would overwrite each other under --clobber and publish a release
+          # quietly missing an asset.
+          if duplicates="$(printf '%s\n' "${assets[@]}" | xargs -n1 basename | sort | uniq -d)" \
+             && [[ -n "$duplicates" ]]; then
+            echo "::error::asset basenames collide, refusing to upload:"
+            printf '::error::  %s\n' $duplicates
+            exit 1
+          fi
+
+          echo "attaching ${#assets[@]} asset(s):"
+          printf '  %s\n' "${assets[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+
+      - name: Verify every asset reached the draft release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          find release-files -type f -printf '%f\n' | sort > local-assets.txt
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort > remote-assets.txt
+
+          if missing="$(comm -23 local-assets.txt remote-assets.txt)" && [[ -n "$missing" ]]; then
+            echo "::error::assets missing from the draft release after upload:"
+            printf '::error::  %s\n' $missing
+            exit 1
+          fi
+
+          echo "verified $(wc -l < local-assets.txt) asset(s) on the draft release"
 
       - name: Publish the complete draft release
         env:
