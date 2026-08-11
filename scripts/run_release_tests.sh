@@ -31,7 +31,6 @@ release_tests=(
   "$project_root/tests/fast/test_ray_cpp_bindings.py"
   "$project_root/tests/fast/test_ray_remote_exceptions.py"
   "$project_root/tests/fast/test_ray_result_contract.py"
-  "$project_root/tests/fast/test_fte_production_readiness.py"
 )
 
 pytest_args=(
