@@ -1680,6 +1680,9 @@ class RayQueryDriverActor:
         from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 
         self._duckdb_conn = vane.connect()
+        # Transported snapshots are authoritative and must not merge with
+        # persistent secrets from the query-driver host.
+        self._duckdb_conn.execute("SET allow_persistent_secrets=false")
         _apply_duckdb_thread_setting(self._duckdb_conn)
         apply_duckdb_memory_limit(self._duckdb_conn, self._driver_duckdb_memory_bytes)
         return self._duckdb_conn

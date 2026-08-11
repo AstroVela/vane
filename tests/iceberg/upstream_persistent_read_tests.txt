@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# All self-contained, non-Catalog local read tests from duckdb-iceberg at the
+# revision pinned by external/duckdb/.github/config/extensions/iceberg.cmake.
+# The runner compares this manifest with upstream discovery so tests cannot
+# silently disappear behind a new require-env directive.
+local/case_sensitive_names.test
+local/column_mapping.test
+local/column_mapping_delete.test
+local/equality_deletes.test
+local/iceberg_scans/big_query_read.test
+local/iceberg_scans/iceberg_column_stats.test
+local/iceberg_scans/iceberg_metadata.test
+local/iceberg_scans/iceberg_partition_stats.test
+local/iceberg_scans/uuid_type.test
+local/initial_default_all_types.test
+local/initial_default_in_struct_all_types.test
+local/moved_positional_delete_path.test
+local/partitioning/foldable_expression_filter.test
+local/partitioning/identity/identity_bigint.test
+local/partitioning/identity/identity_binary.test
+local/partitioning/identity/identity_bool.test
+local/partitioning/identity/identity_date_and_string.test
+local/partitioning/identity/identity_decimal_bigint.test
+local/partitioning/identity/identity_decimal_hugeint.test
+local/partitioning/identity/identity_decimal_integer.test
+local/partitioning/identity/identity_decimal_smallint.test
+local/partitioning/identity/identity_double.test
+local/partitioning/identity/identity_fixed_length_binary.test
+local/partitioning/identity/identity_float.test
+local/partitioning/identity/identity_integer.test
+local/partitioning/identity/identity_time.test
+local/partitioning/identity/identity_timestamp.test
+local/partitioning/identity/identity_timestamptz.test
+local/partitioning/in_filter.test
+local/struct_filter_issue.test
+local/test_custom_write_paths.test
+local/test_iceberg_deletes_scan_does_not_exist.test
+local/unknown_puffin.test
+local/version_name_format_error.test

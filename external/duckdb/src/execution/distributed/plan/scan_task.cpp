@@ -9,7 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/execution/distributed/plan/scan_task.hpp"
-#include "duckdb/function/extension_file_list_provider.hpp"
+#include "duckdb/function/extension_scan_task_provider.hpp"
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
@@ -271,31 +271,24 @@ static bool ApplyScanTasksToOperator(PhysicalOperator &op, const std::unordered_
 			} else if (!scan.bind_data) {
 				stats.missing_bind++;
 			} else {
+				auto provider = TryGetExtensionScanTaskProvider(*scan.bind_data);
 				auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
-				if (!multi_bind) {
-					auto *ext_provider = dynamic_cast<ExtensionFileListProvider *>(scan.bind_data.get());
-					if (ext_provider) {
-						vector<string> paths;
-						paths.reserve(it->second.files.size());
-						for (auto &f : it->second.files) {
-							paths.push_back(f.path);
-						}
-						ext_provider->SetFileList(paths);
-						const idx_t file_count = it->second.file_count();
-						scan.extra_info.total_files = optional_idx(file_count);
-						scan.extra_info.filtered_files = optional_idx(file_count);
-						stats.applied++;
-						applied_any = true;
-					} else {
-						stats.non_multi_bind++;
-					}
-				} else {
+				if (provider) {
+					provider->SetScanTasks(it->second.files);
+					const idx_t file_count = it->second.file_count();
+					scan.extra_info.total_files = optional_idx(file_count);
+					scan.extra_info.filtered_files = optional_idx(file_count);
+					stats.applied++;
+					applied_any = true;
+				} else if (multi_bind) {
 					multi_bind->file_list = duckdb::make_shared_ptr<SimpleMultiFileList>(it->second.files);
 					const idx_t file_count = it->second.file_count();
 					scan.extra_info.total_files = optional_idx(file_count);
 					scan.extra_info.filtered_files = optional_idx(file_count);
 					stats.applied++;
 					applied_any = true;
+				} else {
+					stats.non_multi_bind++;
 				}
 			}
 		}
@@ -457,29 +450,23 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 					}
 					return false;
 				}
+				auto provider = TryGetExtensionScanTaskProvider(*scan.bind_data);
 				auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
-				if (!multi_bind) {
-					auto *ext_provider = dynamic_cast<ExtensionFileListProvider *>(scan.bind_data.get());
-					if (!ext_provider) {
-						if (error) {
-							*error = "FTE dynamic scan source currently requires MultiFileBindData or "
-							         "ExtensionFileListProvider for scan_node_id=" +
-							         std::to_string(node_id);
-						}
-						return false;
-					}
+				if (provider) {
 					FteDynamicScanFileList dynamic_files(entry->second);
 					auto files = dynamic_files.GetAllFiles();
-					vector<string> paths;
-					paths.reserve(files.size());
-					for (auto &file : files) {
-						paths.push_back(file.path);
-					}
-					ext_provider->SetFileList(paths);
+					provider->SetScanTasks(files);
 					const idx_t file_count = files.size();
 					scan.extra_info.total_files = optional_idx(file_count);
 					scan.extra_info.filtered_files = optional_idx(file_count);
 					applied++;
+				} else if (!multi_bind) {
+					if (error) {
+						*error = "FTE dynamic scan source currently requires MultiFileBindData or "
+						         "ExtensionScanTaskProvider for scan_node_id=" +
+						         std::to_string(node_id);
+					}
+					return false;
 				} else {
 					multi_bind->file_list = make_shared_ptr<FteDynamicScanFileList>(entry->second);
 					scan.extra_info.total_files = optional_idx();

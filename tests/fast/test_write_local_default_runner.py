@@ -34,6 +34,29 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
     assert not target.exists()
 
 
+def test_insert_into_with_ray_runner_dispatches_write_without_local_execution(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    import vane
+
+    calls = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            calls.append(relation)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.sql("SELECT 42 AS value").insert_into("target")
+
+    assert len(calls) == 1
+    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
+
+
 def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp_path, monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     import vane

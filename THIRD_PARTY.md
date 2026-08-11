@@ -8,16 +8,22 @@ This document describes third-party code distributed in Vane source or binary ar
 | --- | --- | --- | --- |
 | DuckDB and DuckDB Python | Core SQL engine, Python API, and the base for Vane's engine modifications | MIT | `LICENSES/DuckDB-MIT.txt` and `external/duckdb/LICENSE` |
 | DuckDB HTTPFS | Statically linked HTTP/S3 filesystem extension, fetched at the pinned revision in `external/duckdb/.github/config/extensions/httpfs.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
+| DuckDB Avro | Statically linked Avro reader/writer required by Iceberg manifests, fetched at the pinned revision in `external/duckdb/.github/config/extensions/avro.cmake` | MIT | `LICENSES/DuckDB-MIT.txt` |
+| DuckDB Iceberg | Statically linked Iceberg scan/catalog extension with the Vane patch recorded in `SOURCE_PROVENANCE.md` | MIT | `LICENSES/DuckDB-MIT.txt` |
 | ALP and ALP-RD compression algorithms | Compression implementation retained in the DuckDB source tree | MIT | `external/duckdb/src/include/duckdb/storage/compression/alp/algorithm/LICENSE` and the corresponding `alprd` path |
 | Spark-compatible Python API | Compatibility layer retained from DuckDB Python | Apache-2.0 | `vane/experimental/spark/LICENSE` |
 
 Vane is not affiliated with, endorsed by, or maintained by the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.
 
+Digest-pinned MinIO and Apache Iceberg REST fixture containers are used only by
+hermetic integration tests and are not distributed in Vane artifacts. Their
+runtime source records are documented in `SOURCE_PROVENANCE.md`.
+
 ## Vendored native dependencies
 
 DuckDB vendors permissively licensed native libraries below `external/duckdb/third_party/` and selected extensions below `external/duckdb/extension/`. Their license files are preserved in those directories and included in Python release metadata.
 
-The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `jemalloc`, `json`, and `parquet` extensions. In particular, release artifacts exclude:
+The release allowlist includes only dependencies needed by the core engine and the `core_functions`, `icu`, `jemalloc`, `json`, and `parquet` extensions, plus the pinned external `httpfs`, `avro`, and `iceberg` extension build inputs. In particular, release artifacts exclude:
 
 - `external/duckdb/extension/tpch/`
 - `external/duckdb/extension/tpcds/`
@@ -34,7 +40,10 @@ machinery and are not linked into or shipped with Vane. Zstandard is used under
 the permissive BSD option in its dual-license grant; its upstream record is
 reproduced without alteration.
 
-The direct native build dependencies are Apache Arrow (including Flight), cURL, gflags, glog, gRPC, OpenSSL, and their transitive dependencies. Their individual terms and notices are reproduced in the generated bundle.
+The direct native build dependencies are Apache Arrow (including Flight),
+DuckDB's Apache-2.0 `duckdb-avro-c` fork, the AWS SDK for C++, CRoaring,
+cURL, gflags, glog, gRPC, OpenSSL, and their transitive dependencies. Their
+individual terms and notices are reproduced in the generated bundle.
 
 ## Runtime dependencies
 

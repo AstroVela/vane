@@ -42,6 +42,9 @@ class MetaPipeline;
 class PhysicalPlan;
 class Serializer;
 class Deserializer;
+namespace distributed {
+class ExtensionWriteTaskProvider;
+}
 
 enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED };
 
@@ -95,6 +98,13 @@ public:
 	virtual string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const;
 	void Print() const;
 	virtual vector<const_reference<PhysicalOperator>> GetChildren() const;
+
+	//! Optional coordinator-side contract for distributed extension writes.
+	//! The default keeps ordinary and unsupported extension operators out of the
+	//! distributed write path.
+	virtual optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() {
+		return nullptr;
+	}
 
 	//! Return a vector of the types that will be returned by this operator
 	const vector<LogicalType> &GetTypes() const {

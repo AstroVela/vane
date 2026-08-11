@@ -66,6 +66,12 @@ The build uses two parallel compile jobs by default to stay within standard CI
 runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
 machine has more capacity.
 
+Statically linked DuckDB extensions participate in Ray execution through the
+explicit scan and write provider contracts described in
+[DISTRIBUTED_EXTENSIONS.md](DISTRIBUTED_EXTENSIONS.md). Add engine-level
+protocol tests and extension-specific normal and fault-tolerant tests when
+implementing either contract.
+
 ## Python tests
 
 The required release gate covers the supported base installation and does not
@@ -115,6 +121,31 @@ Run them explicitly when the required service and credentials are available:
 ```bash
 scripts/run_installed_pytest.sh -m external_service tests/fast
 ```
+
+Iceberg has three additional production gates. The first builds DuckDB's native
+SQLLogicTest runner and executes the reviewed self-contained read suite from the
+pinned `duckdb-iceberg` source. The second provisions the digest-pinned MinIO
+container and executes the distributed fixture matrix through real Ray workers
+and `s3://` paths. The third provisions digest-pinned Iceberg REST Catalog and
+MinIO containers, binds a real Catalog table, commits a newer snapshot, stops
+the Catalog, and requires the previously bound snapshot to execute in fresh Ray
+worker processes:
+
+```bash
+scripts/run_iceberg_compat_tests.sh
+scripts/run_iceberg_minio_tests.sh
+scripts/run_iceberg_rest_tests.sh
+```
+
+The compatibility gate requires the incremental package build's pinned
+extension source directories and the bootstrapped vcpkg installation. Set
+`VCPKG_INSTALLED_DIR` when dependencies are shared by multiple worktrees.
+The REST gate provisions tables on the coordinator, exercises append-only
+distributed `INSERT INTO` through real Ray workers, verifies the committed
+snapshot from a fresh Catalog attachment, and covers worker failure, rejected
+Catalog commit, successful Catalog commit with a lost response, and
+post-Catalog marker-publication failure boundaries. It also separately tests
+snapshot-pinned distributed reads after the Catalog stops.
 
 Other optional tests may require network access, model weights, GPUs, credentials, or a local Ray setup. Tests must
 skip with a clear reason when an optional environment is absent; they must not silently use a maintainer's local

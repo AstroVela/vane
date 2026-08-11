@@ -1,0 +1,430 @@
+diff --git a/src/iceberg_functions/iceberg_multi_file_list.cpp b/src/iceberg_functions/iceberg_multi_file_list.cpp
+index 02a3b3d3..5aca1bfb 100644
+--- a/src/iceberg_functions/iceberg_multi_file_list.cpp
++++ b/src/iceberg_functions/iceberg_multi_file_list.cpp
+@@ -23,6 +23,8 @@
+ #include "metadata/iceberg_predicate_stats.hpp"
+ #include "metadata/iceberg_table_metadata.hpp"
+ 
++#include <algorithm>
++
+ namespace duckdb {
+ 
+ namespace {
+@@ -87,15 +89,36 @@ private:
+ } // namespace
+ 
+ IcebergMultiFileList::IcebergMultiFileList(ClientContext &context_p, shared_ptr<IcebergScanInfo> scan_info,
+-                                           const string &path, const IcebergOptions &options)
+-    : context(context_p), fs(FileSystem::GetFileSystem(context)), scan_info(scan_info), path(path), table(nullptr),
+-      finished(false), has_buffered_entries(false), options(options) {
++                                           const string &path, shared_ptr<IcebergOptions> options_owner_p)
++    : context_owner(context_p.shared_from_this()), context(*context_owner), fs(FileSystem::GetFileSystem(context)),
++      scan_info(scan_info), path(path), table(nullptr), finished(false), has_buffered_entries(false),
++      options_owner(std::move(options_owner_p)), options(*options_owner) {
+ }
+ 
+ IcebergMultiFileList::~IcebergMultiFileList() {
+-	lock_guard<mutex> guard(lock);
+-	//! FIXME: this could throw, if the tasks encountered an error
+-	FinishScanTasks(guard);
++	auto finish_tasks_no_throw = [&]() {
++		try {
++			lock_guard<mutex> guard(lock);
++			FinishScanTasks(guard);
++		} catch (std::exception &ex) {
++			ErrorData data(ex);
++			try {
++				DUCKDB_LOG_ERROR(context, "IcebergMultiFileList::~IcebergMultiFileList()\t\t" + data.Message());
++			} catch (...) { // NOLINT
++			}
++		} catch (...) { // NOLINT
++		}
++	};
++	try {
++		if (context.transaction.HasActiveTransaction()) {
++			finish_tasks_no_throw();
++		} else {
++			// Swallow task errors inside the callback. Letting an INTERNAL error
++			// escape RunFunctionInTransaction invalidates the entire database.
++			context.RunFunctionInTransaction(finish_tasks_no_throw);
++		}
++	} catch (...) { // NOLINT
++	}
+ }
+ 
+ string IcebergMultiFileList::ToDuckDBPath(const string &raw_path) {
+@@ -173,7 +196,19 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
+ 		D_ASSERT(!path.empty());
+ 		auto input_string = path;
+ 		auto iceberg_path = IcebergUtils::GetStorageLocation(context, input_string);
+-		auto iceberg_meta_path = IcebergTableMetadata::GetMetaDataPath(context, iceberg_path, fs, options);
++		string iceberg_meta_path;
++		if (options.vane_distributed_worker) {
++			if (options.vane_metadata_path.empty()) {
++				throw InvalidConfigurationException(
++				    "Distributed Iceberg worker bind requires the metadata JSON selected during planning");
++			}
++			iceberg_meta_path = options.vane_metadata_path;
++		} else {
++			if (!options.vane_metadata_path.empty()) {
++				throw InvalidInputException("'_vane_metadata_path' is reserved for distributed worker binds");
++			}
++			iceberg_meta_path = IcebergTableMetadata::GetMetaDataPath(context, iceberg_path, fs, options);
++		}
+ 		auto table_metadata = IcebergTableMetadata::Parse(iceberg_meta_path, fs, options.metadata_compression_codec);
+ 
+ 		auto temp_data = make_uniq<IcebergScanTemporaryData>();
+@@ -187,7 +222,7 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
+ 		} else {
+ 			schema = metadata.GetSchemaFromId(found_snapshot->schema_id);
+ 		}
+-		scan_info = make_shared_ptr<IcebergScanInfo>(iceberg_path, std::move(temp_data), found_snapshot, *schema);
++		scan_info = make_shared_ptr<IcebergScanInfo>(iceberg_meta_path, std::move(temp_data), found_snapshot, *schema);
+ 	}
+ 
+ 	if (!initialized) {
+@@ -212,7 +247,13 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
+ 
+ unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientContext &context,
+                                                                         TableFilterSet &new_filters) const {
+-	auto filtered_list = make_uniq<IcebergMultiFileList>(context, scan_info, path, this->options);
++	// A pushed-down list replaces this list for execution. Finish any manifest
++	// tasks owned by the old list while its client context is still valid.
++	{
++		lock_guard<mutex> guard(lock);
++		FinishScanTasks(guard);
++	}
++	auto filtered_list = make_uniq<IcebergMultiFileList>(context, scan_info, path, options_owner);
+ 
+ 	TableFilterSet result_filter_set;
+ 
+@@ -232,6 +273,8 @@ unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientCo
+ 	filtered_list->names = names;
+ 	filtered_list->types = types;
+ 	filtered_list->have_bound = true;
++	filtered_list->distributed_task_filter_enabled = distributed_task_filter_enabled;
++	filtered_list->distributed_task_paths = distributed_task_paths;
+ 	return filtered_list;
+ }
+ 
+@@ -286,14 +329,85 @@ unique_ptr<MultiFileList> IcebergMultiFileList::ComplexFilterPushdown(ClientCont
+ 
+ vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
+ 	vector<OpenFileInfo> file_list;
+-	//! Lock is required because it reads the 'manifest_entries' vector
+ 	lock_guard<mutex> guard(lock);
+-	for (idx_t i = 0; i < manifest_entries.size(); i++) {
+-		file_list.push_back(GetFileInternal(i, guard));
++	for (idx_t i = 0;; i++) {
++		auto file = GetFileInternal(i, guard);
++		if (file.path.empty()) {
++			break;
++		}
++		file_list.push_back(std::move(file));
+ 	}
+ 	return file_list;
+ }
+ 
++unique_ptr<MultiFileList> IcebergMultiFileList::Copy() const {
++	auto result = make_uniq<IcebergMultiFileList>(context, scan_info, path, options_owner);
++	result->table = table;
++	result->have_bound = have_bound;
++	result->names = names;
++	result->types = types;
++	for (auto &entry : table_filters.filters) {
++		result->table_filters.PushFilter(ColumnIndex(entry.first), entry.second->Copy());
++	}
++	result->distributed_task_filter_enabled = distributed_task_filter_enabled;
++	result->distributed_task_paths = distributed_task_paths;
++	return std::move(result);
++}
++
++vector<OpenFileInfo> IcebergMultiFileList::GetScanTasks() const {
++	return GetAllFiles();
++}
++
++optional_idx IcebergMultiFileList::GetScanTaskEstimatedBytes(const OpenFileInfo &task) const {
++	if (!task.extended_info) {
++		return optional_idx();
++	}
++	auto entry = task.extended_info->options.find("file_size");
++	if (entry == task.extended_info->options.end() || entry->second.IsNull()) {
++		return optional_idx();
++	}
++	return optional_idx(entry->second.GetValue<uint64_t>());
++}
++
++void IcebergMultiFileList::SetScanTasks(const vector<OpenFileInfo> &tasks) {
++	lock_guard<mutex> guard(lock);
++	distributed_task_filter_enabled = true;
++	distributed_task_paths.clear();
++	for (auto &task : tasks) {
++		distributed_task_paths.insert(task.path);
++	}
++	manifest_entries.erase(std::remove_if(manifest_entries.begin(), manifest_entries.end(),
++	                                      [&](const IcebergManifestEntry &entry) {
++		                                      return distributed_task_paths.find(ResolveDataFilePath(
++		                                                 entry.data_file.file_path)) == distributed_task_paths.end();
++	                                      }),
++	                       manifest_entries.end());
++}
++
++void IcebergMultiFileList::PrepareWorkerBind(vector<Value> &parameters, named_parameter_map_t &named_parameters) const {
++	if (!scan_info || scan_info->metadata_path.empty()) {
++		throw InvalidConfigurationException(
++		    "Distributed Iceberg planning did not resolve an immutable metadata JSON path");
++	}
++	if (HasTransactionData()) {
++		throw NotImplementedException("Distributed Iceberg scans do not support uncommitted transaction data");
++	}
++	parameters.clear();
++	parameters.emplace_back(path);
++	named_parameters["_vane_distributed_worker"] = Value::BOOLEAN(true);
++	// Rebind the exact metadata JSON selected during planning. Resolving a
++	// version hint again on a worker can select a newer, uncommitted table
++	// state and is unnecessary metadata I/O for every task attempt.
++	named_parameters["_vane_metadata_path"] = Value(scan_info->metadata_path);
++	auto snapshot = GetSnapshot();
++	if (!snapshot) {
++		return;
++	}
++	named_parameters.erase("snapshot_from_timestamp");
++	named_parameters.erase("snapshot_from_id");
++	named_parameters["snapshot_from_id"] = Value::UBIGINT(static_cast<uint64_t>(snapshot->snapshot_id));
++}
++
+ FileExpandResult IcebergMultiFileList::GetExpandResult() const {
+ 	// GetFileInternal(1) will ensure files with index 0 and index 1 are expanded if they are available
+ 	lock_guard<mutex> guard(lock);
+@@ -533,7 +647,9 @@ bool IcebergMultiFileList::PopulateEntryBuffer(lock_guard<mutex> &guard) const {
+ 	}
+ 	auto &scheduler = TaskScheduler::GetScheduler(context);
+ 	auto worker_thread_count = scheduler.NumberOfThreads();
+-	if (worker_thread_count == 0) {
++	if (options.vane_distributed_worker || distributed_task_filter_enabled || worker_thread_count == 0) {
++		// Distributed workers own a bounded task subset. Read manifests on the
++		// query thread so metadata I/O cannot outlive its catalog transaction.
+ 		//! NOTE: no 'entry_lock' needed here because there are no concurrent tasks
+ 		(void)data_manifest_reader->Read(STANDARD_VECTOR_SIZE, current_manifest_entries);
+ 		return !current_manifest_entries.empty();
+@@ -609,6 +725,11 @@ optional_ptr<const IcebergManifestEntry> IcebergMultiFileList::GetDataFile(idx_t
+ 				continue;
+ 			}
+ 
++			if (distributed_task_filter_enabled &&
++			    distributed_task_paths.find(ResolveDataFilePath(data_file.file_path)) == distributed_task_paths.end()) {
++				continue;
++			}
++
+ 			manifest_entries.push_back(std::move(manifest_entry));
+ 			break;
+ 		}
+@@ -640,12 +761,7 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
+ 		                              data_file.file_format);
+ 	}
+ 
+-	string file_path = path;
+-	if (options.allow_moved_paths) {
+-		auto iceberg_path = GetPath();
+-		auto &fs = FileSystem::GetFileSystem(context);
+-		file_path = IcebergUtils::GetFullPath(iceberg_path, path, fs);
+-	}
++	string file_path = ResolveDataFilePath(path);
+ 	OpenFileInfo res(file_path);
+ 	auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+ 	extended_info->options["file_size"] = Value::UBIGINT(data_file.file_size_in_bytes);
+@@ -662,6 +778,15 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
+ 	return res;
+ }
+ 
++string IcebergMultiFileList::ResolveDataFilePath(const string &path) const {
++	if (!options.allow_moved_paths) {
++		return path;
++	}
++	auto iceberg_path = GetPath();
++	auto &fs = FileSystem::GetFileSystem(context);
++	return IcebergUtils::GetFullPath(iceberg_path, path, fs);
++}
++
+ OpenFileInfo IcebergMultiFileList::GetFile(idx_t file_id) const {
+ 	lock_guard<mutex> guard(lock);
+ 	return GetFileInternal(file_id, guard);
+@@ -822,7 +947,9 @@ void IcebergMultiFileList::InitializeFiles(lock_guard<mutex> &guard) const {
+ 
+ 		auto &scheduler = TaskScheduler::GetScheduler(context);
+ 		auto &executor = manifest_read_state->executor;
+-		auto num_threads = MinValue<idx_t>(scheduler.NumberOfThreads(), data_manifests.size());
++		auto num_threads = options.vane_distributed_worker || distributed_task_filter_enabled
++		                       ? 0
++		                       : MinValue<idx_t>(scheduler.NumberOfThreads(), data_manifests.size());
+ 		manifest_read_state->in_progress_tasks = num_threads;
+ 		for (idx_t i = 0; i < num_threads; i++) {
+ 			executor.ScheduleTask(make_uniq<ManifestReadTask>(*manifest_read_state));
+diff --git a/src/iceberg_functions/iceberg_multi_file_reader.cpp b/src/iceberg_functions/iceberg_multi_file_reader.cpp
+index 7c77d3fd..eaf898ac 100644
+--- a/src/iceberg_functions/iceberg_multi_file_reader.cpp
++++ b/src/iceberg_functions/iceberg_multi_file_reader.cpp
+@@ -23,7 +23,7 @@
+ namespace duckdb {
+ 
+ IcebergMultiFileReader::IcebergMultiFileReader(shared_ptr<TableFunctionInfo> function_info)
+-    : function_info(function_info) {
++    : function_info(function_info), options_owner(make_shared_ptr<IcebergOptions>()), options(*options_owner) {
+ 	row_id_column = make_uniq<MultiFileColumnDefinition>("_row_id", LogicalType::BIGINT);
+ 	row_id_column->identifier = Value::INTEGER(MultiFileReader::ROW_ID_FIELD_ID);
+ 	last_updated_sequence_number_column =
+@@ -43,7 +43,7 @@ shared_ptr<MultiFileList> IcebergMultiFileReader::CreateFileList(ClientContext &
+ 
+ 	//! Scan initiated from a REST Catalog
+ 	auto scan_info = shared_ptr_cast<TableFunctionInfo, IcebergScanInfo>(function_info);
+-	return make_shared_ptr<IcebergMultiFileList>(context, scan_info, paths[0], options);
++	return make_shared_ptr<IcebergMultiFileList>(context, scan_info, paths[0], options_owner);
+ }
+ 
+ static MultiFileColumnDefinition TransformColumn(const IcebergColumnDefinition &input) {
+@@ -445,6 +445,14 @@ bool IcebergMultiFileReader::ParseOption(const string &key, const Value &val, Mu
+ 		this->options.allow_moved_paths = BooleanValue::Get(val);
+ 		return true;
+ 	}
++	if (loption == "_vane_distributed_worker") {
++		this->options.vane_distributed_worker = BooleanValue::Get(val);
++		return true;
++	}
++	if (loption == "_vane_metadata_path") {
++		this->options.vane_metadata_path = StringValue::Get(val);
++		return true;
++	}
+ 	if (loption == "metadata_compression_codec") {
+ 		this->options.metadata_compression_codec = StringValue::Get(val);
+ 		return true;
+diff --git a/src/iceberg_functions/iceberg_scan.cpp b/src/iceberg_functions/iceberg_scan.cpp
+index 19b98f42..204838ff 100644
+--- a/src/iceberg_functions/iceberg_scan.cpp
++++ b/src/iceberg_functions/iceberg_scan.cpp
+@@ -39,6 +39,8 @@ static void AddNamedParameters(TableFunction &fun) {
+ 	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
+ 	fun.named_parameters["snapshot_from_timestamp"] = LogicalType::TIMESTAMP;
+ 	fun.named_parameters["snapshot_from_id"] = LogicalType::UBIGINT;
++	fun.named_parameters["_vane_distributed_worker"] = LogicalType::BOOLEAN;
++	fun.named_parameters["_vane_metadata_path"] = LogicalType::VARCHAR;
+ }
+ 
+ virtual_column_map_t IcebergVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+diff --git a/src/include/iceberg_multi_file_list.hpp b/src/include/iceberg_multi_file_list.hpp
+index 62b71d18..afe1f470 100644
+--- a/src/include/iceberg_multi_file_list.hpp
++++ b/src/include/iceberg_multi_file_list.hpp
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "duckdb/common/multi_file/multi_file_list.hpp"
++#include "duckdb/function/extension_scan_task_provider.hpp"
+ #include "duckdb/common/types/batched_data_collection.hpp"
+ #include "storage/iceberg_metadata_info.hpp"
+ #include "iceberg_metadata.hpp"
+@@ -27,6 +28,7 @@
+ #include "deletes/iceberg_delete_data.hpp"
+ #include "avro_scan.hpp"
+ #include "duckdb/parallel/task_executor.hpp"
++#include "duckdb/common/unordered_set.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -49,10 +51,10 @@ public:
+ 
+ enum class IcebergDataFileType : uint8_t { DATA, DELETE };
+ 
+-struct IcebergMultiFileList : public MultiFileList {
++struct IcebergMultiFileList : public MultiFileList, public ExtensionScanTaskProvider {
+ public:
+ 	IcebergMultiFileList(ClientContext &context, shared_ptr<IcebergScanInfo> scan_info, const string &path,
+-	                     const IcebergOptions &options);
++	                     shared_ptr<IcebergOptions> options_owner);
+ 	virtual ~IcebergMultiFileList() override;
+ 
+ public:
+@@ -92,6 +94,13 @@ public:
+ 	FileExpandResult GetExpandResult() const override;
+ 	idx_t GetTotalFileCount() const override;
+ 	unique_ptr<NodeStatistics> GetCardinality(ClientContext &context) const override;
++	unique_ptr<MultiFileList> Copy() const override;
++
++	//! Vane distributed extension API
++	vector<OpenFileInfo> GetScanTasks() const override;
++	optional_idx GetScanTaskEstimatedBytes(const OpenFileInfo &task) const override;
++	void SetScanTasks(const vector<OpenFileInfo> &tasks) override;
++	void PrepareWorkerBind(vector<Value> &parameters, named_parameter_map_t &named_parameters) const override;
+ 
+ protected:
+ 	//! Get the i-th expanded file
+@@ -109,12 +118,16 @@ protected:
+ 
+ 	optional_ptr<const TableFilter> GetFilterForColumnIndex(const TableFilterSet &filter_set,
+ 	                                                        const ColumnIndex &column_index) const;
++	string ResolveDataFilePath(const string &path) const;
+ 
+ private:
+ 	bool PopulateEntryBuffer(lock_guard<mutex> &guard) const;
+ 	void FinishScanTasks(lock_guard<mutex> &guard) const;
+ 
+ public:
++	//! Manifest readers can run on scheduler threads after planning returns to
++	//! the caller. Keep their client context alive for the lifetime of the list.
++	shared_ptr<ClientContext> context_owner;
+ 	ClientContext &context;
+ 	FileSystem &fs;
+ 	shared_ptr<IcebergScanInfo> scan_info;
+@@ -159,7 +172,10 @@ public:
+ 	mutable mutex delete_lock;
+ 
+ 	mutable bool initialized = false;
+-	const IcebergOptions &options;
++	shared_ptr<IcebergOptions> options_owner;
++	IcebergOptions &options;
++	bool distributed_task_filter_enabled = false;
++	unordered_set<string> distributed_task_paths;
+ };
+ 
+ } // namespace duckdb
+diff --git a/src/include/iceberg_multi_file_reader.hpp b/src/include/iceberg_multi_file_reader.hpp
+index 4acc14ba..ff48e5cd 100644
+--- a/src/include/iceberg_multi_file_reader.hpp
++++ b/src/include/iceberg_multi_file_reader.hpp
+@@ -73,7 +73,8 @@ public:
+ 
+ public:
+ 	shared_ptr<TableFunctionInfo> function_info;
+-	IcebergOptions options;
++	shared_ptr<IcebergOptions> options_owner;
++	IcebergOptions &options;
+ 
+ private:
+ 	unique_ptr<MultiFileColumnDefinition> row_id_column;
+diff --git a/src/include/iceberg_options.hpp b/src/include/iceberg_options.hpp
+index f1878870..69e8237c 100644
+--- a/src/include/iceberg_options.hpp
++++ b/src/include/iceberg_options.hpp
+@@ -46,6 +46,8 @@ struct IcebergOptions {
+ 	bool infer_schema = true;
+ 	string table_version = DEFAULT_TABLE_VERSION;
+ 	string version_name_format = DEFAULT_TABLE_VERSION_FORMAT;
++	bool vane_distributed_worker = false;
++	string vane_metadata_path;
+ 
+ 	IcebergSnapshotLookup snapshot_lookup;
+ };
+diff --git a/src/storage/catalog/iceberg_table_entry.cpp b/src/storage/catalog/iceberg_table_entry.cpp
+index cfc80dd2..0edc043c 100644
+--- a/src/storage/catalog/iceberg_table_entry.cpp
++++ b/src/storage/catalog/iceberg_table_entry.cpp
+@@ -208,7 +208,8 @@ TableFunction IcebergTableEntry::GetScanFunction(ClientContext &context, unique_
+ 	}
+ 
+ 	auto iceberg_schema = metadata.GetSchemaFromId(schema_id);
+-	auto scan_info = make_shared_ptr<IcebergScanInfo>(metadata.GetMetadataPath(), metadata, snapshot, *iceberg_schema);
++	auto scan_info =
++	    make_shared_ptr<IcebergScanInfo>(metadata.GetLatestMetadataJson(), metadata, snapshot, *iceberg_schema);
+ 	if (table_info.transaction_data) {
+ 		scan_info->transaction_data = table_info.transaction_data.get();
+ 	}

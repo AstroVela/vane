@@ -1,0 +1,181 @@
+diff --git a/src/include/storage/iceberg_insert.hpp b/src/include/storage/iceberg_insert.hpp
+index 027f12bf..e1044c67 100644
+--- a/src/include/storage/iceberg_insert.hpp
++++ b/src/include/storage/iceberg_insert.hpp
+@@ -11,6 +11,7 @@
+ #include "duckdb/execution/physical_plan_generator.hpp"
+ #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+ #include "duckdb/execution/physical_operator.hpp"
++#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+ #include "duckdb/common/index_vector.hpp"
+ #include "storage/catalog/iceberg_table_entry.hpp"
+ #include "storage/catalog/iceberg_schema_entry.hpp"
+@@ -71,7 +72,7 @@ private:
+ 	unique_ptr<BaseStatistics> CreateStringStats() const;
+ };
+ 
+-class IcebergInsert : public PhysicalOperator {
++class IcebergInsert : public PhysicalOperator, public distributed::ExtensionWriteTaskProvider {
+ public:
+ 	//! INSERT INTO
+ 	IcebergInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
+@@ -92,6 +93,9 @@ public:
+ 	physical_index_vector_t<idx_t> column_index_map;
+ 	//! The physical copy used internally by this insert
+ 	unique_ptr<PhysicalOperator> physical_copy_to_file;
++	//! CREATE TABLE AS is intentionally outside Vane's first distributed
++	//! Iceberg write contract.
++	bool create_table_as = false;
+ 
+ public:
+ 	// Source interface
+@@ -118,6 +122,16 @@ public:
+ 	                                           ClientContext &context);
+ 	static void AddWrittenFiles(IcebergInsertGlobalState &global_state, DataChunk &chunk,
+ 	                            optional_ptr<TableCatalogEntry> table);
++	static void FinalizeWrittenFiles(IcebergInsertGlobalState &global_state, ClientContext &context,
++	                                 optional_ptr<TableCatalogEntry> table);
++
++	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
++		return this;
++	}
++	string ExtensionWriteName() const override;
++	void ValidateExtensionWrite(ClientContext &context) const override;
++	idx_t FinalizeExtensionWrite(ClientContext &context,
++	                             const vector<distributed::DistributedCopyFileInfo> &files) const override;
+ 
+ 	bool IsSink() const override {
+ 		return true;
+diff --git a/src/include/storage/iceberg_transaction.hpp b/src/include/storage/iceberg_transaction.hpp
+index 511f1490..9763070e 100644
+--- a/src/include/storage/iceberg_transaction.hpp
++++ b/src/include/storage/iceberg_transaction.hpp
+@@ -53,6 +53,7 @@ public:
+ 	void RecordTableRequest(const string &table_key, idx_t sequence_number, idx_t snapshot_id);
+ 	void RecordTableRequest(const string &table_key);
+ 	TableInfoCache GetTableRequestResult(const string &table_key);
++	void RetainFilesOnCommitFailure();
+ 
+ private:
+ 	void CleanupFiles();
+@@ -83,6 +84,7 @@ public:
+ 
+ 	case_insensitive_set_t created_secrets;
+ 	case_insensitive_set_t looked_up_entries;
++	bool retain_files_on_commit_failure = false;
+ };
+ 
+ template <typename Callback>
+diff --git a/src/storage/iceberg_insert.cpp b/src/storage/iceberg_insert.cpp
+index 31356682..7d797227 100644
+--- a/src/storage/iceberg_insert.cpp
++++ b/src/storage/iceberg_insert.cpp
+@@ -292,7 +292,12 @@ SourceResultType IcebergInsert::GetDataInternal(ExecutionContext &context, DataC
+ SinkFinalizeType IcebergInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+                                          OperatorSinkFinalizeInput &input) const {
+ 	auto &global_state = input.global_state.Cast<IcebergInsertGlobalState>();
++	FinalizeWrittenFiles(global_state, context, table);
++	return SinkFinalizeType::READY;
++}
+ 
++void IcebergInsert::FinalizeWrittenFiles(IcebergInsertGlobalState &global_state, ClientContext &context,
++                                         optional_ptr<TableCatalogEntry> table) {
+ 	auto &irc_table = table->Cast<IcebergTableEntry>();
+ 	auto &table_info = irc_table.table_info;
+ 	auto &transaction = IcebergTransaction::Get(context, table->catalog);
+@@ -304,7 +309,60 @@ SinkFinalizeType IcebergInsert::Finalize(Pipeline &pipeline, Event &event, Clien
+ 			tbl.AddSnapshot(transaction, std::move(global_state.written_files));
+ 		});
+ 	}
+-	return SinkFinalizeType::READY;
++}
++
++string IcebergInsert::ExtensionWriteName() const {
++	return "iceberg_append";
++}
++
++void IcebergInsert::ValidateExtensionWrite(ClientContext &context) const {
++	(void)context;
++	if (!table || create_table_as) {
++		throw NotImplementedException("Distributed Iceberg writes only support INSERT INTO an existing table");
++	}
++	auto &iceberg_table = table->Cast<IcebergTableEntry>();
++	auto &metadata = iceberg_table.table_info.table_metadata;
++	if (metadata.iceberg_version != 2) {
++		throw NotImplementedException("Distributed Iceberg writes require an Iceberg v2 table");
++	}
++	if (!metadata.GetLatestPartitionSpec().IsUnpartitioned()) {
++		throw NotImplementedException("Distributed Iceberg writes do not support partitioned tables");
++	}
++	if (metadata.HasSortOrder() && metadata.GetLatestSortOrder().IsSorted()) {
++		throw NotImplementedException("Distributed Iceberg writes do not support sorted tables");
++	}
++}
++
++idx_t IcebergInsert::FinalizeExtensionWrite(
++    ClientContext &context, const vector<distributed::DistributedCopyFileInfo> &files) const {
++	IcebergInsertGlobalState global_state(context);
++	auto return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
++	DataChunk chunk;
++	chunk.Initialize(Allocator::Get(context), return_types);
++
++	for (idx_t offset = 0; offset < files.size(); offset += STANDARD_VECTOR_SIZE) {
++		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, files.size() - offset);
++		chunk.Reset();
++		chunk.SetCardinality(count);
++		for (idx_t row = 0; row < count; row++) {
++			auto &file = files[offset + row];
++			if (file.final_path.empty()) {
++				throw InvalidInputException("Distributed Iceberg write received a file without a final path");
++			}
++			chunk.SetValue(0, row, Value(file.final_path));
++			chunk.SetValue(1, row, Value::UBIGINT(file.row_count));
++			chunk.SetValue(2, row, Value::UBIGINT(file.file_size_bytes));
++			chunk.SetValue(3, row, file.footer_size_bytes);
++			chunk.SetValue(4, row, file.column_statistics);
++			chunk.SetValue(5, row, file.partition_keys);
++		}
++		AddWrittenFiles(global_state, chunk, table);
++	}
++
++	FinalizeWrittenFiles(global_state, context, table);
++	auto &transaction = IcebergTransaction::Get(context, table->catalog);
++	transaction.RetainFilesOnCommitFailure();
++	return global_state.insert_count.load();
+ }
+ 
+ //===--------------------------------------------------------------------===//
+@@ -543,6 +601,7 @@ PhysicalOperator &IcebergCatalog::PlanCreateTableAs(ClientContext &context, Phys
+ 	auto &physical_copy = IcebergInsert::PlanCopyForInsert(context, planner, *info, plan);
+ 	physical_index_vector_t<idx_t> column_index_map;
+ 	auto &insert = planner.Make<IcebergInsert>(op, ic_table, column_index_map);
++	insert.Cast<IcebergInsert>().create_table_as = true;
+ 
+ 	insert.children.push_back(physical_copy);
+ 	return insert;
+diff --git a/src/storage/iceberg_transaction.cpp b/src/storage/iceberg_transaction.cpp
+index 6e4d4d4e..b43092b3 100644
+--- a/src/storage/iceberg_transaction.cpp
++++ b/src/storage/iceberg_transaction.cpp
+@@ -350,7 +350,9 @@ void IcebergTransaction::Commit() {
+ 		DoSchemaDeletes(*temp_con_context);
+ 	} catch (std::exception &ex) {
+ 		ErrorData error(ex);
+-		CleanupFiles();
++		if (!retain_files_on_commit_failure) {
++			CleanupFiles();
++		}
+ 		DropSecrets(*temp_con_context);
+ 		temp_con.Rollback();
+ 		error.Throw("Failed to commit Iceberg transaction: ");
+@@ -483,6 +485,10 @@ void IcebergTransaction::Rollback() {
+ 	CleanupFiles();
+ }
+ 
++void IcebergTransaction::RetainFilesOnCommitFailure() {
++	retain_files_on_commit_failure = true;
++}
++
+ void IcebergTransaction::RecordTableRequest(const string &table_key, idx_t sequence_number, idx_t snapshot_id) {
+ 	requested_tables.emplace(table_key, TableInfoCache(sequence_number, snapshot_id));
+ }
