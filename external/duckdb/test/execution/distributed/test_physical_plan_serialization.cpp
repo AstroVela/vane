@@ -167,6 +167,16 @@ struct TestExtensionScanBindData : public TableFunctionData, public ExtensionSca
 	unordered_map<string, idx_t> task_bytes;
 	unordered_map<string, idx_t> task_cardinalities;
 
+	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
+		DistributedExtensionCapabilityReference result;
+		result.extension_name = "test_extension";
+		result.extension_protocol_version = 1;
+		result.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+		result.capability.name = "scan";
+		result.capability.protocol_version = 1;
+		return result;
+	}
+
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<TestExtensionScanBindData>();
 		copy->marker = marker;
@@ -1920,8 +1930,15 @@ TEST_CASE("Distributed extension scan planning uses provider estimates for opaqu
 
 	distributed::DuckDBExecutionConfig config;
 	config.set_distributed_worker_slots(2);
-	auto tasks =
-	    distributed::MakeTableScanTasks(plan->Root().Cast<PhysicalTableScan>(), config, shared_ptr<DatabaseInstance>());
+	REQUIRE_THROWS_WITH(distributed::MakeTableScanTasks(plan->Root().Cast<PhysicalTableScan>(), config, db.instance),
+	                    Catch::Matchers::Contains("test_extension"));
+	auto &distributed_extensions = DistributedExtensionManager::Get(*db.instance);
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "test_extension";
+	manifest.protocol_version = 1;
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1});
+	distributed_extensions.RegisterManifest(manifest);
+	auto tasks = distributed::MakeTableScanTasks(plan->Root().Cast<PhysicalTableScan>(), config, db.instance);
 
 	REQUIRE(tasks.size() == 2);
 	REQUIRE(tasks[0].files.size() == 1);
@@ -1939,8 +1956,8 @@ TEST_CASE("Distributed extension scan planning uses provider estimates for opaqu
 	partial_bind_data->tasks.emplace_back("opaque-task-c");
 	partial_bind_data->task_bytes["opaque-task-a"] = 1024ULL * 1024 * 1024;
 	auto partial_plan = MakeTestPhysicalTableScan(context, "test_extension_scan_rebind", std::move(partial_bind_data));
-	auto partial_tasks = distributed::MakeTableScanTasks(partial_plan->Root().Cast<PhysicalTableScan>(), config,
-	                                                     shared_ptr<DatabaseInstance>());
+	auto partial_tasks =
+	    distributed::MakeTableScanTasks(partial_plan->Root().Cast<PhysicalTableScan>(), config, db.instance);
 
 	REQUIRE(partial_tasks.size() == 2);
 	REQUIRE(partial_tasks[0].files.size() == 2);

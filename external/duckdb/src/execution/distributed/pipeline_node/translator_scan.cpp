@@ -266,6 +266,12 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	auto provider = TryGetExtensionScanTaskProvider(*scan.bind_data);
 	auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
 	if (provider) {
+		if (!db) {
+			throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
+			                            "validation",
+			                            scan.function.name);
+		}
+		DistributedExtensionManager::Get(*db).RequireCapability(provider->GetDistributedExtensionCapability());
 		files = provider->GetScanTasks();
 	} else if (multi_bind && multi_bind->file_list) {
 		files = multi_bind->file_list->GetAllFiles();

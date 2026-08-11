@@ -534,9 +534,13 @@ public:
 				return DuckDBResult<PlanResult>::err(
 				    DuckDBError::invalid_state_error("distributed extension write requires a non-empty name"));
 			}
-			if (!client_context_) {
-				return DuckDBResult<PlanResult>::err(
-				    DuckDBError::invalid_state_error("distributed extension write requires a ClientContext"));
+			try {
+				DistributedExtensionManager::Get(*client_context_)
+				    .RequireCapability(extension_write_provider->GetDistributedExtensionCapability());
+			} catch (const std::exception &ex) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+				    StringUtil::Format("distributed extension write %s capability validation failed: %s",
+				                       extension_write_name, ex.what())));
 			}
 			if (!client_context_->transaction.IsAutoCommit()) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(

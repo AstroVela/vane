@@ -15,6 +15,7 @@
 #include "duckdb/common/open_file_info.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/main/distributed_extension_manager.hpp"
 
 namespace duckdb {
 
@@ -30,6 +31,10 @@ namespace duckdb {
 class ExtensionScanTaskProvider {
 public:
 	virtual ~ExtensionScanTaskProvider() = default;
+
+	//! Capability declared by the extension during Extension::Load. Distributed
+	//! planning rejects the provider unless this exact identity is registered.
+	virtual DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const = 0;
 
 	//! Expand the complete logical scan into elementary portable tasks.
 	virtual vector<OpenFileInfo> GetScanTasks() const = 0;

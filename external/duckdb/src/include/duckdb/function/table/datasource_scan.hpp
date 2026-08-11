@@ -60,6 +60,9 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionScanTa
 		return std::move(result);
 	}
 
+	//! ExtensionScanTaskProvider: identify the registered distributed contract
+	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override;
+
 	//! ExtensionScanTaskProvider: encode each pickled task as an opaque path token
 	vector<OpenFileInfo> GetScanTasks() const override;
 

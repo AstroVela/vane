@@ -7,9 +7,16 @@ DuckDB extension participate in Vane's Ray distributed execution. The engine
 owns scheduling and transport; each extension continues to own its bind state,
 scan semantics, file production, and catalog transaction.
 
-An extension participates only by implementing the corresponding provider
-interface. Vane does not infer extension behavior, adapt older provider types,
-or execute unsupported extension operators locally.
+An extension participates by registering an explicit distributed manifest and
+implementing the corresponding provider interface. Vane does not infer
+extension behavior, adapt older provider types, or execute unsupported
+extension operators locally.
+
+The manifest is additional metadata. It does not replace DuckDB's
+`ExtensionLoader` registrations. The same extension therefore keeps its
+original scalar, aggregate, table, type, cast, COPY, PRAGMA, collation, secret,
+filesystem, replacement-scan, storage, parser, planner, and optimizer behavior
+when it runs through DuckDB's native runner.
 
 ## Design rules
 
@@ -24,13 +31,71 @@ or execute unsupported extension operators locally.
   extension catalog transaction.
 - Invalid or incomplete provider contracts fail before distributed side
   effects begin.
+- Missing, duplicate, or version-mismatched distributed capabilities are hard
+  errors; there is no compatibility mode or local fallback.
+
+## Registration model
+
+An extension declares its distributed protocol from the same `Load` method
+that performs its ordinary DuckDB registrations:
+
+```cpp
+void IcebergExtension::Load(ExtensionLoader &loader) {
+    // The extension's existing DuckDB registrations remain unchanged.
+    RegisterIcebergFunctions(loader);
+
+    loader.RegisterDistributedExtension(1);
+    loader.RegisterDistributedTableFunction("iceberg_scan", 1);
+    loader.RegisterDistributedOperator("iceberg_write", 1);
+}
+```
+
+The extension-level version identifies the manifest schema. Each capability
+also has its own protocol version so scan and write contracts can evolve
+independently. Names and versions are stable wire identities, not display
+labels.
+
+A capability declaration is discovery and validation metadata; it does not by
+itself make an unsupported operator distributable. The extension must still
+implement the corresponding provider contract. The current framework enforces
+the concrete scan and coordinator-owned write providers, while the remaining
+groups provide stable identities for worker-safe registrations and subsequent
+provider contracts.
+
+The available capability groups are table function, aggregate function, COPY
+function, operator, storage, and context. These groups describe where the
+extension adds distributed behavior rather than duplicating every DuckDB
+registration:
+
+- ordinary worker-safe scalar functions, types, casts, and collations use their
+  normal DuckDB registrations after the exact extension is loaded;
+- table sources add portable task enumeration and worker rebind;
+- distributed aggregates add portable partial-state and merge behavior;
+- COPY, storage, and custom write operators add worker artifact and
+  coordinator commit behavior;
+- context capabilities transport required settings, secrets, or filesystem
+  state;
+- replacement scans and parser, planner, and optimizer hooks normally run on
+  the coordinator; any custom physical operator they produce still needs an
+  explicit distributed operator capability.
+
+`ExtensionLoader` stages the manifest while the extension loads and publishes
+it only when loading finalizes successfully. Duplicate extension declarations,
+duplicate capability identities, zero protocol versions, and non-canonical
+names are rejected.
 
 ## Build and loading
 
-The connection snapshot records loaded static extensions. A worker validates
-every recorded name against its compiled extension registry and invokes
-DuckDB's generated static loader before rebinding a plan. Dynamically installed
-extension binaries are not accepted by distributed execution.
+The connection snapshot records the content-derived DuckDB `SourceID`, every
+loaded static extension name and exact extension version, and the complete
+sorted distributed manifest. A worker first validates its `SourceID`, invokes
+DuckDB's generated static loader, compares the loaded extension identities, and
+then compares the registered manifests before rebinding a plan. Dynamically
+installed extension binaries are not accepted by distributed execution.
+
+The snapshot schema is strict. Legacy name-only extension lists, absent
+manifest data, extra worker manifests, and any protocol mismatch are rejected.
+This validation occurs before task scheduling.
 
 The snapshot also carries serializable DuckDB secrets and the declarations of
 attached catalogs needed to plan a transported logical plan. Secrets are
@@ -72,7 +137,7 @@ must expose the provider and reproduce the coordinator's output schema.
 
 `ExtensionScanTaskProvider` may be implemented directly by table-function bind
 data or by the custom `MultiFileList` owned by `MultiFileBindData`. It provides
-three operations:
+an exact `DistributedExtensionCapabilityReference` and three task operations:
 
 1. Expand the logical scan into portable tasks represented by `OpenFileInfo`.
 2. Apply an assigned task subset to freshly rebound worker state.
@@ -99,6 +164,11 @@ operator whose single child is DuckDB COPY configured to return
 workers execute only the COPY child. Submission preflight therefore validates
 serialization of the worker-executable child, not the coordinator-only
 extension root.
+
+The provider exposes an exact `DistributedExtensionCapabilityReference` in
+addition to its diagnostic write name. `PlanRunner` resolves that reference
+against the loaded extension manifest before validation, translation, worker
+selection, or output creation.
 
 The write protocol is:
 
@@ -143,6 +213,8 @@ lost. Extension-specific reconciliation may establish that outcome separately.
 
 For a distributed scan provider:
 
+- return the exact extension name, extension protocol version, capability name,
+  kind, and capability protocol version registered during `Extension::Load`;
 - emit deterministic task payloads without process-local pointers;
 - normalize moving references to immutable identifiers before serialization,
   deterministically and safely on an already-normalized input;
@@ -154,6 +226,7 @@ For a distributed scan provider:
 
 For a distributed write provider:
 
+- return the exact registered operator capability identity;
 - expose a stable diagnostic name;
 - validate all catalog and output preconditions before workers start;
 - accept only the selected immutable worker files during finalization;
@@ -169,6 +242,10 @@ extension is enabled in release builds.
 ## Failure rules
 
 - Unknown or non-static extension names in a connection snapshot are rejected.
+- DuckDB source, static extension version, and distributed manifest mismatches
+  are rejected before planning or scheduling.
+- A provider whose capability identity was not registered is rejected before
+  task enumeration or write validation.
 - A worker rebind schema mismatch is a serialization error.
 - A declared scan provider must be recreated by worker bind.
 - A scan function that exposes only one of DuckDB's serialization callbacks is

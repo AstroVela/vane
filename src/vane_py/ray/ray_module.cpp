@@ -76,6 +76,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/main/database.hpp>
 #include <duckdb/main/database_manager.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/distributed_extension_manager.hpp>
 #include <duckdb/main/extension_helper.hpp>
 #include <duckdb/main/secret/secret_manager.hpp>
 #include <duckdb/parser/keyword_helper.hpp>
@@ -162,6 +163,16 @@ public:
 
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
 		return this;
+	}
+
+	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
+		DistributedExtensionCapabilityReference result;
+		result.extension_name = "vane_test";
+		result.extension_protocol_version = 1;
+		result.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+		result.capability.name = "coordinator_only_write";
+		result.capability.protocol_version = 1;
+		return result;
 	}
 
 	string ExtensionWriteName() const override {

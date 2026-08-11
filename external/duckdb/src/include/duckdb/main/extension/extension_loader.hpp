@@ -15,6 +15,7 @@
 #include "duckdb/parser/parsed_data/create_type_info.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/extension_manager.hpp"
+#include "duckdb/main/distributed_extension_manager.hpp"
 
 namespace duckdb {
 
@@ -39,6 +40,18 @@ public:
 public:
 	//! Set the description of the extension
 	DUCKDB_API void SetDescription(const string &description);
+
+	//! Declare the extension's additional distributed protocol. This does not
+	//! alter its ordinary DuckDB registrations or native execution path.
+	DUCKDB_API void RegisterDistributedExtension(idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
+	                                              const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedTableFunction(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedOperator(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedStorage(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedContext(const string &capability_name, idx_t protocol_version);
 
 public:
 	//! Register a new scalar function - merge overloads if the function already exists
@@ -108,6 +121,7 @@ private:
 	string extension_name;
 	string extension_description;
 	optional_ptr<ExtensionInfo> extension_info;
+	unique_ptr<DistributedExtensionManifest> distributed_manifest;
 };
 
 } // namespace duckdb

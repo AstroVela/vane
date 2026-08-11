@@ -5,6 +5,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/execution/distributed/copy_to_file.hpp"
+#include "duckdb/main/distributed_extension_manager.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,10 @@ namespace distributed {
 class ExtensionWriteTaskProvider {
 public:
 	virtual ~ExtensionWriteTaskProvider() = default;
+
+	//! Capability declared by the extension during Extension::Load. PlanRunner
+	//! rejects the write before scheduling unless this exact identity is present.
+	virtual DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const = 0;
 
 	//! Stable, human-readable extension write name used in diagnostics/results.
 	virtual string ExtensionWriteName() const = 0;

@@ -34,12 +34,71 @@ void ExtensionLoader::SetDescription(const string &description) {
 	extension_description = description;
 }
 
+void ExtensionLoader::RegisterDistributedExtension(idx_t protocol_version) {
+	if (distributed_manifest) {
+		throw InvalidInputException("Distributed extension '%s' is already declared by this loader", extension_name);
+	}
+	auto manifest = make_uniq<DistributedExtensionManifest>();
+	manifest->extension_name = extension_name;
+	manifest->protocol_version = protocol_version;
+	DistributedExtensionManager::ValidateManifest(*manifest);
+	distributed_manifest = std::move(manifest);
+}
+
+void ExtensionLoader::RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
+                                                    const string &capability_name, idx_t protocol_version) {
+	if (!distributed_manifest) {
+		throw InvalidInputException("Distributed extension '%s' must be declared before capability '%s'",
+		                            extension_name, capability_name);
+	}
+	DistributedExtensionCapability capability;
+	capability.kind = kind;
+	capability.name = capability_name;
+	capability.protocol_version = protocol_version;
+	distributed_manifest->capabilities.push_back(std::move(capability));
+	try {
+		DistributedExtensionManager::ValidateManifest(*distributed_manifest);
+	} catch (...) {
+		distributed_manifest->capabilities.pop_back();
+		throw;
+	}
+}
+
+void ExtensionLoader::RegisterDistributedTableFunction(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::TABLE_FUNCTION, capability_name,
+	                              protocol_version);
+}
+
+void ExtensionLoader::RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::AGGREGATE_FUNCTION, capability_name,
+	                              protocol_version);
+}
+
+void ExtensionLoader::RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::COPY_FUNCTION, capability_name, protocol_version);
+}
+
+void ExtensionLoader::RegisterDistributedOperator(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::OPERATOR, capability_name, protocol_version);
+}
+
+void ExtensionLoader::RegisterDistributedStorage(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::STORAGE, capability_name, protocol_version);
+}
+
+void ExtensionLoader::RegisterDistributedContext(const string &capability_name, idx_t protocol_version) {
+	RegisterDistributedCapability(DistributedExtensionCapabilityKind::CONTEXT, capability_name, protocol_version);
+}
+
 void ExtensionLoader::FinalizeLoad() {
 	// Set extension description, if provided
 	if (!extension_description.empty() && extension_info) {
 		auto info = make_uniq<ExtensionLoadedInfo>();
 		info->description = extension_description;
 		extension_info->load_info = std::move(info);
+	}
+	if (distributed_manifest) {
+		DistributedExtensionManager::Get(db).RegisterManifest(*distributed_manifest);
 	}
 }
 

@@ -802,6 +802,171 @@ def test_snapshot_replay_error_does_not_echo_sensitive_setting_value():
         source_connection.close()
 
 
+def test_connection_snapshot_captures_exact_extension_contract():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-extension-contract",
+    )
+    snapshot = logical_plan.__getstate__()[3]
+
+    assert snapshot["duckdb_source_id"]
+    assert isinstance(snapshot["extensions"], list)
+    assert all(set(extension) >= {"name", "version"} for extension in snapshot["extensions"])
+    assert isinstance(snapshot["distributed_extensions"], list)
+    vane_core = next(
+        manifest for manifest in snapshot["distributed_extensions"] if manifest["extension_name"] == "vane_core"
+    )
+    assert vane_core["protocol_version"] == 1
+    assert vane_core["capabilities"] == [
+        {"kind": "table_function", "name": "datasource_scan", "protocol_version": 1},
+    ]
+
+
+def test_snapshot_replay_rejects_different_duckdb_source_id():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-source-id-mismatch",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["duckdb_source_id"] = "different-worker-build"
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match="SourceID differs between coordinator and worker"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
+def test_snapshot_replay_rejects_different_static_extension_version():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-extension-version-mismatch",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    assert snapshot["extensions"]
+    extensions = [dict(extension) for extension in snapshot["extensions"]]
+    extensions[0]["version"] = "different-extension-version"
+    snapshot["extensions"] = extensions
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match="Static extension identities differ"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
+def test_snapshot_replay_rejects_different_distributed_extension_manifest():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-distributed-extension-mismatch",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["distributed_extensions"] = [
+        *snapshot["distributed_extensions"],
+        {
+            "extension_name": "missing_test_extension",
+            "protocol_version": 1,
+            "capabilities": [
+                {"kind": "table_function", "name": "scan", "protocol_version": 1},
+            ],
+        },
+    ]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match="manifests differ between coordinator and worker"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "error_match"),
+    [
+        ("duckdb_source_id", "missing duckdb_source_id"),
+        ("extensions", "extensions must be a list"),
+        ("distributed_extensions", "distributed_extensions must be a list"),
+    ],
+)
+def test_snapshot_replay_rejects_missing_extension_contract_field(field_name: str, error_match: str):
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        f"snapshot-missing-extension-contract-{field_name}",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    del snapshot[field_name]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match=error_match):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
+def test_snapshot_replay_rejects_boolean_distributed_protocol_version():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-boolean-distributed-protocol-version",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    manifests = [dict(manifest) for manifest in snapshot["distributed_extensions"]]
+    manifests[0]["protocol_version"] = True
+    snapshot["distributed_extensions"] = manifests
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match="non-boolean integer protocol_version"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
+def test_snapshot_replay_rejects_legacy_extension_name_list():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-legacy-extension-list",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["extensions"] = ["core_functions"]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    with pytest.raises(Exception, match="extension entry must be a dict"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
+
+
 def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_path):
     ray_cxx = _require_ray_cxx()
 
@@ -813,7 +978,7 @@ def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_pa
     physical_plan = logical_plan.to_physical_plan(vane.connect())
     state = list(physical_plan.__getstate__())
     snapshot = dict(state[6])
-    snapshot["extensions"] = ["sqlite_scanner"]
+    snapshot["extensions"] = [{"name": "sqlite_scanner", "version": ""}]
     state[6] = snapshot
 
     replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
@@ -866,7 +1031,7 @@ def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
             "sqlite_all_varchar": "true",
         },
     }
-    snapshot["extensions"] = ["sqlite_scanner"]
+    snapshot["extensions"] = [{"name": "sqlite_scanner", "version": ""}]
     state[6] = snapshot
 
     replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)

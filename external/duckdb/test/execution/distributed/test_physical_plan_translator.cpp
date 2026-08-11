@@ -95,6 +95,16 @@ public:
 		return this;
 	}
 
+	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
+		DistributedExtensionCapabilityReference result;
+		result.extension_name = "test_extension";
+		result.extension_protocol_version = 1;
+		result.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+		result.capability.name = "write";
+		result.capability.protocol_version = 1;
+		return result;
+	}
+
 	string ExtensionWriteName() const override {
 		return extension_write_name;
 	}

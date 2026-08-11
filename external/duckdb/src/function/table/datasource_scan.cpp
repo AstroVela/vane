@@ -33,6 +33,16 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 	return callback;
 }
 
+DistributedExtensionCapabilityReference DataSourceScanBindData::GetDistributedExtensionCapability() const {
+	DistributedExtensionCapabilityReference result;
+	result.extension_name = "vane_core";
+	result.extension_protocol_version = 1;
+	result.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	result.capability.name = "datasource_scan";
+	result.capability.protocol_version = 1;
+	return result;
+}
+
 vector<OpenFileInfo> DataSourceScanBindData::GetScanTasks() const {
 	vector<OpenFileInfo> tasks;
 	tasks.reserve(pickled_tasks.size());

@@ -14,6 +14,7 @@
 #include "duckdb.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
@@ -175,6 +176,16 @@ public:
 		return this;
 	}
 
+	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
+		DistributedExtensionCapabilityReference result;
+		result.extension_name = "replay_test_extension";
+		result.extension_protocol_version = 1;
+		result.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+		result.capability.name = "write";
+		result.capability.protocol_version = 1;
+		return result;
+	}
+
 	string ExtensionWriteName() const override {
 		return "replay_test_extension";
 	}
@@ -198,6 +209,15 @@ public:
 
 string PlanRunnerSQLStringLiteral(const string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
+void RegisterReplayTestExtension(DatabaseInstance &db) {
+	auto &manager = DistributedExtensionManager::Get(db);
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "replay_test_extension";
+	manifest.protocol_version = 1;
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::OPERATOR, "write", 1});
+	manager.RegisterManifest(manifest);
 }
 
 void WritePlanRunnerTestFile(FileSystem &fs, const string &path, const string &contents) {
@@ -232,10 +252,39 @@ TEST_CASE("PlanRunner instantiation", "[distributed][plan][local]") {
 	REQUIRE(runner != nullptr);
 }
 
+TEST_CASE("PlanRunner rejects an unregistered extension write capability",
+          "[distributed][plan][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> child_types {LogicalType::BIGINT};
+	auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension_operator = physical_plan->Make<ReplayTestExtensionWriteOperator>(std::move(extension_types));
+	auto &extension = extension_operator.Cast<ReplayTestExtensionWriteOperator>();
+	extension_operator.children.push_back(child);
+	physical_plan->SetRoot(extension_operator);
+
+	auto workers = setup_workers({{make_worker_id("unregistered-extension-w1"), 1}});
+	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(15, "planrunner-unregistered-extension",
+	                                                                  physical_plan, std::move(execution_config));
+
+	auto result = runner->run_plan(std::move(distributed_plan));
+	REQUIRE(result.is_err());
+	REQUIRE(StringUtil::Contains(result.error().what(), "capability validation failed"));
+	REQUIRE(StringUtil::Contains(result.error().what(), "replay_test_extension"));
+	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.finalize_calls == 0);
+}
+
 TEST_CASE("PlanRunner rejects extension writes inside an explicit DuckDB transaction",
           "[distributed][plan][copy][extension-write]") {
 	DuckDB db(nullptr);
 	Connection con(db);
+	RegisterReplayTestExtension(*db.instance);
 	auto output_path = TestCreatePath("planrunner_extension_explicit_transaction");
 	auto logical_plan = con.ExtractPlan("COPY (SELECT 42 AS value) TO " + PlanRunnerSQLStringLiteral(output_path) +
 	                                    " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
@@ -275,6 +324,7 @@ TEST_CASE("PlanRunner requires an EXTENSION root for extension write providers",
           "[distributed][plan][copy][extension-write]") {
 	DuckDB db(nullptr);
 	Connection con(db);
+	RegisterReplayTestExtension(*db.instance);
 	auto output_path = TestCreatePath("planrunner_extension_wrong_root_type");
 	auto logical_plan = con.ExtractPlan("COPY (SELECT 42 AS value) TO " + PlanRunnerSQLStringLiteral(output_path) +
 	                                    " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
@@ -310,6 +360,7 @@ TEST_CASE("PlanRunner replays a committed extension write without coordinator or
           "[distributed][plan][copy][extension-write]") {
 	DuckDB db(nullptr);
 	Connection con(db);
+	RegisterReplayTestExtension(*db.instance);
 	auto output_path = TestCreatePath("planrunner_committed_extension_replay");
 	auto logical_plan = con.ExtractPlan("COPY (SELECT 42 AS value) TO " + PlanRunnerSQLStringLiteral(output_path) +
 	                                    " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
