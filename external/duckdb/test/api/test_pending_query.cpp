@@ -139,6 +139,43 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 	REQUIRE(interrupted_before_catch);
 }
 
+TEST_CASE("Successful query cleanup clears executor cancellation interrupt", "[api][executor][lifecycle]") {
+	DuckDB db(nullptr);
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads = 2"));
+
+	Connection connection(db);
+	auto pending = connection.PendingQuery("SELECT 42");
+	REQUIRE(!pending->HasError());
+
+	auto state = make_shared_ptr<BlockingExecutorTaskState>();
+	auto &executor = connection.context->GetExecutor();
+	duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
+	std::thread executor_task([task = std::move(task)]() mutable {
+		task->Execute(TaskExecutionMode::PROCESS_ALL);
+		task.reset();
+	});
+
+	{
+		std::unique_lock<std::mutex> lock(state->lock);
+		if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
+			state->release = true;
+			state->cv.notify_all();
+			lock.unlock();
+			executor_task.join();
+			FAIL("executor task did not start");
+		}
+	}
+
+	auto result = pending->Execute();
+	executor_task.join();
+
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	REQUIRE(state->finished);
+	REQUIRE(state->interrupted);
+	REQUIRE(!connection.context->IsInterrupted());
+}
+
 TEST_CASE("Test Pending Query API", "[api][.]") {
 	DuckDB db;
 	Connection con(db);

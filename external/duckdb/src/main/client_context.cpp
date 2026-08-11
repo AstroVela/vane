@@ -269,6 +269,11 @@ ErrorData ClientContext::EndQueryInternal(ClientContextLock &lock, bool success,
 	if (active_query->executor) {
 		active_query->executor->CancelTasks();
 	}
+	// CancelTasks can interrupt the context to drain blocked executor tasks. Do not expose that
+	// internal cancellation to consumers of a successfully materialized result.
+	if (success) {
+		ClearInterrupt();
+	}
 	active_query->progress_bar.reset();
 	D_ASSERT(active_query.get());
 	active_query.reset();
