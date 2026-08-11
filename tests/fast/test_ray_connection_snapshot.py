@@ -3,6 +3,7 @@
 
 import gc
 import pickle
+import threading
 
 import pytest
 
@@ -400,6 +401,350 @@ def test_logical_plan_replays_connection_snapshot_on_to_physical_plan():
     assert target_conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
 
 
+def test_transport_replays_attached_catalog_on_isolated_planning_connection(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    attached_path = tmp_path / "attached-catalog.duckdb"
+
+    setup_conn = vane.connect(str(attached_path))
+    setup_conn.execute("CREATE TABLE items AS SELECT 42 AS value")
+    setup_conn.close()
+
+    source_conn = vane.connect()
+    source_conn.execute(f"ATTACH '{attached_path.as_posix()}' AS attached_catalog")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT * FROM attached_catalog.main.items"),
+        "snapshot-attached-catalog",
+    )
+    snapshot = logical_plan.__getstate__()[3]
+    assert len(snapshot["attached_databases"]) == 1
+    assert "attached_catalog" in snapshot["attached_databases"][0]
+
+    transported_plan = pickle.loads(pickle.dumps(logical_plan))
+    source_conn.close()
+
+    target_conn = vane.connect()
+    physical_plan = transported_plan.to_physical_plan(target_conn)
+
+    assert physical_plan.idx() == "snapshot-attached-catalog"
+    assert target_conn.execute(
+        "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'attached_catalog'"
+    ).fetchone() == (0,)
+
+
+def test_transport_replays_temporary_secret_on_isolated_planning_connection():
+    ray_cxx = _require_ray_cxx()
+
+    source_conn = vane.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute(
+        "CREATE SECRET snapshot_s3 ("
+        "TYPE S3, KEY_ID 'snapshot-key', SECRET 'snapshot-secret', "
+        "REGION 'us-east-1', ENDPOINT '127.0.0.1:9000', USE_SSL false, URL_STYLE 'path')"
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "snapshot-temporary-secret",
+    )
+    snapshot = logical_plan.__getstate__()[3]
+    assert any(secret["name"] == "snapshot_s3" for secret in snapshot["secrets"])
+
+    transported_plan = pickle.loads(pickle.dumps(logical_plan))
+    source_conn.close()
+
+    target_conn = vane.connect()
+    transported_plan.to_physical_plan(target_conn)
+
+    assert target_conn.execute("SELECT count(*) FROM duckdb_secrets() WHERE name = 'snapshot_s3'").fetchone() == (0,)
+
+
+def test_pickled_physical_plan_replays_temporary_secret_on_worker_connection():
+    ray_cxx = _require_ray_cxx()
+
+    source_conn = vane.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute(
+        "CREATE SECRET snapshot_worker_s3 ("
+        "TYPE S3, KEY_ID 'worker-key', SECRET 'worker-secret', "
+        "REGION 'us-east-1', ENDPOINT '127.0.0.1:9000', USE_SSL false, URL_STYLE 'path')"
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "snapshot-worker-secret",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    source_conn.close()
+
+    worker_cursor = vane.connect().cursor()
+    worker_cursor.execute("SET allow_persistent_secrets=false")
+    worker_cursor.execute("LOAD httpfs")
+    worker_cursor.execute(
+        "CREATE SECRET host_worker_s3 (TYPE S3, KEY_ID 'host-key', SECRET 'host-secret', REGION 'us-east-1')"
+    )
+    assert worker_cursor.execute(
+        "SELECT count(*) FROM duckdb_secrets() WHERE name = 'snapshot_worker_s3'"
+    ).fetchone() == (0,)
+
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, restored_plan)
+
+    assert _table_from_native_result(result).column(0).to_pylist() == [1]
+    assert worker_cursor.execute(
+        "SELECT name, type, provider FROM duckdb_secrets() WHERE name = 'snapshot_worker_s3'"
+    ).fetchone() == ("snapshot_worker_s3", "s3", "config")
+    assert worker_cursor.execute("SELECT count(*) FROM duckdb_secrets() WHERE name = 'host_worker_s3'").fetchone() == (
+        0,
+    )
+
+
+def test_pickled_physical_plan_replays_secret_with_structured_name():
+    ray_cxx = _require_ray_cxx()
+    secret_name = 'snapshot\nworker"secret'
+    quoted_name = '"' + secret_name.replace('"', '""') + '"'
+
+    source_conn = vane.connect()
+    source_conn.execute("LOAD httpfs")
+    source_conn.execute(
+        f"CREATE TEMPORARY SECRET {quoted_name} ("
+        "TYPE S3, KEY_ID 'worker-key', SECRET 'worker-secret', REGION 'us-east-1')"
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "snapshot-worker-structured-secret-name",
+    )
+    snapshot = logical_plan.__getstate__()[3]
+    assert any(secret["storage"] == "memory" and secret["name"] == secret_name for secret in snapshot["secrets"])
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    source_conn.close()
+
+    worker_cursor = vane.connect().cursor()
+    worker_cursor.execute("SET allow_persistent_secrets=false")
+    result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, restored_plan)
+
+    assert _table_from_native_result(result).column(0).to_pylist() == [1]
+    assert worker_cursor.execute("SELECT count(*) FROM duckdb_secrets() WHERE name = ?", [secret_name]).fetchone() == (
+        1,
+    )
+
+
+def test_worker_secret_snapshot_replaces_previous_temporary_secret_domain():
+    ray_cxx = _require_ray_cxx()
+
+    def build_plan(query_id, secret_name):
+        source_conn = vane.connect()
+        source_conn.execute("SET allow_persistent_secrets=false")
+        source_conn.execute("LOAD httpfs")
+        source_conn.execute(
+            f"CREATE SECRET {secret_name} ("
+            "TYPE S3, KEY_ID 'worker-key', SECRET 'worker-secret', "
+            "REGION 'us-east-1', ENDPOINT '127.0.0.1:9000', USE_SSL false, URL_STYLE 'path')"
+        )
+        logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            source_conn.sql("SELECT 1 AS value"),
+            query_id,
+        )
+        physical_plan = logical_plan.to_physical_plan(vane.connect())
+        source_conn.close()
+        return physical_plan
+
+    first_plan = build_plan("snapshot-secret-domain-a", "snapshot_domain_a")
+    second_plan = build_plan("snapshot-secret-domain-b", "snapshot_domain_b")
+    worker_connection = vane.connect()
+    worker_connection.execute("SET allow_persistent_secrets=false")
+    try:
+        assert ray_cxx._register_query_python_replay_state("snapshot-secret-domain-a", first_plan) is True
+        assert ray_cxx._register_query_python_replay_state("snapshot-secret-domain-b", second_plan) is True
+
+        ray_cxx._prepare_query_secret_snapshot(worker_connection, "snapshot-secret-domain-a")
+        assert worker_connection.execute(
+            "SELECT name FROM duckdb_secrets() WHERE name LIKE 'snapshot_domain_%' ORDER BY name"
+        ).fetchall() == [("snapshot_domain_a",)]
+
+        ray_cxx._prepare_query_secret_snapshot(worker_connection, "snapshot-secret-domain-b")
+        assert worker_connection.execute(
+            "SELECT name FROM duckdb_secrets() WHERE name LIKE 'snapshot_domain_%' ORDER BY name"
+        ).fetchall() == [("snapshot_domain_b",)]
+    finally:
+        ray_cxx._cleanup_query_python_replay_state("snapshot-secret-domain-a")
+        ray_cxx._cleanup_query_python_replay_state("snapshot-secret-domain-b")
+        worker_connection.close()
+
+
+def test_worker_secret_snapshot_rejects_unexpected_persistent_secret(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    query_id = "snapshot-reject-persistent-worker-secret"
+    source_connection = vane.connect()
+    planning_connection = vane.connect()
+    worker_connection = vane.connect(
+        config={
+            "allow_persistent_secrets": True,
+            "secret_directory": str(tmp_path / "worker-secrets"),
+        }
+    )
+    worker_connection.execute(
+        "CREATE PERSISTENT SECRET unexpected_worker_secret (TYPE HTTP, BEARER_TOKEN 'host-only-token')"
+    )
+    try:
+        logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            source_connection.sql("SELECT 1 AS value"),
+            query_id,
+        )
+        physical_plan = logical_plan.to_physical_plan(planning_connection)
+        assert ray_cxx._register_query_python_replay_state(query_id, physical_plan) is True
+
+        with pytest.raises(Exception, match="not identical to the source connection snapshot"):
+            ray_cxx._prepare_query_secret_snapshot(worker_connection, query_id)
+
+        assert worker_connection.execute(
+            "SELECT name, persistent FROM duckdb_secrets() WHERE name = 'unexpected_worker_secret'"
+        ).fetchone() == ("unexpected_worker_secret", True)
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        worker_connection.close()
+        planning_connection.close()
+        source_connection.close()
+
+
+def test_worker_secret_snapshot_accepts_only_byte_identical_persistent_secret(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    query_id = "snapshot-accept-identical-persistent-secret"
+    source_connection = vane.connect(
+        config={
+            "allow_persistent_secrets": True,
+            "secret_directory": str(tmp_path / "source-secrets"),
+        }
+    )
+    worker_connection = vane.connect(
+        config={
+            "allow_persistent_secrets": True,
+            "secret_directory": str(tmp_path / "worker-secrets"),
+        }
+    )
+    create_secret = (
+        "CREATE PERSISTENT SECRET identical_secret "
+        "(TYPE HTTP, BEARER_TOKEN 'identical-token', SCOPE 'https://example.com')"
+    )
+    source_connection.execute(create_secret)
+    worker_connection.execute(create_secret)
+    try:
+        physical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            source_connection.sql("SELECT 1 AS value"),
+            query_id,
+        ).to_physical_plan(source_connection)
+        assert ray_cxx._register_query_python_replay_state(query_id, physical_plan) is True
+
+        ray_cxx._prepare_query_secret_snapshot(worker_connection, query_id)
+
+        assert worker_connection.execute(
+            "SELECT name, persistent FROM duckdb_secrets() WHERE name = 'identical_secret'"
+        ).fetchone() == ("identical_secret", True)
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        worker_connection.close()
+        source_connection.close()
+
+
+def test_worker_nondefault_snapshot_reuses_database_and_secret_domain():
+    from vane.runners.ray import worker as worker_module
+
+    ray_cxx = _require_ray_cxx()
+    query_id = "snapshot-nondefault-worker-database"
+    source_connection = vane.connect(":memory:", config={"threads": "2"})
+    source_connection.execute("SET allow_persistent_secrets=false")
+    source_connection.execute(
+        "CREATE SECRET cached_snapshot_secret (TYPE HTTP, BEARER_TOKEN 'snapshot-token', SCOPE 'https://example.com')"
+    )
+    bootstrap_connection = vane.connect()
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._snapshot_connections = {}
+    actor._snapshot_connections_lock = threading.Lock()
+    actor._native_execution_condition = threading.Condition()
+    actor._active_secret_snapshot_identity = None
+    actor._active_secret_snapshot_leases = 0
+    actor._active_secret_snapshot_initialized = False
+    actor._active_snapshot_execution_cursors = 0
+    actor._closing_native_queries = set()
+    actor._closing_native_tasks = set()
+    actor._shutdown_started = False
+    first_cursor = None
+    second_cursor = None
+    secret_lease = None
+    try:
+        physical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            source_connection.sql("SELECT 1 AS value"),
+            query_id,
+        ).to_physical_plan(source_connection)
+        assert ray_cxx._register_query_python_replay_state(query_id, physical_plan) is True
+
+        first_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
+        second_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
+        assert len(actor._snapshot_connections) == 1
+        assert first_cursor.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
+
+        first_cursor.execute("CREATE TABLE cached_snapshot_table AS SELECT 42 AS value")
+        assert second_cursor.execute("SELECT value FROM cached_snapshot_table").fetchall() == [(42,)]
+        with pytest.raises(Exception, match="cached_snapshot_table"):
+            bootstrap_connection.execute("SELECT * FROM cached_snapshot_table")
+
+        secret_lease = actor_class._acquire_worker_secret_snapshot(actor, first_cursor, query_id)
+        assert second_cursor.execute(
+            "SELECT name FROM duckdb_secrets() WHERE name = 'cached_snapshot_secret'"
+        ).fetchone() == ("cached_snapshot_secret",)
+    finally:
+        actor_class._release_worker_secret_snapshot(actor, secret_lease)
+        if second_cursor is not None:
+            actor_class._close_snapshot_execution_cursor(actor, second_cursor)
+        if first_cursor is not None:
+            actor_class._close_snapshot_execution_cursor(actor, first_cursor)
+        for snapshot_connection in actor._snapshot_connections.values():
+            snapshot_connection.close()
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        bootstrap_connection.close()
+        source_connection.close()
+
+
+def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    query_id = "snapshot-file-disable-persistent-secrets"
+    database_path = tmp_path / "source.duckdb"
+    source_connection = vane.connect(
+        str(database_path),
+        config={
+            "allow_persistent_secrets": True,
+            "secret_directory": str(tmp_path / "source-secrets"),
+        },
+    )
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1 AS value"),
+        query_id,
+    )
+    physical_plan = logical_plan.to_physical_plan(source_connection)
+    restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    del physical_plan
+    del logical_plan
+    source_connection.close()
+    del source_connection
+    gc.collect()
+
+    bootstrap_connection = vane.connect()
+    resolved_connection = None
+    try:
+        assert ray_cxx._register_query_python_replay_state(query_id, restored_plan) is True
+        resolved_connection = ray_cxx._resolve_query_snapshot_connection(bootstrap_connection, query_id)
+
+        assert resolved_connection.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
+        with pytest.raises(Exception, match="Persistent secrets are disabled"):
+            resolved_connection.execute(
+                "CREATE PERSISTENT SECRET forbidden_worker_secret (TYPE HTTP, BEARER_TOKEN 'token')"
+            )
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        if resolved_connection is not None:
+            resolved_connection.close()
+        bootstrap_connection.close()
+
+
 def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     ray_cxx = _require_ray_cxx()
 
@@ -422,6 +767,39 @@ def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     assert table.num_rows == 3
     assert worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0] == 3
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+
+
+def test_snapshot_replay_error_does_not_echo_sensitive_setting_value():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-redacted-query-error",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    sensitive_value = "vane_snapshot_secret_must_not_reach_logs"
+    snapshot["settings"] = [
+        *snapshot["settings"],
+        {"name": "threads", "value": sensitive_value, "input_type": "BIGINT"},
+    ]
+    state[6] = snapshot
+
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    worker_connection = vane.connect()
+    worker_cursor = worker_connection.cursor()
+    try:
+        with pytest.raises(Exception) as exc_info:
+            ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, replay_plan)
+        assert "Connection snapshot query failed (" in str(exc_info.value)
+        assert sensitive_value not in str(exc_info.value)
+    finally:
+        worker_cursor.close()
+        worker_connection.close()
+        source_connection.close()
 
 
 def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_path):

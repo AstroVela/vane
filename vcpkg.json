@@ -3,6 +3,7 @@
   "version-string": "0.1.0-alpha.1",
   "builtin-baseline": "44819aa2a6c10e56065e2b0330e7d6c89d1d2574",
   "dependencies": [
+    "avro-c",
     {
       "name": "arrow",
       "default-features": false,
@@ -11,10 +12,31 @@
         "flight"
       ]
     },
+    {
+      "name": "aws-sdk-cpp",
+      "default-features": false,
+      "features": [
+        "sso",
+        "sts"
+      ]
+    },
     "curl",
     "gflags",
     "glog",
     "grpc",
-    "openssl"
-  ]
+    "openssl",
+    "roaring"
+  ],
+  "vcpkg-configuration": {
+    "registries": [
+      {
+        "kind": "git",
+        "repository": "https://github.com/duckdb/vcpkg-duckdb-ports",
+        "baseline": "02558971ebafdbaa697a0704a3ed7ba365cd5495",
+        "packages": [
+          "avro-c"
+        ]
+      }
+    ]
+  }
 }

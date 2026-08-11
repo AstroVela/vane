@@ -89,6 +89,11 @@ PhysicalOperator &ClonePhysicalPlanRootIntoPlanOrThrow(const DuckPhysicalPlanRef
 		if (client_context) {
 			auto &db = DatabaseInstance::GetDatabase(*client_context);
 			local_conn = make_uniq<Connection>(db);
+			// Physical operator deserialization can rebind extension table
+			// functions. Preserve connection-local settings (including httpfs
+			// endpoints and credentials) while keeping the clone transaction
+			// isolated from the caller's ClientContext.
+			local_conn->context->config = client_context->config;
 		} else {
 			local_db = make_uniq<DuckDB>(nullptr);
 			local_conn = make_uniq<Connection>(*local_db);

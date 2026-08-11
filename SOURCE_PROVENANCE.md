@@ -92,6 +92,39 @@ native build and pinned to commit
 `external/duckdb/.github/config/extensions/httpfs.cmake`. It is covered by the
 DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`.
 
+The statically linked DuckDB Avro and Iceberg extensions are also fetched
+separately during the native build. Avro is pinned to commit
+`4fa0f73f816e9878d5b6a39795e060877766ac1a` by
+`external/duckdb/.github/config/extensions/avro.cmake`; Iceberg is pinned to
+commit `23c7cc52d84f63e9af47d0831862cfe7da3fb40f` by
+`external/duckdb/.github/config/extensions/iceberg.cmake`. Vane applies the
+reviewed patch in
+`external/duckdb/.github/patches/extensions/iceberg/vane-distributed-scan.patch`
+to expose Iceberg's snapshot-preserving distributed scan task boundary. Both
+extension repositories are covered by the DuckDB MIT license recorded in
+`LICENSES/DuckDB-MIT.txt`. The compressed `partition_integer`,
+`equality_deletes`, `moved_positional_delete_path`,
+`add_columns_with_defaults`, `add_columns_with_defaults_in_struct`,
+`hive_partitioned_table`, `struct_filter_issue`, `uuid`, and `unknown_puffin`
+test fixtures under `tests/fast/data/` are reproduced from that pinned Iceberg
+revision under the same license. The fixture archives retain only the selected
+table roots and, for the positional-delete case, files reachable from its
+selected metadata version and current snapshot.
+
+The hermetic Iceberg service gates download test-only containers at runtime and
+do not include them in Vane release artifacts. `scripts/run_iceberg_minio_tests.sh`
+and `scripts/run_iceberg_rest_tests.sh` pin MinIO to
+`sha256:1dce27c494a16bae114774f1cec295493f3613142713130c2d22dd5696be6ad3`;
+the REST gate additionally pins `apache/iceberg-rest-fixture` to
+`sha256:39e1c38a10d1b380dfb22f5c60685a2aa82975651018dd1a87f12045047821d9`.
+
+The Avro extension requires DuckDB's API-compatible `duckdb-avro-c` fork,
+pinned to commit `4b7d9136180cb1d088d4cdb40eb80813b3774c21` through the
+`duckdb/vcpkg-duckdb-ports` registry at commit
+`02558971ebafdbaa697a0704a3ed7ba365cd5495`. The immutable registry selection is
+recorded in `vcpkg.json`; its Apache-2.0 license is reproduced in the generated
+vcpkg license bundle.
+
 The imported DuckDB tree contains upstream benchmark generators with additional terms, including TPC-H, TPC-DS, and TPC-E material. They are not part of Vane release artifacts. The sdist allowlist and artifact checker enforce this boundary.
 
 When importing code:

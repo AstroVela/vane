@@ -68,6 +68,9 @@ static DuckPhysicalPlanRef AppendCopyOperator(DuckPhysicalPlanRef plan, Distribu
 }
 
 SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionContext &plan_context) {
+	if (staging_run_id_.empty()) {
+		throw InvalidInputException("CopySinkNode requires an operation identity before producing tasks");
+	}
 	auto input_stream = child_->produce_tasks(plan_context);
 	auto self = shared_from_this();
 	auto node_id_val = this->node_id();

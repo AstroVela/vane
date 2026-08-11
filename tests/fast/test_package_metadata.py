@@ -381,7 +381,7 @@ def test_release_runtime_is_self_contained_by_default():
         ).fetchall()
     }
 
-    expected_extensions = {"core_functions", "httpfs", "icu", "json", "parquet"}
+    expected_extensions = {"avro", "core_functions", "httpfs", "iceberg", "icu", "json", "parquet"}
     if platform.system() == "Linux" and sys.maxsize > 2**32:
         expected_extensions.add("jemalloc")
 
@@ -394,7 +394,7 @@ def test_release_runtime_is_self_contained_by_default():
     assert all(installed and loaded for installed, loaded, _ in static_extensions.values())
 
     source_id = _expected_duckdb_source_id(REPOSITORY_ROOT)[:10]
-    in_tree_extensions = expected_extensions - {"httpfs"}
+    in_tree_extensions = expected_extensions - {"avro", "httpfs", "iceberg"}
     assert {name: static_extensions[name][2] for name in in_tree_extensions} == {
         name: source_id for name in in_tree_extensions
     }

@@ -33,24 +33,25 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 	return callback;
 }
 
-vector<string> DataSourceScanBindData::GetFileList() const {
-	vector<string> files;
-	files.reserve(pickled_tasks.size());
+vector<OpenFileInfo> DataSourceScanBindData::GetScanTasks() const {
+	vector<OpenFileInfo> tasks;
+	tasks.reserve(pickled_tasks.size());
 	for (auto &task : pickled_tasks) {
-		// Encode pickled task bytes as base64 with a prefix
+		// Encode pickled task bytes as an opaque base64 token.
 		auto encoded = Blob::ToBase64(string_t(task.data(), task.size()));
-		files.push_back(DATASOURCE_PREFIX + encoded);
+		tasks.emplace_back(DATASOURCE_PREFIX + encoded);
 	}
-	return files;
+	return tasks;
 }
 
-void DataSourceScanBindData::SetFileList(const vector<string> &files) {
+void DataSourceScanBindData::SetScanTasks(const vector<OpenFileInfo> &tasks) {
 	pickled_tasks.clear();
-	pickled_tasks.reserve(files.size());
-	for (auto &f : files) {
+	pickled_tasks.reserve(tasks.size());
+	for (const auto &task : tasks) {
+		auto &token = task.path;
 		// Strip the prefix and decode base64 back to pickled task bytes
-		if (f.substr(0, DATASOURCE_PREFIX.size()) == DATASOURCE_PREFIX) {
-			auto base64_str = f.substr(DATASOURCE_PREFIX.size());
+		if (token.substr(0, DATASOURCE_PREFIX.size()) == DATASOURCE_PREFIX) {
+			auto base64_str = token.substr(DATASOURCE_PREFIX.size());
 			auto decoded = Blob::FromBase64(string_t(base64_str.data(), base64_str.size()));
 			pickled_tasks.push_back(std::move(decoded));
 		} else {

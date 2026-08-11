@@ -142,6 +142,8 @@ public:
 
 	//! Secret Manager settings
 	DUCKDB_API virtual void SetEnablePersistentSecrets(bool enabled);
+	//! Atomically update the setting only while the manager is still unused.
+	DUCKDB_API bool TrySetEnablePersistentSecrets(bool enabled);
 	DUCKDB_API virtual void ResetEnablePersistentSecrets();
 	DUCKDB_API virtual bool PersistentSecretsEnabled();
 

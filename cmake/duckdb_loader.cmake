@@ -43,7 +43,8 @@ _duckdb_set_default(DUCKDB_SOURCE_PATH
                     "${CMAKE_CURRENT_SOURCE_DIR}/external/duckdb")
 
 # Extension list - commonly used extensions for Python
-_duckdb_set_default(BUILD_EXTENSIONS "core_functions;parquet;icu;json;httpfs")
+_duckdb_set_default(BUILD_EXTENSIONS
+                    "core_functions;parquet;icu;json;httpfs;avro;iceberg")
 
 # Core build options - disable unnecessary components for Python builds
 _duckdb_set_default(BUILD_SHELL OFF)

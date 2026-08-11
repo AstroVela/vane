@@ -44,6 +44,8 @@
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -313,6 +315,37 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			node_impl = TranslateBatchCopyToFile(batch_op, children);
 		}
 		break;
+	}
+	case PhysicalOperatorType::EXTENSION: {
+		auto provider = op.GetExtensionWriteTaskProvider();
+		if (!provider) {
+			throw NotImplementedException(
+			    "Distributed pipeline does not support extension operator without an extension write provider: %s",
+			    op.GetName());
+		}
+		auto extension_write_name = provider->ExtensionWriteName();
+		if (extension_write_name.empty()) {
+			throw InvalidInputException("Distributed extension write requires a non-empty name");
+		}
+		if (&op != &plan_->Root()) {
+			throw InvalidInputException("Distributed extension write %s must be the physical plan root",
+			                            extension_write_name);
+		}
+		if (children.size() != 1 || !children[0]) {
+			throw InvalidInputException("Distributed extension write %s requires exactly one child",
+			                            extension_write_name);
+		}
+		auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(children[0]->inner());
+		if (!copy_finish) {
+			throw NotImplementedException(
+			    "Distributed extension write %s requires a COPY child returning written-file statistics",
+			    extension_write_name);
+		}
+		// The extension root is coordinator-only. Workers execute the translated
+		// COPY child; PlanRunner invokes the provider after all selected attempts
+		// have produced and validated their files.
+		node_stack_.push_back(children[0]);
+		return;
 	}
 	case PhysicalOperatorType::TABLE_SCAN: {
 		auto &table_scan = static_cast<PhysicalTableScan &>(op);

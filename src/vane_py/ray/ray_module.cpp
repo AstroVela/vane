@@ -22,6 +22,7 @@
 #include <duckdb/execution/distributed/common_types.hpp>
 #include <duckdb/execution/distributed/copy_to_file.hpp>
 #include <duckdb/execution/distributed/copy_finalize.hpp>
+#include <duckdb/execution/distributed/extension_write_task_provider.hpp>
 #include <duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp>
 #include <duckdb/execution/distributed/plan/exchange_source_task.hpp>
 #include <duckdb/execution/distributed/plan/fte_split_queue.hpp>
@@ -37,12 +38,14 @@
 #include <duckdb/planner/planner.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/local_file_system.hpp>
+#include <duckdb/common/map.hpp>
+#include <duckdb/common/set.hpp>
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 
 #include <exception>
 #include <optional>
-#include <set>
+#include <tuple>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);
@@ -71,6 +74,11 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/main/client_data.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/main/database_manager.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/extension_helper.hpp>
+#include <duckdb/main/secret/secret_manager.hpp>
+#include <duckdb/parser/keyword_helper.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
@@ -85,6 +93,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
 #include <duckdb/execution/operator/scan/physical_column_data_scan.hpp>
+#include <duckdb/execution/operator/scan/physical_dummy_scan.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
@@ -144,6 +153,35 @@ protected:
 	}
 };
 
+class PhysicalCoordinatorOnlyExtensionWriteForTest final : public PhysicalOperator,
+                                                           public distributed::ExtensionWriteTaskProvider {
+public:
+	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1) {
+	}
+
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
+		return this;
+	}
+
+	string ExtensionWriteName() const override {
+		return "coordinator_only_test_write";
+	}
+
+	void ValidateExtensionWrite(ClientContext &) const override {
+	}
+
+	idx_t FinalizeExtensionWrite(ClientContext &,
+	                             const vector<distributed::DistributedCopyFileInfo> &files) const override {
+		return files.size();
+	}
+
+protected:
+	void SerializeOperatorData(Serializer &) const override {
+		throw NotImplementedException("COORDINATOR_ONLY_EXTENSION_WRITE root cannot be serialized");
+	}
+};
+
 class CountingResultCollectorForTest {
 public:
 	CountingResultCollectorForTest() : calls(make_shared_ptr<std::atomic<idx_t>>(0)) {
@@ -176,7 +214,8 @@ private:
 static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_connection,
                                                         const py::object &connection_snapshot,
                                                         const py::object &effective_session_config,
-                                                        bool apply_snapshot_s3_credentials) {
+                                                        bool apply_snapshot_s3_credentials,
+                                                        bool snapshot_secrets_prepared = false) {
 	auto resolved_connection = connection_snapshot.is_none()
 	                               ? cleanup_connection
 	                               : ResolveConnectionForSnapshot(cleanup_connection, connection_snapshot);
@@ -184,8 +223,12 @@ static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_conne
 	if (resolved_wrapper.con.ConnectionIsClosed()) {
 		throw std::runtime_error("resolved shuffle cleanup connection is closed");
 	}
-	ApplyEffectiveVaneSessionConfig(resolved_wrapper.con.GetConnection(), effective_session_config);
-	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, false, true, apply_snapshot_s3_credentials);
+	ApplyEffectiveVaneSessionConfig(resolved_wrapper, effective_session_config);
+	ConnectionSnapshotApplyOptions snapshot_options;
+	snapshot_options.apply_session_config = false;
+	snapshot_options.apply_s3_credentials = apply_snapshot_s3_credentials;
+	snapshot_options.apply_secrets = apply_snapshot_s3_credentials && !snapshot_secrets_prepared;
+	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, snapshot_options);
 	return resolved_connection;
 }
 
@@ -584,6 +627,41 @@ void register_ray_bindings(py::module_ &mod) {
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
 
 	m.def(
+	    "_resolve_query_snapshot_connection",
+	    [](py::object connection, const string &query_id) {
+		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
+		    if (snapshot.is_none()) {
+			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
+		    }
+		    return ResolveConnectionForSnapshot(std::move(connection), snapshot);
+	    },
+	    py::arg("connection"), py::arg("query_id"));
+
+	m.def(
+	    "_prepare_query_secret_snapshot",
+	    [](py::object connection, const string &query_id, bool include_snapshot_secrets) {
+		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
+		    if (snapshot.is_none()) {
+			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
+		    }
+		    auto &connection_wrapper = ExtractPyConnectionWrapper(connection);
+		    CloseOpenPythonConnectionResult(connection_wrapper);
+		    if (!include_snapshot_secrets) {
+			    py::dict empty_snapshot;
+			    empty_snapshot[py::str("secrets")] = py::list();
+			    ApplySecretSnapshot(*connection_wrapper.con.GetConnection().context, empty_snapshot);
+			    return;
+		    }
+		    ConnectionSnapshotApplyOptions options;
+		    options.apply_session_config = false;
+		    options.apply_s3_credentials = false;
+		    options.apply_settings = false;
+		    options.apply_secrets = true;
+		    ApplyConnectionSnapshot(connection, snapshot, options);
+	    },
+	    py::arg("connection"), py::arg("query_id"), py::arg("include_snapshot_secrets") = true);
+
+	m.def(
 	    "_register_query_python_replay_state",
 	    [](const string &query_id, const PyPhysicalPlanWrapper &plan) {
 		    if (query_id.empty()) {
@@ -656,7 +734,7 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "cleanup_flight_shuffle_for_query",
 	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id,
-	       bool apply_snapshot_s3_credentials, py::object effective_session_config) {
+	       bool apply_snapshot_s3_credentials, py::object effective_session_config, bool snapshot_secrets_prepared) {
 		    py::dict out;
 		    if (query_id.empty()) {
 			    out["registry_entries_removed"] = 0;
@@ -682,16 +760,17 @@ void register_ray_bindings(py::module_ &mod) {
 				    snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
 				    if (!snapshot.is_none()) {
 					    resolved_cleanup_connection = ResolveFlightShuffleCleanupConnection(
-					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials);
+					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials,
+					        snapshot_secrets_prepared);
 				    } else {
-					    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+					    ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
 				    }
 				    // Concurrent idempotent teardown can retire replay state after
 				    // this cleanup cursor was configured. Continue with its
 				    // sanitized session baseline: remaining storage failures stay
 				    // visible and retryable in the registry.
 			    } else {
-				    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+				    ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
 			    }
 			    auto &resolved_wrapper = ExtractPyConnectionWrapper(resolved_cleanup_connection);
 			    auto &context = *resolved_wrapper.con.GetConnection().context;
@@ -716,7 +795,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "",
-	    py::arg("apply_snapshot_s3_credentials") = true, py::arg("effective_session_config") = py::none());
+	    py::arg("apply_snapshot_s3_credentials") = true, py::arg("effective_session_config") = py::none(),
+	    py::arg("snapshot_secrets_prepared") = false);
 
 	m.def(
 	    "_resolve_flight_shuffle_cleanup_connection_for_test",
@@ -781,8 +861,8 @@ void register_ray_bindings(py::module_ &mod) {
 	         py::arg("conn") = py::none())
 	    .def(
 	        "_validate_serializable_for_submission",
-	        [](const PyPhysicalPlanWrapper &p) { (void)p.serialize_root_for_clone(); },
-	        "Validate the physical root before distributed query registration.")
+	        [](const PyPhysicalPlanWrapper &p) { p.validate_serializable_for_submission(); },
+	        "Validate worker-executable physical roots before distributed query registration.")
 	    .def(py::pickle(
 	        // __getstate__: serialize the plan
 	        [](const PyPhysicalPlanWrapper &p) {
@@ -856,6 +936,27 @@ void register_ray_bindings(py::module_ &mod) {
 		    return PyPhysicalPlanWrapper(std::move(distributed_plan));
 	    },
 	    py::arg("query_id"), "Create an intentionally non-serializable physical plan for native tests.");
+
+	m.def(
+	    "_make_coordinator_only_extension_write_plan_for_test",
+	    [](const string &query_id) {
+		    if (query_id.empty()) {
+			    throw duckdb::InternalException("test extension write plan requires a non-empty query_id");
+		    }
+		    auto physical_plan = std::make_shared<duckdb::PhysicalPlan>(duckdb::Allocator::DefaultAllocator());
+		    vector<LogicalType> child_types {LogicalType::BIGINT};
+		    auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
+		    auto &root = physical_plan->Make<PhysicalCoordinatorOnlyExtensionWriteForTest>();
+		    root.children.push_back(child);
+		    physical_plan->SetRoot(root);
+		    uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    auto distributed_plan = std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(
+		        idx, query_id, std::move(physical_plan), std::move(config));
+		    return PyPhysicalPlanWrapper(std::move(distributed_plan));
+	    },
+	    py::arg("query_id"), "Create a coordinator-only extension write plan for submission-boundary tests.");
 
 	m.def(
 	    "_make_worker_task_for_test",
@@ -1160,7 +1261,7 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
-	           py::object effective_session_config_obj) {
+	           py::object effective_session_config_obj, bool snapshot_secrets_prepared) {
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
 		        std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> scan_task_map;
 		        bool has_scan_task_map = false;
@@ -1417,7 +1518,7 @@ void register_ray_bindings(py::module_ &mod) {
 				        py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
 				        // Install refreshed session credentials as a baseline
 				        // before replaying explicit source-connection settings.
-				        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn).con.GetConnection(),
+				        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
 				                                        effective_session_config_obj);
 				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
 				        // Handle deferred deserialization (from pickle round-trip)
@@ -1435,7 +1536,8 @@ void register_ray_bindings(py::module_ &mod) {
 					        deferred_exec_plan.connection_snapshot_ = plan.connection_snapshot_;
 					        deferred_exec_plan.serialized_root_ = plan.serialized_root_;
 					        deferred_exec_plan.worker_connection_ = exec_conn;
-					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config);
+					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config,
+					                                                     !snapshot_secrets_prepared);
 					        exec_plan = &deferred_exec_plan;
 				        }
 
@@ -1443,7 +1545,8 @@ void register_ray_bindings(py::module_ &mod) {
 					        throw py::value_error("PyPhysicalPlanWrapper has no root after deserialization");
 				        }
 				        exec_plan->worker_connection_ = exec_conn;
-				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
+				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config,
+				                                              !snapshot_secrets_prepared);
 				        exec_plan->apply_udf_actor_handles();
 				        auto result = self.execute_native_impl(
 				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
@@ -1465,7 +1568,8 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
-	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
+	        py::arg("effective_session_config") = py::none(), py::arg("snapshot_secrets_prepared") = false,
+	        "Execute physical plan using DuckDB's native Executor");
 
 	// Merge multiple raw-bytes ScanTaskDescriptors into one.
 	// Each descriptor may contain multiple files; the merged result is a single
@@ -4156,7 +4260,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> files;
+		    vector<DistributedCopyFileInfo> files;
 		    DistributedCopyFileInfo first;
 		    first.staging_path = first_staged;
 		    first.row_count = 1;
@@ -4227,7 +4331,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_staged;
 			    first.row_count = 1;
@@ -4310,7 +4414,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> manifest_files;
+		    vector<DistributedCopyFileInfo> manifest_files;
 		    DistributedCopyFileInfo first_manifest;
 		    first_manifest.staging_path = first_staged;
 		    first_manifest.final_path = first_final;
@@ -4333,7 +4437,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    fs.MoveFile(first_staged, first_final);
 
 		    auto make_input_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_staged;
 			    first.row_count = 1;
@@ -4434,7 +4538,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_file;
 			    first.row_count = 1;
@@ -4537,7 +4641,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_file;
 			    first.row_count = 1;
@@ -4616,6 +4720,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.use_tmp_file = use_tmp_file;
 		    try {
 			    auto sink = std::make_shared<CopySinkNode>(1, PipelineNodeRef(), std::move(spec));
+			    sink->SetOperationIdentity("distributed-copy-sink-mode-test");
 			    out["construct_error"] = false;
 			    out["error"] = "";
 			    out["staging_root_base"] = sink->staging_root_base();
@@ -4656,7 +4761,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> files;
+		    vector<DistributedCopyFileInfo> files;
 		    DistributedCopyFileInfo info;
 		    info.staging_path = invisible_file;
 		    info.row_count = 4;
@@ -4725,7 +4830,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_info.final_path = selected_file;
 		    selected_info.row_count = 7;
 		    selected_info.file_size_bytes = selected_body.size();
-		    std::vector<DistributedCopyFileInfo> selected_files;
+		    vector<DistributedCopyFileInfo> selected_files;
 		    selected_files.push_back(std::move(selected_info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
@@ -4831,7 +4936,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (stale_lifecycle_res.is_err()) {
 			    throw std::runtime_error(stale_lifecycle_res.error().what());
 		    }
-		    std::vector<DistributedCopyFileInfo> stale_files;
+		    vector<DistributedCopyFileInfo> stale_files;
 		    stale_files.push_back(make_file_info(stale_file, 1, stale_body.size()));
 		    auto stale_manifest_res = WriteDistributedCopyFinalizeManifest(fs, stale_commit_paths, final_root,
 		                                                                   "direct:" + stale_run_id, stale_files);
@@ -4849,7 +4954,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (committed_lifecycle_res.is_err()) {
 			    throw std::runtime_error(committed_lifecycle_res.error().what());
 		    }
-		    std::vector<DistributedCopyFileInfo> committed_files;
+		    vector<DistributedCopyFileInfo> committed_files;
 		    committed_files.push_back(make_file_info(committed_file, 1, committed_body.size()));
 		    auto committed_manifest_res = WriteDistributedCopyFinalizeManifest(
 		        fs, committed_paths, final_root, "direct:" + committed_run_id, committed_files);

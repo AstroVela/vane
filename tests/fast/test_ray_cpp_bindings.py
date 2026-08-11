@@ -252,6 +252,17 @@ def test_physical_plan_submission_preflight_accepts_serializable_root():
     assert plan._validate_serializable_for_submission() is None
 
 
+def test_submission_preflight_skips_coordinator_only_extension_write_root():
+    plan = vane.ray_cxx._make_coordinator_only_extension_write_plan_for_test("query-coordinator-only-extension-write")
+
+    assert plan._validate_serializable_for_submission() is None
+    with pytest.raises(
+        vane.NotImplementedException,
+        match="COORDINATOR_ONLY_EXTENSION_WRITE root cannot be serialized",
+    ):
+        pickle.dumps(plan)
+
+
 def test_logical_to_physical_plan_propagates_submission_preflight_cause(monkeypatch):
     con = vane.connect()
     logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -2049,6 +2060,7 @@ def test_distributed_copy_sink_mode_local_default_uses_visible_direct_target(mon
 
     assert result["construct_error"] is False, result["error"]
     assert result["staging_root_base"] == ""
+    assert result["staging_run_id"]
     assert result["uses_direct_write"] is True
     assert result["uses_visible_direct_target"] is True
 
