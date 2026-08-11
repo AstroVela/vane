@@ -4,6 +4,7 @@
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
@@ -226,7 +227,16 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 	Allocator &alloc = Allocator::DefaultAllocator();
 	auto plan = std::make_shared<PhysicalPlan>(alloc);
 
-	auto bind_data = scan.bind_data ? scan.bind_data->Copy() : nullptr;
+	unique_ptr<FunctionData> bind_data;
+	if (scan.bind_data) {
+		try {
+			bind_data = scan.bind_data->Copy();
+		} catch (const NotImplementedException &ex) {
+			ErrorData error(ex);
+			throw NotImplementedException("Distributed execution does not support table function \"%s\": %s",
+			                              scan.function.name, error.RawMessage());
+		}
+	}
 	auto table_filters = scan.table_filters ? scan.table_filters->Copy() : nullptr;
 	auto extra_info = CopyExtraOperatorInfo(scan.extra_info);
 
@@ -243,7 +253,9 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 	std::vector<ScanTaskDescriptor> tasks;
 
 	if (!scan.bind_data) {
-		throw BinderException("MakeTableScanTasks: bind_data is nullptr for function '%s'", scan.function.name);
+		throw NotImplementedException("Distributed execution does not support table function \"%s\": bind data is "
+		                              "missing",
+		                              scan.function.name);
 	}
 
 	vector<OpenFileInfo> files;
@@ -253,9 +265,9 @@ std::vector<ScanTaskDescriptor> MakeTableScanTasks(const PhysicalTableScan &scan
 	} else {
 		auto *ext_provider = dynamic_cast<ExtensionFileListProvider *>(scan.bind_data.get());
 		if (!ext_provider) {
-			throw BinderException("MakeTableScanTasks: bind_data for '%s' is not MultiFileBindData or "
-			                      "ExtensionFileListProvider (type: %s)",
-			                      scan.function.name, typeid(*scan.bind_data).name());
+			throw NotImplementedException("Distributed execution does not support table function \"%s\": its bind data "
+			                              "does not provide a distributable file list",
+			                              scan.function.name);
 		}
 		for (auto &path : ext_provider->GetFileList()) {
 			files.emplace_back(path);

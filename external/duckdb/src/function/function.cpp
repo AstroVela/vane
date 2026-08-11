@@ -37,7 +37,7 @@ TableFunctionData::~TableFunctionData() {
 }
 
 unique_ptr<FunctionData> TableFunctionData::Copy() const {
-	throw InternalException("Copy not supported for TableFunctionData");
+	throw NotImplementedException("Copy not supported for TableFunctionData");
 }
 
 bool TableFunctionData::Equals(const FunctionData &other) const {

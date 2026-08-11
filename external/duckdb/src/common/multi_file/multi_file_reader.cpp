@@ -60,6 +60,7 @@ MultiFileBindData::~MultiFileBindData() {
 
 unique_ptr<FunctionData> MultiFileBindData::Copy() const {
 	auto result = make_uniq<MultiFileBindData>();
+	result->column_ids = column_ids;
 	if (bind_data) {
 		if (typeid(*bind_data) == typeid(TableFunctionData)) {
 			result->bind_data = make_uniq<TableFunctionData>();

@@ -885,6 +885,10 @@ BuildDistributedPipelineNode(const std::shared_ptr<duckdb::distributed::Distribu
 	PlanConfig cfg(plan->idx(), plan->query_id(), plan->execution_config());
 	auto pipeline_res = physical_plan_to_pipeline_node(std::move(cfg), std::move(physical_plan), client_context);
 	if (!pipeline_res.is_ok()) {
+		if (pipeline_res.error().type() == DuckDBError::Type::ValueError) {
+			throw duckdb::InvalidInputException("Ray runner cannot execute this query: %s",
+			                                    pipeline_res.error().what());
+		}
 		throw duckdb::InternalException(string("Failed to build distributed pipeline node: ") +
 		                                pipeline_res.error().what());
 	}
