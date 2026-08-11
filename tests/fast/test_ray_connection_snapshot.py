@@ -704,6 +704,83 @@ def test_worker_nondefault_snapshot_reuses_database_and_secret_domain():
         source_connection.close()
 
 
+def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_path):
+    from vane.runners.ray import worker as worker_module
+
+    ray_cxx = _require_ray_cxx()
+    database_path = tmp_path / "identity-source.duckdb"
+    source_connection = vane.connect(str(database_path), config={"threads": "2"})
+    source_connection.execute("CREATE TABLE snapshot_items AS SELECT 42 AS value")
+    source_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT * FROM snapshot_items"),
+        "snapshot-file-identity-source",
+    ).to_physical_plan(source_connection)
+    source_payload = pickle.dumps(source_plan)
+    source_connection.close()
+    del source_connection
+    del source_plan
+    gc.collect()
+
+    first_plan = pickle.loads(source_payload)
+    second_state = list(first_plan.__getstate__())
+    second_state[3] = "snapshot-file-identity-second-resource"
+    second_snapshot = dict(second_state[6])
+    second_bootstrap = dict(second_snapshot["bootstrap"])
+    second_bootstrap["config"] = {**second_bootstrap["config"], "threads": "3"}
+    second_snapshot["bootstrap"] = second_bootstrap
+    second_state[6] = second_snapshot
+    second_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    second_plan.__setstate__(tuple(second_state))
+
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor._snapshot_connections = {}
+    actor._snapshot_connections_lock = threading.Lock()
+    actor._native_execution_condition = threading.Condition()
+    actor._active_snapshot_execution_cursors = 0
+    actor._shutdown_started = False
+    bootstrap_connection = vane.connect()
+    first_cursor = None
+    second_cursor = None
+    first_query_id = "snapshot-file-identity-first"
+    second_query_id = "snapshot-file-identity-second"
+    try:
+        assert ray_cxx._register_query_python_replay_state(first_query_id, first_plan) is True
+        assert ray_cxx._register_query_python_replay_state(second_query_id, second_plan) is True
+
+        first_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, first_query_id)
+        second_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, second_query_id)
+
+        assert len(actor._snapshot_connections) == 2
+        plan_runner = ray_cxx.DistributedPhysicalPlanRunner()
+        first_result = plan_runner.execute_native(first_cursor, first_plan)
+        second_result = plan_runner.execute_native(second_cursor, second_plan)
+        assert _table_from_native_result(first_result).column(0).to_pylist() == [42]
+        assert _table_from_native_result(second_result).column(0).to_pylist() == [42]
+        assert first_cursor.execute("SELECT current_setting('access_mode'), current_setting('threads')").fetchone() == (
+            "read_only",
+            2,
+        )
+        assert second_cursor.execute(
+            "SELECT current_setting('access_mode'), current_setting('threads')"
+        ).fetchone() == (
+            "read_only",
+            3,
+        )
+        assert first_cursor.execute("SELECT * FROM snapshot_items").fetchall() == [(42,)]
+        assert second_cursor.execute("SELECT * FROM snapshot_items").fetchall() == [(42,)]
+    finally:
+        if second_cursor is not None:
+            actor_class._close_snapshot_execution_cursor(actor, second_cursor)
+        if first_cursor is not None:
+            actor_class._close_snapshot_execution_cursor(actor, first_cursor)
+        for snapshot_connection in actor._snapshot_connections.values():
+            snapshot_connection.close()
+        ray_cxx._cleanup_query_python_replay_state(first_query_id)
+        ray_cxx._cleanup_query_python_replay_state(second_query_id)
+        bootstrap_connection.close()
+
+
 def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_path):
     ray_cxx = _require_ray_cxx()
     query_id = "snapshot-file-disable-persistent-secrets"

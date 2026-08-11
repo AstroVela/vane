@@ -639,12 +639,16 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "_resolve_query_snapshot_connection",
-	    [](py::object connection, const string &query_id) {
+	    [](py::object, const string &query_id) {
 		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
 		    if (snapshot.is_none()) {
 			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
 		    }
-		    return ResolveConnectionForSnapshot(std::move(connection), snapshot);
+		    // Ray workers cache this connection by the snapshot's exact engine and
+		    // extension identity. Always create its DatabaseInstance independently
+		    // from the session bootstrap so an extension loaded for one query cannot
+		    // contaminate another query's exact extension contract.
+		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true);
 	    },
 	    py::arg("connection"), py::arg("query_id"));
 

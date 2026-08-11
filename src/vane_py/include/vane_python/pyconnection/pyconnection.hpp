@@ -373,6 +373,8 @@ public:
 	duckdb::pyarrow::RecordBatchReader FetchRecordBatchReader(const idx_t rows_per_batch);
 
 	static shared_ptr<DuckDBPyConnection> Connect(const py::object &database, bool read_only, const py::dict &config);
+	static shared_ptr<DuckDBPyConnection> ConnectUncached(const py::object &database, bool read_only,
+	                                                      const py::dict &config);
 	void SetConnectionBootstrapConfig(const string &database, bool read_only, const py::dict &config);
 	py::dict ExportConnectionBootstrapConfig() const;
 	void InitializeVaneSession();

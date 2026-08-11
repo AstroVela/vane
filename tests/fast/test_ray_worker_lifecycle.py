@@ -302,7 +302,14 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         def shutdown(self):
             shutdown_started.set()
 
-    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(":memory:", False, (("threads", "2"),))
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (("threads", "2"),),
+        "test-source-id",
+        (),
+        (),
+    )
 
     class DummyActor:
         _shutdown_lock = threading.Lock()

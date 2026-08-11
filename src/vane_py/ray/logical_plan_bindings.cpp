@@ -212,12 +212,25 @@ static py::dict SanitizeBootstrapConfig(const py::dict &config, bool in_memory_d
 		sanitized[item.first] = item.second;
 	}
 	// A transported in-memory plan carries the complete source secret snapshot.
-	// File databases retain their bootstrap identity so DuckDB can safely reuse
-	// an already-open instance of the same file.
+	// File databases retain the settings needed to identify the source
+	// bootstrap; worker execution may separately force an isolated read-only
+	// instance.
 	if (in_memory_database) {
 		sanitized[py::str("allow_persistent_secrets")] = py::str("false");
 	}
 	return sanitized;
+}
+
+static py::dict ForceReadOnlyAccessMode(const py::dict &config) {
+	py::dict result;
+	for (auto item : config) {
+		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
+		if (name != "access_mode") {
+			result[item.first] = item.second;
+		}
+	}
+	result[py::str("access_mode")] = py::str("read_only");
+	return result;
 }
 
 static py::object LookupBootstrapSnapshot(const py::object &snapshot_obj) {
@@ -422,11 +435,13 @@ static void DisablePersistentSecretsWhenUnused(DuckDBPyConnection &connection) {
 	(void)SecretManager::Get(database).TrySetEnablePersistentSecrets(false);
 }
 
-static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj) {
+static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
+                                                        bool force_file_read_only = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		py::dict config;
 		config[py::str("allow_persistent_secrets")] = py::str("false");
-		auto connection = DuckDBPyConnection::Connect(py::str(":memory:"), false, std::move(config));
+		auto connection = use_instance_cache ? DuckDBPyConnection::Connect(py::str(":memory:"), false, config)
+		                                     : DuckDBPyConnection::ConnectUncached(py::str(":memory:"), false, config);
 		DisablePersistentSecretsWhenUnused(*connection);
 		return py::cast(std::move(connection));
 	}
@@ -435,9 +450,9 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	auto database = BootstrapDatabasePath(bootstrap_obj);
 	auto in_memory_database = duckdb::DBConfig::IsInMemoryDatabase(database.c_str());
 
-	bool read_only = false;
+	bool source_read_only = false;
 	if (bootstrap.contains(py::str("read_only")) && !bootstrap[py::str("read_only")].is_none()) {
-		read_only = bootstrap[py::str("read_only")].cast<bool>();
+		source_read_only = bootstrap[py::str("read_only")].cast<bool>();
 	}
 
 	py::dict config = py::dict();
@@ -445,12 +460,20 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	    py::isinstance<py::dict>(bootstrap[py::str("config")])) {
 		config = CopyPyDict(bootstrap[py::str("config")].cast<py::dict>());
 	}
+	auto sanitized_config = SanitizeBootstrapConfig(config, in_memory_database);
+	auto worker_file_read_only = force_file_read_only && !in_memory_database;
+	if (worker_file_read_only) {
+		sanitized_config = ForceReadOnlyAccessMode(sanitized_config);
+	}
+	auto connection_read_only = source_read_only || worker_file_read_only;
 	auto connection =
-	    DuckDBPyConnection::Connect(py::str(database), read_only, SanitizeBootstrapConfig(config, in_memory_database));
+	    use_instance_cache
+	        ? DuckDBPyConnection::Connect(py::str(database), connection_read_only, sanitized_config)
+	        : DuckDBPyConnection::ConnectUncached(py::str(database), connection_read_only, sanitized_config);
 	DisablePersistentSecretsWhenUnused(*connection);
 	// Keep the source bootstrap identity for connection matching even though
-	// worker extension security settings are forced off.
-	connection->SetConnectionBootstrapConfig(database, read_only, config);
+	// worker security and file access settings are forced off/read-only.
+	connection->SetConnectionBootstrapConfig(database, source_read_only, config);
 	return py::cast(std::move(connection));
 }
 
@@ -1570,6 +1593,9 @@ BuildDistributedPipelineNode(const std::shared_ptr<duckdb::distributed::Distribu
 		throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root");
 	}
 	PlanConfig cfg(plan->idx(), plan->query_id(), plan->execution_config());
+	if (client_context && client_context->db) {
+		cfg.db = client_context->db;
+	}
 	auto pipeline_res = physical_plan_to_pipeline_node(std::move(cfg), std::move(physical_plan), client_context);
 	if (!pipeline_res.is_ok()) {
 		if (pipeline_res.error().type() == DuckDBError::Type::ValueError) {

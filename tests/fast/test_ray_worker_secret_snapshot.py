@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from vane.runners.ray import worker as worker_module
 
 
@@ -27,10 +29,13 @@ def _worker_actor():
 def test_worker_secret_snapshot_identity_includes_bootstrap_and_exact_secrets(monkeypatch):
     snapshots = {
         "shared": {
+            "duckdb_source_id": "test-source-id",
+            "extensions": [],
+            "distributed_extensions": [],
             "secrets": [
                 {"storage": "memory", "name": "z", "payload": b"z-payload"},
                 {"storage": "memory", "name": "a", "payload": b"a-payload"},
-            ]
+            ],
         },
         "isolated": {
             "bootstrap": {
@@ -38,6 +43,9 @@ def test_worker_secret_snapshot_identity_includes_bootstrap_and_exact_secrets(mo
                 "read_only": False,
                 "config": {"threads": "2"},
             },
+            "duckdb_source_id": "test-source-id",
+            "extensions": [],
+            "distributed_extensions": [],
             "secrets": [],
         },
     }
@@ -71,6 +79,9 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         "/tmp/vane-worker-snapshot.duckdb",
         False,
         (("threads", "2"),),
+        "test-source-id",
+        (),
+        (),
     )
     cursors = []
     resolve_calls = []
@@ -115,12 +126,129 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     assert actor._active_snapshot_execution_cursors == 0
 
 
-def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(monkeypatch):
+def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(monkeypatch):
     actor_class, actor = _worker_actor()
+    base_snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "distributed_extensions": [],
+    }
+    httpfs_snapshot = {
+        **base_snapshot,
+        "extensions": [{"name": "httpfs", "version": "test-version"}],
+    }
+    identities = {
+        "plain-a": worker_module._worker_snapshot_database_identity(base_snapshot),
+        "plain-b": worker_module._worker_snapshot_database_identity(base_snapshot),
+        "httpfs": worker_module._worker_snapshot_database_identity(httpfs_snapshot),
+    }
+    assert identities["plain-a"] == identities["plain-b"]
+    assert identities["plain-a"] != identities["httpfs"]
+
+    created_connections = []
+
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def close(self):
+            return None
+
+    class ResolvedConnection:
+        def __init__(self, query_id):
+            self.query_id = query_id
+
+        def cursor(self):
+            return Cursor(self)
+
+    def resolve(_connection, query_id):
+        connection = ResolvedConnection(query_id)
+        created_connections.append(connection)
+        return connection
+
     monkeypatch.setattr(
         worker_module,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: worker_module.WorkerSnapshotDatabaseIdentity(":memory:", False, ()),
+        lambda query_id: identities[query_id],
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: resolve,
+    )
+
+    plain_a = actor_class._get_snapshot_execution_cursor(actor, object(), "plain-a")
+    plain_b = actor_class._get_snapshot_execution_cursor(actor, object(), "plain-b")
+    httpfs = actor_class._get_snapshot_execution_cursor(actor, object(), "httpfs")
+
+    assert plain_a.connection is plain_b.connection
+    assert httpfs.connection is not plain_a.connection
+    assert len(created_connections) == 2
+    assert len(actor._snapshot_connections) == 2
+
+    actor_class._close_snapshot_execution_cursor(actor, httpfs)
+    actor_class._close_snapshot_execution_cursor(actor, plain_b)
+    actor_class._close_snapshot_execution_cursor(actor, plain_a)
+    assert actor._active_snapshot_execution_cursors == 0
+
+
+def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
+    snapshot = {
+        "bootstrap": {
+            "database": ":memory:",
+            "read_only": False,
+            "config": {"threads": 2},
+        },
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "distributed_extensions": [],
+    }
+    string_config_snapshot = {
+        **snapshot,
+        "bootstrap": {**snapshot["bootstrap"], "config": {"threads": "2"}},
+    }
+
+    assert worker_module._worker_snapshot_database_identity(
+        snapshot
+    ) == worker_module._worker_snapshot_database_identity(string_config_snapshot)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "message"),
+    [
+        ({"extensions": [], "distributed_extensions": []}, "duckdb_source_id"),
+        (
+            {
+                "duckdb_source_id": "test-source-id",
+                "extensions": [
+                    {"name": "httpfs", "version": "test-version"},
+                    {"name": "httpfs", "version": "test-version"},
+                ],
+                "distributed_extensions": [],
+            },
+            "duplicate extension name",
+        ),
+    ],
+)
+def test_worker_snapshot_database_identity_rejects_ambiguous_contract(snapshot, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        worker_module._worker_snapshot_database_identity(snapshot)
+
+
+def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(monkeypatch):
+    actor_class, actor = _worker_actor()
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (),
+        (),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
     )
 
     class Cursor:
@@ -132,7 +260,14 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
             assert actor._active_snapshot_execution_cursors == 1
             return Cursor()
 
-    cursor = actor_class._get_snapshot_execution_cursor(actor, Connection(), "query-a")
+    resolved_connection = Connection()
+    monkeypatch.setattr(
+        worker_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
+    )
+
+    cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
     actor_class._close_snapshot_execution_cursor(actor, cursor)
 
     assert actor._active_snapshot_execution_cursors == 0
@@ -140,18 +275,33 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
 
 def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeypatch):
     actor_class, actor = _worker_actor()
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (),
+        (),
+    )
     monkeypatch.setattr(
         worker_module,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: worker_module.WorkerSnapshotDatabaseIdentity(":memory:", False, ()),
+        lambda _query_id: database_identity,
     )
 
     class Connection:
         def cursor(self):
             raise RuntimeError("cursor creation failed")
 
+    resolved_connection = Connection()
+    monkeypatch.setattr(
+        worker_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
+    )
+
     try:
-        actor_class._get_snapshot_execution_cursor(actor, Connection(), "query-a")
+        actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
     except RuntimeError as exc:
         assert str(exc) == "cursor creation failed"
     else:

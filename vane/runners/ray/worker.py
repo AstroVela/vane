@@ -258,33 +258,126 @@ class WorkerSecretSnapshotIdentity(NamedTuple):
 
 
 class WorkerSnapshotDatabaseIdentity(NamedTuple):
-    """Bootstrap identity for a worker-owned DatabaseInstance."""
+    """Exact identity for a worker-owned DatabaseInstance."""
 
     database: str
     read_only: bool
     config: tuple[tuple[str, str], ...]
+    duckdb_source_id: str
+    extensions: tuple[tuple[str, str], ...]
+    distributed_extensions: tuple[tuple[str, int, tuple[tuple[str, str, int], ...]], ...]
 
-    def is_default(self) -> bool:
-        return self == WorkerSnapshotDatabaseIdentity(":memory:", False, ())
+    def has_static_extension(self, extension_name: str) -> bool:
+        normalized_name = str(extension_name).lower()
+        return any(name.lower() == normalized_name for name, _version in self.extensions)
+
+
+def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description: str) -> str:
+    value = entry.get(field)
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"query connection snapshot {description} {field} must be a non-empty string")
+    return value
+
+
+def _snapshot_protocol_version(entry: Mapping[str, Any], description: str) -> int:
+    value = entry.get("protocol_version")
+    if type(value) is not int or value <= 0:
+        raise TypeError(
+            f"query connection snapshot {description} protocol_version must be a positive non-boolean integer"
+        )
+    return value
 
 
 def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSnapshotDatabaseIdentity:
     raw_bootstrap = snapshot.get("bootstrap")
     if raw_bootstrap is None:
-        return WorkerSnapshotDatabaseIdentity(":memory:", False, ())
-    if not isinstance(raw_bootstrap, Mapping):
-        raise TypeError("query connection snapshot bootstrap must be a mapping")
-    database = str(raw_bootstrap.get("database") or ":memory:")
-    read_only = bool(raw_bootstrap.get("read_only", False))
-    raw_config = raw_bootstrap.get("config")
-    if raw_config is None:
-        raw_config = {}
-    if not isinstance(raw_config, Mapping):
-        raise TypeError("query connection snapshot bootstrap config must be a mapping")
+        database = ":memory:"
+        read_only = False
+        raw_config: Mapping[str, Any] = {}
+    else:
+        if not isinstance(raw_bootstrap, Mapping):
+            raise TypeError("query connection snapshot bootstrap must be a mapping")
+        raw_database = raw_bootstrap.get("database", ":memory:")
+        if not isinstance(raw_database, str) or not raw_database:
+            raise TypeError("query connection snapshot bootstrap database must be a non-empty string")
+        database = raw_database
+        raw_read_only = raw_bootstrap.get("read_only", False)
+        if not isinstance(raw_read_only, bool):
+            raise TypeError("query connection snapshot bootstrap read_only must be a boolean")
+        read_only = raw_read_only
+        raw_config_value = raw_bootstrap.get("config", {})
+        if not isinstance(raw_config_value, Mapping):
+            raise TypeError("query connection snapshot bootstrap config must be a mapping")
+        raw_config = raw_config_value
     config = tuple(sorted((str(key).lower(), str(value)) for key, value in raw_config.items()))
     if len({key for key, _value in config}) != len(config):
         raise ValueError("query connection snapshot bootstrap has duplicate case-insensitive config keys")
-    return WorkerSnapshotDatabaseIdentity(database, read_only, config)
+
+    duckdb_source_id = snapshot.get("duckdb_source_id")
+    if not isinstance(duckdb_source_id, str) or not duckdb_source_id:
+        raise TypeError("query connection snapshot duckdb_source_id must be a non-empty string")
+
+    raw_extensions = snapshot.get("extensions")
+    if not isinstance(raw_extensions, list):
+        raise TypeError("query connection snapshot extensions must be a list")
+    extensions: list[tuple[str, str]] = []
+    extension_names: set[str] = set()
+    for raw_extension in raw_extensions:
+        if not isinstance(raw_extension, Mapping):
+            raise TypeError("query connection snapshot extension entry must be a mapping")
+        name = _snapshot_nonempty_string(raw_extension, "name", "extension")
+        version = raw_extension.get("version")
+        if not isinstance(version, str):
+            raise TypeError("query connection snapshot extension version must be a string")
+        if name in extension_names:
+            raise ValueError(f"query connection snapshot has duplicate extension name: {name}")
+        extension_names.add(name)
+        extensions.append((name, version))
+    extensions.sort()
+
+    raw_distributed_extensions = snapshot.get("distributed_extensions")
+    if not isinstance(raw_distributed_extensions, list):
+        raise TypeError("query connection snapshot distributed_extensions must be a list")
+    distributed_extensions: list[tuple[str, int, tuple[tuple[str, str, int], ...]]] = []
+    distributed_extension_names: set[str] = set()
+    for raw_manifest in raw_distributed_extensions:
+        if not isinstance(raw_manifest, Mapping):
+            raise TypeError("query connection snapshot distributed extension entry must be a mapping")
+        extension_name = _snapshot_nonempty_string(raw_manifest, "extension_name", "distributed extension")
+        if extension_name in distributed_extension_names:
+            raise ValueError(f"query connection snapshot has duplicate distributed extension name: {extension_name}")
+        distributed_extension_names.add(extension_name)
+        extension_protocol_version = _snapshot_protocol_version(raw_manifest, "distributed extension")
+        raw_capabilities = raw_manifest.get("capabilities")
+        if not isinstance(raw_capabilities, list):
+            raise TypeError("query connection snapshot distributed extension capabilities must be a list")
+        capabilities: list[tuple[str, str, int]] = []
+        capability_names: set[tuple[str, str]] = set()
+        for raw_capability in raw_capabilities:
+            if not isinstance(raw_capability, Mapping):
+                raise TypeError("query connection snapshot distributed extension capability must be a mapping")
+            kind = _snapshot_nonempty_string(raw_capability, "kind", "distributed extension capability")
+            name = _snapshot_nonempty_string(raw_capability, "name", "distributed extension capability")
+            capability_name = (kind, name)
+            if capability_name in capability_names:
+                raise ValueError(
+                    f"query connection snapshot has duplicate distributed extension capability: {kind}:{name}"
+                )
+            capability_names.add(capability_name)
+            capabilities.append(
+                (kind, name, _snapshot_protocol_version(raw_capability, "distributed extension capability"))
+            )
+        capabilities.sort()
+        distributed_extensions.append((extension_name, extension_protocol_version, tuple(capabilities)))
+    distributed_extensions.sort()
+    return WorkerSnapshotDatabaseIdentity(
+        database,
+        read_only,
+        config,
+        duckdb_source_id,
+        tuple(extensions),
+        tuple(distributed_extensions),
+    )
 
 
 def _query_worker_snapshot_database_identity(connection_snapshot_query_id: str) -> WorkerSnapshotDatabaseIdentity:
@@ -328,11 +421,27 @@ def _query_worker_secret_snapshot_identity(
 
     database_identity = _worker_snapshot_database_identity(snapshot)
     digest = hashlib.sha256()
+    _update_secret_identity_digest(digest, b"worker-snapshot-v1")
     _update_secret_identity_digest(digest, database_identity.database.encode("utf-8"))
     _update_secret_identity_digest(digest, b"1" if database_identity.read_only else b"0")
+    _update_secret_identity_digest(digest, str(len(database_identity.config)).encode("ascii"))
     for key, value in database_identity.config:
         _update_secret_identity_digest(digest, key.encode("utf-8"))
         _update_secret_identity_digest(digest, value.encode("utf-8"))
+    _update_secret_identity_digest(digest, database_identity.duckdb_source_id.encode("utf-8"))
+    _update_secret_identity_digest(digest, str(len(database_identity.extensions)).encode("ascii"))
+    for static_extension_name, static_extension_version in database_identity.extensions:
+        _update_secret_identity_digest(digest, static_extension_name.encode("utf-8"))
+        _update_secret_identity_digest(digest, static_extension_version.encode("utf-8"))
+    _update_secret_identity_digest(digest, str(len(database_identity.distributed_extensions)).encode("ascii"))
+    for extension_name, protocol_version, capabilities in database_identity.distributed_extensions:
+        _update_secret_identity_digest(digest, extension_name.encode("utf-8"))
+        _update_secret_identity_digest(digest, str(protocol_version).encode("ascii"))
+        _update_secret_identity_digest(digest, str(len(capabilities)).encode("ascii"))
+        for kind, capability_name, capability_protocol_version in capabilities:
+            _update_secret_identity_digest(digest, kind.encode("utf-8"))
+            _update_secret_identity_digest(digest, capability_name.encode("utf-8"))
+            _update_secret_identity_digest(digest, str(capability_protocol_version).encode("ascii"))
 
     if not include_snapshot_secrets:
         return WorkerSecretSnapshotIdentity(digest=digest.digest(), secret_count=0)
@@ -347,27 +456,27 @@ def _query_worker_secret_snapshot_identity(
         if not isinstance(raw_secret, Mapping):
             raise TypeError("query connection snapshot secret entry must be a mapping")
         storage = raw_secret.get("storage")
-        name = raw_secret.get("name")
+        secret_name = raw_secret.get("name")
         payload = raw_secret.get("payload")
         if not isinstance(storage, str) or not storage:
             raise TypeError("query connection snapshot secret storage must be a non-empty string")
-        if not isinstance(name, str) or not name:
+        if not isinstance(secret_name, str) or not secret_name:
             raise TypeError("query connection snapshot secret name must be a non-empty string")
         if not isinstance(payload, bytes) or not payload:
             raise TypeError("query connection snapshot secret payload must be non-empty bytes")
-        identity = (storage, name)
+        identity = (storage, secret_name)
         if identity in seen_identities:
-            raise ValueError(f"query connection snapshot has duplicate secret identity: {storage}/{name}")
-        normalized_name = name.lower()
+            raise ValueError(f"query connection snapshot has duplicate secret identity: {storage}/{secret_name}")
+        normalized_name = secret_name.lower()
         if normalized_name in seen_names:
-            raise ValueError(f"query connection snapshot has duplicate case-insensitive secret name: {name}")
+            raise ValueError(f"query connection snapshot has duplicate case-insensitive secret name: {secret_name}")
         seen_identities.add(identity)
         seen_names.add(normalized_name)
-        secrets.append((storage, name, payload))
+        secrets.append((storage, secret_name, payload))
     secrets.sort()
-    for storage, name, payload in secrets:
+    for storage, secret_name, payload in secrets:
         _update_secret_identity_digest(digest, storage.encode("utf-8"))
-        _update_secret_identity_digest(digest, name.encode("utf-8"))
+        _update_secret_identity_digest(digest, secret_name.encode("utf-8"))
         _update_secret_identity_digest(digest, payload)
     return WorkerSecretSnapshotIdentity(digest=digest.digest(), secret_count=len(secrets))
 
@@ -1580,6 +1689,8 @@ class RayWorkerActor:
         self,
         bootstrap_connection: Any,
         connection_snapshot_query_id: str,
+        *,
+        database_identity: WorkerSnapshotDatabaseIdentity | None = None,
     ) -> Any:
         """Return a task cursor on the snapshot's stable DatabaseInstance."""
         with self._native_execution_condition:
@@ -1587,9 +1698,8 @@ class RayWorkerActor:
                 raise RuntimeError("Ray worker runtime is shutting down")
             self._active_snapshot_execution_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0)) + 1
         try:
-            database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
-            if database_identity.is_default():
-                return bootstrap_connection.cursor()
+            if database_identity is None:
+                database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
 
             snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
             if snapshot_connections_lock is None:
@@ -1947,17 +2057,20 @@ class RayWorkerActor:
                 if cleanup_context.session_id in getattr(self, "_session_connections", {}):
                     self._session_s3_configs[cleanup_context.session_id] = effective_s3_config
 
+        database_identity = _query_worker_snapshot_database_identity(cleanup_context.connection_snapshot_query_id)
         cleanup_cursor = self._get_snapshot_execution_cursor(
             self._get_shared_conn(),
             cleanup_context.connection_snapshot_query_id,
+            database_identity=database_identity,
         )
         secret_snapshot_lease: WorkerSecretSnapshotIdentity | None = None
         try:
-            _configure_duckdb_s3(
-                cleanup_cursor,
-                effective_s3_config,
-                use_session_credentials=cleanup_context.use_session_credentials,
-            )
+            if database_identity.has_static_extension("httpfs"):
+                _configure_duckdb_s3(
+                    cleanup_cursor,
+                    effective_s3_config,
+                    use_session_credentials=cleanup_context.use_session_credentials,
+                )
             apply_snapshot_s3_credentials = not cleanup_context.use_session_credentials
             secret_snapshot_lease = self._acquire_worker_secret_snapshot(
                 cleanup_cursor,
@@ -2461,9 +2574,11 @@ class RayWorkerActor:
         start = time.monotonic()
 
         try:
+            database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
             cursor = self._get_snapshot_execution_cursor(
                 conn,
                 connection_snapshot_query_id,
+                database_identity=database_identity,
             )
             with self._session_connections_lock:
                 if self._shutdown_started:
@@ -2483,11 +2598,12 @@ class RayWorkerActor:
                 if self._worker_native_query_is_closing(native_query_id):
                     raise RuntimeError(f"native query is closing: {native_query_id}")
                 raise RuntimeError(f"native task is closing: {native_task_id}")
-            effective_s3_config = _configure_duckdb_s3(
-                cursor,
-                effective_s3_config,
-                use_session_credentials=use_session_credentials,
-            )
+            if database_identity.has_static_extension("httpfs"):
+                effective_s3_config = _configure_duckdb_s3(
+                    cursor,
+                    effective_s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
             self._register_native_query_cleanup_context(
                 native_query_id,
                 plan,

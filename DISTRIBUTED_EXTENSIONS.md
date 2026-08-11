@@ -107,8 +107,11 @@ the scan provider.
 The secret list is authoritative for its DatabaseInstance. Transported plans
 with secrets use an isolated driver planning database. A Ray worker disables
 host persistent-secret loading before a newly opened snapshot database first
-uses its secret manager, retains non-default bootstrap databases for the worker
-lifetime, and leases one exact bootstrap-plus-secret digest through execution.
+uses its secret manager, opens persistent source databases read-only, retains
+exact snapshot databases for the worker lifetime, and leases one exact
+snapshot-plus-secret digest through execution. Read-only worker instances let
+the same source file support isolated exact extension identities without
+sharing a mutable catalog; extension catalog commits remain coordinator-only.
 Tasks with the same digest may execute concurrently; a different digest waits
 until every current lease is released before replacing temporary secrets. If a
 reused database had already loaded persistent secrets, every such secret must
