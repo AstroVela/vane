@@ -518,12 +518,10 @@ void register_ray_bindings(py::module_ &mod) {
 
 	// Register the higher-level distributed plan / runner / stream stubs
 	py::class_<ResultPartitionStream, std::shared_ptr<ResultPartitionStream>>(m, "ResultPartitionStream")
-	    .def("blocking_next", &ResultPartitionStream::blocking_next)
-	    .def(
-	        "__iter__",
-	        [](std::shared_ptr<ResultPartitionStream> &self) -> std::shared_ptr<ResultPartitionStream> { return self; })
-	    .def("__next__",
-	         [](std::shared_ptr<ResultPartitionStream> &self) -> py::object { return self->blocking_next(); });
+	    .def("next_nowait", &ResultPartitionStream::next_nowait)
+	    .def("set_ready_callback", &ResultPartitionStream::set_ready_callback)
+	    .def("arm_ready_notification", &ResultPartitionStream::arm_ready_notification)
+	    .def("clear_ready_callback", &ResultPartitionStream::clear_ready_callback);
 
 	// Helper function to create PyPhysicalPlanWrapper from capsule (used by task.cpp)
 	// Wraps a raw PhysicalPlan in a DistributedPhysicalPlan for unified execution.

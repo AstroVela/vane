@@ -22,6 +22,7 @@ import pytest
 
 import vane
 import vane._ray_cxx as ray_cxx_helpers
+from tests.result_stream_helpers import collect_result_stream
 from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
@@ -425,7 +426,7 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
             RuntimeError,
             match=f"distributed worker task submission failed for query_id={query_id}",
         ) as exc_info:
-            list(stream)
+            collect_result_stream(stream)
     finally:
         runner.drop_query_fragments(query_id)
         con.close()

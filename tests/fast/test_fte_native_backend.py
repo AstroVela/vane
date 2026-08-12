@@ -16,6 +16,7 @@ import pytest
 
 import vane
 import vane.runners.fte.backends.native.backend as native_backend_mod
+from tests.result_stream_helpers import collect_result_stream
 from vane.runners.fte import FteTaskAttemptId, FteTaskId, FteTaskState, TaskResultState
 from vane.runners.fte.backends.native import (
     NativeFteWorkerManagerBackend,
@@ -2451,7 +2452,7 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
     backend = Backend()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
-    parts = list(iter(runner.run_plan(plan, con)))
+    parts = collect_result_stream(runner.run_plan(plan, con))
 
     assert parts == []
     assert backend.submitted_task_names
@@ -2548,7 +2549,7 @@ def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
     drop_thread.start()
     try:
         with pytest.raises(RuntimeError, match="query is closing"):
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
     finally:
         allow_submit_return.set()
         drop_thread.join(timeout=5.0)
@@ -2680,7 +2681,7 @@ def test_cxx_streaming_runner_output_handle_release_lifecycle(
     backend = Backend()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
-    parts = list(iter(runner.run_plan(plan, con)))
+    parts = collect_result_stream(runner.run_plan(plan, con))
 
     assert parts
     assert all(handle.acked for handle in backend.handles)
@@ -2795,7 +2796,7 @@ def test_cxx_backend_cleanup_waits_for_active_output_delivery(cleanup_mode):
 
     def consume() -> None:
         try:
-            consumed.extend(stream)
+            consumed.extend(collect_result_stream(stream))
         except BaseException as exc:
             consume_errors.append(exc)
 
@@ -3223,7 +3224,7 @@ def test_cxx_backend_drop_failure_preserves_replay_state_for_active_submit_until
 
     def run() -> None:
         try:
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
         except BaseException as exc:
             run_errors.append(exc)
 
@@ -3339,7 +3340,7 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
 
     def run() -> None:
         try:
-            list(runner.run_plan(plan, con))
+            collect_result_stream(runner.run_plan(plan, con))
         except BaseException as exc:
             run_errors.append(exc)
 
@@ -3554,7 +3555,7 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
 
     with pytest.raises(Exception, match="planned Python backend poll failure"):
-        list(runner.run_plan(plan, con))
+        collect_result_stream(runner.run_plan(plan, con))
 
     assert backend.handle is not None
     assert backend.handle.release_calls == 0
