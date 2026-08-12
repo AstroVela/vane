@@ -198,10 +198,11 @@ public:
 	enum class Type { InternalError, ExternalError, IoError, ValueError, InvalidStateError };
 
 	/// Default constructor for pair compatibility
-	DuckDBError() : std::runtime_error("uninitialized") {
+	DuckDBError() : std::runtime_error("uninitialized"), type_(Type::InternalError) {
 	}
 
-	explicit DuckDBError(Type type, const std::string &message) : std::runtime_error(format_message(type, message)) {
+	explicit DuckDBError(Type type, const std::string &message)
+	    : std::runtime_error(format_message(type, message)), type_(type) {
 	}
 
 	explicit DuckDBError(const std::string &message) : DuckDBError(Type::InternalError, message) {
@@ -227,6 +228,10 @@ public:
 		return DuckDBError(Type::InvalidStateError, msg);
 	}
 
+	Type type() const noexcept {
+		return type_;
+	}
+
 private:
 	static std::string format_message(Type type, const std::string &msg) {
 		const char *prefix = "DuckDBError";
@@ -249,6 +254,8 @@ private:
 		}
 		return std::string(prefix) + " " + msg;
 	}
+
+	Type type_;
 };
 
 //------------------------------------------------------------------------------

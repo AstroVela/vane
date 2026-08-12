@@ -6,6 +6,7 @@
 
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/physical_operator_visitor.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
@@ -69,6 +70,10 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(PlanConfig 
 	}
 	try {
 		translator.VisitOperator(plan->Root());
+	} catch (const NotImplementedException &ex) {
+		ErrorData error(ex);
+		return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::err(
+		    DuckDBError::value_error(std::string("failed to translate physical plan: ") + error.RawMessage()));
 	} catch (const std::exception &ex) {
 		return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::err(
 		    DuckDBError::invalid_state_error(std::string("failed to translate physical plan: ") + ex.what()));
@@ -411,9 +416,9 @@ physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCon
 				scan.extra_info.scan_node_id = optional_idx(next_id++);
 			}
 
-			auto tasks = MakeTableScanTasks(scan, *exec_cfg, db);
-			if (!tasks.empty()) {
-				out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(tasks));
+			auto task_set = MakeTableScanTasks(scan, *exec_cfg, db);
+			if (!task_set.tasks.empty()) {
+				out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(task_set.tasks));
 			}
 		}
 		for (auto &child : op.children) {

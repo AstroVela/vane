@@ -72,9 +72,9 @@ SchemaRef MakeSchemaFromTypes(const duckdb::vector<LogicalType> &types) {
 std::shared_ptr<DistributedPipelineNode>
 MakeScanSourceNode(PipelineNodeContext context, DuckPhysicalPlanRef scan_plan,
                    std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks, SchemaRef schema,
-                   DuckDBExecutionConfigRef exec_cfg, bool is_external_scan) {
+                   DuckDBExecutionConfigRef exec_cfg, bool require_scan_tasks) {
 	auto scan_node = std::make_shared<ScanSourceNode>(std::move(context), std::move(scan_plan), std::move(scan_tasks),
-	                                                  std::move(schema), std::move(exec_cfg), is_external_scan);
+	                                                  std::move(schema), std::move(exec_cfg), require_scan_tasks);
 	return std::make_shared<DistributedPipelineNode>(scan_node);
 }
 
@@ -142,6 +142,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	auto scan_node_id = get_next_pipeline_node_id();
 	DuckPhysicalPlanRef scan_plan;
 	std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks;
+	bool require_scan_tasks;
 
 	if (op.extra_info.scan_node_id.IsValid()) {
 		scan_node_id = static_cast<int>(op.extra_info.scan_node_id.GetIndex());
@@ -156,7 +157,9 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	}
 
 	scan_plan = MakeTableScanPlan(op);
-	scan_tasks = MakeTableScanTasks(op, *exec_cfg, plan_config_.db);
+	auto scan_task_set = MakeTableScanTasks(op, *exec_cfg, plan_config_.db);
+	require_scan_tasks = !scan_task_set.known_empty;
+	scan_tasks = std::move(scan_task_set.tasks);
 	if (!scan_plan || !scan_plan->HasRoot()) {
 		throw std::runtime_error(
 		    "[translate.cpp] TABLE_SCAN: MakeTableScanPlan returned null/empty plan for function " + op.function.name);
@@ -173,7 +176,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	auto schema = MakeTableScanSchema(op, op.GetTypes());
 	return MakeScanSourceNode(
 	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"),
-	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, true);
+	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, require_scan_tasks);
 }
 
 } // namespace distributed
