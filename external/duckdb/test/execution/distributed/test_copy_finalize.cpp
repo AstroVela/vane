@@ -251,6 +251,59 @@ private:
 	bool fail_removal = false;
 };
 
+class VirtualPrefixMappedRemoteFileSystem : public MappedRemoteFileSystem {
+public:
+	explicit VirtualPrefixMappedRemoteFileSystem(string local_root) : MappedRemoteFileSystem(std::move(local_root)) {
+	}
+
+	void RemoveDirectory(const string &, optional_ptr<FileOpener> = nullptr) override {
+		// Object stores can report a virtual prefix as a directory even after its
+		// final object is gone. There is no materialized directory to remove.
+	}
+
+	string GetName() const override {
+		return "VirtualPrefixMappedRemoteFileSystem";
+	}
+};
+
+class StaleDeletedObjectOpenMappedRemoteFileSystem : public MappedRemoteFileSystem {
+public:
+	explicit StaleDeletedObjectOpenMappedRemoteFileSystem(string local_root)
+	    : MappedRemoteFileSystem(std::move(local_root)) {
+	}
+
+	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
+	                                optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == stale_path && stale_handle) {
+			returned_stale_handle = true;
+			return std::move(stale_handle);
+		}
+		return MappedRemoteFileSystem::OpenFile(path, flags, opener);
+	}
+
+	void ReturnStaleOpenAfterRemovalOf(string path) {
+		stale_path = std::move(path);
+		stale_handle = MappedRemoteFileSystem::OpenFile(stale_path, FileFlags::FILE_FLAGS_READ);
+	}
+
+	bool HasStaleHandle() const {
+		return stale_handle != nullptr;
+	}
+
+	bool ReturnedStaleHandle() const {
+		return returned_stale_handle;
+	}
+
+	string GetName() const override {
+		return "StaleDeletedObjectOpenMappedRemoteFileSystem";
+	}
+
+private:
+	string stale_path;
+	unique_ptr<FileHandle> stale_handle;
+	bool returned_stale_handle = false;
+};
+
 class WindowsPathFileSystem : public LocalFileSystem {
 public:
 	string PathSeparator(const string &) override {
@@ -603,6 +656,57 @@ TEST_CASE("Distributed COPY direct-target empty result removes loser files befor
 	REQUIRE_FALSE(fs.FileExists(loser_file));
 }
 
+TEST_CASE("Distributed extension write publishes its file marker only after catalog commit",
+          "[distributed][copy][extension-write][lifecycle]") {
+	CopyFinalizeTestDirectory test_dir("extension_write_two_phase_commit");
+	auto &fs = test_dir.fs;
+	auto base_path = fs.JoinPath(test_dir.path, "data");
+	const string run_id = "extension-write-run";
+	auto selected_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_selected", "part.parquet");
+	const string selected_contents = "selected-extension-data";
+	WriteTestFile(fs, selected_file, selected_contents);
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id).is_ok());
+
+	DuckDB db(nullptr);
+	Connection connection(db);
+	DistributedCopySpec spec;
+	spec.file_path = base_path;
+	spec.file_extension = "parquet";
+	spec.rotate = true;
+
+	DistributedCopyFileInfo selected_info;
+	selected_info.staging_path = selected_file;
+	selected_info.row_count = 3;
+	selected_info.file_size_bytes = selected_contents.size();
+	vector<DistributedCopyFileInfo> selected_files;
+	selected_files.push_back(std::move(selected_info));
+
+	auto prepare_res = FinalizeCopyFiles(spec, "", std::move(selected_files), *connection.context, run_id, false);
+	REQUIRE(prepare_res.is_ok());
+	auto prepared = std::move(prepare_res).value();
+	REQUIRE(prepared.output_direct_write);
+	REQUIRE_FALSE(prepared.output_committed);
+	REQUIRE_FALSE(prepared.output_outcome_unknown);
+	REQUIRE(prepared.rows_copied == 3);
+	REQUIRE(fs.FileExists(prepared.output_manifest_path));
+	REQUIRE_FALSE(fs.FileExists(prepared.output_committed_marker_path));
+	REQUIRE(ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, run_id).is_err());
+	auto replay_files = prepared.files;
+	auto prepared_replay_res = FinalizeCopyFiles(spec, "", std::move(replay_files), *connection.context, run_id, false);
+	REQUIRE(prepared_replay_res.is_ok());
+	REQUIRE(prepared_replay_res.value().output_prepared_manifest_replayed);
+	REQUIRE_FALSE(prepared_replay_res.value().output_committed);
+
+	auto commit_res = CommitPreparedDistributedCopyDirectWriteResult(std::move(prepared), *connection.context);
+	REQUIRE(commit_res.is_ok());
+	const auto &committed = commit_res.value();
+	REQUIRE(committed.output_committed);
+	REQUIRE_FALSE(committed.output_outcome_unknown);
+	REQUIRE(fs.FileExists(committed.output_committed_marker_path));
+	REQUIRE(fs.FileExists(selected_file));
+	REQUIRE(ReadCommittedDistributedCopyDirectWriteResult(fs, base_path, run_id).is_ok());
+}
+
 TEST_CASE("Distributed COPY direct-target cleanup failure prevents commit",
           "[distributed][copy][lifecycle][object-storage]") {
 	CopyFinalizeTestDirectory test_dir("copy_finalize_cleanup_before_commit");
@@ -885,6 +989,23 @@ TEST_CASE("Distributed COPY strict marker checks distinguish remote missing and 
 	REQUIRE_FALSE(forbidden_fs.used_null_if_missing);
 }
 
+TEST_CASE("Distributed COPY cleanup accepts an empty virtual object prefix",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_empty_virtual_prefix");
+	VirtualPrefixMappedRemoteFileSystem object_fs(test_dir.path);
+	const string prefix = "s3://bucket/run";
+	auto object_path = object_fs.JoinPath(prefix, "part.parquet");
+	WriteTestFile(object_fs, object_path, "stale");
+
+	auto cleanup_res = CleanupDistributedCopyPrefix(object_fs, prefix);
+
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE(cleanup_res.value().existed);
+	REQUIRE(cleanup_res.value().removed);
+	REQUIRE_FALSE(object_fs.FileExists(object_path));
+	REQUIRE(object_fs.DirectoryExists(prefix));
+}
+
 TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
           "[distributed][copy][lifecycle][object-storage]") {
 	CopyFinalizeTestDirectory test_dir("copy_finalize_file_only_listing");
@@ -894,6 +1015,7 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	const string stale_run_id = "run-stale";
 	const string second_stale_run_id = "run-stale-two";
 	const string active_run_id = "run-active";
+	const string catalog_commit_pending_run_id = "run-catalog-commit-pending";
 	const string committed_run_id = "run-committed";
 
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, stale_run_id, 1).is_ok());
@@ -915,6 +1037,18 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	                      "w_running", "part.parquet");
 	WriteTestFile(local_fs, active_file, "active");
 
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, catalog_commit_pending_run_id, 1).is_ok());
+	auto catalog_commit_pending_file = local_fs.JoinPath(
+	    BuildCopyDirectWriteRunDirectory(base_path, catalog_commit_pending_run_id, local_fs.PathSeparator(base_path)),
+	    "w_selected", "part.parquet");
+	WriteTestFile(local_fs, catalog_commit_pending_file, "catalog commit pending");
+	REQUIRE(ProtectDistributedCopyDirectWriteCatalogCommit(local_fs, base_path, catalog_commit_pending_run_id).is_ok());
+	auto protected_cleanup =
+	    CleanupDistributedCopyUncommittedDirectWriteRun(local_fs, base_path, catalog_commit_pending_run_id);
+	REQUIRE(protected_cleanup.is_ok());
+	REQUIRE(protected_cleanup.value().skipped_catalog_commit_pending);
+	REQUIRE(local_fs.FileExists(catalog_commit_pending_file));
+
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, committed_run_id, 1).is_ok());
 	auto committed_file = local_fs.JoinPath(
 	    BuildCopyDirectWriteRunDirectory(base_path, committed_run_id, local_fs.PathSeparator(base_path)), "w_selected",
@@ -931,10 +1065,11 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	REQUIRE(cleanup_res.is_ok());
 	auto cleanup = std::move(cleanup_res).value();
 
-	REQUIRE(cleanup.scanned_runs == 4);
+	REQUIRE(cleanup.scanned_runs == 5);
 	REQUIRE(cleanup.cleaned_runs == 2);
 	REQUIRE(cleanup.committed_runs == 1);
 	REQUIRE(cleanup.active_runs == 1);
+	REQUIRE(cleanup.catalog_commit_pending_runs == 1);
 	REQUIRE(cleanup.skipped_unregistered_runs == 0);
 	REQUIRE(cleanup.errors == 0);
 	REQUIRE(cleanup.cleaned_run_ids == vector<string> {stale_run_id, second_stale_run_id});
@@ -945,6 +1080,7 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.lifecycle_path));
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.manifest_path));
 	REQUIRE(local_fs.FileExists(active_file));
+	REQUIRE(local_fs.FileExists(catalog_commit_pending_file));
 	REQUIRE(local_fs.FileExists(committed_file));
 	REQUIRE(local_fs.FileExists(committed_paths.committed_marker_path));
 	REQUIRE(local_fs.FileExists(unregistered_path));
@@ -1019,6 +1155,30 @@ TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
 	REQUIRE_FALSE(local_fs.FileExists(data_file));
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
 	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Direct-target cleanup resolves a stale remote open through a fresh prefix listing",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_stale_deleted_object_open");
+	StaleDeletedObjectOpenMappedRemoteFileSystem fs(test_dir.fs.JoinPath(test_dir.path, "remote"));
+	const string base_path = "s3://bucket/out";
+	const string run_id = "run-stale-open";
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, data_file, "stale");
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	WriteTestFile(fs, paths.manifest_path, "partial");
+	fs.ReturnStaleOpenAfterRemovalOf(data_file);
+	REQUIRE(fs.HasStaleHandle());
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE(fs.ReturnedStaleHandle());
+	REQUIRE_FALSE(fs.HasStaleHandle());
+	REQUIRE_FALSE(fs.FileExists(data_file));
+	REQUIRE_FALSE(fs.FileExists(paths.manifest_path));
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path));
 }
 
 TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata cleanup finishes",

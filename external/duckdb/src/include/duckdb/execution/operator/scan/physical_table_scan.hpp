@@ -58,6 +58,10 @@ public:
 	ExtraOperatorInfo extra_info;
 	//! Parameters
 	vector<Value> parameters;
+	//! Runtime-only fence for distributed scans. Worker plan deserialization
+	//! leaves this false; explicit static or FTE task injection sets it before
+	//! executor initialization. Coordinator bind state is never a fallback.
+	bool distributed_scan_tasks_applied = false;
 	//! Contains a reference to dynamically generated table filters (through e.g. a join up in the tree)
 	shared_ptr<DynamicTableFilterSet> dynamic_filters;
 	//! Virtual columns

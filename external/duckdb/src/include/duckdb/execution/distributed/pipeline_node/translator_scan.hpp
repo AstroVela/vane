@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
 #include "duckdb/execution/distributed/plan/scan_task.hpp"
@@ -13,11 +14,12 @@
 
 namespace duckdb {
 class DatabaseInstance;
+class ClientContext;
 class PhysicalPlan;
 
 namespace distributed {
 
-DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan);
+DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan, optional_ptr<ClientContext> client_context);
 
 struct TableScanTaskSet {
 	std::vector<ScanTaskDescriptor> tasks;

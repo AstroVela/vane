@@ -143,6 +143,7 @@ enum class PhysicalOperatorType : uint8_t {
 	STREAMING_UDF,
 	GROUPING_SET_EXPAND,
 	DISTRIBUTED_RESERVOIR_SAMPLE,
+	DISTRIBUTED_EXTENSION_WRITE,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

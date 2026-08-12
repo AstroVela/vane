@@ -29,6 +29,7 @@
 #include "duckdb/function/partition_stats.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
+#include "duckdb/function/distributed_table_function.hpp"
 
 namespace duckdb {
 
@@ -415,6 +416,14 @@ public:
 	table_function_deserialize_t GetDeserializeCallback() const {
 		return deserialize;
 	}
+	DUCKDB_API void SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks);
+	//! Bind the loader-derived distributed identity. Extension authors should not
+	//! call this directly; it is also used for Vane's built-in core functions.
+	DUCKDB_API void BindDistributedScanCapability(const string &extension_name);
+	bool HasDistributedScanCallbacks() const {
+		return distributed_scan != nullptr;
+	}
+	DUCKDB_API const TableFunctionDistributedScanCallbacks &GetDistributedScanCallbacks() const;
 
 	//! Bind function
 	//! This function is used for determining the return type of a table producing function and returning bind data
@@ -498,6 +507,10 @@ public:
 
 	table_function_serialize_t serialize;
 	table_function_deserialize_t deserialize;
+	//! Optional extension-owned distributed scan protocol. Bind-state transport
+	//! continues to use serialize/deserialize; these callbacks only detach,
+	//! create, and apply opaque scan tasks.
+	shared_ptr<const TableFunctionDistributedScanCallbacks> distributed_scan;
 	bool verify_serialization = true;
 
 	//! Whether or not the table function supports projection pushdown. If not supported a projection will be added

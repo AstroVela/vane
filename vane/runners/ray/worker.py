@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -76,9 +77,12 @@ _CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS = frozenset(
 )
 _CONNECTION_SNAPSHOT_SECURITY_SETTINGS = frozenset(
     {
+        "allow_persistent_secrets",
         "allow_unsigned_extensions",
         "autoinstall_known_extensions",
         "autoload_known_extensions",
+        "default_secret_storage",
+        "secret_directory",
     }
 )
 
@@ -246,6 +250,213 @@ class CleanupConnectionSnapshotIdentity(NamedTuple):
     settings: tuple[tuple[str, str, str], ...]
 
 
+class WorkerSecretSnapshotIdentity(NamedTuple):
+    """Database-global secret state used by a shared worker DatabaseInstance."""
+
+    digest: bytes
+    secret_count: int
+
+
+class WorkerSnapshotDatabaseIdentity(NamedTuple):
+    """Exact identity for a worker-owned DatabaseInstance."""
+
+    database: str
+    read_only: bool
+    config: tuple[tuple[str, str], ...]
+    duckdb_source_id: str
+    extensions: tuple[tuple[str, str], ...]
+    distributed_extension_contracts: tuple[str, ...]
+
+    def has_static_extension(self, extension_name: str) -> bool:
+        normalized_name = str(extension_name).lower()
+        return any(name.lower() == normalized_name for name, _version in self.extensions)
+
+
+def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description: str) -> str:
+    value = entry.get(field)
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"query connection snapshot {description} {field} must be a non-empty string")
+    return value
+
+
+def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSnapshotDatabaseIdentity:
+    raw_bootstrap = snapshot.get("bootstrap")
+    if raw_bootstrap is None:
+        database = ":memory:"
+        read_only = False
+        raw_config: Mapping[str, Any] = {}
+    else:
+        if not isinstance(raw_bootstrap, Mapping):
+            raise TypeError("query connection snapshot bootstrap must be a mapping")
+        raw_database = raw_bootstrap.get("database", ":memory:")
+        if not isinstance(raw_database, str) or not raw_database:
+            raise TypeError("query connection snapshot bootstrap database must be a non-empty string")
+        database = raw_database
+        raw_read_only = raw_bootstrap.get("read_only", False)
+        if not isinstance(raw_read_only, bool):
+            raise TypeError("query connection snapshot bootstrap read_only must be a boolean")
+        read_only = raw_read_only
+        raw_config_value = raw_bootstrap.get("config", {})
+        if not isinstance(raw_config_value, Mapping):
+            raise TypeError("query connection snapshot bootstrap config must be a mapping")
+        raw_config = raw_config_value
+    config = tuple(sorted((str(key).lower(), str(value)) for key, value in raw_config.items()))
+    if len({key for key, _value in config}) != len(config):
+        raise ValueError("query connection snapshot bootstrap has duplicate case-insensitive config keys")
+
+    duckdb_source_id = snapshot.get("duckdb_source_id")
+    if not isinstance(duckdb_source_id, str) or not duckdb_source_id:
+        raise TypeError("query connection snapshot duckdb_source_id must be a non-empty string")
+
+    raw_extensions = snapshot.get("extensions")
+    if not isinstance(raw_extensions, list):
+        raise TypeError("query connection snapshot extensions must be a list")
+    extensions: list[tuple[str, str]] = []
+    extension_names: set[str] = set()
+    for raw_extension in raw_extensions:
+        if not isinstance(raw_extension, Mapping):
+            raise TypeError("query connection snapshot extension entry must be a mapping")
+        name = _snapshot_nonempty_string(raw_extension, "name", "extension")
+        version = raw_extension.get("version")
+        if not isinstance(version, str):
+            raise TypeError("query connection snapshot extension version must be a string")
+        if name in extension_names:
+            raise ValueError(f"query connection snapshot has duplicate extension name: {name}")
+        extension_names.add(name)
+        extensions.append((name, version))
+    extensions.sort()
+
+    raw_distributed_contracts = snapshot.get("distributed_extension_contracts")
+    if not isinstance(raw_distributed_contracts, list):
+        raise TypeError("query connection snapshot distributed_extension_contracts must be a list")
+    distributed_contracts: list[str] = []
+    seen_distributed_contracts: set[str] = set()
+    for raw_contract in raw_distributed_contracts:
+        if not isinstance(raw_contract, str) or not raw_contract:
+            raise TypeError("query connection snapshot distributed extension contract must be a non-empty string")
+        if raw_contract in seen_distributed_contracts:
+            raise ValueError("query connection snapshot has a duplicate distributed extension contract")
+        seen_distributed_contracts.add(raw_contract)
+        distributed_contracts.append(raw_contract)
+    distributed_contracts.sort()
+    return WorkerSnapshotDatabaseIdentity(
+        database,
+        read_only,
+        config,
+        duckdb_source_id,
+        tuple(extensions),
+        tuple(distributed_contracts),
+    )
+
+
+def _query_worker_snapshot_database_identity(connection_snapshot_query_id: str) -> WorkerSnapshotDatabaseIdentity:
+    lookup = require_ray_cxx_attr(
+        "_lookup_query_connection_snapshot",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    snapshot = lookup(str(connection_snapshot_query_id))
+    if snapshot is None:
+        raise RuntimeError(
+            f"query connection snapshot is unavailable during worker connection resolution: "
+            f"{connection_snapshot_query_id}"
+        )
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("query connection snapshot must be a mapping")
+    return _worker_snapshot_database_identity(snapshot)
+
+
+def _update_secret_identity_digest(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _query_worker_secret_snapshot_identity(
+    connection_snapshot_query_id: str,
+    *,
+    include_snapshot_secrets: bool = True,
+) -> WorkerSecretSnapshotIdentity:
+    """Return the exact worker DatabaseInstance and secret-domain identity."""
+    lookup = require_ray_cxx_attr(
+        "_lookup_query_connection_snapshot",
+        hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
+    )
+    snapshot = lookup(str(connection_snapshot_query_id))
+    if snapshot is None:
+        raise RuntimeError(
+            f"query connection snapshot is unavailable during worker secret replay: {connection_snapshot_query_id}"
+        )
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("query connection snapshot must be a mapping")
+
+    database_identity = _worker_snapshot_database_identity(snapshot)
+    digest = hashlib.sha256()
+    _update_secret_identity_digest(digest, b"worker-snapshot-v1")
+    _update_secret_identity_digest(digest, database_identity.database.encode("utf-8"))
+    _update_secret_identity_digest(digest, b"1" if database_identity.read_only else b"0")
+    _update_secret_identity_digest(digest, str(len(database_identity.config)).encode("ascii"))
+    for key, value in database_identity.config:
+        _update_secret_identity_digest(digest, key.encode("utf-8"))
+        _update_secret_identity_digest(digest, value.encode("utf-8"))
+    _update_secret_identity_digest(digest, database_identity.duckdb_source_id.encode("utf-8"))
+    _update_secret_identity_digest(digest, str(len(database_identity.extensions)).encode("ascii"))
+    for static_extension_name, static_extension_version in database_identity.extensions:
+        _update_secret_identity_digest(digest, static_extension_name.encode("utf-8"))
+        _update_secret_identity_digest(digest, static_extension_version.encode("utf-8"))
+    _update_secret_identity_digest(digest, str(len(database_identity.distributed_extension_contracts)).encode("ascii"))
+    for contract_identity in database_identity.distributed_extension_contracts:
+        _update_secret_identity_digest(digest, contract_identity.encode("utf-8"))
+
+    if not include_snapshot_secrets:
+        return WorkerSecretSnapshotIdentity(digest=digest.digest(), secret_count=0)
+
+    raw_secrets = snapshot.get("secrets")
+    if not isinstance(raw_secrets, list):
+        raise TypeError("query connection snapshot secrets must be a list")
+    secrets: list[tuple[str, str, bytes]] = []
+    seen_identities: set[tuple[str, str]] = set()
+    seen_names: set[str] = set()
+    for raw_secret in raw_secrets:
+        if not isinstance(raw_secret, Mapping):
+            raise TypeError("query connection snapshot secret entry must be a mapping")
+        storage = raw_secret.get("storage")
+        secret_name = raw_secret.get("name")
+        payload = raw_secret.get("payload")
+        if not isinstance(storage, str) or not storage:
+            raise TypeError("query connection snapshot secret storage must be a non-empty string")
+        if not isinstance(secret_name, str) or not secret_name:
+            raise TypeError("query connection snapshot secret name must be a non-empty string")
+        if not isinstance(payload, bytes) or not payload:
+            raise TypeError("query connection snapshot secret payload must be non-empty bytes")
+        identity = (storage, secret_name)
+        if identity in seen_identities:
+            raise ValueError(f"query connection snapshot has duplicate secret identity: {storage}/{secret_name}")
+        normalized_name = secret_name.lower()
+        if normalized_name in seen_names:
+            raise ValueError(f"query connection snapshot has duplicate case-insensitive secret name: {secret_name}")
+        seen_identities.add(identity)
+        seen_names.add(normalized_name)
+        secrets.append((storage, secret_name, payload))
+    secrets.sort()
+    for storage, secret_name, payload in secrets:
+        _update_secret_identity_digest(digest, storage.encode("utf-8"))
+        _update_secret_identity_digest(digest, secret_name.encode("utf-8"))
+        _update_secret_identity_digest(digest, payload)
+    return WorkerSecretSnapshotIdentity(digest=digest.digest(), secret_count=len(secrets))
+
+
+def _prepare_query_worker_secret_snapshot(
+    connection: Any,
+    connection_snapshot_query_id: str,
+    *,
+    include_snapshot_secrets: bool = True,
+) -> None:
+    prepare = require_ray_cxx_attr(
+        "_prepare_query_secret_snapshot",
+        hint="Ensure the C++ ray extension is built with worker secret snapshot support.",
+    )
+    prepare(connection, str(connection_snapshot_query_id), bool(include_snapshot_secrets))
+
+
 def _query_cleanup_connection_identity(
     connection_snapshot_query_id: str,
     *,
@@ -324,6 +535,7 @@ def _cleanup_flight_shuffle_for_query(
     *,
     apply_snapshot_s3_credentials: bool = True,
     effective_session_config: Mapping[str, str] | None = None,
+    snapshot_secrets_prepared: bool = False,
 ) -> dict[str, Any]:
     query_id = str(query_id or "").strip()
     if not query_id:
@@ -351,6 +563,7 @@ def _cleanup_flight_shuffle_for_query(
             None
             if effective_session_config is None
             else {str(key): str(value) for key, value in effective_session_config.items()},
+            bool(snapshot_secrets_prepared),
         )
     if not isinstance(raw, dict):
         raise TypeError("Flight shuffle cleanup binding must return a dict")
@@ -890,6 +1103,8 @@ class RayWorkerActor:
         # with actor creation instead of blocking the first task.
         self._shared_conn: Any | None = None
         self._shared_conn_lock = threading.Lock()
+        self._snapshot_connections: dict[WorkerSnapshotDatabaseIdentity, Any] = {}
+        self._snapshot_connections_lock = threading.Lock()
         self._session_connections: dict[str, tuple[dict[str, str], Any]] = {}
         self._session_s3_configs: dict[str, dict[str, str]] = {}
         self._session_operation_locks: dict[str, threading.Lock] = {}
@@ -907,6 +1122,10 @@ class RayWorkerActor:
         self._native_cursor_task_ids: dict[Any, str] = {}
         self._closing_native_queries: set[str] = set()
         self._closing_native_tasks: set[str] = set()
+        self._active_secret_snapshot_identity: WorkerSecretSnapshotIdentity | None = None
+        self._active_secret_snapshot_leases = 0
+        self._active_secret_snapshot_initialized = False
+        self._active_snapshot_execution_cursors = 0
         self._shutdown_started = False
         self._shutdown_prepared = False
         self._shutdown_complete = False
@@ -1405,15 +1624,17 @@ class RayWorkerActor:
 
     def _configure_conn(self, conn: Any) -> None:
         """Apply standard DuckDB settings (S3, threading, etc.) to a connection."""
+        # Source snapshots are authoritative. Do not let persistent secrets on
+        # the Ray host enter the shared worker DatabaseInstance.
+        conn.execute("SET allow_persistent_secrets=false")
         _configure_ray_worker_conn(conn, self._duckdb_memory_bytes)
 
     def _get_shared_conn(self) -> Any:
         """Return the shared DuckDB connection, creating it lazily on first use.
 
-        All tasks executed by this actor share the same DatabaseInstance (and
-        therefore the same TaskScheduler thread pool).  Individual tasks should
-        call ``self._get_shared_conn().cursor()`` to obtain a lightweight cursor
-        with its own ClientContext.
+        Default-bootstrap tasks executed by this actor share this
+        DatabaseInstance (and therefore the same TaskScheduler thread pool).
+        Non-default snapshot databases are cached separately.
         """
         with self._shared_conn_lock:
             if self._shutdown_started:
@@ -1426,6 +1647,63 @@ class RayWorkerActor:
             self._configure_conn(conn)
             self._shared_conn = conn
             return conn
+
+    def _get_snapshot_execution_cursor(
+        self,
+        bootstrap_connection: Any,
+        connection_snapshot_query_id: str,
+        *,
+        database_identity: WorkerSnapshotDatabaseIdentity | None = None,
+    ) -> Any:
+        """Return a task cursor on the snapshot's stable DatabaseInstance."""
+        with self._native_execution_condition:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            self._active_snapshot_execution_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0)) + 1
+        try:
+            if database_identity is None:
+                database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
+
+            snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+            if snapshot_connections_lock is None:
+                snapshot_connections_lock = threading.Lock()
+                self._snapshot_connections_lock = snapshot_connections_lock
+            with snapshot_connections_lock:
+                snapshot_connections = getattr(self, "_snapshot_connections", None)
+                if snapshot_connections is None:
+                    snapshot_connections = {}
+                    self._snapshot_connections = snapshot_connections
+                connection: Any = snapshot_connections.get(database_identity)
+                if connection is None:
+                    resolve = require_ray_cxx_attr(
+                        "_resolve_query_snapshot_connection",
+                        hint="Ensure the C++ ray extension is built with worker snapshot resolution support.",
+                    )
+                    connection = cast(Any, resolve(bootstrap_connection, str(connection_snapshot_query_id)))
+                    if connection is bootstrap_connection:
+                        raise RuntimeError("non-default worker snapshot unexpectedly reused the bootstrap connection")
+                    snapshot_connections[database_identity] = connection
+                return connection.cursor()
+        except BaseException:
+            with self._native_execution_condition:
+                active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
+                if active_cursors <= 0:
+                    raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
+                self._active_snapshot_execution_cursors = active_cursors - 1
+                self._native_execution_condition.notify_all()
+            raise
+
+    def _close_snapshot_execution_cursor(self, cursor: Any) -> None:
+        """Close a snapshot cursor and release its shutdown fence."""
+        try:
+            cursor.close()
+        finally:
+            with self._native_execution_condition:
+                active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
+                if active_cursors <= 0:
+                    raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
+                self._active_snapshot_execution_cursors = active_cursors - 1
+                self._native_execution_condition.notify_all()
 
     def _get_session_operation_lock(
         self,
@@ -1610,6 +1888,102 @@ class RayWorkerActor:
                 return
             contexts[query_key] = cleanup_context
 
+    def _acquire_worker_secret_snapshot(
+        self,
+        connection: Any,
+        connection_snapshot_query_id: str,
+        *,
+        native_query_id: str = "",
+        native_task_id: str = "",
+        allow_closing: bool = False,
+        include_snapshot_secrets: bool = True,
+    ) -> WorkerSecretSnapshotIdentity:
+        """Lease the shared DatabaseInstance for one exact secret snapshot."""
+        snapshot_identity = _query_worker_secret_snapshot_identity(
+            connection_snapshot_query_id,
+            include_snapshot_secrets=include_snapshot_secrets,
+        )
+        native_query_id = str(native_query_id or "").strip()
+        native_task_id = str(native_task_id or "").strip()
+        initializer = False
+        with self._native_execution_condition:
+            while True:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if not allow_closing:
+                    if native_query_id and native_query_id in self._closing_native_queries:
+                        raise RuntimeError(f"native query is closing: {native_query_id}")
+                    if native_task_id and native_task_id in self._closing_native_tasks:
+                        raise RuntimeError(f"native task is closing: {native_task_id}")
+
+                active_identity = getattr(self, "_active_secret_snapshot_identity", None)
+                active_leases = int(getattr(self, "_active_secret_snapshot_leases", 0))
+                initialized = bool(getattr(self, "_active_secret_snapshot_initialized", False))
+                if active_leases == 0:
+                    if active_identity == snapshot_identity and initialized:
+                        self._active_secret_snapshot_leases = 1
+                        return snapshot_identity
+                    self._active_secret_snapshot_identity = snapshot_identity
+                    self._active_secret_snapshot_leases = 1
+                    self._active_secret_snapshot_initialized = False
+                    initializer = True
+                    break
+                if active_identity == snapshot_identity and initialized:
+                    self._active_secret_snapshot_leases = active_leases + 1
+                    return snapshot_identity
+                self._native_execution_condition.wait(timeout=0.1)
+
+        if not initializer:
+            raise RuntimeError("worker secret snapshot lease reached an invalid state")
+        try:
+            _prepare_query_worker_secret_snapshot(
+                connection,
+                connection_snapshot_query_id,
+                include_snapshot_secrets=include_snapshot_secrets,
+            )
+        except BaseException:
+            with self._native_execution_condition:
+                leases = int(getattr(self, "_active_secret_snapshot_leases", 0))
+                if self._active_secret_snapshot_identity != snapshot_identity or leases != 1:
+                    raise RuntimeError("worker secret snapshot initialization ownership changed")
+                self._active_secret_snapshot_leases = 0
+                self._active_secret_snapshot_initialized = False
+                self._native_execution_condition.notify_all()
+            raise
+
+        with self._native_execution_condition:
+            if self._active_secret_snapshot_identity != snapshot_identity:
+                raise RuntimeError("worker secret snapshot initialization identity changed")
+            if self._shutdown_started or (
+                not allow_closing
+                and (
+                    (native_query_id and native_query_id in self._closing_native_queries)
+                    or (native_task_id and native_task_id in self._closing_native_tasks)
+                )
+            ):
+                self._active_secret_snapshot_leases = 0
+                self._active_secret_snapshot_initialized = True
+                self._native_execution_condition.notify_all()
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if native_query_id and native_query_id in self._closing_native_queries:
+                    raise RuntimeError(f"native query is closing: {native_query_id}")
+                raise RuntimeError(f"native task is closing: {native_task_id}")
+            self._active_secret_snapshot_initialized = True
+            self._native_execution_condition.notify_all()
+        return snapshot_identity
+
+    def _release_worker_secret_snapshot(self, snapshot_identity: WorkerSecretSnapshotIdentity | None) -> None:
+        if snapshot_identity is None:
+            return
+        with self._native_execution_condition:
+            active_identity = getattr(self, "_active_secret_snapshot_identity", None)
+            active_leases = int(getattr(self, "_active_secret_snapshot_leases", 0))
+            if active_identity != snapshot_identity or active_leases <= 0:
+                raise RuntimeError("Ray worker secret snapshot lease ownership underflow")
+            self._active_secret_snapshot_leases = active_leases - 1
+            self._native_execution_condition.notify_all()
+
     def _cleanup_flight_shuffle_for_query_with_context(self, query_id: str) -> dict[str, Any]:
         query_key = str(query_id or "").strip()
         with self._native_execution_condition:
@@ -1646,12 +2020,27 @@ class RayWorkerActor:
                 if cleanup_context.session_id in getattr(self, "_session_connections", {}):
                     self._session_s3_configs[cleanup_context.session_id] = effective_s3_config
 
-        cleanup_cursor = self._get_shared_conn().cursor()
+        database_identity = _query_worker_snapshot_database_identity(cleanup_context.connection_snapshot_query_id)
+        cleanup_cursor = self._get_snapshot_execution_cursor(
+            self._get_shared_conn(),
+            cleanup_context.connection_snapshot_query_id,
+            database_identity=database_identity,
+        )
+        secret_snapshot_lease: WorkerSecretSnapshotIdentity | None = None
         try:
-            _configure_duckdb_s3(
+            if database_identity.has_static_extension("httpfs"):
+                _configure_duckdb_s3(
+                    cleanup_cursor,
+                    effective_s3_config,
+                    use_session_credentials=cleanup_context.use_session_credentials,
+                )
+            apply_snapshot_s3_credentials = not cleanup_context.use_session_credentials
+            secret_snapshot_lease = self._acquire_worker_secret_snapshot(
                 cleanup_cursor,
-                effective_s3_config,
-                use_session_credentials=cleanup_context.use_session_credentials,
+                cleanup_context.connection_snapshot_query_id,
+                native_query_id=query_key,
+                allow_closing=True,
+                include_snapshot_secrets=apply_snapshot_s3_credentials,
             )
             cleanup = _cleanup_flight_shuffle_for_query(
                 query_key,
@@ -1661,8 +2050,9 @@ class RayWorkerActor:
                 # plan-time local settings captured in the snapshot. Explicit
                 # connection credentials still replay when session credentials
                 # are intentionally disabled.
-                apply_snapshot_s3_credentials=not cleanup_context.use_session_credentials,
+                apply_snapshot_s3_credentials=apply_snapshot_s3_credentials,
                 effective_session_config=effective_s3_config,
+                snapshot_secrets_prepared=secret_snapshot_lease is not None,
             )
             cleanup["registry_entries_removed"] += probe["registry_entries_removed"]
             cleanup["storage_entries_removed"] += probe["storage_entries_removed"]
@@ -1675,11 +2065,14 @@ class RayWorkerActor:
             return cleanup
         finally:
             try:
-                cleanup_cursor.close()
-            except Exception:
-                # The cursor is no longer reachable after this callback. Keep
-                # the storage/configuration error as the retry diagnostic.
-                pass
+                try:
+                    self._close_snapshot_execution_cursor(cleanup_cursor)
+                except Exception:
+                    # The cursor is no longer reachable after this callback. Keep
+                    # the storage/configuration error as the retry diagnostic.
+                    pass
+            finally:
+                self._release_worker_secret_snapshot(secret_snapshot_lease)
 
     @ray.method(concurrency_group="control")
     async def close_session(self, session_id: str) -> None:
@@ -1914,6 +2307,8 @@ class RayWorkerActor:
                 self._native_cursor_task_ids = {}
                 self._closing_native_queries = set()
                 self._closing_native_tasks = set()
+                self._active_snapshot_execution_cursors = 0
+                self._active_secret_snapshot_leases = 0
             with native_condition:
                 self._shutdown_started = True
             task_manager = getattr(self, "_fte_task_manager", None)
@@ -1934,6 +2329,10 @@ class RayWorkerActor:
                 self._session_connections_lock = session_connections_lock
             with session_connections_lock:
                 session_connections = list(getattr(self, "_session_connections", {}).items())
+            snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+            if snapshot_connections_lock is None:
+                snapshot_connections_lock = threading.Lock()
+                self._snapshot_connections_lock = snapshot_connections_lock
             if conn is not None:
                 try:
                     conn.interrupt()
@@ -1944,8 +2343,10 @@ class RayWorkerActor:
             while True:
                 with native_condition:
                     active_executions = int(getattr(self, "_native_execution_count", 0))
+                    active_snapshot_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
+                    active_secret_leases = int(getattr(self, "_active_secret_snapshot_leases", 0))
                     active_cursors = list(getattr(self, "_active_native_cursors", ()))
-                if active_executions == 0:
+                if active_executions == 0 and active_snapshot_cursors == 0 and active_secret_leases == 0:
                     break
                 for cursor in active_cursors:
                     try:
@@ -1957,15 +2358,50 @@ class RayWorkerActor:
                             errors.append(message)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    errors.append(f"timed out waiting for {active_executions} native execution(s) to stop")
+                    errors.append(
+                        "timed out waiting for worker database users to stop: "
+                        f"native_executions={active_executions} "
+                        f"snapshot_cursors={active_snapshot_cursors} secret_leases={active_secret_leases}"
+                    )
                     break
                 with native_condition:
-                    if self._native_execution_count > 0:
+                    if (
+                        self._native_execution_count > 0
+                        or int(getattr(self, "_active_snapshot_execution_cursors", 0)) > 0
+                        or int(getattr(self, "_active_secret_snapshot_leases", 0)) > 0
+                    ):
                         native_condition.wait(timeout=min(0.1, remaining))
             with native_condition:
-                native_drained = self._native_execution_count == 0
+                native_drained = (
+                    self._native_execution_count == 0
+                    and int(getattr(self, "_active_snapshot_execution_cursors", 0)) == 0
+                    and int(getattr(self, "_active_secret_snapshot_leases", 0)) == 0
+                )
             if not native_drained:
                 raise RuntimeError("; ".join(errors))
+            # A task admitted immediately before shutdown may finish resolving a
+            # non-default DatabaseInstance while shutdown waits on its cursor
+            # fence. Snapshot the cache only after every such user has drained.
+            with snapshot_connections_lock:
+                snapshot_connections: list[tuple[WorkerSnapshotDatabaseIdentity, Any]] = list(
+                    cast(
+                        dict[WorkerSnapshotDatabaseIdentity, Any],
+                        getattr(self, "_snapshot_connections", {}),
+                    ).items()
+                )
+            for database_identity, snapshot_connection in snapshot_connections:
+                with snapshot_connections_lock:
+                    if getattr(self, "_snapshot_connections", {}).get(database_identity) is not snapshot_connection:
+                        continue
+                connection_to_close = cast(Any, snapshot_connection)
+                try:
+                    connection_to_close.close()
+                except Exception as exc:
+                    errors.append(f"close DuckDB snapshot connection {database_identity.database}: {exc}")
+                else:
+                    with snapshot_connections_lock:
+                        if self._snapshot_connections.get(database_identity) is snapshot_connection:
+                            self._snapshot_connections.pop(database_identity, None)
             for session_id, record in session_connections:
                 with session_connections_lock:
                     if getattr(self, "_session_connections", {}).get(session_id) is not record:
@@ -2074,12 +2510,27 @@ class RayWorkerActor:
         native_query_id: str = "",
         native_task_id: str = "",
     ) -> Any:
+        native_query_id = str(native_query_id or "").strip()
+        native_task_id = str(native_task_id or "").strip()
+        debug_context = dict(debug_context or {})
+        runtime_context = dict(debug_context)
+        debug_task_id = runtime_context.pop("task_id", None)
+        if native_task_id:
+            if debug_task_id is not None and str(debug_task_id) != native_task_id:
+                raise RuntimeError(
+                    "native runtime task identity differs from debug context: "
+                    f"runtime={native_task_id} debug={debug_task_id}"
+                )
+            runtime_context["task_id"] = native_task_id
+        elif debug_task_id is not None:
+            raise RuntimeError("debug task identity requires an authoritative native runtime task identity")
         session_id = str(plan.session_id()).strip()
         session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
         has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
         if not callable(has_explicit_s3_credentials):
             raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
         use_session_credentials = not bool(has_explicit_s3_credentials())
+        connection_snapshot_query_id = _plan_resource_query_id(plan)
         conn = self._get_session_conn(
             session_id,
             session_config,
@@ -2093,12 +2544,18 @@ class RayWorkerActor:
         )
         cursor = None
         cursor_registered = False
-        debug_context = dict(debug_context or {})
+        secret_snapshot_lease: WorkerSecretSnapshotIdentity | None = None
         worker_log_context = dict(debug_context)
         worker_log_context.update(_ray_worker_log_fields(self))
         start = time.monotonic()
 
         try:
+            database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
+            cursor = self._get_snapshot_execution_cursor(
+                conn,
+                connection_snapshot_query_id,
+                database_identity=database_identity,
+            )
             with self._session_connections_lock:
                 if self._shutdown_started:
                     raise RuntimeError("Ray worker runtime is shutting down")
@@ -2107,7 +2564,6 @@ class RayWorkerActor:
                 record = self._session_connections.get(session_id)
                 if record is None or record[1] is not conn:
                     raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
-                cursor = conn.cursor()
                 query_admitted = self._register_native_cursor(
                     cursor,
                     native_query_id,
@@ -2118,17 +2574,24 @@ class RayWorkerActor:
                 if self._worker_native_query_is_closing(native_query_id):
                     raise RuntimeError(f"native query is closing: {native_query_id}")
                 raise RuntimeError(f"native task is closing: {native_task_id}")
-            effective_s3_config = _configure_duckdb_s3(
-                cursor,
-                effective_s3_config,
-                use_session_credentials=use_session_credentials,
-            )
+            if database_identity.has_static_extension("httpfs"):
+                effective_s3_config = _configure_duckdb_s3(
+                    cursor,
+                    effective_s3_config,
+                    use_session_credentials=use_session_credentials,
+                )
             self._register_native_query_cleanup_context(
                 native_query_id,
                 plan,
                 session_id,
                 session_config,
                 use_session_credentials=use_session_credentials,
+            )
+            secret_snapshot_lease = self._acquire_worker_secret_snapshot(
+                cursor,
+                connection_snapshot_query_id,
+                native_query_id=native_query_id,
+                native_task_id=native_task_id,
             )
             _ray_worker_memory_log(
                 "native_execute_start",
@@ -2151,8 +2614,9 @@ class RayWorkerActor:
                 fte_exchange_source_queues,
                 dynamic_filter_domains or None,
                 native_progress_callback,
-                debug_context or None,
+                runtime_context or None,
                 effective_s3_config,
+                secret_snapshot_lease is not None,
             )
             _ray_worker_memory_log(
                 "native_execute_done",
@@ -2172,10 +2636,12 @@ class RayWorkerActor:
         finally:
             try:
                 if cursor is not None:
-                    cursor.close()
-            except Exception:
-                pass
+                    try:
+                        self._close_snapshot_execution_cursor(cursor)
+                    except Exception:
+                        pass
             finally:
+                self._release_worker_secret_snapshot(secret_snapshot_lease)
                 if cursor_registered:
                     self._unregister_native_cursor(cursor)
 

@@ -3618,7 +3618,7 @@ def test_driver_rejects_active_plan_identity_collision(copy_plan):
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
-def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
+def test_driver_forwards_session_s3_config_without_mutating_query_cursor(copy_plan):
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
     session.config = {
@@ -3640,9 +3640,9 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
         @staticmethod
         def to_physical_plan(_connection, effective_session_config):
             assert effective_session_config == session.s3_config
-            raise RuntimeError("planned stop after query cursor configuration")
+            raise RuntimeError("planned stop after session config forwarding")
 
-    with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
+    with pytest.raises(RuntimeError, match="planned stop after session config forwarding"):
         if copy_plan:
             cls._prepare_copy_plan_sync(
                 runner,
@@ -3661,14 +3661,12 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
             )
 
     query_connection = session.connection.cursors[-1]
-    assert "SET s3_access_key_id='session-key'" in query_connection.statements
-    assert "SET s3_secret_access_key='session-secret'" in query_connection.statements
-    assert "SET s3_region='us-east-2'" in query_connection.statements
+    assert query_connection.statements == []
     assert query_connection.closed is True
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
-def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkeypatch, copy_plan):
+def test_driver_explicit_s3_settings_bypass_without_mutating_query_cursor(monkeypatch, copy_plan):
     from vane.runners.ray import worker as worker_module
 
     cls, runner = _make_local_query_driver_actor()
@@ -3700,9 +3698,9 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
         @staticmethod
         def to_physical_plan(_connection, effective_session_config):
             assert effective_session_config == {}
-            raise RuntimeError("planned stop after explicit S3 baseline reset")
+            raise RuntimeError("planned stop after explicit S3 bypass")
 
-    with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
+    with pytest.raises(RuntimeError, match="planned stop after explicit S3 bypass"):
         if copy_plan:
             cls._prepare_copy_plan_sync(
                 runner,
@@ -3721,9 +3719,7 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
             )
 
     query_connection = session.connection.cursors[-1]
-    assert "SET s3_access_key_id=''" in query_connection.statements
-    assert "SET s3_secret_access_key=''" in query_connection.statements
-    assert "SET s3_session_token=''" in query_connection.statements
+    assert query_connection.statements == []
     assert query_connection.closed is True
 
 
@@ -6104,6 +6100,17 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
             topology = vane.ray_cxx.describe_native_progress(con.cursor(), task_plan)
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
+                task_inputs = task.Inputs()
+                scan_task = {
+                    str(node_id): entry["data"]
+                    for node_id, entry in task_inputs.items()
+                    if entry["kind"] == "scan_task"
+                }
+                exchange_source_task = {
+                    str(node_id): entry["data"]
+                    for node_id, entry in task_inputs.items()
+                    if entry["kind"] == "exchange_source_task"
+                }
                 native_sink_instance = task.exchange_sink_instance()
                 sink_instance = ExchangeSinkInstanceHandle(
                     ExchangeSinkHandle(
@@ -6122,6 +6129,8 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
                     runner.execute_native(
                         con.cursor(),
                         task_plan,
+                        scan_task=scan_task or None,
+                        exchange_source_task=exchange_source_task or None,
                         exchange_sink_instance=sink_instance,
                     )
                 )

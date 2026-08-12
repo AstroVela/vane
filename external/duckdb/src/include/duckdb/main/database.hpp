@@ -25,6 +25,7 @@ class Catalog;
 class TransactionManager;
 class ConnectionManager;
 class ExtensionManager;
+class DistributedExtensionManager;
 class FileSystem;
 class TaskScheduler;
 class ObjectCache;
@@ -58,6 +59,7 @@ public:
 	DUCKDB_API ObjectCache &GetObjectCache();
 	DUCKDB_API ConnectionManager &GetConnectionManager();
 	DUCKDB_API ExtensionManager &GetExtensionManager();
+	DUCKDB_API DistributedExtensionManager &GetDistributedExtensionManager();
 	DUCKDB_API ValidChecker &GetValidChecker();
 	DUCKDB_API LogManager &GetLogManager() const;
 
@@ -92,6 +94,7 @@ private:
 	unique_ptr<ObjectCache> object_cache;
 	unique_ptr<ConnectionManager> connection_manager;
 	unique_ptr<ExtensionManager> extension_manager;
+	unique_ptr<DistributedExtensionManager> distributed_extension_manager;
 	ValidChecker db_validity;
 	unique_ptr<DatabaseFileSystem> db_file_system;
 	unique_ptr<LogManager> log_manager;

@@ -9,7 +9,6 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/hive_partitioning.hpp"
 #include "parquet_crypto.hpp"
 #include "duckdb/function/table_function.hpp"
 #include <algorithm>
@@ -343,6 +342,7 @@ static void ParquetScanSerialize(Serializer &serializer, const optional_ptr<Func
 	                                           static_cast<idx_t>(0));
 	serializer.WritePropertyWithDefault<idx_t>(106, "initial_file_cardinality", parquet_data.initial_file_cardinality,
 	                                           static_cast<idx_t>(0));
+	serializer.WriteProperty<MultiFileReaderBindData>(107, "reader_bind", bind_data.reader_bind);
 }
 
 static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -357,11 +357,13 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 	    deserializer.ReadPropertyWithExplicitDefault<idx_t>(105, "initial_file_row_groups", static_cast<idx_t>(0));
 	auto initial_file_cardinality =
 	    deserializer.ReadPropertyWithExplicitDefault<idx_t>(106, "initial_file_cardinality", static_cast<idx_t>(0));
+	MultiFileReaderBindData reader_bind;
+	deserializer.ReadProperty<MultiFileReaderBindData>(107, "reader_bind", reader_bind);
 
 	auto multi_file_reader = MultiFileReader::Create(function);
-	if (files.empty()) {
-		throw IOException("%s needs at least one file to read", function.name);
-	}
+	// A distributed worker plan deliberately serializes the schema-bearing bind
+	// state without coordinator files. The explicit scan task assignment replaces
+	// this empty list before executor initialization.
 	vector<OpenFileInfo> open_files;
 	open_files.reserve(files.size());
 	for (auto &path : files) {
@@ -382,6 +384,7 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 	result->types = std::move(types);
 	result->names = std::move(names);
 	result->table_columns = std::move(table_columns);
+	result->reader_bind = std::move(reader_bind);
 
 	auto &parquet_bind = result->bind_data->Cast<ParquetReadBindData>();
 	parquet_bind.initial_file_row_groups = initial_file_row_groups;
@@ -404,25 +407,6 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 		}
 		result->reader_bind.mapping =
 		    match_by_field_id ? MultiFileColumnMappingMode::BY_FIELD_ID : MultiFileColumnMappingMode::BY_NAME;
-	}
-
-	// Restore filename/hive partition indexes if those options were enabled.
-	if (result->file_options.filename) {
-		auto it = std::find(result->names.begin(), result->names.end(), result->file_options.filename_column);
-		if (it != result->names.end()) {
-			result->reader_bind.filename_idx = optional_idx(it - result->names.begin());
-		}
-	}
-	if (result->file_options.hive_partitioning) {
-		auto partitions = HivePartitioning::Parse(result->file_list->GetFirstFile().path);
-		for (auto &part : partitions) {
-			auto it = std::find_if(result->names.begin(), result->names.end(),
-			                       [&](const string &col_name) { return StringUtil::CIEquals(col_name, part.first); });
-			if (it != result->names.end()) {
-				result->reader_bind.hive_partitioning_indexes.emplace_back(
-				    part.first, NumericCast<idx_t>(it - result->names.begin()));
-			}
-		}
 	}
 
 	result->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(result->names, result->types);

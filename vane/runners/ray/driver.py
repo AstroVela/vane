@@ -1680,6 +1680,9 @@ class RayQueryDriverActor:
         from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 
         self._duckdb_conn = vane.connect()
+        # Transported snapshots are authoritative and must not merge with
+        # persistent secrets from the query-driver host.
+        self._duckdb_conn.execute("SET allow_persistent_secrets=false")
         _apply_duckdb_thread_setting(self._duckdb_conn)
         apply_duckdb_memory_limit(self._duckdb_conn, self._driver_duckdb_memory_bytes)
         return self._duckdb_conn
@@ -6095,10 +6098,7 @@ class RayQueryDriverActor:
                 self._plan_connections[plan_id] = query_connection
 
             try:
-                from vane.runners.ray.worker import (
-                    _configure_duckdb_s3,
-                    _refresh_effective_duckdb_s3_config,
-                )
+                from vane.runners.ray.worker import _refresh_effective_duckdb_s3_config
 
                 use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
                 refreshed_s3_config = _refresh_effective_duckdb_s3_config(
@@ -6106,11 +6106,7 @@ class RayQueryDriverActor:
                     session.s3_config,
                     use_session_credentials=use_session_credentials,
                 )
-                session.s3_config = _configure_duckdb_s3(
-                    query_connection,
-                    refreshed_s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
+                session.s3_config = refreshed_s3_config
                 physical_plan = logical_plan.to_physical_plan(
                     query_connection,
                     session.s3_config,
@@ -6845,10 +6841,7 @@ class RayQueryDriverActor:
                 self._plan_session_ids[plan_id] = str(session_id)
                 self._plan_connections[plan_id] = query_connection
             try:
-                from vane.runners.ray.worker import (
-                    _configure_duckdb_s3,
-                    _refresh_effective_duckdb_s3_config,
-                )
+                from vane.runners.ray.worker import _refresh_effective_duckdb_s3_config
 
                 use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
                 refreshed_s3_config = _refresh_effective_duckdb_s3_config(
@@ -6856,11 +6849,7 @@ class RayQueryDriverActor:
                     session.s3_config,
                     use_session_credentials=use_session_credentials,
                 )
-                session.s3_config = _configure_duckdb_s3(
-                    query_connection,
-                    refreshed_s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
+                session.s3_config = refreshed_s3_config
                 plan = logical_plan.to_physical_plan(
                     query_connection,
                     session.s3_config,

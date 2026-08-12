@@ -14,7 +14,6 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/built_in_functions.hpp"
-#include "duckdb/function/extension_file_list_provider.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
 namespace duckdb {
@@ -38,7 +37,7 @@ typedef void (*datasource_acquire_source_t)(const char *pickled_source, idx_t pi
                                             idx_t query_id_len);
 typedef void (*datasource_release_source_t)(const char *pickled_source, idx_t pickled_len);
 
-struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileListProvider {
+struct DataSourceScanBindData : public TableFunctionData {
 	//! Pickled DataSourceTask objects, one per task
 	vector<string> pickled_tasks;
 	//! Serialized logical source package (for schema extraction on workers)
@@ -59,12 +58,6 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionFileLi
 		result->arrow_table = arrow_table;
 		return std::move(result);
 	}
-
-	//! ExtensionFileListProvider: encode each pickled task as a fake file path
-	vector<string> GetFileList() const override;
-
-	//! ExtensionFileListProvider: decode fake file paths back to pickled tasks
-	void SetFileList(const vector<string> &files) override;
 };
 
 struct DataSourceScanGlobalState : public GlobalTableFunctionState {

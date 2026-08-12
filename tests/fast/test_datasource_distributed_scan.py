@@ -396,6 +396,10 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
     source_plan = logical_plan.to_physical_plan(duckdb_conn)
     assert source_plan.idx() == source_plan_id
     assert source_plan.resource_query_id() == source_plan_id
+    scan_task_descriptors = source_plan.scan_task_descriptor_map()
+    assert len(scan_task_descriptors) == 1
+    scan_node_id, descriptors = next(iter(scan_task_descriptors.items()))
+    assert len(descriptors) == 1
 
     vane.ray_cxx._register_query_python_replay_state(resource_query_id, source_plan)
     worker_connection = vane.connect()
@@ -417,6 +421,7 @@ def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_diff
         result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
             worker_connection,
             worker_plan,
+            scan_task={str(scan_node_id): bytes(descriptors[0])},
         )
         assert result.completion_status == "ok"
         assert result.partition_payloads[0].column(0).to_pylist() == [41]

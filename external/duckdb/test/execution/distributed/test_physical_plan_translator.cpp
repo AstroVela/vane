@@ -26,6 +26,7 @@
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/optional_idx.hpp"
@@ -51,8 +52,11 @@
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 
 #include "duckdb/main/connection.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/execution/distributed/pipeline_node/grouping_set_expand.hpp"
@@ -69,6 +73,9 @@
 
 // Include distributed pipeline translator headers (lightweight declarations)
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
+#include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
+#include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
+#include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "test_helpers.hpp"
 
 #include <memory>
@@ -77,6 +84,102 @@
 
 using namespace duckdb;
 using namespace duckdb::distributed;
+
+static string SQLStringLiteral(const string &value);
+
+class TestExtensionWriteOperator final : public PhysicalOperator, public ExtensionWriteTaskProvider {
+public:
+	TestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
+	                           string extension_write_name_p = "test_extension_write",
+	                           DistributedWriteMode mode = DistributedWriteMode::FILE_ARTIFACT,
+	                           PhysicalOperatorType operator_type = PhysicalOperatorType::EXTENSION)
+	    : PhysicalOperator(physical_plan, operator_type, std::move(types), 0) {
+		plan.extension_name = "test_extension";
+		plan.operator_name = std::move(extension_write_name_p);
+		if (mode == DistributedWriteMode::CALLBACK) {
+			plan.worker_bind_data = "worker-bind";
+		}
+	}
+
+	optional_ptr<ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
+		return this;
+	}
+
+	const DistributedExtensionWritePlan &WritePlan() const override {
+		return plan;
+	}
+
+	void ValidateDistributedWrite(ClientContext &, const DistributedWriteOperationContext &) const override {
+	}
+
+	idx_t FinalizeDistributedWrite(ClientContext &, const DistributedWriteOperationContext &,
+	                               const vector<DistributedWriteTaskResult> &results) const override {
+		idx_t rows = 0;
+		for (const auto &result : results) {
+			rows += result.RowCount();
+		}
+		return rows;
+	}
+
+	void AbortDistributedWrite(ClientContext &, const DistributedWriteOperationContext &,
+	                           const vector<DistributedWriteTaskResult> &) const override {
+	}
+
+private:
+	DistributedExtensionWritePlan plan;
+};
+
+class TestWriteGlobalState final : public DistributedWriteGlobalState {};
+
+class TestWriteLocalState final : public DistributedWriteLocalState {};
+
+static unique_ptr<DistributedWriteGlobalState>
+TestWriteInitializeGlobal(ClientContext &, const DistributedExtensionWriteInfo &, const DistributedWriteTaskContext &) {
+	return make_uniq<TestWriteGlobalState>();
+}
+
+static unique_ptr<DistributedWriteLocalState> TestWriteInitializeLocal(ExecutionContext &,
+                                                                       const DistributedExtensionWriteInfo &,
+                                                                       const DistributedWriteTaskContext &,
+                                                                       DistributedWriteGlobalState &) {
+	return make_uniq<TestWriteLocalState>();
+}
+
+static void TestWriteSink(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                          const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                          DistributedWriteLocalState &, DataChunk &) {
+}
+
+static void TestWriteCombine(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                             const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                             DistributedWriteLocalState &) {
+}
+
+static vector<DistributedWriteFragment> TestWriteFinalize(ClientContext &, const DistributedExtensionWriteInfo &,
+                                                          const DistributedWriteTaskContext &,
+                                                          DistributedWriteGlobalState &) {
+	return {};
+}
+
+static void RegisterTestExtensionWrite(DatabaseInstance &db, const string &name, DistributedWriteMode mode) {
+	DistributedWriteOperatorExtension write_operator;
+	write_operator.name = name;
+	write_operator.protocol_version = 1;
+	write_operator.mode = mode;
+	if (mode == DistributedWriteMode::FILE_ARTIFACT) {
+		write_operator.fragment_codec = {DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC,
+		                                 DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION};
+	} else {
+		write_operator.fragment_codec = {"test-extension.opaque-write", 1};
+		write_operator.callbacks = {TestWriteInitializeGlobal, TestWriteInitializeLocal, TestWriteSink,
+		                            TestWriteCombine, TestWriteFinalize};
+	}
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "test_extension";
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, name, 1});
+	DistributedExtensionManager::Get(db).RegisterExtension(
+	    manifest, {make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(write_operator))});
+}
 
 // A tiny test-only nullary aggregate operator used to construct BoundAggregateExpression
 struct TestNullaryAggOp {
@@ -120,6 +223,163 @@ static UnaryPlan MakeUnaryScanPlan() {
 	auto &scan =
 	    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0, std::move(collection));
 	return {plan, types, &scan};
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write unwraps its COPY child", "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	RegisterTestExtensionWrite(*db.instance, "test_extension_write", DistributedWriteMode::FILE_ARTIFACT);
+	auto output_path = TestCreatePath("distributed_extension_write_translation.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+	REQUIRE(copy_root.type == PhysicalOperatorType::COPY_TO_FILE);
+	REQUIRE(copy_root.Cast<PhysicalCopyToFile>().return_type == CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(std::move(extension_types));
+	extension.children.push_back(copy_root);
+	physical_plan->SetRoot(extension);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated =
+	    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()), conn.context.get());
+	REQUIRE(translated.is_ok());
+	auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(translated.value()->inner());
+	REQUIRE(copy_finish != nullptr);
+	REQUIRE(copy_finish->copy_sink()->spec().return_type == CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+}
+
+TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker sink", "[distributed][extension-write]") {
+	DuckDB db(nullptr);
+	Connection connection(db);
+	RegisterTestExtensionWrite(*db.instance, "test_callback_extension_write", DistributedWriteMode::CALLBACK);
+	auto unary = MakeUnaryScanPlan();
+	auto &extension = unary.plan->Make<TestExtensionWriteOperator>(
+	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK);
+	auto &extension_write = extension.Cast<TestExtensionWriteOperator>();
+	extension.children.push_back(*unary.scan);
+	unary.plan->SetRoot(extension);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto write_info = ResolveDistributedExtensionWriteInfo(*connection.context, extension_write.WritePlan());
+	auto unrelated = MakeUnaryScanPlan();
+	unrelated.plan->SetRoot(*unrelated.scan);
+	auto unrelated_result =
+	    physical_plan_to_pipeline_node(config, unrelated.plan, connection.context.get(), &write_info);
+	REQUIRE(unrelated_result.is_err());
+	REQUIRE(StringUtil::Contains(unrelated_result.error().what(), "requires an extension write root"));
+	auto wrong_type = MakeUnaryScanPlan();
+	auto &wrong_type_extension = wrong_type.plan->Make<TestExtensionWriteOperator>(
+	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK,
+	    PhysicalOperatorType::PROJECTION);
+	wrong_type_extension.children.push_back(*wrong_type.scan);
+	wrong_type.plan->SetRoot(wrong_type_extension);
+	auto wrong_type_result =
+	    physical_plan_to_pipeline_node(config, wrong_type.plan, connection.context.get(), &write_info);
+	REQUIRE(wrong_type_result.is_err());
+	REQUIRE(StringUtil::Contains(wrong_type_result.error().what(), "requires an extension write root"));
+	auto mismatched_write_info = write_info;
+	mismatched_write_info.worker_bind_data = "different-worker-bind";
+	auto mismatched =
+	    physical_plan_to_pipeline_node(config, unary.plan, connection.context.get(), &mismatched_write_info);
+	REQUIRE(mismatched.is_err());
+	REQUIRE(StringUtil::Contains(mismatched.error().what(), "does not match physical operator plan"));
+	auto translated = physical_plan_to_pipeline_node(config, unary.plan, connection.context.get(), &write_info);
+	REQUIRE(translated.is_ok());
+	auto write_sink = std::dynamic_pointer_cast<ExtensionWriteSinkNode>(translated.value()->inner());
+	REQUIRE(write_sink != nullptr);
+	REQUIRE(write_sink->write_info().mode == DistributedWriteMode::CALLBACK);
+	REQUIRE(write_sink->write_info().Name() == "test_callback_extension_write");
+	REQUIRE(write_sink->write_info().fragment_codec.name == "test-extension.opaque-write");
+
+	auto task_executor = std::make_shared<PlanTaskExecutor>(connection.context);
+	PlanExecutionContext execution_context(task_executor, connection.context);
+	auto tasks = translated.value()->produce_tasks(execution_context);
+	auto next = tasks.poll_next();
+	REQUIRE(next.first);
+	REQUIRE(next.second.task() != nullptr);
+	REQUIRE(next.second.task()->plan() != nullptr);
+	REQUIRE(next.second.task()->plan()->HasRoot());
+	auto &worker_write = next.second.task()->plan()->Root().Cast<PhysicalDistributedExtensionWrite>();
+	REQUIRE(worker_write.info.capability == write_sink->write_info().capability);
+	REQUIRE(worker_write.info.Name() == write_sink->write_info().Name());
+	REQUIRE(worker_write.info.fragment_codec == write_sink->write_info().fragment_codec);
+	REQUIRE(worker_write.info.worker_bind_data == write_sink->write_info().worker_bind_data);
+	REQUIRE(worker_write.task_context.operation_id.empty());
+	REQUIRE(worker_write.task_context.task_attempt_id.empty());
+	REQUIRE(worker_write.children.size() == 1);
+	REQUIRE_FALSE(tasks.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write must be the physical plan root",
+          "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	RegisterTestExtensionWrite(*db.instance, "test_extension_write", DistributedWriteMode::FILE_ARTIFACT);
+	auto output_path = TestCreatePath("distributed_nested_extension_write.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(extension_types);
+	extension.children.push_back(copy_root);
+
+	vector<unique_ptr<Expression>> expressions;
+	expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0));
+	auto &projection = physical_plan->Make<PhysicalProjection>(extension_types, std::move(expressions), 0);
+	projection.children.push_back(extension);
+	physical_plan->SetRoot(projection);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated =
+	    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()), conn.context.get());
+	REQUIRE(translated.is_err());
+	REQUIRE(StringUtil::Contains(translated.error().what(), "must be the physical plan root"));
+}
+
+TEST_CASE("PhysicalPlanTranslator: extension write requires a non-empty name", "[distributed][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto output_path = TestCreatePath("distributed_unnamed_extension_write.parquet");
+	auto logical_plan = conn.ExtractPlan("COPY (SELECT 42 AS value) TO " + SQLStringLiteral(output_path) +
+	                                     " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto physical_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(physical_plan != nullptr);
+	auto &copy_root = physical_plan->Root();
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension = physical_plan->Make<TestExtensionWriteOperator>(extension_types, string());
+	extension.children.push_back(copy_root);
+	physical_plan->SetRoot(extension);
+
+	PlanConfig config;
+	config.db = db.instance;
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated =
+	    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(physical_plan.release()), conn.context.get());
+	REQUIRE(translated.is_err());
+	REQUIRE(StringUtil::Contains(translated.error().what(), "requires extension and operator names"));
 }
 
 static DuckPhysicalPlanRef MakeWindowPlan(bool streaming, idx_t input_partitions, bool input_hash_partitioned,
@@ -206,7 +466,7 @@ static idx_t SchemaColumnCount(const SchemaRef &schema) {
 	return GetSchemaTypes(schema).size();
 }
 
-static std::string SQLStringLiteral(const std::string &value) {
+static string SQLStringLiteral(const string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
@@ -473,6 +733,31 @@ TEST_CASE("PhysicalPlanTranslator: unsupported table function bind data is a val
 	auto msg = std::string(res.error().what());
 	REQUIRE(msg.find("unsupported_table_scan") != std::string::npos);
 	REQUIRE(msg.find("Copy not supported for TableFunctionData") != std::string::npos);
+	DuckDBExecutionConfig config;
+	REQUIRE_THROWS_WITH(MakeTableScanTasks(scan.Cast<PhysicalTableScan>(), config, nullptr),
+	                    Catch::Matchers::Contains("does not provide a distributable file list"));
+}
+
+TEST_CASE("PhysicalPlanTranslator: missing table function bind data is a value error", "[distributed]") {
+	Allocator allocator;
+	auto plan_ptr = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	TableFunction function;
+	function.name = "missing_bind_table_scan";
+	vector<ColumnIndex> column_ids = {ColumnIndex(0)};
+	vector<string> names = {"value"};
+
+	auto &scan = plan_ptr->Make<PhysicalTableScan>(types, function, nullptr, types, std::move(column_ids),
+	                                               vector<idx_t> {}, std::move(names), nullptr, 0, ExtraOperatorInfo {},
+	                                               vector<Value> {}, virtual_column_map_t {});
+	plan_ptr->SetRoot(scan);
+
+	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
+	REQUIRE(res.is_err());
+	REQUIRE(res.error().type() == DuckDBError::Type::ValueError);
+	auto msg = std::string(res.error().what());
+	REQUIRE(msg.find("missing_bind_table_scan") != std::string::npos);
+	REQUIRE(msg.find("bind data is missing") != std::string::npos);
 }
 
 TEST_CASE("PhysicalPlanTranslator: auto broadcast only considers semantically safe sides", "[distributed][join]") {
@@ -1022,6 +1307,36 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	REQUIRE(res.ok);
 	REQUIRE(res.value() != nullptr);
 	REQUIRE(res.value()->num_partitions() > 1);
+	auto scan_source = std::dynamic_pointer_cast<ScanSourceNode>(res.value()->inner());
+	REQUIRE(scan_source != nullptr);
+	REQUIRE_FALSE(scan_source->scan_tasks().empty());
+
+	auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
+	PlanExecutionContext execution_context(task_executor, conn.context);
+	auto task_stream = res.value()->produce_tasks(execution_context);
+	auto next_task = task_stream.poll_next();
+	REQUIRE(next_task.first);
+	REQUIRE(next_task.second.task() != nullptr);
+	auto worker_plan = next_task.second.task()->plan();
+	REQUIRE(worker_plan != nullptr);
+	auto &worker_scan = worker_plan->Root().Cast<PhysicalTableScan>();
+	auto &worker_bind = worker_scan.bind_data->Cast<MultiFileBindData>();
+	REQUIRE(worker_bind.file_list->GetAllFiles().empty());
+	string assignment_error;
+	REQUIRE_FALSE(ValidateDistributedScanTasksApplied(*worker_plan, &assignment_error));
+	REQUIRE(StringUtil::Contains(assignment_error, "no explicit worker task assignment"));
+
+	REQUIRE(next_task.second.task()->inputs().size() == 1);
+	const auto &task_input = next_task.second.task()->inputs().begin()->second;
+	REQUIRE(task_input.kind == TaskInput::Kind::ScanTask);
+	std::unordered_map<idx_t, ScanTaskDescriptor> assignments;
+	assignments.emplace(static_cast<idx_t>(scan_source->node_id()),
+	                    ScanTaskDescriptor::DeserializeFromBytes(task_input.scan_task_bytes));
+	assignment_error.clear();
+	REQUIRE(ApplyScanTasksToPlan(*worker_plan, assignments, &assignment_error));
+	REQUIRE(assignment_error.empty());
+	REQUIRE(ValidateDistributedScanTasksApplied(*worker_plan, &assignment_error));
+	REQUIRE_FALSE(worker_bind.file_list->GetAllFiles().empty());
 
 	if (prev_min) {
 		setenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES", prev_min, 1);

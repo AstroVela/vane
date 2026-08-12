@@ -34,12 +34,48 @@ void ExtensionLoader::SetDescription(const string &description) {
 	extension_description = description;
 }
 
+DistributedExtensionManifest &ExtensionLoader::GetOrCreateDistributedManifest() {
+	if (!distributed_manifest) {
+		auto manifest = make_uniq<DistributedExtensionManifest>();
+		manifest->extension_name = extension_name;
+		distributed_manifest = std::move(manifest);
+	}
+	return *distributed_manifest;
+}
+
+void DistributedWriteOperatorExtension::Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension) {
+	loader.RegisterDistributedWriteOperatorExtension(std::move(extension));
+}
+
+void ExtensionLoader::RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension) {
+	auto &manifest = GetOrCreateDistributedManifest();
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::WRITE_OPERATOR;
+	capability.name = extension.name;
+	capability.protocol_version = extension.protocol_version;
+	DistributedExtensionCapabilityReference reference;
+	reference.extension_name = extension_name;
+	reference.capability = capability;
+	reference.Validate();
+	extension.Validate(reference.CanonicalIdentity());
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
+	candidate_manifest->capabilities.push_back(capability);
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+	distributed_write_operators.push_back(
+	    make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(extension)));
+	distributed_manifest = std::move(candidate_manifest);
+}
+
 void ExtensionLoader::FinalizeLoad() {
 	// Set extension description, if provided
 	if (!extension_description.empty() && extension_info) {
 		auto info = make_uniq<ExtensionLoadedInfo>();
 		info->description = extension_description;
 		extension_info->load_info = std::move(info);
+	}
+	if (distributed_manifest) {
+		DistributedExtensionManager::Get(db).RegisterExtension(*distributed_manifest,
+		                                                       std::move(distributed_write_operators));
 	}
 }
 
@@ -100,11 +136,110 @@ void ExtensionLoader::RegisterFunction(TableFunctionSet function) {
 	RegisterFunction(std::move(info));
 }
 
+unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFunctions(TableFunctionSet &functions) {
+	idx_t callback_count = 0;
+	idx_t protocol_version = 0;
+	for (const auto &function : functions.functions) {
+		if (!function.HasDistributedScanCallbacks()) {
+			continue;
+		}
+		callback_count++;
+		const auto &callbacks = function.GetDistributedScanCallbacks();
+		callbacks.ValidateDefinition(functions.name);
+		if (!function.HasSerializationCallbacks()) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' must define serialize and deserialize callbacks before registration",
+			    functions.name);
+		}
+		if (protocol_version == 0) {
+			protocol_version = callbacks.protocol_version;
+		} else if (protocol_version != callbacks.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' overloads must use one capability protocol version", functions.name);
+		}
+	}
+	if (callback_count != 0 && callback_count != functions.functions.size()) {
+		throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
+		                            functions.name);
+	}
+
+	auto existing_entry = TryGetTableFunction(functions.name);
+	idx_t existing_callback_count = 0;
+	if (existing_entry) {
+		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+			if (function.HasDistributedScanCallbacks()) {
+				existing_callback_count++;
+			}
+		}
+	}
+	if (existing_entry && existing_callback_count != 0 &&
+	    existing_callback_count != existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions.size()) {
+		throw InternalException("Distributed table function '%s' has a mixed callback registration", functions.name);
+	}
+	if (callback_count == 0) {
+		if (existing_callback_count != 0) {
+			throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
+			                            functions.name);
+		}
+		return nullptr;
+	}
+	if (existing_entry && existing_callback_count == 0) {
+		throw InvalidInputException("Distributed table function '%s' cannot add callbacks to native-only overloads",
+		                            functions.name);
+	}
+	auto &manifest = GetOrCreateDistributedManifest();
+
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	capability.name = functions.name;
+	capability.protocol_version = protocol_version;
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
+	bool capability_exists = false;
+	for (const auto &registered : candidate_manifest->capabilities) {
+		if (registered.kind != capability.kind || registered.name != capability.name) {
+			continue;
+		}
+		if (registered.protocol_version != capability.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' protocol mismatch: callbacks use %llu, manifest uses %llu",
+			    functions.name, static_cast<unsigned long long>(capability.protocol_version),
+			    static_cast<unsigned long long>(registered.protocol_version));
+		}
+		capability_exists = true;
+	}
+	if (!capability_exists) {
+		candidate_manifest->capabilities.push_back(capability);
+	}
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+
+	DistributedExtensionCapabilityReference reference;
+	reference.extension_name = extension_name;
+	reference.capability = capability;
+	if (existing_entry) {
+		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+			const auto &callbacks = function.GetDistributedScanCallbacks();
+			callbacks.Validate(function.name);
+			if (callbacks.GetCapability() != reference) {
+				throw InvalidInputException("Distributed table function '%s' is already owned by '%s'", functions.name,
+				                            callbacks.GetCapability().CanonicalIdentity());
+			}
+		}
+	}
+	for (auto &function : functions.functions) {
+		function.BindDistributedScanCapability(extension_name);
+	}
+	return candidate_manifest;
+}
+
 void ExtensionLoader::RegisterFunction(CreateTableFunctionInfo info) {
 	D_ASSERT(!info.functions.name.empty());
+	auto candidate_manifest = BindDistributedTableFunctions(info.functions);
 	auto &system_catalog = Catalog::GetSystemCatalog(db);
 	auto data = CatalogTransaction::GetSystemTransaction(db);
 	system_catalog.CreateFunction(data, info);
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
+	}
 }
 
 void ExtensionLoader::RegisterFunction(PragmaFunction function) {
@@ -169,10 +304,17 @@ void ExtensionLoader::AddFunctionOverload(ScalarFunctionSet functions) { // NOLI
 }
 
 void ExtensionLoader::AddFunctionOverload(TableFunctionSet functions) { // NOLINT
-	auto &table_function = GetTableFunction(functions.name);
+	D_ASSERT(!functions.name.empty());
 	for (auto &function : functions.functions) {
 		function.name = functions.name;
+	}
+	auto candidate_manifest = BindDistributedTableFunctions(functions);
+	auto &table_function = GetTableFunction(functions.name);
+	for (auto &function : functions.functions) {
 		table_function.functions.AddFunction(std::move(function));
+	}
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
 	}
 }
 

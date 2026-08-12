@@ -1141,10 +1141,22 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 
 // Try to dispatch a write relation to the Python runner.
 // Returns true if dispatched, false if this relation should run locally.
-static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner) {
+static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner,
+                                bool require_ray_auto_commit = false) {
 	auto runner_type = ResolveRunnerType();
 	if (runner_type == "local-fast") {
 		return false;
+	}
+	if (runner_type == "ray" && require_ray_auto_commit) {
+		if (!write_rel || !write_rel->context) {
+			throw InternalException("Cannot validate Ray write transaction: relation has no context");
+		}
+		auto context = write_rel->context->GetContext();
+		if (!context->transaction.IsAutoCommit()) {
+			throw InvalidInputException(
+			    "Ray insert_into requires DuckDB auto-commit mode because distributed execution cannot participate in "
+			    "the caller's explicit transaction");
+		}
 	}
 	auto runner_for_db = GetOrCreateRunnerForDB(write_rel, runner_type);
 	PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
@@ -2011,6 +2023,9 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
+	if (TryDispatchToRunner(insert, connection_owner, true)) {
+		return;
+	}
 	PyExecuteRelation(insert);
 }
 

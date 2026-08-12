@@ -11,6 +11,7 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_handles.hpp"
 
 #include <string>
@@ -39,9 +40,16 @@ struct ExchangeSourceTaskDescriptor {
 	static ExchangeSourceTaskDescriptor DeserializeFromBytes(const std::string &bytes);
 };
 
+//! Apply a validated static subset. The worker boundary must call
+//! ValidateExchangeSourceAssignments with the static-plus-FTE union first.
 bool ApplyExchangeSourceTasksToPlan(duckdb::PhysicalPlan &plan,
                                     const std::unordered_map<idx_t, ExchangeSourceTaskDescriptor> &tasks,
                                     std::string *error = nullptr);
+
+//! Validate the complete static-plus-FTE assignment domain before either
+//! assignment mechanism mutates the worker plan.
+bool ValidateExchangeSourceAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
+                                       std::string *error = nullptr);
 
 } // namespace distributed
 } // namespace duckdb

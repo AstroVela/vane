@@ -167,6 +167,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "GROUPING_SET_EXPAND";
 	case PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE:
 		return "DISTRIBUTED_RESERVOIR_SAMPLE";
+	case PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE:
+		return "DISTRIBUTED_EXTENSION_WRITE";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
 	case PhysicalOperatorType::ATTACH:

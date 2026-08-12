@@ -3076,9 +3076,10 @@ void InstantiateNewInstance(DuckDB &db) {
 	system_catalog.CreateFunction(transaction, *ai_embed_macro);
 }
 
-static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config) {
+static shared_ptr<DuckDBPyConnection> FetchOrCreateInstance(const string &database_path, DBConfig &config,
+                                                            bool use_instance_cache) {
 	auto res = make_shared_ptr<DuckDBPyConnection>();
-	bool cache_instance = database_path != ":memory:" && !database_path.empty();
+	bool cache_instance = use_instance_cache && database_path != ":memory:" && !database_path.empty();
 	config.replacement_scans.emplace_back(PythonReplacementScan::Replace);
 	{
 		D_ASSERT(py::gil_check());
@@ -3114,8 +3115,8 @@ static string GetPathString(const py::object &path) {
 	throw InvalidInputException("Please provide either a str or a pathlib.Path, not %s", actual_type);
 }
 
-shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &database_p, bool read_only,
-                                                           const py::dict &config_options) {
+static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database_p, bool read_only,
+                                                      const py::dict &config_options, bool use_instance_cache) {
 	auto config_dict = TransformPyConfigDict(config_options);
 	auto database = GetPathString(database_p);
 	if (IsDefaultConnectionString(database, read_only, config_dict)) {
@@ -3140,12 +3141,22 @@ shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &dat
 	}
 	config.SetOptionsByName(config_dict);
 
-	auto res = FetchOrCreateInstance(database, config);
+	auto res = FetchOrCreateInstance(database, config, use_instance_cache);
 	res->SetConnectionBootstrapConfig(database, read_only, config_options);
 	res->InitializeVaneSession();
 	auto &client_context = *res->con.GetConnection().context;
 	SetDefaultConfigArguments(client_context);
 	return res;
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::Connect(const py::object &database_p, bool read_only,
+                                                           const py::dict &config_options) {
+	return ConnectInternal(database_p, read_only, config_options, true);
+}
+
+shared_ptr<DuckDBPyConnection> DuckDBPyConnection::ConnectUncached(const py::object &database_p, bool read_only,
+                                                                   const py::dict &config_options) {
+	return ConnectInternal(database_p, read_only, config_options, false);
 }
 
 vector<Value> DuckDBPyConnection::TransformPythonParamList(const py::handle &params) {

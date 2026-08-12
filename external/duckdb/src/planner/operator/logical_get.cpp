@@ -237,6 +237,11 @@ void LogicalGet::SetScanOrder(unique_ptr<RowGroupOrderOptions> options) {
 }
 
 void LogicalGet::Serialize(Serializer &serializer) const {
+	if (function.HasDistributedScanCallbacks() && !function.HasSerializationCallbacks()) {
+		throw SerializationException("Distributed table function '%s' requires complete serialize and deserialize "
+		                             "callbacks; logical-plan rebind is not supported",
+		                             function.name);
+	}
 	LogicalOperator::Serialize(serializer);
 	serializer.WriteProperty(200, "table_index", table_index);
 	serializer.WriteProperty(201, "returned_types", returned_types);
@@ -245,7 +250,7 @@ void LogicalGet::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(204, "projection_ids", projection_ids);
 	serializer.WriteProperty(205, "table_filters", table_filters);
 	FunctionSerializer::Serialize(serializer, function, bind_data.get());
-	if (!function.serialize || function.in_out_function) {
+	if (!function.HasSerializationCallbacks() || function.in_out_function) {
 		// Functions without custom serialization need these values for rebinding. In-out functions also need them
 		// during execution.
 		serializer.WriteProperty(206, "parameters", parameters);
@@ -303,6 +308,11 @@ unique_ptr<LogicalOperator> LogicalGet::Deserialize(Deserializer &deserializer) 
 	}
 	auto &context = deserializer.Get<ClientContext &>();
 	virtual_column_map_t virtual_columns;
+	if (function.HasDistributedScanCallbacks() && !has_serialize) {
+		throw SerializationException("Distributed table function '%s' requires serialized bind data; logical-plan "
+		                             "rebind is not supported",
+		                             function.name);
+	}
 	if (!has_serialize) {
 		TableFunctionRef empty_ref;
 		TableFunctionBindInput input(result->parameters, result->named_parameters, result->input_table_types,
