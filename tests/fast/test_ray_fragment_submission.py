@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import vane
+from vane._ray_errors import RemoteRayException
 
 ray = pytest.importorskip("ray")
 
@@ -146,6 +147,12 @@ class _ImmediateObjectRef:
 
     def future(self):
         return _ImmediateFuture(self._value)
+
+    def __await__(self):
+        async def _resolve():
+            return self._value
+
+        return _resolve().__await__()
 
 
 class _FakeRemoteMethod:
@@ -4517,6 +4524,138 @@ def test_fte_control_ref_uses_async_actor_safe_get(monkeypatch):
         == "resolved"
     )
     assert calls == [("status-ref", 7.5)]
+
+
+def test_fte_wait_task_status_async_awaits_object_ref_without_blocking_get(monkeypatch):
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task_id = {"query_id": "q", "fragment_execution_id": 0, "partition_id": 1, "attempt_id": 0}
+
+    monkeypatch.setattr(
+        task_control_mod,
+        "resolve_object_refs_blocking",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("blocking get must not be used")),
+    )
+
+    status = asyncio.run(handle.fte_wait_task_status_async(task_id, -1, 1.0))
+
+    assert status == {"state": "FINISHED", "task_id": task_id, "version": 4}
+    assert actor.fte_calls == [("wait_status", task_id, -1, 1.0)]
+
+
+def test_fte_wait_task_status_async_cancels_remote_wait_with_caller(monkeypatch):
+    started = asyncio.Event()
+
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                started.set()
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    async def _cancel_wait():
+        wait = asyncio.create_task(handle.fte_wait_task_status_async({}, -1, None))
+        await started.wait()
+        wait.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await wait
+
+    asyncio.run(_cancel_wait())
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_times_out_and_cancels_remote_wait(monkeypatch):
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", "0.01")
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    with pytest.raises(TimeoutError, match="did not complete within 0.010s"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_rechecks_query_deadline_after_submission(monkeypatch):
+    class _PendingRef:
+        def __await__(self):
+            async def _wait():
+                await asyncio.Event().wait()
+
+            return _wait().__await__()
+
+    pending_ref = _PendingRef()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() - 1.0))
+            return pending_ref
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    cancelled = []
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", str(time.time() + 60.0))
+    monkeypatch.setattr(ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    with pytest.raises(task_control_mod.QueryDeadlineExceeded, match="query deadline expired"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
+
+    assert cancelled == [(pending_ref, False)]
+
+
+def test_fte_wait_task_status_async_restores_remote_timeout_error():
+    remote_error = RemoteRayException.from_exception(TimeoutError("remote status timeout"))
+
+    class _RayTaskError(RuntimeError):
+        cause = remote_error
+
+    class _FailingRef:
+        def __await__(self):
+            async def _fail():
+                raise _RayTaskError("Ray wrapper")
+
+            return _fail().__await__()
+
+    class _RemoteMethod:
+        @staticmethod
+        def remote(*_args):
+            return _FailingRef()
+
+    actor = SimpleNamespace(fte_wait_task_status=_RemoteMethod())
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+
+    with pytest.raises(TimeoutError, match="remote status timeout"):
+        asyncio.run(handle.fte_wait_task_status_async({}, -1, None))
 
 
 def test_strip_fte_dynamic_context_removes_static_bindings_only():

@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextvars
+import functools
 import hashlib
 import hmac
 import json
@@ -17,6 +19,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass, field, replace
@@ -72,6 +75,17 @@ _DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S = 10.0
 _TASK_COMPLETION_CLEANUP_RETRY_MIN_S = 0.01
 _TASK_COMPLETION_CLEANUP_RETRY_MAX_S = 1.0
 _QUERY_ADMISSION_BATCH_SIZE = 64
+# Whole-query consumers must not share a pool with the producer/control work
+# they can synchronously trigger. These executors are intentionally partitioned
+# by dependency rather than pooled behind asyncio's default executor.
+_DRIVER_COPY_EXECUTOR_WORKERS = max(32, (os.cpu_count() or 1) * 4)
+_DRIVER_NATIVE_EXECUTOR_WORKERS = max(32, (os.cpu_count() or 1) * 4)
+_DRIVER_LIFECYCLE_EXECUTOR_WORKERS = max(16, (os.cpu_count() or 1) * 2)
+_DRIVER_SESSION_EXECUTOR_WORKERS = max(16, (os.cpu_count() or 1) * 2)
+_FTE_STATUS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(16, (os.cpu_count() or 1) * 2),
+    thread_name_prefix="vane-fte-status",
+)
 
 
 def _query_udf_actor_lifecycle_lock(owner: Any, query_id: str) -> threading.RLock:
@@ -419,6 +433,14 @@ class _DriverSession:
         self.condition = threading.Condition(self.lock)
 
 
+@dataclass(frozen=True)
+class _AsyncResultStreamState:
+    stream: Any
+    loop: asyncio.AbstractEventLoop
+    ready: asyncio.Event
+    read_lock: asyncio.Lock
+
+
 @dataclass
 class _ClientOwnerLease:
     lease_token: str
@@ -453,16 +475,46 @@ def _ray_runtime_job_id(runtime_context: Any) -> str:
     return ray_runtime_job_id(runtime_context)
 
 
-async def _to_thread_with_owned_side_effects(callback: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """Do not expose cancellation until a thread-owned mutation has finished."""
-    thread_task = asyncio.create_task(asyncio.to_thread(callback, *args, **kwargs))
+def _submit_to_executor(
+    executor: Executor,
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> asyncio.Future[Any]:
+    loop = asyncio.get_running_loop()
+    context = contextvars.copy_context()
+    call = functools.partial(callback, *args, **kwargs)
+    return loop.run_in_executor(executor, context.run, call)
+
+
+async def _run_in_executor(
+    executor: Executor,
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    return await _submit_to_executor(executor, callback, *args, **kwargs)
+
+
+async def _run_in_executor_with_owned_side_effects(
+    executor: Executor,
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Finish an executor-owned mutation before exposing caller cancellation."""
+
+    executor_future = _submit_to_executor(executor, callback, *args, **kwargs)
     cancellation: asyncio.CancelledError | None = None
-    while not thread_task.done():
+    while not executor_future.done():
         try:
-            await asyncio.shield(thread_task)
+            await asyncio.shield(executor_future)
         except asyncio.CancelledError as error:
             cancellation = error
-    result = thread_task.result()
+    result = executor_future.result()
     if cancellation is not None:
         raise cancellation
     return result
@@ -750,7 +802,7 @@ class FteWorkerTaskHandle:
         self.task_context_info = dict(self.task_context_info or {})
         self.query_task_lease = dict(self.query_task_lease or {})
         for method_name in (
-            "fte_wait_task_status",
+            "fte_wait_task_status_async",
             "fte_cancel_task",
             "mark_fte_worker_failed",
             "record_fte_task_terminal",
@@ -791,8 +843,7 @@ class FteWorkerTaskHandle:
     async def _wait_task_status(self) -> dict[str, Any]:
         with self._lifecycle_lock:
             min_version = self._last_status_version
-        return await asyncio.to_thread(
-            self.worker_handle.fte_wait_task_status,
+        return await self.worker_handle.fte_wait_task_status_async(
             self._attempt_id().to_dict(),
             min_version,
             self.status_wait_timeout_s,
@@ -836,7 +887,11 @@ class FteWorkerTaskHandle:
                 if terminal_error is None:
                     continue
                 raise terminal_error
-            apply_failure = await asyncio.to_thread(self._apply_status, status)
+            apply_failure = await _run_in_executor(
+                _FTE_STATUS_EXECUTOR,
+                self._apply_status,
+                status,
+            )
             if apply_failure is not None:
                 terminal_error = await self._finalize_status_watch_failure(
                     apply_failure,
@@ -858,7 +913,8 @@ class FteWorkerTaskHandle:
             self._worker_failure_publish_started = True
         contextual_error = RuntimeError(f"{failure_kind} for {self.task_id}: {_safe_failure_message(exc)}")
         contextual_error.__cause__ = exc
-        await asyncio.to_thread(
+        await _run_in_executor(
+            _FTE_STATUS_EXECUTOR,
             self.worker_handle.mark_fte_worker_failed,
             self.worker_id,
             contextual_error,
@@ -883,7 +939,10 @@ class FteWorkerTaskHandle:
         except Exception as cleanup_exc:
             cleanup_errors.append(f"worker failure publication failed: {_safe_failure_message(cleanup_exc)}")
         try:
-            await asyncio.to_thread(self._record_fte_task_terminal)
+            await _run_in_executor(
+                _FTE_STATUS_EXECUTOR,
+                self._record_fte_task_terminal,
+            )
         except Exception as cleanup_exc:
             cleanup_errors.append(f"terminal record failed: {_safe_failure_message(cleanup_exc)}")
         message = _safe_failure_message(exc)
@@ -1323,6 +1382,7 @@ class RayQueryDriverActor:
         # lazily instantiate the plan runner when first required.
         self.curr_plans: dict[str, Any] = {}
         self.curr_streams: dict[str, Any] = {}  # C++ ResultPartitionStream objects
+        self._async_result_streams: dict[str, _AsyncResultStreamState] = {}
         self._plan_query_ids: dict[str, str] = {}
         self._query_terminal_errors: dict[str, str] = {}
         self._leased_result_partition_refs: dict[str, dict[str, Any]] = {}
@@ -1398,7 +1458,24 @@ class RayQueryDriverActor:
         self._driver_shutdown_lock = asyncio.Lock()
         self._driver_shutdown_started = False
         self._driver_shutdown_complete = False
+        self._driver_executors_shutdown = False
         self._driver_duckdb_memory_bytes = duckdb_memory_bytes
+        self._driver_copy_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_DRIVER_COPY_EXECUTOR_WORKERS,
+            thread_name_prefix="vane-driver-copy",
+        )
+        self._driver_native_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_DRIVER_NATIVE_EXECUTOR_WORKERS,
+            thread_name_prefix="vane-driver-native",
+        )
+        self._driver_lifecycle_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_DRIVER_LIFECYCLE_EXECUTOR_WORKERS,
+            thread_name_prefix="vane-driver-lifecycle",
+        )
+        self._driver_session_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=_DRIVER_SESSION_EXECUTOR_WORKERS,
+            thread_name_prefix="vane-driver-session",
+        )
 
         self._query_resource_coordinator = self._create_query_resource_coordinator()
 
@@ -1426,6 +1503,72 @@ class RayQueryDriverActor:
         self._get_plan_runner()
         self._start_client_lease_maintenance()
         self._start_query_resource_maintenance()
+
+    def _get_driver_copy_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_driver_copy_executor", None)
+        if executor is None:
+            if getattr(self, "_driver_executors_shutdown", False):
+                raise RuntimeError("Ray query driver COPY executor is shut down")
+            executor = ThreadPoolExecutor(
+                max_workers=_DRIVER_COPY_EXECUTOR_WORKERS,
+                thread_name_prefix="vane-driver-copy",
+            )
+            self._driver_copy_executor = executor
+        return executor
+
+    def _get_driver_native_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_driver_native_executor", None)
+        if executor is None:
+            if getattr(self, "_driver_executors_shutdown", False):
+                raise RuntimeError("Ray query driver native executor is shut down")
+            executor = ThreadPoolExecutor(
+                max_workers=_DRIVER_NATIVE_EXECUTOR_WORKERS,
+                thread_name_prefix="vane-driver-native",
+            )
+            self._driver_native_executor = executor
+        return executor
+
+    def _get_driver_lifecycle_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_driver_lifecycle_executor", None)
+        if executor is None:
+            if getattr(self, "_driver_executors_shutdown", False):
+                raise RuntimeError("Ray query driver lifecycle executor is shut down")
+            executor = ThreadPoolExecutor(
+                max_workers=_DRIVER_LIFECYCLE_EXECUTOR_WORKERS,
+                thread_name_prefix="vane-driver-lifecycle",
+            )
+            self._driver_lifecycle_executor = executor
+        return executor
+
+    def _get_driver_session_executor(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_driver_session_executor", None)
+        if executor is None:
+            if getattr(self, "_driver_executors_shutdown", False):
+                raise RuntimeError("Ray query driver session executor is shut down")
+            executor = ThreadPoolExecutor(
+                max_workers=_DRIVER_SESSION_EXECUTOR_WORKERS,
+                thread_name_prefix="vane-driver-session",
+            )
+            self._driver_session_executor = executor
+        return executor
+
+    def _shutdown_driver_executors(self) -> None:
+        if getattr(self, "_driver_executors_shutdown", False):
+            return
+        self._driver_executors_shutdown = True
+        executors = (
+            getattr(self, "_driver_copy_executor", None),
+            getattr(self, "_driver_native_executor", None),
+            getattr(self, "_driver_lifecycle_executor", None),
+            getattr(self, "_driver_session_executor", None),
+        )
+        self._driver_copy_executor = None
+        self._driver_native_executor = None
+        self._driver_lifecycle_executor = None
+        self._driver_session_executor = None
+        for executor in executors:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     def _drop_query_fragments_sync(self, query_id: str) -> None:
         self._drop_query_fragments_after_admission_fence_sync(
@@ -1558,7 +1701,10 @@ class RayQueryDriverActor:
 
     async def fragment_stats(self) -> dict[str, Any]:
         plan_runner = self._get_plan_runner()
-        stats = await asyncio.to_thread(plan_runner.fragment_stats)
+        stats = await _run_in_executor(
+            self._get_driver_native_executor(),
+            plan_runner.fragment_stats,
+        )
         if isinstance(stats, dict):
             return stats
         raise TypeError("DistributedPhysicalPlanRunner.fragment_stats() must return a dict")
@@ -1948,7 +2094,11 @@ class RayQueryDriverActor:
             await self.stop_client_lease_maintenance()
             await self.stop_query_resource_maintenance()
             if plan_runner is not None:
-                await _to_thread_with_owned_side_effects(plan_runner.shutdown)
+                await _run_in_executor_with_owned_side_effects(
+                    self._get_driver_lifecycle_executor(),
+                    plan_runner.shutdown,
+                )
+            self._shutdown_driver_executors()
             self._driver_shutdown_complete = True
 
     def _client_detach_lock_for(self, owner_key: str) -> asyncio.Lock:
@@ -2214,7 +2364,10 @@ class RayQueryDriverActor:
                     session.close_in_progress = False
                     session.condition.notify_all()
 
-        await _to_thread_with_owned_side_effects(_close)
+        await _run_in_executor_with_owned_side_effects(
+            self._get_driver_session_executor(),
+            _close,
+        )
 
     @staticmethod
     def _sum_node_capacity(node_capacities: tuple[Any, ...]) -> Any:
@@ -4701,7 +4854,8 @@ class RayQueryDriverActor:
         elif owner_loop is not running_loop:
             raise RuntimeError("query resource registration must run on the admission owner loop")
 
-        prepared = await _to_thread_with_owned_side_effects(
+        prepared = await _run_in_executor_with_owned_side_effects(
+            self._get_driver_native_executor(),
             self._prepare_query_resource_registration,
             plan,
             query_connection,
@@ -5518,7 +5672,8 @@ class RayQueryDriverActor:
             task = self._query_udf_actor_activation_tasks.get(key)
             if task is None:
                 task = asyncio.create_task(
-                    _to_thread_with_owned_side_effects(
+                    _run_in_executor_with_owned_side_effects(
+                        self._get_driver_native_executor(),
                         self._activate_query_udf_actor_pool_sync,
                         normalized,
                         str(query_generation_capability),
@@ -5729,6 +5884,9 @@ class RayQueryDriverActor:
         execution_owner_errors: list[BaseException] = []
         self.curr_plans.pop(plan_id, None)
         self.curr_streams.pop(plan_id, None)
+        async_streams = getattr(self, "_async_result_streams", None)
+        if async_streams is not None:
+            async_streams.pop(str(plan_id), None)
         with self._plan_teardown_condition:
             leased_refs = getattr(self, "_leased_result_partition_refs", None)
             records = {} if leased_refs is None else dict(leased_refs.get(str(plan_id), {}))
@@ -5938,7 +6096,11 @@ class RayQueryDriverActor:
             raise PermissionError("query plan does not belong to the requested Vane session")
         if plan_session_id is None or not owns_plan:
             raise RuntimeError(f"query plan ownership state is inconsistent: {plan_key}")
-        await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_key)
+        await _run_in_executor_with_owned_side_effects(
+            self._get_driver_lifecycle_executor(),
+            self._cleanup_finished_plan,
+            plan_key,
+        )
 
     async def run_plan(
         self,
@@ -5954,7 +6116,8 @@ class RayQueryDriverActor:
         self._begin_session_operation(session, session_id)
         try:
             try:
-                plan, plan_id, query_connection = await _to_thread_with_owned_side_effects(
+                plan, plan_id, query_connection = await _run_in_executor_with_owned_side_effects(
+                    self._get_driver_native_executor(),
                     self._prepare_plan_sync,
                     session_id,
                     session,
@@ -5963,7 +6126,8 @@ class RayQueryDriverActor:
                 )
             except asyncio.CancelledError as cancellation_error:
                 try:
-                    await _to_thread_with_owned_side_effects(
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
                         self._teardown_plan_resources,
                         plan_id,
                         "",
@@ -5989,7 +6153,8 @@ class RayQueryDriverActor:
                 )
             except BaseException as registration_error:
                 try:
-                    await _to_thread_with_owned_side_effects(
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
                         self._teardown_plan_resources,
                         plan_id,
                         plan_id,
@@ -6009,7 +6174,8 @@ class RayQueryDriverActor:
 
             startup_ownership = _PlanStartupOwnership()
             startup = asyncio.create_task(
-                asyncio.to_thread(
+                _run_in_executor(
+                    self._get_driver_native_executor(),
                     self._run_plan_sync_with_ownership,
                     plan,
                     plan_id,
@@ -6027,7 +6193,8 @@ class RayQueryDriverActor:
                     startup.cancel()
                     await asyncio.gather(startup, return_exceptions=True)
                     try:
-                        await _to_thread_with_owned_side_effects(
+                        await _run_in_executor_with_owned_side_effects(
+                            self._get_driver_lifecycle_executor(),
                             self._teardown_plan_resources,
                             plan_id,
                             str(graph.query_id),
@@ -6048,7 +6215,8 @@ class RayQueryDriverActor:
                     except BaseException as startup_error:
                         raise startup_error from cancellation_error
                     try:
-                        await _to_thread_with_owned_side_effects(
+                        await _run_in_executor_with_owned_side_effects(
+                            self._get_driver_lifecycle_executor(),
                             self._teardown_plan_resources,
                             plan_id,
                             str(graph.query_id),
@@ -6547,7 +6715,8 @@ class RayQueryDriverActor:
         cleanup_warnings = outcome.cleanup_warnings
         cleanup_state: Literal["complete", "pending"] = "complete"
         try:
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
                 self._cleanup_finished_plan,
                 operation_id,
             )
@@ -6626,7 +6795,8 @@ class RayQueryDriverActor:
         plan_runner_started = False
         plan_execution: asyncio.Task[Any] | None = None
         try:
-            plan, query_connection = await _to_thread_with_owned_side_effects(
+            plan, query_connection = await _run_in_executor_with_owned_side_effects(
+                self._get_driver_native_executor(),
                 self._prepare_copy_plan_sync,
                 session_id,
                 session,
@@ -6640,14 +6810,16 @@ class RayQueryDriverActor:
                 expected_plan_id=plan_id,
             )
             self._plan_query_ids[plan_id] = str(graph.query_id)
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_native_executor(),
                 self._precreate_udf_actors,
                 plan,
                 graph,
                 query_connection=query_connection,
                 session_config=session.config,
             )
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_native_executor(),
                 self._precreate_vllm_actors,
                 plan,
                 query_connection=query_connection,
@@ -6656,7 +6828,8 @@ class RayQueryDriverActor:
             plan_runner = self._get_plan_runner()
             plan_runner_started = True
             plan_execution = asyncio.create_task(
-                asyncio.to_thread(
+                _run_in_executor(
+                    self._get_driver_copy_executor(),
                     plan_runner.run_copy_plan,
                     plan,
                     query_connection,
@@ -6679,7 +6852,8 @@ class RayQueryDriverActor:
             query_id = self._plan_query_ids.get(plan_id, "")
             teardown_error: BaseException | None = None
             try:
-                await _to_thread_with_owned_side_effects(
+                await _run_in_executor_with_owned_side_effects(
+                    self._get_driver_lifecycle_executor(),
                     self._teardown_plan_resources,
                     plan_id,
                     query_id,
@@ -6784,7 +6958,8 @@ class RayQueryDriverActor:
         if terminal_reason:
             cleanup_warnings += (f"COPY post-commit terminal query state: {terminal_reason}",)
         try:
-            final_progress_snapshot = await _to_thread_with_owned_side_effects(
+            final_progress_snapshot = await _run_in_executor_with_owned_side_effects(
+                self._get_driver_native_executor(),
                 self._build_local_progress_snapshot,
                 query_id,
                 None,
@@ -6799,7 +6974,8 @@ class RayQueryDriverActor:
             )
         final_cleanup_state: Literal["complete", "pending"] = "complete"
         try:
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
                 self._teardown_plan_resources,
                 plan_id,
                 query_id,
@@ -6918,7 +7094,8 @@ class RayQueryDriverActor:
         if not query_id:
             raise RuntimeError(f"Plan {plan_id} is missing its registered query resource owner")
         if query_id in getattr(self, "_query_terminal_errors", {}):
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
                 self._finish_terminal_query,
                 str(plan_id),
                 query_id,
@@ -6929,49 +7106,66 @@ class RayQueryDriverActor:
         manager.set_external_consumer_waiting(True)
         try:
             try:
-                # C++ ResultPartitionStream path: use blocking_next in a thread.
-                # IMPORTANT: blocking_next raises StopIteration when stream is exhausted.
-                # Python 3.12 forbids StopIteration inside asyncio Futures, so we must
-                # catch it in the thread and convert to a sentinel before it reaches
-                # the event loop.
                 stream = self.curr_streams[plan_id]
-
-                def _safe_blocking_next() -> Any | None:
+                stream_state = self._async_result_stream_state(plan_id, stream)
+                async with stream_state.read_lock:
                     try:
-                        return stream.blocking_next()
+                        while True:
+                            next_item = stream.next_nowait()
+                            if next_item is not None:
+                                break
+                            stream_state.ready.clear()
+                            stream.arm_ready_notification()
+                            await stream_state.ready.wait()
                     except StopIteration:
-                        return None
+                        next_item = None
                     except RuntimeError as e:
                         if "StopIteration" in str(e):
-                            return None
-                        raise
-
-                next_item = await asyncio.to_thread(_safe_blocking_next)
+                            next_item = None
+                        else:
+                            raise
             except (StopIteration, StopAsyncIteration):
-                await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_id)
+                await _run_in_executor_with_owned_side_effects(
+                    self._get_driver_lifecycle_executor(),
+                    self._cleanup_finished_plan,
+                    plan_id,
+                )
                 return None
             except RuntimeError as e:
                 # pybind11 wraps StopIteration in RuntimeError
                 if "StopIteration" in str(e):
-                    await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_id)
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
+                        self._cleanup_finished_plan,
+                        plan_id,
+                    )
                     return None
                 raise
         finally:
             manager.set_external_consumer_waiting(False)
         if query_id in getattr(self, "_query_terminal_errors", {}):
-            await _to_thread_with_owned_side_effects(
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
                 self._finish_terminal_query,
                 str(plan_id),
                 query_id,
             )
         if next_item is None:
-            await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_id)
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
+                self._cleanup_finished_plan,
+                plan_id,
+            )
             return None
 
         if isinstance(next_item, RayMaterializedResult):
             return next_item
         if isinstance(next_item, WorkerTaskMetadata):
-            await _to_thread_with_owned_side_effects(self._cleanup_finished_plan, plan_id)
+            await _run_in_executor_with_owned_side_effects(
+                self._get_driver_lifecycle_executor(),
+                self._cleanup_finished_plan,
+                plan_id,
+            )
             return None
 
         if hasattr(next_item, "object_ref"):
@@ -7004,6 +7198,33 @@ class RayQueryDriverActor:
                 release_token=release_token,
             )
         raise TypeError(f"expected metadata-aware fragment from stream, got {type(next_item).__name__}")
+
+    def _async_result_stream_state(
+        self,
+        plan_id: str,
+        stream: Any,
+    ) -> _AsyncResultStreamState:
+        plan_key = str(plan_id)
+        loop = asyncio.get_running_loop()
+        states = getattr(self, "_async_result_streams", None)
+        if states is None:
+            states = {}
+            self._async_result_streams = states
+        state = states.get(plan_key)
+        if state is not None and state.stream is stream and state.loop is loop:
+            return state
+        if state is not None:
+            state.stream.clear_ready_callback()
+        ready = asyncio.Event()
+        stream.set_ready_callback(loop, ready.set)
+        state = _AsyncResultStreamState(
+            stream=stream,
+            loop=loop,
+            ready=ready,
+            read_lock=asyncio.Lock(),
+        )
+        states[plan_key] = state
+        return state
 
 
 def get_head_node() -> dict[str, Any] | None:

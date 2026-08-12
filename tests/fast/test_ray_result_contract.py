@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 import vane
+from tests.result_stream_helpers import collect_result_stream
 from vane.runners.common import PartitionMetadata
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 from vane.runners.ray import driver, partition_metadata
@@ -118,11 +119,58 @@ def _make_test_physical_plan(con=None):
 class _DummyStream:
     def __init__(self, items):
         self.items = list(items)
+        self.loop = None
+        self.ready_callback = None
 
-    def blocking_next(self):
+    def next_nowait(self):
         if not self.items:
             raise StopIteration
         return self.items.pop(0)
+
+    def set_ready_callback(self, loop, callback):
+        self.loop = loop
+        self.ready_callback = callback
+
+    def arm_ready_notification(self):
+        raise AssertionError("an exhausted or readable dummy stream must not arm a notification")
+
+    def clear_ready_callback(self):
+        self.loop = None
+        self.ready_callback = None
+
+
+class _NotifyingStream:
+    def __init__(self):
+        self.items = []
+        self.closed = False
+        self.loop = None
+        self.ready_callback = None
+        self.armed = asyncio.Event()
+
+    def next_nowait(self):
+        if self.items:
+            return self.items.pop(0)
+        if self.closed:
+            raise StopIteration
+        return None
+
+    def set_ready_callback(self, loop, callback):
+        self.loop = loop
+        self.ready_callback = callback
+
+    def arm_ready_notification(self):
+        self.armed.set()
+        if self.items or self.closed:
+            self.loop.call_soon(self.ready_callback)
+
+    def clear_ready_callback(self):
+        self.loop = None
+        self.ready_callback = None
+
+    def publish(self, item):
+        self.items.append(item)
+        if self.loop is not None and self.ready_callback is not None:
+            self.loop.call_soon_threadsafe(self.ready_callback)
 
 
 class _FakeOutputLeaseOwner:
@@ -692,6 +740,7 @@ def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    executor = driver.ThreadPoolExecutor(max_workers=1)
 
     def _mutate():
         started.set()
@@ -699,7 +748,7 @@ def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
         finished.set()
 
     async def _cancel():
-        task = asyncio.create_task(driver._to_thread_with_owned_side_effects(_mutate))
+        task = asyncio.create_task(driver._run_in_executor_with_owned_side_effects(executor, _mutate))
         for _ in range(100):
             if started.is_set():
                 break
@@ -714,7 +763,10 @@ def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    asyncio.run(_cancel())
+    try:
+        asyncio.run(_cancel())
+    finally:
+        executor.shutdown(wait=True)
     assert finished.is_set()
 
 
@@ -841,6 +893,7 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
         def run_copy_plan(self, plan, conn):
             captured["plan"] = plan
             captured["conn"] = conn
+            captured["copy_thread"] = threading.current_thread().name
             return _committed_copy_result(ok=True)
 
     def _precreate_udf_actors(
@@ -889,8 +942,90 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     assert outcome.final_progress_snapshot == {"query_id": "copy-plan", "state": "FINISHED"}
     assert captured["plan"] is physical_plan
     assert captured["conn"] is runner._test_session_connection.cursors[-1]
-    assert captured["actor_init_thread"].startswith("asyncio_")
+    assert captured["actor_init_thread"].startswith("vane-driver-native")
+    assert captured["copy_thread"].startswith("vane-driver-copy")
     assert captured["lifecycle"] == ["snapshot", "teardown"]
+
+
+def test_query_driver_copy_progresses_while_default_executor_is_saturated(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    runner._driver_executors_shutdown = False
+    runner._driver_copy_executor = driver.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="test-driver-copy",
+    )
+    runner._driver_native_executor = driver.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="test-driver-native",
+    )
+    plan_id = "copy-default-executor-saturated"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    default_started = threading.Event()
+    default_release = threading.Event()
+    copy_started = threading.Event()
+    native_producer_started = threading.Event()
+    actor_loop = None
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn):
+            copy_started.set()
+            assert actor_loop is not None
+            producer = asyncio.run_coroutine_threadsafe(
+                driver._run_in_executor(
+                    runner._get_driver_native_executor(),
+                    native_producer_started.set,
+                ),
+                actor_loop,
+            )
+            producer.result(timeout=1.0)
+            return _committed_copy_result()
+
+    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+        assert actual_plan_id == plan_id
+        assert drop_fragments is True
+        cls._release_plan_session_state(runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    def _occupy_default_executor():
+        default_started.set()
+        assert default_release.wait(timeout=2.0)
+
+    async def _run_with_saturated_default_executor():
+        nonlocal actor_loop
+        actor_loop = asyncio.get_running_loop()
+        default_executor = driver.ThreadPoolExecutor(max_workers=1, thread_name_prefix="saturated-default")
+        asyncio.get_running_loop().set_default_executor(default_executor)
+        blocker = asyncio.create_task(asyncio.to_thread(_occupy_default_executor))
+        try:
+            while not default_started.is_set():
+                await asyncio.sleep(0)
+            copy = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+            for _ in range(1000):
+                if copy_started.is_set() and native_producer_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert copy_started.is_set()
+            assert native_producer_started.is_set()
+            return await asyncio.wait_for(copy, timeout=1.0)
+        finally:
+            default_release.set()
+            await blocker
+            default_executor.shutdown(wait=True)
+
+    try:
+        outcome = asyncio.run(_run_with_saturated_default_executor())
+    finally:
+        cls._shutdown_driver_executors(runner)
+
+    assert outcome.write_state == "committed"
+    assert outcome.cleanup_state == "complete"
 
 
 def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
@@ -2559,7 +2694,7 @@ def test_query_driver_run_plan_passes_distributed_physical_plan_wrapper(monkeypa
 
     assert captured["plan"] is physical_plan
     assert captured["conn"] is runner._test_session_connection.cursors[-1]
-    assert captured["startup_thread"].startswith("asyncio_")
+    assert captured["startup_thread"].startswith("vane-driver-native")
     assert runner.curr_plans["stream-plan"] is physical_plan
     assert runner.curr_streams["stream-plan"] is stream
 
@@ -3242,15 +3377,37 @@ def test_expired_client_reclamation_cancels_blocked_partition_read():
     release_read = threading.Event()
 
     class _BlockingStream:
-        @staticmethod
-        def blocking_next():
+        def __init__(self):
+            self.loop = None
+            self.ready_callback = None
+
+        def next_nowait(self):
             read_started.set()
-            release_read.wait(timeout=2.0)
-            raise StopIteration
+            if release_read.is_set():
+                raise StopIteration
+            return None
+
+        def set_ready_callback(self, loop, callback):
+            self.loop = loop
+            self.ready_callback = callback
+
+        def arm_ready_notification(self):
+            if release_read.is_set():
+                self.loop.call_soon(self.ready_callback)
+
+        def clear_ready_callback(self):
+            self.loop = None
+            self.ready_callback = None
+
+        def release(self):
+            release_read.set()
+            if self.loop is not None and self.ready_callback is not None:
+                self.loop.call_soon_threadsafe(self.ready_callback)
 
     runner.curr_plans[plan_id] = object()
-    runner.curr_streams[plan_id] = _BlockingStream()
-    runner._drop_query_fragments_sync = lambda _query_id: release_read.set()
+    stream = _BlockingStream()
+    runner.curr_streams[plan_id] = stream
+    runner._drop_query_fragments_sync = lambda _query_id: stream.release()
     lease = runner._client_leases[_TEST_RUNTIME_OWNER_ID]
     lease.expires_at = time.monotonic() + 60.0
 
@@ -4224,6 +4381,9 @@ class _RequiredFteWorkerCallbacks:
             },
         }
 
+    async def fte_wait_task_status_async(self, task_id, min_version, timeout_s):
+        return self.fte_wait_task_status(task_id, min_version, timeout_s)
+
     def mark_fte_worker_failed(self, _worker_id, _error, *, worker_incarnation_id):
         return []
 
@@ -4326,7 +4486,7 @@ def test_fte_worker_task_handle_finishes_via_status_wait():
     assert worker.terminal_attempts == ["q.1.2.0"]
 
 
-def test_fte_worker_task_status_transition_runs_off_event_loop():
+def test_fte_worker_task_status_transition_uses_dedicated_executor(monkeypatch):
     worker = _FakeFteStatusWorker()
     worker.status = {"state": "FINISHED", "stats": [1]}
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
@@ -4342,10 +4502,15 @@ def test_fte_worker_task_status_transition_runs_off_event_loop():
 
     handle._apply_status = _apply_status
 
+    async def _unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("successful FTE status adoption must not use the default executor")
+
+    monkeypatch.setattr(driver.asyncio, "to_thread", _unexpected_to_thread)
+
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
     assert transition_threads
-    assert transition_threads[0].startswith("asyncio_")
+    assert transition_threads[0].startswith("vane-fte-status")
 
 
 def test_fte_worker_task_handle_starts_one_watcher_under_concurrent_polling(
@@ -4519,12 +4684,13 @@ def test_fte_terminal_record_failure_is_not_masked_by_adopted_result():
 def test_fte_worker_task_handle_requires_status_wait_protocol():
     class _StatusOnlyWorker(_RequiredFteWorkerCallbacks):
         worker_id = "worker-without-status-wait"
+        fte_wait_task_status_async = None
 
         def fte_get_task_status(self, task_id):
             return {"state": "FINISHED", "task_id": task_id, "stats": [1]}
 
     task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
-    with pytest.raises(RuntimeError, match="must provide fte_wait_task_status"):
+    with pytest.raises(RuntimeError, match="must provide fte_wait_task_status_async"):
         driver.FteWorkerTaskHandle(task_id, _StatusOnlyWorker())
 
 
@@ -5329,6 +5495,59 @@ def test_get_next_partition_wraps_metadata_aware_fragment(monkeypatch):
     assert manager.snapshot()["external_consumer_waiting"] is False
 
 
+def test_get_next_partition_awaits_native_readiness_without_default_executor(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "plan-async-readiness"
+    manager = _bind_test_query_resource_owner(runner, plan_id)
+    payload = object()
+    fragment = vane.ray_cxx.RayResultPartitionRef(payload, 7, 99, _FakeOutputLeaseOwner())
+    runner.curr_plans[plan_id] = object()
+
+    class _LocalMetadataAccessor:
+        def __init__(self, metadatas):
+            self._metadatas = list(metadatas)
+
+        def get_index(self, key: int):
+            return self._metadatas[key]
+
+    monkeypatch.setattr(
+        PartitionMetadataAccessor,
+        "from_metadata_list",
+        classmethod(lambda _cls, meta: _LocalMetadataAccessor(meta)),
+    )
+    monkeypatch.setattr(
+        partition_metadata,
+        "resolve_object_refs_blocking",
+        lambda value, **_kwargs: value,
+    )
+
+    async def _unexpected_to_thread(*_args, **_kwargs):
+        raise AssertionError("stream readiness must not use the default executor")
+
+    monkeypatch.setattr(driver.asyncio, "to_thread", _unexpected_to_thread)
+
+    async def _run():
+        stream = _NotifyingStream()
+        runner.curr_streams[plan_id] = stream
+        partition_read = asyncio.create_task(
+            cls.get_next_partition(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
+        await stream.armed.wait()
+        stream.publish(fragment)
+        return await partition_read
+
+    result = asyncio.run(_run())
+
+    assert result is not None
+    assert result.partition() is payload
+    assert manager.snapshot()["external_consumer_waiting"] is False
+
+
 def test_get_next_partition_leases_and_releases_metadata_aware_fragment(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "plan-lease"
@@ -5760,7 +5979,7 @@ def test_close_plan_runs_blocking_teardown_off_actor_event_loop():
     asyncio.run(_close())
 
     assert len(cleanup_threads) == 1
-    assert cleanup_threads[0].startswith("asyncio_")
+    assert cleanup_threads[0].startswith("vane-driver-lifecycle")
 
 
 def test_fragment_stats_runs_worker_observation_off_actor_event_loop():
@@ -6096,8 +6315,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
     sink_results = []
     with _registered_low_level_plan(plan, con, node_id="node-a"):
         stream = runner.run_plan(plan, con)
-        with pytest.raises(StopIteration):
-            stream.blocking_next()
+        assert collect_result_stream(stream) == []
 
         for task in worker.tasks:
             task_plan = task.plan()
@@ -6296,7 +6514,7 @@ def test_run_plan_uses_distributed_worker_path(tmp_path):
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
-        parts = list(iter(runner.run_plan(plan, con)))
+        parts = collect_result_stream(runner.run_plan(plan, con))
 
         assert len(parts) == 1
         assert isinstance(parts[0], vane.ray_cxx.RayResultPartitionRef)
@@ -6328,7 +6546,7 @@ def test_run_plan_continues_with_final_tasks_after_order_by_barrier(tmp_path):
         refresh_phase_allocation=True,
     ) as graph:
         assert len(graph.materialization_barriers) == 1
-        parts = list(iter(runner.run_plan(plan, con)))
+        parts = collect_result_stream(runner.run_plan(plan, con))
         tables = ray.get([part.object_ref for part in parts])
 
     assert all(isinstance(table, pa.Table) for table in tables)

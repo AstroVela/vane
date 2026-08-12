@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -80,6 +82,13 @@ private:
 // compute scheduler. The stream owns the executor while results are consumed.
 class PlanResultStream {
 public:
+	enum class PollState : uint8_t { READY, PENDING, EXHAUSTED };
+
+	struct PollResult {
+		PollState state;
+		ResultPartitionRef partition;
+	};
+
 	PlanResultStream() = default;
 	PlanResultStream(std::shared_ptr<PlanTaskExecutor> executor, UnboundedReceiver<MaterializedOutput> rx,
 	                 std::shared_ptr<PlanExecutionStatus> status = nullptr)
@@ -94,6 +103,7 @@ public:
 		// Waiting for control tasks here would block the event loop and prevent
 		// Ray from delivering the final result back to the client. Each detached
 		// task retains the ClientContext and status until it finishes naturally.
+		ClearReadyCallback();
 		receiver_.close();
 	}
 
@@ -136,6 +146,58 @@ public:
 				status_->ThrowIfError();
 			}
 			return std::make_pair(true, curr_fragments_[curr_index_++]);
+		}
+	}
+
+	/// Poll without occupying a thread. PENDING callers can install a one-shot
+	/// readiness callback and poll again after the notification.
+	PollResult try_next() {
+		if (status_) {
+			status_->ThrowIfError();
+		}
+		while (curr_index_ < curr_fragments_.size()) {
+			if (status_) {
+				status_->ThrowIfError();
+			}
+			return {PollState::READY, curr_fragments_[curr_index_++]};
+		}
+		while (true) {
+			auto opt = receiver_.try_recv();
+			if (status_) {
+				status_->ThrowIfError();
+			}
+			if (!opt.first) {
+				if (receiver_.is_disconnected()) {
+					return {PollState::EXHAUSTED, ResultPartitionRef()};
+				}
+				return {PollState::PENDING, ResultPartitionRef()};
+			}
+			curr_fragments_ = opt.second.fragments();
+			curr_index_ = 0;
+			if (curr_fragments_.empty()) {
+				continue;
+			}
+			return {PollState::READY, curr_fragments_[curr_index_++]};
+		}
+	}
+
+	void NotifyWhenReady(std::function<void()> callback) {
+		auto notified = std::make_shared<std::atomic<bool>>(false);
+		auto notify_once = [notified, callback = std::move(callback)]() {
+			if (!notified->exchange(true)) {
+				callback();
+			}
+		};
+		receiver_.notify_when_ready(notify_once);
+		if (status_) {
+			status_->NotifyWhenError(std::move(notify_once));
+		}
+	}
+
+	void ClearReadyCallback() {
+		receiver_.clear_ready_callback();
+		if (status_) {
+			status_->ClearErrorCallback();
 		}
 	}
 
