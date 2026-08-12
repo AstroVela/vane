@@ -53,13 +53,6 @@ struct DistributedTestScanBindData : public TableFunctionData {
 	idx_t requested_task_count = 0;
 	vector<DistributedTestRuntimeTask> tasks;
 
-	unique_ptr<FunctionData> Copy() const override {
-		auto result = make_uniq<DistributedTestScanBindData>();
-		result->requested_task_count = requested_task_count;
-		result->tasks = tasks;
-		return std::move(result);
-	}
-
 	bool Equals(const FunctionData &other) const override {
 		auto other_data = dynamic_cast<const DistributedTestScanBindData *>(&other);
 		if (!other_data || requested_task_count != other_data->requested_task_count ||
@@ -456,11 +449,14 @@ static PlannedDistributedTestScan PlanDistributedTestScan(DuckDB &db, Connection
 	}
 	auto coordinator_plan = distributed::DuckPhysicalPlanRef(generated_plan.release());
 	auto &coordinator_scan = coordinator_plan->Root().Cast<PhysicalTableScan>();
+	REQUIRE_THROWS_WITH(coordinator_scan.bind_data->Copy(), Catch::Matchers::Contains("Copy not supported"));
 	distributed::DuckDBExecutionConfig config;
 	config.set_distributed_worker_slots(worker_slots);
 	PlannedDistributedTestScan result;
-	result.worker_plan = distributed::MakeTableScanPlan(coordinator_scan);
-	result.tasks = distributed::MakeTableScanTasks(coordinator_scan, config, db.instance);
+	result.worker_plan = distributed::MakeTableScanPlan(coordinator_scan, connection.context.get());
+	auto task_set = distributed::MakeTableScanTasks(coordinator_scan, config, db.instance);
+	REQUIRE_FALSE(task_set.known_empty);
+	result.tasks = std::move(task_set.tasks);
 	return result;
 }
 
@@ -483,7 +479,7 @@ static distributed::DuckPhysicalPlanRef CloneAndApply(Connection &worker,
 
 } // namespace
 
-TEST_CASE("Distributed synthetic extension registers one native scan and transports file tasks",
+TEST_CASE("Distributed synthetic extension transports file tasks with non-copyable bind data",
           "[distributed][extension][extension-scan]") {
 	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBytes(""),
 	                    Catch::Matchers::Contains("empty scan task descriptor"));

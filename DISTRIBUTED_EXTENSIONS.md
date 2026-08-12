@@ -147,10 +147,12 @@ format or a persistence format.
 ### Worker bind serialization
 
 An extension scan must implement both of DuckDB's normal table-function
-`serialize` and `deserialize` callbacks. The coordinator copies the bind object,
-invokes the distributed `prepare_bind` callback to remove coordinator-only task
-collections, and serializes the remaining worker bind state through the normal
-DuckDB binary DTO path.
+`serialize` and `deserialize` callbacks. The coordinator round-trips the bind
+through that normal DuckDB binary DTO path to create an independent worker bind,
+then invokes the distributed `prepare_bind` callback to remove coordinator-only
+task collections. `FunctionData::Copy()` is not part of the distributed scan
+contract. The detached bind is serialized normally when the worker physical
+plan is transported.
 
 After loading the required static extension, each worker resolves the normal
 DuckDB table function from its catalog and calls its `deserialize` callback.
@@ -164,7 +166,7 @@ DuckDB `TableFunction`. It provides the table-function capability protocol
 version, a task codec identity, and three operations:
 
 1. `plan` expands coordinator bind state into elementary opaque task envelopes.
-2. `prepare_bind` removes coordinator-only tasks from a copied worker bind.
+2. `prepare_bind` removes coordinator-only tasks from the deserialized worker bind.
 3. `apply_tasks` decodes and installs an assigned subset after worker bind
    deserialization.
 

@@ -75,6 +75,7 @@
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
+#include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "test_helpers.hpp"
 
 #include <memory>
@@ -90,8 +91,9 @@ class TestExtensionWriteOperator final : public PhysicalOperator, public Extensi
 public:
 	TestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                           string extension_write_name_p = "test_extension_write",
-	                           DistributedWriteMode mode = DistributedWriteMode::FILE_ARTIFACT)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), 0) {
+	                           DistributedWriteMode mode = DistributedWriteMode::FILE_ARTIFACT,
+	                           PhysicalOperatorType operator_type = PhysicalOperatorType::EXTENSION)
+	    : PhysicalOperator(physical_plan, operator_type, std::move(types), 0) {
 		plan.extension_name = "test_extension";
 		plan.operator_name = std::move(extension_write_name_p);
 		if (mode == DistributedWriteMode::CALLBACK) {
@@ -262,13 +264,37 @@ TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker si
 	auto unary = MakeUnaryScanPlan();
 	auto &extension = unary.plan->Make<TestExtensionWriteOperator>(
 	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK);
+	auto &extension_write = extension.Cast<TestExtensionWriteOperator>();
 	extension.children.push_back(*unary.scan);
 	unary.plan->SetRoot(extension);
 
 	PlanConfig config;
 	config.db = db.instance;
 	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
-	auto translated = physical_plan_to_pipeline_node(config, unary.plan, connection.context.get());
+	auto write_info = ResolveDistributedExtensionWriteInfo(*connection.context, extension_write.WritePlan());
+	auto unrelated = MakeUnaryScanPlan();
+	unrelated.plan->SetRoot(*unrelated.scan);
+	auto unrelated_result =
+	    physical_plan_to_pipeline_node(config, unrelated.plan, connection.context.get(), &write_info);
+	REQUIRE(unrelated_result.is_err());
+	REQUIRE(StringUtil::Contains(unrelated_result.error().what(), "requires an extension write root"));
+	auto wrong_type = MakeUnaryScanPlan();
+	auto &wrong_type_extension = wrong_type.plan->Make<TestExtensionWriteOperator>(
+	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK,
+	    PhysicalOperatorType::PROJECTION);
+	wrong_type_extension.children.push_back(*wrong_type.scan);
+	wrong_type.plan->SetRoot(wrong_type_extension);
+	auto wrong_type_result =
+	    physical_plan_to_pipeline_node(config, wrong_type.plan, connection.context.get(), &write_info);
+	REQUIRE(wrong_type_result.is_err());
+	REQUIRE(StringUtil::Contains(wrong_type_result.error().what(), "requires an extension write root"));
+	auto mismatched_write_info = write_info;
+	mismatched_write_info.worker_bind_data = "different-worker-bind";
+	auto mismatched =
+	    physical_plan_to_pipeline_node(config, unary.plan, connection.context.get(), &mismatched_write_info);
+	REQUIRE(mismatched.is_err());
+	REQUIRE(StringUtil::Contains(mismatched.error().what(), "does not match physical operator plan"));
+	auto translated = physical_plan_to_pipeline_node(config, unary.plan, connection.context.get(), &write_info);
 	REQUIRE(translated.is_ok());
 	auto write_sink = std::dynamic_pointer_cast<ExtensionWriteSinkNode>(translated.value()->inner());
 	REQUIRE(write_sink != nullptr);
@@ -707,6 +733,31 @@ TEST_CASE("PhysicalPlanTranslator: unsupported table function bind data is a val
 	auto msg = std::string(res.error().what());
 	REQUIRE(msg.find("unsupported_table_scan") != std::string::npos);
 	REQUIRE(msg.find("Copy not supported for TableFunctionData") != std::string::npos);
+	DuckDBExecutionConfig config;
+	REQUIRE_THROWS_WITH(MakeTableScanTasks(scan.Cast<PhysicalTableScan>(), config, nullptr),
+	                    Catch::Matchers::Contains("does not provide a distributable file list"));
+}
+
+TEST_CASE("PhysicalPlanTranslator: missing table function bind data is a value error", "[distributed]") {
+	Allocator allocator;
+	auto plan_ptr = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	TableFunction function;
+	function.name = "missing_bind_table_scan";
+	vector<ColumnIndex> column_ids = {ColumnIndex(0)};
+	vector<string> names = {"value"};
+
+	auto &scan = plan_ptr->Make<PhysicalTableScan>(types, function, nullptr, types, std::move(column_ids),
+	                                               vector<idx_t> {}, std::move(names), nullptr, 0, ExtraOperatorInfo {},
+	                                               vector<Value> {}, virtual_column_map_t {});
+	plan_ptr->SetRoot(scan);
+
+	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
+	REQUIRE(res.is_err());
+	REQUIRE(res.error().type() == DuckDBError::Type::ValueError);
+	auto msg = std::string(res.error().what());
+	REQUIRE(msg.find("missing_bind_table_scan") != std::string::npos);
+	REQUIRE(msg.find("bind data is missing") != std::string::npos);
 }
 
 TEST_CASE("PhysicalPlanTranslator: auto broadcast only considers semantically safe sides", "[distributed][join]") {

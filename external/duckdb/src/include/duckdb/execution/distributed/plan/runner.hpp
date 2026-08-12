@@ -582,7 +582,8 @@ public:
 
 		DuckDBResult<std::shared_ptr<DistributedPipelineNode>> pipeline_res;
 		try {
-			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get());
+			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get(),
+			                                                      extension_write_info.get());
 		} catch (const std::exception &ex) {
 			return DuckDBResult<PlanResult>::err(DuckDBError(std::string("Failed to translate plan: ") + ex.what()));
 		}
@@ -839,6 +840,7 @@ public:
 		}
 
 		bool streaming_channel_state_installed = false;
+		bool execution_may_have_started = false;
 		try {
 			if (copy_sink_node && copy_sink_node->staging_root_base().empty()) {
 				// Persist lifecycle metadata for explicit operator-managed cleanup. Starting a COPY must not age out
@@ -863,9 +865,14 @@ public:
 			}
 			auto task_executor = std::make_shared<PlanTaskExecutor>(client_context_, execute_status);
 
-			auto self = this->shared_from_this();
+			auto self = std::shared_ptr<PlanRunner>(this->shared_from_this());
+			if (!self) {
+				return DuckDBResult<PlanResult>::err(
+				    DuckDBError("PlanRunner requires shared_ptr ownership; create via std::make_shared"));
+			}
 			auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
 			auto initial_inputs_ptr = std::make_shared<TaskInputs>(std::move(initial_inputs));
+			execution_may_have_started = true;
 			task_executor->ScheduleTask([self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
 			                             initial_inputs_ptr]() mutable {
 				std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
@@ -954,14 +961,13 @@ public:
 			} catch (const std::exception &ex) {
 				capture_execution_error();
 				if (!deferred_collection_error) {
-					deferred_collection_error =
-					    std::make_shared<DuckDBError>(DuckDBError::external_error(ex.what()));
+					deferred_collection_error = std::make_shared<DuckDBError>(DuckDBError::external_error(ex.what()));
 				}
 			} catch (...) {
 				capture_execution_error();
 				if (!deferred_collection_error) {
-					deferred_collection_error = std::make_shared<DuckDBError>(DuckDBError::external_error(
-					    "distributed write result collection threw an unknown exception"));
+					deferred_collection_error = std::make_shared<DuckDBError>(
+					    DuckDBError::external_error("distributed write result collection threw an unknown exception"));
 				}
 			}
 
@@ -1084,17 +1090,33 @@ public:
 				    DuckDBError::external_error("distributed callback write finalization threw an unknown exception"));
 			}
 		} catch (const std::exception &ex) {
+			const auto execution_error =
+			    DuckDBError::external_error("distributed write setup or execution threw: " + string(ex.what()));
+			if (execution_may_have_started) {
+				auto result = fail_after_worker_abort(execution_error);
+				if (streaming_channel_state_installed && worker_manager_) {
+					worker_manager_->clear_streaming_results_channel_state();
+				}
+				return result;
+			}
 			if (streaming_channel_state_installed && worker_manager_) {
 				worker_manager_->clear_streaming_results_channel_state();
 			}
-			return fail_after_write_cleanup(
-			    DuckDBError::external_error("distributed write setup or execution threw: " + string(ex.what())));
+			return fail_after_write_cleanup(execution_error);
 		} catch (...) {
+			const auto execution_error =
+			    DuckDBError::external_error("distributed write setup or execution threw an unknown exception");
+			if (execution_may_have_started) {
+				auto result = fail_after_worker_abort(execution_error);
+				if (streaming_channel_state_installed && worker_manager_) {
+					worker_manager_->clear_streaming_results_channel_state();
+				}
+				return result;
+			}
 			if (streaming_channel_state_installed && worker_manager_) {
 				worker_manager_->clear_streaming_results_channel_state();
 			}
-			return fail_after_write_cleanup(
-			    DuckDBError::external_error("distributed write setup or execution threw an unknown exception"));
+			return fail_after_write_cleanup(execution_error);
 		}
 	}
 

@@ -61,8 +61,7 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
       serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
-      filter_pushdown(false),
-      filter_prune(false), sampling_pushdown(false), late_materialization(false) {
+      filter_pushdown(false), filter_prune(false), sampling_pushdown(false), late_materialization(false) {
 }
 
 TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, std::nullptr_t function_,
@@ -78,8 +77,7 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
       serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
-      filter_pushdown(false),
-      filter_prune(false), sampling_pushdown(false), late_materialization(false) {
+      filter_pushdown(false), filter_prune(false), sampling_pushdown(false), late_materialization(false) {
 }
 
 TableFunction::TableFunction(const vector<LogicalType> &arguments, table_function_t function_,

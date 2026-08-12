@@ -52,17 +52,38 @@
 namespace duckdb {
 namespace distributed {
 
-PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(PlanConfig plan_config,
-                                                                           DuckPhysicalPlanRef plan,
-                                                                           ClientContext *client_context)
+namespace {
+
+void ValidateResolvedExtensionWriteInfo(const DistributedExtensionWriteInfo &info,
+                                        const DistributedExtensionWritePlan &plan) {
+	info.Validate();
+	plan.Validate();
+	if (info.capability.extension_name != plan.extension_name ||
+	    info.capability.capability.kind != DistributedExtensionCapabilityKind::WRITE_OPERATOR ||
+	    info.capability.capability.name != plan.operator_name || info.worker_bind_data != plan.worker_bind_data) {
+		throw InvalidInputException(
+		    "Pre-resolved distributed extension write protocol does not match physical operator "
+		    "plan '%s.%s'",
+		    plan.extension_name, plan.operator_name);
+	}
+}
+
+} // namespace
+
+PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(
+    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context,
+    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info)
     : plan_config_(std::move(plan_config)), plan_(std::move(plan)), client_context_(client_context),
+      resolved_extension_write_info_(resolved_extension_write_info),
       exchange_mgr_(std::make_shared<FlightExchangeManager>(ResolveFlightExchangeConfigFromEnv(), client_context)) {
 }
 
 DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-                                                                     ClientContext *client_context) {
-	PhysicalPlanToPipelineNodeTranslator translator(std::move(plan_config), plan, client_context);
+PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
+    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context,
+    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info) {
+	PhysicalPlanToPipelineNodeTranslator translator(std::move(plan_config), plan, client_context,
+	                                                resolved_extension_write_info);
 	if (!plan) {
 		return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::err(
 		    DuckDBError::invalid_state_error("physical plan is null"));
@@ -70,6 +91,11 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(PlanConfig 
 	if (!plan->HasRoot()) {
 		return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::err(
 		    DuckDBError::invalid_state_error("physical plan has no root"));
+	}
+	if (resolved_extension_write_info &&
+	    (plan->Root().type != PhysicalOperatorType::EXTENSION || !plan->Root().GetExtensionWriteTaskProvider())) {
+		return DuckDBResult<std::shared_ptr<DistributedPipelineNode>>::err(DuckDBError::invalid_state_error(
+		    "pre-resolved distributed extension write protocol requires an extension write root"));
 	}
 	try {
 		translator.VisitOperator(plan->Root());
@@ -332,32 +358,39 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		if (!client_context_) {
 			throw InvalidInputException("Distributed extension write requires a ClientContext");
 		}
-		auto write_info = ResolveDistributedExtensionWriteInfo(*client_context_, provider->WritePlan());
-		write_info.Validate();
+		DistributedExtensionWriteInfo owned_write_info;
+		optional_ptr<const DistributedExtensionWriteInfo> write_info = resolved_extension_write_info_;
+		if (write_info) {
+			ValidateResolvedExtensionWriteInfo(*write_info, provider->WritePlan());
+		} else {
+			owned_write_info = ResolveDistributedExtensionWriteInfo(*client_context_, provider->WritePlan());
+			write_info = &owned_write_info;
+		}
 		if (&op != &plan_->Root()) {
 			throw InvalidInputException("Distributed extension write %s must be the physical plan root",
-			                            write_info.Name());
+			                            write_info->Name());
 		}
 		if (children.size() != 1 || !children[0]) {
-			throw InvalidInputException("Distributed extension write %s requires exactly one child", write_info.Name());
+			throw InvalidInputException("Distributed extension write %s requires exactly one child",
+			                            write_info->Name());
 		}
-		if (write_info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+		if (write_info->mode == DistributedWriteMode::FILE_ARTIFACT) {
 			auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(children[0]->inner());
 			if (!copy_finish) {
 				throw InvalidInputException(
 				    "Distributed file-artifact write %s requires a COPY child returning written-file statistics",
-				    write_info.Name());
+				    write_info->Name());
 			}
 			// The extension root is coordinator-only. Workers execute the translated
 			// COPY child and return the fixed file-artifact envelope.
 			node_stack_.push_back(children[0]);
 			return;
 		}
-		if (write_info.mode != DistributedWriteMode::CALLBACK) {
-			throw InvalidInputException("Distributed extension write %s has an unknown mode", write_info.Name());
+		if (write_info->mode != DistributedWriteMode::CALLBACK) {
+			throw InvalidInputException("Distributed extension write %s has an unknown mode", write_info->Name());
 		}
 		auto write_sink =
-		    std::make_shared<ExtensionWriteSinkNode>(get_next_pipeline_node_id(), children[0], write_info);
+		    std::make_shared<ExtensionWriteSinkNode>(get_next_pipeline_node_id(), children[0], *write_info);
 		node_stack_.push_back(std::make_shared<DistributedPipelineNode>(std::move(write_sink)));
 		return;
 	}
@@ -403,11 +436,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 // Wrapper implementation for translator API declared in `translator_api.hpp`.
 // This keeps the heavy translator implementation out of widely-included
 // headers while providing a single externally-linkable symbol.
-DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-physical_plan_to_pipeline_node_wrapper(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-                                       ClientContext *client_context) {
-	auto result = PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(std::move(plan_config), plan,
-	                                                                                   client_context);
+DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline_node_wrapper(
+    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context,
+    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info) {
+	auto result = PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
+	    std::move(plan_config), plan, client_context, resolved_extension_write_info);
 	return result;
 }
 

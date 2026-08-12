@@ -35,7 +35,7 @@ struct DistributedScanTask {
 };
 
 //! Physical scan information available while an extension creates its task
-//! envelopes or detaches a worker bind-data copy.
+//! envelopes or detaches a serialized worker bind.
 struct TableFunctionDistributedScanInput {
 	TableFunctionDistributedScanInput(const FunctionData &bind_data_p, const vector<ColumnIndex> &column_ids_p,
 	                                  const vector<idx_t> &projection_ids_p,
@@ -55,9 +55,9 @@ struct TableFunctionDistributedScanInput {
 typedef vector<DistributedScanTask> (*table_function_plan_distributed_scan_t)(
     const TableFunctionDistributedScanInput &input);
 
-//! Remove coordinator-only task state from a copied bind object before that
-//! object is transported with the worker physical plan. This is not a rebind:
-//! the ordinary table-function serialize callback still serializes the copy.
+//! Remove coordinator-only task state from an independently deserialized bind
+//! object before it is transported with the worker physical plan. This is not
+//! a rebind: the ordinary table-function serde creates and transports the bind.
 typedef void (*table_function_prepare_distributed_scan_bind_t)(const TableFunctionDistributedScanInput &input,
                                                                FunctionData &worker_bind_data);
 
