@@ -47,6 +47,11 @@ void ExtensionLoader::RegisterDistributedExtension(idx_t protocol_version) {
 
 void ExtensionLoader::RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
                                                     const string &capability_name, idx_t protocol_version) {
+	if (kind == DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
+		throw InvalidInputException(
+		    "Distributed table function '%s' must attach callbacks to its normal RegisterFunction registration",
+		    capability_name);
+	}
 	if (!distributed_manifest) {
 		throw InvalidInputException("Distributed extension '%s' must be declared before capability '%s'",
 		                            extension_name, capability_name);
@@ -64,11 +69,6 @@ void ExtensionLoader::RegisterDistributedCapability(DistributedExtensionCapabili
 	}
 }
 
-void ExtensionLoader::RegisterDistributedTableFunction(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::TABLE_FUNCTION, capability_name,
-	                              protocol_version);
-}
-
 void ExtensionLoader::RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version) {
 	RegisterDistributedCapability(DistributedExtensionCapabilityKind::AGGREGATE_FUNCTION, capability_name,
 	                              protocol_version);
@@ -82,23 +82,29 @@ void ExtensionLoader::RegisterDistributedOperator(const string &capability_name,
 	RegisterDistributedCapability(DistributedExtensionCapabilityKind::OPERATOR, capability_name, protocol_version);
 }
 
-void ExtensionLoader::RegisterDistributedWriteOperator(const string &capability_name, idx_t protocol_version,
-                                                       DistributedExtensionWriteCallbacks callbacks) {
+void DistributedWriteOperatorExtension::Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension) {
+	loader.RegisterDistributedWriteOperatorExtension(std::move(extension));
+}
+
+void ExtensionLoader::RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension) {
 	if (!distributed_manifest) {
 		throw InvalidInputException("Distributed extension '%s' must be declared before write capability '%s'",
-		                            extension_name, capability_name);
+		                            extension_name, extension.name);
 	}
 	DistributedExtensionCapability capability;
 	capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-	capability.name = capability_name;
-	capability.protocol_version = protocol_version;
+	capability.name = extension.name;
+	capability.protocol_version = extension.protocol_version;
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = extension_name;
 	reference.extension_protocol_version = distributed_manifest->protocol_version;
 	reference.capability = capability;
-	callbacks.Validate(reference.CanonicalIdentity());
-	RegisterDistributedCapability(capability.kind, capability.name, capability.protocol_version);
-	distributed_write_callbacks.emplace_back(std::move(capability), std::move(callbacks));
+	extension.callbacks.Validate(reference.CanonicalIdentity());
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+	candidate_manifest->capabilities.push_back(capability);
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+	distributed_write_callbacks.emplace_back(std::move(capability), std::move(extension.callbacks));
+	distributed_manifest = std::move(candidate_manifest);
 }
 
 void ExtensionLoader::RegisterDistributedStorage(const string &capability_name, idx_t protocol_version) {
@@ -186,11 +192,110 @@ void ExtensionLoader::RegisterFunction(TableFunctionSet function) {
 	RegisterFunction(std::move(info));
 }
 
+unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFunctions(TableFunctionSet &functions) {
+	idx_t callback_count = 0;
+	idx_t protocol_version = 0;
+	for (const auto &function : functions.functions) {
+		if (!function.HasDistributedScanCallbacks()) {
+			continue;
+		}
+		callback_count++;
+		const auto &callbacks = function.GetDistributedScanCallbacks();
+		callbacks.ValidateDefinition(functions.name);
+		if (protocol_version == 0) {
+			protocol_version = callbacks.protocol_version;
+		} else if (protocol_version != callbacks.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' overloads must use one capability protocol version", functions.name);
+		}
+	}
+	if (callback_count != 0 && callback_count != functions.functions.size()) {
+		throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
+		                            functions.name);
+	}
+
+	auto existing_entry = TryGetTableFunction(functions.name);
+	idx_t existing_callback_count = 0;
+	if (existing_entry) {
+		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+			if (function.HasDistributedScanCallbacks()) {
+				existing_callback_count++;
+			}
+		}
+	}
+	if (existing_entry && existing_callback_count != 0 &&
+	    existing_callback_count != existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions.size()) {
+		throw InternalException("Distributed table function '%s' has a mixed callback registration", functions.name);
+	}
+	if (callback_count == 0) {
+		if (existing_callback_count != 0) {
+			throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
+			                            functions.name);
+		}
+		return nullptr;
+	}
+	if (existing_entry && existing_callback_count == 0) {
+		throw InvalidInputException("Distributed table function '%s' cannot add callbacks to native-only overloads",
+		                            functions.name);
+	}
+	if (!distributed_manifest) {
+		throw InvalidInputException(
+		    "Distributed extension '%s' must be declared before distributed table function '%s'", extension_name,
+		    functions.name);
+	}
+
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	capability.name = functions.name;
+	capability.protocol_version = protocol_version;
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+	bool capability_exists = false;
+	for (const auto &registered : candidate_manifest->capabilities) {
+		if (registered.kind != capability.kind || registered.name != capability.name) {
+			continue;
+		}
+		if (registered.protocol_version != capability.protocol_version) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' protocol mismatch: callbacks use %llu, manifest uses %llu",
+			    functions.name, static_cast<unsigned long long>(capability.protocol_version),
+			    static_cast<unsigned long long>(registered.protocol_version));
+		}
+		capability_exists = true;
+	}
+	if (!capability_exists) {
+		candidate_manifest->capabilities.push_back(capability);
+	}
+	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
+
+	DistributedExtensionCapabilityReference reference;
+	reference.extension_name = extension_name;
+	reference.extension_protocol_version = distributed_manifest->protocol_version;
+	reference.capability = capability;
+	if (existing_entry) {
+		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+			const auto &callbacks = function.GetDistributedScanCallbacks();
+			callbacks.Validate(function.name);
+			if (callbacks.GetCapability() != reference) {
+				throw InvalidInputException("Distributed table function '%s' is already owned by '%s'", functions.name,
+				                            callbacks.GetCapability().CanonicalIdentity());
+			}
+		}
+	}
+	for (auto &function : functions.functions) {
+		function.BindDistributedScanCapability(extension_name, distributed_manifest->protocol_version);
+	}
+	return candidate_manifest;
+}
+
 void ExtensionLoader::RegisterFunction(CreateTableFunctionInfo info) {
 	D_ASSERT(!info.functions.name.empty());
+	auto candidate_manifest = BindDistributedTableFunctions(info.functions);
 	auto &system_catalog = Catalog::GetSystemCatalog(db);
 	auto data = CatalogTransaction::GetSystemTransaction(db);
 	system_catalog.CreateFunction(data, info);
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
+	}
 }
 
 void ExtensionLoader::RegisterFunction(PragmaFunction function) {
@@ -255,10 +360,17 @@ void ExtensionLoader::AddFunctionOverload(ScalarFunctionSet functions) { // NOLI
 }
 
 void ExtensionLoader::AddFunctionOverload(TableFunctionSet functions) { // NOLINT
-	auto &table_function = GetTableFunction(functions.name);
+	D_ASSERT(!functions.name.empty());
 	for (auto &function : functions.functions) {
 		function.name = functions.name;
+	}
+	auto candidate_manifest = BindDistributedTableFunctions(functions);
+	auto &table_function = GetTableFunction(functions.name);
+	for (auto &function : functions.functions) {
 		table_function.functions.AddFunction(std::move(function));
+	}
+	if (candidate_manifest) {
+		distributed_manifest = std::move(candidate_manifest);
 	}
 }
 

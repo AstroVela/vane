@@ -72,19 +72,29 @@ typedef void (*table_function_prepare_distributed_scan_bind_t)(const TableFuncti
 typedef void (*table_function_apply_distributed_scan_tasks_t)(FunctionData &worker_bind_data,
                                                               const vector<DistributedScanTask> &tasks);
 
-//! Complete distributed scan contract attached to a TableFunction. The
-//! capability and codec identity are transported in every task descriptor and
-//! must match exactly on the worker.
+//! Complete distributed scan contract attached to a TableFunction. Extension
+//! authors declare only the capability protocol and task codec here. The
+//! ExtensionLoader derives the extension and function identity from the normal
+//! DuckDB registration and binds the complete capability before publication.
+//! The complete capability and codec identity are transported in every task
+//! descriptor and must match exactly on the worker.
 struct TableFunctionDistributedScanCallbacks {
-	DistributedExtensionCapabilityReference capability;
+	idx_t protocol_version = 0;
 	string task_codec;
 	idx_t task_codec_version = 0;
 	table_function_plan_distributed_scan_t plan = nullptr;
 	table_function_prepare_distributed_scan_bind_t prepare_bind = nullptr;
 	table_function_apply_distributed_scan_tasks_t apply_tasks = nullptr;
 
+	DUCKDB_API void ValidateDefinition(const string &function_name) const;
 	DUCKDB_API void Validate(const string &function_name) const;
+	DUCKDB_API void BindCapability(const string &extension_name, idx_t extension_protocol_version,
+	                               const string &function_name);
+	DUCKDB_API const DistributedExtensionCapabilityReference &GetCapability() const;
 	DUCKDB_API bool operator==(const TableFunctionDistributedScanCallbacks &other) const;
+
+private:
+	DistributedExtensionCapabilityReference capability;
 };
 
 } // namespace duckdb

@@ -303,10 +303,11 @@ static bool ApplyExtensionScanTasks(PhysicalTableScan &scan, const ScanTaskDescr
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 	callbacks.Validate(scan.function.name);
-	if (descriptor.extension_capability != callbacks.capability) {
+	const auto &capability = callbacks.GetCapability();
+	if (descriptor.extension_capability != capability) {
 		SetApplyError(error, "distributed scan capability mismatch for table function '" + scan.function.name +
 		                         "': task=" + descriptor.extension_capability.CanonicalIdentity() +
-		                         ", worker=" + callbacks.capability.CanonicalIdentity());
+		                         ", worker=" + capability.CanonicalIdentity());
 		return false;
 	}
 	if (descriptor.task_codec != callbacks.task_codec ||

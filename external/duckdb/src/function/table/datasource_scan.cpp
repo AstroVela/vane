@@ -32,16 +32,6 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 	return callback;
 }
 
-static DistributedExtensionCapabilityReference DataSourceDistributedCapability() {
-	DistributedExtensionCapabilityReference result;
-	result.extension_name = "vane_core";
-	result.extension_protocol_version = 1;
-	result.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	result.capability.name = "datasource_scan";
-	result.capability.protocol_version = 1;
-	return result;
-}
-
 static vector<DistributedScanTask> DataSourcePlanDistributedScan(const TableFunctionDistributedScanInput &input) {
 	auto &bind_data = input.bind_data.Cast<DataSourceScanBindData>();
 	vector<DistributedScanTask> tasks;
@@ -307,13 +297,14 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	func.serialize = DataSourceScanSerialize;
 	func.deserialize = DataSourceScanDeserialize;
 	TableFunctionDistributedScanCallbacks distributed_scan;
-	distributed_scan.capability = DataSourceDistributedCapability();
+	distributed_scan.protocol_version = 1;
 	distributed_scan.task_codec = DATASOURCE_TASK_CODEC;
 	distributed_scan.task_codec_version = 1;
 	distributed_scan.plan = DataSourcePlanDistributedScan;
 	distributed_scan.prepare_bind = DataSourcePrepareDistributedBind;
 	distributed_scan.apply_tasks = DataSourceApplyDistributedTasks;
 	func.SetDistributedScanCallbacks(std::move(distributed_scan));
+	func.BindDistributedScanCapability("vane_core", 1);
 	func.projection_pushdown = false;
 	return func;
 }

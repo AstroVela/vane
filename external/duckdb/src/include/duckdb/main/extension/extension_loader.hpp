@@ -30,6 +30,7 @@ struct CreateTableFunctionInfo;
 class ExtensionLoader {
 	friend class DuckDB;
 	friend class ExtensionHelper;
+	friend struct DistributedWriteOperatorExtension;
 
 public:
 	explicit ExtensionLoader(ExtensionActiveLoad &load_info);
@@ -47,12 +48,9 @@ public:
 	DUCKDB_API void RegisterDistributedExtension(idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
 	                                              const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedTableFunction(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedOperator(const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedWriteOperator(const string &capability_name, idx_t protocol_version,
-	                                                 DistributedExtensionWriteCallbacks callbacks);
 	DUCKDB_API void RegisterDistributedStorage(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedContext(const string &capability_name, idx_t protocol_version);
 
@@ -118,6 +116,8 @@ public:
 
 private:
 	void FinalizeLoad();
+	unique_ptr<DistributedExtensionManifest> BindDistributedTableFunctions(TableFunctionSet &functions);
+	void RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension);
 
 private:
 	DatabaseInstance &db;

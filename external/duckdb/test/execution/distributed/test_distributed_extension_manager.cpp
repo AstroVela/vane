@@ -4,6 +4,9 @@
 #include "catch.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -20,7 +23,7 @@ class NativeContractExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
 		loader.RegisterDistributedExtension(1);
-		loader.RegisterDistributedTableFunction("native_identity", 1);
+		loader.RegisterDistributedOperator("native_identity", 1);
 		loader.RegisterFunction(ScalarFunction("distributed_native_identity", {LogicalType::INTEGER},
 		                                       LogicalType::INTEGER, DistributedNativeIdentity));
 	}
@@ -38,7 +41,7 @@ class FailingContractExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
 		loader.RegisterDistributedExtension(1);
-		loader.RegisterDistributedTableFunction("never_published", 1);
+		loader.RegisterDistributedOperator("never_published", 1);
 		throw InvalidInputException("intentional distributed extension load failure");
 	}
 
@@ -52,9 +55,12 @@ public:
 	void Load(ExtensionLoader &loader) override {
 		REQUIRE_THROWS_WITH(loader.RegisterDistributedExtension(0), Catch::Matchers::Contains("greater than zero"));
 		loader.RegisterDistributedExtension(1);
-		REQUIRE_THROWS_WITH(loader.RegisterDistributedTableFunction("Invalid Capability", 1),
+		REQUIRE_THROWS_WITH(
+		    loader.RegisterDistributedCapability(DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1),
+		    Catch::Matchers::Contains("normal RegisterFunction"));
+		REQUIRE_THROWS_WITH(loader.RegisterDistributedOperator("Invalid Capability", 1),
 		                    Catch::Matchers::Contains("lowercase ASCII"));
-		loader.RegisterDistributedTableFunction("scan", 1);
+		loader.RegisterDistributedOperator("scan", 1);
 	}
 
 	string Name() override {
@@ -66,11 +72,86 @@ class IncompleteWriteContractExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
 		loader.RegisterDistributedExtension(1);
-		loader.RegisterDistributedWriteOperator("write", 1, DistributedExtensionWriteCallbacks {});
+		DistributedWriteOperatorExtension::Register(loader, {"write", 1, DistributedExtensionWriteCallbacks {}});
 	}
 
 	string Name() override {
 		return "incomplete_write_contract";
+	}
+};
+
+struct DistributedOverloadBindData : public FunctionData {
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<DistributedOverloadBindData>();
+	}
+
+	bool Equals(const FunctionData &other) const override {
+		return dynamic_cast<const DistributedOverloadBindData *>(&other) != nullptr;
+	}
+};
+
+static unique_ptr<FunctionData> DistributedOverloadBind(ClientContext &, TableFunctionBindInput &,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("value");
+	return make_uniq<DistributedOverloadBindData>();
+}
+
+static void DistributedOverloadScan(ClientContext &, TableFunctionInput &, DataChunk &output) {
+	output.SetCardinality(0);
+}
+
+static vector<DistributedScanTask> DistributedOverloadPlan(const TableFunctionDistributedScanInput &) {
+	return {};
+}
+
+static void DistributedOverloadPrepare(const TableFunctionDistributedScanInput &, FunctionData &) {
+}
+
+static void DistributedOverloadApply(FunctionData &, const vector<DistributedScanTask> &) {
+}
+
+static void DistributedOverloadSerialize(Serializer &serializer, const optional_ptr<FunctionData>,
+                                         const TableFunction &) {
+	serializer.WriteProperty(100, "marker", true);
+}
+
+static unique_ptr<FunctionData> DistributedOverloadDeserialize(Deserializer &deserializer, TableFunction &) {
+	if (!deserializer.ReadProperty<bool>(100, "marker")) {
+		throw SerializationException("invalid distributed overload marker");
+	}
+	return make_uniq<DistributedOverloadBindData>();
+}
+
+static TableFunction DistributedOverloadFunction(const LogicalType &argument) {
+	TableFunction function({argument}, DistributedOverloadScan, DistributedOverloadBind);
+	function.serialize = DistributedOverloadSerialize;
+	function.deserialize = DistributedOverloadDeserialize;
+	TableFunctionDistributedScanCallbacks callbacks;
+	callbacks.protocol_version = 1;
+	callbacks.task_codec = "distributed-overload.task";
+	callbacks.task_codec_version = 1;
+	callbacks.plan = DistributedOverloadPlan;
+	callbacks.prepare_bind = DistributedOverloadPrepare;
+	callbacks.apply_tasks = DistributedOverloadApply;
+	function.SetDistributedScanCallbacks(std::move(callbacks));
+	return function;
+}
+
+class DistributedOverloadExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		loader.RegisterDistributedExtension(1);
+		TableFunctionSet initial("distributed_overload_scan");
+		initial.AddFunction(DistributedOverloadFunction(LogicalType::INTEGER));
+		loader.RegisterFunction(std::move(initial));
+		TableFunctionSet overloads("distributed_overload_scan");
+		overloads.AddFunction(DistributedOverloadFunction(LogicalType::BIGINT));
+		loader.AddFunctionOverload(std::move(overloads));
+	}
+
+	string Name() override {
+		return "distributed_overload";
 	}
 };
 
@@ -197,5 +278,21 @@ TEST_CASE("ExtensionLoader distributed declaration validation has strong excepti
 
 	DistributedExtensionManifest manifest;
 	REQUIRE(DistributedExtensionManager::Get(*db.instance).TryGetExtension("loader_retry", manifest));
-	REQUIRE(manifest.CanonicalIdentity() == "loader_retry@1{table_function:scan@1}");
+	REQUIRE(manifest.CanonicalIdentity() == "loader_retry@1{operator:scan@1}");
+}
+
+TEST_CASE("ExtensionLoader derives one capability across separately registered table overloads",
+          "[distributed][extension]") {
+	DuckDB db(nullptr);
+	REQUIRE_NOTHROW(db.LoadStaticExtension<DistributedOverloadExtension>());
+
+	DistributedExtensionManifest manifest;
+	REQUIRE(DistributedExtensionManager::Get(*db.instance).TryGetExtension("distributed_overload", manifest));
+	REQUIRE(manifest.CanonicalIdentity() == "distributed_overload@1{table_function:distributed_overload_scan@1}");
+
+	Connection connection(db);
+	auto integer_result = connection.Query("SELECT * FROM distributed_overload_scan(1::INTEGER)");
+	REQUIRE_NO_FAIL(*integer_result);
+	auto bigint_result = connection.Query("SELECT * FROM distributed_overload_scan(1::BIGINT)");
+	REQUIRE_NO_FAIL(*bigint_result);
 }

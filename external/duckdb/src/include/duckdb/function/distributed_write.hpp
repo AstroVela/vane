@@ -13,6 +13,7 @@ class ClientContext;
 class DataChunk;
 class Deserializer;
 class ExecutionContext;
+class ExtensionLoader;
 class Serializer;
 
 //! Selects the worker-side implementation used by an extension write.
@@ -161,6 +162,18 @@ struct DistributedExtensionWriteCallbacks {
 	distributed_write_finalize_t finalize = nullptr;
 
 	DUCKDB_API void Validate(const string &capability_identity) const;
+};
+
+//! One worker-side distributed write hook. Like DuckDB's OperatorExtension,
+//! this is registered independently from catalog functions. ExtensionLoader is
+//! used so the hook receives the current extension identity and is published
+//! atomically with the extension manifest.
+struct DistributedWriteOperatorExtension {
+	string name;
+	idx_t protocol_version = 0;
+	DistributedExtensionWriteCallbacks callbacks;
+
+	DUCKDB_API static void Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension);
 };
 
 } // namespace duckdb

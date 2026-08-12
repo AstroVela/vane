@@ -42,16 +42,28 @@ that performs its ordinary DuckDB registrations:
 
 ```cpp
 void IcebergExtension::Load(ExtensionLoader &loader) {
-    // The extension's existing DuckDB registrations remain unchanged.
-    RegisterIcebergFunctions(loader);
-
     loader.RegisterDistributedExtension(1);
-    loader.RegisterDistributedTableFunction("iceberg_scan", 1);
+
+    auto scan_functions = GetIcebergScanFunction(loader);
+    TableFunctionDistributedScanCallbacks scan_callbacks;
+    scan_callbacks.protocol_version = 1;
+    scan_callbacks.task_codec = "iceberg.scan-task";
+    scan_callbacks.task_codec_version = 1;
+    scan_callbacks.plan = IcebergPlanScanTasks;
+    scan_callbacks.prepare_bind = IcebergPrepareWorkerBind;
+    scan_callbacks.apply_tasks = IcebergApplyScanTasks;
+    for (auto &function : scan_functions.functions) {
+        function.SetDistributedScanCallbacks(scan_callbacks);
+    }
+    // This remains the ordinary DuckDB catalog registration. The loader
+    // derives and stages the table-function capability from the callbacks.
+    loader.RegisterFunction(std::move(scan_functions));
+
     // A FILE_ARTIFACT provider declares only the operator capability.
     loader.RegisterDistributedOperator("iceberg_write_files", 1);
     // A CALLBACK provider also registers its complete worker sink contract.
-    loader.RegisterDistributedWriteOperator("iceberg_write_fragments", 1,
-                                            IcebergWriteCallbacks());
+    DistributedWriteOperatorExtension::Register(
+        loader, {"iceberg_write_fragments", 1, IcebergWriteCallbacks()});
 }
 ```
 
@@ -85,10 +97,14 @@ registration:
   the coordinator; any custom physical operator they produce still needs an
   explicit distributed operator capability.
 
-`ExtensionLoader` stages the manifest while the extension loads and publishes
-it only when loading finalizes successfully. Duplicate extension declarations,
-duplicate capability identities, zero protocol versions, and non-canonical
-names are rejected.
+`ExtensionLoader` automatically stages a table-function capability when the
+normally registered `TableFunction` carries distributed scan callbacks. The
+extension name, extension protocol, function name, and capability kind are
+derived rather than repeated by the extension author. It stages the complete
+manifest while the extension loads and publishes it only when loading finalizes
+successfully. Duplicate extension declarations, duplicate capability
+identities, zero protocol versions, mixed distributed/native-only overloads,
+and non-canonical names are rejected.
 
 ## Build and loading
 
@@ -147,14 +163,19 @@ metadata planning. Missing or incomplete bind serde is a hard error.
 ### Extension-owned tasks
 
 `TableFunctionDistributedScanCallbacks` is attached directly to the registered
-DuckDB `TableFunction`. It provides an exact
-`DistributedExtensionCapabilityReference`, a task codec identity, and three
-operations:
+DuckDB `TableFunction`. It provides the table-function capability protocol
+version, a task codec identity, and three operations:
 
 1. `plan` expands coordinator bind state into elementary opaque task envelopes.
 2. `prepare_bind` removes coordinator-only tasks from a copied worker bind.
 3. `apply_tasks` decodes and installs an assigned subset after worker bind
    deserialization.
+
+The ordinary `loader.RegisterFunction(...)` call binds the complete
+`DistributedExtensionCapabilityReference` from the loader's extension identity
+and the table function's catalog name. No second table-function registration is
+required, and native DuckDB continues to execute the original bind/init/scan
+callbacks.
 
 Each envelope contains a stable task ID, opaque payload bytes, optional binary
 artifacts with their own codec identities, and optional cardinality/byte
@@ -218,14 +239,17 @@ without invoking the provider again.
 ### Callback mode
 
 `CALLBACK` supports extensions whose worker output is a commit fragment rather
-than DuckDB's file-statistics row. `RegisterDistributedWriteOperator` registers
-five mandatory worker callbacks: `initialize_global`, `initialize_local`,
-`sink`, `combine`, and `finalize`. The distributed translator replaces the
-coordinator-only extension root with a generic streaming sink on each worker
-input task. The sink passes the extension's opaque `worker_bind_data` and an
-explicit `DistributedWriteTaskContext` containing the stable operation ID and
-runtime FTE task-attempt ID to every callback. Extensions never parse Vane's
-internal task-attempt naming scheme to recover the operation namespace.
+than DuckDB's file-statistics row. `DistributedWriteOperatorExtension::Register`
+registers a write hook containing five mandatory worker callbacks:
+`initialize_global`, `initialize_local`, `sink`, `combine`, and `finalize`.
+Like DuckDB's parser, planner, optimizer, storage, and operator extension hooks,
+this is deliberately separate from catalog-function registration. The
+distributed translator replaces the coordinator-only extension root with a
+generic streaming sink on each worker input task. The sink passes the
+extension's opaque `worker_bind_data` and an explicit
+`DistributedWriteTaskContext` containing the stable operation ID and runtime
+FTE task-attempt ID to every callback. Extensions never parse Vane's internal
+task-attempt naming scheme to recover the operation namespace.
 
 `finalize` returns zero or more `DistributedWriteFragment` values. A fragment
 has a stable ID, opaque payload, row and byte counts, and zero or more
@@ -296,8 +320,8 @@ outcome separately.
 
 For distributed table-function scan callbacks:
 
-- return the exact extension name, extension protocol version, capability name,
-  kind, and capability protocol version registered during `Extension::Load`;
+- declare one non-zero capability protocol version on the callbacks and let the
+  ordinary `RegisterFunction` call derive the complete capability identity;
 - emit deterministic task payloads without process-local pointers;
 - implement complete DuckDB bind `serialize`/`deserialize` callbacks and make
   the deserializer accept detached task state;
@@ -334,7 +358,7 @@ For every distributed write provider:
 
 For callback-mode worker code:
 
-- register all five callbacks with `RegisterDistributedWriteOperator`;
+- register all five callbacks as one `DistributedWriteOperatorExtension` hook;
 - treat `worker_bind_data`, fragment payloads, and artifact payloads as portable
   bytes with no process-local pointers;
 - use the supplied operation ID as the artifact namespace and task-attempt ID

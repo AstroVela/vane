@@ -40,12 +40,9 @@ static constexpr idx_t DISTRIBUTED_TEST_SCAN_PROTOCOL = 1;
 static constexpr idx_t DISTRIBUTED_TEST_TASK_CODEC_VERSION = 1;
 static constexpr idx_t DISTRIBUTED_TEST_WRITE_PROTOCOL = 1;
 static constexpr idx_t DISTRIBUTED_TEST_WRITE_CODEC_VERSION = 1;
-static const string DISTRIBUTED_TEST_FILE_CODEC = "distributed-test.file-task";
-static const string DISTRIBUTED_TEST_FRAGMENT_CODEC = "distributed-test.opaque-fragment-task";
+static const string DISTRIBUTED_TEST_SCAN_CODEC = "distributed-test.scan-task";
 static const string DISTRIBUTED_TEST_WRITE_CODEC = "distributed-test.opaque-write-fragment";
 static const string DISTRIBUTED_TEST_WRITE_NAME = "distributed_test_opaque_write";
-
-enum class DistributedTestScanKind : uint8_t { FILE_TASK = 0, OPAQUE_FRAGMENT_TASK = 1 };
 
 struct DistributedTestRuntimeTask {
 	idx_t task_id = 0;
@@ -54,13 +51,11 @@ struct DistributedTestRuntimeTask {
 };
 
 struct DistributedTestScanBindData : public TableFunctionData {
-	DistributedTestScanKind kind = DistributedTestScanKind::FILE_TASK;
 	idx_t requested_task_count = 0;
 	vector<DistributedTestRuntimeTask> tasks;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DistributedTestScanBindData>();
-		result->kind = kind;
 		result->requested_task_count = requested_task_count;
 		result->tasks = tasks;
 		return std::move(result);
@@ -68,7 +63,7 @@ struct DistributedTestScanBindData : public TableFunctionData {
 
 	bool Equals(const FunctionData &other) const override {
 		auto other_data = dynamic_cast<const DistributedTestScanBindData *>(&other);
-		if (!other_data || kind != other_data->kind || requested_task_count != other_data->requested_task_count ||
+		if (!other_data || requested_task_count != other_data->requested_task_count ||
 		    tasks.size() != other_data->tasks.size()) {
 			return false;
 		}
@@ -88,10 +83,6 @@ struct DistributedTestScanGlobalState : public GlobalTableFunctionState {
 };
 
 static atomic<idx_t> distributed_test_bind_calls {0};
-
-static void DistributedTestIdentity(DataChunk &input, ExpressionState &, Vector &result) {
-	result.Reference(input.data[0]);
-}
 
 static string FileResource(idx_t task_id) {
 	return "synthetic-file://partition-" + std::to_string(task_id) + ".parquet";
@@ -137,12 +128,12 @@ static idx_t ParseTaskId(const string &task_id, const string &prefix) {
 	return result;
 }
 
-static DistributedExtensionCapabilityReference DistributedTestCapability(const string &function_name) {
+static DistributedExtensionCapabilityReference DistributedTestCapability() {
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = "distributed_test";
 	reference.extension_protocol_version = DISTRIBUTED_TEST_EXTENSION_PROTOCOL;
 	reference.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	reference.capability.name = function_name;
+	reference.capability.name = "distributed_test_scan";
 	reference.capability.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
 	return reference;
 }
@@ -276,15 +267,12 @@ static unique_ptr<FunctionData> DistributedTestScanBind(ClientContext &, TableFu
 	return_types.emplace_back(LogicalType::UBIGINT);
 	names.emplace_back("task_id");
 	auto result = make_uniq<DistributedTestScanBindData>();
-	result->kind = input.table_function.name == "distributed_test_file_scan"
-	                   ? DistributedTestScanKind::FILE_TASK
-	                   : DistributedTestScanKind::OPAQUE_FRAGMENT_TASK;
 	result->requested_task_count = NumericCast<idx_t>(signed_task_count);
 	result->tasks.reserve(result->requested_task_count);
 	for (idx_t task_id = 0; task_id < result->requested_task_count; task_id++) {
 		DistributedTestRuntimeTask task;
 		task.task_id = task_id;
-		if (result->kind == DistributedTestScanKind::FILE_TASK) {
+		if (task_id % 2 == 0) {
 			task.resource = FileResource(task_id);
 		} else {
 			task.resource = FragmentPayload(task_id);
@@ -314,9 +302,8 @@ static void DistributedTestScan(ClientContext &, TableFunctionInput &input, Data
 static void DistributedTestScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                          const TableFunction &) {
 	auto &bind_data = bind_data_p->Cast<DistributedTestScanBindData>();
-	serializer.WriteProperty(100, "kind", static_cast<uint8_t>(bind_data.kind));
-	serializer.WriteProperty(101, "requested_task_count", bind_data.requested_task_count);
-	serializer.WriteList(102, "tasks", bind_data.tasks.size(), [&](Serializer::List &tasks, idx_t task_index) {
+	serializer.WriteProperty(100, "requested_task_count", bind_data.requested_task_count);
+	serializer.WriteList(101, "tasks", bind_data.tasks.size(), [&](Serializer::List &tasks, idx_t task_index) {
 		const auto &task = bind_data.tasks[task_index];
 		tasks.WriteObject([&](Serializer &task_serializer) {
 			task_serializer.WriteProperty(1, "task_id", task.task_id);
@@ -328,9 +315,8 @@ static void DistributedTestScanSerialize(Serializer &serializer, const optional_
 
 static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &deserializer, TableFunction &) {
 	auto result = make_uniq<DistributedTestScanBindData>();
-	result->kind = static_cast<DistributedTestScanKind>(deserializer.ReadProperty<uint8_t>(100, "kind"));
-	result->requested_task_count = deserializer.ReadProperty<idx_t>(101, "requested_task_count");
-	deserializer.ReadList(102, "tasks", [&](Deserializer::List &tasks, idx_t) {
+	result->requested_task_count = deserializer.ReadProperty<idx_t>(100, "requested_task_count");
+	deserializer.ReadList(101, "tasks", [&](Deserializer::List &tasks, idx_t) {
 		DistributedTestRuntimeTask task;
 		tasks.ReadObject([&](Deserializer &task_deserializer) {
 			task.task_id = task_deserializer.ReadProperty<idx_t>(1, "task_id");
@@ -342,112 +328,77 @@ static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &des
 	return std::move(result);
 }
 
-static void DistributedTestPrepareWorkerBind(const TableFunctionDistributedScanInput &input,
+static void DistributedTestPrepareWorkerBind(const TableFunctionDistributedScanInput &,
                                              FunctionData &worker_bind_data) {
-	auto &coordinator_bind = input.bind_data.Cast<DistributedTestScanBindData>();
 	auto &worker_bind = worker_bind_data.Cast<DistributedTestScanBindData>();
-	if (coordinator_bind.kind != worker_bind.kind) {
-		throw InternalException("distributed test worker bind kind changed while copying bind data");
-	}
 	worker_bind.tasks.clear();
 }
 
-static vector<DistributedScanTask> DistributedTestPlanFileTasks(const TableFunctionDistributedScanInput &input) {
+static vector<DistributedScanTask> DistributedTestPlanTasks(const TableFunctionDistributedScanInput &input) {
 	auto &bind_data = input.bind_data.Cast<DistributedTestScanBindData>();
-	if (bind_data.kind != DistributedTestScanKind::FILE_TASK) {
-		throw InternalException("file task planner received opaque fragment bind data");
-	}
 	vector<DistributedScanTask> result;
 	result.reserve(bind_data.tasks.size());
 	for (const auto &runtime_task : bind_data.tasks) {
 		DistributedScanTask task;
-		task.task_id = "file-" + std::to_string(runtime_task.task_id);
-		task.payload = runtime_task.resource;
 		task.estimated_cardinality = optional_idx(1);
-		task.estimated_bytes = optional_idx(1024 + runtime_task.task_id);
+		task.payload = runtime_task.resource;
+		if (runtime_task.artifact.empty()) {
+			task.task_id = "file-" + std::to_string(runtime_task.task_id);
+			task.estimated_bytes = optional_idx(1024 + runtime_task.task_id);
+		} else {
+			task.task_id = "fragment-" + std::to_string(runtime_task.task_id);
+			task.estimated_bytes = optional_idx(2048 + runtime_task.task_id);
+			DistributedScanTaskArtifact artifact;
+			artifact.name = "delete-vector";
+			artifact.codec = "distributed-test.delete-vector";
+			artifact.codec_version = 1;
+			artifact.data = runtime_task.artifact;
+			task.artifacts.push_back(std::move(artifact));
+		}
 		result.push_back(std::move(task));
 	}
 	return result;
 }
 
-static vector<DistributedScanTask> DistributedTestPlanFragmentTasks(const TableFunctionDistributedScanInput &input) {
-	auto &bind_data = input.bind_data.Cast<DistributedTestScanBindData>();
-	if (bind_data.kind != DistributedTestScanKind::OPAQUE_FRAGMENT_TASK) {
-		throw InternalException("opaque fragment planner received file task bind data");
-	}
-	vector<DistributedScanTask> result;
-	result.reserve(bind_data.tasks.size());
-	for (const auto &runtime_task : bind_data.tasks) {
-		DistributedScanTask task;
-		task.task_id = "fragment-" + std::to_string(runtime_task.task_id);
-		task.payload = runtime_task.resource;
-		task.estimated_cardinality = optional_idx(1);
-		task.estimated_bytes = optional_idx(2048 + runtime_task.task_id);
-		DistributedScanTaskArtifact artifact;
-		artifact.name = "delete-vector";
-		artifact.codec = "distributed-test.delete-vector";
-		artifact.codec_version = 1;
-		artifact.data = runtime_task.artifact;
-		task.artifacts.push_back(std::move(artifact));
-		result.push_back(std::move(task));
-	}
-	return result;
-}
-
-static void DistributedTestApplyFileTasks(FunctionData &worker_bind_data, const vector<DistributedScanTask> &tasks) {
+static void DistributedTestApplyTasks(FunctionData &worker_bind_data, const vector<DistributedScanTask> &tasks) {
 	auto &bind_data = worker_bind_data.Cast<DistributedTestScanBindData>();
-	if (bind_data.kind != DistributedTestScanKind::FILE_TASK) {
-		throw InternalException("file tasks were applied to opaque fragment bind data");
-	}
 	vector<DistributedTestRuntimeTask> validated_tasks;
 	validated_tasks.reserve(tasks.size());
 	for (const auto &task : tasks) {
-		auto task_id = ParseTaskId(task.task_id, "file-");
-		if (task.payload != FileResource(task_id) || !task.artifacts.empty()) {
-			throw InvalidInputException("invalid distributed test file task '%s'", task.task_id);
+		if (StringUtil::StartsWith(task.task_id, "file-")) {
+			auto task_id = ParseTaskId(task.task_id, "file-");
+			if (task.payload != FileResource(task_id) || !task.artifacts.empty()) {
+				throw InvalidInputException("invalid distributed test file task '%s'", task.task_id);
+			}
+			validated_tasks.push_back({task_id, task.payload, string()});
+		} else {
+			auto task_id = ParseTaskId(task.task_id, "fragment-");
+			if (task.payload != FragmentPayload(task_id) || task.artifacts.size() != 1) {
+				throw InvalidInputException("invalid distributed test opaque fragment task '%s'", task.task_id);
+			}
+			const auto &artifact = task.artifacts[0];
+			if (artifact.name != "delete-vector" || artifact.codec != "distributed-test.delete-vector" ||
+			    artifact.codec_version != 1 || artifact.data != FragmentArtifact(task_id)) {
+				throw InvalidInputException("invalid distributed test artifact for task '%s'", task.task_id);
+			}
+			validated_tasks.push_back({task_id, task.payload, artifact.data});
 		}
-		validated_tasks.push_back({task_id, task.payload, string()});
 	}
 	bind_data.tasks = std::move(validated_tasks);
 }
 
-static void DistributedTestApplyFragmentTasks(FunctionData &worker_bind_data,
-                                              const vector<DistributedScanTask> &tasks) {
-	auto &bind_data = worker_bind_data.Cast<DistributedTestScanBindData>();
-	if (bind_data.kind != DistributedTestScanKind::OPAQUE_FRAGMENT_TASK) {
-		throw InternalException("opaque fragment tasks were applied to file bind data");
-	}
-	vector<DistributedTestRuntimeTask> validated_tasks;
-	validated_tasks.reserve(tasks.size());
-	for (const auto &task : tasks) {
-		auto task_id = ParseTaskId(task.task_id, "fragment-");
-		if (task.payload != FragmentPayload(task_id) || task.artifacts.size() != 1) {
-			throw InvalidInputException("invalid distributed test opaque fragment task '%s'", task.task_id);
-		}
-		const auto &artifact = task.artifacts[0];
-		if (artifact.name != "delete-vector" || artifact.codec != "distributed-test.delete-vector" ||
-		    artifact.codec_version != 1 || artifact.data != FragmentArtifact(task_id)) {
-			throw InvalidInputException("invalid distributed test artifact for task '%s'", task.task_id);
-		}
-		validated_tasks.push_back({task_id, task.payload, artifact.data});
-	}
-	bind_data.tasks = std::move(validated_tasks);
-}
-
-static TableFunction DistributedTestScanFunction(const string &name, table_function_plan_distributed_scan_t plan,
-                                                 table_function_apply_distributed_scan_tasks_t apply_tasks,
-                                                 const string &codec) {
-	TableFunction function(name, {LogicalType::BIGINT}, DistributedTestScan, DistributedTestScanBind,
+static TableFunction DistributedTestScanFunction() {
+	TableFunction function("distributed_test_scan", {LogicalType::BIGINT}, DistributedTestScan, DistributedTestScanBind,
 	                       DistributedTestScanInit);
 	function.serialize = DistributedTestScanSerialize;
 	function.deserialize = DistributedTestScanDeserialize;
 	TableFunctionDistributedScanCallbacks callbacks;
-	callbacks.capability = DistributedTestCapability(name);
-	callbacks.task_codec = codec;
+	callbacks.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
+	callbacks.task_codec = DISTRIBUTED_TEST_SCAN_CODEC;
 	callbacks.task_codec_version = DISTRIBUTED_TEST_TASK_CODEC_VERSION;
-	callbacks.plan = plan;
+	callbacks.plan = DistributedTestPlanTasks;
 	callbacks.prepare_bind = DistributedTestPrepareWorkerBind;
-	callbacks.apply_tasks = apply_tasks;
+	callbacks.apply_tasks = DistributedTestApplyTasks;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;
 }
@@ -456,18 +407,9 @@ class DistributedTestExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
 		loader.RegisterDistributedExtension(DISTRIBUTED_TEST_EXTENSION_PROTOCOL);
-		loader.RegisterFunction(ScalarFunction("distributed_test_identity", {LogicalType::UBIGINT},
-		                                       LogicalType::UBIGINT, DistributedTestIdentity));
-		loader.RegisterFunction(DistributedTestScanFunction("distributed_test_file_scan", DistributedTestPlanFileTasks,
-		                                                    DistributedTestApplyFileTasks,
-		                                                    DISTRIBUTED_TEST_FILE_CODEC));
-		loader.RegisterFunction(
-		    DistributedTestScanFunction("distributed_test_fragment_scan", DistributedTestPlanFragmentTasks,
-		                                DistributedTestApplyFragmentTasks, DISTRIBUTED_TEST_FRAGMENT_CODEC));
-		loader.RegisterDistributedTableFunction("distributed_test_file_scan", DISTRIBUTED_TEST_SCAN_PROTOCOL);
-		loader.RegisterDistributedTableFunction("distributed_test_fragment_scan", DISTRIBUTED_TEST_SCAN_PROTOCOL);
-		loader.RegisterDistributedWriteOperator(DISTRIBUTED_TEST_WRITE_NAME, DISTRIBUTED_TEST_WRITE_PROTOCOL,
-		                                        DistributedTestWriteCallbacks());
+		loader.RegisterFunction(DistributedTestScanFunction());
+		DistributedWriteOperatorExtension::Register(
+		    loader, {DISTRIBUTED_TEST_WRITE_NAME, DISTRIBUTED_TEST_WRITE_PROTOCOL, DistributedTestWriteCallbacks()});
 	}
 
 	string Name() override {
@@ -524,26 +466,24 @@ static distributed::DuckPhysicalPlanRef CloneAndApply(Connection &worker,
 
 } // namespace
 
-TEST_CASE("Distributed synthetic extension transports file tasks in opaque envelopes",
+TEST_CASE("Distributed synthetic extension registers one native scan and transports file tasks",
           "[distributed][extension][extension-scan]") {
 	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBytes(""),
 	                    Catch::Matchers::Contains("empty scan task descriptor"));
 	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBase64(""),
 	                    Catch::Matchers::Contains("empty base64 scan task descriptor"));
 
-	auto invalid_function = DistributedTestScanFunction("distributed_test_file_scan", DistributedTestPlanFileTasks,
-	                                                    DistributedTestApplyFileTasks, DISTRIBUTED_TEST_FILE_CODEC);
+	auto invalid_function = DistributedTestScanFunction();
 	auto invalid_callbacks = invalid_function.GetDistributedScanCallbacks();
-	invalid_callbacks.capability.capability.name = "different_scan";
+	invalid_callbacks.protocol_version = 0;
 	REQUIRE_THROWS_WITH(invalid_function.SetDistributedScanCallbacks(std::move(invalid_callbacks)),
-	                    Catch::Matchers::Contains("does not match table function"));
+	                    Catch::Matchers::Contains("greater than zero"));
 
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection coordinator(coordinator_db);
 
-	auto native_result = coordinator.Query(
-	    "SELECT distributed_test_identity(task_id) FROM distributed_test_file_scan(3) ORDER BY task_id");
+	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY task_id");
 	REQUIRE_NO_FAIL(*native_result);
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
 
@@ -551,32 +491,28 @@ TEST_CASE("Distributed synthetic extension transports file tasks in opaque envel
 	auto &coordinator_manager = DistributedExtensionManager::Get(*coordinator_db.instance);
 	REQUIRE(coordinator_manager.TryGetExtension("distributed_test", manifest));
 	REQUIRE(manifest.CanonicalIdentity() ==
-	        "distributed_test@1{table_function:distributed_test_file_scan@1,table_function:distributed_test_fragment_"
-	        "scan@1,operator:distributed_test_opaque_write@1}");
+	        "distributed_test@1{table_function:distributed_test_scan@1,operator:distributed_test_opaque_write@1}");
 
-	auto planned =
-	    PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_file_scan(3)", 3);
-	REQUIRE(planned.tasks.size() == 3);
+	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(1)", 3);
+	REQUIRE(planned.tasks.size() == 1);
 	auto &detached_bind =
 	    planned.worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
 	REQUIRE(detached_bind.tasks.empty());
-	for (idx_t task_index = 0; task_index < planned.tasks.size(); task_index++) {
-		const auto &descriptor = planned.tasks[task_index];
-		REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
-		REQUIRE(descriptor.files.empty());
-		REQUIRE(descriptor.extension_capability == DistributedTestCapability("distributed_test_file_scan"));
-		REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_FILE_CODEC);
-		REQUIRE(descriptor.task_codec_version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
-		REQUIRE(descriptor.extension_tasks.size() == 1);
-		REQUIRE(descriptor.extension_tasks[0].task_id == "file-" + std::to_string(task_index));
-		REQUIRE(descriptor.extension_tasks[0].payload == FileResource(task_index));
-		REQUIRE(descriptor.extension_tasks[0].artifacts.empty());
-		REQUIRE(descriptor.estimated_cardinality == 1);
-		REQUIRE(descriptor.estimated_bytes == 1024 + task_index);
-	}
+	const auto &descriptor = planned.tasks[0];
+	REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
+	REQUIRE(descriptor.files.empty());
+	REQUIRE(descriptor.extension_capability == DistributedTestCapability());
+	REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_SCAN_CODEC);
+	REQUIRE(descriptor.task_codec_version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
+	REQUIRE(descriptor.extension_tasks.size() == 1);
+	REQUIRE(descriptor.extension_tasks[0].task_id == "file-0");
+	REQUIRE(descriptor.extension_tasks[0].payload == FileResource(0));
+	REQUIRE(descriptor.extension_tasks[0].artifacts.empty());
+	REQUIRE(descriptor.estimated_cardinality == 1);
+	REQUIRE(descriptor.estimated_bytes == 1024);
 
-	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(planned.tasks[1].SerializeToBytes());
-	REQUIRE(roundtrip.extension_tasks[0].payload == FileResource(1));
+	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(planned.tasks[0].SerializeToBytes());
+	REQUIRE(roundtrip.extension_tasks[0].payload == FileResource(0));
 
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
@@ -601,11 +537,11 @@ TEST_CASE("Distributed synthetic extension transports file tasks in opaque envel
 	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*worker_plan, &assigned_error));
 	auto &assigned_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
 	REQUIRE(assigned_bind.tasks.size() == 1);
-	REQUIRE(assigned_bind.tasks[0].task_id == 1);
-	REQUIRE(assigned_bind.tasks[0].resource == FileResource(1));
+	REQUIRE(assigned_bind.tasks[0].task_id == 0);
+	REQUIRE(assigned_bind.tasks[0].resource == FileResource(0));
 
 	auto empty_planned =
-	    PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_file_scan(0)", 3);
+	    PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(0)", 3);
 	REQUIRE(empty_planned.tasks.size() == 1);
 	REQUIRE(empty_planned.tasks[0].kind == distributed::ScanTaskKind::EXTENSION);
 	REQUIRE(empty_planned.tasks[0].extension_tasks.empty());
@@ -654,40 +590,46 @@ TEST_CASE("Distributed synthetic extension transports file tasks in opaque envel
 	                    Catch::Matchers::Contains("worker rebind is not supported"));
 }
 
-TEST_CASE("Distributed synthetic extension transports opaque fragment tasks and binary artifacts",
+TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragments and binary artifacts",
           "[distributed][extension][extension-scan]") {
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection coordinator(coordinator_db);
 
-	auto native_result = coordinator.Query("SELECT * FROM distributed_test_fragment_scan(3) ORDER BY task_id");
+	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY task_id");
 	REQUIRE_NO_FAIL(*native_result);
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
 
-	auto planned =
-	    PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_fragment_scan(3)", 3);
+	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(3)", 3);
 	REQUIRE(planned.tasks.size() == 3);
 	for (idx_t task_index = 0; task_index < planned.tasks.size(); task_index++) {
 		const auto &descriptor = planned.tasks[task_index];
 		REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
 		REQUIRE(descriptor.files.empty());
-		REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_FRAGMENT_CODEC);
+		REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_SCAN_CODEC);
 		REQUIRE(descriptor.extension_tasks.size() == 1);
 		const auto &task = descriptor.extension_tasks[0];
-		REQUIRE(task.payload == FragmentPayload(task_index));
-		REQUIRE(task.payload[0] == '\0');
-		REQUIRE(task.artifacts.size() == 1);
-		REQUIRE(task.artifacts[0].data == FragmentArtifact(task_index));
-		REQUIRE(task.artifacts[0].data[1] == '\0');
+		if (task_index % 2 == 0) {
+			REQUIRE(task.task_id == "file-" + std::to_string(task_index));
+			REQUIRE(task.payload == FileResource(task_index));
+			REQUIRE(task.artifacts.empty());
+		} else {
+			REQUIRE(task.task_id == "fragment-" + std::to_string(task_index));
+			REQUIRE(task.payload == FragmentPayload(task_index));
+			REQUIRE(task.payload[0] == '\0');
+			REQUIRE(task.artifacts.size() == 1);
+			REQUIRE(task.artifacts[0].data == FragmentArtifact(task_index));
+			REQUIRE(task.artifacts[0].data[1] == '\0');
+		}
 	}
 
 	auto merged = planned.tasks[0];
-	merged.Merge(planned.tasks[2]);
+	merged.Merge(planned.tasks[1]);
 	REQUIRE(merged.extension_tasks.size() == 2);
 	REQUIRE(merged.source_task_partition_id == DConstants::INVALID_INDEX);
 	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(merged.SerializeToBytes());
 	REQUIRE(roundtrip.extension_tasks.size() == 2);
-	REQUIRE(roundtrip.extension_tasks[1].artifacts[0].data == FragmentArtifact(2));
+	REQUIRE(roundtrip.extension_tasks[1].artifacts[0].data == FragmentArtifact(1));
 
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
@@ -696,13 +638,13 @@ TEST_CASE("Distributed synthetic extension transports opaque fragment tasks and 
 	auto &assigned_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
 	REQUIRE(assigned_bind.tasks.size() == 2);
 	REQUIRE(assigned_bind.tasks[0].task_id == 0);
-	REQUIRE(assigned_bind.tasks[0].resource == FragmentPayload(0));
-	REQUIRE(assigned_bind.tasks[0].artifact == FragmentArtifact(0));
-	REQUIRE(assigned_bind.tasks[1].task_id == 2);
-	REQUIRE(assigned_bind.tasks[1].artifact == FragmentArtifact(2));
+	REQUIRE(assigned_bind.tasks[0].resource == FileResource(0));
+	REQUIRE(assigned_bind.tasks[0].artifact.empty());
+	REQUIRE(assigned_bind.tasks[1].task_id == 1);
+	REQUIRE(assigned_bind.tasks[1].artifact == FragmentArtifact(1));
 
-	auto mismatched = planned.tasks[1];
-	mismatched.task_codec = DISTRIBUTED_TEST_FILE_CODEC;
+	auto mismatched = planned.tasks[2];
+	mismatched.task_codec = "distributed-test.invalid-task";
 	REQUIRE_THROWS_WITH(roundtrip.Merge(std::move(mismatched)),
 	                    Catch::Matchers::Contains("different protocol identities"));
 	auto duplicate_merge_target = planned.tasks[0];
@@ -710,14 +652,14 @@ TEST_CASE("Distributed synthetic extension transports opaque fragment tasks and 
 	REQUIRE_THROWS_WITH(duplicate_merge_target.Merge(std::move(duplicate_merge_source)),
 	                    Catch::Matchers::Contains("duplicate task_id"));
 	REQUIRE(duplicate_merge_target.extension_tasks.size() == 1);
-	REQUIRE(duplicate_merge_target.extension_tasks[0].task_id == "fragment-0");
+	REQUIRE(duplicate_merge_target.extension_tasks[0].task_id == "file-0");
 
 	auto mismatched_worker_plan = distributed::ClonePhysicalPlanOrThrow(
 	    planned.worker_plan, "distributed_test_extension_codec_mismatch", worker.context.get());
 	auto &mismatched_worker_scan = mismatched_worker_plan->Root().Cast<PhysicalTableScan>();
 	mismatched_worker_scan.extra_info.scan_node_id = optional_idx(12);
 	auto mismatched_assignment = planned.tasks[1];
-	mismatched_assignment.task_codec = DISTRIBUTED_TEST_FILE_CODEC;
+	mismatched_assignment.task_codec = "distributed-test.invalid-task";
 	unordered_map<idx_t, distributed::ScanTaskDescriptor> mismatched_tasks;
 	mismatched_tasks.emplace(12, std::move(mismatched_assignment));
 	string mismatch_error;
@@ -1054,7 +996,7 @@ TEST_CASE("Distributed synthetic extension composes opaque scan and write callba
 	DuckDB db(nullptr);
 	db.LoadStaticExtension<DistributedTestExtension>();
 	Connection connection(db);
-	auto planned = PlanDistributedTestScan(db, connection, "SELECT * FROM distributed_test_fragment_scan(3)", 1);
+	auto planned = PlanDistributedTestScan(db, connection, "SELECT * FROM distributed_test_scan(3)", 1);
 	REQUIRE(planned.tasks.size() == 1);
 	REQUIRE(planned.tasks[0].extension_tasks.size() == 3);
 

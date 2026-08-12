@@ -93,11 +93,15 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 	       global_initialization == rhs.global_initialization;
 }
 
-void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
+void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &function_name) const {
 	if (!plan || !prepare_bind || !apply_tasks) {
 		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan, "
 		                            "prepare_bind, and apply_tasks",
 		                            function_name);
+	}
+	if (protocol_version == 0) {
+		throw InvalidInputException(
+		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
 	if (task_codec.empty()) {
 		throw InvalidInputException("Distributed scan task codec for table function '%s' must not be empty",
@@ -106,6 +110,14 @@ void TableFunctionDistributedScanCallbacks::Validate(const string &function_name
 	if (task_codec_version == 0) {
 		throw InvalidInputException("Distributed scan task codec version for table function '%s' must be greater than "
 		                            "zero",
+		                            function_name);
+	}
+}
+
+void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
+	ValidateDefinition(function_name);
+	if (capability.extension_name.empty()) {
+		throw InvalidInputException("Distributed scan capability for table function '%s' was not bound by its loader",
 		                            function_name);
 	}
 	if (capability.capability.kind != DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
@@ -123,14 +135,48 @@ void TableFunctionDistributedScanCallbacks::Validate(const string &function_name
 	DistributedExtensionManager::ValidateManifest(manifest);
 }
 
+void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name,
+                                                           idx_t extension_protocol_version,
+                                                           const string &function_name) {
+	ValidateDefinition(function_name);
+	DistributedExtensionCapabilityReference bound_capability;
+	bound_capability.extension_name = extension_name;
+	bound_capability.extension_protocol_version = extension_protocol_version;
+	bound_capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	bound_capability.capability.name = function_name;
+	bound_capability.capability.protocol_version = protocol_version;
+	if (!capability.extension_name.empty() && capability != bound_capability) {
+		throw InvalidInputException("Distributed scan capability for table function '%s' is already bound to '%s'",
+		                            function_name, capability.CanonicalIdentity());
+	}
+	capability = std::move(bound_capability);
+	Validate(function_name);
+}
+
+const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallbacks::GetCapability() const {
+	if (capability.extension_name.empty()) {
+		throw InternalException("Distributed scan capability has not been bound by its extension loader");
+	}
+	return capability;
+}
+
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
-	return capability == other.capability && task_codec == other.task_codec &&
-	       task_codec_version == other.task_codec_version && plan == other.plan && prepare_bind == other.prepare_bind &&
-	       apply_tasks == other.apply_tasks;
+	return protocol_version == other.protocol_version && capability == other.capability &&
+	       task_codec == other.task_codec && task_codec_version == other.task_codec_version && plan == other.plan &&
+	       prepare_bind == other.prepare_bind && apply_tasks == other.apply_tasks;
 }
 
 void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
-	callbacks.Validate(name);
+	callbacks.ValidateDefinition(name);
+	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
+}
+
+void TableFunction::BindDistributedScanCapability(const string &extension_name, idx_t extension_protocol_version) {
+	if (!distributed_scan) {
+		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
+	}
+	auto callbacks = *distributed_scan;
+	callbacks.BindCapability(extension_name, extension_protocol_version, name);
 	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
 }
 

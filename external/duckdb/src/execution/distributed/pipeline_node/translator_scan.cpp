@@ -240,18 +240,19 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 	callbacks.Validate(scan.function.name);
+	const auto &capability = callbacks.GetCapability();
 	if (!db) {
 		throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
 		                            "validation",
 		                            scan.function.name);
 	}
-	DistributedExtensionManager::Get(*db).RequireCapability(callbacks.capability);
+	DistributedExtensionManager::Get(*db).RequireCapability(capability);
 
 	auto planned_tasks = callbacks.plan(MakeDistributedScanInput(scan));
 	if (planned_tasks.empty()) {
 		ScanTaskDescriptor empty_task;
 		empty_task.kind = ScanTaskKind::EXTENSION;
-		empty_task.extension_capability = callbacks.capability;
+		empty_task.extension_capability = capability;
 		empty_task.task_codec = callbacks.task_codec;
 		empty_task.task_codec_version = callbacks.task_codec_version;
 		empty_task.source_task_partition_id = 0;
@@ -260,7 +261,7 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	}
 	ScanTaskDescriptor validation_descriptor;
 	validation_descriptor.kind = ScanTaskKind::EXTENSION;
-	validation_descriptor.extension_capability = callbacks.capability;
+	validation_descriptor.extension_capability = capability;
 	validation_descriptor.task_codec = callbacks.task_codec;
 	validation_descriptor.task_codec_version = callbacks.task_codec_version;
 	validation_descriptor.extension_tasks = std::move(planned_tasks);
@@ -312,7 +313,7 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	for (auto &group : groups) {
 		ScanTaskDescriptor descriptor;
 		descriptor.kind = ScanTaskKind::EXTENSION;
-		descriptor.extension_capability = callbacks.capability;
+		descriptor.extension_capability = capability;
 		descriptor.task_codec = callbacks.task_codec;
 		descriptor.task_codec_version = callbacks.task_codec_version;
 		descriptor.source_task_partition_id = result.size();
