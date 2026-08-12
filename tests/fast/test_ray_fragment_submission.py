@@ -5788,6 +5788,27 @@ def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 0
 
 
+def test_fte_owner_selection_balances_sequential_tasks_across_idle_workers():
+    first = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        manager_instance_id="manager-a",
+    )
+
+    assert first._select_fte_worker() is first
+    first.record_fte_task_terminal_without_drain("query-fair.0.0.0")
+    assert first._select_fte_worker() is second
+    second.record_fte_task_terminal_without_drain("query-fair.0.1.0")
+    assert first._select_fte_worker() is first
+
+
 def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=15, worker_id="worker-0")

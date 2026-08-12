@@ -1540,7 +1540,7 @@ def _fte_worker_selection_key(
     memory_requirement_bytes: Any = None,
     execution_class: FteTaskExecutionClass | str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
-) -> tuple[int, int, int, int, int, int, str]:
+) -> tuple[int, int, int, int, int, int, int, str]:
     stats = _required_fte_pressure_stats(handle)
     running = int(stats.get("running_attempt_count", 0)) + int(stats.get("reserved_partition_count", 0))
     current_memory_bytes = _fte_pressure_capacity_memory_bytes(
@@ -1553,6 +1553,14 @@ def _fte_worker_selection_key(
     over_budget = 1 if memory_after_bytes > budget_bytes else 0
     split_bytes = int(stats.get("assigned_split_bytes", 0))
     split_count = int(stats.get("assigned_split_count", 0))
+    # QRM can intentionally admit source partitions one at a time. Without a
+    # completed-task tie breaker, every idle worker has identical live
+    # pressure between those partitions and the stable worker-id tie breaker
+    # sends the entire scan to one actor. Terminal task identities are already
+    # compacted per query and removed during query teardown, so they provide a
+    # bounded, retry-aware fairness signal without weakening locality or live
+    # resource-pressure priorities.
+    completed = int(stats.get("terminal_attempt_count", 0))
     return (
         over_budget,
         _node_requirements_preference_penalty(handle, node_requirements),
@@ -1560,6 +1568,7 @@ def _fte_worker_selection_key(
         memory_after_bytes,
         split_bytes,
         split_count,
+        completed,
         str(handle.worker_id),
     )
 
