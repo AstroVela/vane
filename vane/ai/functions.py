@@ -1632,6 +1632,14 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPro
     )
 
 
+def _cast_structured_prompt_output(
+    expression: Expression,
+    structured_output: StructuredOutputSpec,
+) -> Expression:
+    """Decode validated JSON text into the public structured type."""
+    return expression.cast("JSON").cast(structured_output.duckdb_type)
+
+
 def _prompt_relation(
     rel: Any,
     messages: Any,
@@ -1675,15 +1683,18 @@ def _prompt_relation(
                 output_column,
                 udf_options.on_error,
             )
-            expression = _build_map_batches_expression(
-                validator.__call__,
-                name="validate_vllm_structured_output",
-                inputs={input_column: expression},
-                schema={output_column: "VARCHAR"},
-                batch_size=None,
-                row_preserving=True,
-                gpus=0,
-            ).cast(structured_output.duckdb_type)
+            expression = _cast_structured_prompt_output(
+                _build_map_batches_expression(
+                    validator.__call__,
+                    name="validate_vllm_structured_output",
+                    inputs={input_column: expression},
+                    schema={output_column: "VARCHAR"},
+                    batch_size=None,
+                    row_preserving=True,
+                    gpus=0,
+                ),
+                structured_output,
+            )
         expression = expression.alias(output_column)
         star = _star_excluding_existing_output_column(rel, output_column)
         return rel.select(star, expression)
@@ -1707,9 +1718,6 @@ def _prompt_relation(
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
     )
-    output_type = (
-        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
-    )
     expression = _build_ai_batch_expression(
         wrapper,
         inputs=dict(zip(input_names, message_expressions, strict=True)),
@@ -1718,7 +1726,11 @@ def _prompt_relation(
         udf_opts=udf_options,
         name="ai_prompt",
         execution_backend=execution_backend,
-    ).cast(output_type)
+    )
+    if structured_output is not None and not return_raw_response:
+        expression = _cast_structured_prompt_output(expression, structured_output)
+    else:
+        expression = expression.cast("VARCHAR")
     star = _star_excluding_existing_output_column(rel, output_column)
     return rel.select(star, expression.alias(output_column))
 
@@ -1758,15 +1770,18 @@ def _prompt_expression(
             "response",
             udf_options.on_error,
         )
-        return _build_map_batches_expression(
-            validator.__call__,
-            name="validate_vllm_structured_output",
-            inputs={input_column: expression},
-            schema={"response": "VARCHAR"},
-            batch_size=None,
-            row_preserving=True,
-            gpus=0,
-        ).cast(structured_output.duckdb_type)
+        return _cast_structured_prompt_output(
+            _build_map_batches_expression(
+                validator.__call__,
+                name="validate_vllm_structured_output",
+                inputs={input_column: expression},
+                schema={"response": "VARCHAR"},
+                batch_size=None,
+                row_preserving=True,
+                gpus=0,
+            ),
+            structured_output,
+        )
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
@@ -1786,17 +1801,17 @@ def _prompt_expression(
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
     )
-    output_type = (
-        structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
-    )
-    return _build_ai_batch_expression(
+    expression = _build_ai_batch_expression(
         wrapper,
         inputs=dict(zip(input_names, validated_messages, strict=True)),
         output_column="response",
         output_type="VARCHAR",
         udf_opts=udf_options,
         name="ai_prompt",
-    ).cast(output_type)
+    )
+    if structured_output is not None and not return_raw_response:
+        return _cast_structured_prompt_output(expression, structured_output)
+    return expression.cast("VARCHAR")
 
 
 def _is_relation_like(value: Any) -> TypeGuard[Relation]:

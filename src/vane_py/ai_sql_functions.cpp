@@ -237,6 +237,18 @@ static unique_ptr<Expression> BindScalarFunction(ClientContext &context, const s
 	return result;
 }
 
+static unique_ptr<Expression> CastPromptOutput(ClientContext &context, unique_ptr<Expression> result,
+                                               const LogicalType &target_type) {
+	if (result->return_type == target_type) {
+		return result;
+	}
+	if (target_type.id() == LogicalTypeId::STRUCT) {
+		// Structured Prompt UDFs return validated JSON text, not DuckDB's STRUCT literal syntax.
+		result = BoundCastExpression::AddCastToType(context, std::move(result), LogicalType::JSON());
+	}
+	return BoundCastExpression::AddCastToType(context, std::move(result), target_type);
+}
+
 static unique_ptr<Expression> BuildNativeVLLMPromptArgument(ClientContext &context, unique_ptr<Expression> prompt,
                                                             const Value &system_message) {
 	if (system_message.IsNull() || StringValue::Get(system_message).empty()) {
@@ -272,10 +284,7 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 		validation_children.push_back(make_uniq<BoundConstantExpression>(data.validation_payload));
 		result = BindScalarFunction(input.context, UDFFunction::Name, std::move(validation_children));
 	}
-	if (result->return_type != data.return_type) {
-		result = BoundCastExpression::AddCastToType(input.context, std::move(result), data.return_type);
-	}
-	return result;
+	return CastPromptOutput(input.context, std::move(result), data.return_type);
 }
 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
@@ -393,10 +402,7 @@ static unique_ptr<Expression> LowerAISQLPromptExpressionUDF(FunctionBindExpressi
 		throw BinderException("ai_prompt payload is missing ai_return_type");
 	}
 	auto target_type = TransformStringToLogicalType(public_type.second, input.context);
-	if (result->return_type != target_type) {
-		result = BoundCastExpression::AddCastToType(input.context, std::move(result), target_type);
-	}
-	return result;
+	return CastPromptOutput(input.context, std::move(result), target_type);
 }
 
 static unique_ptr<Expression> LowerAISQLEmbedExpressionUDF(FunctionBindExpressionInput &input) {
