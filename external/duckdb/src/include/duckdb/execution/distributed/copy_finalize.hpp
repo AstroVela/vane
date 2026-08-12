@@ -544,10 +544,25 @@ inline idx_t DistributedCopyCurrentEpochMillis() {
 	return static_cast<idx_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
-inline DuckDBResult<void>
-WriteDistributedCopyDirectWriteLifecycle(FileSystem &fs, const std::string &base_path, const std::string &run_id,
-                                         idx_t created_epoch_ms = 0,
-                                         const std::string &worker_base_path = std::string()) {
+enum class DistributedCopyDirectWriteLifecycleState : uint8_t {
+	WRITING = 0,
+	CATALOG_COMMIT_PENDING = 1,
+};
+
+inline const char *DistributedCopyDirectWriteLifecycleStateName(DistributedCopyDirectWriteLifecycleState state) {
+	switch (state) {
+	case DistributedCopyDirectWriteLifecycleState::WRITING:
+		return "writing";
+	case DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING:
+		return "catalog_commit_pending";
+	}
+	throw InternalException("unknown distributed COPY direct-write lifecycle state");
+}
+
+inline DuckDBResult<void> WriteDistributedCopyDirectWriteLifecycle(
+    FileSystem &fs, const std::string &base_path, const std::string &run_id, idx_t created_epoch_ms = 0,
+    const std::string &worker_base_path = std::string(),
+    DistributedCopyDirectWriteLifecycleState state = DistributedCopyDirectWriteLifecycleState::WRITING) {
 	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
 	if (canonical_res.is_err()) {
 		return DuckDBResult<void>::err(canonical_res.error());
@@ -585,8 +600,9 @@ WriteDistributedCopyDirectWriteLifecycle(FileSystem &fs, const std::string &base
 	auto direct_write_run_dir = BuildCopyDirectWriteRunDirectory(canonical_worker_base_path, run_id,
 	                                                             fs.PathSeparator(canonical_worker_base_path));
 	std::ostringstream lifecycle;
-	lifecycle << "version=2\n";
+	lifecycle << "version=3\n";
 	lifecycle << "mode=direct_write\n";
+	lifecycle << "state=" << DistributedCopyDirectWriteLifecycleStateName(state) << "\n";
 	lifecycle << "base_path=" << canonical_base_path << "\n";
 	lifecycle << "worker_base_path=" << canonical_worker_base_path << "\n";
 	lifecycle << "run_id=" << run_id << "\n";
@@ -600,6 +616,7 @@ struct DistributedCopyDirectWriteLifecycleInfo {
 	std::string worker_base_path;
 	std::string run_id;
 	idx_t created_epoch_ms = 0;
+	DistributedCopyDirectWriteLifecycleState state = DistributedCopyDirectWriteLifecycleState::WRITING;
 };
 
 inline DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>
@@ -616,6 +633,7 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 
 	bool seen_version = false;
 	bool seen_mode = false;
+	bool seen_state = false;
 	bool seen_base_path = false;
 	bool seen_worker_base_path = false;
 	bool seen_run_id = false;
@@ -648,7 +666,7 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 				    DuckDBError::value_error("direct-write lifecycle duplicate version"));
 			}
 			seen_version = true;
-			if (value != "2") {
+			if (value != "3") {
 				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
 				    DuckDBError::value_error("unsupported direct-write lifecycle version: " + value));
 			}
@@ -661,6 +679,20 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 			if (value != "direct_write") {
 				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
 				    DuckDBError::value_error("direct-write lifecycle mode mismatch"));
+			}
+		} else if (key == "state") {
+			if (seen_state) {
+				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
+				    DuckDBError::value_error("direct-write lifecycle duplicate state"));
+			}
+			seen_state = true;
+			if (value == "writing") {
+				info.state = DistributedCopyDirectWriteLifecycleState::WRITING;
+			} else if (value == "catalog_commit_pending") {
+				info.state = DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING;
+			} else {
+				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
+				    DuckDBError::value_error("unknown direct-write lifecycle state: " + value));
 			}
 		} else if (key == "base_path") {
 			if (seen_base_path) {
@@ -719,7 +751,7 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 		}
 	}
 
-	if (!seen_version || !seen_mode || !seen_base_path || !seen_worker_base_path || !seen_run_id ||
+	if (!seen_version || !seen_mode || !seen_state || !seen_base_path || !seen_worker_base_path || !seen_run_id ||
 	    !seen_created_epoch_ms || !seen_direct_write_run_dir) {
 		return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
 		    DuckDBError::value_error("direct-write lifecycle missing required fields"));
@@ -731,6 +763,24 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 		    DuckDBError::value_error("direct-write lifecycle direct_write_run_dir mismatch"));
 	}
 	return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::ok(std::move(info));
+}
+
+inline DuckDBResult<void> ProtectDistributedCopyDirectWriteCatalogCommit(FileSystem &fs, const std::string &base_path,
+                                                                         const std::string &run_id) {
+	auto canonical_res = CanonicalDistributedCopyBasePath(fs, base_path);
+	if (canonical_res.is_err()) {
+		return DuckDBResult<void>::err(canonical_res.error());
+	}
+	auto canonical_base_path = std::move(canonical_res).value();
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, canonical_base_path, run_id);
+	auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, paths, canonical_base_path, run_id);
+	if (lifecycle_res.is_err()) {
+		return DuckDBResult<void>::err(lifecycle_res.error());
+	}
+	auto lifecycle = std::move(lifecycle_res).value();
+	return WriteDistributedCopyDirectWriteLifecycle(fs, lifecycle.base_path, lifecycle.run_id,
+	                                                lifecycle.created_epoch_ms, lifecycle.worker_base_path,
+	                                                DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING);
 }
 
 inline DuckDBResult<DistributedCopyResult>
@@ -1392,6 +1442,7 @@ CleanupDistributedCopyDirectTargetFilesForRun(FileSystem &fs, const std::string 
 
 struct DistributedCopyDirectWriteRunCleanupResult {
 	bool skipped_committed = false;
+	bool skipped_catalog_commit_pending = false;
 	bool data_run_dir_existed = false;
 	bool data_run_dir_removed = false;
 	bool commit_dir_existed = false;
@@ -1495,7 +1546,13 @@ CleanupDistributedCopyUncommittedDirectWriteRun(FileSystem &fs, const std::strin
 	if (lifecycle_res.is_err()) {
 		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::err(lifecycle_res.error());
 	}
-	auto worker_base_path = std::move(lifecycle_res).value().worker_base_path;
+	auto lifecycle = std::move(lifecycle_res).value();
+	if (lifecycle.state == DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING) {
+		DistributedCopyDirectWriteRunCleanupResult result;
+		result.skipped_catalog_commit_pending = true;
+		return DuckDBResult<DistributedCopyDirectWriteRunCleanupResult>::ok(std::move(result));
+	}
+	auto worker_base_path = std::move(lifecycle.worker_base_path);
 	return CleanupDistributedCopyUncommittedDirectWriteRunWithWorkerBase(fs, canonical_base_path, worker_base_path,
 	                                                                     run_id);
 }
@@ -1574,6 +1631,7 @@ struct DistributedCopyDirectWriteCleanupScanResult {
 	idx_t cleaned_runs = 0;
 	idx_t committed_runs = 0;
 	idx_t active_runs = 0;
+	idx_t catalog_commit_pending_runs = 0;
 	idx_t skipped_unregistered_runs = 0;
 	idx_t errors = 0;
 	std::vector<std::string> cleaned_run_ids;
@@ -1640,6 +1698,10 @@ CleanupExpiredDistributedCopyDirectWriteRuns(FileSystem &fs, const std::string &
 			continue;
 		}
 		const auto &lifecycle = lifecycle_res.value();
+		if (lifecycle.state == DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING) {
+			result.catalog_commit_pending_runs++;
+			continue;
+		}
 		if (now_epoch_ms < lifecycle.created_epoch_ms || now_epoch_ms - lifecycle.created_epoch_ms < min_age_ms) {
 			result.active_runs++;
 			continue;

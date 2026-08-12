@@ -3782,8 +3782,16 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
             events.append(("close",))
 
     cleanup_cursor = _CleanupCursor()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+    )
     actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id: cleanup_cursor
+    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: None
     actor._release_worker_secret_snapshot = lambda _identity: None
@@ -3843,6 +3851,11 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
     monkeypatch.setattr(worker_mod, "_refresh_effective_duckdb_s3_config", refresh)
     monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", configure)
     monkeypatch.setattr(worker_mod, "_cleanup_flight_shuffle_for_query", cleanup)
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
@@ -3911,8 +3924,16 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         )
     }
     cleanup_cursor = SimpleNamespace(close=lambda: None)
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+    )
     actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id: cleanup_cursor
+    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: None
     actor._release_worker_secret_snapshot = lambda _identity: None
@@ -3971,6 +3992,11 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "_cleanup_flight_shuffle_for_query",
         cleanup,
     )
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
 
@@ -4017,8 +4043,16 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
             raise RuntimeError("cursor close failed")
 
     cleanup_cursor = _CleanupCursor()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+    )
     actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id: cleanup_cursor
+    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     monkeypatch.setattr(
         worker_mod,
@@ -4044,6 +4078,11 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         lambda connection, config, *, use_session_credentials: (_ for _ in ()).throw(
             RuntimeError("cleanup configuration failed")
         ),
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
     )
 
     with pytest.raises(RuntimeError, match="cleanup configuration failed"):
@@ -13576,6 +13615,14 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
 
     cursor = _Cursor()
     session_conn = SimpleNamespace(cursor=lambda: cursor)
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+    )
     actor._session_connections = {
         "session-a": (
             {
@@ -13596,8 +13643,13 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         return session_conn
 
     actor._get_session_conn = _get_session_conn
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id: connection.cursor()
+    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
 
     def _fail_configuration(_connection, _config, *, use_session_credentials):
         assert use_session_credentials is True
@@ -13941,6 +13993,14 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
             return "resource-query"
 
     shared_conn = _FakeConn()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+    )
     actor._session_connections = {
         "session-a": (
             {
@@ -13963,7 +14023,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         return shared_conn
 
     actor._get_session_conn = _get_session_conn
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id: connection.cursor()
+    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._get_plan_runner = lambda: _FakePlanRunner()
     secret_identity = worker_mod.WorkerSecretSnapshotIdentity(b"s" * 32, 1)
@@ -13983,6 +14043,11 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         return dict(config)
 
     monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
     result = actor_cls._execute_native_task(
@@ -13993,7 +14058,8 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         exchange_source_task_map={"9": b"exchange-binding"},
         exchange_sink_instance={"sink_handle": {"partition_id": 4}, "attempt_id": 2, "attempt_path": "/tmp/attempt"},
         dynamic_filter_domains=dynamic_domains,
-        debug_context={"query_id": "q1", "fragment_id": "f1", "task_id": "q1.2.3.4"},
+        debug_context={"query_id": "q1", "fragment_id": "f1"},
+        native_task_id="q1.2.3.4",
     )
 
     assert result == "ok"
@@ -14043,6 +14109,39 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "AWS_SECRET_ACCESS_KEY": "session-a-secret",
     }
     assert lifecycle == ["execute", "cursor-close", "secret-release"]
+
+
+def test_execute_native_task_rejects_conflicting_runtime_task_identity():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+
+    with pytest.raises(
+        RuntimeError,
+        match=("native runtime task identity differs from debug context: runtime=q1.2.3.4 debug=q1.2.3.5"),
+    ):
+        actor_cls._execute_native_task(
+            actor,
+            object(),
+            None,
+            debug_context={"task_id": "q1.2.3.5"},
+            native_task_id="q1.2.3.4",
+        )
+
+
+def test_execute_native_task_rejects_debug_task_identity_without_native_identity():
+    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+
+    with pytest.raises(
+        RuntimeError,
+        match="debug task identity requires an authoritative native runtime task identity",
+    ):
+        actor_cls._execute_native_task(
+            actor,
+            object(),
+            None,
+            debug_context={"task_id": "q1.2.3.4"},
+        )
 
 
 def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_context():
@@ -14355,7 +14454,7 @@ def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_
     assert resolver_calls == []
 
 
-def test_execute_native_task_uses_session_database_for_fte():
+def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._shutdown_started = False
@@ -14388,6 +14487,14 @@ def test_execute_native_task_uses_session_database_for_fte():
             closed.append("conn")
 
     shared_conn = _FakeConn()
+    database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        "test-source-id",
+        (),
+        (),
+    )
     actor._session_connections = {"session-a": ({}, shared_conn)}
 
     class _FakePlan:
@@ -14406,8 +14513,13 @@ def test_execute_native_task_uses_session_database_for_fte():
     actor._get_session_conn = lambda session_id, config, *, use_session_credentials: (
         shared_conn if (session_id, config) == ("session-a", {}) else None
     )
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id: connection.cursor()
+    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
+    monkeypatch.setattr(
+        worker_mod,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
 
     class _FakePlanRunner:
         def execute_native(

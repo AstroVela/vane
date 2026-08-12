@@ -6,6 +6,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -158,6 +159,15 @@ string DistributedExtensionCapabilityReference::CanonicalIdentity() const {
 	                          capability.CanonicalIdentity());
 }
 
+bool DistributedExtensionCapabilityReference::operator==(const DistributedExtensionCapabilityReference &other) const {
+	return extension_name == other.extension_name && extension_protocol_version == other.extension_protocol_version &&
+	       capability == other.capability;
+}
+
+bool DistributedExtensionCapabilityReference::operator!=(const DistributedExtensionCapabilityReference &other) const {
+	return !(*this == other);
+}
+
 string DistributedExtensionManifest::CanonicalIdentity() const {
 	auto sorted_capabilities = capabilities;
 	std::sort(sorted_capabilities.begin(), sorted_capabilities.end());
@@ -278,6 +288,34 @@ void DistributedExtensionManager::RequireCapability(const DistributedExtensionCa
 	}
 	RequireCapability(capability.extension_name, capability.capability.kind, capability.capability.name,
 	                  capability.capability.protocol_version);
+}
+
+void DistributedExtensionManager::RegisterWriteCallbacks(const DistributedExtensionCapabilityReference &capability,
+                                                         DistributedExtensionWriteCallbacks callbacks) {
+	RequireCapability(capability);
+	if (capability.capability.kind != DistributedExtensionCapabilityKind::OPERATOR) {
+		throw InvalidInputException("Distributed write callbacks require an operator capability: %s",
+		                            capability.CanonicalIdentity());
+	}
+	const auto identity = capability.CanonicalIdentity();
+	callbacks.Validate(identity);
+	auto registered_callbacks = make_shared_ptr<DistributedExtensionWriteCallbacks>(std::move(callbacks));
+	lock_guard<mutex> guard(lock);
+	if (!write_callbacks.emplace(identity, std::move(registered_callbacks)).second) {
+		throw InvalidInputException("Distributed write callbacks for '%s' are already registered", identity);
+	}
+}
+
+shared_ptr<const DistributedExtensionWriteCallbacks>
+DistributedExtensionManager::GetWriteCallbacks(const DistributedExtensionCapabilityReference &capability) const {
+	RequireCapability(capability);
+	const auto identity = capability.CanonicalIdentity();
+	lock_guard<mutex> guard(lock);
+	auto entry = write_callbacks.find(identity);
+	if (entry == write_callbacks.end()) {
+		throw InvalidInputException("Distributed write callbacks for '%s' are not registered", identity);
+	}
+	return entry->second;
 }
 
 void DistributedExtensionManager::ValidateExact(const vector<DistributedExtensionManifest> &expected_p) const {

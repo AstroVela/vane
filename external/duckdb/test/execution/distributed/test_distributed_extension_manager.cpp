@@ -4,6 +4,7 @@
 #include "catch.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/function/distributed_write.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -58,6 +59,18 @@ public:
 
 	string Name() override {
 		return "loader_retry";
+	}
+};
+
+class IncompleteWriteContractExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override {
+		loader.RegisterDistributedExtension(1);
+		loader.RegisterDistributedWriteOperator("write", 1, DistributedExtensionWriteCallbacks {});
+	}
+
+	string Name() override {
+		return "incomplete_write_contract";
 	}
 };
 
@@ -143,6 +156,38 @@ TEST_CASE("ExtensionLoader publishes a distributed manifest only after successfu
 
 	DistributedExtensionManifest manifest;
 	REQUIRE_FALSE(DistributedExtensionManager::Get(*db.instance).TryGetExtension("failing_contract", manifest));
+
+	REQUIRE_THROWS_WITH(db.LoadStaticExtension<IncompleteWriteContractExtension>(),
+	                    Catch::Matchers::Contains("callbacks"));
+	REQUIRE_FALSE(
+	    DistributedExtensionManager::Get(*db.instance).TryGetExtension("incomplete_write_contract", manifest));
+}
+
+TEST_CASE("Distributed write callbacks require an exact operator capability", "[distributed][extension]") {
+	DuckDB db(nullptr);
+	auto &manager = DistributedExtensionManager::Get(*db.instance);
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "write_contract";
+	manifest.protocol_version = 2;
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1});
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::OPERATOR, "write", 3});
+	manager.RegisterManifest(manifest);
+
+	DistributedExtensionCapabilityReference write;
+	write.extension_name = "write_contract";
+	write.extension_protocol_version = 2;
+	write.capability = {DistributedExtensionCapabilityKind::OPERATOR, "write", 3};
+	DistributedExtensionWriteCallbacks incomplete_callbacks;
+	incomplete_callbacks.fragment_codec = "write-contract.fragment";
+	incomplete_callbacks.fragment_codec_version = 1;
+	REQUIRE_THROWS_WITH(manager.RegisterWriteCallbacks(write, std::move(incomplete_callbacks)),
+	                    Catch::Matchers::Contains("incomplete"));
+	REQUIRE_THROWS_WITH(manager.GetWriteCallbacks(write), Catch::Matchers::Contains("not registered"));
+
+	auto scan = write;
+	scan.capability = {DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1};
+	REQUIRE_THROWS_WITH(manager.RegisterWriteCallbacks(scan, DistributedExtensionWriteCallbacks {}),
+	                    Catch::Matchers::Contains("operator capability"));
 }
 
 TEST_CASE("ExtensionLoader distributed declaration validation has strong exception safety",

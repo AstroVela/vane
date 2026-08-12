@@ -17,7 +17,6 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/execution/dynamic_filter_serialization.hpp"
-#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/function/function_serialization.hpp"
 
 #include <utility>
@@ -455,6 +454,11 @@ void PhysicalTableScan::GetMetrics(ClientContext &context, GlobalSourceState &gs
 
 void PhysicalTableScan::SerializeOperatorData(Serializer &serializer) const {
 	// TableScan-specific serialization
+	if (function.HasDistributedScanCallbacks() && !function.HasSerializationCallbacks()) {
+		throw SerializationException("Distributed physical table function '%s' requires complete serialize and "
+		                             "deserialize callbacks; worker rebind is not supported",
+		                             function.name);
+	}
 	FunctionSerializer::Serialize(serializer, function, bind_data.get());
 	serializer.WriteProperty(200, "returned_types", returned_types);
 	serializer.WriteProperty(201, "column_ids", column_ids);
@@ -465,13 +469,7 @@ void PhysicalTableScan::SerializeOperatorData(Serializer &serializer) const {
 		serializer.WriteProperty(205, "table_filters", *table_filters);
 	}
 	serializer.WritePropertyWithDefault(206, "extra_info", extra_info, ExtraOperatorInfo {});
-	auto provider = bind_data ? TryGetExtensionScanTaskProvider(*bind_data) : nullptr;
-	auto rebound_parameters = parameters;
-	auto rebound_named_parameters = named_parameters;
-	if (provider && !function.HasSerializationCallbacks()) {
-		provider->PrepareWorkerBind(rebound_parameters, rebound_named_parameters);
-	}
-	serializer.WritePropertyWithDefault(207, "parameters", rebound_parameters);
+	serializer.WritePropertyWithDefault(207, "parameters", parameters);
 	serializer.WritePropertyWithDefault(208, "virtual_columns", virtual_columns);
 	optional_idx dynamic_filters_id;
 	if (dynamic_filters) {
@@ -479,18 +477,6 @@ void PhysicalTableScan::SerializeOperatorData(Serializer &serializer) const {
 		dynamic_filters_id = state.GetId(dynamic_filters);
 	}
 	serializer.WritePropertyWithDefault(209, "dynamic_filters_id", dynamic_filters_id);
-	if (!function.HasSerializationCallbacks()) {
-		if ((function.GetSerializeCallback() || function.GetDeserializeCallback()) && !provider) {
-			throw SerializationException(
-			    "PhysicalTableScan table function '%s' declares incomplete serialization callbacks and requires an "
-			    "explicit ExtensionScanTaskProvider",
-			    function.name);
-		}
-		serializer.WriteProperty(210, "named_parameters", rebound_named_parameters);
-		serializer.WriteProperty(211, "input_table_types", input_table_types);
-		serializer.WriteProperty(212, "input_table_names", input_table_names);
-	}
-	serializer.WriteProperty(213, "requires_extension_scan_task_provider", provider != nullptr);
 }
 
 } // namespace duckdb

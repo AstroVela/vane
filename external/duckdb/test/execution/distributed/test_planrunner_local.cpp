@@ -170,41 +170,60 @@ public:
 	ReplayTestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                                 PhysicalOperatorType operator_type = PhysicalOperatorType::EXTENSION)
 	    : PhysicalOperator(physical_plan, operator_type, std::move(types), 0) {
+		info.capability.extension_name = "replay_test_extension";
+		info.capability.extension_protocol_version = 1;
+		info.capability.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+		info.capability.capability.name = "write";
+		info.capability.capability.protocol_version = 1;
+		info.write_name = "replay_test_extension";
+		info.mode = DistributedWriteMode::FILE_ARTIFACT;
+		info.fragment_codec = DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC;
+		info.fragment_codec_version = DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION;
 	}
 
 	optional_ptr<ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
 		return this;
 	}
 
-	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
-		DistributedExtensionCapabilityReference result;
-		result.extension_name = "replay_test_extension";
-		result.extension_protocol_version = 1;
-		result.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-		result.capability.name = "write";
-		result.capability.protocol_version = 1;
-		return result;
+	const DistributedExtensionWriteInfo &WriteInfo() const override {
+		return info;
 	}
 
-	string ExtensionWriteName() const override {
-		return "replay_test_extension";
-	}
-
-	void ValidateExtensionWrite(ClientContext &) const override {
+	void ValidateDistributedWrite(ClientContext &, const DistributedWriteOperationContext &operation) const override {
 		validation_calls++;
+		validation_operation_id = operation.operation_id;
+		if (fail_validation) {
+			throw InvalidInputException("planned extension write validation failure");
+		}
 	}
 
-	idx_t FinalizeExtensionWrite(ClientContext &, const vector<DistributedCopyFileInfo> &files) const override {
+	idx_t FinalizeDistributedWrite(ClientContext &, const DistributedWriteOperationContext &operation,
+	                               const vector<DistributedWriteTaskResult> &results) const override {
 		finalize_calls++;
+		finalize_operation_id = operation.operation_id;
 		idx_t rows = 0;
-		for (const auto &file : files) {
-			rows += file.row_count;
+		for (const auto &result : results) {
+			rows += result.RowCount();
 		}
 		return rows;
 	}
 
+	void AbortDistributedWrite(ClientContext &, const DistributedWriteOperationContext &operation,
+	                           const vector<DistributedWriteTaskResult> &) const override {
+		abort_calls++;
+		abort_operation_id = operation.operation_id;
+	}
+
 	mutable idx_t validation_calls = 0;
 	mutable idx_t finalize_calls = 0;
+	mutable idx_t abort_calls = 0;
+	mutable string validation_operation_id;
+	mutable string finalize_operation_id;
+	mutable string abort_operation_id;
+	bool fail_validation = false;
+
+private:
+	DistributedExtensionWriteInfo info;
 };
 
 string PlanRunnerSQLStringLiteral(const string &value) {
@@ -274,7 +293,7 @@ TEST_CASE("PlanRunner rejects an unregistered extension write capability",
 
 	auto result = runner->run_plan(std::move(distributed_plan));
 	REQUIRE(result.is_err());
-	REQUIRE(StringUtil::Contains(result.error().what(), "capability validation failed"));
+	REQUIRE(StringUtil::Contains(result.error().what(), "protocol validation failed"));
 	REQUIRE(StringUtil::Contains(result.error().what(), "replay_test_extension"));
 	REQUIRE(extension.validation_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
@@ -317,6 +336,56 @@ TEST_CASE("PlanRunner rejects extension writes inside an explicit DuckDB transac
 	REQUIRE(StringUtil::Contains(result.error().what(), "auto-commit mode"));
 	REQUIRE(extension.validation_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
+	REQUIRE_FALSE(FileSystem::GetFileSystem(*con.context).DirectoryExists(output_path));
+}
+
+TEST_CASE("PlanRunner aborts an extension write when coordinator validation fails",
+          "[distributed][plan][copy][extension-write]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	RegisterReplayTestExtension(*db.instance);
+	auto output_path = TestCreatePath("planrunner_extension_validation_failure");
+	auto logical_plan = con.ExtractPlan("COPY (SELECT 42 AS value) TO " + PlanRunnerSQLStringLiteral(output_path) +
+	                                    " (FORMAT PARQUET, RETURN_STATS true, USE_TMP_FILE false)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*con.context);
+	auto generated_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(generated_plan != nullptr);
+	auto &copy_root = generated_plan->Root();
+
+	vector<LogicalType> extension_types {LogicalType::BIGINT};
+	auto &extension_operator = generated_plan->Make<ReplayTestExtensionWriteOperator>(std::move(extension_types));
+	auto &extension = extension_operator.Cast<ReplayTestExtensionWriteOperator>();
+	extension.fail_validation = true;
+	extension_operator.children.push_back(copy_root);
+	generated_plan->SetRoot(extension_operator);
+	auto physical_plan = DuckPhysicalPlanRef(generated_plan.release());
+
+	auto workers = setup_workers({{make_worker_id("validation-w1"), 1}});
+	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(19, "planrunner-extension-validation-failure",
+	                                                                  physical_plan, std::move(execution_config));
+
+	auto missing_transaction = runner->run_plan(distributed_plan);
+	REQUIRE(missing_transaction.is_err());
+	REQUIRE(StringUtil::Contains(missing_transaction.error().what(), "active Vane-owned auto-commit transaction"));
+	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.finalize_calls == 0);
+	REQUIRE(extension.abort_calls == 0);
+
+	DuckDBResult<PlanRunner::PlanResult> result;
+	con.context->RunFunctionInTransaction([&]() { result = runner->run_plan(std::move(distributed_plan)); });
+
+	REQUIRE(result.is_err());
+	REQUIRE(StringUtil::Contains(result.error().what(), "planned extension write validation failure"));
+	REQUIRE(extension.validation_calls == 1);
+	REQUIRE(extension.finalize_calls == 0);
+	REQUIRE(extension.abort_calls == 1);
+	REQUIRE(extension.validation_operation_id == "planrunner-extension-validation-failure");
+	REQUIRE(extension.abort_operation_id == extension.validation_operation_id);
 	REQUIRE_FALSE(FileSystem::GetFileSystem(*con.context).DirectoryExists(output_path));
 }
 
@@ -413,18 +482,27 @@ TEST_CASE("PlanRunner replays a committed extension write without coordinator or
 	file_info.file_size_bytes = contents.size();
 	vector<DistributedCopyFileInfo> files;
 	files.push_back(std::move(file_info));
-	auto prepare_res = FinalizeCopyFiles(copy_finish->spec(), "", std::move(files), *con.context, run_id, false);
-	REQUIRE(prepare_res.is_ok());
-	auto prepared = std::move(prepare_res).value();
-	REQUIRE_FALSE(prepared.output_committed);
-	REQUIRE(fs.FileExists(prepared.output_manifest_path));
-	REQUIRE_FALSE(fs.FileExists(prepared.output_committed_marker_path));
+	REQUIRE(ProtectDistributedCopyDirectWriteCatalogCommit(fs, base_path, run_id).is_ok());
 
 	auto workers = setup_workers({{make_worker_id("replay-w1"), 1}});
 	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
 	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
 	auto distributed_plan =
 	    std::make_shared<DistributedPhysicalPlan>(17, query_id, physical_plan, std::move(execution_config));
+
+	auto pending_without_manifest = runner->run_plan(distributed_plan);
+	REQUIRE(pending_without_manifest.is_err());
+	REQUIRE(StringUtil::Contains(pending_without_manifest.error().what(), "catalog-commit-pending lifecycle"));
+	REQUIRE(fs.FileExists(data_path));
+	REQUIRE(extension.validation_calls == 0);
+	REQUIRE(extension.finalize_calls == 0);
+
+	auto prepare_res = FinalizeCopyFiles(copy_finish->spec(), "", std::move(files), *con.context, run_id, false);
+	REQUIRE(prepare_res.is_ok());
+	auto prepared = std::move(prepare_res).value();
+	REQUIRE_FALSE(prepared.output_committed);
+	REQUIRE(fs.FileExists(prepared.output_manifest_path));
+	REQUIRE_FALSE(fs.FileExists(prepared.output_committed_marker_path));
 
 	auto uncertain_replay = runner->run_plan(distributed_plan);
 
@@ -442,11 +520,12 @@ TEST_CASE("PlanRunner replays a committed extension write without coordinator or
 
 	REQUIRE(replay.is_ok());
 	REQUIRE(replay.value().tag == PlanRunner::PlanResult::EXTENSION_WRITE);
-	REQUIRE(replay.value().copy_result.output_committed);
-	REQUIRE(replay.value().copy_result.extension_write);
-	REQUIRE(replay.value().copy_result.extension_catalog_committed);
-	REQUIRE(replay.value().copy_result.extension_write_name == "replay_test_extension");
-	REQUIRE(replay.value().copy_result.rows_copied == 7);
+	REQUIRE(replay.value().extension_write_result.file_result.output_committed);
+	REQUIRE(replay.value().extension_write_result.catalog_committed);
+	REQUIRE(replay.value().extension_write_result.info.write_name == "replay_test_extension");
+	REQUIRE(replay.value().extension_write_result.rows_written == 7);
+	REQUIRE(replay.value().extension_write_result.selected_task_results.size() == 1);
+	REQUIRE(replay.value().extension_write_result.selected_task_results[0].operation_id == query_id);
 	REQUIRE(extension.validation_calls == 0);
 	REQUIRE(extension.finalize_calls == 0);
 }

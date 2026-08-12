@@ -974,6 +974,49 @@ def test_snapshot_replay_rejects_different_distributed_extension_manifest():
         ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
 
 
+def test_logical_snapshot_validates_manifest_before_applying_effective_s3_config():
+    ray_cxx = _require_ray_cxx()
+
+    source_connection = vane.connect()
+    source_connection.execute("LOAD httpfs")
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "logical-snapshot-extension-before-s3",
+    )
+    state = list(logical_plan.__getstate__())
+    snapshot = dict(state[3])
+    assert any(extension["name"] == "httpfs" for extension in snapshot["extensions"])
+    snapshot["distributed_extensions"] = [
+        *snapshot["distributed_extensions"],
+        {
+            "extension_name": "missing_test_extension",
+            "protocol_version": 1,
+            "capabilities": [],
+        },
+    ]
+    state[3] = snapshot
+
+    replay_logical_plan = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
+    replay_logical_plan.__setstate__(tuple(state))
+    planning_connection = vane.connect()
+    with pytest.raises(Exception, match="manifests differ between coordinator and worker"):
+        replay_logical_plan.to_physical_plan(
+            planning_connection,
+            effective_session_config={
+                "AWS_ACCESS_KEY_ID": "must-not-be-applied",
+                "AWS_SECRET_ACCESS_KEY": "must-not-be-applied",
+            },
+        )
+
+    assert planning_connection.execute(
+        "SELECT name, value FROM duckdb_settings() "
+        "WHERE name IN ('s3_access_key_id', 's3_secret_access_key') ORDER BY name"
+    ).fetchall() == [
+        ("s3_access_key_id", None),
+        ("s3_secret_access_key", None),
+    ]
+
+
 @pytest.mark.parametrize(
     ("field_name", "error_match"),
     [
@@ -1376,6 +1419,40 @@ def test_effective_session_config_reaches_nondefault_bootstrap_connection(tmp_pa
     ]
 
 
+def test_effective_session_config_does_not_load_undeclared_httpfs():
+    ray_cxx = _require_ray_cxx()
+    source_conn = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1 AS value"),
+        "snapshot-session-config-without-httpfs",
+    )
+    state = list(logical_plan.__getstate__())
+    snapshot = dict(state[3])
+    snapshot["extensions"] = [extension for extension in snapshot["extensions"] if extension["name"] != "httpfs"]
+    state[3] = snapshot
+    replay_logical_plan = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
+    replay_logical_plan.__setstate__(tuple(state))
+
+    planning_conn = vane.connect()
+    with pytest.raises(Exception, match="Static extension identities differ"):
+        replay_logical_plan.to_physical_plan(
+            planning_conn,
+            effective_session_config={
+                "AWS_ACCESS_KEY_ID": "unused-key",
+                "AWS_SECRET_ACCESS_KEY": "unused-secret",
+                "AWS_REGION": "us-east-2",
+            },
+        )
+
+    assert planning_conn.execute(
+        "SELECT name, value FROM duckdb_settings() "
+        "WHERE name IN ('s3_access_key_id', 's3_secret_access_key') ORDER BY name"
+    ).fetchall() == [
+        ("s3_access_key_id", None),
+        ("s3_secret_access_key", None),
+    ]
+
+
 def test_file_database_snapshot_baseline_ignores_database_target_settings(tmp_path):
     ray_cxx = _require_ray_cxx()
     database_path = str(tmp_path / "read-only-bootstrap.duckdb")
@@ -1429,6 +1506,19 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
 
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
+    direct_worker_cursor = vane.connect().cursor()
+    direct_result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+        direct_worker_cursor,
+        physical_plan,
+        effective_session_config=effective_config,
+    )
+    direct_table = _table_from_native_result(direct_result)
+    assert direct_table.column(0).to_pylist() == ["explicit-key"]
+    assert direct_table.column(1).to_pylist() == ["explicit-secret"]
+    assert direct_table.column(2).to_pylist() == [""]
+    assert direct_worker_cursor.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
+    assert direct_worker_cursor.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
+
     worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
         worker_cursor,

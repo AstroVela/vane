@@ -82,6 +82,25 @@ void ExtensionLoader::RegisterDistributedOperator(const string &capability_name,
 	RegisterDistributedCapability(DistributedExtensionCapabilityKind::OPERATOR, capability_name, protocol_version);
 }
 
+void ExtensionLoader::RegisterDistributedWriteOperator(const string &capability_name, idx_t protocol_version,
+                                                       DistributedExtensionWriteCallbacks callbacks) {
+	if (!distributed_manifest) {
+		throw InvalidInputException("Distributed extension '%s' must be declared before write capability '%s'",
+		                            extension_name, capability_name);
+	}
+	DistributedExtensionCapability capability;
+	capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+	capability.name = capability_name;
+	capability.protocol_version = protocol_version;
+	DistributedExtensionCapabilityReference reference;
+	reference.extension_name = extension_name;
+	reference.extension_protocol_version = distributed_manifest->protocol_version;
+	reference.capability = capability;
+	callbacks.Validate(reference.CanonicalIdentity());
+	RegisterDistributedCapability(capability.kind, capability.name, capability.protocol_version);
+	distributed_write_callbacks.emplace_back(std::move(capability), std::move(callbacks));
+}
+
 void ExtensionLoader::RegisterDistributedStorage(const string &capability_name, idx_t protocol_version) {
 	RegisterDistributedCapability(DistributedExtensionCapabilityKind::STORAGE, capability_name, protocol_version);
 }
@@ -98,7 +117,15 @@ void ExtensionLoader::FinalizeLoad() {
 		extension_info->load_info = std::move(info);
 	}
 	if (distributed_manifest) {
-		DistributedExtensionManager::Get(db).RegisterManifest(*distributed_manifest);
+		auto &manager = DistributedExtensionManager::Get(db);
+		manager.RegisterManifest(*distributed_manifest);
+		for (auto &entry : distributed_write_callbacks) {
+			DistributedExtensionCapabilityReference reference;
+			reference.extension_name = extension_name;
+			reference.extension_protocol_version = distributed_manifest->protocol_version;
+			reference.capability = entry.first;
+			manager.RegisterWriteCallbacks(reference, std::move(entry.second));
+		}
 	}
 }
 

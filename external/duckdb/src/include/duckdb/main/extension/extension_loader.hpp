@@ -16,6 +16,7 @@
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/main/extension_manager.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
+#include "duckdb/function/distributed_write.hpp"
 
 namespace duckdb {
 
@@ -50,6 +51,8 @@ public:
 	DUCKDB_API void RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedOperator(const string &capability_name, idx_t protocol_version);
+	DUCKDB_API void RegisterDistributedWriteOperator(const string &capability_name, idx_t protocol_version,
+	                                                 DistributedExtensionWriteCallbacks callbacks);
 	DUCKDB_API void RegisterDistributedStorage(const string &capability_name, idx_t protocol_version);
 	DUCKDB_API void RegisterDistributedContext(const string &capability_name, idx_t protocol_version);
 
@@ -122,6 +125,7 @@ private:
 	string extension_description;
 	optional_ptr<ExtensionInfo> extension_info;
 	unique_ptr<DistributedExtensionManifest> distributed_manifest;
+	vector<pair<DistributedExtensionCapability, DistributedExtensionWriteCallbacks>> distributed_write_callbacks;
 };
 
 } // namespace duckdb

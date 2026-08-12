@@ -14,6 +14,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/physical_plan.hpp"
 
@@ -24,6 +25,30 @@ namespace distributed {
 
 namespace {
 
+bool CollectExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, std::string *error) {
+	if (op.type == PhysicalOperatorType::EXCHANGE_SOURCE) {
+		auto *source = dynamic_cast<const PhysicalRemoteExchangeSource *>(&op);
+		if (!source) {
+			if (error) {
+				*error = "exchange source has an unexpected physical implementation";
+			}
+			return false;
+		}
+		// Sources with embedded handles are already fully bound by the
+		// coordinator. Only sources explicitly tagged with a runtime node id
+		// participate in the static/FTE assignment domain.
+		if (source->RuntimeSourceNodeId().IsValid()) {
+			node_ids.insert(source->RuntimeSourceNodeId().GetIndex());
+		}
+	}
+	for (const auto &child : op.children) {
+		if (!CollectExchangeSourceNodeIds(child.get(), node_ids, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool ApplyExchangeSourceTasksToOperator(PhysicalOperator &op,
                                         const std::unordered_map<idx_t, ExchangeSourceTaskDescriptor> &tasks,
                                         std::string *error, idx_t &applied) {
@@ -32,14 +57,10 @@ bool ApplyExchangeSourceTasksToOperator(PhysicalOperator &op,
 		if (source && source->RuntimeSourceNodeId().IsValid()) {
 			const auto node_id = source->RuntimeSourceNodeId().GetIndex();
 			auto entry = tasks.find(node_id);
-			if (entry == tasks.end()) {
-				if (error) {
-					*error = "missing exchange source task for runtime_source_node_id=" + std::to_string(node_id);
-				}
-				return false;
+			if (entry != tasks.end()) {
+				source->ApplyRuntimeTaskDescriptor(entry->second);
+				applied++;
 			}
-			source->ApplyRuntimeTaskDescriptor(entry->second);
-			applied++;
 		}
 	}
 	for (auto &child : op.children) {
@@ -142,7 +163,7 @@ std::string ExchangeSourceTaskDescriptor::SerializeToBytes() const {
 
 ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::DeserializeFromBytes(const std::string &bytes) {
 	if (bytes.empty()) {
-		return ExchangeSourceTaskDescriptor();
+		throw SerializationException("cannot deserialize an empty exchange source task descriptor");
 	}
 	auto *data_ptr = reinterpret_cast<data_ptr_t>(const_cast<char *>(bytes.data()));
 	MemoryStream stream(data_ptr, bytes.size());
@@ -162,8 +183,68 @@ bool ApplyExchangeSourceTasksToPlan(duckdb::PhysicalPlan &plan,
 		}
 		return false;
 	}
+	if (tasks.empty()) {
+		if (error) {
+			*error = "exchange source task map is empty";
+		}
+		return false;
+	}
+	set<idx_t> source_node_ids;
+	if (!CollectExchangeSourceNodeIds(plan.Root(), source_node_ids, error)) {
+		return false;
+	}
+	for (const auto &entry : tasks) {
+		if (source_node_ids.find(entry.first) == source_node_ids.end()) {
+			if (error) {
+				*error = "exchange source task node_id=" + std::to_string(entry.first) +
+				         " is not present in the worker plan";
+			}
+			return false;
+		}
+	}
 	idx_t applied = 0;
-	return ApplyExchangeSourceTasksToOperator(plan.Root(), tasks, error, applied);
+	if (!ApplyExchangeSourceTasksToOperator(plan.Root(), tasks, error, applied)) {
+		return false;
+	}
+	if (applied == 0) {
+		if (error) {
+			*error = "no exchange source tasks applied";
+		}
+		return false;
+	}
+	return true;
+}
+
+bool ValidateExchangeSourceAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
+                                       std::string *error) {
+	if (!plan.HasRoot()) {
+		if (error) {
+			*error = "plan has no root";
+		}
+		return false;
+	}
+	set<idx_t> source_node_ids;
+	if (!CollectExchangeSourceNodeIds(plan.Root(), source_node_ids, error)) {
+		return false;
+	}
+	for (auto node_id : source_node_ids) {
+		if (assigned_node_ids.find(node_id) == assigned_node_ids.end()) {
+			if (error) {
+				*error = "missing exchange source assignment for runtime_source_node_id=" + std::to_string(node_id);
+			}
+			return false;
+		}
+	}
+	for (auto node_id : assigned_node_ids) {
+		if (source_node_ids.find(node_id) == source_node_ids.end()) {
+			if (error) {
+				*error = "exchange source assignment node_id=" + std::to_string(node_id) +
+				         " is not present in the worker plan";
+			}
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace distributed

@@ -1015,6 +1015,7 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	const string stale_run_id = "run-stale";
 	const string second_stale_run_id = "run-stale-two";
 	const string active_run_id = "run-active";
+	const string catalog_commit_pending_run_id = "run-catalog-commit-pending";
 	const string committed_run_id = "run-committed";
 
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, stale_run_id, 1).is_ok());
@@ -1036,6 +1037,18 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	                      "w_running", "part.parquet");
 	WriteTestFile(local_fs, active_file, "active");
 
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, catalog_commit_pending_run_id, 1).is_ok());
+	auto catalog_commit_pending_file = local_fs.JoinPath(
+	    BuildCopyDirectWriteRunDirectory(base_path, catalog_commit_pending_run_id, local_fs.PathSeparator(base_path)),
+	    "w_selected", "part.parquet");
+	WriteTestFile(local_fs, catalog_commit_pending_file, "catalog commit pending");
+	REQUIRE(ProtectDistributedCopyDirectWriteCatalogCommit(local_fs, base_path, catalog_commit_pending_run_id).is_ok());
+	auto protected_cleanup =
+	    CleanupDistributedCopyUncommittedDirectWriteRun(local_fs, base_path, catalog_commit_pending_run_id);
+	REQUIRE(protected_cleanup.is_ok());
+	REQUIRE(protected_cleanup.value().skipped_catalog_commit_pending);
+	REQUIRE(local_fs.FileExists(catalog_commit_pending_file));
+
 	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(local_fs, base_path, committed_run_id, 1).is_ok());
 	auto committed_file = local_fs.JoinPath(
 	    BuildCopyDirectWriteRunDirectory(base_path, committed_run_id, local_fs.PathSeparator(base_path)), "w_selected",
@@ -1052,10 +1065,11 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	REQUIRE(cleanup_res.is_ok());
 	auto cleanup = std::move(cleanup_res).value();
 
-	REQUIRE(cleanup.scanned_runs == 4);
+	REQUIRE(cleanup.scanned_runs == 5);
 	REQUIRE(cleanup.cleaned_runs == 2);
 	REQUIRE(cleanup.committed_runs == 1);
 	REQUIRE(cleanup.active_runs == 1);
+	REQUIRE(cleanup.catalog_commit_pending_runs == 1);
 	REQUIRE(cleanup.skipped_unregistered_runs == 0);
 	REQUIRE(cleanup.errors == 0);
 	REQUIRE(cleanup.cleaned_run_ids == vector<string> {stale_run_id, second_stale_run_id});
@@ -1066,6 +1080,7 @@ TEST_CASE("Expired direct-write cleanup discovers file-only object listings",
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.lifecycle_path));
 	REQUIRE_FALSE(local_fs.FileExists(stale_paths.manifest_path));
 	REQUIRE(local_fs.FileExists(active_file));
+	REQUIRE(local_fs.FileExists(catalog_commit_pending_file));
 	REQUIRE(local_fs.FileExists(committed_file));
 	REQUIRE(local_fs.FileExists(committed_paths.committed_marker_path));
 	REQUIRE(local_fs.FileExists(unregistered_path));

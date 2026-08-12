@@ -6,6 +6,8 @@
 
 #include "duckdb/function/table_function.hpp"
 
+#include "duckdb/common/exception.hpp"
+
 namespace duckdb {
 
 GlobalTableFunctionState::~GlobalTableFunctionState() {
@@ -32,8 +34,9 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
       get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
-      sampling_pushdown(false), late_materialization(false) {
+      serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
+      filter_pushdown(false),
+      filter_prune(false), sampling_pushdown(false), late_materialization(false) {
 }
 
 TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, std::nullptr_t function_,
@@ -48,8 +51,9 @@ TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, 
       get_partition_data(nullptr), get_bind_info(nullptr), type_pushdown(nullptr), get_multi_file_reader(nullptr),
       supports_pushdown_type(nullptr), supports_pushdown_extract(nullptr), get_partition_info(nullptr),
       get_partition_stats(nullptr), get_virtual_columns(nullptr), get_row_id_columns(nullptr), set_scan_order(nullptr),
-      serialize(nullptr), deserialize(nullptr), projection_pushdown(false), filter_pushdown(false), filter_prune(false),
-      sampling_pushdown(false), late_materialization(false) {
+      serialize(nullptr), deserialize(nullptr), distributed_scan(nullptr), projection_pushdown(false),
+      filter_pushdown(false),
+      filter_prune(false), sampling_pushdown(false), late_materialization(false) {
 }
 
 TableFunction::TableFunction(const vector<LogicalType> &arguments, table_function_t function_,
@@ -81,10 +85,60 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 	       get_partition_info == rhs.get_partition_info && get_partition_stats == rhs.get_partition_stats &&
 	       get_virtual_columns == rhs.get_virtual_columns && get_row_id_columns == rhs.get_row_id_columns &&
 	       serialize == rhs.serialize && deserialize == rhs.deserialize &&
+	       ((!distributed_scan && !rhs.distributed_scan) ||
+	        (distributed_scan && rhs.distributed_scan && *distributed_scan == *rhs.distributed_scan)) &&
 	       verify_serialization == rhs.verify_serialization && projection_pushdown == rhs.projection_pushdown &&
 	       filter_pushdown == rhs.filter_pushdown && filter_prune == rhs.filter_prune &&
 	       sampling_pushdown == rhs.sampling_pushdown && late_materialization == rhs.late_materialization &&
 	       global_initialization == rhs.global_initialization;
+}
+
+void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
+	if (!plan || !prepare_bind || !apply_tasks) {
+		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan, "
+		                            "prepare_bind, and apply_tasks",
+		                            function_name);
+	}
+	if (task_codec.empty()) {
+		throw InvalidInputException("Distributed scan task codec for table function '%s' must not be empty",
+		                            function_name);
+	}
+	if (task_codec_version == 0) {
+		throw InvalidInputException("Distributed scan task codec version for table function '%s' must be greater than "
+		                            "zero",
+		                            function_name);
+	}
+	if (capability.capability.kind != DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
+		throw InvalidInputException("Distributed scan capability for table function '%s' must have kind table_function",
+		                            function_name);
+	}
+	if (capability.capability.name != function_name) {
+		throw InvalidInputException("Distributed scan capability name '%s' does not match table function '%s'",
+		                            capability.capability.name, function_name);
+	}
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = capability.extension_name;
+	manifest.protocol_version = capability.extension_protocol_version;
+	manifest.capabilities.push_back(capability.capability);
+	DistributedExtensionManager::ValidateManifest(manifest);
+}
+
+bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
+	return capability == other.capability && task_codec == other.task_codec &&
+	       task_codec_version == other.task_codec_version && plan == other.plan && prepare_bind == other.prepare_bind &&
+	       apply_tasks == other.apply_tasks;
+}
+
+void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
+	callbacks.Validate(name);
+	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
+}
+
+const TableFunctionDistributedScanCallbacks &TableFunction::GetDistributedScanCallbacks() const {
+	if (!distributed_scan) {
+		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
+	}
+	return *distributed_scan;
 }
 
 bool TableFunction::operator!=(const TableFunction &rhs) const {

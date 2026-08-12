@@ -23,6 +23,7 @@ class CopyDirectWriteLifecycleScan:
     cleaned_runs: int
     committed_runs: int
     active_runs: int
+    catalog_commit_pending_runs: int
     skipped_unregistered_runs: int
     errors: int
     cleaned_run_ids: list[str]
@@ -36,6 +37,7 @@ class CopyDirectWriteLifecycleScan:
             cleaned_runs=int(result.get("cleaned_runs", 0)),
             committed_runs=int(result.get("committed_runs", 0)),
             active_runs=int(result.get("active_runs", 0)),
+            catalog_commit_pending_runs=int(result["catalog_commit_pending_runs"]),
             skipped_unregistered_runs=int(result.get("skipped_unregistered_runs", 0)),
             errors=int(result.get("errors", 0)),
             cleaned_run_ids=[str(run_id) for run_id in result.get("cleaned_run_ids", [])],
@@ -50,6 +52,7 @@ class CopyDirectWriteLifecycleScan:
             cleaned_runs=0,
             committed_runs=0,
             active_runs=0,
+            catalog_commit_pending_runs=0,
             skipped_unregistered_runs=0,
             errors=1,
             cleaned_run_ids=[],
@@ -63,6 +66,7 @@ class CopyDirectWriteLifecycleScan:
             "cleaned_runs": self.cleaned_runs,
             "committed_runs": self.committed_runs,
             "active_runs": self.active_runs,
+            "catalog_commit_pending_runs": self.catalog_commit_pending_runs,
             "skipped_unregistered_runs": self.skipped_unregistered_runs,
             "errors": self.errors,
             "cleaned_run_ids": list(self.cleaned_run_ids),
@@ -94,6 +98,7 @@ def _aggregate_scans(scans: Sequence[CopyDirectWriteLifecycleScan]) -> dict[str,
         "cleaned_runs": sum(scan.cleaned_runs for scan in scans),
         "committed_runs": sum(scan.committed_runs for scan in scans),
         "active_runs": sum(scan.active_runs for scan in scans),
+        "catalog_commit_pending_runs": sum(scan.catalog_commit_pending_runs for scan in scans),
         "skipped_unregistered_runs": sum(scan.skipped_unregistered_runs for scan in scans),
         "errors": sum(scan.errors for scan in scans),
         "cleaned_run_ids": cleaned_runs,
@@ -114,9 +119,10 @@ def cleanup_copy_direct_write_lifecycle_once(
 
     This is the one-shot entry point for stale uncommitted direct-write COPY
     results. It delegates correctness decisions to the C++ manifest/marker
-    aware scanner: committed runs are skipped, active runs are kept, and only
-    lifecycle-registered stale uncommitted runs are removed. Pass the DuckDB
-    connection that owns any connection-scoped filesystem or secret config.
+    aware scanner: committed runs and catalog-commit-pending extension runs are
+    skipped, active runs are kept, and only lifecycle-registered stale
+    uncommitted runs are removed. Pass the DuckDB connection that owns any
+    connection-scoped filesystem or secret config.
 
     The caller must ensure that no COPY is running for any supplied base path.
     Elapsed time does not prove that an uncommitted run is abandoned.
@@ -149,6 +155,7 @@ def _format_summary(summary: dict[str, Any]) -> str:
         f"cleaned={summary['cleaned_runs']} "
         f"committed={summary['committed_runs']} "
         f"active={summary['active_runs']} "
+        f"catalog_commit_pending={summary['catalog_commit_pending_runs']} "
         f"errors={summary['errors']}"
     )
 

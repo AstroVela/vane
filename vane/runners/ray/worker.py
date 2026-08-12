@@ -2547,6 +2547,20 @@ class RayWorkerActor:
         native_query_id: str = "",
         native_task_id: str = "",
     ) -> Any:
+        native_query_id = str(native_query_id or "").strip()
+        native_task_id = str(native_task_id or "").strip()
+        debug_context = dict(debug_context or {})
+        runtime_context = dict(debug_context)
+        debug_task_id = runtime_context.pop("task_id", None)
+        if native_task_id:
+            if debug_task_id is not None and str(debug_task_id) != native_task_id:
+                raise RuntimeError(
+                    "native runtime task identity differs from debug context: "
+                    f"runtime={native_task_id} debug={debug_task_id}"
+                )
+            runtime_context["task_id"] = native_task_id
+        elif debug_task_id is not None:
+            raise RuntimeError("debug task identity requires an authoritative native runtime task identity")
         session_id = str(plan.session_id()).strip()
         session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
         has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
@@ -2568,7 +2582,6 @@ class RayWorkerActor:
         cursor = None
         cursor_registered = False
         secret_snapshot_lease: WorkerSecretSnapshotIdentity | None = None
-        debug_context = dict(debug_context or {})
         worker_log_context = dict(debug_context)
         worker_log_context.update(_ray_worker_log_fields(self))
         start = time.monotonic()
@@ -2638,7 +2651,7 @@ class RayWorkerActor:
                 fte_exchange_source_queues,
                 dynamic_filter_domains or None,
                 native_progress_callback,
-                debug_context or None,
+                runtime_context or None,
                 effective_s3_config,
                 secret_snapshot_lease is not None,
             )

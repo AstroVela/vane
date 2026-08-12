@@ -11,6 +11,7 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
+struct DistributedExtensionWriteCallbacks;
 
 //! Coarse capability groups exposed by an extension to the distributed runner.
 //! Ordinary DuckDB registration remains authoritative for local execution; these
@@ -37,15 +38,17 @@ struct DistributedExtensionCapability {
 	DUCKDB_API bool operator<(const DistributedExtensionCapability &other) const;
 };
 
-//! Stable capability identity embedded by a per-plan distributed provider.
+//! Stable capability identity embedded by a distributed execution contract.
 //! The runner resolves it against the database-local manifest before work is
-//! scheduled; the provider object continues to own the actual bind/execute hook.
+//! scheduled; the extension continues to own the actual execution hooks.
 struct DistributedExtensionCapabilityReference {
 	string extension_name;
 	idx_t extension_protocol_version = 0;
 	DistributedExtensionCapability capability;
 
 	DUCKDB_API string CanonicalIdentity() const;
+	DUCKDB_API bool operator==(const DistributedExtensionCapabilityReference &other) const;
+	DUCKDB_API bool operator!=(const DistributedExtensionCapabilityReference &other) const;
 };
 
 //! A manifest is registered once by an extension during Extension::Load.
@@ -78,6 +81,10 @@ public:
 	DUCKDB_API void RequireCapability(const string &extension_name, DistributedExtensionCapabilityKind kind,
 	                                  const string &capability_name, idx_t protocol_version) const;
 	DUCKDB_API void RequireCapability(const DistributedExtensionCapabilityReference &capability) const;
+	DUCKDB_API void RegisterWriteCallbacks(const DistributedExtensionCapabilityReference &capability,
+	                                       DistributedExtensionWriteCallbacks callbacks);
+	DUCKDB_API shared_ptr<const DistributedExtensionWriteCallbacks>
+	GetWriteCallbacks(const DistributedExtensionCapabilityReference &capability) const;
 	DUCKDB_API void ValidateExact(const vector<DistributedExtensionManifest> &expected) const;
 
 	DUCKDB_API static DistributedExtensionManager &Get(DatabaseInstance &db);
@@ -87,6 +94,7 @@ public:
 private:
 	mutable mutex lock;
 	map<string, DistributedExtensionManifest> extensions;
+	map<string, shared_ptr<const DistributedExtensionWriteCallbacks>> write_callbacks;
 };
 
 } // namespace duckdb

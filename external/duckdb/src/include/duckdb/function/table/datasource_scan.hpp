@@ -14,7 +14,6 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/built_in_functions.hpp"
-#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/function/table/arrow.hpp"
 
 namespace duckdb {
@@ -38,7 +37,7 @@ typedef void (*datasource_acquire_source_t)(const char *pickled_source, idx_t pi
                                             idx_t query_id_len);
 typedef void (*datasource_release_source_t)(const char *pickled_source, idx_t pickled_len);
 
-struct DataSourceScanBindData : public TableFunctionData, public ExtensionScanTaskProvider {
+struct DataSourceScanBindData : public TableFunctionData {
 	//! Pickled DataSourceTask objects, one per task
 	vector<string> pickled_tasks;
 	//! Serialized logical source package (for schema extraction on workers)
@@ -59,15 +58,6 @@ struct DataSourceScanBindData : public TableFunctionData, public ExtensionScanTa
 		result->arrow_table = arrow_table;
 		return std::move(result);
 	}
-
-	//! ExtensionScanTaskProvider: identify the registered distributed contract
-	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override;
-
-	//! ExtensionScanTaskProvider: encode each pickled task as an opaque path token
-	vector<OpenFileInfo> GetScanTasks() const override;
-
-	//! ExtensionScanTaskProvider: decode assigned opaque tokens back to tasks
-	void SetScanTasks(const vector<OpenFileInfo> &tasks) override;
 };
 
 struct DataSourceScanGlobalState : public GlobalTableFunctionState {

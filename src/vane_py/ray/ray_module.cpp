@@ -93,6 +93,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp>
 #include <duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
+#include <duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp>
 #include <duckdb/execution/operator/scan/physical_column_data_scan.hpp>
 #include <duckdb/execution/operator/scan/physical_dummy_scan.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
@@ -159,38 +160,49 @@ class PhysicalCoordinatorOnlyExtensionWriteForTest final : public PhysicalOperat
 public:
 	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1) {
+		info.capability.extension_name = "vane_test";
+		info.capability.extension_protocol_version = 1;
+		info.capability.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+		info.capability.capability.name = "coordinator_only_write";
+		info.capability.capability.protocol_version = 1;
+		info.write_name = "coordinator_only_test_write";
+		info.mode = DistributedWriteMode::FILE_ARTIFACT;
+		info.fragment_codec = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC;
+		info.fragment_codec_version = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION;
 	}
 
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
 		return this;
 	}
 
-	DistributedExtensionCapabilityReference GetDistributedExtensionCapability() const override {
-		DistributedExtensionCapabilityReference result;
-		result.extension_name = "vane_test";
-		result.extension_protocol_version = 1;
-		result.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-		result.capability.name = "coordinator_only_write";
-		result.capability.protocol_version = 1;
-		return result;
+	const DistributedExtensionWriteInfo &WriteInfo() const override {
+		return info;
 	}
 
-	string ExtensionWriteName() const override {
-		return "coordinator_only_test_write";
+	void ValidateDistributedWrite(ClientContext &,
+	                              const distributed::DistributedWriteOperationContext &) const override {
 	}
 
-	void ValidateExtensionWrite(ClientContext &) const override {
+	idx_t FinalizeDistributedWrite(ClientContext &, const distributed::DistributedWriteOperationContext &,
+	                               const vector<DistributedWriteTaskResult> &results) const override {
+		idx_t rows = 0;
+		for (const auto &result : results) {
+			rows += result.RowCount();
+		}
+		return rows;
 	}
 
-	idx_t FinalizeExtensionWrite(ClientContext &,
-	                             const vector<distributed::DistributedCopyFileInfo> &files) const override {
-		return files.size();
+	void AbortDistributedWrite(ClientContext &, const distributed::DistributedWriteOperationContext &,
+	                           const vector<DistributedWriteTaskResult> &) const override {
 	}
 
 protected:
 	void SerializeOperatorData(Serializer &) const override {
 		throw NotImplementedException("COORDINATOR_ONLY_EXTENSION_WRITE root cannot be serialized");
 	}
+
+private:
+	DistributedExtensionWriteInfo info;
 };
 
 class CountingResultCollectorForTest {
@@ -234,11 +246,15 @@ static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_conne
 	if (resolved_wrapper.con.ConnectionIsClosed()) {
 		throw std::runtime_error("resolved shuffle cleanup connection is closed");
 	}
-	ApplyEffectiveVaneSessionConfig(resolved_wrapper, effective_session_config);
 	ConnectionSnapshotApplyOptions snapshot_options;
 	snapshot_options.apply_session_config = false;
 	snapshot_options.apply_s3_credentials = apply_snapshot_s3_credentials;
 	snapshot_options.apply_secrets = apply_snapshot_s3_credentials && !snapshot_secrets_prepared;
+	ValidateConnectionSnapshotExtensions(resolved_connection, connection_snapshot,
+	                                     snapshot_options.enforce_extension_security);
+	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot, "httpfs")) {
+		ApplyEffectiveVaneSessionConfig(resolved_wrapper, effective_session_config);
+	}
 	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, snapshot_options);
 	return resolved_connection;
 }
@@ -1291,31 +1307,56 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
 	           py::object effective_session_config_obj, bool snapshot_secrets_prepared) {
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
+		        auto parse_node_id = [](py::handle key, const char *map_name) -> idx_t {
+			        if (!py::isinstance<py::str>(key)) {
+				        throw py::value_error(string(map_name) + " node_id must be a decimal string");
+			        }
+			        auto key_str = py::str(key).cast<string>();
+			        if (key_str.empty()) {
+				        throw py::value_error(string(map_name) + " node_id must not be empty");
+			        }
+			        if (!std::all_of(key_str.begin(), key_str.end(),
+			                         [](char value) { return value >= '0' && value <= '9'; })) {
+				        throw py::value_error(string(map_name) + " node_id must contain only decimal digits");
+			        }
+			        if (key_str.size() > 1 && key_str.front() == '0') {
+				        throw py::value_error(string(map_name) + " node_id must use canonical decimal form");
+			        }
+			        try {
+				        auto value = std::stoull(key_str);
+				        if (value >= std::numeric_limits<idx_t>::max()) {
+					        throw std::out_of_range("node_id exceeds the valid idx_t range");
+				        }
+				        return static_cast<idx_t>(value);
+			        } catch (const std::exception &ex) {
+				        throw py::value_error(string("Invalid ") + map_name + " node_id: " + ex.what());
+			        }
+		        };
 		        std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> scan_task_map;
 		        bool has_scan_task_map = false;
 		        if (!scan_task_obj.is_none()) {
 			        if (py::isinstance<py::dict>(scan_task_obj)) {
 				        auto dict_obj = scan_task_obj.cast<py::dict>();
 				        for (auto item : dict_obj) {
-					        auto key_str = py::str(item.first).cast<string>();
-					        if (key_str.empty()) {
-						        continue;
-					        }
+					        auto node_id = parse_node_id(item.first, "scan_task");
 					        // Values are raw bytes (py::bytes) from driver context
-					        string val_bytes;
 					        auto val_obj = py::reinterpret_borrow<py::object>(item.second);
-					        if (py::isinstance<py::bytes>(val_obj)) {
-						        val_bytes = val_obj.cast<string>();
-					        } else {
-						        val_bytes = py::str(val_obj).cast<string>();
+					        if (!py::isinstance<py::bytes>(val_obj)) {
+						        throw py::value_error("scan_task values must be raw bytes");
 					        }
+					        auto val_bytes = val_obj.cast<string>();
 					        if (val_bytes.empty()) {
-						        continue;
+						        throw py::value_error("scan_task descriptor must not be empty");
 					        }
 					        try {
-						        auto node_id = static_cast<idx_t>(std::stoll(key_str));
-						        scan_task_map.emplace(
-						            node_id, duckdb::distributed::ScanTaskDescriptor::DeserializeFromBytes(val_bytes));
+						        auto inserted =
+						            scan_task_map
+						                .emplace(node_id, duckdb::distributed::ScanTaskDescriptor::DeserializeFromBytes(
+						                                      val_bytes))
+						                .second;
+						        if (!inserted) {
+							        throw std::invalid_argument("duplicate normalized node_id");
+						        }
 					        } catch (const std::exception &ex) {
 						        throw py::value_error(string("Invalid scan task map entry: ") + ex.what());
 					        }
@@ -1334,25 +1375,26 @@ void register_ray_bindings(py::module_ &mod) {
 			        if (py::isinstance<py::dict>(exchange_source_task_obj)) {
 				        auto dict_obj = exchange_source_task_obj.cast<py::dict>();
 				        for (auto item : dict_obj) {
-					        auto key_str = py::str(item.first).cast<string>();
-					        if (key_str.empty()) {
-						        continue;
-					        }
-					        string val_bytes;
+					        auto node_id = parse_node_id(item.first, "exchange_source_task");
 					        auto val_obj = py::reinterpret_borrow<py::object>(item.second);
-					        if (py::isinstance<py::bytes>(val_obj)) {
-						        val_bytes = val_obj.cast<string>();
-					        } else {
-						        val_bytes = py::str(val_obj).cast<string>();
+					        if (!py::isinstance<py::bytes>(val_obj)) {
+						        throw py::value_error("exchange_source_task values must be raw bytes");
 					        }
+					        auto val_bytes = val_obj.cast<string>();
 					        if (val_bytes.empty()) {
-						        continue;
+						        throw py::value_error("exchange_source_task descriptor must not be empty");
 					        }
 					        try {
-						        auto node_id = static_cast<idx_t>(std::stoll(key_str));
-						        exchange_source_task_map.emplace(
-						            node_id,
-						            duckdb::distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(val_bytes));
+						        auto inserted =
+						            exchange_source_task_map
+						                .emplace(
+						                    node_id,
+						                    duckdb::distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(
+						                        val_bytes))
+						                .second;
+						        if (!inserted) {
+							        throw std::invalid_argument("duplicate normalized node_id");
+						        }
 					        } catch (const std::exception &ex) {
 						        throw py::value_error(string("Invalid exchange source task map entry: ") + ex.what());
 					        }
@@ -1374,18 +1416,16 @@ void register_ray_bindings(py::module_ &mod) {
 			        }
 			        auto dict_obj = fte_scan_source_queues_obj.cast<py::dict>();
 			        for (auto item : dict_obj) {
-				        auto key_str = py::str(item.first).cast<string>();
-				        if (key_str.empty()) {
-					        continue;
-				        }
+				        auto node_id = parse_node_id(item.first, "fte_scan_source_queues");
 				        auto value_obj = py::reinterpret_borrow<py::object>(item.second);
 				        if (!py::isinstance<duckdb::distributed::FteSplitQueue>(value_obj)) {
 					        throw py::value_error("fte_scan_source_queues values must be FteSplitQueue instances");
 				        }
 				        try {
-					        auto node_id = static_cast<idx_t>(std::stoll(key_str));
 					        auto queue = value_obj.cast<std::shared_ptr<duckdb::distributed::FteSplitQueue>>();
-					        fte_scan_source_queue_map.emplace(node_id, std::move(queue));
+					        if (!fte_scan_source_queue_map.emplace(node_id, std::move(queue)).second) {
+						        throw std::invalid_argument("duplicate normalized node_id");
+					        }
 				        } catch (const std::exception &ex) {
 					        throw py::value_error(string("Invalid FTE scan source queue map entry: ") + ex.what());
 				        }
@@ -1406,18 +1446,16 @@ void register_ray_bindings(py::module_ &mod) {
 			        }
 			        auto dict_obj = fte_exchange_source_queues_obj.cast<py::dict>();
 			        for (auto item : dict_obj) {
-				        auto key_str = py::str(item.first).cast<string>();
-				        if (key_str.empty()) {
-					        continue;
-				        }
+				        auto node_id = parse_node_id(item.first, "fte_exchange_source_queues");
 				        auto value_obj = py::reinterpret_borrow<py::object>(item.second);
 				        if (!py::isinstance<duckdb::distributed::FteSplitQueue>(value_obj)) {
 					        throw py::value_error("fte_exchange_source_queues values must be FteSplitQueue instances");
 				        }
 				        try {
-					        auto node_id = static_cast<idx_t>(std::stoll(key_str));
 					        auto queue = value_obj.cast<std::shared_ptr<duckdb::distributed::FteSplitQueue>>();
-					        fte_exchange_source_queue_map.emplace(node_id, std::move(queue));
+					        if (!fte_exchange_source_queue_map.emplace(node_id, std::move(queue)).second) {
+						        throw std::invalid_argument("duplicate normalized node_id");
+					        }
 				        } catch (const std::exception &ex) {
 					        throw py::value_error(string("Invalid FTE exchange source queue map entry: ") + ex.what());
 				        }
@@ -1544,11 +1582,18 @@ void register_ray_bindings(py::module_ &mod) {
 
 			        try {
 				        py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
-				        // Install refreshed session credentials as a baseline
-				        // before replaying explicit source-connection settings.
-				        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
-				                                        effective_session_config_obj);
 				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
+				        // Establish the exact extension set before refreshed AWS
+				        // settings can load httpfs into this DatabaseInstance. Replay the
+				        // full snapshot only after the environment/profile baseline so
+				        // explicit source-connection settings retain normal precedence.
+				        ValidateConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_, true);
+				        if (ConnectionSnapshotDeclaresStaticExtension(plan.connection_snapshot_, "httpfs")) {
+					        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
+					                                        effective_session_config_obj);
+				        }
+				        plan.ensure_connection_snapshot(exec_conn, apply_snapshot_session_config,
+				                                        !snapshot_secrets_prepared);
 				        // Handle deferred deserialization (from pickle round-trip)
 				        if (!plan.has_root() && !plan.serialized_root_.empty()) {
 					        // Materialize into a temporary wrapper so any physical-plan
@@ -1600,9 +1645,9 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("effective_session_config") = py::none(), py::arg("snapshot_secrets_prepared") = false,
 	        "Execute physical plan using DuckDB's native Executor");
 
-	// Merge multiple raw-bytes ScanTaskDescriptors into one.
-	// Each descriptor may contain multiple files; the merged result is a single
-	// ScanTaskDescriptor whose file list is the concatenation of all inputs.
+	// Merge multiple raw-bytes ScanTaskDescriptors into one. File descriptors
+	// concatenate files; extension descriptors concatenate opaque envelopes only
+	// when their capability and codec identities match exactly.
 	m.def(
 	    "merge_scan_task_descriptors",
 	    [](const py::list &bytes_list) -> py::bytes {
@@ -1610,29 +1655,26 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (py::len(bytes_list) == 0) {
 			    return py::bytes("");
 		    }
-		    if (py::len(bytes_list) == 1) {
-			    return bytes_list[0].cast<py::bytes>();
-		    }
 		    ScanTaskDescriptor merged;
+		    bool has_descriptor = false;
 		    for (auto item : bytes_list) {
 			    py::bytes b = item.cast<py::bytes>();
 			    string raw(b);
-			    if (raw.empty()) {
-				    continue;
-			    }
 			    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
-			    merged.estimated_cardinality =
-			        SaturatingAddIdx(merged.estimated_cardinality, desc.estimated_cardinality);
-			    merged.estimated_bytes = SaturatingAddIdx(merged.estimated_bytes, desc.estimated_bytes);
-			    merged.files.insert(merged.files.end(), std::make_move_iterator(desc.files.begin()),
-			                        std::make_move_iterator(desc.files.end()));
+			    if (!has_descriptor) {
+				    merged = std::move(desc);
+				    has_descriptor = true;
+			    } else {
+				    merged.Merge(std::move(desc));
+			    }
+		    }
+		    if (!has_descriptor) {
+			    return py::bytes("");
 		    }
 		    auto result = merged.SerializeToBytes();
 		    return py::bytes(result);
 	    },
-	    py::arg("bytes_list"),
-	    "Merge multiple raw-bytes ScanTaskDescriptors into a single descriptor "
-	    "by concatenating their file lists.");
+	    py::arg("bytes_list"), "Merge compatible raw-bytes ScanTaskDescriptors into a single descriptor.");
 
 	m.def(
 	    "scan_task_source_partition_id",
@@ -1763,6 +1805,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto cleanup = std::move(cleanup_res).value();
 		    py::dict out;
 		    out["skipped_committed"] = cleanup.skipped_committed;
+		    out["skipped_catalog_commit_pending"] = cleanup.skipped_catalog_commit_pending;
 		    out["data_run_dir_existed"] = cleanup.data_run_dir_existed;
 		    out["data_run_dir_removed"] = cleanup.data_run_dir_removed;
 		    out["commit_dir_existed"] = cleanup.commit_dir_existed;
@@ -1907,6 +1950,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["cleaned_runs"] = cleanup.cleaned_runs;
 		    out["committed_runs"] = cleanup.committed_runs;
 		    out["active_runs"] = cleanup.active_runs;
+		    out["catalog_commit_pending_runs"] = cleanup.catalog_commit_pending_runs;
 		    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
 		    out["errors"] = cleanup.errors;
 		    py::list cleaned_run_ids;

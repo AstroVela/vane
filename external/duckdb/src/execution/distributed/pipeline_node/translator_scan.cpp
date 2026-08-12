@@ -10,10 +10,10 @@
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/physical_plan.hpp"
-#include "duckdb/function/extension_scan_task_provider.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <typeinfo>
 
 namespace duckdb {
@@ -100,6 +100,11 @@ bool HasPositiveSizes(const std::vector<uint64_t> &sizes) {
 	return false;
 }
 
+uint64_t SaturatingAddExtensionScanEstimate(uint64_t left, uint64_t right) {
+	const auto maximum = std::numeric_limits<uint64_t>::max();
+	return right > maximum - left ? maximum : left + right;
+}
+
 size_t ResolveScanTaskTargetCount(size_t source_count, const DuckDBExecutionConfig &exec_cfg) {
 	if (source_count == 0) {
 		return 0;
@@ -158,28 +163,28 @@ std::vector<std::vector<idx_t>> GroupWeightedIndexesByTargetCount(const std::vec
 		return GroupIndexesByCount(item_count, target_groups);
 	}
 
-	uint64_t remaining_weight = 0;
+	long double remaining_weight = 0;
 	for (auto weight : weights) {
-		remaining_weight += weight;
+		remaining_weight += static_cast<long double>(weight);
 	}
 
 	size_t remaining_groups = target_groups;
 	std::vector<idx_t> current;
 	current.reserve(static_cast<size_t>(item_count + target_groups - 1) / target_groups);
-	uint64_t current_weight = 0;
+	long double current_weight = 0;
 
 	for (idx_t i = 0; i < item_count; ++i) {
 		const auto weight = weights[static_cast<size_t>(i)];
 		current.push_back(i);
-		current_weight += weight;
-		remaining_weight -= weight;
+		current_weight += static_cast<long double>(weight);
+		remaining_weight -= static_cast<long double>(weight);
 
 		if (remaining_groups <= 1) {
 			continue;
 		}
 
 		const auto remaining_items = static_cast<size_t>(item_count - i - 1);
-		const auto target_weight = (current_weight + remaining_weight + remaining_groups - 1) / remaining_groups;
+		const auto target_weight = (current_weight + remaining_weight) / static_cast<long double>(remaining_groups);
 		const bool reached_target = current_weight >= target_weight;
 		const bool must_split = remaining_items == (remaining_groups - 1);
 		if (reached_target || must_split) {
@@ -221,6 +226,126 @@ std::vector<uint64_t> GetFileSizesFromDB(const std::vector<OpenFileInfo> &files,
 	return sizes;
 }
 
+TableFunctionDistributedScanInput MakeDistributedScanInput(const PhysicalTableScan &scan) {
+	return TableFunctionDistributedScanInput(*scan.bind_data, scan.column_ids, scan.projection_ids,
+	                                         scan.table_filters.get(), scan.estimated_cardinality);
+}
+
+vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
+                                                  const shared_ptr<DatabaseInstance> &db) {
+	if (!scan.function.HasSerializationCallbacks()) {
+		throw SerializationException("Distributed table function '%s' requires complete serialize and deserialize "
+		                             "callbacks; worker rebind is not supported",
+		                             scan.function.name);
+	}
+	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
+	callbacks.Validate(scan.function.name);
+	if (!db) {
+		throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
+		                            "validation",
+		                            scan.function.name);
+	}
+	DistributedExtensionManager::Get(*db).RequireCapability(callbacks.capability);
+
+	auto planned_tasks = callbacks.plan(MakeDistributedScanInput(scan));
+	if (planned_tasks.empty()) {
+		ScanTaskDescriptor empty_task;
+		empty_task.kind = ScanTaskKind::EXTENSION;
+		empty_task.extension_capability = callbacks.capability;
+		empty_task.task_codec = callbacks.task_codec;
+		empty_task.task_codec_version = callbacks.task_codec_version;
+		empty_task.source_task_partition_id = 0;
+		empty_task.Validate();
+		return {std::move(empty_task)};
+	}
+	ScanTaskDescriptor validation_descriptor;
+	validation_descriptor.kind = ScanTaskKind::EXTENSION;
+	validation_descriptor.extension_capability = callbacks.capability;
+	validation_descriptor.task_codec = callbacks.task_codec;
+	validation_descriptor.task_codec_version = callbacks.task_codec_version;
+	validation_descriptor.extension_tasks = std::move(planned_tasks);
+	bool validation_complete_cardinality = true;
+	bool validation_complete_bytes = true;
+	for (const auto &task : validation_descriptor.extension_tasks) {
+		if (task.estimated_cardinality.IsValid()) {
+			validation_descriptor.estimated_cardinality = SaturatingAddExtensionScanEstimate(
+			    validation_descriptor.estimated_cardinality, task.estimated_cardinality.GetIndex());
+		} else {
+			validation_complete_cardinality = false;
+		}
+		if (task.estimated_bytes.IsValid()) {
+			validation_descriptor.estimated_bytes = SaturatingAddExtensionScanEstimate(
+			    validation_descriptor.estimated_bytes, task.estimated_bytes.GetIndex());
+		} else {
+			validation_complete_bytes = false;
+		}
+	}
+	if (!validation_complete_cardinality) {
+		validation_descriptor.estimated_cardinality = 0;
+	}
+	if (!validation_complete_bytes) {
+		validation_descriptor.estimated_bytes = 0;
+	}
+	validation_descriptor.Validate();
+	auto &elementary_tasks = validation_descriptor.extension_tasks;
+
+	auto target_count = ResolveScanTaskTargetCount(elementary_tasks.size(), exec_cfg);
+	std::vector<std::vector<idx_t>> groups;
+	vector<uint64_t> weights;
+	weights.reserve(elementary_tasks.size());
+	bool complete_weights = true;
+	for (const auto &task : elementary_tasks) {
+		if (!task.estimated_bytes.IsValid()) {
+			complete_weights = false;
+			break;
+		}
+		weights.push_back(task.estimated_bytes.GetIndex());
+	}
+	if (complete_weights && HasPositiveSizes(weights)) {
+		groups = GroupWeightedIndexesByTargetCount(weights, target_count);
+	} else {
+		groups = GroupIndexesByCount(elementary_tasks.size(), target_count);
+	}
+
+	vector<ScanTaskDescriptor> result;
+	result.reserve(groups.size());
+	for (auto &group : groups) {
+		ScanTaskDescriptor descriptor;
+		descriptor.kind = ScanTaskKind::EXTENSION;
+		descriptor.extension_capability = callbacks.capability;
+		descriptor.task_codec = callbacks.task_codec;
+		descriptor.task_codec_version = callbacks.task_codec_version;
+		descriptor.source_task_partition_id = result.size();
+		bool complete_cardinality = true;
+		bool complete_bytes = true;
+		for (auto task_index : group) {
+			auto &task = elementary_tasks[task_index];
+			if (task.estimated_cardinality.IsValid()) {
+				descriptor.estimated_cardinality = SaturatingAddExtensionScanEstimate(
+				    descriptor.estimated_cardinality, task.estimated_cardinality.GetIndex());
+			} else {
+				complete_cardinality = false;
+			}
+			if (task.estimated_bytes.IsValid()) {
+				descriptor.estimated_bytes =
+				    SaturatingAddExtensionScanEstimate(descriptor.estimated_bytes, task.estimated_bytes.GetIndex());
+			} else {
+				complete_bytes = false;
+			}
+			descriptor.extension_tasks.push_back(std::move(task));
+		}
+		if (!complete_cardinality) {
+			descriptor.estimated_cardinality = 0;
+		}
+		if (!complete_bytes) {
+			descriptor.estimated_bytes = 0;
+		}
+		descriptor.Validate();
+		result.push_back(std::move(descriptor));
+	}
+	return result;
+}
+
 } // namespace
 
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
@@ -237,17 +362,38 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 			                              scan.function.name, error.RawMessage());
 		}
 	}
+	if (scan.function.HasDistributedScanCallbacks()) {
+		if (!scan.bind_data || !bind_data) {
+			throw SerializationException("Distributed table function '%s' requires copyable bind data",
+			                             scan.function.name);
+		}
+		if (!scan.function.HasSerializationCallbacks()) {
+			throw SerializationException("Distributed table function '%s' requires complete serialize and deserialize "
+			                             "callbacks; worker rebind is not supported",
+			                             scan.function.name);
+		}
+		const auto &callbacks = scan.function.GetDistributedScanCallbacks();
+		callbacks.Validate(scan.function.name);
+		callbacks.prepare_bind(MakeDistributedScanInput(scan), *bind_data);
+	} else {
+		auto *multi_bind = dynamic_cast<MultiFileBindData *>(bind_data.get());
+		if (!multi_bind) {
+			throw SerializationException("Distributed table function '%s' requires MultiFileBindData or explicit "
+			                             "distributed scan callbacks",
+			                             scan.function.name);
+		}
+		// The coordinator file list is never a worker fallback. Every worker must
+		// receive an explicit static descriptor or FTE queue, including an empty
+		// descriptor for a legal zero-file scan.
+		multi_bind->file_list = make_shared_ptr<SimpleMultiFileList>(vector<OpenFileInfo> {});
+	}
 	auto table_filters = scan.table_filters ? scan.table_filters->Copy() : nullptr;
 	auto extra_info = CopyExtraOperatorInfo(scan.extra_info);
 
-	auto &scan_operator = plan->Make<PhysicalTableScan>(
-	    scan.GetTypes(), scan.function, std::move(bind_data), scan.returned_types, scan.column_ids, scan.projection_ids,
-	    scan.names, std::move(table_filters), scan.estimated_cardinality, std::move(extra_info), scan.parameters,
-	    scan.virtual_columns);
-	auto &scan_op = scan_operator.Cast<PhysicalTableScan>();
-	scan_op.named_parameters = scan.named_parameters;
-	scan_op.input_table_types = scan.input_table_types;
-	scan_op.input_table_names = scan.input_table_names;
+	auto &scan_op = plan->Make<PhysicalTableScan>(scan.GetTypes(), scan.function, std::move(bind_data),
+	                                              scan.returned_types, scan.column_ids, scan.projection_ids, scan.names,
+	                                              std::move(table_filters), scan.estimated_cardinality,
+	                                              std::move(extra_info), scan.parameters, scan.virtual_columns);
 	plan->SetRoot(scan_op);
 	return plan;
 }
@@ -261,27 +407,25 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 		                              "missing",
 		                              scan.function.name);
 	}
+	if (scan.function.HasDistributedScanCallbacks()) {
+		return {MakeExtensionScanTasks(scan, exec_cfg, db), false};
+	}
 
 	vector<OpenFileInfo> files;
-	auto provider = TryGetExtensionScanTaskProvider(*scan.bind_data);
 	auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get());
-	if (provider) {
-		if (!db) {
-			throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
-			                            "validation",
-			                            scan.function.name);
-		}
-		DistributedExtensionManager::Get(*db).RequireCapability(provider->GetDistributedExtensionCapability());
-		files = provider->GetScanTasks();
-	} else if (multi_bind && multi_bind->file_list) {
+	if (multi_bind && multi_bind->file_list) {
 		files = multi_bind->file_list->GetAllFiles();
 	} else {
-		throw BinderException("MakeTableScanTasks: bind_data for '%s' is not MultiFileBindData or "
-		                      "ExtensionScanTaskProvider (type: %s)",
+		throw BinderException("MakeTableScanTasks: bind_data for '%s' is not MultiFileBindData and the table function "
+		                      "has no distributed scan callbacks (type: %s)",
 		                      scan.function.name, typeid(*scan.bind_data).name());
 	}
 	if (files.empty()) {
-		return {std::move(tasks), true};
+		ScanTaskDescriptor empty_task;
+		empty_task.source_task_partition_id = 0;
+		empty_task.Validate();
+		tasks.push_back(std::move(empty_task));
+		return {std::move(tasks), false};
 	}
 	const idx_t estimated_scan_rows =
 	    scan.estimated_cardinality == DConstants::INVALID_INDEX ? 0 : scan.estimated_cardinality;
@@ -294,20 +438,6 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 			return;
 		}
 		file_sizes_loaded = true;
-		if (provider) {
-			file_sizes_complete = true;
-			file_sizes.reserve(files.size());
-			for (const auto &file : files) {
-				auto estimate = provider->GetScanTaskEstimatedBytes(file);
-				if (!estimate.IsValid()) {
-					file_sizes_complete = false;
-				}
-				auto size = estimate.IsValid() ? static_cast<uint64_t>(estimate.GetIndex()) : 0;
-				file_sizes.push_back(size);
-				total_file_bytes += size;
-			}
-			return;
-		}
 		if (!db) {
 			return;
 		}
@@ -319,21 +449,6 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 		}
 	};
 	auto estimate_rows_for_task = [&](const auto &task_files, uint64_t task_bytes) -> idx_t {
-		if (provider) {
-			idx_t provider_rows = 0;
-			bool complete_provider_estimate = true;
-			for (const auto &file : task_files) {
-				auto estimate = provider->GetScanTaskEstimatedCardinality(file);
-				if (!estimate.IsValid()) {
-					complete_provider_estimate = false;
-					break;
-				}
-				provider_rows += estimate.GetIndex();
-			}
-			if (complete_provider_estimate) {
-				return provider_rows;
-			}
-		}
 		if (estimated_scan_rows == 0) {
 			return 0;
 		}
@@ -350,17 +465,6 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 		return 0;
 	};
 	auto estimate_bytes_for_group = [&](const std::vector<OpenFileInfo> &group) -> uint64_t {
-		if (provider) {
-			uint64_t bytes = 0;
-			for (const auto &group_file : group) {
-				auto estimate = provider->GetScanTaskEstimatedBytes(group_file);
-				if (!estimate.IsValid()) {
-					return 0;
-				}
-				bytes += static_cast<uint64_t>(estimate.GetIndex());
-			}
-			return bytes;
-		}
 		ensure_file_sizes();
 		if (file_sizes.size() != files.size()) {
 			return 0;
@@ -391,7 +495,7 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 	const bool use_size_thresholds = exec_cfg.scan_task_size_grouping_enabled() &&
 	                                 (exec_cfg.scan_task_min_bytes() > 0 || exec_cfg.scan_task_max_bytes() > 0);
 	std::vector<std::vector<OpenFileInfo>> groups;
-	if (use_size_thresholds && (provider || db)) {
+	if (use_size_thresholds && db) {
 		ensure_file_sizes();
 		auto sizes = file_sizes;
 		if (!sizes.empty() && file_sizes_complete && HasPositiveSizes(sizes)) {

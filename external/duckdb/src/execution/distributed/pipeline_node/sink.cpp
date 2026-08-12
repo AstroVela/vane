@@ -78,7 +78,10 @@ SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionConte
 	auto staging_root_base = staging_root_base_;
 	auto staging_run_id = staging_run_id_;
 	auto *client_context = plan_context.client_context();
-	auto fragment_plan_cache = std::make_shared<std::unordered_map<const PhysicalPlan *, DuckPhysicalPlanRef>>();
+	// Hold the source plan strongly for as long as its derived COPY template is
+	// cached. A raw-address key can dangle after a cloned source plan is released
+	// and then alias an unrelated plan that reuses the same address.
+	auto fragment_plan_cache = std::make_shared<std::unordered_map<DuckPhysicalPlanRef, DuckPhysicalPlanRef>>();
 	auto fragment_plan_cache_lock = std::make_shared<std::mutex>();
 
 	if (!client_context) {
@@ -105,7 +108,7 @@ SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionConte
 		DuckPhysicalPlanRef fragment_plan;
 		{
 			std::lock_guard<std::mutex> guard(*fragment_plan_cache_lock);
-			auto it = fragment_plan_cache->find(base_plan.get());
+			auto it = fragment_plan_cache->find(base_plan);
 			if (it != fragment_plan_cache->end()) {
 				fragment_plan = it->second;
 			}
@@ -113,10 +116,10 @@ SubmittableTaskStream<WorkerTask> CopySinkNode::produce_tasks(PlanExecutionConte
 		if (!fragment_plan) {
 			auto local_spec = self->spec_.Clone();
 			auto plan_template_path = BuildCopyPlanTemplatePath(local_spec, node_id_val);
-			auto cache_key = base_plan.get();
+			const bool can_reuse_base_plan = base_plan.use_count() <= 2;
+			auto cache_key = base_plan;
 			DuckPhysicalPlanRef working_plan;
-			auto rc = base_plan.use_count();
-			if (rc <= 2) {
+			if (can_reuse_base_plan) {
 				working_plan = std::move(base_plan);
 			} else {
 				working_plan = ClonePhysicalPlanOrThrow(base_plan, "CopySinkNode", client_context);

@@ -532,7 +532,7 @@ static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, cons
 			// source connection, so it gets an isolated planning DatabaseInstance.
 			return py::cast(ExtractPyConnectionWrapper(source_conn_obj).Cursor());
 		}
-		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj);
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
 	}
 	if (bootstrap_obj.is_none() || IsDefaultBootstrapSnapshot(bootstrap_obj) ||
 	    ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
@@ -1352,6 +1352,45 @@ struct ConnectionSnapshotApplyOptions {
 	bool apply_secrets = false;
 	bool apply_attached_databases = false;
 };
+
+static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
+                                    const ConnectionSnapshotApplyOptions &options);
+
+static bool ConnectionSnapshotDeclaresStaticExtension(const py::object &snapshot_obj, const string &extension_name) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		return false;
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	auto extensions_key = py::str("extensions");
+	if (!snapshot.contains(extensions_key) || !py::isinstance<py::list>(snapshot[extensions_key])) {
+		return false;
+	}
+	auto expected_name = StringUtil::Lower(extension_name);
+	for (auto item : snapshot[extensions_key].cast<py::list>()) {
+		if (!py::isinstance<py::dict>(item)) {
+			continue;
+		}
+		auto extension = py::reinterpret_borrow<py::dict>(item);
+		auto name_key = py::str("name");
+		if (extension.contains(name_key) && py::isinstance<py::str>(extension[name_key]) &&
+		    StringUtil::Lower(extension[name_key].cast<string>()) == expected_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void ValidateConnectionSnapshotExtensions(py::object conn_obj, const py::object &snapshot_obj,
+                                                 bool enforce_extension_security) {
+	ConnectionSnapshotApplyOptions validation_options;
+	validation_options.apply_session_config = false;
+	validation_options.enforce_extension_security = enforce_extension_security;
+	validation_options.apply_s3_credentials = false;
+	validation_options.apply_settings = false;
+	validation_options.apply_secrets = false;
+	validation_options.apply_attached_databases = false;
+	ApplyConnectionSnapshot(conn_obj, snapshot_obj, validation_options);
+}
 
 static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
                                     const ConnectionSnapshotApplyOptions &options = {}) {

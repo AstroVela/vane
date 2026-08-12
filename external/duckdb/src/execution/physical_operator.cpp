@@ -45,6 +45,7 @@
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
@@ -70,8 +71,6 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serialization_data.hpp"
 #include "duckdb/execution/dynamic_filter_serialization.hpp"
-#include "duckdb/function/extension_scan_task_provider.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 namespace duckdb {
 
@@ -824,6 +823,20 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalDistributedReservoirSample>(physical_plan, std::move(types), std::move(options), stage,
 		                                                     task_index, estimated_cardinality);
 	}
+	case PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE: {
+		DistributedExtensionWriteInfo info;
+		deserializer.ReadObject(103, "distributed_write_info", [&](Deserializer &object) {
+			info = DistributedExtensionWriteInfo::Deserialize(object);
+		});
+		auto operation_id = deserializer.ReadProperty<string>(104, "operation_id");
+		auto task_attempt_id = deserializer.ReadProperty<string>(105, "task_attempt_id");
+		auto result =
+		    make_uniq<PhysicalDistributedExtensionWrite>(physical_plan, std::move(info), estimated_cardinality);
+		if (!operation_id.empty() || !task_attempt_id.empty()) {
+			throw SerializationException("distributed extension write plan must not transport a runtime task context");
+		}
+		return std::move(result);
+	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
 		return make_uniq<PhysicalStreamingSample>(physical_plan, std::move(types), std::move(options),
@@ -994,6 +1007,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		unique_ptr<FunctionData> bind_data;
 		if (has_serialize) {
 			bind_data = FunctionSerializer::FunctionDeserialize(deserializer, function);
+		} else {
+			throw SerializationException(
+			    "PhysicalTableScan deserialization requires table function serialization for %s", function.name);
 		}
 
 		auto returned_types = deserializer.ReadProperty<vector<LogicalType>>(200, "returned_types");
@@ -1015,48 +1031,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto virtual_columns = deserializer.ReadPropertyWithExplicitDefault<virtual_column_map_t>(
 		    208, "virtual_columns", virtual_column_map_t());
 		auto dynamic_filters_id = deserializer.ReadPropertyWithDefault<optional_idx>(209, "dynamic_filters_id");
-		named_parameter_map_t named_parameters;
-		vector<LogicalType> input_table_types;
-		vector<string> input_table_names;
-		if (!has_serialize) {
-			named_parameters = deserializer.ReadProperty<named_parameter_map_t>(210, "named_parameters");
-			input_table_types = deserializer.ReadProperty<vector<LogicalType>>(211, "input_table_types");
-			input_table_names = deserializer.ReadProperty<vector<string>>(212, "input_table_names");
-
-			if (!function.bind) {
-				throw SerializationException("PhysicalTableScan table function '%s' has neither bind nor complete "
-				                             "serialization callbacks",
-				                             function.name);
-			}
-			auto &context = deserializer.Get<ClientContext &>();
-			TableFunctionRef empty_ref;
-			TableFunctionBindInput input(parameters, named_parameters, input_table_types, input_table_names,
-			                             function.function_info.get(), nullptr, function, empty_ref);
-			vector<LogicalType> rebound_types;
-			vector<string> rebound_names;
-			bind_data = function.bind(context, input, rebound_types, rebound_names);
-			if (rebound_types != returned_types || rebound_names != names) {
-				throw SerializationException(
-				    "PhysicalTableScan rebind schema mismatch for table function '%s': expected %d columns, got %d",
-				    function.name, returned_types.size(), rebound_types.size());
-			}
-		}
-		auto requires_extension_scan_task_provider =
-		    deserializer.ReadProperty<bool>(213, "requires_extension_scan_task_provider");
-		if (requires_extension_scan_task_provider && (!bind_data || !TryGetExtensionScanTaskProvider(*bind_data))) {
-			throw SerializationException(
-			    "PhysicalTableScan deserialization for table function '%s' did not produce the required "
-			    "ExtensionScanTaskProvider",
-			    function.name);
-		}
 
 		auto scan = make_uniq<PhysicalTableScan>(
 		    physical_plan, std::move(types), std::move(function), std::move(bind_data), std::move(returned_types),
 		    std::move(column_ids), std::move(projection_ids), std::move(names), std::move(table_filters),
 		    estimated_cardinality, std::move(extra_info), std::move(parameters), std::move(virtual_columns));
-		scan->named_parameters = std::move(named_parameters);
-		scan->input_table_types = std::move(input_table_types);
-		scan->input_table_names = std::move(input_table_names);
 		if (dynamic_filters_id.IsValid()) {
 			auto &state = deserializer.GetSerializationData().GetCustom<DynamicTableFilterSerializationState>();
 			scan->dynamic_filters = state.GetFilters(dynamic_filters_id);

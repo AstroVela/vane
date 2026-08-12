@@ -557,6 +557,154 @@ def test_fte_split_queue_basic_states():
     assert queue.try_get_next() == {"state": "FINISHED"}
 
 
+def test_merge_scan_task_descriptors_rejects_empty_payload():
+    assert vane.ray_cxx.merge_scan_task_descriptors([]) == b""
+    with pytest.raises(Exception, match="empty scan task descriptor"):
+        vane.ray_cxx.merge_scan_task_descriptors([b""])
+
+
+@pytest.mark.parametrize("argument", ["scan_task", "exchange_source_task"])
+def test_execute_native_rejects_empty_distributed_task_descriptor(argument):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="descriptor must not be empty"):
+            runner.execute_native(cursor, plan, **{argument: {"1": b""}})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize("argument", ["scan_task", "exchange_source_task"])
+def test_execute_native_rejects_nonbinary_distributed_task_descriptor(argument):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="values must be raw bytes"):
+            runner.execute_native(cursor, plan, **{argument: {"1": "not-bytes"}})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize("node_id", ["", "-1", "1suffix", "01", 1])
+def test_execute_native_rejects_noncanonical_distributed_task_node_id(node_id):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match="node_id"):
+            runner.execute_native(cursor, plan, scan_task={node_id: b"not-reached"})
+    finally:
+        cursor.close()
+        con.close()
+
+
+@pytest.mark.parametrize(
+    ("runtime_context", "message"),
+    [
+        ("not-a-dict", "runtime_context must be a dict"),
+        ({"task_id": 1}, "runtime_context task_id must be a string"),
+        ({"task_id": ""}, "runtime_context task_id must not be empty"),
+    ],
+)
+def test_execute_native_rejects_invalid_runtime_task_identity(runtime_context, message):
+    con = vane.connect()
+    cursor = con.cursor()
+    plan = _make_test_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+
+    try:
+        with pytest.raises(ValueError, match=message):
+            runner.execute_native(cursor, plan, runtime_context=runtime_context)
+    finally:
+        cursor.close()
+        con.close()
+
+
+def test_execute_native_rejects_static_and_fte_scan_assignment_for_same_node(tmp_path):
+    source = tmp_path / "overlapping_scan.parquet"
+    con = vane.connect()
+    con.execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql(f"SELECT * FROM parquet_scan('{source}')"),
+        "overlapping-scan-assignment",
+    ).to_physical_plan(con)
+    descriptor_map = plan.scan_task_descriptor_map()
+    assert len(descriptor_map) == 1
+    node_id, descriptors = next(iter(descriptor_map.items()))
+    assert len(descriptors) == 1
+
+    try:
+        with pytest.raises(ValueError, match="both a static task descriptor and an FTE split queue"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+                scan_task={str(node_id): bytes(descriptors[0])},
+                fte_scan_source_queues={str(node_id): vane.ray_cxx.FteSplitQueue()},
+            )
+    finally:
+        con.close()
+
+
+def test_execute_native_rejects_missing_distributed_scan_assignment(tmp_path):
+    source = tmp_path / "missing_scan_assignment.parquet"
+    con = vane.connect()
+    con.execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql(f"SELECT * FROM parquet_scan('{source}')"),
+        "missing-scan-assignment",
+    ).to_physical_plan(con)
+    assert plan.scan_task_descriptor_map()
+
+    try:
+        with pytest.raises(ValueError, match="no explicit worker task assignment"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+            )
+    finally:
+        con.close()
+
+
+def test_execute_native_rejects_static_and_fte_exchange_assignment_for_same_node():
+    con = vane.connect()
+    plan = _make_test_physical_plan(con)
+    descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
+        [
+            {
+                "partition_id": 0,
+                "attempt_id": 0,
+                "node_id": "node-a",
+                "flight_port": 5010,
+                "files": [{"path": "shuffle-a", "rows": 1, "file_size": 1}],
+            }
+        ],
+        [0],
+        1,
+        1,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="both a static task descriptor and an FTE split queue"):
+            vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+                con.cursor(),
+                plan,
+                exchange_source_task={"7": descriptor},
+                fte_exchange_source_queues={"7": vane.ray_cxx.FteSplitQueue()},
+            )
+    finally:
+        con.close()
+
+
 def test_fte_split_queue_tracks_exchange_source_progress_stats():
     queue = vane.ray_cxx.FteSplitQueue()
     raw = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
@@ -614,9 +762,11 @@ def test_fte_split_queue_tracks_exchange_source_width_metadata():
     assert queue.exchange_source_task_count() == 8
 
 
-def test_exchange_source_task_partition_indices_accepts_empty_descriptor():
-    assert vane.ray_cxx.exchange_source_task_partition_indices(b"") == []
-    assert vane.ray_cxx.split_exchange_source_task_by_partition(b"") == []
+def test_exchange_source_task_helpers_reject_empty_descriptor():
+    with pytest.raises(vane.SerializationException, match="empty exchange source task descriptor"):
+        vane.ray_cxx.exchange_source_task_partition_indices(b"")
+    with pytest.raises(vane.SerializationException, match="empty exchange source task descriptor"):
+        vane.ray_cxx.split_exchange_source_task_by_partition(b"")
 
 
 def test_exchange_source_task_descriptor_preserves_attempt_ids():
@@ -2300,12 +2450,25 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
         committed=True,
     )
 
+    catalog_pending_run_id = "run-lifecycle-catalog-pending"
+    catalog_pending, catalog_pending_file = _register_direct_write_lifecycle_run(
+        base,
+        catalog_pending_run_id,
+        created_epoch_ms=1_000,
+        worker_dir="w_catalog_pending",
+    )
+    catalog_pending_lifecycle = Path(catalog_pending["copy_output_lifecycle_path"])
+    catalog_pending_lifecycle.write_text(
+        catalog_pending_lifecycle.read_text().replace("state=writing", "state=catalog_commit_pending")
+    )
+
     result = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(str(base), min_age_ms=5_000, now_epoch_ms=10_000)
 
-    assert result["scanned_runs"] == 3
+    assert result["scanned_runs"] == 4
     assert result["cleaned_runs"] == 1
     assert result["committed_runs"] == 1
     assert result["active_runs"] == 1
+    assert result["catalog_commit_pending_runs"] == 1
     assert result["skipped_unregistered_runs"] == 0
     assert result["errors"] == 0
     assert result["cleaned_run_ids"] == [stale_run_id]
@@ -2315,6 +2478,8 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
     assert Path(active["copy_output_lifecycle_path"]).exists()
     assert committed_file.exists()
     assert Path(committed["copy_output_lifecycle_path"]).exists()
+    assert catalog_pending_file.exists()
+    assert catalog_pending_lifecycle.exists()
 
 
 def test_copy_direct_write_lifecycle_uses_trimmed_base_path(tmp_path):
@@ -2404,8 +2569,9 @@ def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
         data_path = f"{run_dir}/w_failed/part.parquet"
         lifecycle = textwrap.dedent(
             f"""\
-            version=2
+            version=3
             mode=direct_write
+            state=writing
             base_path={base_path}
             worker_base_path={base_path}
             run_id={run_id}
