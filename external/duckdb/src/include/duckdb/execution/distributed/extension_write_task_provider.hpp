@@ -23,15 +23,26 @@ struct DistributedWriteOperationContext {
 	DUCKDB_API void Validate() const;
 };
 
+//! Dynamic coordinator state supplied by one physical extension root. Static
+//! mode, protocol, and codec information is resolved from the registered write
+//! operator contract and cannot be overridden by a plan.
+struct DistributedExtensionWritePlan {
+	string extension_name;
+	string operator_name;
+	string worker_bind_data;
+
+	DUCKDB_API void Validate() const;
+};
+
 //! Coordinator-side half of the explicit distributed extension write contract.
 //! The ordinary extension operator remains authoritative for native DuckDB
-//! execution. Vane replaces it only for Ray execution according to WriteInfo().
+//! execution. Vane replaces it only for Ray execution according to WritePlan().
 class ExtensionWriteTaskProvider {
 public:
 	virtual ~ExtensionWriteTaskProvider() = default;
 
-	//! Immutable capability, codec, mode, and worker bind envelope.
-	virtual const DistributedExtensionWriteInfo &WriteInfo() const = 0;
+	//! Immutable extension/operator key and extension-owned worker bind envelope.
+	virtual const DistributedExtensionWritePlan &WritePlan() const = 0;
 
 	//! Validate coordinator/catalog state before any worker callback can run.
 	//! The stable operation identity may name an earlier attempt, so callback
@@ -71,6 +82,11 @@ struct DistributedExtensionWriteResult {
 //! Fixed file adapter used by FILE_ARTIFACT writes.
 static constexpr const char *DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC = "duckdb.written-file-statistics";
 static constexpr idx_t DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION = 1;
+
+//! Resolve the complete immutable worker protocol from the database-local
+//! concrete write registration and the physical operator's dynamic plan.
+DUCKDB_API DistributedExtensionWriteInfo
+ResolveDistributedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWritePlan &plan);
 
 DUCKDB_API vector<DistributedWriteTaskResult>
 EncodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info,

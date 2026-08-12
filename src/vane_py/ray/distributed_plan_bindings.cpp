@@ -3142,7 +3142,7 @@ struct PyPhysicalPlanWrapperRunner {
 			out["files"] = files;
 			AppendDistributedCopyResultMetadata(out, result);
 			out["extension_write"] = py::bool_(extension_write);
-			out["extension_write_name"] = py::str(extension_write ? extension_result.info.write_name : string());
+			out["extension_write_name"] = py::str(extension_write ? extension_result.info.Name() : string());
 			out["extension_catalog_committed"] = py::bool_(extension_write && extension_result.catalog_committed);
 			out["extension_write_mode"] =
 			    py::str(!extension_write                                                    ? string()

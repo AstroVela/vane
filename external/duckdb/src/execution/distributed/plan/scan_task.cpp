@@ -310,12 +310,10 @@ static bool ApplyExtensionScanTasks(PhysicalTableScan &scan, const ScanTaskDescr
 		                         ", worker=" + capability.CanonicalIdentity());
 		return false;
 	}
-	if (descriptor.task_codec != callbacks.task_codec ||
-	    descriptor.task_codec_version != callbacks.task_codec_version) {
+	if (descriptor.task_codec != callbacks.task_codec) {
 		SetApplyError(error, "distributed scan task codec mismatch for table function '" + scan.function.name +
-		                         "': task=" + descriptor.task_codec + "@" +
-		                         std::to_string(descriptor.task_codec_version) + ", worker=" + callbacks.task_codec +
-		                         "@" + std::to_string(callbacks.task_codec_version));
+		                         "': task=" + descriptor.task_codec.CanonicalIdentity() +
+		                         ", worker=" + callbacks.task_codec.CanonicalIdentity());
 		return false;
 	}
 	callbacks.apply_tasks(*scan.bind_data, descriptor.extension_tasks);
@@ -422,8 +420,8 @@ static void ComputeExtensionTaskEstimates(const vector<DistributedScanTask> &tas
 void ScanTaskDescriptor::Validate() const {
 	switch (kind) {
 	case ScanTaskKind::FILES:
-		if (!extension_tasks.empty() || !extension_capability.extension_name.empty() || !task_codec.empty() ||
-		    task_codec_version != 0) {
+		if (!extension_tasks.empty() || !extension_capability.extension_name.empty() || !task_codec.name.empty() ||
+		    task_codec.version != 0) {
 			throw SerializationException("file scan task descriptor contains extension task state");
 		}
 		break;
@@ -431,40 +429,17 @@ void ScanTaskDescriptor::Validate() const {
 		if (!files.empty()) {
 			throw SerializationException("extension scan task descriptor contains OpenFileInfo entries");
 		}
-		if (task_codec.empty() || task_codec_version == 0) {
-			throw SerializationException("extension scan task descriptor has an invalid task codec identity");
-		}
+		task_codec.Validate("Extension scan task descriptor");
+		extension_capability.Validate();
 		if (extension_capability.capability.kind != DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
 			throw SerializationException("extension scan task descriptor capability is not a table function");
 		}
-		DistributedExtensionManifest manifest;
-		manifest.extension_name = extension_capability.extension_name;
-		manifest.protocol_version = extension_capability.extension_protocol_version;
-		manifest.capabilities.push_back(extension_capability.capability);
-		DistributedExtensionManager::ValidateManifest(manifest);
 
 		set<string> task_ids;
 		for (const auto &task : extension_tasks) {
-			if (task.task_id.empty()) {
-				throw SerializationException("extension scan task has an empty task_id");
-			}
+			task.Validate();
 			if (!task_ids.insert(task.task_id).second) {
 				throw SerializationException("extension scan task_id '%s' appears more than once", task.task_id);
-			}
-			set<string> artifact_names;
-			for (const auto &artifact : task.artifacts) {
-				if (artifact.name.empty()) {
-					throw SerializationException("extension scan task '%s' has an artifact with an empty name",
-					                             task.task_id);
-				}
-				if (!artifact_names.insert(artifact.name).second) {
-					throw SerializationException("extension scan task '%s' has duplicate artifact '%s'", task.task_id,
-					                             artifact.name);
-				}
-				if (artifact.codec.empty() || artifact.codec_version == 0) {
-					throw SerializationException("extension scan task '%s' artifact '%s' has an invalid codec identity",
-					                             task.task_id, artifact.name);
-				}
 			}
 		}
 		idx_t expected_cardinality;
@@ -487,8 +462,7 @@ void ScanTaskDescriptor::Merge(ScanTaskDescriptor other) {
 		throw InvalidInputException("cannot merge file and extension scan task descriptors");
 	}
 	if (kind == ScanTaskKind::EXTENSION &&
-	    (extension_capability != other.extension_capability || task_codec != other.task_codec ||
-	     task_codec_version != other.task_codec_version)) {
+	    (extension_capability != other.extension_capability || task_codec != other.task_codec)) {
 		throw InvalidInputException("cannot merge extension scan task descriptors with different protocol identities");
 	}
 	if (kind == ScanTaskKind::EXTENSION) {
@@ -532,32 +506,11 @@ void ScanTaskDescriptor::Serialize(Serializer &serializer) const {
 			});
 		});
 	} else {
-		serializer.WriteObject(10, "extension_capability", [&](Serializer &obj) {
-			obj.WriteProperty(1, "extension_name", extension_capability.extension_name);
-			obj.WriteProperty(2, "extension_protocol_version", extension_capability.extension_protocol_version);
-			obj.WriteProperty(3, "capability_kind", static_cast<uint8_t>(extension_capability.capability.kind));
-			obj.WriteProperty(4, "capability_name", extension_capability.capability.name);
-			obj.WriteProperty(5, "capability_protocol_version", extension_capability.capability.protocol_version);
-		});
-		serializer.WriteProperty(11, "task_codec", task_codec);
-		serializer.WriteProperty(12, "task_codec_version", task_codec_version);
-		serializer.WriteList(13, "extension_tasks", extension_tasks.size(), [&](Serializer::List &list, idx_t i) {
-			const auto &task = extension_tasks[i];
-			list.WriteObject([&](Serializer &obj) {
-				obj.WriteProperty(1, "task_id", task.task_id);
-				obj.WriteProperty(2, "payload", task.payload);
-				obj.WriteProperty(3, "estimated_cardinality", task.estimated_cardinality);
-				obj.WriteProperty(4, "estimated_bytes", task.estimated_bytes);
-				obj.WriteList(5, "artifacts", task.artifacts.size(), [&](Serializer::List &artifacts, idx_t j) {
-					const auto &artifact = task.artifacts[j];
-					artifacts.WriteObject([&](Serializer &artifact_obj) {
-						artifact_obj.WriteProperty(1, "name", artifact.name);
-						artifact_obj.WriteProperty(2, "codec", artifact.codec);
-						artifact_obj.WriteProperty(3, "codec_version", artifact.codec_version);
-						artifact_obj.WriteProperty(4, "data", artifact.data);
-					});
-				});
-			});
+		serializer.WriteObject(10, "extension_capability",
+		                       [&](Serializer &object) { extension_capability.Serialize(object); });
+		serializer.WriteObject(11, "task_codec", [&](Serializer &object) { task_codec.Serialize(object); });
+		serializer.WriteList(12, "extension_tasks", extension_tasks.size(), [&](Serializer::List &list, idx_t i) {
+			list.WriteObject([&](Serializer &object) { extension_tasks[i].Serialize(object); });
 		});
 	}
 	serializer.WriteProperty(20, "estimated_cardinality", estimated_cardinality);
@@ -583,37 +536,16 @@ ScanTaskDescriptor ScanTaskDescriptor::Deserialize(Deserializer &deserializer) {
 			});
 		});
 	} else if (desc.kind == ScanTaskKind::EXTENSION) {
-		deserializer.ReadObject(10, "extension_capability", [&](Deserializer &obj) {
-			desc.extension_capability.extension_name = obj.ReadProperty<string>(1, "extension_name");
-			desc.extension_capability.extension_protocol_version =
-			    obj.ReadProperty<idx_t>(2, "extension_protocol_version");
-			desc.extension_capability.capability.kind =
-			    static_cast<DistributedExtensionCapabilityKind>(obj.ReadProperty<uint8_t>(3, "capability_kind"));
-			desc.extension_capability.capability.name = obj.ReadProperty<string>(4, "capability_name");
-			desc.extension_capability.capability.protocol_version =
-			    obj.ReadProperty<idx_t>(5, "capability_protocol_version");
+		deserializer.ReadObject(10, "extension_capability", [&](Deserializer &object) {
+			desc.extension_capability = DistributedExtensionCapabilityReference::Deserialize(object);
 		});
-		desc.task_codec = deserializer.ReadProperty<string>(11, "task_codec");
-		desc.task_codec_version = deserializer.ReadProperty<idx_t>(12, "task_codec_version");
-		deserializer.ReadList(13, "extension_tasks", [&](Deserializer::List &list, idx_t) {
-			DistributedScanTask task;
-			list.ReadObject([&](Deserializer &obj) {
-				task.task_id = obj.ReadProperty<string>(1, "task_id");
-				task.payload = obj.ReadProperty<string>(2, "payload");
-				task.estimated_cardinality = obj.ReadProperty<optional_idx>(3, "estimated_cardinality");
-				task.estimated_bytes = obj.ReadProperty<optional_idx>(4, "estimated_bytes");
-				obj.ReadList(5, "artifacts", [&](Deserializer::List &artifacts, idx_t) {
-					DistributedScanTaskArtifact artifact;
-					artifacts.ReadObject([&](Deserializer &artifact_obj) {
-						artifact.name = artifact_obj.ReadProperty<string>(1, "name");
-						artifact.codec = artifact_obj.ReadProperty<string>(2, "codec");
-						artifact.codec_version = artifact_obj.ReadProperty<idx_t>(3, "codec_version");
-						artifact.data = artifact_obj.ReadProperty<string>(4, "data");
-					});
-					task.artifacts.push_back(std::move(artifact));
-				});
+		deserializer.ReadObject(11, "task_codec", [&](Deserializer &object) {
+			desc.task_codec = DistributedPayloadCodec::Deserialize(object);
+		});
+		deserializer.ReadList(12, "extension_tasks", [&](Deserializer::List &list, idx_t) {
+			list.ReadObject([&](Deserializer &object) {
+				desc.extension_tasks.push_back(DistributedScanTask::Deserialize(object));
 			});
-			desc.extension_tasks.push_back(std::move(task));
 		});
 	} else {
 		throw SerializationException("unknown scan task descriptor kind: %u", static_cast<unsigned int>(desc.kind));

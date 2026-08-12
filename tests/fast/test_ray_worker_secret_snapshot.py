@@ -31,7 +31,7 @@ def test_worker_secret_snapshot_identity_includes_bootstrap_and_exact_secrets(mo
         "shared": {
             "duckdb_source_id": "test-source-id",
             "extensions": [],
-            "distributed_extensions": [],
+            "distributed_extension_contracts": [],
             "secrets": [
                 {"storage": "memory", "name": "z", "payload": b"z-payload"},
                 {"storage": "memory", "name": "a", "payload": b"a-payload"},
@@ -45,7 +45,7 @@ def test_worker_secret_snapshot_identity_includes_bootstrap_and_exact_secrets(mo
             },
             "duckdb_source_id": "test-source-id",
             "extensions": [],
-            "distributed_extensions": [],
+            "distributed_extension_contracts": [],
             "secrets": [],
         },
     }
@@ -131,7 +131,7 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
     base_snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [],
-        "distributed_extensions": [],
+        "distributed_extension_contracts": [],
     }
     httpfs_snapshot = {
         **base_snapshot,
@@ -201,7 +201,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
         },
         "duckdb_source_id": "test-source-id",
         "extensions": [],
-        "distributed_extensions": [],
+        "distributed_extension_contracts": [],
     }
     string_config_snapshot = {
         **snapshot,
@@ -216,7 +216,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
 @pytest.mark.parametrize(
     ("snapshot", "message"),
     [
-        ({"extensions": [], "distributed_extensions": []}, "duckdb_source_id"),
+        ({"extensions": [], "distributed_extension_contracts": []}, "duckdb_source_id"),
         (
             {
                 "duckdb_source_id": "test-source-id",
@@ -224,7 +224,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
                     {"name": "httpfs", "version": "test-version"},
                     {"name": "httpfs", "version": "test-version"},
                 ],
-                "distributed_extensions": [],
+                "distributed_extension_contracts": [],
             },
             "duplicate extension name",
         ),

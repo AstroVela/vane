@@ -344,9 +344,8 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	distributed_extension_manager = make_uniq<DistributedExtensionManager>(*this);
 	DistributedExtensionManifest core_manifest;
 	core_manifest.extension_name = "vane_core";
-	core_manifest.protocol_version = 1;
 	core_manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "datasource_scan", 1});
-	distributed_extension_manager->RegisterManifest(core_manifest);
+	distributed_extension_manager->RegisterExtension(core_manifest);
 
 	// initialize the secret manager
 	config.secret_manager->Initialize(*this);

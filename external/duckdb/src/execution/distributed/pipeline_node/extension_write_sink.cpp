@@ -95,8 +95,7 @@ SubmittableTaskStream<WorkerTask> ExtensionWriteSinkNode::produce_tasks(PlanExec
 }
 
 std::vector<std::string> ExtensionWriteSinkNode::multiline_display(bool) const {
-	return {"ExtensionWriteSink: " + info_.write_name,
-	        "Codec: " + info_.fragment_codec + "@" + std::to_string(info_.fragment_codec_version)};
+	return {"ExtensionWriteSink: " + info_.Name(), "Codec: " + info_.fragment_codec.CanonicalIdentity()};
 }
 
 } // namespace distributed

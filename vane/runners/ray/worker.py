@@ -265,7 +265,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     config: tuple[tuple[str, str], ...]
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
-    distributed_extensions: tuple[tuple[str, int, tuple[tuple[str, str, int], ...]], ...]
+    distributed_extension_contracts: tuple[str, ...]
 
     def has_static_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
@@ -276,15 +276,6 @@ def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description:
     value = entry.get(field)
     if not isinstance(value, str) or not value:
         raise TypeError(f"query connection snapshot {description} {field} must be a non-empty string")
-    return value
-
-
-def _snapshot_protocol_version(entry: Mapping[str, Any], description: str) -> int:
-    value = entry.get("protocol_version")
-    if type(value) is not int or value <= 0:
-        raise TypeError(
-            f"query connection snapshot {description} protocol_version must be a positive non-boolean integer"
-        )
     return value
 
 
@@ -335,48 +326,26 @@ def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSna
         extensions.append((name, version))
     extensions.sort()
 
-    raw_distributed_extensions = snapshot.get("distributed_extensions")
-    if not isinstance(raw_distributed_extensions, list):
-        raise TypeError("query connection snapshot distributed_extensions must be a list")
-    distributed_extensions: list[tuple[str, int, tuple[tuple[str, str, int], ...]]] = []
-    distributed_extension_names: set[str] = set()
-    for raw_manifest in raw_distributed_extensions:
-        if not isinstance(raw_manifest, Mapping):
-            raise TypeError("query connection snapshot distributed extension entry must be a mapping")
-        extension_name = _snapshot_nonempty_string(raw_manifest, "extension_name", "distributed extension")
-        if extension_name in distributed_extension_names:
-            raise ValueError(f"query connection snapshot has duplicate distributed extension name: {extension_name}")
-        distributed_extension_names.add(extension_name)
-        extension_protocol_version = _snapshot_protocol_version(raw_manifest, "distributed extension")
-        raw_capabilities = raw_manifest.get("capabilities")
-        if not isinstance(raw_capabilities, list):
-            raise TypeError("query connection snapshot distributed extension capabilities must be a list")
-        capabilities: list[tuple[str, str, int]] = []
-        capability_names: set[tuple[str, str]] = set()
-        for raw_capability in raw_capabilities:
-            if not isinstance(raw_capability, Mapping):
-                raise TypeError("query connection snapshot distributed extension capability must be a mapping")
-            kind = _snapshot_nonempty_string(raw_capability, "kind", "distributed extension capability")
-            name = _snapshot_nonempty_string(raw_capability, "name", "distributed extension capability")
-            capability_name = (kind, name)
-            if capability_name in capability_names:
-                raise ValueError(
-                    f"query connection snapshot has duplicate distributed extension capability: {kind}:{name}"
-                )
-            capability_names.add(capability_name)
-            capabilities.append(
-                (kind, name, _snapshot_protocol_version(raw_capability, "distributed extension capability"))
-            )
-        capabilities.sort()
-        distributed_extensions.append((extension_name, extension_protocol_version, tuple(capabilities)))
-    distributed_extensions.sort()
+    raw_distributed_contracts = snapshot.get("distributed_extension_contracts")
+    if not isinstance(raw_distributed_contracts, list):
+        raise TypeError("query connection snapshot distributed_extension_contracts must be a list")
+    distributed_contracts: list[str] = []
+    seen_distributed_contracts: set[str] = set()
+    for raw_contract in raw_distributed_contracts:
+        if not isinstance(raw_contract, str) or not raw_contract:
+            raise TypeError("query connection snapshot distributed extension contract must be a non-empty string")
+        if raw_contract in seen_distributed_contracts:
+            raise ValueError("query connection snapshot has a duplicate distributed extension contract")
+        seen_distributed_contracts.add(raw_contract)
+        distributed_contracts.append(raw_contract)
+    distributed_contracts.sort()
     return WorkerSnapshotDatabaseIdentity(
         database,
         read_only,
         config,
         duckdb_source_id,
         tuple(extensions),
-        tuple(distributed_extensions),
+        tuple(distributed_contracts),
     )
 
 
@@ -433,15 +402,9 @@ def _query_worker_secret_snapshot_identity(
     for static_extension_name, static_extension_version in database_identity.extensions:
         _update_secret_identity_digest(digest, static_extension_name.encode("utf-8"))
         _update_secret_identity_digest(digest, static_extension_version.encode("utf-8"))
-    _update_secret_identity_digest(digest, str(len(database_identity.distributed_extensions)).encode("ascii"))
-    for extension_name, protocol_version, capabilities in database_identity.distributed_extensions:
-        _update_secret_identity_digest(digest, extension_name.encode("utf-8"))
-        _update_secret_identity_digest(digest, str(protocol_version).encode("ascii"))
-        _update_secret_identity_digest(digest, str(len(capabilities)).encode("ascii"))
-        for kind, capability_name, capability_protocol_version in capabilities:
-            _update_secret_identity_digest(digest, kind.encode("utf-8"))
-            _update_secret_identity_digest(digest, capability_name.encode("utf-8"))
-            _update_secret_identity_digest(digest, str(capability_protocol_version).encode("ascii"))
+    _update_secret_identity_digest(digest, str(len(database_identity.distributed_extension_contracts)).encode("ascii"))
+    for contract_identity in database_identity.distributed_extension_contracts:
+        _update_secret_identity_digest(digest, contract_identity.encode("utf-8"))
 
     if not include_snapshot_secrets:
         return WorkerSecretSnapshotIdentity(digest=digest.digest(), secret_count=0)

@@ -13,7 +13,7 @@ namespace {
 
 class DistributedExtensionWriteGlobalSinkState final : public GlobalSinkState {
 public:
-	shared_ptr<const DistributedExtensionWriteCallbacks> callbacks;
+	shared_ptr<const DistributedWriteOperatorExtension> write_operator;
 	unique_ptr<DistributedWriteGlobalState> extension_state;
 	DistributedWriteTaskResult result;
 	bool finalized = false;
@@ -72,7 +72,7 @@ static void ValidateExistingTaskContext(const PhysicalOperator &op, const Distri
 		    (existing.operation_id != task_context.operation_id ||
 		     existing.task_attempt_id != task_context.task_attempt_id)) {
 			throw InvalidInputException("distributed extension write '%s' runtime task context cannot change",
-			                            write->info.write_name);
+			                            write->info.Name());
 		}
 	}
 	for (const auto &child : op.children) {
@@ -96,33 +96,31 @@ PhysicalDistributedExtensionWrite::PhysicalDistributedExtensionWrite(PhysicalPla
 
 unique_ptr<GlobalSinkState> PhysicalDistributedExtensionWrite::GetGlobalSinkState(ClientContext &context) const {
 	task_context.Validate();
-	auto callbacks = DistributedExtensionManager::Get(context).GetWriteCallbacks(info.capability);
-	callbacks->Validate(info.capability.CanonicalIdentity());
-	if (callbacks->fragment_codec != info.fragment_codec ||
-	    callbacks->fragment_codec_version != info.fragment_codec_version) {
-		throw InvalidInputException(
-		    "distributed extension write '%s' callback codec mismatch: plan=%s@%llu worker=%s@%llu", info.write_name,
-		    info.fragment_codec, static_cast<unsigned long long>(info.fragment_codec_version),
-		    callbacks->fragment_codec, static_cast<unsigned long long>(callbacks->fragment_codec_version));
+	auto write_operator = DistributedExtensionManager::Get(context).GetWriteOperator(info.capability);
+	write_operator->Validate(info.capability.CanonicalIdentity());
+	if (write_operator->mode != DistributedWriteMode::CALLBACK ||
+	    write_operator->fragment_codec != info.fragment_codec) {
+		throw InvalidInputException("distributed extension write '%s' worker contract does not match the plan",
+		                            info.Name());
 	}
 	auto result = make_uniq<DistributedExtensionWriteGlobalSinkState>();
-	result->callbacks = std::move(callbacks);
-	result->extension_state = result->callbacks->initialize_global(context, info, task_context);
+	result->write_operator = std::move(write_operator);
+	result->extension_state = result->write_operator->callbacks.initialize_global(context, info, task_context);
 	if (!result->extension_state) {
-		throw InvalidInputException("distributed extension write '%s' initialize_global returned null",
-		                            info.write_name);
+		throw InvalidInputException("distributed extension write '%s' initialize_global returned null", info.Name());
 	}
 	return std::move(result);
 }
 
 unique_ptr<LocalSinkState> PhysicalDistributedExtensionWrite::GetLocalSinkState(ExecutionContext &context) const {
 	if (!sink_state) {
-		throw InternalException("distributed extension write '%s' has no global sink state", info.write_name);
+		throw InternalException("distributed extension write '%s' has no global sink state", info.Name());
 	}
 	auto &global = sink_state->Cast<DistributedExtensionWriteGlobalSinkState>();
-	auto local = global.callbacks->initialize_local(context, info, task_context, *global.extension_state);
+	auto local =
+	    global.write_operator->callbacks.initialize_local(context, info, task_context, *global.extension_state);
 	if (!local) {
-		throw InvalidInputException("distributed extension write '%s' initialize_local returned null", info.write_name);
+		throw InvalidInputException("distributed extension write '%s' initialize_local returned null", info.Name());
 	}
 	return make_uniq<DistributedExtensionWriteLocalSinkState>(std::move(local));
 }
@@ -131,7 +129,8 @@ SinkResultType PhysicalDistributedExtensionWrite::Sink(ExecutionContext &context
                                                        OperatorSinkInput &input) const {
 	auto &global = input.global_state.Cast<DistributedExtensionWriteGlobalSinkState>();
 	auto &local = input.local_state.Cast<DistributedExtensionWriteLocalSinkState>();
-	global.callbacks->sink(context, info, task_context, *global.extension_state, *local.extension_state, chunk);
+	global.write_operator->callbacks.sink(context, info, task_context, *global.extension_state, *local.extension_state,
+	                                      chunk);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -139,7 +138,8 @@ SinkCombineResultType PhysicalDistributedExtensionWrite::Combine(ExecutionContex
                                                                  OperatorSinkCombineInput &input) const {
 	auto &global = input.global_state.Cast<DistributedExtensionWriteGlobalSinkState>();
 	auto &local = input.local_state.Cast<DistributedExtensionWriteLocalSinkState>();
-	global.callbacks->combine(context, info, task_context, *global.extension_state, *local.extension_state);
+	global.write_operator->callbacks.combine(context, info, task_context, *global.extension_state,
+	                                         *local.extension_state);
 	return SinkCombineResultType::FINISHED;
 }
 
@@ -147,14 +147,14 @@ SinkFinalizeType PhysicalDistributedExtensionWrite::Finalize(Pipeline &, Event &
                                                              OperatorSinkFinalizeInput &input) const {
 	auto &global = input.global_state.Cast<DistributedExtensionWriteGlobalSinkState>();
 	if (global.finalized) {
-		throw InternalException("distributed extension write '%s' finalized more than once", info.write_name);
+		throw InternalException("distributed extension write '%s' finalized more than once", info.Name());
 	}
 	global.result.capability = info.capability;
 	global.result.fragment_codec = info.fragment_codec;
-	global.result.fragment_codec_version = info.fragment_codec_version;
 	global.result.operation_id = task_context.operation_id;
 	global.result.task_attempt_id = task_context.task_attempt_id;
-	global.result.fragments = global.callbacks->finalize(context, info, task_context, *global.extension_state);
+	global.result.fragments =
+	    global.write_operator->callbacks.finalize(context, info, task_context, *global.extension_state);
 	global.result.Validate();
 	global.finalized = true;
 	return SinkFinalizeType::READY;
@@ -171,12 +171,11 @@ SourceResultType PhysicalDistributedExtensionWrite::GetDataInternal(ExecutionCon
 		return SourceResultType::FINISHED;
 	}
 	if (!sink_state) {
-		throw InternalException("distributed extension write '%s' has no finalized sink state", info.write_name);
+		throw InternalException("distributed extension write '%s' has no finalized sink state", info.Name());
 	}
 	auto &global = sink_state->Cast<DistributedExtensionWriteGlobalSinkState>();
 	if (!global.finalized) {
-		throw InternalException("distributed extension write '%s' source ran before sink finalization",
-		                        info.write_name);
+		throw InternalException("distributed extension write '%s' source ran before sink finalization", info.Name());
 	}
 	auto bytes = global.result.SerializeToBytes();
 	chunk.SetValue(0, 0, Value::BLOB(reinterpret_cast<const_data_ptr_t>(bytes.data()), bytes.size()));
@@ -190,17 +189,16 @@ void PhysicalDistributedExtensionWrite::ApplyRuntimeTaskContext(DistributedWrite
 	if ((!task_context.operation_id.empty() || !task_context.task_attempt_id.empty()) &&
 	    (task_context.operation_id != context.operation_id ||
 	     task_context.task_attempt_id != context.task_attempt_id)) {
-		throw InvalidInputException("distributed extension write '%s' runtime task context cannot change",
-		                            info.write_name);
+		throw InvalidInputException("distributed extension write '%s' runtime task context cannot change", info.Name());
 	}
 	task_context = std::move(context);
 }
 
 InsertionOrderPreservingMap<string> PhysicalDistributedExtensionWrite::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Write"] = info.write_name;
+	result["Write"] = info.Name();
 	result["Capability"] = info.capability.CanonicalIdentity();
-	result["Fragment Codec"] = info.fragment_codec + "@" + std::to_string(info.fragment_codec_version);
+	result["Fragment Codec"] = info.fragment_codec.CanonicalIdentity();
 	return result;
 }
 

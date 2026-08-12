@@ -11,22 +11,14 @@ namespace duckdb {
 
 class ClientContext;
 class DatabaseInstance;
-struct DistributedExtensionWriteCallbacks;
+class Deserializer;
+class Serializer;
+struct DistributedWriteOperatorExtension;
 
 //! Coarse capability groups exposed by an extension to the distributed runner.
 //! Ordinary DuckDB registration remains authoritative for local execution; these
 //! entries describe only the additional protocol implemented by an extension.
-enum class DistributedExtensionCapabilityKind : uint8_t {
-	TABLE_FUNCTION = 0,
-	AGGREGATE_FUNCTION = 1,
-	COPY_FUNCTION = 2,
-	OPERATOR = 3,
-	STORAGE = 4,
-	CONTEXT = 5
-};
-
-DUCKDB_API string DistributedExtensionCapabilityKindToString(DistributedExtensionCapabilityKind kind);
-DUCKDB_API DistributedExtensionCapabilityKind DistributedExtensionCapabilityKindFromString(const string &value);
+enum class DistributedExtensionCapabilityKind : uint8_t { TABLE_FUNCTION = 0, WRITE_OPERATOR = 1 };
 
 struct DistributedExtensionCapability {
 	DistributedExtensionCapabilityKind kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
@@ -43,25 +35,37 @@ struct DistributedExtensionCapability {
 //! scheduled; the extension continues to own the actual execution hooks.
 struct DistributedExtensionCapabilityReference {
 	string extension_name;
-	idx_t extension_protocol_version = 0;
 	DistributedExtensionCapability capability;
 
+	DUCKDB_API void Validate() const;
+	DUCKDB_API void Serialize(Serializer &serializer) const;
+	DUCKDB_API static DistributedExtensionCapabilityReference Deserialize(Deserializer &deserializer);
 	DUCKDB_API string CanonicalIdentity() const;
 	DUCKDB_API bool operator==(const DistributedExtensionCapabilityReference &other) const;
 	DUCKDB_API bool operator!=(const DistributedExtensionCapabilityReference &other) const;
 };
 
+//! Stable identity of an extension-owned opaque payload codec.
+struct DistributedPayloadCodec {
+	string name;
+	idx_t version = 0;
+
+	DUCKDB_API void Validate(const string &description) const;
+	DUCKDB_API void Serialize(Serializer &serializer) const;
+	DUCKDB_API static DistributedPayloadCodec Deserialize(Deserializer &deserializer);
+	DUCKDB_API string CanonicalIdentity() const;
+	DUCKDB_API bool operator==(const DistributedPayloadCodec &other) const;
+	DUCKDB_API bool operator!=(const DistributedPayloadCodec &other) const;
+};
+
 //! A manifest is registered once by an extension during Extension::Load.
 //! The extension's ordinary DuckDB version is transported separately by the
-//! connection snapshot; protocol_version versions the distributed manifest.
+//! connection snapshot. Every concrete capability owns its protocol version.
 struct DistributedExtensionManifest {
 	string extension_name;
-	idx_t protocol_version = 0;
 	vector<DistributedExtensionCapability> capabilities;
 
 	DUCKDB_API string CanonicalIdentity() const;
-	DUCKDB_API bool operator==(const DistributedExtensionManifest &other) const;
-	DUCKDB_API bool operator<(const DistributedExtensionManifest &other) const;
 };
 
 //! Database-local registry for explicit distributed extension contracts.
@@ -74,18 +78,17 @@ class DistributedExtensionManager {
 public:
 	explicit DistributedExtensionManager(DatabaseInstance &db);
 
-	DUCKDB_API void RegisterManifest(const DistributedExtensionManifest &manifest);
+	//! Atomically publish every concrete contract contributed by one extension.
+	DUCKDB_API void RegisterExtension(const DistributedExtensionManifest &manifest,
+	                                  vector<shared_ptr<const DistributedWriteOperatorExtension>> write_operators = {});
 
-	DUCKDB_API bool TryGetExtension(const string &extension_name, DistributedExtensionManifest &result) const;
-	DUCKDB_API vector<DistributedExtensionManifest> GetExtensions() const;
-	DUCKDB_API void RequireCapability(const string &extension_name, DistributedExtensionCapabilityKind kind,
-	                                  const string &capability_name, idx_t protocol_version) const;
+	DUCKDB_API vector<string> GetContractIdentities() const;
 	DUCKDB_API void RequireCapability(const DistributedExtensionCapabilityReference &capability) const;
-	DUCKDB_API void RegisterWriteCallbacks(const DistributedExtensionCapabilityReference &capability,
-	                                       DistributedExtensionWriteCallbacks callbacks);
-	DUCKDB_API shared_ptr<const DistributedExtensionWriteCallbacks>
-	GetWriteCallbacks(const DistributedExtensionCapabilityReference &capability) const;
-	DUCKDB_API void ValidateExact(const vector<DistributedExtensionManifest> &expected) const;
+	DUCKDB_API shared_ptr<const DistributedWriteOperatorExtension>
+	GetWriteOperator(const DistributedExtensionCapabilityReference &capability) const;
+	DUCKDB_API shared_ptr<const DistributedWriteOperatorExtension> GetWriteOperator(const string &extension_name,
+	                                                                                const string &operator_name) const;
+	DUCKDB_API void ValidateExact(const vector<string> &expected_contract_identities) const;
 
 	DUCKDB_API static DistributedExtensionManager &Get(DatabaseInstance &db);
 	DUCKDB_API static DistributedExtensionManager &Get(ClientContext &context);
@@ -94,7 +97,7 @@ public:
 private:
 	mutable mutex lock;
 	map<string, DistributedExtensionManifest> extensions;
-	map<string, shared_ptr<const DistributedExtensionWriteCallbacks>> write_callbacks;
+	map<string, shared_ptr<const DistributedWriteOperatorExtension>> write_operators;
 };
 
 } // namespace duckdb

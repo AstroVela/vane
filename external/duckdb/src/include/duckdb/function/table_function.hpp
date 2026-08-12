@@ -424,7 +424,7 @@ public:
 	DUCKDB_API void SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks);
 	//! Bind the loader-derived distributed identity. Extension authors should not
 	//! call this directly; it is also used for Vane's built-in core functions.
-	DUCKDB_API void BindDistributedScanCapability(const string &extension_name, idx_t extension_protocol_version);
+	DUCKDB_API void BindDistributedScanCapability(const string &extension_name);
 	bool HasDistributedScanCallbacks() const {
 		return distributed_scan != nullptr;
 	}

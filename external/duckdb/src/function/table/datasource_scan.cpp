@@ -67,7 +67,7 @@ static void DataSourceApplyDistributedTasks(FunctionData &worker_bind_data, cons
 	vector<string> validated_tasks;
 	validated_tasks.reserve(tasks.size());
 	for (const auto &task : tasks) {
-		if (!IsCanonicalDataSourceTaskId(task.task_id) || task.payload.empty() || !task.artifacts.empty()) {
+		if (!IsCanonicalDataSourceTaskId(task.task_id) || task.payload.empty()) {
 			throw InvalidInputException("invalid distributed DataSource task '%s'", task.task_id);
 		}
 		validated_tasks.push_back(task.payload);
@@ -298,13 +298,12 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	func.deserialize = DataSourceScanDeserialize;
 	TableFunctionDistributedScanCallbacks distributed_scan;
 	distributed_scan.protocol_version = 1;
-	distributed_scan.task_codec = DATASOURCE_TASK_CODEC;
-	distributed_scan.task_codec_version = 1;
+	distributed_scan.task_codec = {DATASOURCE_TASK_CODEC, 1};
 	distributed_scan.plan = DataSourcePlanDistributedScan;
 	distributed_scan.prepare_bind = DataSourcePrepareDistributedBind;
 	distributed_scan.apply_tasks = DataSourceApplyDistributedTasks;
 	func.SetDistributedScanCallbacks(std::move(distributed_scan));
-	func.BindDistributedScanCapability("vane_core", 1);
+	func.BindDistributedScanCapability("vane_core");
 	func.projection_pushdown = false;
 	return func;
 }

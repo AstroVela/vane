@@ -21,23 +21,17 @@ namespace duckdb {
 class FunctionData;
 class TableFilterSet;
 
-//! An immutable binary object carried alongside an opaque scan task. The
-//! extension owns the codec and the meaning of the bytes.
-struct DistributedScanTaskArtifact {
-	string name;
-	string codec;
-	idx_t codec_version = 0;
-	string data;
-};
-
 //! One elementary, portable unit of work produced by an extension on the
-//! coordinator. Vane never interprets payload or artifact bytes.
+//! coordinator. Vane never interprets the payload bytes.
 struct DistributedScanTask {
 	string task_id;
 	string payload;
-	vector<DistributedScanTaskArtifact> artifacts;
 	optional_idx estimated_cardinality;
 	optional_idx estimated_bytes;
+
+	DUCKDB_API void Validate() const;
+	DUCKDB_API void Serialize(Serializer &serializer) const;
+	DUCKDB_API static DistributedScanTask Deserialize(Deserializer &deserializer);
 };
 
 //! Physical scan information available while an extension creates its task
@@ -80,16 +74,14 @@ typedef void (*table_function_apply_distributed_scan_tasks_t)(FunctionData &work
 //! descriptor and must match exactly on the worker.
 struct TableFunctionDistributedScanCallbacks {
 	idx_t protocol_version = 0;
-	string task_codec;
-	idx_t task_codec_version = 0;
+	DistributedPayloadCodec task_codec;
 	table_function_plan_distributed_scan_t plan = nullptr;
 	table_function_prepare_distributed_scan_bind_t prepare_bind = nullptr;
 	table_function_apply_distributed_scan_tasks_t apply_tasks = nullptr;
 
 	DUCKDB_API void ValidateDefinition(const string &function_name) const;
 	DUCKDB_API void Validate(const string &function_name) const;
-	DUCKDB_API void BindCapability(const string &extension_name, idx_t extension_protocol_version,
-	                               const string &function_name);
+	DUCKDB_API void BindCapability(const string &extension_name, const string &function_name);
 	DUCKDB_API const DistributedExtensionCapabilityReference &GetCapability() const;
 	DUCKDB_API bool operator==(const TableFunctionDistributedScanCallbacks &other) const;
 

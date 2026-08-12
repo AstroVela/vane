@@ -160,23 +160,16 @@ class PhysicalCoordinatorOnlyExtensionWriteForTest final : public PhysicalOperat
 public:
 	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1) {
-		info.capability.extension_name = "vane_test";
-		info.capability.extension_protocol_version = 1;
-		info.capability.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-		info.capability.capability.name = "coordinator_only_write";
-		info.capability.capability.protocol_version = 1;
-		info.write_name = "coordinator_only_test_write";
-		info.mode = DistributedWriteMode::FILE_ARTIFACT;
-		info.fragment_codec = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC;
-		info.fragment_codec_version = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION;
+		plan.extension_name = "vane_test";
+		plan.operator_name = "coordinator_only_write";
 	}
 
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
 		return this;
 	}
 
-	const DistributedExtensionWriteInfo &WriteInfo() const override {
-		return info;
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override {
+		return plan;
 	}
 
 	void ValidateDistributedWrite(ClientContext &,
@@ -202,7 +195,7 @@ protected:
 	}
 
 private:
-	DistributedExtensionWriteInfo info;
+	distributed::DistributedExtensionWritePlan plan;
 };
 
 class CountingResultCollectorForTest {

@@ -18,31 +18,8 @@ namespace duckdb {
 
 namespace {
 
-static void SerializeCapability(Serializer &serializer, const DistributedExtensionCapabilityReference &capability) {
-	serializer.WriteProperty(1, "extension_name", capability.extension_name);
-	serializer.WriteProperty(2, "extension_protocol_version", capability.extension_protocol_version);
-	serializer.WriteProperty(3, "capability_kind", static_cast<uint8_t>(capability.capability.kind));
-	serializer.WriteProperty(4, "capability_name", capability.capability.name);
-	serializer.WriteProperty(5, "capability_protocol_version", capability.capability.protocol_version);
-}
-
-static DistributedExtensionCapabilityReference DeserializeCapability(Deserializer &deserializer) {
-	DistributedExtensionCapabilityReference result;
-	result.extension_name = deserializer.ReadProperty<string>(1, "extension_name");
-	result.extension_protocol_version = deserializer.ReadProperty<idx_t>(2, "extension_protocol_version");
-	result.capability.kind =
-	    static_cast<DistributedExtensionCapabilityKind>(deserializer.ReadProperty<uint8_t>(3, "capability_kind"));
-	result.capability.name = deserializer.ReadProperty<string>(4, "capability_name");
-	result.capability.protocol_version = deserializer.ReadProperty<idx_t>(5, "capability_protocol_version");
-	return result;
-}
-
-static void ValidateCapability(const DistributedExtensionCapabilityReference &capability) {
-	DistributedExtensionManifest manifest;
-	manifest.extension_name = capability.extension_name;
-	manifest.protocol_version = capability.extension_protocol_version;
-	manifest.capabilities.push_back(capability.capability);
-	DistributedExtensionManager::ValidateManifest(manifest);
+static const string &WriteName(const DistributedExtensionWriteInfo &info) {
+	return info.capability.capability.name;
 }
 
 static idx_t AddCount(idx_t total, idx_t value, const char *name) {
@@ -93,27 +70,24 @@ void DistributedWriteArtifact::Validate() const {
 	if (artifact_id.empty()) {
 		throw SerializationException("distributed write artifact has an empty artifact_id");
 	}
-	if (codec.empty() || codec_version == 0) {
-		throw SerializationException("distributed write artifact '%s' has an invalid codec identity", artifact_id);
-	}
+	codec.Validate("Distributed write artifact '" + artifact_id + "'");
 }
 
 void DistributedWriteArtifact::Serialize(Serializer &serializer) const {
 	Validate();
 	serializer.WriteProperty(1, "artifact_id", artifact_id);
 	serializer.WriteProperty(2, "uri", uri);
-	serializer.WriteProperty(3, "codec", codec);
-	serializer.WriteProperty(4, "codec_version", codec_version);
-	serializer.WriteProperty(5, "payload", payload);
+	serializer.WriteObject(3, "codec", [&](Serializer &object) { codec.Serialize(object); });
+	serializer.WriteProperty(4, "payload", payload);
 }
 
 DistributedWriteArtifact DistributedWriteArtifact::Deserialize(Deserializer &deserializer) {
 	DistributedWriteArtifact result;
 	result.artifact_id = deserializer.ReadProperty<string>(1, "artifact_id");
 	result.uri = deserializer.ReadProperty<string>(2, "uri");
-	result.codec = deserializer.ReadProperty<string>(3, "codec");
-	result.codec_version = deserializer.ReadProperty<idx_t>(4, "codec_version");
-	result.payload = deserializer.ReadProperty<string>(5, "payload");
+	deserializer.ReadObject(3, "codec",
+	                        [&](Deserializer &object) { result.codec = DistributedPayloadCodec::Deserialize(object); });
+	result.payload = deserializer.ReadProperty<string>(4, "payload");
 	result.Validate();
 	return result;
 }
@@ -167,13 +141,11 @@ void DistributedWriteTaskContext::Validate() const {
 }
 
 void DistributedWriteTaskResult::Validate() const {
-	ValidateCapability(capability);
-	if (capability.capability.kind != DistributedExtensionCapabilityKind::OPERATOR) {
-		throw SerializationException("distributed write task result capability is not an operator");
+	capability.Validate();
+	if (capability.capability.kind != DistributedExtensionCapabilityKind::WRITE_OPERATOR) {
+		throw SerializationException("distributed write task result capability is not a write operator");
 	}
-	if (fragment_codec.empty() || fragment_codec_version == 0) {
-		throw SerializationException("distributed write task result has an invalid fragment codec identity");
-	}
+	fragment_codec.Validate("Distributed write task result");
 	if (operation_id.empty()) {
 		throw SerializationException("distributed write task result has an empty operation_id");
 	}
@@ -210,25 +182,26 @@ idx_t DistributedWriteTaskResult::ByteCount() const {
 
 void DistributedWriteTaskResult::Serialize(Serializer &serializer) const {
 	Validate();
-	serializer.WriteObject(1, "capability", [&](Serializer &object) { SerializeCapability(object, capability); });
-	serializer.WriteProperty(2, "fragment_codec", fragment_codec);
-	serializer.WriteProperty(3, "fragment_codec_version", fragment_codec_version);
-	serializer.WriteProperty(4, "operation_id", operation_id);
-	serializer.WriteProperty(5, "task_attempt_id", task_attempt_id);
-	serializer.WriteList(6, "fragments", fragments.size(), [&](Serializer::List &list, idx_t index) {
+	serializer.WriteObject(1, "capability", [&](Serializer &object) { capability.Serialize(object); });
+	serializer.WriteObject(2, "fragment_codec", [&](Serializer &object) { fragment_codec.Serialize(object); });
+	serializer.WriteProperty(3, "operation_id", operation_id);
+	serializer.WriteProperty(4, "task_attempt_id", task_attempt_id);
+	serializer.WriteList(5, "fragments", fragments.size(), [&](Serializer::List &list, idx_t index) {
 		list.WriteObject([&](Serializer &object) { fragments[index].Serialize(object); });
 	});
 }
 
 DistributedWriteTaskResult DistributedWriteTaskResult::Deserialize(Deserializer &deserializer) {
 	DistributedWriteTaskResult result;
-	deserializer.ReadObject(1, "capability",
-	                        [&](Deserializer &object) { result.capability = DeserializeCapability(object); });
-	result.fragment_codec = deserializer.ReadProperty<string>(2, "fragment_codec");
-	result.fragment_codec_version = deserializer.ReadProperty<idx_t>(3, "fragment_codec_version");
-	result.operation_id = deserializer.ReadProperty<string>(4, "operation_id");
-	result.task_attempt_id = deserializer.ReadProperty<string>(5, "task_attempt_id");
-	deserializer.ReadList(6, "fragments", [&](Deserializer::List &list, idx_t) {
+	deserializer.ReadObject(1, "capability", [&](Deserializer &object) {
+		result.capability = DistributedExtensionCapabilityReference::Deserialize(object);
+	});
+	deserializer.ReadObject(2, "fragment_codec", [&](Deserializer &object) {
+		result.fragment_codec = DistributedPayloadCodec::Deserialize(object);
+	});
+	result.operation_id = deserializer.ReadProperty<string>(3, "operation_id");
+	result.task_attempt_id = deserializer.ReadProperty<string>(4, "task_attempt_id");
+	deserializer.ReadList(5, "fragments", [&](Deserializer::List &list, idx_t) {
 		list.ReadObject(
 		    [&](Deserializer &object) { result.fragments.push_back(DistributedWriteFragment::Deserialize(object)); });
 	});
@@ -259,72 +232,115 @@ DistributedWriteTaskResult DistributedWriteTaskResult::DeserializeFromBytes(cons
 }
 
 void DistributedExtensionWriteInfo::Validate() const {
-	ValidateCapability(capability);
-	if (capability.capability.kind != DistributedExtensionCapabilityKind::OPERATOR) {
-		throw InvalidInputException("distributed extension write '%s' capability must be an operator", write_name);
+	capability.Validate();
+	if (capability.capability.kind != DistributedExtensionCapabilityKind::WRITE_OPERATOR) {
+		throw InvalidInputException("distributed extension write capability must be a write operator");
 	}
-	if (write_name.empty()) {
-		throw InvalidInputException("distributed extension write requires a non-empty name");
-	}
-	if (fragment_codec.empty() || fragment_codec_version == 0) {
-		throw InvalidInputException("distributed extension write '%s' has an invalid fragment codec identity",
-		                            write_name);
-	}
+	fragment_codec.Validate("Distributed extension write '" + WriteName(*this) + "'");
 	switch (mode) {
 	case DistributedWriteMode::FILE_ARTIFACT:
-		if (fragment_codec != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC ||
-		    fragment_codec_version != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION) {
+		if (fragment_codec.name != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC ||
+		    fragment_codec.version != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION) {
 			throw InvalidInputException(
-			    "distributed file write '%s' must use %s@%llu", write_name,
+			    "distributed file write '%s' must use %s@%llu", WriteName(*this),
 			    distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC,
 			    static_cast<unsigned long long>(distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION));
 		}
 		if (!worker_bind_data.empty()) {
 			throw InvalidInputException("distributed file write '%s' cannot carry callback worker bind data",
-			                            write_name);
+			                            WriteName(*this));
 		}
 		break;
 	case DistributedWriteMode::CALLBACK:
 		break;
 	default:
-		throw InvalidInputException("distributed extension write '%s' has an unknown mode", write_name);
+		throw InvalidInputException("distributed extension write '%s' has an unknown mode", WriteName(*this));
 	}
+}
+
+const string &DistributedExtensionWriteInfo::Name() const {
+	return WriteName(*this);
 }
 
 void DistributedExtensionWriteInfo::Serialize(Serializer &serializer) const {
 	Validate();
-	serializer.WriteObject(1, "capability", [&](Serializer &object) { SerializeCapability(object, capability); });
-	serializer.WriteProperty(2, "write_name", write_name);
-	serializer.WriteProperty(3, "mode", static_cast<uint8_t>(mode));
-	serializer.WriteProperty(4, "fragment_codec", fragment_codec);
-	serializer.WriteProperty(5, "fragment_codec_version", fragment_codec_version);
-	serializer.WriteProperty(6, "worker_bind_data", worker_bind_data);
+	serializer.WriteObject(1, "capability", [&](Serializer &object) { capability.Serialize(object); });
+	serializer.WriteProperty(2, "mode", static_cast<uint8_t>(mode));
+	serializer.WriteObject(3, "fragment_codec", [&](Serializer &object) { fragment_codec.Serialize(object); });
+	serializer.WriteProperty(4, "worker_bind_data", worker_bind_data);
 }
 
 DistributedExtensionWriteInfo DistributedExtensionWriteInfo::Deserialize(Deserializer &deserializer) {
 	DistributedExtensionWriteInfo result;
-	deserializer.ReadObject(1, "capability",
-	                        [&](Deserializer &object) { result.capability = DeserializeCapability(object); });
-	result.write_name = deserializer.ReadProperty<string>(2, "write_name");
-	result.mode = static_cast<DistributedWriteMode>(deserializer.ReadProperty<uint8_t>(3, "mode"));
-	result.fragment_codec = deserializer.ReadProperty<string>(4, "fragment_codec");
-	result.fragment_codec_version = deserializer.ReadProperty<idx_t>(5, "fragment_codec_version");
-	result.worker_bind_data = deserializer.ReadProperty<string>(6, "worker_bind_data");
+	deserializer.ReadObject(1, "capability", [&](Deserializer &object) {
+		result.capability = DistributedExtensionCapabilityReference::Deserialize(object);
+	});
+	result.mode = static_cast<DistributedWriteMode>(deserializer.ReadProperty<uint8_t>(2, "mode"));
+	deserializer.ReadObject(3, "fragment_codec", [&](Deserializer &object) {
+		result.fragment_codec = DistributedPayloadCodec::Deserialize(object);
+	});
+	result.worker_bind_data = deserializer.ReadProperty<string>(4, "worker_bind_data");
 	result.Validate();
 	return result;
 }
 
 void DistributedExtensionWriteCallbacks::Validate(const string &capability_identity) const {
-	if (fragment_codec.empty() || fragment_codec_version == 0) {
-		throw InvalidInputException("distributed write callbacks for %s have an invalid fragment codec identity",
-		                            capability_identity);
-	}
 	if (!initialize_global || !initialize_local || !sink || !combine || !finalize) {
 		throw InvalidInputException("distributed write callbacks for %s are incomplete", capability_identity);
 	}
 }
 
+bool DistributedExtensionWriteCallbacks::Empty() const {
+	return !initialize_global && !initialize_local && !sink && !combine && !finalize;
+}
+
+void DistributedWriteOperatorExtension::Validate(const string &capability_identity) const {
+	fragment_codec.Validate("Distributed write operator '" + capability_identity + "'");
+	switch (mode) {
+	case DistributedWriteMode::FILE_ARTIFACT:
+		if (fragment_codec.name != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC ||
+		    fragment_codec.version != distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION) {
+			throw InvalidInputException(
+			    "Distributed file write operator '%s' must use %s@%llu", capability_identity,
+			    distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC,
+			    static_cast<unsigned long long>(distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION));
+		}
+		if (!callbacks.Empty()) {
+			throw InvalidInputException("Distributed file write operator '%s' cannot register worker callbacks",
+			                            capability_identity);
+		}
+		return;
+	case DistributedWriteMode::CALLBACK:
+		callbacks.Validate(capability_identity);
+		return;
+	default:
+		throw InvalidInputException("Distributed write operator '%s' has an unknown mode", capability_identity);
+	}
+}
+
 namespace distributed {
+
+void DistributedExtensionWritePlan::Validate() const {
+	if (extension_name.empty() || operator_name.empty()) {
+		throw InvalidInputException("distributed extension write plan requires extension and operator names");
+	}
+}
+
+DistributedExtensionWriteInfo ResolveDistributedExtensionWriteInfo(ClientContext &context,
+                                                                   const DistributedExtensionWritePlan &plan) {
+	plan.Validate();
+	auto write_operator =
+	    DistributedExtensionManager::Get(context).GetWriteOperator(plan.extension_name, plan.operator_name);
+	DistributedExtensionWriteInfo result;
+	result.capability.extension_name = plan.extension_name;
+	result.capability.capability = {DistributedExtensionCapabilityKind::WRITE_OPERATOR, write_operator->name,
+	                                write_operator->protocol_version};
+	result.mode = write_operator->mode;
+	result.fragment_codec = write_operator->fragment_codec;
+	result.worker_bind_data = plan.worker_bind_data;
+	result.Validate();
+	return result;
+}
 
 void DistributedWriteOperationContext::Validate() const {
 	if (operation_id.empty()) {
@@ -338,7 +354,7 @@ vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const Distr
 	info.Validate();
 	operation.Validate();
 	if (info.mode != DistributedWriteMode::FILE_ARTIFACT) {
-		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", info.write_name);
+		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", WriteName(info));
 	}
 	vector<DistributedWriteTaskResult> results;
 	results.reserve(files.size());
@@ -347,17 +363,16 @@ vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const Distr
 		const auto &file = files[index];
 		const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
 		if (path.empty()) {
-			throw InvalidInputException("distributed file write '%s' returned an empty file path", info.write_name);
+			throw InvalidInputException("distributed file write '%s' returned an empty file path", WriteName(info));
 		}
 		if (!fragment_ids.insert(path).second) {
 			throw InvalidInputException("distributed file write '%s' selected file '%s' more than once",
-			                            info.write_name, path);
+			                            WriteName(info), path);
 		}
 		DistributedWriteArtifact artifact;
 		artifact.artifact_id = "data_file";
 		artifact.uri = path;
-		artifact.codec = "duckdb.file";
-		artifact.codec_version = 1;
+		artifact.codec = {"duckdb.file", 1};
 
 		DistributedWriteFragment fragment;
 		fragment.fragment_id = path;
@@ -369,7 +384,6 @@ vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const Distr
 		DistributedWriteTaskResult result;
 		result.capability = info.capability;
 		result.fragment_codec = info.fragment_codec;
-		result.fragment_codec_version = info.fragment_codec_version;
 		result.operation_id = operation.operation_id;
 		result.task_attempt_id = "file:" + path;
 		result.fragments.push_back(std::move(fragment));
@@ -385,7 +399,7 @@ vector<DistributedCopyFileInfo> DecodeDistributedFileWriteResults(const Distribu
 	info.Validate();
 	operation.Validate();
 	if (info.mode != DistributedWriteMode::FILE_ARTIFACT) {
-		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", info.write_name);
+		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", WriteName(info));
 	}
 	vector<DistributedCopyFileInfo> files;
 	set<string> task_attempt_ids;
@@ -393,32 +407,31 @@ vector<DistributedCopyFileInfo> DecodeDistributedFileWriteResults(const Distribu
 	for (const auto &result : results) {
 		result.Validate();
 		if (result.operation_id != operation.operation_id || result.capability != info.capability ||
-		    result.fragment_codec != info.fragment_codec ||
-		    result.fragment_codec_version != info.fragment_codec_version) {
+		    result.fragment_codec != info.fragment_codec) {
 			throw InvalidInputException("distributed file write '%s' received a mismatched task result protocol",
-			                            info.write_name);
+			                            WriteName(info));
 		}
 		if (!task_attempt_ids.insert(result.task_attempt_id).second) {
 			throw InvalidInputException("distributed file write '%s' selected task attempt '%s' more than once",
-			                            info.write_name, result.task_attempt_id);
+			                            WriteName(info), result.task_attempt_id);
 		}
 		for (const auto &fragment : result.fragments) {
 			if (!fragment_ids.insert(fragment.fragment_id).second) {
 				throw InvalidInputException("distributed file write '%s' selected fragment '%s' more than once",
-				                            info.write_name, fragment.fragment_id);
+				                            WriteName(info), fragment.fragment_id);
 			}
 			if (fragment.artifacts.size() != 1 || fragment.artifacts[0].artifact_id != "data_file" ||
-			    fragment.artifacts[0].codec != "duckdb.file" || fragment.artifacts[0].codec_version != 1 ||
+			    fragment.artifacts[0].codec != DistributedPayloadCodec {"duckdb.file", 1} ||
 			    !fragment.artifacts[0].payload.empty()) {
 				throw InvalidInputException("distributed file write '%s' received an invalid file artifact",
-				                            info.write_name);
+				                            WriteName(info));
 			}
 			auto file = DeserializeCopyFileInfo(fragment.payload);
 			const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
 			if (path != fragment.fragment_id || path != fragment.artifacts[0].uri ||
 			    file.row_count != fragment.row_count || file.file_size_bytes != fragment.byte_count) {
 				throw InvalidInputException("distributed file write '%s' fragment metadata does not match its file DTO",
-				                            info.write_name);
+				                            WriteName(info));
 			}
 			files.push_back(std::move(file));
 		}
@@ -432,7 +445,7 @@ vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const Distri
 	info.Validate();
 	operation.Validate();
 	if (info.mode != DistributedWriteMode::CALLBACK) {
-		throw InvalidInputException("distributed extension write '%s' is not a callback write", info.write_name);
+		throw InvalidInputException("distributed extension write '%s' is not a callback write", WriteName(info));
 	}
 	vector<DistributedWriteTaskResult> results;
 	set<string> task_attempt_ids;
@@ -442,17 +455,17 @@ vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const Distri
 		auto collection = partition ? partition->to_column_data() : nullptr;
 		if (!collection) {
 			throw InvalidInputException("distributed extension write '%s' partition %llu is not tabular",
-			                            info.write_name, static_cast<unsigned long long>(partition_index));
+			                            WriteName(info), static_cast<unsigned long long>(partition_index));
 		}
 		if (collection->Types().size() != 1 || collection->Types()[0].id() != LogicalTypeId::BLOB) {
 			throw InvalidInputException(
-			    "distributed extension write '%s' partition %llu must contain exactly one BLOB column", info.write_name,
+			    "distributed extension write '%s' partition %llu must contain exactly one BLOB column", WriteName(info),
 			    static_cast<unsigned long long>(partition_index));
 		}
 		if (collection->Count() != 1) {
 			throw InvalidInputException(
 			    "distributed extension write '%s' partition %llu must contain exactly one task envelope",
-			    info.write_name, static_cast<unsigned long long>(partition_index));
+			    WriteName(info), static_cast<unsigned long long>(partition_index));
 		}
 		ColumnDataScanState scan_state;
 		collection->InitializeScan(scan_state);
@@ -461,30 +474,29 @@ vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const Distri
 		while (collection->Scan(scan_state, chunk)) {
 			if (chunk.ColumnCount() != 1) {
 				throw InvalidInputException("distributed extension write '%s' result schema changed while scanning",
-				                            info.write_name);
+				                            WriteName(info));
 			}
 			for (idx_t row = 0; row < chunk.size(); row++) {
 				auto value = chunk.GetValue(0, row);
 				if (value.IsNull()) {
 					throw InvalidInputException("distributed extension write '%s' returned a NULL task envelope",
-					                            info.write_name);
+					                            WriteName(info));
 				}
 				auto result = DistributedWriteTaskResult::DeserializeFromBytes(StringValue::Get(value));
 				if (result.operation_id != operation.operation_id || result.capability != info.capability ||
-				    result.fragment_codec != info.fragment_codec ||
-				    result.fragment_codec_version != info.fragment_codec_version) {
+				    result.fragment_codec != info.fragment_codec) {
 					throw InvalidInputException(
-					    "distributed extension write '%s' received a mismatched task result protocol", info.write_name);
+					    "distributed extension write '%s' received a mismatched task result protocol", WriteName(info));
 				}
 				if (!task_attempt_ids.insert(result.task_attempt_id).second) {
 					throw InvalidInputException(
-					    "distributed extension write '%s' selected task attempt '%s' more than once", info.write_name,
+					    "distributed extension write '%s' selected task attempt '%s' more than once", WriteName(info),
 					    result.task_attempt_id);
 				}
 				for (const auto &fragment : result.fragments) {
 					if (!fragment_ids.insert(fragment.fragment_id).second) {
 						throw InvalidInputException(
-						    "distributed extension write '%s' selected fragment '%s' more than once", info.write_name,
+						    "distributed extension write '%s' selected fragment '%s' more than once", WriteName(info),
 						    fragment.fragment_id);
 					}
 				}

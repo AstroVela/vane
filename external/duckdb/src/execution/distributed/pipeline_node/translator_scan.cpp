@@ -254,7 +254,6 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 		empty_task.kind = ScanTaskKind::EXTENSION;
 		empty_task.extension_capability = capability;
 		empty_task.task_codec = callbacks.task_codec;
-		empty_task.task_codec_version = callbacks.task_codec_version;
 		empty_task.source_task_partition_id = 0;
 		empty_task.Validate();
 		return {std::move(empty_task)};
@@ -263,7 +262,6 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	validation_descriptor.kind = ScanTaskKind::EXTENSION;
 	validation_descriptor.extension_capability = capability;
 	validation_descriptor.task_codec = callbacks.task_codec;
-	validation_descriptor.task_codec_version = callbacks.task_codec_version;
 	validation_descriptor.extension_tasks = std::move(planned_tasks);
 	bool validation_complete_cardinality = true;
 	bool validation_complete_bytes = true;
@@ -315,7 +313,6 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 		descriptor.kind = ScanTaskKind::EXTENSION;
 		descriptor.extension_capability = capability;
 		descriptor.task_codec = callbacks.task_codec;
-		descriptor.task_codec_version = callbacks.task_codec_version;
 		descriptor.source_task_partition_id = result.size();
 		bool complete_cardinality = true;
 		bool complete_bytes = true;

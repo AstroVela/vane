@@ -8,12 +8,14 @@ owns scheduling, transport, and the coordinator transaction boundary; each
 extension continues to own its bind state, scan semantics, artifact production,
 and catalog mutation logic.
 
-An extension participates by registering an explicit distributed manifest and
-implementing the corresponding callback or provider contract. Vane does not
-infer extension behavior, adapt older contracts, or execute unsupported
-extension operators locally.
+An extension participates by attaching a concrete distributed scan contract to
+a normal table function or by registering a concrete distributed write hook.
+The loader derives one internal manifest from those implementations. Extension
+authors do not separately register generic declarations. Vane does not infer
+extension behavior, adapt older contracts, or execute unsupported extension
+operators locally.
 
-The manifest is additional metadata. It does not replace DuckDB's
+The derived manifest is additional metadata. It does not replace DuckDB's
 `ExtensionLoader` registrations. The same extension therefore keeps its
 original scalar, aggregate, table, type, cast, COPY, PRAGMA, collation, secret,
 filesystem, replacement-scan, storage, parser, planner, and optimizer behavior
@@ -42,81 +44,76 @@ that performs its ordinary DuckDB registrations:
 
 ```cpp
 void IcebergExtension::Load(ExtensionLoader &loader) {
-    loader.RegisterDistributedExtension(1);
-
     auto scan_functions = GetIcebergScanFunction(loader);
     TableFunctionDistributedScanCallbacks scan_callbacks;
     scan_callbacks.protocol_version = 1;
-    scan_callbacks.task_codec = "iceberg.scan-task";
-    scan_callbacks.task_codec_version = 1;
+    scan_callbacks.task_codec = {"iceberg.scan-task", 1};
     scan_callbacks.plan = IcebergPlanScanTasks;
     scan_callbacks.prepare_bind = IcebergPrepareWorkerBind;
     scan_callbacks.apply_tasks = IcebergApplyScanTasks;
-    for (auto &function : scan_functions.functions) {
-        function.SetDistributedScanCallbacks(scan_callbacks);
-    }
+    scan_functions.SetDistributedScanCallbacks(std::move(scan_callbacks));
     // This remains the ordinary DuckDB catalog registration. The loader
     // derives and stages the table-function capability from the callbacks.
     loader.RegisterFunction(std::move(scan_functions));
 
-    // A FILE_ARTIFACT provider declares only the operator capability.
-    loader.RegisterDistributedOperator("iceberg_write_files", 1);
-    // A CALLBACK provider also registers its complete worker sink contract.
-    DistributedWriteOperatorExtension::Register(
-        loader, {"iceberg_write_fragments", 1, IcebergWriteCallbacks()});
+    DistributedWriteOperatorExtension write;
+    write.name = "iceberg_write_fragments";
+    write.protocol_version = 1;
+    write.mode = DistributedWriteMode::CALLBACK;
+    write.fragment_codec = {"iceberg.commit-fragment", 1};
+    write.callbacks = IcebergWriteCallbacks();
+    DistributedWriteOperatorExtension::Register(loader, std::move(write));
 }
 ```
 
-The extension-level version identifies the manifest schema. Each capability
-also has its own protocol version so scan and write contracts can evolve
-independently. Names and versions are stable wire identities, not display
-labels.
+Each concrete capability owns a protocol version so scan and write contracts
+can evolve independently. Names and versions are stable wire identities, not
+display labels. The current registry accepts only implemented hook kinds:
+distributed table scans and distributed write operators. It has no public
+placeholder API for hypothetical aggregate, COPY, storage, or context
+protocols.
 
-A capability declaration is discovery and validation metadata; it does not by
-itself make an unsupported operator distributable. The extension must still
-implement the corresponding execution contract. The current framework enforces
-table-function scan callbacks and coordinator-owned write providers, while the
-remaining groups provide stable identities for worker-safe registrations and
-subsequent contracts.
-
-The available capability groups are table function, aggregate function, COPY
-function, operator, storage, and context. These groups describe where the
-extension adds distributed behavior rather than duplicating every DuckDB
-registration:
+Ordinary DuckDB registrations remain available on every statically linked
+worker:
 
 - ordinary worker-safe scalar functions, types, casts, and collations use their
   normal DuckDB registrations after the exact extension is loaded;
-- table sources add portable task enumeration, detached bind serialization, and
-  worker task application;
-- distributed aggregates add portable partial-state and merge behavior;
-- COPY, storage, and custom write operators add worker artifact and
-  coordinator commit behavior;
-- context capabilities transport required settings, secrets, or filesystem
-  state;
+- table sources that require distributed partitioning add portable task
+  enumeration, detached bind serialization, and worker task application;
+- custom write roots add either the fixed file adapter or a worker fragment
+  sink plus coordinator commit behavior;
 - replacement scans and parser, planner, and optimizer hooks normally run on
   the coordinator; any custom physical operator they produce still needs an
-  explicit distributed operator capability.
+  implemented distributed hook.
 
 `ExtensionLoader` automatically stages a table-function capability when the
 normally registered `TableFunction` carries distributed scan callbacks. The
-extension name, extension protocol, function name, and capability kind are
-derived rather than repeated by the extension author. It stages the complete
-manifest while the extension loads and publishes it only when loading finalizes
-successfully. Duplicate extension declarations, duplicate capability
-identities, zero protocol versions, mixed distributed/native-only overloads,
-and non-canonical names are rejected.
+extension name, function name, and capability kind are derived rather than
+repeated by the extension author. A write hook similarly receives its extension
+identity from the loader. The loader stages every concrete contract and
+publishes the manifest and write implementations atomically only when loading
+finalizes successfully. Duplicate identities, zero protocol versions, mixed
+distributed/native-only overloads, incomplete callbacks, and non-canonical
+names are rejected.
+
+`DistributedWriteOperatorExtension` is a hook type, not another loadable
+`Extension`: it has no `Load`, `Name`, or `Version` lifecycle. The one top-level
+extension owns it and registers it from that extension's existing `Load`
+method, matching DuckDB's `OperatorExtension`, `ParserExtension`,
+`PlannerExtension`, and `OptimizerExtension` layering.
 
 ## Build and loading
 
 The connection snapshot records the content-derived DuckDB `SourceID`, every
-loaded static extension name and exact extension version, and the complete
-sorted distributed manifest. A worker first validates its `SourceID`, invokes
-DuckDB's generated static loader, compares the loaded extension identities, and
-then compares the registered manifests before deserializing a plan. Dynamically
+loaded static extension name and exact extension version, and a sorted list of
+canonical distributed contract identities. A worker first validates its
+`SourceID`, invokes DuckDB's generated static loader, compares the loaded
+extension identities, and then compares the registered contracts before
+deserializing a plan. Dynamically
 installed extension binaries are not accepted by distributed execution.
 
 The snapshot schema is strict. Legacy name-only extension lists, absent
-manifest data, extra worker manifests, and any protocol mismatch are rejected.
+contract data, extra worker contracts, and any protocol mismatch are rejected.
 This validation occurs before task scheduling.
 
 The snapshot also carries serializable DuckDB secrets and the declarations of
@@ -177,12 +174,13 @@ and the table function's catalog name. No second table-function registration is
 required, and native DuckDB continues to execute the original bind/init/scan
 callbacks.
 
-Each envelope contains a stable task ID, opaque payload bytes, optional binary
-artifacts with their own codec identities, and optional cardinality/byte
-estimates. Vane serializes the envelope with DuckDB's binary serializer but does
-not interpret its payload or artifacts. File-backed and non-file extensions use
-the same envelope; `OpenFileInfo` is reserved for the engine-owned MultiFile
-path.
+Each envelope contains a stable task ID, one opaque payload, and optional
+cardinality/byte estimates. The task codec describes the complete extension
+payload. An adapter that needs paths, delete vectors, credentials, partition
+metadata, or other fat task state serializes all of it inside that payload.
+Vane serializes the outer envelope with DuckDB's binary serializer but never
+interprets the payload. File-backed and non-file extensions use the same
+envelope; `OpenFileInfo` is reserved for the engine-owned MultiFile path.
 
 Extensions may return per-task byte and cardinality estimates for balancing.
 Vane never opens or parses an extension payload to infer those estimates, even
@@ -209,9 +207,11 @@ original file list is never retained as a worker fallback.
 
 `ExtensionWriteTaskProvider` is the coordinator-side contract exposed by the
 extension's ordinary physical root. That root is never serialized or run on a
-worker. Its immutable `DistributedExtensionWriteInfo` selects one of two strict
-worker protocols and carries the exact operator capability, fragment codec, and
-opaque worker bind bytes.
+worker. It returns only a `DistributedExtensionWritePlan`: the extension name,
+write-operator name, and opaque dynamic worker bind bytes. Vane resolves the
+mode, capability protocol, fragment codec, and worker callbacks from the
+database-local immutable `DistributedWriteOperatorExtension`. A physical plan
+cannot override that static contract.
 
 `PlanRunner` validates the capability, codec, provider, and worker callback
 contract before translation, task selection, or artifact creation. There is no
@@ -240,7 +240,8 @@ without invoking the provider again.
 
 `CALLBACK` supports extensions whose worker output is a commit fragment rather
 than DuckDB's file-statistics row. `DistributedWriteOperatorExtension::Register`
-registers a write hook containing five mandatory worker callbacks:
+registers one complete hook containing its mode, protocol, codec, and five
+mandatory worker callbacks:
 `initialize_global`, `initialize_local`, `sink`, `combine`, and `finalize`.
 Like DuckDB's parser, planner, optimizer, storage, and operator extension hooks,
 this is deliberately separate from catalog-function registration. The
@@ -334,10 +335,11 @@ For distributed table-function scan callbacks:
 
 For every distributed write provider:
 
-- return the exact registered operator capability identity;
-- return a complete immutable `DistributedExtensionWriteInfo` with a stable
-  diagnostic name, explicit mode, exact fragment codec, and portable worker
-  bind bytes;
+- return a `DistributedExtensionWritePlan` containing the exact registered
+  extension/operator key and portable dynamic worker bind bytes;
+- register the mode, protocol, codec, and callbacks once in the static
+  `DistributedWriteOperatorExtension`; do not duplicate them in the physical
+  provider;
 - validate all catalog and output preconditions before workers start;
 - use the supplied stable operation ID as the root of the complete speculative
   artifact namespace, including when no worker envelope is returned;
@@ -365,7 +367,7 @@ For callback-mode worker code:
   to make speculative retries independently identifiable and deterministic;
 - keep artifact creation worker-local and catalog mutation coordinator-only;
 - report exact row and byte counts and stable fragment and artifact IDs;
-- make the registered codec match `DistributedExtensionWriteInfo` exactly.
+- encode every fragment according to the registered opaque codec.
 
 Both scan callbacks and write providers require normal and fault-tolerant
 distributed tests before an extension is enabled in release builds.
@@ -373,7 +375,7 @@ distributed tests before an extension is enabled in release builds.
 ## Failure rules
 
 - Unknown or non-static extension names in a connection snapshot are rejected.
-- DuckDB source, static extension version, and distributed manifest mismatches
+- DuckDB source, static extension version, and distributed contract mismatches
   are rejected before planning or scheduling.
 - A callback/provider whose capability identity was not registered is rejected
   before task enumeration or write validation.
@@ -399,8 +401,8 @@ distributed tests before an extension is enabled in release builds.
 
 ## Framework test matrix
 
-The engine-level suite covers scan callback discovery, opaque scan task and
-artifact serialization, detached worker bind serde, task subset application,
+The engine-level suite covers scan callback discovery, opaque fat-task payload
+serialization, detached worker bind serde, task subset application,
 empty assignments, schema validation, file and callback write translation,
 write callback execution, binary fragment and artifact envelopes, runtime
 operation/task-attempt identity, pre-write validation, selected-result propagation,

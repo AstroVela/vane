@@ -43,18 +43,6 @@ public:
 	//! Set the description of the extension
 	DUCKDB_API void SetDescription(const string &description);
 
-	//! Declare the extension's additional distributed protocol. This does not
-	//! alter its ordinary DuckDB registrations or native execution path.
-	DUCKDB_API void RegisterDistributedExtension(idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
-	                                              const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedOperator(const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedStorage(const string &capability_name, idx_t protocol_version);
-	DUCKDB_API void RegisterDistributedContext(const string &capability_name, idx_t protocol_version);
-
-public:
 	//! Register a new scalar function - merge overloads if the function already exists
 	DUCKDB_API void RegisterFunction(ScalarFunction function);
 	DUCKDB_API void RegisterFunction(ScalarFunctionSet function);
@@ -116,6 +104,7 @@ public:
 
 private:
 	void FinalizeLoad();
+	DistributedExtensionManifest &GetOrCreateDistributedManifest();
 	unique_ptr<DistributedExtensionManifest> BindDistributedTableFunctions(TableFunctionSet &functions);
 	void RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension);
 
@@ -125,7 +114,7 @@ private:
 	string extension_description;
 	optional_ptr<ExtensionInfo> extension_info;
 	unique_ptr<DistributedExtensionManifest> distributed_manifest;
-	vector<pair<DistributedExtensionCapability, DistributedExtensionWriteCallbacks>> distributed_write_callbacks;
+	vector<shared_ptr<const DistributedWriteOperatorExtension>> distributed_write_operators;
 };
 
 } // namespace duckdb

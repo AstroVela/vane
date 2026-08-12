@@ -35,7 +35,6 @@ using namespace duckdb;
 
 namespace {
 
-static constexpr idx_t DISTRIBUTED_TEST_EXTENSION_PROTOCOL = 1;
 static constexpr idx_t DISTRIBUTED_TEST_SCAN_PROTOCOL = 1;
 static constexpr idx_t DISTRIBUTED_TEST_TASK_CODEC_VERSION = 1;
 static constexpr idx_t DISTRIBUTED_TEST_WRITE_PROTOCOL = 1;
@@ -103,6 +102,30 @@ static string FragmentArtifact(idx_t task_id) {
 	return result;
 }
 
+static string FragmentTaskEnvelope(idx_t task_id) {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "fragment", FragmentPayload(task_id));
+	serializer.WriteProperty(2, "delete_vector", FragmentArtifact(task_id));
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+}
+
+static pair<string, string> DecodeFragmentTaskEnvelope(const string &payload) {
+	if (payload.empty()) {
+		throw InvalidInputException("distributed test fragment envelope is empty");
+	}
+	auto *data = reinterpret_cast<data_ptr_t>(const_cast<char *>(payload.data()));
+	MemoryStream stream(data, payload.size());
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto fragment = deserializer.ReadProperty<string>(1, "fragment");
+	auto delete_vector = deserializer.ReadProperty<string>(2, "delete_vector");
+	deserializer.End();
+	return {std::move(fragment), std::move(delete_vector)};
+}
+
 static idx_t ParseTaskId(const string &task_id, const string &prefix) {
 	if (!StringUtil::StartsWith(task_id, prefix)) {
 		throw InvalidInputException("distributed test task '%s' does not start with '%s'", task_id, prefix);
@@ -131,21 +154,19 @@ static idx_t ParseTaskId(const string &task_id, const string &prefix) {
 static DistributedExtensionCapabilityReference DistributedTestCapability() {
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = "distributed_test";
-	reference.extension_protocol_version = DISTRIBUTED_TEST_EXTENSION_PROTOCOL;
 	reference.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	reference.capability.name = "distributed_test_scan";
 	reference.capability.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
 	return reference;
 }
 
-static DistributedExtensionCapabilityReference DistributedTestWriteCapability() {
-	DistributedExtensionCapabilityReference reference;
-	reference.extension_name = "distributed_test";
-	reference.extension_protocol_version = DISTRIBUTED_TEST_EXTENSION_PROTOCOL;
-	reference.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-	reference.capability.name = DISTRIBUTED_TEST_WRITE_NAME;
-	reference.capability.protocol_version = DISTRIBUTED_TEST_WRITE_PROTOCOL;
-	return reference;
+static bool SyntheticExtensionHasContractIdentity(DistributedExtensionManager &manager, const string &identity) {
+	for (const auto &registered : manager.GetContractIdentities()) {
+		if (registered == identity) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string DistributedTestWriteBindData() {
@@ -215,8 +236,7 @@ static vector<DistributedWriteFragment> DistributedTestWriteFinalize(ClientConte
 	DistributedWriteArtifact artifact;
 	artifact.artifact_id = "manifest";
 	artifact.uri = "synthetic-write://" + task.operation_id + "/" + task.task_attempt_id;
-	artifact.codec = "distributed-test.manifest";
-	artifact.codec_version = 1;
+	artifact.codec = {"distributed-test.manifest", 1};
 	artifact.payload.push_back('\0');
 	artifact.payload += "rows=" + std::to_string(global_state.row_count);
 
@@ -232,8 +252,6 @@ static vector<DistributedWriteFragment> DistributedTestWriteFinalize(ClientConte
 
 static DistributedExtensionWriteCallbacks DistributedTestWriteCallbacks() {
 	DistributedExtensionWriteCallbacks callbacks;
-	callbacks.fragment_codec = DISTRIBUTED_TEST_WRITE_CODEC;
-	callbacks.fragment_codec_version = DISTRIBUTED_TEST_WRITE_CODEC_VERSION;
 	callbacks.initialize_global = DistributedTestWriteInitializeGlobal;
 	callbacks.initialize_local = DistributedTestWriteInitializeLocal;
 	callbacks.sink = DistributedTestWriteSink;
@@ -242,15 +260,26 @@ static DistributedExtensionWriteCallbacks DistributedTestWriteCallbacks() {
 	return callbacks;
 }
 
-static DistributedExtensionWriteInfo DistributedTestWriteInfo() {
-	DistributedExtensionWriteInfo info;
-	info.capability = DistributedTestWriteCapability();
-	info.write_name = DISTRIBUTED_TEST_WRITE_NAME;
-	info.mode = DistributedWriteMode::CALLBACK;
-	info.fragment_codec = DISTRIBUTED_TEST_WRITE_CODEC;
-	info.fragment_codec_version = DISTRIBUTED_TEST_WRITE_CODEC_VERSION;
-	info.worker_bind_data = DistributedTestWriteBindData();
-	return info;
+static DistributedWriteOperatorExtension DistributedTestWriteOperator() {
+	DistributedWriteOperatorExtension result;
+	result.name = DISTRIBUTED_TEST_WRITE_NAME;
+	result.protocol_version = DISTRIBUTED_TEST_WRITE_PROTOCOL;
+	result.mode = DistributedWriteMode::CALLBACK;
+	result.fragment_codec = {DISTRIBUTED_TEST_WRITE_CODEC, DISTRIBUTED_TEST_WRITE_CODEC_VERSION};
+	result.callbacks = DistributedTestWriteCallbacks();
+	return result;
+}
+
+static distributed::DistributedExtensionWritePlan DistributedTestWritePlan() {
+	distributed::DistributedExtensionWritePlan result;
+	result.extension_name = "distributed_test";
+	result.operator_name = DISTRIBUTED_TEST_WRITE_NAME;
+	result.worker_bind_data = DistributedTestWriteBindData();
+	return result;
+}
+
+static DistributedExtensionWriteInfo ResolveDistributedTestWriteInfo(ClientContext &context) {
+	return distributed::ResolveDistributedExtensionWriteInfo(context, DistributedTestWritePlan());
 }
 
 static unique_ptr<FunctionData> DistributedTestScanBind(ClientContext &, TableFunctionBindInput &input,
@@ -348,12 +377,7 @@ static vector<DistributedScanTask> DistributedTestPlanTasks(const TableFunctionD
 		} else {
 			task.task_id = "fragment-" + std::to_string(runtime_task.task_id);
 			task.estimated_bytes = optional_idx(2048 + runtime_task.task_id);
-			DistributedScanTaskArtifact artifact;
-			artifact.name = "delete-vector";
-			artifact.codec = "distributed-test.delete-vector";
-			artifact.codec_version = 1;
-			artifact.data = runtime_task.artifact;
-			task.artifacts.push_back(std::move(artifact));
+			task.payload = FragmentTaskEnvelope(runtime_task.task_id);
 		}
 		result.push_back(std::move(task));
 	}
@@ -367,21 +391,17 @@ static void DistributedTestApplyTasks(FunctionData &worker_bind_data, const vect
 	for (const auto &task : tasks) {
 		if (StringUtil::StartsWith(task.task_id, "file-")) {
 			auto task_id = ParseTaskId(task.task_id, "file-");
-			if (task.payload != FileResource(task_id) || !task.artifacts.empty()) {
+			if (task.payload != FileResource(task_id)) {
 				throw InvalidInputException("invalid distributed test file task '%s'", task.task_id);
 			}
 			validated_tasks.push_back({task_id, task.payload, string()});
 		} else {
 			auto task_id = ParseTaskId(task.task_id, "fragment-");
-			if (task.payload != FragmentPayload(task_id) || task.artifacts.size() != 1) {
+			auto fragment = DecodeFragmentTaskEnvelope(task.payload);
+			if (fragment.first != FragmentPayload(task_id) || fragment.second != FragmentArtifact(task_id)) {
 				throw InvalidInputException("invalid distributed test opaque fragment task '%s'", task.task_id);
 			}
-			const auto &artifact = task.artifacts[0];
-			if (artifact.name != "delete-vector" || artifact.codec != "distributed-test.delete-vector" ||
-			    artifact.codec_version != 1 || artifact.data != FragmentArtifact(task_id)) {
-				throw InvalidInputException("invalid distributed test artifact for task '%s'", task.task_id);
-			}
-			validated_tasks.push_back({task_id, task.payload, artifact.data});
+			validated_tasks.push_back({task_id, std::move(fragment.first), std::move(fragment.second)});
 		}
 	}
 	bind_data.tasks = std::move(validated_tasks);
@@ -394,8 +414,7 @@ static TableFunction DistributedTestScanFunction() {
 	function.deserialize = DistributedTestScanDeserialize;
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
-	callbacks.task_codec = DISTRIBUTED_TEST_SCAN_CODEC;
-	callbacks.task_codec_version = DISTRIBUTED_TEST_TASK_CODEC_VERSION;
+	callbacks.task_codec = {DISTRIBUTED_TEST_SCAN_CODEC, DISTRIBUTED_TEST_TASK_CODEC_VERSION};
 	callbacks.plan = DistributedTestPlanTasks;
 	callbacks.prepare_bind = DistributedTestPrepareWorkerBind;
 	callbacks.apply_tasks = DistributedTestApplyTasks;
@@ -406,10 +425,8 @@ static TableFunction DistributedTestScanFunction() {
 class DistributedTestExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
-		loader.RegisterDistributedExtension(DISTRIBUTED_TEST_EXTENSION_PROTOCOL);
 		loader.RegisterFunction(DistributedTestScanFunction());
-		DistributedWriteOperatorExtension::Register(
-		    loader, {DISTRIBUTED_TEST_WRITE_NAME, DISTRIBUTED_TEST_WRITE_PROTOCOL, DistributedTestWriteCallbacks()});
+		DistributedWriteOperatorExtension::Register(loader, DistributedTestWriteOperator());
 	}
 
 	string Name() override {
@@ -487,11 +504,10 @@ TEST_CASE("Distributed synthetic extension registers one native scan and transpo
 	REQUIRE_NO_FAIL(*native_result);
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
 
-	DistributedExtensionManifest manifest;
 	auto &coordinator_manager = DistributedExtensionManager::Get(*coordinator_db.instance);
-	REQUIRE(coordinator_manager.TryGetExtension("distributed_test", manifest));
-	REQUIRE(manifest.CanonicalIdentity() ==
-	        "distributed_test@1{table_function:distributed_test_scan@1,operator:distributed_test_opaque_write@1}");
+	REQUIRE(SyntheticExtensionHasContractIdentity(
+	    coordinator_manager,
+	    "distributed_test{table_function:distributed_test_scan@1,write_operator:distributed_test_opaque_write@1}"));
 
 	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(1)", 3);
 	REQUIRE(planned.tasks.size() == 1);
@@ -502,12 +518,11 @@ TEST_CASE("Distributed synthetic extension registers one native scan and transpo
 	REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
 	REQUIRE(descriptor.files.empty());
 	REQUIRE(descriptor.extension_capability == DistributedTestCapability());
-	REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_SCAN_CODEC);
-	REQUIRE(descriptor.task_codec_version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
+	REQUIRE(descriptor.task_codec.name == DISTRIBUTED_TEST_SCAN_CODEC);
+	REQUIRE(descriptor.task_codec.version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
 	REQUIRE(descriptor.extension_tasks.size() == 1);
 	REQUIRE(descriptor.extension_tasks[0].task_id == "file-0");
 	REQUIRE(descriptor.extension_tasks[0].payload == FileResource(0));
-	REQUIRE(descriptor.extension_tasks[0].artifacts.empty());
 	REQUIRE(descriptor.estimated_cardinality == 1);
 	REQUIRE(descriptor.estimated_bytes == 1024);
 
@@ -590,7 +605,7 @@ TEST_CASE("Distributed synthetic extension registers one native scan and transpo
 	                    Catch::Matchers::Contains("worker rebind is not supported"));
 }
 
-TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragments and binary artifacts",
+TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fat fragment payloads",
           "[distributed][extension][extension-scan]") {
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
@@ -606,20 +621,20 @@ TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragment
 		const auto &descriptor = planned.tasks[task_index];
 		REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
 		REQUIRE(descriptor.files.empty());
-		REQUIRE(descriptor.task_codec == DISTRIBUTED_TEST_SCAN_CODEC);
+		REQUIRE(descriptor.task_codec.name == DISTRIBUTED_TEST_SCAN_CODEC);
+		REQUIRE(descriptor.task_codec.version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
 		REQUIRE(descriptor.extension_tasks.size() == 1);
 		const auto &task = descriptor.extension_tasks[0];
 		if (task_index % 2 == 0) {
 			REQUIRE(task.task_id == "file-" + std::to_string(task_index));
 			REQUIRE(task.payload == FileResource(task_index));
-			REQUIRE(task.artifacts.empty());
 		} else {
 			REQUIRE(task.task_id == "fragment-" + std::to_string(task_index));
-			REQUIRE(task.payload == FragmentPayload(task_index));
-			REQUIRE(task.payload[0] == '\0');
-			REQUIRE(task.artifacts.size() == 1);
-			REQUIRE(task.artifacts[0].data == FragmentArtifact(task_index));
-			REQUIRE(task.artifacts[0].data[1] == '\0');
+			auto fragment = DecodeFragmentTaskEnvelope(task.payload);
+			REQUIRE(fragment.first == FragmentPayload(task_index));
+			REQUIRE(fragment.first[0] == '\0');
+			REQUIRE(fragment.second == FragmentArtifact(task_index));
+			REQUIRE(fragment.second[1] == '\0');
 		}
 	}
 
@@ -629,7 +644,7 @@ TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragment
 	REQUIRE(merged.source_task_partition_id == DConstants::INVALID_INDEX);
 	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(merged.SerializeToBytes());
 	REQUIRE(roundtrip.extension_tasks.size() == 2);
-	REQUIRE(roundtrip.extension_tasks[1].artifacts[0].data == FragmentArtifact(1));
+	REQUIRE(DecodeFragmentTaskEnvelope(roundtrip.extension_tasks[1].payload).second == FragmentArtifact(1));
 
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
@@ -644,7 +659,7 @@ TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragment
 	REQUIRE(assigned_bind.tasks[1].artifact == FragmentArtifact(1));
 
 	auto mismatched = planned.tasks[2];
-	mismatched.task_codec = "distributed-test.invalid-task";
+	mismatched.task_codec = {"distributed-test.invalid-task", 1};
 	REQUIRE_THROWS_WITH(roundtrip.Merge(std::move(mismatched)),
 	                    Catch::Matchers::Contains("different protocol identities"));
 	auto duplicate_merge_target = planned.tasks[0];
@@ -659,7 +674,7 @@ TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fragment
 	auto &mismatched_worker_scan = mismatched_worker_plan->Root().Cast<PhysicalTableScan>();
 	mismatched_worker_scan.extra_info.scan_node_id = optional_idx(12);
 	auto mismatched_assignment = planned.tasks[1];
-	mismatched_assignment.task_codec = "distributed-test.invalid-task";
+	mismatched_assignment.task_codec = {"distributed-test.invalid-task", 1};
 	unordered_map<idx_t, distributed::ScanTaskDescriptor> mismatched_tasks;
 	mismatched_tasks.emplace(12, std::move(mismatched_assignment));
 	string mismatch_error;
@@ -715,14 +730,14 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	REQUIRE_NOTHROW(operation.Validate());
 
 	DistributedExtensionWriteInfo info;
-	info.capability = DistributedTestWriteCapability();
-	info.write_name = "distributed_test_file_write";
+	info.capability.extension_name = "distributed_test";
+	info.capability.capability = {DistributedExtensionCapabilityKind::WRITE_OPERATOR, "distributed_test_file_write", 1};
 	info.mode = DistributedWriteMode::FILE_ARTIFACT;
-	info.fragment_codec = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC;
-	info.fragment_codec_version = distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION;
+	info.fragment_codec = {distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC,
+	                       distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION};
 	auto invalid_info = info;
 	invalid_info.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	REQUIRE_THROWS_WITH(invalid_info.Validate(), Catch::Matchers::Contains("must be an operator"));
+	REQUIRE_THROWS_WITH(invalid_info.Validate(), Catch::Matchers::Contains("must be a write operator"));
 
 	distributed::DistributedCopyFileInfo file;
 	file.staging_path = "synthetic-stage://part-0.parquet";
@@ -747,7 +762,7 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	auto roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
 	auto invalid_result = roundtrip;
 	invalid_result.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	REQUIRE_THROWS_WITH(invalid_result.Validate(), Catch::Matchers::Contains("not an operator"));
+	REQUIRE_THROWS_WITH(invalid_result.Validate(), Catch::Matchers::Contains("not a write operator"));
 	auto decoded = distributed::DecodeDistributedFileWriteResults(info, operation, {roundtrip});
 	REQUIRE(decoded.size() == 1);
 	REQUIRE(decoded[0].staging_path == file.staging_path);
@@ -758,7 +773,7 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	REQUIRE(decoded[0].column_statistics == file.column_statistics);
 	REQUIRE(decoded[0].partition_keys == file.partition_keys);
 
-	roundtrip.fragments[0].artifacts[0].codec = "distributed-test.invalid-file";
+	roundtrip.fragments[0].artifacts[0].codec = {"distributed-test.invalid-file", 1};
 	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, operation, {roundtrip}),
 	                    Catch::Matchers::Contains("invalid file artifact"));
 	roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
@@ -776,10 +791,12 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection worker(worker_db);
-	auto info = DistributedTestWriteInfo();
-	auto callbacks = DistributedExtensionManager::Get(*worker_db.instance).GetWriteCallbacks(info.capability);
-	callbacks->Validate(info.capability.CanonicalIdentity());
-	REQUIRE(callbacks->fragment_codec == DISTRIBUTED_TEST_WRITE_CODEC);
+	auto info = ResolveDistributedTestWriteInfo(*worker.context);
+	auto write_operator = DistributedExtensionManager::Get(*worker_db.instance).GetWriteOperator(info.capability);
+	const auto &callbacks = write_operator->callbacks;
+	callbacks.Validate(info.capability.CanonicalIdentity());
+	REQUIRE(write_operator->fragment_codec.name == DISTRIBUTED_TEST_WRITE_CODEC);
+	REQUIRE(write_operator->fragment_codec.version == DISTRIBUTED_TEST_WRITE_CODEC_VERSION);
 
 	DistributedWriteTaskContext missing_task_context;
 	REQUIRE_THROWS_WITH(missing_task_context.Validate(), Catch::Matchers::Contains("operation identity"));
@@ -788,10 +805,10 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	const DistributedWriteTaskContext task_context {"query-1", "fragment-2.partition-3.attempt-4"};
 	REQUIRE_NOTHROW(task_context.Validate());
 	distributed::DistributedWriteOperationContext operation {task_context.operation_id};
-	auto global_state = callbacks->initialize_global(*worker.context, info, task_context);
+	auto global_state = callbacks.initialize_global(*worker.context, info, task_context);
 	ThreadContext thread_context(*worker.context);
 	ExecutionContext execution_context(*worker.context, thread_context, nullptr);
-	auto local_state = callbacks->initialize_local(execution_context, info, task_context, *global_state);
+	auto local_state = callbacks.initialize_local(execution_context, info, task_context, *global_state);
 
 	DataChunk input;
 	input.Initialize(Allocator::DefaultAllocator(), {LogicalType::UBIGINT});
@@ -799,9 +816,9 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	input.SetValue(0, 1, Value::UBIGINT(5));
 	input.SetValue(0, 2, Value::UBIGINT(6));
 	input.SetCardinality(3);
-	callbacks->sink(execution_context, info, task_context, *global_state, *local_state, input);
-	callbacks->combine(execution_context, info, task_context, *global_state, *local_state);
-	auto fragments = callbacks->finalize(*worker.context, info, task_context, *global_state);
+	callbacks.sink(execution_context, info, task_context, *global_state, *local_state, input);
+	callbacks.combine(execution_context, info, task_context, *global_state, *local_state);
+	auto fragments = callbacks.finalize(*worker.context, info, task_context, *global_state);
 	REQUIRE(fragments.size() == 1);
 	REQUIRE(fragments[0].row_count == 3);
 	REQUIRE(fragments[0].byte_count == 3 * sizeof(uint64_t));
@@ -813,7 +830,6 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	DistributedWriteTaskResult task_result;
 	task_result.capability = info.capability;
 	task_result.fragment_codec = info.fragment_codec;
-	task_result.fragment_codec_version = info.fragment_codec_version;
 	task_result.operation_id = task_context.operation_id;
 	task_result.task_attempt_id = task_context.task_attempt_id;
 	task_result.fragments = std::move(fragments);
@@ -1006,7 +1022,7 @@ TEST_CASE("Distributed synthetic extension composes opaque scan and write callba
 	                 .Cast<PhysicalTableScan>();
 	scan.extra_info.scan_node_id = optional_idx(21);
 	scan.extra_info.scan_group_id = optional_idx(21);
-	auto info = DistributedTestWriteInfo();
+	auto info = ResolveDistributedTestWriteInfo(*connection.context);
 	auto &write =
 	    execution_plan->Make<PhysicalDistributedExtensionWrite>(info, 3).Cast<PhysicalDistributedExtensionWrite>();
 	write.children.push_back(scan);

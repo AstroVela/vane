@@ -40,8 +40,7 @@ struct ScanTaskDescriptor {
 	vector<OpenFileInfo> files;
 	//! Used only by a TableFunction with explicit distributed scan callbacks.
 	DistributedExtensionCapabilityReference extension_capability;
-	string task_codec;
-	idx_t task_codec_version = 0;
+	DistributedPayloadCodec task_codec;
 	vector<DistributedScanTask> extension_tasks;
 	idx_t estimated_cardinality = 0;
 	idx_t estimated_bytes = 0;

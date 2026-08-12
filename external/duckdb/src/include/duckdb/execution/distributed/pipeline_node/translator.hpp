@@ -58,6 +58,7 @@ private:
 	PlanConfig plan_config_;
 	int pipeline_node_id_counter_ = 0;
 	DuckPhysicalPlanRef plan_;
+	ClientContext *client_context_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
 
 	int get_next_pipeline_node_id() {

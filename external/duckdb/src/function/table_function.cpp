@@ -7,6 +7,8 @@
 #include "duckdb/function/table_function.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 
 namespace duckdb {
 
@@ -20,6 +22,30 @@ PartitionStatistics::PartitionStatistics() : row_start(0), count(0), count_type(
 }
 
 TableFunctionInfo::~TableFunctionInfo() {
+}
+
+void DistributedScanTask::Validate() const {
+	if (task_id.empty()) {
+		throw SerializationException("distributed extension scan task has an empty task_id");
+	}
+}
+
+void DistributedScanTask::Serialize(Serializer &serializer) const {
+	Validate();
+	serializer.WriteProperty(1, "task_id", task_id);
+	serializer.WriteProperty(2, "payload", payload);
+	serializer.WriteProperty(3, "estimated_cardinality", estimated_cardinality);
+	serializer.WriteProperty(4, "estimated_bytes", estimated_bytes);
+}
+
+DistributedScanTask DistributedScanTask::Deserialize(Deserializer &deserializer) {
+	DistributedScanTask result;
+	result.task_id = deserializer.ReadProperty<string>(1, "task_id");
+	result.payload = deserializer.ReadProperty<string>(2, "payload");
+	result.estimated_cardinality = deserializer.ReadProperty<optional_idx>(3, "estimated_cardinality");
+	result.estimated_bytes = deserializer.ReadProperty<optional_idx>(4, "estimated_bytes");
+	result.Validate();
+	return result;
 }
 
 TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, table_function_t function_,
@@ -103,15 +129,7 @@ void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &fun
 		throw InvalidInputException(
 		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
-	if (task_codec.empty()) {
-		throw InvalidInputException("Distributed scan task codec for table function '%s' must not be empty",
-		                            function_name);
-	}
-	if (task_codec_version == 0) {
-		throw InvalidInputException("Distributed scan task codec version for table function '%s' must be greater than "
-		                            "zero",
-		                            function_name);
-	}
+	task_codec.Validate("Distributed scan task codec for table function '" + function_name + "'");
 }
 
 void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
@@ -128,20 +146,13 @@ void TableFunctionDistributedScanCallbacks::Validate(const string &function_name
 		throw InvalidInputException("Distributed scan capability name '%s' does not match table function '%s'",
 		                            capability.capability.name, function_name);
 	}
-	DistributedExtensionManifest manifest;
-	manifest.extension_name = capability.extension_name;
-	manifest.protocol_version = capability.extension_protocol_version;
-	manifest.capabilities.push_back(capability.capability);
-	DistributedExtensionManager::ValidateManifest(manifest);
+	capability.Validate();
 }
 
-void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name,
-                                                           idx_t extension_protocol_version,
-                                                           const string &function_name) {
+void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name, const string &function_name) {
 	ValidateDefinition(function_name);
 	DistributedExtensionCapabilityReference bound_capability;
 	bound_capability.extension_name = extension_name;
-	bound_capability.extension_protocol_version = extension_protocol_version;
 	bound_capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	bound_capability.capability.name = function_name;
 	bound_capability.capability.protocol_version = protocol_version;
@@ -162,8 +173,8 @@ const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallb
 
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
 	return protocol_version == other.protocol_version && capability == other.capability &&
-	       task_codec == other.task_codec && task_codec_version == other.task_codec_version && plan == other.plan &&
-	       prepare_bind == other.prepare_bind && apply_tasks == other.apply_tasks;
+	       task_codec == other.task_codec && plan == other.plan && prepare_bind == other.prepare_bind &&
+	       apply_tasks == other.apply_tasks;
 }
 
 void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
@@ -171,12 +182,12 @@ void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCall
 	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
 }
 
-void TableFunction::BindDistributedScanCapability(const string &extension_name, idx_t extension_protocol_version) {
+void TableFunction::BindDistributedScanCapability(const string &extension_name) {
 	if (!distributed_scan) {
 		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
 	}
 	auto callbacks = *distributed_scan;
-	callbacks.BindCapability(extension_name, extension_protocol_version, name);
+	callbacks.BindCapability(extension_name, name);
 	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
 }
 

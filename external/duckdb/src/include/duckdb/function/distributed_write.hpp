@@ -27,8 +27,7 @@ enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK = 1 };
 struct DistributedWriteArtifact {
 	string artifact_id;
 	string uri;
-	string codec;
-	idx_t codec_version = 0;
+	DistributedPayloadCodec codec;
 	string payload;
 
 	DUCKDB_API void Validate() const;
@@ -68,8 +67,7 @@ struct DistributedWriteTaskContext {
 //! bytes under a different write operation or extension contract.
 struct DistributedWriteTaskResult {
 	DistributedExtensionCapabilityReference capability;
-	string fragment_codec;
-	idx_t fragment_codec_version = 0;
+	DistributedPayloadCodec fragment_codec;
 	string operation_id;
 	string task_attempt_id;
 	vector<DistributedWriteFragment> fragments;
@@ -88,12 +86,11 @@ struct DistributedWriteTaskResult {
 //! process-local pointer.
 struct DistributedExtensionWriteInfo {
 	DistributedExtensionCapabilityReference capability;
-	string write_name;
 	DistributedWriteMode mode = DistributedWriteMode::FILE_ARTIFACT;
-	string fragment_codec;
-	idx_t fragment_codec_version = 0;
+	DistributedPayloadCodec fragment_codec;
 	string worker_bind_data;
 
+	DUCKDB_API const string &Name() const;
 	DUCKDB_API void Validate() const;
 	DUCKDB_API void Serialize(Serializer &serializer) const;
 	DUCKDB_API static DistributedExtensionWriteInfo Deserialize(Deserializer &deserializer);
@@ -153,8 +150,6 @@ using distributed_write_finalize_t = vector<DistributedWriteFragment> (*)(Client
 //! Complete worker-side streaming write implementation registered by a static
 //! extension. Every callback is mandatory; missing callbacks are hard errors.
 struct DistributedExtensionWriteCallbacks {
-	string fragment_codec;
-	idx_t fragment_codec_version = 0;
 	distributed_write_initialize_global_t initialize_global = nullptr;
 	distributed_write_initialize_local_t initialize_local = nullptr;
 	distributed_write_sink_t sink = nullptr;
@@ -162,17 +157,22 @@ struct DistributedExtensionWriteCallbacks {
 	distributed_write_finalize_t finalize = nullptr;
 
 	DUCKDB_API void Validate(const string &capability_identity) const;
+	DUCKDB_API bool Empty() const;
 };
 
 //! One worker-side distributed write hook. Like DuckDB's OperatorExtension,
-//! this is registered independently from catalog functions. ExtensionLoader is
-//! used so the hook receives the current extension identity and is published
-//! atomically with the extension manifest.
+//! this is not a loadable Extension subclass. A top-level Extension registers
+//! the hook independently from catalog functions. ExtensionLoader supplies the
+//! current extension identity and publishes the hook atomically with the
+//! derived extension manifest.
 struct DistributedWriteOperatorExtension {
 	string name;
 	idx_t protocol_version = 0;
+	DistributedWriteMode mode = DistributedWriteMode::FILE_ARTIFACT;
+	DistributedPayloadCodec fragment_codec;
 	DistributedExtensionWriteCallbacks callbacks;
 
+	DUCKDB_API void Validate(const string &capability_identity) const;
 	DUCKDB_API static void Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension);
 };
 

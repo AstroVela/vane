@@ -941,101 +941,34 @@ static void LoadStaticRayExtensions(duckdb::Connection &conn, const vector<Stati
 	}
 }
 
-static py::list CaptureDistributedExtensionManifests(DatabaseInstance &database) {
-	py::list manifests_obj;
-	for (const auto &manifest : DistributedExtensionManager::Get(database).GetExtensions()) {
-		py::dict manifest_obj;
-		manifest_obj[py::str("extension_name")] = py::str(manifest.extension_name);
-		manifest_obj[py::str("protocol_version")] = py::int_(manifest.protocol_version);
-		py::list capabilities_obj;
-		for (const auto &capability : manifest.capabilities) {
-			py::dict capability_obj;
-			capability_obj[py::str("kind")] = py::str(DistributedExtensionCapabilityKindToString(capability.kind));
-			capability_obj[py::str("name")] = py::str(capability.name);
-			capability_obj[py::str("protocol_version")] = py::int_(capability.protocol_version);
-			capabilities_obj.append(std::move(capability_obj));
-		}
-		manifest_obj[py::str("capabilities")] = std::move(capabilities_obj);
-		manifests_obj.append(std::move(manifest_obj));
+static py::list CaptureDistributedExtensionContracts(DatabaseInstance &database) {
+	py::list result;
+	for (const auto &identity : DistributedExtensionManager::Get(database).GetContractIdentities()) {
+		result.append(py::str(identity));
 	}
-	return manifests_obj;
+	return result;
 }
 
-static idx_t ParsePositiveProtocolVersion(const py::dict &entry, const char *field_name, const string &identity) {
-	auto field = py::str(field_name);
-	if (!entry.contains(field) || !py::isinstance<py::int_>(entry[field]) || py::isinstance<py::bool_>(entry[field])) {
-		throw InvalidInputException("Connection snapshot %s must contain a non-boolean integer %s", identity,
-		                            field_name);
+static vector<string> ParseDistributedExtensionContracts(const py::dict &snapshot) {
+	auto key = py::str("distributed_extension_contracts");
+	if (!snapshot.contains(key) || !py::isinstance<py::list>(snapshot[key])) {
+		throw InvalidInputException("Connection snapshot distributed_extension_contracts must be a list");
 	}
-	auto value = entry[field].cast<int64_t>();
-	if (value <= 0) {
-		throw InvalidInputException("Connection snapshot %s %s must be greater than zero", identity, field_name);
+	vector<string> result;
+	set<string> identities;
+	for (auto item : snapshot[key].cast<py::list>()) {
+		if (!py::isinstance<py::str>(item)) {
+			throw InvalidInputException("Connection snapshot distributed extension contract must be a string");
+		}
+		auto identity = item.cast<string>();
+		if (identity.empty() || !identities.insert(identity).second) {
+			throw InvalidInputException(
+			    "Connection snapshot distributed extension contracts must be non-empty and unique");
+		}
+		result.push_back(std::move(identity));
 	}
-	return NumericCast<idx_t>(value);
-}
-
-static vector<DistributedExtensionManifest> ParseDistributedExtensionManifests(const py::dict &snapshot) {
-	if (!snapshot.contains(py::str("distributed_extensions")) ||
-	    !py::isinstance<py::list>(snapshot[py::str("distributed_extensions")])) {
-		throw InvalidInputException("Connection snapshot distributed_extensions must be a list");
-	}
-	vector<DistributedExtensionManifest> manifests;
-	set<string> extension_names;
-	for (auto item : snapshot[py::str("distributed_extensions")].cast<py::list>()) {
-		if (!py::isinstance<py::dict>(item)) {
-			throw InvalidInputException("Connection snapshot distributed extension entry must be a dict");
-		}
-		auto manifest_obj = py::reinterpret_borrow<py::dict>(item);
-		if (!manifest_obj.contains(py::str("extension_name")) ||
-		    !py::isinstance<py::str>(manifest_obj[py::str("extension_name")])) {
-			throw InvalidInputException("Connection snapshot distributed extension is missing extension_name");
-		}
-		DistributedExtensionManifest manifest;
-		manifest.extension_name = manifest_obj[py::str("extension_name")].cast<string>();
-		if (manifest.extension_name.empty() || !extension_names.insert(manifest.extension_name).second) {
-			throw InvalidInputException("Connection snapshot has an empty or duplicate distributed extension name");
-		}
-		manifest.protocol_version =
-		    ParsePositiveProtocolVersion(manifest_obj, "protocol_version", "distributed extension");
-		if (!manifest_obj.contains(py::str("capabilities")) ||
-		    !py::isinstance<py::list>(manifest_obj[py::str("capabilities")])) {
-			throw InvalidInputException("Connection snapshot distributed extension capabilities must be a list");
-		}
-		set<string> capability_identities;
-		for (auto capability_item : manifest_obj[py::str("capabilities")].cast<py::list>()) {
-			if (!py::isinstance<py::dict>(capability_item)) {
-				throw InvalidInputException("Connection snapshot distributed extension capability must be a dict");
-			}
-			auto capability_obj = py::reinterpret_borrow<py::dict>(capability_item);
-			if (!capability_obj.contains(py::str("kind")) ||
-			    !py::isinstance<py::str>(capability_obj[py::str("kind")]) ||
-			    !capability_obj.contains(py::str("name")) ||
-			    !py::isinstance<py::str>(capability_obj[py::str("name")])) {
-				throw InvalidInputException(
-				    "Connection snapshot distributed extension capability is missing kind or name");
-			}
-			DistributedExtensionCapability capability;
-			auto kind = capability_obj[py::str("kind")].cast<string>();
-			capability.kind = DistributedExtensionCapabilityKindFromString(kind);
-			capability.name = capability_obj[py::str("name")].cast<string>();
-			if (capability.name.empty()) {
-				throw InvalidInputException(
-				    "Connection snapshot distributed extension capability name must not be empty");
-			}
-			capability.protocol_version =
-			    ParsePositiveProtocolVersion(capability_obj, "protocol_version", "distributed extension capability");
-			auto capability_identity = kind + ":" + capability.name;
-			if (!capability_identities.insert(capability_identity).second) {
-				throw InvalidInputException("Connection snapshot has duplicate distributed extension capability '%s'",
-				                            capability_identity);
-			}
-			manifest.capabilities.push_back(std::move(capability));
-		}
-		DistributedExtensionManager::ValidateManifest(manifest);
-		manifests.push_back(std::move(manifest));
-	}
-	std::sort(manifests.begin(), manifests.end());
-	return manifests;
+	std::sort(result.begin(), result.end());
+	return result;
 }
 
 static string SerializeSecretForSnapshot(duckdb::ClientContext &context, const BaseSecret &secret) {
@@ -1334,7 +1267,7 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	}
 	snapshot_obj[py::str("extensions")] = std::move(extensions_obj);
 	auto &source_database = DatabaseInstance::GetDatabase(*conn_wrapper.con.GetConnection().context);
-	snapshot_obj[py::str("distributed_extensions")] = CaptureDistributedExtensionManifests(source_database);
+	snapshot_obj[py::str("distributed_extension_contracts")] = CaptureDistributedExtensionContracts(source_database);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
 	snapshot_obj[py::str("secrets")] = CaptureSecretSnapshot(conn_wrapper);
 	snapshot_obj[py::str("attached_databases")] = CaptureAttachedDatabaseSnapshot(conn_wrapper);
@@ -1436,7 +1369,7 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		extensions.push_back(std::move(extension));
 	}
 	std::sort(extensions.begin(), extensions.end());
-	auto distributed_extensions = ParseDistributedExtensionManifests(snapshot);
+	auto distributed_extension_contracts = ParseDistributedExtensionContracts(snapshot);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
 	// Snapshot replay starts a new unit of work on this Python cursor. Close a
 	// partially consumed DB-API result before touching ClientContext directly;
@@ -1451,7 +1384,7 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	}
 	LoadStaticRayExtensions(conn, extensions);
 	DistributedExtensionManager::Get(DatabaseInstance::GetDatabase(*conn.context))
-	    .ValidateExact(distributed_extensions);
+	    .ValidateExact(distributed_extension_contracts);
 	if (options.apply_secrets) {
 		ApplySecretSnapshot(*conn.context, snapshot);
 	}

@@ -82,6 +82,12 @@ TableFunction TableFunctionSet::GetFunctionByArguments(ClientContext &context, c
 	return GetFunctionByOffset(index.GetIndex());
 }
 
+void TableFunctionSet::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
+	for (auto &function : functions) {
+		function.SetDistributedScanCallbacks(callbacks);
+	}
+}
+
 PragmaFunctionSet::PragmaFunctionSet(string name) : FunctionSet(std::move(name)) {
 }
 

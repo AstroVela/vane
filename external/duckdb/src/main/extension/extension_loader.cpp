@@ -34,52 +34,13 @@ void ExtensionLoader::SetDescription(const string &description) {
 	extension_description = description;
 }
 
-void ExtensionLoader::RegisterDistributedExtension(idx_t protocol_version) {
-	if (distributed_manifest) {
-		throw InvalidInputException("Distributed extension '%s' is already declared by this loader", extension_name);
-	}
-	auto manifest = make_uniq<DistributedExtensionManifest>();
-	manifest->extension_name = extension_name;
-	manifest->protocol_version = protocol_version;
-	DistributedExtensionManager::ValidateManifest(*manifest);
-	distributed_manifest = std::move(manifest);
-}
-
-void ExtensionLoader::RegisterDistributedCapability(DistributedExtensionCapabilityKind kind,
-                                                    const string &capability_name, idx_t protocol_version) {
-	if (kind == DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
-		throw InvalidInputException(
-		    "Distributed table function '%s' must attach callbacks to its normal RegisterFunction registration",
-		    capability_name);
-	}
+DistributedExtensionManifest &ExtensionLoader::GetOrCreateDistributedManifest() {
 	if (!distributed_manifest) {
-		throw InvalidInputException("Distributed extension '%s' must be declared before capability '%s'",
-		                            extension_name, capability_name);
+		auto manifest = make_uniq<DistributedExtensionManifest>();
+		manifest->extension_name = extension_name;
+		distributed_manifest = std::move(manifest);
 	}
-	DistributedExtensionCapability capability;
-	capability.kind = kind;
-	capability.name = capability_name;
-	capability.protocol_version = protocol_version;
-	distributed_manifest->capabilities.push_back(std::move(capability));
-	try {
-		DistributedExtensionManager::ValidateManifest(*distributed_manifest);
-	} catch (...) {
-		distributed_manifest->capabilities.pop_back();
-		throw;
-	}
-}
-
-void ExtensionLoader::RegisterDistributedAggregateFunction(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::AGGREGATE_FUNCTION, capability_name,
-	                              protocol_version);
-}
-
-void ExtensionLoader::RegisterDistributedCopyFunction(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::COPY_FUNCTION, capability_name, protocol_version);
-}
-
-void ExtensionLoader::RegisterDistributedOperator(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::OPERATOR, capability_name, protocol_version);
+	return *distributed_manifest;
 }
 
 void DistributedWriteOperatorExtension::Register(ExtensionLoader &loader, DistributedWriteOperatorExtension extension) {
@@ -87,32 +48,22 @@ void DistributedWriteOperatorExtension::Register(ExtensionLoader &loader, Distri
 }
 
 void ExtensionLoader::RegisterDistributedWriteOperatorExtension(DistributedWriteOperatorExtension extension) {
-	if (!distributed_manifest) {
-		throw InvalidInputException("Distributed extension '%s' must be declared before write capability '%s'",
-		                            extension_name, extension.name);
-	}
+	auto &manifest = GetOrCreateDistributedManifest();
 	DistributedExtensionCapability capability;
-	capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
+	capability.kind = DistributedExtensionCapabilityKind::WRITE_OPERATOR;
 	capability.name = extension.name;
 	capability.protocol_version = extension.protocol_version;
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = extension_name;
-	reference.extension_protocol_version = distributed_manifest->protocol_version;
 	reference.capability = capability;
-	extension.callbacks.Validate(reference.CanonicalIdentity());
-	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+	reference.Validate();
+	extension.Validate(reference.CanonicalIdentity());
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
 	candidate_manifest->capabilities.push_back(capability);
 	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
-	distributed_write_callbacks.emplace_back(std::move(capability), std::move(extension.callbacks));
+	distributed_write_operators.push_back(
+	    make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(extension)));
 	distributed_manifest = std::move(candidate_manifest);
-}
-
-void ExtensionLoader::RegisterDistributedStorage(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::STORAGE, capability_name, protocol_version);
-}
-
-void ExtensionLoader::RegisterDistributedContext(const string &capability_name, idx_t protocol_version) {
-	RegisterDistributedCapability(DistributedExtensionCapabilityKind::CONTEXT, capability_name, protocol_version);
 }
 
 void ExtensionLoader::FinalizeLoad() {
@@ -123,15 +74,8 @@ void ExtensionLoader::FinalizeLoad() {
 		extension_info->load_info = std::move(info);
 	}
 	if (distributed_manifest) {
-		auto &manager = DistributedExtensionManager::Get(db);
-		manager.RegisterManifest(*distributed_manifest);
-		for (auto &entry : distributed_write_callbacks) {
-			DistributedExtensionCapabilityReference reference;
-			reference.extension_name = extension_name;
-			reference.extension_protocol_version = distributed_manifest->protocol_version;
-			reference.capability = entry.first;
-			manager.RegisterWriteCallbacks(reference, std::move(entry.second));
-		}
+		DistributedExtensionManager::Get(db).RegisterExtension(*distributed_manifest,
+		                                                       std::move(distributed_write_operators));
 	}
 }
 
@@ -202,6 +146,11 @@ unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFu
 		callback_count++;
 		const auto &callbacks = function.GetDistributedScanCallbacks();
 		callbacks.ValidateDefinition(functions.name);
+		if (!function.HasSerializationCallbacks()) {
+			throw InvalidInputException(
+			    "Distributed table function '%s' must define serialize and deserialize callbacks before registration",
+			    functions.name);
+		}
 		if (protocol_version == 0) {
 			protocol_version = callbacks.protocol_version;
 		} else if (protocol_version != callbacks.protocol_version) {
@@ -238,17 +187,13 @@ unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFu
 		throw InvalidInputException("Distributed table function '%s' cannot add callbacks to native-only overloads",
 		                            functions.name);
 	}
-	if (!distributed_manifest) {
-		throw InvalidInputException(
-		    "Distributed extension '%s' must be declared before distributed table function '%s'", extension_name,
-		    functions.name);
-	}
+	auto &manifest = GetOrCreateDistributedManifest();
 
 	DistributedExtensionCapability capability;
 	capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	capability.name = functions.name;
 	capability.protocol_version = protocol_version;
-	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
 	bool capability_exists = false;
 	for (const auto &registered : candidate_manifest->capabilities) {
 		if (registered.kind != capability.kind || registered.name != capability.name) {
@@ -269,7 +214,6 @@ unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFu
 
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = extension_name;
-	reference.extension_protocol_version = distributed_manifest->protocol_version;
 	reference.capability = capability;
 	if (existing_entry) {
 		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
@@ -282,7 +226,7 @@ unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFu
 		}
 	}
 	for (auto &function : functions.functions) {
-		function.BindDistributedScanCapability(extension_name, distributed_manifest->protocol_version);
+		function.BindDistributedScanCapability(extension_name);
 	}
 	return candidate_manifest;
 }

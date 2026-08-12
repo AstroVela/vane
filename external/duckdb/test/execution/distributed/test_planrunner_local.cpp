@@ -170,23 +170,16 @@ public:
 	ReplayTestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                                 PhysicalOperatorType operator_type = PhysicalOperatorType::EXTENSION)
 	    : PhysicalOperator(physical_plan, operator_type, std::move(types), 0) {
-		info.capability.extension_name = "replay_test_extension";
-		info.capability.extension_protocol_version = 1;
-		info.capability.capability.kind = DistributedExtensionCapabilityKind::OPERATOR;
-		info.capability.capability.name = "write";
-		info.capability.capability.protocol_version = 1;
-		info.write_name = "replay_test_extension";
-		info.mode = DistributedWriteMode::FILE_ARTIFACT;
-		info.fragment_codec = DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC;
-		info.fragment_codec_version = DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION;
+		plan.extension_name = "replay_test_extension";
+		plan.operator_name = "write";
 	}
 
 	optional_ptr<ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
 		return this;
 	}
 
-	const DistributedExtensionWriteInfo &WriteInfo() const override {
-		return info;
+	const DistributedExtensionWritePlan &WritePlan() const override {
+		return plan;
 	}
 
 	void ValidateDistributedWrite(ClientContext &, const DistributedWriteOperationContext &operation) const override {
@@ -223,7 +216,7 @@ public:
 	bool fail_validation = false;
 
 private:
-	DistributedExtensionWriteInfo info;
+	DistributedExtensionWritePlan plan;
 };
 
 string PlanRunnerSQLStringLiteral(const string &value) {
@@ -234,9 +227,15 @@ void RegisterReplayTestExtension(DatabaseInstance &db) {
 	auto &manager = DistributedExtensionManager::Get(db);
 	DistributedExtensionManifest manifest;
 	manifest.extension_name = "replay_test_extension";
-	manifest.protocol_version = 1;
-	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::OPERATOR, "write", 1});
-	manager.RegisterManifest(manifest);
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, "write", 1});
+	DistributedWriteOperatorExtension write_operator;
+	write_operator.name = "write";
+	write_operator.protocol_version = 1;
+	write_operator.mode = DistributedWriteMode::FILE_ARTIFACT;
+	write_operator.fragment_codec = {DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC,
+	                                 DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION};
+	manager.RegisterExtension(manifest,
+	                          {make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(write_operator))});
 }
 
 void WritePlanRunnerTestFile(FileSystem &fs, const string &path, const string &contents) {
@@ -522,7 +521,7 @@ TEST_CASE("PlanRunner replays a committed extension write without coordinator or
 	REQUIRE(replay.value().tag == PlanRunner::PlanResult::EXTENSION_WRITE);
 	REQUIRE(replay.value().extension_write_result.file_result.output_committed);
 	REQUIRE(replay.value().extension_write_result.catalog_committed);
-	REQUIRE(replay.value().extension_write_result.info.write_name == "replay_test_extension");
+	REQUIRE(replay.value().extension_write_result.info.Name() == "write");
 	REQUIRE(replay.value().extension_write_result.rows_written == 7);
 	REQUIRE(replay.value().extension_write_result.selected_task_results.size() == 1);
 	REQUIRE(replay.value().extension_write_result.selected_task_results[0].operation_id == query_id);

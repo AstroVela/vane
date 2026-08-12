@@ -55,7 +55,7 @@ namespace distributed {
 PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(PlanConfig plan_config,
                                                                            DuckPhysicalPlanRef plan,
                                                                            ClientContext *client_context)
-    : plan_config_(std::move(plan_config)), plan_(std::move(plan)),
+    : plan_config_(std::move(plan_config)), plan_(std::move(plan)), client_context_(client_context),
       exchange_mgr_(std::make_shared<FlightExchangeManager>(ResolveFlightExchangeConfigFromEnv(), client_context)) {
 }
 
@@ -329,22 +329,24 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			    "Distributed pipeline does not support extension operator without an extension write provider: %s",
 			    op.GetName());
 		}
-		const auto &write_info = provider->WriteInfo();
+		if (!client_context_) {
+			throw InvalidInputException("Distributed extension write requires a ClientContext");
+		}
+		auto write_info = ResolveDistributedExtensionWriteInfo(*client_context_, provider->WritePlan());
 		write_info.Validate();
 		if (&op != &plan_->Root()) {
 			throw InvalidInputException("Distributed extension write %s must be the physical plan root",
-			                            write_info.write_name);
+			                            write_info.Name());
 		}
 		if (children.size() != 1 || !children[0]) {
-			throw InvalidInputException("Distributed extension write %s requires exactly one child",
-			                            write_info.write_name);
+			throw InvalidInputException("Distributed extension write %s requires exactly one child", write_info.Name());
 		}
 		if (write_info.mode == DistributedWriteMode::FILE_ARTIFACT) {
 			auto copy_finish = std::dynamic_pointer_cast<CopyFinishNode>(children[0]->inner());
 			if (!copy_finish) {
 				throw InvalidInputException(
 				    "Distributed file-artifact write %s requires a COPY child returning written-file statistics",
-				    write_info.write_name);
+				    write_info.Name());
 			}
 			// The extension root is coordinator-only. Workers execute the translated
 			// COPY child and return the fixed file-artifact envelope.
@@ -352,7 +354,7 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			return;
 		}
 		if (write_info.mode != DistributedWriteMode::CALLBACK) {
-			throw InvalidInputException("Distributed extension write %s has an unknown mode", write_info.write_name);
+			throw InvalidInputException("Distributed extension write %s has an unknown mode", write_info.Name());
 		}
 		auto write_sink =
 		    std::make_shared<ExtensionWriteSinkNode>(get_next_pipeline_node_id(), children[0], write_info);
