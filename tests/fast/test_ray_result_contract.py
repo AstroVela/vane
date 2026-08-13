@@ -831,13 +831,12 @@ def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
             await asyncio.sleep(0.001)
         assert started.is_set()
 
-        task.cancel()
+        assert task.cancel() is True
         await asyncio.sleep(0)
         assert task.done() is False
-        task.cancel()
+        assert task.cancel() is True
         await asyncio.sleep(0)
         assert task.done() is False
-        assert task.cancelling() == 2
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -893,13 +892,12 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
             await asyncio.sleep(0.001)
         assert started.is_set()
 
-        task.cancel()
+        assert task.cancel() is True
         await asyncio.sleep(0)
         assert task.done() is False
-        task.cancel()
+        assert task.cancel() is True
         await asyncio.sleep(0)
         assert task.done() is False
-        assert task.cancelling() == 2
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -3726,18 +3724,27 @@ def test_expired_client_reclamation_joins_plan_startup_before_session_close(monk
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
     monkeypatch.setattr(cls, "_release_query_resources", lambda *_args, **_kwargs: None)
 
+    class _CancelCountingTask(asyncio.Task):
+        def __init__(self, coroutine):
+            super().__init__(coroutine)
+            self.cancel_calls = 0
+
+        def cancel(self, *args, **kwargs):
+            self.cancel_calls += 1
+            return super().cancel(*args, **kwargs)
+
     async def _expire_during_startup():
-        run_task = asyncio.create_task(_run_actor_stream_plan(runner, logical_plan))
+        run_task = _CancelCountingTask(_run_actor_stream_plan(runner, logical_plan))
         assert await asyncio.to_thread(startup_started.wait, 1.0)
         query_connection = runner._test_session_connection.cursors[-1]
         runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1.0
         cls._schedule_expired_client_reclamations(runner)
         cleanup_task = runner._expired_client_cleanup_tasks[_TEST_RUNTIME_OWNER_ID]
         for _ in range(100):
-            if run_task.cancelling():
+            if run_task.cancel_calls:
                 break
             await asyncio.sleep(0.001)
-        assert run_task.cancelling() == 1
+        assert run_task.cancel_calls == 1
         assert run_task.done() is False
         assert cleanup_task.done() is False
         assert query_connection.closed is False
@@ -3750,7 +3757,7 @@ def test_expired_client_reclamation_joins_plan_startup_before_session_close(monk
 
     query_connection, run_task = asyncio.run(_expire_during_startup())
 
-    assert run_task.cancelling() == 1
+    assert run_task.cancel_calls == 1
     assert query_connection.closed is True
     assert pool.shutdown_calls == 1
     assert runner._active_vllm_actors == []
