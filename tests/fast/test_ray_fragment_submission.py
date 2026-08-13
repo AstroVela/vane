@@ -3511,6 +3511,8 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
     }
     assert sum(worker["running_attempt_count"] for worker in before["workers"].values()) == 2
     assert sum(worker["terminal_attempt_count"] for worker in before["workers"].values()) == 1
+    assert sum(worker.fte_query_partition_assignment_count("query-drop") for worker in (handle0, handle1)) == 1
+    assert sum(worker.fte_query_partition_assignment_count("query-keep") for worker in (handle0, handle1)) == 1
 
     assert handle0.fte_drop_query("query-drop") == {
         "tasks_removed": 1,
@@ -3530,6 +3532,8 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
     }
     assert sum(worker["running_attempt_count"] for worker in after["workers"].values()) == 1
     assert sum(worker["terminal_attempt_count"] for worker in after["workers"].values()) == 0
+    assert all(worker.fte_query_partition_assignment_count("query-drop") == 0 for worker in (handle0, handle1))
+    assert sum(worker.fte_query_partition_assignment_count("query-keep") for worker in (handle0, handle1)) == 1
     assert all(
         "query-drop" not in attempt
         for worker in (handle0, handle1)
@@ -5846,8 +5850,8 @@ def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch
 def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
     actor0 = _FakeActor()
     actor1 = _FakeActor()
-    high_memory = RayWorkerActorHandle(actor0, memory_capacity_bytes=20, worker_id="worker-0")
-    low_memory = RayWorkerActorHandle(actor1, memory_capacity_bytes=20, worker_id="worker-1")
+    high_memory = RayWorkerActorHandle(actor0, memory_capacity_bytes=30, worker_id="worker-0")
+    low_memory = RayWorkerActorHandle(actor1, memory_capacity_bytes=30, worker_id="worker-1")
 
     high_memory.reserve_fte_partition(
         "query-pressure",
@@ -5861,15 +5865,125 @@ def test_fte_owner_selection_uses_reserved_memory_pressure(monkeypatch):
         1,
         memory_requirement_bytes=5,
     )
+    for partition_id in (2, 3):
+        low_memory.reserve_fte_partition(
+            "query-pressure",
+            "fragment",
+            partition_id,
+        )
+        low_memory.release_fte_partition_reservation(
+            "query-pressure",
+            "fragment",
+            partition_id,
+        )
 
-    selected = high_memory._select_fte_worker(memory_requirement_bytes=10)
+    selected = high_memory._select_fte_worker(query_id="query-pressure", memory_requirement_bytes=10)
 
     assert selected is low_memory
+    assert high_memory.fte_query_partition_assignment_count("query-pressure") == 1
+    assert low_memory.fte_query_partition_assignment_count("query-pressure") == 3
     assert high_memory.fte_pressure_stats()["reserved_memory_bytes"] == 15
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 15
     high_memory.release_fte_partition_reservation("query-pressure", "fragment", 0)
     assert high_memory.fte_pressure_stats()["reserved_memory_bytes"] == 0
     assert high_memory.fte_pressure_stats()["total_memory_bytes"] == 0
+
+
+def test_fte_sequential_partition_admission_balances_query_assignments():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    query_id = "query-sequential-fairness"
+    fragment_id = _install_manual_test_fragment(query_id, "7", partition_count=3)
+    selected_workers = []
+
+    for partition_id in range(3):
+        reservation = first_worker._fte_worker_placement_manager.acquire(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=partition_id,
+            memory_requirement_bytes=10,
+        )
+        selected_workers.append(reservation.worker)
+        first_worker._fte_worker_placement_manager.release(
+            query_id=query_id,
+            fragment_id=fragment_id,
+            partition_id=partition_id,
+        )
+
+    assert selected_workers == [first_worker, second_worker, first_worker]
+    assert first_worker.fte_query_partition_assignment_count(query_id) == 2
+    assert second_worker.fte_query_partition_assignment_count(query_id) == 1
+    assert first_worker.fte_pressure_stats()["reserved_partition_count"] == 0
+    assert second_worker.fte_pressure_stats()["reserved_partition_count"] == 0
+
+
+def test_fte_partition_assignment_fairness_is_query_scoped():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    for partition_id in range(3):
+        first_worker.reserve_fte_partition(
+            "query-old",
+            "fragment",
+            partition_id,
+        )
+        first_worker.release_fte_partition_reservation(
+            "query-old",
+            "fragment",
+            partition_id,
+        )
+
+    assert first_worker._select_fte_worker(query_id="query-new") is first_worker
+    assert first_worker._select_fte_worker(query_id="query-old") is second_worker
+
+
+def test_fte_partition_assignment_fairness_spans_fragments_in_one_query():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-1",
+    )
+    first_worker.reserve_fte_partition("query-multi-fragment", "fragment-a", 0)
+    first_worker.release_fte_partition_reservation("query-multi-fragment", "fragment-a", 0)
+
+    selected = first_worker._select_fte_worker(query_id="query-multi-fragment")
+
+    assert selected is second_worker
+    assert first_worker.fte_query_partition_assignment_count("query-multi-fragment") == 1
+
+
+def test_fte_partition_assignment_history_is_retry_idempotent():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="worker-0",
+    )
+
+    for _ in range(3):
+        handle.reserve_fte_partition("query-retry", "fragment", 0)
+        handle.release_fte_partition_reservation("query-retry", "fragment", 0)
+
+    assert handle.fte_query_partition_assignment_count("query-retry") == 1
 
 
 def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
@@ -6067,12 +6181,25 @@ def test_fte_owner_selection_prefers_node_requirement_host(monkeypatch):
         worker_id="manager-a:node-b:0",
         host="zzz",
     )
+    for partition_id in range(3):
+        matching.reserve_fte_partition(
+            "query-node-requirement",
+            "fragment",
+            partition_id,
+        )
+        matching.release_fte_partition_reservation(
+            "query-node-requirement",
+            "fragment",
+            partition_id,
+        )
 
     selected = non_matching._select_fte_worker(
+        query_id="query-node-requirement",
         node_requirements=NodeRequirements(host="zzz"),
     )
 
     assert selected is matching
+    assert matching.fte_query_partition_assignment_count("query-node-requirement") == 3
 
 
 def test_fte_worker_registry_rejects_duplicate_worker_identity():
@@ -6109,7 +6236,26 @@ def test_fte_worker_selection_stays_with_manager_scope():
         manager_instance_id="manager-b",
     )
 
-    assert current._select_fte_worker() is current
+    assert current._select_fte_worker(query_id="query-manager-scope") is current
+
+
+def test_fte_worker_selection_requires_query_identity():
+    current = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(ValueError, match="worker selection requires query_id"):
+        current._select_fte_worker(query_id="")
+    with pytest.raises(ValueError, match="replacement worker selection requires query_id"):
+        fte_fragment_scheduler_mod._select_replacement_fte_worker(
+            "manager-a:failed:0",
+            query_id="",
+            exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+            manager_instance_id="manager-a",
+        )
 
 
 def test_fte_registry_stats_exposes_worker_topology():
@@ -6195,11 +6341,45 @@ def test_fte_worker_failure_replacement_stays_with_manager_scope():
 
     replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
         "manager-a:failed:0",
+        query_id="query-replacement-manager-scope",
         exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
         manager_instance_id="manager-a",
     )
 
     assert replacement is same_manager
+
+
+def test_fte_worker_failure_replacement_uses_query_scoped_fairness():
+    first_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:0",
+        manager_instance_id="manager-a",
+    )
+    second_worker = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-b:0",
+        manager_instance_id="manager-a",
+    )
+    first_worker.reserve_fte_partition("query-old", "fragment", 0)
+    first_worker.release_fte_partition_reservation("query-old", "fragment", 0)
+
+    new_query_replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
+        "manager-a:failed:0",
+        query_id="query-new",
+        exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+        manager_instance_id="manager-a",
+    )
+    old_query_replacement = fte_fragment_scheduler_mod._select_replacement_fte_worker(
+        "manager-a:failed:0",
+        query_id="query-old",
+        exclude_worker_incarnation_ids={"manager-a:failed:0": "failed-incarnation"},
+        manager_instance_id="manager-a",
+    )
+
+    assert new_query_replacement is first_worker
+    assert old_query_replacement is second_worker
 
 
 def test_fte_worker_quarantine_rejects_cross_manager_identity():
@@ -6739,9 +6919,11 @@ def test_fte_non_remote_node_requirement_requires_matching_host(monkeypatch):
     matching = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="bbb#0")
 
     selected = non_matching._select_fte_worker(
+        query_id="query-non-remote-node",
         node_requirements=NodeRequirements(host="bbb", remotely_accessible=False),
     )
     missing = non_matching._select_fte_worker(
+        query_id="query-non-remote-node",
         node_requirements=NodeRequirements(host="missing", remotely_accessible=False),
     )
 
@@ -6763,11 +6945,13 @@ def test_fte_remote_node_requirement_waits_before_fallback(monkeypatch):
     )
 
     not_expired = fallback._select_fte_worker(
+        query_id="query-locality",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb"),
         node_requirements_wait_started_at=worker_handle_mod.time.time(),
     )
     expired = fallback._select_fte_worker(
+        query_id="query-locality",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb"),
         node_requirements_wait_started_at=worker_handle_mod.time.time() - 61,
@@ -6791,6 +6975,7 @@ def test_fte_non_remote_node_requirement_never_fallback_after_wait(monkeypatch):
     )
 
     selected = fallback._select_fte_worker(
+        query_id="query-locality-hard",
         memory_requirement_bytes=10,
         node_requirements=NodeRequirements(host="bbb", remotely_accessible=False),
         node_requirements_wait_started_at=worker_handle_mod.time.time() - 60,
@@ -11467,6 +11652,12 @@ def test_worker_pressure_drop_uses_exact_query_identity():
     pressure.split_counts_by_attempt.update({parent_attempt: 1, child_attempt: 2})
     pressure.pending_split_counts_by_attempt.update({parent_attempt: 3, child_attempt: 4})
     pressure.reserved_partitions.update({parent_reservation, child_reservation})
+    pressure.assigned_partitions_by_query.update(
+        {
+            parent_reservation[0]: {(parent_reservation[1], parent_reservation[2])},
+            child_reservation[0]: {(child_reservation[1], child_reservation[2])},
+        }
+    )
     pressure.memory_bytes_by_reservation.update({parent_reservation: 10, child_reservation: 20})
 
     pressure.drop_query("q")
@@ -11476,6 +11667,9 @@ def test_worker_pressure_drop_uses_exact_query_identity():
     assert pressure.split_counts_by_attempt == {child_attempt: 2}
     assert pressure.pending_split_counts_by_attempt == {child_attempt: 4}
     assert pressure.reserved_partitions == {child_reservation}
+    assert pressure.assigned_partitions_by_query == {
+        child_reservation[0]: {(child_reservation[1], child_reservation[2])}
+    }
     assert pressure.memory_bytes_by_reservation == {child_reservation: 20}
 
 

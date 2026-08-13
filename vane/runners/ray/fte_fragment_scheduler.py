@@ -1537,10 +1537,11 @@ def _fte_worker_has_memory_capacity(
 def _fte_worker_selection_key(
     handle: RayWorkerActorHandle,
     *,
+    query_id: str,
     memory_requirement_bytes: Any = None,
     execution_class: FteTaskExecutionClass | str | None = None,
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
-) -> tuple[int, int, int, int, int, int, str]:
+) -> tuple[int, int, int, int, int, int, int, str]:
     stats = _required_fte_pressure_stats(handle)
     running = int(stats.get("running_attempt_count", 0)) + int(stats.get("reserved_partition_count", 0))
     current_memory_bytes = _fte_pressure_capacity_memory_bytes(
@@ -1553,6 +1554,7 @@ def _fte_worker_selection_key(
     over_budget = 1 if memory_after_bytes > budget_bytes else 0
     split_bytes = int(stats.get("assigned_split_bytes", 0))
     split_count = int(stats.get("assigned_split_count", 0))
+    query_partition_assignment_count = handle.fte_query_partition_assignment_count(query_id)
     return (
         over_budget,
         _node_requirements_preference_penalty(handle, node_requirements),
@@ -1560,6 +1562,7 @@ def _fte_worker_selection_key(
         memory_after_bytes,
         split_bytes,
         split_count,
+        query_partition_assignment_count,
         str(handle.worker_id),
     )
 
@@ -1579,6 +1582,7 @@ def _worker_matches_failure_incarnation(
 def _select_replacement_fte_worker(
     exclude_worker_id: str | set[str],
     *,
+    query_id: str,
     exclude_worker_incarnation_ids: Mapping[str, str],
     manager_instance_id: str,
     memory_requirement_bytes: Any = None,
@@ -1586,6 +1590,9 @@ def _select_replacement_fte_worker(
     node_requirements: NodeRequirements | Mapping[str, Any] | None = None,
     node_requirements_wait_started_at: float | None = None,
 ) -> RayWorkerActorHandle | None:
+    query_id = str(query_id or "").strip()
+    if not query_id:
+        raise ValueError("FTE replacement worker selection requires query_id")
     exclude_worker_ids = (
         {str(exclude_worker_id)}
         if isinstance(exclude_worker_id, str)
@@ -1627,6 +1634,7 @@ def _select_replacement_fte_worker(
         candidates,
         key=lambda handle: _fte_worker_selection_key(
             handle,
+            query_id=query_id,
             memory_requirement_bytes=memory_requirement_bytes,
             execution_class=execution_class,
             node_requirements=node_requirements,
@@ -2065,6 +2073,7 @@ class FteWorkerPlacementManager:
             if owner is None:
                 try:
                     owner = self.coordinator._select_fte_worker(
+                        query_id=query_id,
                         exclude=set(),
                         memory_requirement_bytes=memory_requirement_bytes,
                         execution_class=execution_class,
@@ -2616,6 +2625,7 @@ def _mark_fte_worker_failed(
         wait_started_at = time.time()
         replacement = _select_replacement_fte_worker(
             failed_worker_ids,
+            query_id=owner_key[0],
             exclude_worker_incarnation_ids=failed_worker_incarnation_ids,
             manager_instance_id=normalized_manager_instance_id,
             memory_requirement_bytes=memory_requirement_bytes,

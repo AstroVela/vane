@@ -124,6 +124,12 @@ class _FteWorkerPressure:
         # for every retry for the lifetime of the query.
         self.terminal_attempt_id_by_task: dict[str, int] = {}
         self.reserved_partitions: set[tuple[str, str, int]] = set()
+        # Retain one entry for every logical partition assigned to this worker
+        # during an active query.  Reservations may be released between
+        # sequential tasks, so live pressure alone cannot provide a stable
+        # fairness tie-breaker.  Query-indexed sets make selection and teardown
+        # cheap while keeping repeated reservations and retries idempotent.
+        self.assigned_partitions_by_query: dict[str, set[tuple[str, int]]] = {}
         self.split_counts_by_attempt: dict[str, int] = {}
         self.split_bytes_by_attempt: dict[str, int] = {}
         self.pending_split_counts_by_attempt: dict[str, int] = {}
@@ -144,6 +150,12 @@ class _FteWorkerPressure:
             int(attempt_id.attempt_id),
             self.terminal_attempt_id_by_task.get(task_key, -1),
         )
+
+    def query_partition_assignment_count(self, query_id: str) -> int:
+        query_key = str(query_id or "").strip()
+        if not query_key:
+            raise ValueError("query partition assignment count requires query_id")
+        return len(self.assigned_partitions_by_query.get(query_key, ()))
 
     def score(self) -> int:
         return (
@@ -244,6 +256,7 @@ class _FteWorkerPressure:
             self.reserved_partitions = {
                 reservation for reservation in self.reserved_partitions if reservation[0] != query_id
             }
+            self.assigned_partitions_by_query.pop(query_id, None)
             self.split_counts_by_attempt = {
                 attempt: count for attempt, count in self.split_counts_by_attempt.items() if not owned_attempt(attempt)
             }
