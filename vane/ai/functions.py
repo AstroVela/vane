@@ -139,6 +139,21 @@ def _validate_on_error(on_error: object) -> _OnError:
     return cast(_OnError, on_error)
 
 
+def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
+    """Reconstruct a pickled :class:`RetryAfterError` from its sanitized state.
+
+    The constructor derives the message and status attributes from an
+    ``original`` exception, so feeding a pickled message back through it would
+    misassign the message string to ``retry_after`` and require re-transporting
+    the original provider error — defeating the sanitization. Rebuild the
+    instance directly from its already-sanitized state instead.
+    """
+    exc = RetryAfterError.__new__(RetryAfterError)
+    exc.args = args
+    exc.__dict__.update(state)
+    return exc
+
+
 class RetryAfterError(Exception):
     """Retryable error carrying the requested wait time (in seconds).
 
@@ -162,6 +177,15 @@ class RetryAfterError(Exception):
                 continue
             if type(value) is int and -999_999 <= value <= 999_999:
                 setattr(self, name, value)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The default BaseException reduction rebuilds via ``__init__(*self.args)``,
+        # which feeds the sanitized message in as ``retry_after`` and regenerates
+        # a generic message — losing the summary across a pickle boundary (Ray
+        # worker -> driver). Rebuild from the already-sanitized instance state
+        # (numeric ``retry_after`` plus whitelisted status attributes) without
+        # re-running constructor sanitization or resurrecting the original error.
+        return (_rebuild_retry_after_error, (self.args, dict(self.__dict__)))
 
 
 def _retry_wait_seconds(exc: Exception, attempt: int) -> float:

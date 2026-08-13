@@ -1269,6 +1269,50 @@ class TestRetryAfterError:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__context__ is None
 
+    def test_retry_after_error_survives_pickling(self):
+        """A RetryAfterError transported across a process boundary (Ray worker →
+        driver) keeps its numeric retry_after, sanitized message, and whitelisted
+        status attributes — and never resurrects the original provider error."""
+        import pickle
+
+        from vane.ai.functions import RetryAfterError, _retry_wait_seconds
+
+        class FakeSDKError(RuntimeError):
+            def __init__(self) -> None:
+                super().__init__("rate limited: sk-SECRET-token")
+                self.status_code = 429
+
+        err = RetryAfterError(retry_after=0.5, original=FakeSDKError())
+        restored = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(restored.retry_after, float)
+        assert restored.retry_after == 0.5
+        # The sanitized summary is preserved verbatim (default pickling degraded
+        # it to the generic "RetryAfterError").
+        assert str(restored) == str(err)
+        assert restored.status_code == 429
+        # Sanitization survives transport: the original's secret-bearing message
+        # is never reconstructed.
+        assert "SECRET" not in str(restored)
+        assert restored.__cause__ is None
+        assert restored.__context__ is None
+        # The numeric delay is still honored after transport.
+        assert _retry_wait_seconds(restored, attempt=0) == 0.5
+
+    def test_retry_after_error_without_original_survives_pickling(self):
+        import pickle
+
+        from vane.ai.functions import RetryAfterError
+
+        err = RetryAfterError(retry_after=3.0)
+        restored = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(restored.retry_after, float)
+        assert restored.retry_after == 3.0
+        assert str(restored) == str(err) == "RetryAfterError"
+        assert not hasattr(restored, "status_code")
+        assert restored.__cause__ is None
+
     @pytest.mark.parametrize("bad", [-1.0, -0.001, float("nan"), float("inf"), 10**400, -(10**400)])
     def test_retry_wait_seconds_rejects_malformed_retry_after(self, bad):
         """A non-finite or negative retry_after never becomes the sleep value (issue #469)."""
