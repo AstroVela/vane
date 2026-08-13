@@ -2646,6 +2646,8 @@ struct PyPhysicalPlanWrapperRunner {
 	py::object run_copy_plan(const PyPhysicalPlanWrapper &plan,
 	                         duckdb::shared_ptr<duckdb::ClientContext> client_context = nullptr,
 	                         duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
+	                             duckdb::distributed::python::ray::SafePyObject(),
+	                         duckdb::distributed::python::ray::SafePyObject on_execution_started =
 	                             duckdb::distributed::python::ray::SafePyObject()) {
 		using namespace duckdb::distributed;
 		(void)py_conn_keepalive;
@@ -2719,10 +2721,18 @@ struct PyPhysicalPlanWrapperRunner {
 				auto run_plan_started = std::chrono::steady_clock::now();
 				py::gil_scoped_release release;
 				DuckDBResult<duckdb::distributed::PlanRunner::PlanResult> plan_res;
+				auto publish_execution_started = [&]() {
+					if (!on_execution_started.has_value()) {
+						return;
+					}
+					py::gil_scoped_acquire acquire;
+					on_execution_started.get()();
+				};
 				if (!client_context) {
-					plan_res = runner->run_plan(plan.plan_);
+					plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started);
 				} else {
-					client_context->RunFunctionInTransaction([&]() { plan_res = runner->run_plan(plan.plan_); });
+					client_context->RunFunctionInTransaction(
+					    [&]() { plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started); });
 				}
 				if (!plan_res.is_ok()) {
 					res = DuckDBResult<DistributedCopyResult>::err(plan_res.error());

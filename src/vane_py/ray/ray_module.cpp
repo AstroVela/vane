@@ -1051,7 +1051,8 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("plan"), py::arg("conn") = py::none())
 	    .def(
 	        "run_copy_plan",
-	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj) -> py::object {
+	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj,
+	           py::object on_execution_started_obj) -> py::object {
 		        if (!py::isinstance<PyPhysicalPlanWrapper>(plan_obj)) {
 			        throw py::type_error("plan must be DistributedPhysicalPlan (PyPhysicalPlanWrapper)");
 		        }
@@ -1101,9 +1102,15 @@ void register_ray_bindings(py::module_ &mod) {
 
 		        duckdb::distributed::python::ray::SafePyObject keepalive;
 		        auto client_context = get_client_context(conn_obj, keepalive);
-		        return self.run_copy_plan(*plan_ptr, client_context, std::move(keepalive));
+		        duckdb::distributed::python::ray::SafePyObject on_execution_started;
+		        if (!on_execution_started_obj.is_none()) {
+			        on_execution_started =
+			            duckdb::distributed::python::ray::SafePyObject(std::move(on_execution_started_obj));
+		        }
+		        return self.run_copy_plan(*plan_ptr, client_context, std::move(keepalive),
+		                                  std::move(on_execution_started));
 	        },
-	        py::arg("plan"), py::arg("conn") = py::none())
+	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
 	    .def(
 	        "finalize_copy",
 	        [](PyPhysicalPlanWrapperRunner &self, py::list file_infos, py::str copy_spec_key, py::str staging_root,

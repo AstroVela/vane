@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, SupportsFloat, SupportsIndex, SupportsInt, overload
 
 from typing_extensions import Never
@@ -40,7 +40,12 @@ class DistributedPhysicalPlanRunner:
     @overload
     def __init__(self, backend: object) -> None: ...
     def run_plan(self, plan: DistributedPhysicalPlan, conn: object | None = ...) -> ResultPartitionStream: ...
-    def run_copy_plan(self, plan: DistributedPhysicalPlan, conn: object | None = ...) -> dict[str, Any]: ...
+    def run_copy_plan(
+        self,
+        plan: DistributedPhysicalPlan,
+        conn: object | None = ...,
+        on_execution_started: Callable[[], None] | None = ...,
+    ) -> dict[str, Any]: ...
     def finalize_copy(
         self,
         file_infos: list[Any],

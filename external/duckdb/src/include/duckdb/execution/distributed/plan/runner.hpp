@@ -498,7 +498,8 @@ public:
 	/// Unified run_plan: auto-detects sink nodes and handles both streaming and finalize paths.
 	/// - Non-sink plans → returns PlanResultStream (streaming pull)
 	/// - Sink plans (CopyFinish) → collects all outputs, calls finalize(), returns DistributedCopyResult
-	DuckDBResult<PlanResult> run_plan(std::shared_ptr<DistributedPhysicalPlan> plan, TaskInputs initial_inputs = {}) {
+	DuckDBResult<PlanResult> run_plan(std::shared_ptr<DistributedPhysicalPlan> plan, TaskInputs initial_inputs = {},
+	                                  std::function<void()> on_execution_started = {}) {
 		if (!client_context_) {
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a ClientContext"));
 		}
@@ -656,6 +657,9 @@ public:
 				output_lifetime_guard.reset();
 			}
 		});
+		if (on_execution_started) {
+			on_execution_started();
+		}
 
 		// ── Step 4: Dispatch based on sink presence ──
 		if (!sink_node) {
