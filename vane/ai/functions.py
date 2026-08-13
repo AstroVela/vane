@@ -167,6 +167,13 @@ def _log_substituted_failure(exc: Exception, *, on_error: _OnError, attempts: in
         logger.warning("vane.ai substituted NULL for a failed provider call: %s", summary)
 
 
+# Sentinel a retry-helper caller can pass as ``default`` to tell an
+# already-logged substituted failure apart from a genuine provider NULL —
+# the two must not be conflated, or a NULL that fails downstream result
+# validation would be swallowed without its own warning.
+_SUBSTITUTED_FAILURE = object()
+
+
 def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
     """Reconstruct a pickled :class:`RetryAfterError` from its sanitized state.
 
@@ -355,17 +362,6 @@ def _retry_after_error(exc: Exception) -> RetryAfterError | None:
     if retry_after is None:
         retry_after = _DEFAULT_RETRY_AFTER_SECONDS
     return RetryAfterError(retry_after=retry_after, original=exc)
-
-
-def _raise_if_retry_after(exc: Exception) -> None:
-    """Re-raise a rate-limited provider error as a :class:`RetryAfterError` when
-    it qualifies (429/503); a no-op otherwise, so the caller re-raises the
-    original error. Lets every HTTP provider honour ``Retry-After`` uniformly
-    (issue #148) by delegating to :func:`_retry_after_error`.
-    """
-    retry_error = _retry_after_error(exc)
-    if retry_error is not None:
-        raise retry_error from None
 
 
 def _retry_call(
@@ -1245,6 +1241,7 @@ class _PromptBatch:
                     row_messages[index],
                     max_retries=max_retries,
                     on_error=on_error,
+                    default=_SUBSTITUTED_FAILURE,
                     on_awaitable=self._mark_loop_bound,
                 )
             except ProviderCapabilityError as exc:
@@ -1258,17 +1255,16 @@ class _PromptBatch:
             if provider_error is not None:
                 provider, model = _descriptor_identity(self._descriptor)
                 raise _safe_provider_execution_error(provider, model, "Prompt execution", provider_error) from None
+            if result is _SUBSTITUTED_FAILURE:
+                # The retry helper already logged this substitution before
+                # returning the sentinel; surface it as a NULL row.
+                return None
             try:
                 return self._validate_result(result)
             except (_ProviderResultError, OutputValidationError, RawResponseSerializationError) as exc:
                 if on_error == "raise":
                     raise
-                # A NULL reaching validation is either a legitimate provider NULL
-                # or an already-logged swallowed failure (the retry helper logged
-                # it before substituting None); only a non-NULL payload that fails
-                # the result contract is a fresh substitution to record here.
-                if result is not None:
-                    _log_substituted_failure(exc, on_error=on_error)
+                _log_substituted_failure(exc, on_error=on_error)
                 return None
 
         async def run_all(indices: list[int]) -> list[str | None]:

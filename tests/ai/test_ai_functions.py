@@ -1273,8 +1273,6 @@ class TestRetryAfterError:
         """A RetryAfterError transported across a process boundary (Ray worker →
         driver) keeps its numeric retry_after, sanitized message, and whitelisted
         status attributes — and never resurrects the original provider error."""
-        import pickle
-
         from vane.ai.functions import RetryAfterError, _retry_wait_seconds
 
         class FakeSDKError(RuntimeError):
@@ -1300,8 +1298,6 @@ class TestRetryAfterError:
         assert _retry_wait_seconds(restored, attempt=0) == 0.5
 
     def test_retry_after_error_without_original_survives_pickling(self):
-        import pickle
-
         from vane.ai.functions import RetryAfterError
 
         err = RetryAfterError(retry_after=3.0)
@@ -1509,8 +1505,10 @@ class TestSharedRetryAfterExtraction:
         err = _retry_after_error(self._error(status=429, headers={"Retry-After": "12"}))
         assert isinstance(err, RetryAfterError)
         assert err.retry_after == 12.0
-        # Sanitization: the original secret-bearing message is not surfaced.
+        # Sanitization: the original secret-bearing message is not surfaced,
+        # while the whitelisted status attribute is carried over.
         assert "SECRET" not in str(err)
+        assert err.status_code == 429
 
     def test_503_without_header_uses_default(self):
         from vane.ai.functions import RetryAfterError, _retry_after_error
@@ -1546,7 +1544,26 @@ class TestSharedRetryAfterExtraction:
         assert err is not None
         assert err.retry_after == 5.0
 
-    def test_header_lookup_is_case_insensitive(self):
+    @pytest.mark.parametrize("response_attr", ["status_code", "status"])
+    def test_status_discovered_from_response_attribute(self, response_attr):
+        """Some SDK errors carry the status only on the attached response."""
+        from unittest.mock import MagicMock
+
+        from vane.ai.functions import _retry_after_error
+
+        exc = RuntimeError("rate limited")
+        response = MagicMock(spec=[response_attr, "headers"])
+        setattr(response, response_attr, 429)
+        response.headers = {"Retry-After": "6"}
+        exc.response = response
+
+        err = _retry_after_error(exc)
+        assert err is not None
+        assert err.retry_after == 6.0
+
+    def test_header_lookup_accepts_lowercase_key(self):
+        """Both header casings providers actually emit are accepted (the exact
+        two lookups Google's extraction always performed)."""
         from vane.ai.functions import _retry_after_error
 
         err = _retry_after_error(self._error(status=429, headers={"retry-after": "8"}))
@@ -1616,6 +1633,11 @@ class TestProviderRetryAfterAdoption:
             asyncio.run(prompter.prompt(("hello",)))
         assert ctx.value.retry_after == 10.0
         assert "SECRET" not in str(ctx.value)
+        # Sanitization parity with the Google provider: the converted error is
+        # raised outside the SDK-error handler, so the raw error is not
+        # retained as __context__.
+        assert ctx.value.__cause__ is None
+        assert ctx.value.__context__ is None
 
     def test_openai_prompt_503_without_header_uses_default(self):
         import asyncio
@@ -1696,6 +1718,19 @@ class TestProviderRetryAfterAdoption:
         with pytest.raises(RetryAfterError) as ctx:
             asyncio.run(prompter.prompt(("hello",)))
         assert ctx.value.retry_after == 7.0
+        assert ctx.value.__cause__ is None
+        assert ctx.value.__context__ is None
+
+    @pytest.mark.parametrize("bad_header", ["-1", "nan", "inf", "later"])
+    def test_anthropic_prompt_malformed_header_uses_default(self, bad_header):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=429, headers={"Retry-After": bad_header}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
 
     def test_anthropic_prompt_503_without_header_uses_default(self):
         import asyncio
@@ -2514,6 +2549,58 @@ class TestSubstitutionLogging:
         assert "_ProviderResultError" in messages[0]
         # The vane-authored detail message is reduced to the class name.
         assert "returned int" not in messages[0]
+
+    def test_prompt_ignore_logs_structured_null_contract_violation(self, caplog):
+        """A provider NULL that violates the structured-output contract is a
+        substitution and must warn — it is not the retry helper's already-logged
+        NULL (regression: the two were conflated and this case was silent)."""
+        import logging
+        from types import SimpleNamespace
+
+        from vane.ai.functions import _PromptBatch
+
+        class Prompter:
+            async def prompt(self, messages):
+                return None  # legitimate provider NULL, illegal for structured output
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(
+            Descriptor(),
+            ["message"],
+            "response",
+            return_format=SimpleNamespace(validate_json=lambda text: text),
+            max_retries=0,
+            on_error="ignore",
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["hello"]}))
+
+        assert result.column("response").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "OutputValidationError" in messages[0]
+
+    def test_embed_ignore_logs_bad_embedding_shape(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(texts):
+            return [[1.0, 2.0]] * len(texts)  # wrong width: contract expects 3
+
+        wrapper = _EmbedTextBatch(
+            self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="ignore"
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"text": ["a"]}))
+
+        assert result.column("emb").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "_ProviderResultError" in messages[0]
 
 
 # ---------------------------------------------------------------------------
