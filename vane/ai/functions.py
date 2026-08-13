@@ -142,22 +142,29 @@ def _validate_on_error(on_error: object) -> _OnError:
     return cast(_OnError, on_error)
 
 
-def _log_substituted_failure(exc: Exception, *, on_error: _OnError) -> None:
+def _log_substituted_failure(exc: Exception, *, on_error: _OnError, attempts: int | None = None) -> None:
     """Record one bounded WARNING when a provider failure is replaced with NULL.
 
     Called at each site that swallows a provider error and yields NULL under
     ``on_error='ignore'``; a no-op under ``'raise'`` so callers cannot log a
-    failure they are about to re-raise. Only the exception class and its
-    sanitized numeric-status summary are emitted — never prompt text, row
-    payloads, option mappings, credentials, or a traceback (vane#105) — so a
-    silent data degradation becomes observable without leaking sensitive input.
+    failure they are about to re-raise. ``attempts`` is the number of tries made
+    when the caller is a retry loop (omitted where no attempt count is
+    meaningful). Only the exception class, its sanitized numeric-status summary,
+    and that count are emitted — never prompt text, row payloads, option
+    mappings, credentials, or a traceback (vane#105) — so a silent data
+    degradation becomes observable without leaking sensitive input.
     """
     if on_error == "raise":
         return
-    logger.warning(
-        "vane.ai substituted NULL for a failed provider call: %s",
-        _safe_original_error_summary(exc),
-    )
+    summary = _safe_original_error_summary(exc)
+    if attempts is not None:
+        logger.warning(
+            "vane.ai substituted NULL after %d attempt(s) for a failed provider call: %s",
+            attempts,
+            summary,
+        )
+    else:
+        logger.warning("vane.ai substituted NULL for a failed provider call: %s", summary)
 
 
 def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
@@ -389,7 +396,9 @@ def _retry_call(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -426,7 +435,7 @@ def _retry_call(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
-    _log_substituted_failure(last_exc, on_error=on_error)
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 
@@ -448,7 +457,9 @@ async def _retry_call_async(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -474,7 +485,7 @@ async def _retry_call_async(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
-    _log_substituted_failure(last_exc, on_error=on_error)
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 

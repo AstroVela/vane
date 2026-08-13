@@ -2351,6 +2351,28 @@ class TestSubstitutionLogging:
         assert "TransientError" in messages[0]
         assert "secret-payload" not in messages[0]
         assert "Traceback" not in messages[0]
+        # A retry loop reports how many attempts it made before substituting.
+        assert "1 attempt(s)" in messages[0]
+
+    def test_retry_call_warning_counts_all_attempts(self, caplog, monkeypatch):
+        import logging
+
+        from vane.ai import functions
+        from vane.ai.functions import _retry_call
+
+        monkeypatch.setattr(functions.time, "sleep", lambda _seconds: None)
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _retry_call(fn, max_retries=2, on_error="ignore")
+
+        # 1 initial try + 2 retries = 3 attempts, all exhausted.
+        assert "3 attempt(s)" in _warnings(caplog)[0]
 
     def test_retry_call_raise_mode_logs_nothing(self, caplog):
         import logging
