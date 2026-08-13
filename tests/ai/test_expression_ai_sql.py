@@ -276,6 +276,35 @@ def test_ai_prompt_sql_structured_output_has_native_struct_type():
     ]
 
 
+def test_ai_prompt_sql_structured_output_preserves_json_control_characters():
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    response = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            concat('line1', chr(10), 'line2', chr(9), chr(1)),
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured'
+        ) AS response
+    """)
+        .fetchone()[0]
+    )
+
+    answer = "structured:line1\nline2\t\x01"
+    assert response == {"answer": answer, "score": len(answer)}
+
+
 def test_ai_prompt_sql_structured_output_composes_with_positional_image():
     schema = json.dumps(
         {
@@ -512,7 +541,7 @@ def test_ai_prompt_sql_structured_type_survives_plan_round_trip():
     )
     relation = vane.connect().sql(f"""
         SELECT ai_prompt(
-            'alpha',
+            concat('line1', chr(10), 'line2', chr(9), chr(1)),
             return_format := json '{schema}',
             provider := 'mock_ai_sql',
             model := 'structured',
@@ -524,8 +553,9 @@ def test_ai_prompt_sql_structured_type_survives_plan_round_trip():
     node = physical.collect_udf_nodes()[0]
     table = _execute_ai_physical_plan(target, physical)
 
+    answer = "structured:line1\nline2\t\x01"
     assert table.schema.field(0).type == pa.struct([pa.field("answer", pa.string()), pa.field("score", pa.int64())])
-    assert table.column(0).to_pylist() == [{"answer": "structured:alpha", "score": 16}]
+    assert table.column(0).to_pylist() == [{"answer": answer, "score": len(answer)}]
     assert node["payload"]["ai_return_type"] == 'STRUCT("answer" VARCHAR, "score" BIGINT)'
 
 
@@ -748,7 +778,8 @@ def test_ai_prompt_sql_vllm_rejects_raw_response_during_planning():
 def test_ai_prompt_sql_vllm_validates_structured_output(monkeypatch):
     import vane.execution.vllm as vllm_executor
 
-    executor = RecordingNativeVLLMExecutor({"alpha": '{"answer":"ok"}', "beta": '{"answer":1}'})
+    control_text = "line1\nline2\t\x01"
+    executor = RecordingNativeVLLMExecutor({"alpha": json.dumps({"answer": control_text}), "beta": '{"answer":1}'})
     builds = []
 
     def build_executor(model, options):
@@ -776,7 +807,7 @@ def test_ai_prompt_sql_vllm_validates_structured_output(monkeypatch):
     """)
 
     assert str(relation.types[-1]) == "STRUCT(answer VARCHAR)"
-    assert sorted(relation.fetchall()) == [(1, {"answer": "ok"}), (2, None), (3, None)]
+    assert sorted(relation.fetchall()) == [(1, {"answer": control_text}), (2, None), (3, None)]
     assert builds[0][1]["generate_args"]["sampling_params"]["structured_outputs"] == {"json": json.loads(schema)}
 
 
