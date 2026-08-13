@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -132,11 +133,31 @@ def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
 
 _OnError = Literal["raise", "ignore"]
 
+logger = logging.getLogger(__name__)
+
 
 def _validate_on_error(on_error: object) -> _OnError:
     if not isinstance(on_error, str) or on_error not in ("raise", "ignore"):
         raise ValueError("on_error must be 'raise' or 'ignore'")
     return cast(_OnError, on_error)
+
+
+def _log_substituted_failure(exc: Exception, *, on_error: _OnError) -> None:
+    """Record one bounded WARNING when a provider failure is replaced with NULL.
+
+    Called at each site that swallows a provider error and yields NULL under
+    ``on_error='ignore'``; a no-op under ``'raise'`` so callers cannot log a
+    failure they are about to re-raise. Only the exception class and its
+    sanitized numeric-status summary are emitted — never prompt text, row
+    payloads, option mappings, credentials, or a traceback (vane#105) — so a
+    silent data degradation becomes observable without leaking sensitive input.
+    """
+    if on_error == "raise":
+        return
+    logger.warning(
+        "vane.ai substituted NULL for a failed provider call: %s",
+        _safe_original_error_summary(exc),
+    )
 
 
 def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
@@ -328,6 +349,7 @@ def _retry_call(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error)
     return default
 
 
@@ -375,6 +397,7 @@ async def _retry_call_async(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error)
     return default
 
 
@@ -802,9 +825,10 @@ class _EmbedTextBatch:
                 embedding = self._coerce_embedding(value)
                 if normalize:
                     embedding = self._coerce_embedding(_normalize_embedding(embedding))
-            except _ProviderResultError:
+            except _ProviderResultError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 embeddings.append(None)
                 continue
             embeddings.append(embedding)
@@ -853,9 +877,10 @@ class _EmbedTextBatch:
             return self._invoke_embedder(texts)
         except _MissingAsyncRuntimeError:
             raise
-        except ProviderCapabilityError:
+        except ProviderCapabilityError as exc:
             if self._on_error == "raise":
                 raise
+            _log_substituted_failure(exc, on_error=self._on_error)
             return [None] * len(texts)
         except Exception:
             if self._on_error == "raise":
@@ -863,13 +888,17 @@ class _EmbedTextBatch:
 
         # A batch-level failure does not identify the failing row. Isolate the
         # inputs so on_error="ignore" nulls only rows that fail independently.
+        # The batch error itself is not logged here: each isolated row that
+        # actually fails logs its own substitution below (a row that recovers
+        # on isolation is not a substitution and must stay silent).
         isolated: list[np.ndarray | None] = []
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
             except _MissingAsyncRuntimeError:
                 raise
-            except Exception:
+            except Exception as exc:
+                _log_substituted_failure(exc, on_error=self._on_error)
                 isolated.append(None)
         return isolated
 
@@ -1143,9 +1172,15 @@ class _PromptBatch:
                 raise _safe_provider_execution_error(provider, model, "Prompt execution", provider_error) from None
             try:
                 return self._validate_result(result)
-            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
+            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError) as exc:
                 if on_error == "raise":
                     raise
+                # A NULL reaching validation is either a legitimate provider NULL
+                # or an already-logged swallowed failure (the retry helper logged
+                # it before substituting None); only a non-NULL payload that fails
+                # the result contract is a fresh substitution to record here.
+                if result is not None:
+                    _log_substituted_failure(exc, on_error=on_error)
                 return None
 
         async def run_all(indices: list[int]) -> list[str | None]:

@@ -2052,6 +2052,184 @@ class TestWrapperRetry:
         assert result.column("emb").to_pylist() == [None]
 
 
+_LOGGER_NAME = "vane.ai.functions"
+
+
+def _warnings(caplog) -> list[str]:
+    import logging
+
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class TestSubstitutionLogging:
+    """Every NULL substituted for a failed provider call under on_error='ignore'
+    leaves exactly one bounded, sanitized WARNING; 'raise' mode logs nothing."""
+
+    # --- Seam A: retry helpers -------------------------------------------
+
+    def test_retry_call_ignore_logs_one_sanitized_warning(self, caplog):
+        import logging
+
+        from vane.ai.functions import _retry_call
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("secret-payload")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _retry_call(fn, max_retries=0, on_error="ignore")
+
+        assert result is None
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "TransientError" in messages[0]
+        assert "secret-payload" not in messages[0]
+        assert "Traceback" not in messages[0]
+
+    def test_retry_call_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai.functions import _retry_call
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(TransientError):
+                _retry_call(fn, max_retries=0, on_error="raise")
+
+        assert _warnings(caplog) == []
+
+    def test_retry_call_async_ignore_logs_one_warning(self, caplog):
+        import asyncio
+        import logging
+
+        from vane.ai.functions import _retry_call_async
+
+        class TransientError(RuntimeError):
+            status_code = 503
+
+        async def fn():
+            raise TransientError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = asyncio.run(_retry_call_async(fn, max_retries=0, on_error="ignore"))
+
+        assert result is None
+        assert len(_warnings(caplog)) == 1
+
+    # --- Seam B: embed wrapper -------------------------------------------
+
+    def _make_embed_descriptor(self, embed_fn):
+        desc = MagicMock(spec=[])
+        desc.get_dimensions = MagicMock(return_value=3)
+        embedder = MagicMock(spec=[])
+        embedder.embed_text = embed_fn
+        desc.instantiate = MagicMock(return_value=embedder)
+        return desc
+
+    def test_embed_ignore_logs_one_warning_per_isolated_row(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(_texts):
+            raise RuntimeError("permanent failure: sk-SECRET")
+
+        wrapper = _EmbedTextBatch(
+            self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="ignore"
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"text": ["a", "b"]}))
+
+        assert result.column("emb").to_pylist() == [None, None]
+        messages = _warnings(caplog)
+        # Batch call fails, then each of the two rows fails in isolation: one
+        # warning per substituted row.
+        assert len(messages) == 2
+        assert all("RuntimeError" in m for m in messages)
+        assert all("SECRET" not in m for m in messages)
+
+    def test_embed_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai.functions import _EmbedTextBatch
+
+        def embed(_texts):
+            raise RuntimeError("permanent failure")
+
+        wrapper = _EmbedTextBatch(self._make_embed_descriptor(embed), "text", "emb", 3, max_retries=0, on_error="raise")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(Exception):
+                _drive(wrapper, pa.table({"text": ["a"]}))
+
+        assert _warnings(caplog) == []
+
+    # --- Seam B: prompt wrapper ------------------------------------------
+
+    def test_prompt_ignore_logs_only_for_substituted_rows(self, caplog, monkeypatch):
+        import asyncio
+        import logging
+
+        from vane.ai.functions import _PromptBatch
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+        class Prompter:
+            async def prompt(self, messages):
+                if messages[0] == "fail":
+                    raise RuntimeError("permanent: sk-SECRET")
+                return f"answer:{messages[0]}"
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=0, on_error="ignore")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["ok", "fail", None]}))
+
+        assert result.column("response").to_pylist() == ["answer:ok", None, None]
+        # Only the "fail" row is substituted (the None row was never dispatched);
+        # exactly one warning, no double from the downstream None validation.
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "RuntimeError" in messages[0]
+        assert "SECRET" not in messages[0]
+
+    def test_prompt_ignore_logs_on_bad_result_type(self, caplog):
+        import logging
+
+        from vane.ai.functions import _PromptBatch
+
+        class Prompter:
+            async def prompt(self, messages):
+                return 123  # not text or NULL: a result-contract violation
+
+        class Descriptor:
+            def instantiate(self):
+                return Prompter()
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=0, on_error="ignore")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _drive(wrapper, pa.table({"message": ["hello"]}))
+
+        assert result.column("response").to_pylist() == [None]
+        messages = _warnings(caplog)
+        assert len(messages) == 1
+        assert "_ProviderResultError" in messages[0]
+        # The vane-authored detail message is reduced to the class name.
+        assert "returned int" not in messages[0]
+
+
 # ---------------------------------------------------------------------------
 # Basic Prompt provider contract
 # ---------------------------------------------------------------------------
