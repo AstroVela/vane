@@ -350,6 +350,17 @@ def _retry_after_error(exc: Exception) -> RetryAfterError | None:
     return RetryAfterError(retry_after=retry_after, original=exc)
 
 
+def _raise_if_retry_after(exc: Exception) -> None:
+    """Re-raise a rate-limited provider error as a :class:`RetryAfterError` when
+    it qualifies (429/503); a no-op otherwise, so the caller re-raises the
+    original error. Lets every HTTP provider honour ``Retry-After`` uniformly
+    (issue #148) by delegating to :func:`_retry_after_error`.
+    """
+    retry_error = _retry_after_error(exc)
+    if retry_error is not None:
+        raise retry_error from None
+
+
 def _retry_call(
     fn: Any,
     *args: Any,

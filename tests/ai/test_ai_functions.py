@@ -1554,6 +1554,202 @@ class TestSharedRetryAfterExtraction:
         assert err.retry_after == 8.0
 
 
+class TestProviderRetryAfterAdoption:
+    """OpenAI and Anthropic honour Retry-After through the shared helper, so a
+    429/503 behaves the same as it already does for Google (issue #148)."""
+
+    def _rate_limit_error(self, *, status, headers=None):
+        from unittest.mock import MagicMock
+
+        exc = RuntimeError("rate limited: sk-SECRET")
+        exc.status_code = status
+        if headers is not None:
+            response = MagicMock()
+            response.headers = headers
+            exc.response = response
+        else:
+            exc.response = None
+        return exc
+
+    def _openai_prompter(self, side_effect):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.providers.openai import OpenAIPrompter
+
+        prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+        prompter._provider_name = "openai"
+        prompter._model = "gpt-test"
+        prompter._system_message = None
+        prompter._use_chat_completions = False
+        prompter._return_format = None
+        prompter._return_raw_response = False
+        prompter._options = {}
+        prompter._client = MagicMock()
+        prompter._client.responses.create = AsyncMock(side_effect=side_effect)
+        return prompter
+
+    def _anthropic_prompter(self, side_effect):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        prompter = AnthropicPrompter.__new__(AnthropicPrompter)
+        prompter._provider_name = "anthropic"
+        prompter._model = "claude-test"
+        prompter._system_message = None
+        prompter._return_format = None
+        prompter._return_raw_response = False
+        prompter._options = {"max_tokens": 64}
+        prompter._client = SimpleNamespace(messages=SimpleNamespace(create=AsyncMock(side_effect=side_effect)))
+        return prompter
+
+    # --- OpenAI: mirror the Google extraction cases ----------------------
+
+    def test_openai_prompt_429_with_header_honored(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=429, headers={"Retry-After": "10"}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 10.0
+        assert "SECRET" not in str(ctx.value)
+
+    def test_openai_prompt_503_without_header_uses_default(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=503))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    @pytest.mark.parametrize("bad_header", ["-1", "nan", "inf", "later"])
+    def test_openai_prompt_malformed_header_uses_default(self, bad_header):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._openai_prompter(self._rate_limit_error(status=429, headers={"Retry-After": bad_header}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    def test_openai_prompt_non_rate_limit_status_not_converted(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        error = self._rate_limit_error(status=400)
+        prompter = self._openai_prompter(error)
+        with pytest.raises(Exception) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        # A non-429/503 error propagates unchanged, not as a RetryAfterError.
+        assert not isinstance(ctx.value, RetryAfterError)
+        assert ctx.value is error
+
+    def test_openai_embed_429_honored(self, monkeypatch):
+        """The embed hook point adopts the shared helper too (smoke)."""
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        from vane.ai.functions import RetryAfterError
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        class OpenAIError(Exception):
+            pass
+
+        class RateLimitError(OpenAIError):
+            status_code = 429
+
+        error = RateLimitError("rate limited")
+        response = MagicMock()
+        response.headers = {"Retry-After": "10"}
+        error.response = response
+
+        monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAIError=OpenAIError))
+        embedder = OpenAITextEmbedder.__new__(OpenAITextEmbedder)
+        embedder._client = MagicMock()
+        embedder._client.embeddings.create = AsyncMock(side_effect=error)
+        embedder._provider_name = "openai"
+        embedder._model = "text-embedding-test"
+        embedder._dimensions = 4
+        embedder._encoding_format = "float"
+
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(embedder._embed_batch(["hello"]))
+        assert ctx.value.retry_after == 10.0
+
+    # --- Anthropic: mirror the same case set -----------------------------
+
+    def test_anthropic_prompt_429_with_header_honored(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=429, headers={"Retry-After": "7"}))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 7.0
+
+    def test_anthropic_prompt_503_without_header_uses_default(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        prompter = self._anthropic_prompter(self._rate_limit_error(status=503))
+        with pytest.raises(RetryAfterError) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert ctx.value.retry_after == 5.0
+
+    def test_anthropic_prompt_non_rate_limit_status_not_converted(self):
+        import asyncio
+
+        from vane.ai.functions import RetryAfterError
+
+        error = self._rate_limit_error(status=400)
+        prompter = self._anthropic_prompter(error)
+        with pytest.raises(Exception) as ctx:
+            asyncio.run(prompter.prompt(("hello",)))
+        assert not isinstance(ctx.value, RetryAfterError)
+        assert ctx.value is error
+
+    # --- Wrapper seam: the honored delay drives the retry sleep ----------
+
+    def test_openai_retry_after_drives_wrapper_sleep_then_succeeds(self, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+
+        from vane.ai.functions import _PromptBatch
+
+        slept: list[float] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        error = self._rate_limit_error(status=429, headers={"Retry-After": "10"})
+        success = SimpleNamespace(output_text="answer", usage=None)
+        prompter = self._openai_prompter([error, success])
+
+        class Descriptor:
+            def instantiate(self):
+                return prompter
+
+        wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=2, on_error="raise")
+        result = _drive(wrapper, pa.table({"message": ["hi"]}))
+
+        assert result.column("response").to_pylist() == ["answer"]
+        # The server-requested 10s was honoured, not exponential backoff (1s).
+        assert slept == [10.0]
+
+
 class TestEmbedProviderCapabilityErrors:
     @pytest.mark.parametrize("name", ["batch_size", "actor_number", "batch_token_limit"])
     def test_non_nullable_integer_options_reject_explicit_none_during_planning(self, name):

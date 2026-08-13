@@ -272,6 +272,9 @@ class AnthropicPrompter:
                     original_error=exc,
                 )
             else:
+                from vane.ai.functions import _raise_if_retry_after
+
+                _raise_if_retry_after(exc)
                 raise
         if capability_error is not None:
             raise capability_error from None
