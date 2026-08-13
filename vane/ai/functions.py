@@ -284,6 +284,72 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     return False
 
 
+_RATE_LIMIT_STATUS_CODES = frozenset({429, 503})
+_DEFAULT_RETRY_AFTER_SECONDS = 5.0
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    """Discover an HTTP status from a provider SDK error.
+
+    Providers surface the status differently — OpenAI/Anthropic expose
+    ``status_code``, Google exposes ``code``, and some attach it to the
+    response — so probe the common locations in a stable order.
+    """
+    for status in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+        getattr(getattr(exc, "response", None), "status", None),
+    ):
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _parse_retry_after_header(exc: Exception) -> float | None:
+    """Return a usable ``Retry-After`` delay from a provider error's response.
+
+    Returns ``None`` when no response, no header, or a malformed value is
+    present. A negative, NaN, or infinite header (all parseable by ``float()``,
+    e.g. ``"-1"``, ``"nan"``, ``"1e999"``) is treated as malformed and rejected
+    so it never reaches a retry sleep that would raise or hang (issue #469).
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(parsed) and parsed >= 0:
+        return parsed
+    return None
+
+
+def _retry_after_error(exc: Exception) -> RetryAfterError | None:
+    """Build a :class:`RetryAfterError` for a rate-limited/unavailable provider
+    error, or ``None`` when the error does not qualify.
+
+    Shared by every HTTP provider (issue #148) so 429/503 retry timing is
+    uniform: the server-requested ``Retry-After`` is honoured when present and
+    usable, otherwise a default wait applies. The returned error carries the
+    original for its sanitized summary and status attributes only.
+    """
+    if _provider_status_code(exc) not in _RATE_LIMIT_STATUS_CODES:
+        return None
+    retry_after = _parse_retry_after_header(exc)
+    if retry_after is None:
+        retry_after = _DEFAULT_RETRY_AFTER_SECONDS
+    return RetryAfterError(retry_after=retry_after, original=exc)
+
+
 def _retry_call(
     fn: Any,
     *args: Any,

@@ -18,7 +18,6 @@ Requires::
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -74,37 +73,13 @@ _IMAGE_MIME_POLICY = ImageMimePolicy(
 def _retry_after_error_from_google_error(exc: Exception) -> Exception | None:
     """Build a safe retry signal for Google 429/503 responses, if applicable.
 
-    Parses the ``Retry-After`` header if present; a missing, unparseable, or
-    malformed (negative or non-finite) header falls back to a 5-second
-    default wait.
+    Thin adapter over the shared, provider-agnostic extraction helper (issue
+    #148) so 429/503 retry timing — header parsing, malformed-value guards
+    (issue #469), and the default wait — is identical across every provider.
     """
-    from vane.ai.functions import RetryAfterError
+    from vane.ai.functions import _retry_after_error
 
-    code = getattr(exc, "code", None)
-    if code not in (429, 503):
-        return None
-
-    # Try to extract Retry-After from the response headers
-    response = getattr(exc, "response", None)
-    retry_after: float | None = None
-    if response is not None:
-        headers = getattr(response, "headers", None) or {}
-        raw = headers.get("Retry-After") or headers.get("retry-after")
-        if raw is not None:
-            try:
-                parsed = float(raw)
-            except (TypeError, ValueError):
-                parsed = None
-            # A negative, NaN, or infinite header (all parseable by float(),
-            # e.g. "-1", "nan", "1e999") is malformed: ignore it and fall back
-            # to the default wait rather than passing it to a retry sleep that
-            # would raise or hang (issue #469).
-            if parsed is not None and math.isfinite(parsed) and parsed >= 0:
-                retry_after = parsed
-    if retry_after is None:
-        retry_after = 5.0  # default wait for 429/503
-
-    return RetryAfterError(retry_after=retry_after, original=exc)
+    return _retry_after_error(exc)
 
 
 def _raise_retry_after_on_google_error(exc: Exception) -> None:

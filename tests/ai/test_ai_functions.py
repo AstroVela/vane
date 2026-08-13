@@ -1486,6 +1486,74 @@ class TestGoogleRetryHandling:
         assert ctx.value.retry_after == 3.5
 
 
+class TestSharedRetryAfterExtraction:
+    """The provider-agnostic Retry-After extraction helper (issue #148) that
+    every HTTP provider shares, so 429/503 retry timing is uniform."""
+
+    def _error(self, *, status_attr="status_code", status=429, headers=None):
+        from unittest.mock import MagicMock
+
+        exc = RuntimeError("rate limited: sk-SECRET")
+        setattr(exc, status_attr, status)
+        if headers is not None:
+            response = MagicMock()
+            response.headers = headers
+            exc.response = response
+        else:
+            exc.response = None
+        return exc
+
+    def test_429_with_header_honored(self):
+        from vane.ai.functions import RetryAfterError, _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": "12"}))
+        assert isinstance(err, RetryAfterError)
+        assert err.retry_after == 12.0
+        # Sanitization: the original secret-bearing message is not surfaced.
+        assert "SECRET" not in str(err)
+
+    def test_503_without_header_uses_default(self):
+        from vane.ai.functions import RetryAfterError, _retry_after_error
+
+        err = _retry_after_error(self._error(status=503, headers=None))
+        assert isinstance(err, RetryAfterError)
+        assert err.retry_after == 5.0
+
+    @pytest.mark.parametrize("bad_header", ["-1", "-0.5", "nan", "NaN", "inf", "1e999", "soon", ""])
+    def test_malformed_header_uses_default(self, bad_header):
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": bad_header}))
+        assert err is not None
+        assert err.retry_after == 5.0
+
+    @pytest.mark.parametrize("status", [200, 400, 401, 404, 500, None])
+    def test_non_rate_limit_status_not_converted(self, status):
+        from vane.ai.functions import _retry_after_error
+
+        if status is None:
+            exc = RuntimeError("no status here")
+            assert _retry_after_error(exc) is None
+        else:
+            assert _retry_after_error(self._error(status=status, headers=None)) is None
+
+    def test_status_discovered_from_code_attribute(self):
+        """Google-style errors expose the HTTP status as ``.code``, not
+        ``.status_code``; the shared helper must find either."""
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status_attr="code", status=429, headers=None))
+        assert err is not None
+        assert err.retry_after == 5.0
+
+    def test_header_lookup_is_case_insensitive(self):
+        from vane.ai.functions import _retry_after_error
+
+        err = _retry_after_error(self._error(status=429, headers={"retry-after": "8"}))
+        assert err is not None
+        assert err.retry_after == 8.0
+
+
 class TestEmbedProviderCapabilityErrors:
     @pytest.mark.parametrize("name", ["batch_size", "actor_number", "batch_token_limit"])
     def test_non_nullable_integer_options_reject_explicit_none_during_planning(self, name):
