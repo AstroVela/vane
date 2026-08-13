@@ -2936,7 +2936,20 @@ def test_fte_worker_selection_requires_pressure_stats_protocol():
         worker_id = "worker-a"
 
     with pytest.raises(AttributeError, match="fte_pressure_stats"):
-        fte_fragment_scheduler._fte_worker_selection_key(_Worker())
+        fte_fragment_scheduler._fte_worker_selection_key(_Worker(), query_id="q")
+
+
+def test_fte_worker_selection_requires_query_assignment_protocol():
+    class _Worker:
+        worker_id = "worker-a"
+        memory_capacity_bytes = 1 << 60
+
+        @staticmethod
+        def fte_pressure_stats():
+            return {}
+
+    with pytest.raises(AttributeError, match="fte_query_partition_assignment_count"):
+        fte_fragment_scheduler._fte_worker_selection_key(_Worker(), query_id="q")
 
 
 def test_fte_fragment_execution_assignment_creates_task_and_sends_later_updates():
