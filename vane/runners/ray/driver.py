@@ -65,6 +65,7 @@ _LEASE_REQUEST_REPLAY_CAPACITY = 65_536
 _SESSION_CLOSE_REPLAY_CAPACITY = 65_536
 _CLIENT_DETACH_REPLAY_CAPACITY = 65_536
 _COPY_OPERATION_REPLAY_CAPACITY = 1_024
+_COPY_PLAN_NOT_STARTED = object()
 _DEFAULT_COPY_RECONCILIATION_TIMEOUT_S = 30.0
 _RUNTIME_ATTACH_TIMEOUT_S = 300.0
 _RUNTIME_ATTACH_RETRY_INTERVAL_S = 0.05
@@ -391,26 +392,206 @@ class _PreparedQueryResourceRegistration:
     capacity_snapshot_started_at: float
 
 
-class _PlanStartupOwnership:
-    """Hand registered resources to exactly one startup or cancellation path."""
+@dataclass
+class _PlanLifecycle:
+    """Own one plan from preparation until deterministic teardown."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._owner = "caller"
+    plan_id: str
+    session_id: str
+    _condition: threading.Condition = field(default_factory=threading.Condition)
+    _state: Literal["preparing", "starting", "running", "closing", "closed"] = "preparing"
+    _startup_owner: Literal["caller", "worker", "cancelled"] = "caller"
+    _close_requested: bool = False
+    _setup_finished: bool = False
+    _fragments_started: bool = False
+    _query_id: str = ""
+    _query_connection: Any | None = None
+    _startup_future: ConcurrentFuture[Any] | None = field(default=None, repr=False)
+    _startup_decision: ConcurrentFuture[bool] = field(default_factory=ConcurrentFuture, repr=False)
 
-    def claim_for_worker(self) -> bool:
-        with self._lock:
-            if self._owner != "caller":
+    def _complete_startup_decision_locked(
+        self,
+        *,
+        started: bool | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self._startup_decision.done():
+            return
+        if error is not None:
+            self._startup_decision.set_exception(error)
+            return
+        if started is None:
+            raise RuntimeError("startup decision requires a result or error")
+        self._startup_decision.set_result(started)
+
+    def set_query_connection(self, connection: Any) -> None:
+        with self._condition:
+            if self._query_connection is not None:
+                raise RuntimeError(f"query plan {self.plan_id} already owns a query connection")
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            if self._state != "preparing":
+                raise RuntimeError(
+                    f"query plan {self.plan_id} cannot attach a query connection from state {self._state!r}"
+                )
+            self._query_connection = connection
+
+    def set_query_id(self, query_id: str) -> None:
+        query_key = str(query_id).strip()
+        if not query_key:
+            raise ValueError("query_id must not be empty")
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            if self._state != "preparing":
+                raise RuntimeError(f"query plan {self.plan_id} cannot set its query id from state {self._state!r}")
+            self._query_id = query_key
+
+    def begin_startup(self) -> bool:
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            if self._close_requested:
                 return False
-            self._owner = "worker"
+            if self._state != "preparing":
+                raise RuntimeError(f"query plan {self.plan_id} cannot start from state {self._state!r}")
+            self._state = "starting"
             return True
 
-    def cancel_before_worker_claim(self) -> bool:
-        with self._lock:
-            if self._owner != "caller":
+    def bind_startup_future(self, future: ConcurrentFuture[Any]) -> None:
+        """Attach the executor job while preserving close/start ownership."""
+
+        cancel_future = False
+        with self._condition:
+            if self._startup_future is not None:
+                raise RuntimeError(f"query plan {self.plan_id} startup future was bound more than once")
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            self._startup_future = future
+            if self._startup_owner == "cancelled" or (self._startup_owner == "caller" and self._close_requested):
+                self._startup_owner = "cancelled"
+                self._complete_startup_decision_locked(started=False)
+                cancel_future = True
+        if cancel_future:
+            future.cancel()
+
+    def startup_decision_future(self) -> ConcurrentFuture[bool]:
+        return self._startup_decision
+
+    def claim_startup_for_worker(self) -> bool:
+        with self._condition:
+            if self._startup_owner != "caller":
                 return False
-            self._owner = "cancelled"
+            if self._close_requested or self._state != "starting":
+                self._startup_owner = "cancelled"
+                self._complete_startup_decision_locked(started=False)
+                return False
+            self._startup_owner = "worker"
             return True
+
+    def request_close(self) -> None:
+        """Fence new execution publication for this plan."""
+
+        startup_future: ConcurrentFuture[Any] | None = None
+        with self._condition:
+            self._close_requested = True
+            if self._state != "closed":
+                self._state = "closing"
+            if self._startup_owner == "caller":
+                self._startup_owner = "cancelled"
+                startup_future = self._startup_future
+                self._complete_startup_decision_locked(started=False)
+            self._condition.notify_all()
+        if startup_future is not None:
+            startup_future.cancel()
+
+    def close_requested(self) -> bool:
+        with self._condition:
+            return self._close_requested
+
+    def begin_fragment_execution(self) -> bool:
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            if self._close_requested:
+                return False
+            if self._state != "starting":
+                raise RuntimeError(
+                    f"query plan {self.plan_id} cannot begin fragment execution from state {self._state!r}"
+                )
+            if self._fragments_started:
+                raise RuntimeError(f"query plan {self.plan_id} fragment execution started more than once")
+            self._fragments_started = True
+            return True
+
+    def publish_copy_execution_started(self) -> None:
+        """Open COPY's native-start fence after its execution task is registered."""
+
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup is already terminal")
+            if self._startup_owner != "worker":
+                raise RuntimeError(f"query plan {self.plan_id} COPY startup is not owned by its worker")
+            if self._state not in {"starting", "closing"}:
+                raise RuntimeError(
+                    f"query plan {self.plan_id} cannot publish COPY execution from state {self._state!r}"
+                )
+            if self._fragments_started:
+                raise RuntimeError(f"query plan {self.plan_id} fragment execution started more than once")
+            self._fragments_started = True
+            self._complete_startup_decision_locked(started=True)
+            self._condition.notify_all()
+
+    def publish_startup_result(self, *, started: bool) -> None:
+        """Publish a worker's terminal streaming-start decision."""
+
+        with self._condition:
+            if started and not self._fragments_started:
+                raise RuntimeError(
+                    f"query plan {self.plan_id} cannot publish successful startup before fragment execution"
+                )
+            self._complete_startup_decision_locked(started=started)
+            self._condition.notify_all()
+
+    def fail_startup(self, error: BaseException) -> None:
+        """Wake a startup waiter when the worker fails before publication."""
+
+        with self._condition:
+            self._complete_startup_decision_locked(error=error)
+            self._condition.notify_all()
+
+    def finish_setup(self, *, succeeded: bool) -> bool:
+        """Publish the setup barrier and return whether close already won."""
+        with self._condition:
+            if self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} setup completed more than once")
+            if succeeded and not self._fragments_started:
+                raise RuntimeError(f"query plan {self.plan_id} cannot publish running state before fragment execution")
+            self._complete_startup_decision_locked(started=succeeded)
+            self._setup_finished = True
+            self._startup_future = None
+            if succeeded and not self._close_requested:
+                self._state = "running"
+            else:
+                self._close_requested = True
+                self._state = "closing"
+            self._condition.notify_all()
+            return self._close_requested
+
+    def wait_for_setup(self) -> tuple[str, Any | None, bool]:
+        with self._condition:
+            while not self._setup_finished:
+                self._condition.wait()
+            return self._query_id, self._query_connection, self._fragments_started
+
+    def mark_closed(self) -> None:
+        with self._condition:
+            if not self._setup_finished:
+                raise RuntimeError(f"query plan {self.plan_id} closed before setup reached a terminal state")
+            if not self._close_requested:
+                raise RuntimeError(f"query plan {self.plan_id} closed without a close request")
+            self._state = "closed"
+            self._condition.notify_all()
 
 
 @dataclass
@@ -482,10 +663,22 @@ def _submit_to_executor(
     *args: Any,
     **kwargs: Any,
 ) -> asyncio.Future[Any]:
+    _, future = _submit_to_executor_with_source(executor, callback, *args, **kwargs)
+    return future
+
+
+def _submit_to_executor_with_source(
+    executor: Executor,
+    callback: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[ConcurrentFuture[Any], asyncio.Future[Any]]:
     loop = asyncio.get_running_loop()
     context = contextvars.copy_context()
     call = functools.partial(callback, *args, **kwargs)
-    return loop.run_in_executor(executor, context.run, call)
+    source = executor.submit(context.run, call)
+    return source, asyncio.wrap_future(source, loop=loop)
 
 
 async def _run_in_executor(
@@ -508,13 +701,22 @@ async def _run_in_executor_with_owned_side_effects(
     """Finish an executor-owned mutation before exposing caller cancellation."""
 
     executor_future = _submit_to_executor(executor, callback, *args, **kwargs)
+    return await _await_future_with_owned_side_effects(executor_future)
+
+
+async def _await_future_with_owned_side_effects(future: asyncio.Future[Any]) -> Any:
+    """Observe one owned mutation to completion across repeated cancellation."""
+
     cancellation: asyncio.CancelledError | None = None
-    while not executor_future.done():
+    while not future.done():
         try:
-            await asyncio.shield(executor_future)
+            await asyncio.shield(future)
         except asyncio.CancelledError as error:
-            cancellation = error
-    result = executor_future.result()
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    result = future.result()
     if cancellation is not None:
         raise cancellation
     return result
@@ -1364,6 +1566,7 @@ class RayQueryDriverActor:
         self._sessions: dict[str, _DriverSession] = {}
         self._closed_session_owners = BoundedReplayMap[str, str](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_lock = threading.RLock()
+        self._plan_lifecycles: dict[str, _PlanLifecycle] = {}
         self._plan_session_ids: dict[str, str] = {}
         self._plan_connections: dict[str, Any] = {}
         self._plan_teardown_condition = threading.Condition(self._session_lock)
@@ -1959,10 +2162,10 @@ class RayQueryDriverActor:
     def _require_plan_session(self, owner_id: str, session_id: str, plan_id: str) -> _DriverSession:
         session = self._require_session(owner_id, session_id)
         plan_key = str(plan_id)
-        with self._session_lock:
-            plan_session_id = self._plan_session_ids.get(plan_key)
         with session.condition:
-            owns_plan = plan_key in session.plan_ids
+            with self._session_lock:
+                plan_session_id = self._plan_session_ids.get(plan_key)
+                owns_plan = plan_key in session.plan_ids
         if plan_session_id != str(session_id) or not owns_plan:
             raise PermissionError("query plan does not belong to the requested Vane session")
         return session
@@ -2141,13 +2344,6 @@ class RayQueryDriverActor:
 
     def _schedule_expired_client_reclamations(self) -> None:
         for owner_key in self._mark_expired_client_leases():
-            with self._session_lock:
-                sessions = tuple(session for session in self._sessions.values() if session.owner_id == owner_key)
-            for session in sessions:
-                with session.condition:
-                    active_operation_tasks = tuple(session.active_operation_tasks)
-                for active_operation in active_operation_tasks:
-                    active_operation.cancel()
             task = asyncio.create_task(
                 self._detach_client_owner(owner_key, expired=True),
                 name=f"vane-expired-client-cleanup:{owner_key}",
@@ -2240,13 +2436,18 @@ class RayQueryDriverActor:
                 session_ids = [
                     session_id for session_id, session in self._sessions.items() if session.owner_id == owner_key
                 ]
+                sessions = tuple(self._sessions[session_id] for session_id in session_ids)
+            if expired_cleanup:
+                active_operation_tasks: set[asyncio.Task[Any]] = set()
+                for session in sessions:
+                    with session.condition:
+                        session.closing = True
+                        active_operation_tasks.update(session.active_operation_tasks)
+                for active_operation in active_operation_tasks:
+                    active_operation.cancel()
             try:
                 for session_id in session_ids:
-                    await self._close_session_for_owner(
-                        owner_key,
-                        session_id,
-                        cancel_active=expired_cleanup,
-                    )
+                    await self._close_session_for_owner(owner_key, session_id)
                 with self._session_lock:
                     last_owner = len(self._client_ids) == 1
                     if last_owner:
@@ -2304,8 +2505,6 @@ class RayQueryDriverActor:
         self,
         owner_key: str,
         session_id: str,
-        *,
-        cancel_active: bool = False,
     ) -> None:
         session_key = str(session_id).strip()
         if not session_key:
@@ -2326,10 +2525,6 @@ class RayQueryDriverActor:
             if session.closed:
                 return
             session.closing = True
-            active_operation_tasks = tuple(session.active_operation_tasks)
-        if cancel_active:
-            for task in active_operation_tasks:
-                task.cancel()
 
         def _close() -> None:
             with session.condition:
@@ -5809,8 +6004,98 @@ class RayQueryDriverActor:
                 f"failed to shut down {len(errors)} query-owned vLLM actor pool(s): " + "; ".join(errors)
             )
 
-    def _release_plan_session_state(self, plan_id: str) -> None:
-        plan_key = str(plan_id)
+    def _register_plan_lifecycle(
+        self,
+        session_id: str,
+        session: _DriverSession,
+        plan_id: str,
+    ) -> _PlanLifecycle:
+        plan_key = str(plan_id).strip()
+        session_key = str(session_id).strip()
+        if not plan_key:
+            raise ValueError("query plan identity must not be empty")
+        lifecycle = _PlanLifecycle(plan_id=plan_key, session_id=session_key)
+        with session.condition:
+            if session.closing or session.closed:
+                raise RuntimeError(f"Vane session closed during query startup: {session_key}")
+            with self._session_lock:
+                if self._sessions.get(session_key) is not session:
+                    raise RuntimeError(f"Vane session closed during query startup: {session_key}")
+                if (
+                    plan_key in self._plan_lifecycles
+                    or plan_key in self._plan_session_ids
+                    or plan_key in self._plan_connections
+                    or plan_key in self._plan_query_ids
+                    or plan_key in self._plan_teardowns_in_progress
+                    or plan_key in session.plan_ids
+                    or plan_key in self.curr_plans
+                    or plan_key in self.curr_streams
+                    or plan_key in self._async_result_streams
+                    or plan_key in self._leased_result_partition_refs
+                    or plan_key in self._result_partition_ref_counters
+                    or plan_key in self._active_udf_actors_by_plan
+                    or plan_key in self._active_udf_actor_by_unit
+                    or plan_key in self._active_vllm_actors_by_plan
+                    or plan_key in self._query_udf_actor_nodes
+                    or plan_key in self._query_udf_session_configs
+                    or plan_key in self._query_resource_graphs
+                    or plan_key in self._query_allocations
+                    or plan_key in self._query_terminal_errors
+                    or any(query_id == plan_key for query_id, _ in self._query_udf_actor_activation_tasks)
+                ):
+                    raise RuntimeError(f"query plan identity is already active: {plan_key}")
+                self._plan_lifecycles[plan_key] = lifecycle
+                self._plan_session_ids[plan_key] = session_key
+                session.plan_ids.add(plan_key)
+        return lifecycle
+
+    def _attach_plan_connection(
+        self,
+        lifecycle: _PlanLifecycle,
+        query_connection: Any,
+    ) -> None:
+        plan_key = lifecycle.plan_id
+        with self._session_lock:
+            if self._plan_lifecycles.get(plan_key) is not lifecycle:
+                raise RuntimeError(f"query plan lifecycle changed during preparation: {plan_key}")
+            if plan_key in self._plan_connections:
+                raise RuntimeError(f"query plan {plan_key} already owns a query connection")
+            lifecycle.set_query_connection(query_connection)
+            self._plan_connections[plan_key] = query_connection
+
+    def _set_plan_query_id(self, lifecycle: _PlanLifecycle, query_id: str) -> None:
+        plan_key = lifecycle.plan_id
+        with self._session_lock:
+            if self._plan_lifecycles.get(plan_key) is not lifecycle:
+                raise RuntimeError(f"query plan lifecycle changed during registration: {plan_key}")
+            lifecycle.set_query_id(query_id)
+            self._plan_query_ids[plan_key] = str(query_id).strip()
+
+    def _release_plan_session_state(
+        self,
+        lifecycle: _PlanLifecycle,
+        query_id: str,
+        query_connection: Any | None,
+    ) -> None:
+        plan_key = lifecycle.plan_id
+        query_key = str(query_id or "").strip()
+        with self._session_lock:
+            current_lifecycle = self._plan_lifecycles.get(plan_key)
+            session_id = self._plan_session_ids.get(plan_key)
+            indexed_query_id = self._plan_query_ids.get(plan_key, "")
+            indexed_connection = self._plan_connections.get(plan_key)
+            if current_lifecycle is not lifecycle:
+                raise RuntimeError(f"query plan lifecycle changed during teardown: {plan_key}")
+            if session_id != lifecycle.session_id:
+                raise RuntimeError(f"query plan session ownership changed during teardown: {plan_key}")
+            if indexed_query_id != query_key:
+                raise RuntimeError(f"query plan resource identity changed during teardown: {plan_key}")
+            if indexed_connection is not query_connection:
+                raise RuntimeError(f"query plan connection ownership changed during teardown: {plan_key}")
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise RuntimeError(f"query plan session disappeared during teardown: {plan_key}")
+
         activation_tasks = [
             task
             for (query_id, _resource_unit_id), task in tuple(self._query_udf_actor_activation_tasks.items())
@@ -5828,46 +6113,92 @@ class RayQueryDriverActor:
                 continue
             if loop is not None and loop.is_running() and not loop.is_closed():
                 loop.call_soon_threadsafe(task.cancel)
-        with self._session_lock:
-            session_id = self._plan_session_ids.get(plan_key)
-            query_connection = self._plan_connections.get(plan_key)
-            session = self._sessions.get(session_id) if session_id is not None else None
         if query_connection is not None:
             query_connection.close()
-        with self._session_lock:
-            if self._plan_session_ids.get(plan_key) == session_id:
-                self._plan_session_ids.pop(plan_key, None)
-            if self._plan_connections.get(plan_key) is query_connection:
+        lifecycle.mark_closed()
+        # Registration publishes these indices while holding the same locks in
+        # this order. Remove them as one ownership commit so close_plan cannot
+        # observe a half-released plan.
+        with session.condition:
+            with self._session_lock:
+                if self._plan_lifecycles.get(plan_key) is not lifecycle:
+                    raise RuntimeError(f"query plan lifecycle changed while releasing teardown state: {plan_key}")
+                if self._plan_session_ids.get(plan_key) != lifecycle.session_id:
+                    raise RuntimeError(f"query plan session changed while releasing teardown state: {plan_key}")
+                if self._plan_query_ids.get(plan_key, "") != query_key:
+                    raise RuntimeError(f"query plan resource changed while releasing teardown state: {plan_key}")
+                if self._plan_connections.get(plan_key) is not query_connection:
+                    raise RuntimeError(f"query plan connection changed while releasing teardown state: {plan_key}")
+                if self._sessions.get(lifecycle.session_id) is not session:
+                    raise RuntimeError(f"query plan session disappeared while releasing teardown state: {plan_key}")
+                self._plan_lifecycles.pop(plan_key)
+                self._plan_session_ids.pop(plan_key)
+                self._plan_query_ids.pop(plan_key, None)
                 self._plan_connections.pop(plan_key, None)
-            lifecycle_locks = getattr(self, "_query_udf_actor_lifecycle_locks", None)
-            if lifecycle_locks is not None:
-                lifecycle_locks.pop(plan_key, None)
-        if session is not None:
-            with session.condition:
+                terminal_errors = getattr(self, "_query_terminal_errors", None)
+                if terminal_errors is not None:
+                    terminal_errors.pop(query_key, None)
                 session.plan_ids.discard(plan_key)
 
     def _teardown_plan_resources(
         self,
         plan_id: str,
-        query_id: str,
-        *,
-        drop_fragments: bool,
     ) -> None:
         plan_key = str(plan_id)
         with self._plan_teardown_condition:
             while plan_key in self._plan_teardowns_in_progress:
                 self._plan_teardown_condition.wait()
-            if plan_key not in self._plan_session_ids:
+            lifecycle = self._plan_lifecycles.get(plan_key)
+            if lifecycle is None:
+                if (
+                    plan_key in self._plan_session_ids
+                    or plan_key in self._plan_connections
+                    or plan_key in self._plan_query_ids
+                    or plan_key in self.curr_plans
+                    or plan_key in self.curr_streams
+                    or plan_key in self._async_result_streams
+                    or plan_key in self._leased_result_partition_refs
+                    or plan_key in self._result_partition_ref_counters
+                    or plan_key in self._active_udf_actors_by_plan
+                    or plan_key in self._active_udf_actor_by_unit
+                    or plan_key in self._active_vllm_actors_by_plan
+                    or plan_key in self._query_udf_actor_nodes
+                    or plan_key in self._query_udf_session_configs
+                    or plan_key in self._query_resource_graphs
+                    or plan_key in self._query_allocations
+                    or plan_key in self._query_terminal_errors
+                    or any(query_id == plan_key for query_id, _ in self._query_udf_actor_activation_tasks)
+                ):
+                    raise RuntimeError(f"active query plan is missing its lifecycle: {plan_key}")
                 return
+            if self._plan_session_ids.get(plan_key) != lifecycle.session_id:
+                raise RuntimeError(f"query plan lifecycle/session index mismatch: {plan_key}")
+            lifecycle.request_close()
             self._plan_teardowns_in_progress.add(plan_key)
-        lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
         try:
+            query_id, query_connection, drop_fragments = lifecycle.wait_for_setup()
+            with self._session_lock:
+                if self._plan_lifecycles.get(plan_key) is not lifecycle:
+                    raise RuntimeError(f"query plan lifecycle changed before teardown: {plan_key}")
+                indexed_query_id = self._plan_query_ids.get(plan_key, "")
+                if indexed_query_id != query_id:
+                    raise RuntimeError(f"query plan resource identity changed before teardown: {plan_key}")
+                if self._plan_connections.get(plan_key) is not query_connection:
+                    raise RuntimeError(f"query plan connection identity changed before teardown: {plan_key}")
+            lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
             with lifecycle_lock:
                 self._teardown_plan_resources_once(
-                    plan_key,
+                    lifecycle,
                     query_id,
+                    query_connection,
                     drop_fragments=drop_fragments,
                 )
+            with self._session_lock:
+                if self._plan_lifecycles.get(plan_key) is lifecycle:
+                    raise RuntimeError(f"query plan teardown returned without releasing its lifecycle: {plan_key}")
+                lifecycle_locks = getattr(self, "_query_udf_actor_lifecycle_locks", None)
+                if lifecycle_locks is not None and lifecycle_locks.get(plan_key) is lifecycle_lock:
+                    lifecycle_locks.pop(plan_key, None)
         finally:
             with self._plan_teardown_condition:
                 self._plan_teardowns_in_progress.discard(plan_key)
@@ -5875,11 +6206,13 @@ class RayQueryDriverActor:
 
     def _teardown_plan_resources_once(
         self,
-        plan_id: str,
+        lifecycle: _PlanLifecycle,
         query_id: str,
+        query_connection: Any | None,
         *,
         drop_fragments: bool,
     ) -> None:
+        plan_id = lifecycle.plan_id
         errors: list[BaseException] = []
         execution_owner_errors: list[BaseException] = []
         self.curr_plans.pop(plan_id, None)
@@ -5948,19 +6281,10 @@ class RayQueryDriverActor:
             raise RuntimeError(
                 f"query plan {plan_id} teardown failed: " + "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
             ) from errors[0]
-        self._plan_query_ids.pop(plan_id, None)
-        terminal_errors = getattr(self, "_query_terminal_errors", None)
-        if terminal_errors is not None:
-            terminal_errors.pop(str(query_id or ""), None)
-        self._release_plan_session_state(plan_id)
+        self._release_plan_session_state(lifecycle, query_id, query_connection)
 
     def _cleanup_finished_plan(self, plan_id: str) -> None:
-        query_id = self._plan_query_ids.get(plan_id, "")
-        self._teardown_plan_resources(
-            plan_id,
-            query_id,
-            drop_fragments=bool(query_id),
-        )
+        self._teardown_plan_resources(plan_id)
 
     def _finish_terminal_query(self, plan_id: str, query_id: str) -> None:
         reason = str(getattr(self, "_query_terminal_errors", {}).get(str(query_id), ""))
@@ -5968,11 +6292,7 @@ class RayQueryDriverActor:
             return
         primary_error = RuntimeError(reason)
         try:
-            self._teardown_plan_resources(
-                plan_id,
-                query_id,
-                drop_fragments=True,
-            )
+            self._teardown_plan_resources(plan_id)
         except BaseException as teardown_error:
             aggregate_error = QueryExecutionCleanupError.from_errors(
                 f"terminal query {query_id} failed and deterministic teardown also failed",
@@ -6079,7 +6399,6 @@ class RayQueryDriverActor:
         with self._session_lock:
             session = self._sessions.get(session_key)
             closed_owner = self._closed_session_owners.get(session_key)
-            plan_session_id = self._plan_session_ids.get(plan_key)
         if session is None:
             if closed_owner is None:
                 raise RuntimeError(f"Vane session is not open: {session_key}")
@@ -6089,7 +6408,9 @@ class RayQueryDriverActor:
         if session.owner_id != owner_key:
             raise PermissionError("Vane session operation requires its owning runtime client")
         with session.condition:
-            owns_plan = plan_key in session.plan_ids
+            with self._session_lock:
+                plan_session_id = self._plan_session_ids.get(plan_key)
+                owns_plan = plan_key in session.plan_ids
         if plan_session_id is None and not owns_plan:
             return
         if plan_session_id is not None and plan_session_id != session_key:
@@ -6115,6 +6436,10 @@ class RayQueryDriverActor:
         plan_id = str(plan.idx())
         self._begin_session_operation(session, session_id)
         try:
+            lifecycle = self._register_plan_lifecycle(session_id, session, plan_id)
+            startup: asyncio.Future[Any] | None = None
+            startup_decision: asyncio.Future[bool] | None = None
+            setup_finished = False
             try:
                 plan, plan_id, query_connection = await _run_in_executor_with_owned_side_effects(
                     self._get_driver_native_executor(),
@@ -6123,115 +6448,89 @@ class RayQueryDriverActor:
                     session,
                     plan,
                     plan_id,
+                    lifecycle,
                 )
-            except asyncio.CancelledError as cancellation_error:
-                try:
-                    await _run_in_executor_with_owned_side_effects(
-                        self._get_driver_lifecycle_executor(),
-                        self._teardown_plan_resources,
-                        plan_id,
-                        "",
-                        drop_fragments=False,
-                    )
-                except asyncio.CancelledError:
-                    pass
-                except BaseException as teardown_error:
-                    aggregate_error = QueryExecutionCleanupError.from_errors(
-                        f"query plan {plan_id} was cancelled during preparation and teardown failed",
-                        cancellation_error,
-                        [teardown_error],
-                    )
-                    raise aggregate_error from cancellation_error
-                raise cancellation_error
-
-            self._plan_query_ids[plan_id] = plan_id
-            try:
+                self._set_plan_query_id(lifecycle, plan_id)
                 graph, _ = await self._register_query_resources(
                     plan,
                     query_connection=query_connection,
                     expected_plan_id=plan_id,
                 )
-            except BaseException as registration_error:
-                try:
-                    await _run_in_executor_with_owned_side_effects(
-                        self._get_driver_lifecycle_executor(),
-                        self._teardown_plan_resources,
-                        plan_id,
-                        plan_id,
-                        drop_fragments=False,
-                    )
-                except asyncio.CancelledError:
-                    pass
-                except BaseException as teardown_error:
-                    aggregate_error = QueryExecutionCleanupError.from_errors(
-                        f"query plan {plan_id} registration failed and teardown also failed",
-                        registration_error,
-                        [teardown_error],
-                    )
-                    raise aggregate_error from registration_error
-                raise
-            self._plan_query_ids[plan_id] = str(graph.query_id)
+                self._set_plan_query_id(lifecycle, str(graph.query_id))
+                if not lifecycle.begin_startup():
+                    raise RuntimeError(f"query plan closed during startup: {plan_id}")
 
-            startup_ownership = _PlanStartupOwnership()
-            startup = asyncio.create_task(
-                _run_in_executor(
+                startup_decision = asyncio.wrap_future(lifecycle.startup_decision_future())
+                startup_source, startup = _submit_to_executor_with_source(
                     self._get_driver_native_executor(),
-                    self._run_plan_sync_with_ownership,
+                    self._run_plan_sync_with_lifecycle,
                     plan,
                     plan_id,
                     graph,
                     query_connection,
                     session.config,
-                    startup_ownership,
-                ),
-                name=f"vane-plan-startup:{plan_id}",
-            )
-            try:
-                await asyncio.shield(startup)
-            except asyncio.CancelledError as cancellation_error:
-                if startup_ownership.cancel_before_worker_claim():
-                    startup.cancel()
-                    await asyncio.gather(startup, return_exceptions=True)
+                    lifecycle,
+                )
+                lifecycle.bind_startup_future(startup_source)
+                started = await asyncio.shield(startup_decision)
+                try:
+                    await _await_future_with_owned_side_effects(startup)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    cancelling = None if current_task is None else getattr(current_task, "cancelling", None)
+                    if started or (callable(cancelling) and cancelling()):
+                        raise
+                if not started:
+                    raise RuntimeError(f"query plan closed before fragment startup: {plan_id}")
+                close_requested = lifecycle.finish_setup(succeeded=True)
+                setup_finished = True
+                if close_requested:
+                    raise RuntimeError(f"query plan closed during startup: {plan_id}")
+            except BaseException as execution_error:
+                lifecycle.request_close()
+                primary_error = execution_error
+                if startup_decision is not None:
                     try:
-                        await _run_in_executor_with_owned_side_effects(
-                            self._get_driver_lifecycle_executor(),
-                            self._teardown_plan_resources,
-                            plan_id,
-                            str(graph.query_id),
-                            drop_fragments=False,
-                        )
+                        await _await_future_with_owned_side_effects(startup_decision)
                     except asyncio.CancelledError:
                         pass
-                    except BaseException as teardown_error:
-                        aggregate_error = QueryExecutionCleanupError.from_errors(
-                            f"query plan {plan_id} was cancelled before startup and teardown failed",
-                            cancellation_error,
-                            [teardown_error],
-                        )
-                        raise aggregate_error from cancellation_error
-                else:
-                    try:
-                        await asyncio.shield(startup)
                     except BaseException as startup_error:
-                        raise startup_error from cancellation_error
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            primary_error = startup_error
+                if startup is not None:
                     try:
-                        await _run_in_executor_with_owned_side_effects(
-                            self._get_driver_lifecycle_executor(),
-                            self._teardown_plan_resources,
-                            plan_id,
-                            str(graph.query_id),
-                            drop_fragments=True,
-                        )
+                        await _await_future_with_owned_side_effects(startup)
                     except asyncio.CancelledError:
                         pass
-                    except BaseException as teardown_error:
-                        aggregate_error = QueryExecutionCleanupError.from_errors(
-                            f"query plan {plan_id} was cancelled during startup and teardown failed",
-                            cancellation_error,
-                            [teardown_error],
-                        )
-                        raise aggregate_error from cancellation_error
-                raise
+                    except BaseException as startup_error:
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            primary_error = startup_error
+                if not setup_finished:
+                    lifecycle.finish_setup(succeeded=False)
+                    setup_finished = True
+                teardown_error: BaseException | None = None
+                try:
+                    await _run_in_executor_with_owned_side_effects(
+                        self._get_driver_lifecycle_executor(),
+                        self._teardown_plan_resources,
+                        plan_id,
+                    )
+                except asyncio.CancelledError:
+                    # The lifecycle-owned teardown completed before exposing
+                    # any additional cancellation to this already-failing call.
+                    pass
+                except BaseException as error:
+                    teardown_error = error
+                if teardown_error is not None:
+                    aggregate_error = QueryExecutionCleanupError.from_errors(
+                        f"query plan {plan_id} failed to start and teardown also failed",
+                        primary_error,
+                        [teardown_error],
+                    )
+                    raise aggregate_error from primary_error
+                if primary_error is execution_error:
+                    raise
+                raise primary_error from execution_error
         finally:
             self._end_session_operation(session)
 
@@ -6241,6 +6540,7 @@ class RayQueryDriverActor:
         session: _DriverSession,
         plan: vane.ray_cxx.PyLogicalPlan,
         plan_id: str,
+        lifecycle: _PlanLifecycle,
     ) -> tuple[Any, str, Any]:
         """Prepare a physical plan on an owned worker thread."""
         if os.environ.get("VANE_WORKER") == "1":
@@ -6251,48 +6551,45 @@ class RayQueryDriverActor:
         with session.operation_lock:
             logical_plan = plan
             query_connection = session.connection.cursor()
-            with self._session_lock:
-                if self._sessions.get(str(session_id)) is not session:
-                    query_connection.close()
-                    raise RuntimeError(f"Vane session closed during query startup: {session_id}")
-                if plan_id in self._plan_session_ids:
-                    query_connection.close()
-                    raise RuntimeError(f"query plan identity is already active: {plan_id}")
-                session.plan_ids.add(plan_id)
-                self._plan_session_ids[plan_id] = str(session_id)
-                self._plan_connections[plan_id] = query_connection
-
             try:
-                from vane.runners.ray.worker import (
-                    _configure_duckdb_s3,
-                    _refresh_effective_duckdb_s3_config,
-                )
-
-                use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
-                refreshed_s3_config = _refresh_effective_duckdb_s3_config(
-                    session.config,
-                    session.s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
-                session.s3_config = _configure_duckdb_s3(
-                    query_connection,
-                    refreshed_s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
-                physical_plan = logical_plan.to_physical_plan(
-                    query_connection,
-                    session.s3_config,
-                )
-                physical_plan_id = str(physical_plan.idx())
-                if physical_plan_id != plan_id:
-                    raise RuntimeError(
-                        f"logical/physical query plan identity changed: logical={plan_id!r} "
-                        f"physical={physical_plan_id!r}"
-                    )
-                self._validate_plan_session(session_id, physical_plan, session)
+                with self._session_lock:
+                    if self._sessions.get(str(session_id)) is not session:
+                        raise RuntimeError(f"Vane session closed during query startup: {session_id}")
+                    if self._plan_lifecycles.get(plan_id) is not lifecycle:
+                        raise RuntimeError(f"query plan lifecycle changed during preparation: {plan_id}")
+                self._attach_plan_connection(lifecycle, query_connection)
             except BaseException:
-                self._release_plan_session_state(plan_id)
-                raise
+                try:
+                    query_connection.close()
+                finally:
+                    raise
+
+            from vane.runners.ray.worker import (
+                _configure_duckdb_s3,
+                _refresh_effective_duckdb_s3_config,
+            )
+
+            use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
+            refreshed_s3_config = _refresh_effective_duckdb_s3_config(
+                session.config,
+                session.s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            session.s3_config = _configure_duckdb_s3(
+                query_connection,
+                refreshed_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            physical_plan = logical_plan.to_physical_plan(
+                query_connection,
+                session.s3_config,
+            )
+            physical_plan_id = str(physical_plan.idx())
+            if physical_plan_id != plan_id:
+                raise RuntimeError(
+                    f"logical/physical query plan identity changed: logical={plan_id!r} physical={physical_plan_id!r}"
+                )
+            self._validate_plan_session(session_id, physical_plan, session)
         return physical_plan, plan_id, query_connection
 
     def _run_plan_sync(
@@ -6302,63 +6599,86 @@ class RayQueryDriverActor:
         graph: Any,
         query_connection: Any,
         session_config: dict[str, str],
-    ) -> None:
+        lifecycle: _PlanLifecycle,
+    ) -> bool:
         """Start an already registered streaming plan on a worker thread."""
-        plan_runner_started = False
-        try:
-            self._precreate_udf_actors(
-                plan,
-                graph,
-                query_connection=query_connection,
-                session_config=session_config,
-            )
-            self._precreate_vllm_actors(
-                plan,
-                query_connection=query_connection,
-                session_config=session_config,
-            )
+        self._precreate_udf_actors(
+            plan,
+            graph,
+            query_connection=query_connection,
+            session_config=session_config,
+        )
+        if lifecycle.close_requested():
+            return False
+        self._precreate_vllm_actors(
+            plan,
+            query_connection=query_connection,
+            session_config=session_config,
+        )
+        if lifecycle.close_requested():
+            return False
 
-            self.curr_plans[plan_id] = plan
-            self._plan_query_ids[plan_id] = str(graph.query_id)
-            plan_runner = self._get_plan_runner()
-            plan_runner_started = True
-            self.curr_streams[plan_id] = plan_runner.run_plan(plan, query_connection)
-        except BaseException as start_error:
-            query_id = self._plan_query_ids.get(plan_id, "")
-            try:
-                self._teardown_plan_resources(
-                    plan_id,
-                    query_id,
-                    drop_fragments=plan_runner_started,
-                )
-            except BaseException as teardown_error:
-                aggregate_error = QueryExecutionCleanupError.from_errors(
-                    f"query plan {plan_id} failed to start and teardown also failed",
-                    start_error,
-                    [teardown_error],
-                )
-                raise aggregate_error from start_error
-            raise
+        self.curr_plans[plan_id] = plan
+        plan_runner = self._get_plan_runner()
+        if not lifecycle.begin_fragment_execution():
+            return False
+        self.curr_streams[plan_id] = plan_runner.run_plan(plan, query_connection)
+        return True
 
-    def _run_plan_sync_with_ownership(
+    def _run_plan_sync_with_lifecycle(
         self,
         plan: Any,
         plan_id: str,
         graph: Any,
         query_connection: Any,
         session_config: dict[str, str],
-        startup_ownership: _PlanStartupOwnership,
-    ) -> None:
+        lifecycle: _PlanLifecycle,
+    ) -> bool:
         """Start only after atomically claiming the registered resources."""
-        if not startup_ownership.claim_for_worker():
-            return
-        self._run_plan_sync(
-            plan,
-            plan_id,
-            graph,
-            query_connection,
-            session_config,
-        )
+        if not lifecycle.claim_startup_for_worker():
+            return False
+        try:
+            started = self._run_plan_sync(
+                plan,
+                plan_id,
+                graph,
+                query_connection,
+                session_config,
+                lifecycle,
+            )
+        except BaseException as error:
+            lifecycle.fail_startup(error)
+            raise
+        lifecycle.publish_startup_result(started=started)
+        return started
+
+    @staticmethod
+    def _run_copy_plan_sync_with_lifecycle(
+        plan_runner: Any,
+        plan: Any,
+        query_connection: Any,
+        lifecycle: _PlanLifecycle,
+    ) -> Any:
+        """Run COPY only after claiming startup and publishing its native fence."""
+
+        if not lifecycle.claim_startup_for_worker():
+            return _COPY_PLAN_NOT_STARTED
+        try:
+            result = plan_runner.run_copy_plan(
+                plan,
+                query_connection,
+                lifecycle.publish_copy_execution_started,
+            )
+        except BaseException as error:
+            lifecycle.fail_startup(error)
+            raise
+        if not lifecycle.startup_decision_future().done():
+            startup_contract_error = RuntimeError(
+                f"native COPY plan {lifecycle.plan_id} returned without publishing its execution-start fence"
+            )
+            lifecycle.fail_startup(startup_contract_error)
+            raise startup_contract_error
+        return result
 
     def _ensure_copy_operation_state(self) -> None:
         if not isinstance(getattr(self, "_copy_operations_inflight", None), dict):
@@ -6439,7 +6759,7 @@ class RayQueryDriverActor:
         )
 
     @staticmethod
-    async def _await_copy_operation(task: asyncio.Task[CopyPlanOutcome]) -> CopyPlanOutcome:
+    async def _await_copy_operation(task: asyncio.Future[CopyPlanOutcome]) -> CopyPlanOutcome:
         cancellation: asyncio.CancelledError | None = None
         while not task.done():
             try:
@@ -6792,8 +7112,10 @@ class RayQueryDriverActor:
         logical_plan = plan
         plan_id = str(logical_plan.idx())
         graph = None
-        plan_runner_started = False
-        plan_execution: asyncio.Task[Any] | None = None
+        plan_execution: asyncio.Future[Any] | None = None
+        startup_decision: asyncio.Future[bool] | None = None
+        lifecycle = self._register_plan_lifecycle(session_id, session, plan_id)
+        setup_finished = False
         try:
             plan, query_connection = await _run_in_executor_with_owned_side_effects(
                 self._get_driver_native_executor(),
@@ -6802,14 +7124,17 @@ class RayQueryDriverActor:
                 session,
                 logical_plan,
                 plan_id,
+                lifecycle,
             )
-            self._plan_query_ids[plan_id] = plan_id
+            self._set_plan_query_id(lifecycle, plan_id)
             graph, _ = await self._register_query_resources(
                 plan,
                 query_connection=query_connection,
                 expected_plan_id=plan_id,
             )
-            self._plan_query_ids[plan_id] = str(graph.query_id)
+            self._set_plan_query_id(lifecycle, str(graph.query_id))
+            if not lifecycle.begin_startup():
+                raise RuntimeError(f"COPY query plan closed during startup: {plan_id}")
             await _run_in_executor_with_owned_side_effects(
                 self._get_driver_native_executor(),
                 self._precreate_udf_actors,
@@ -6818,6 +7143,8 @@ class RayQueryDriverActor:
                 query_connection=query_connection,
                 session_config=session.config,
             )
+            if lifecycle.close_requested():
+                raise RuntimeError(f"COPY query plan closed during actor startup: {plan_id}")
             await _run_in_executor_with_owned_side_effects(
                 self._get_driver_native_executor(),
                 self._precreate_vllm_actors,
@@ -6825,17 +7152,26 @@ class RayQueryDriverActor:
                 query_connection=query_connection,
                 session_config=session.config,
             )
+            if lifecycle.close_requested():
+                raise RuntimeError(f"COPY query plan closed during actor startup: {plan_id}")
             plan_runner = self._get_plan_runner()
-            plan_runner_started = True
-            plan_execution = asyncio.create_task(
-                _run_in_executor(
-                    self._get_driver_copy_executor(),
-                    plan_runner.run_copy_plan,
-                    plan,
-                    query_connection,
-                ),
-                name=f"vane-copy-plan:{plan_id}",
+            startup_decision = asyncio.wrap_future(lifecycle.startup_decision_future())
+            startup_source, plan_execution = _submit_to_executor_with_source(
+                self._get_driver_copy_executor(),
+                self._run_copy_plan_sync_with_lifecycle,
+                plan_runner,
+                plan,
+                query_connection,
+                lifecycle,
             )
+            lifecycle.bind_startup_future(startup_source)
+            started = await asyncio.shield(startup_decision)
+            if not started:
+                raise RuntimeError(f"COPY query plan closed before fragment startup: {plan_id}")
+            close_requested = lifecycle.finish_setup(succeeded=True)
+            setup_finished = True
+            if close_requested:
+                raise RuntimeError(f"COPY query plan closed during startup: {plan_id}")
             # Cancellation must reach the exception path promptly so teardown
             # can interrupt a still-running native write, but it must not
             # cancel the asyncio wrapper around that thread. The exception path
@@ -6849,6 +7185,19 @@ class RayQueryDriverActor:
             if result.get("copy_output_committed") is not True:
                 raise RuntimeError(f"native COPY plan {plan_id} returned without a committed output marker")
         except BaseException as execution_error:
+            lifecycle.request_close()
+            primary_error = execution_error
+            if startup_decision is not None and not setup_finished:
+                try:
+                    await _await_future_with_owned_side_effects(startup_decision)
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as startup_error:
+                    if isinstance(primary_error, asyncio.CancelledError):
+                        primary_error = startup_error
+            if not setup_finished:
+                lifecycle.finish_setup(succeeded=False)
+                setup_finished = True
             query_id = self._plan_query_ids.get(plan_id, "")
             teardown_error: BaseException | None = None
             try:
@@ -6856,8 +7205,6 @@ class RayQueryDriverActor:
                     self._get_driver_lifecycle_executor(),
                     self._teardown_plan_resources,
                     plan_id,
-                    query_id,
-                    drop_fragments=plan_runner_started,
                 )
             except asyncio.CancelledError:
                 # The owned teardown finished before cancellation was exposed.
@@ -6868,7 +7215,7 @@ class RayQueryDriverActor:
             # terminal result so a concurrent failure cannot escape as an
             # unobserved asyncio task exception.
             committed_result: Mapping[str, Any] | None = None
-            unknown_outcome_error = execution_error if isinstance(execution_error, CopyOutcomeUnknownError) else None
+            unknown_outcome_error = primary_error if isinstance(primary_error, CopyOutcomeUnknownError) else None
             if plan_execution is not None:
                 try:
                     await self._await_copy_operation(plan_execution)
@@ -6892,7 +7239,7 @@ class RayQueryDriverActor:
                 cleanup_warnings = self._copy_native_cleanup_warnings(committed_result) + (
                     self._copy_cleanup_warning(
                         "COPY post-commit execution finalization",
-                        execution_error,
+                        primary_error,
                     ),
                 )
                 cleanup_state: Literal["complete", "pending"] = "complete"
@@ -6921,28 +7268,32 @@ class RayQueryDriverActor:
                     cleanup_warnings=cleanup_warnings,
                 )
             if unknown_outcome_error is not None:
-                if unknown_outcome_error is not execution_error:
+                if unknown_outcome_error is not primary_error:
                     unknown_outcome_error.add_cleanup_warnings(
                         self._copy_cleanup_warning(
                             "COPY outcome-unknown execution finalization",
-                            execution_error,
+                            primary_error,
                         )
                     )
                 if teardown_error is not None:
                     unknown_outcome_error.add_cleanup_warnings(
                         self._copy_cleanup_warning("COPY outcome-unknown teardown", teardown_error)
                     )
-                if unknown_outcome_error is execution_error:
-                    raise
-                raise unknown_outcome_error from execution_error
+                if unknown_outcome_error is primary_error:
+                    if primary_error is execution_error:
+                        raise
+                    raise primary_error from execution_error
+                raise unknown_outcome_error from primary_error
             if teardown_error is not None:
                 aggregate_error = QueryExecutionCleanupError.from_errors(
                     f"COPY query plan {plan_id} failed and teardown also failed",
-                    execution_error,
+                    primary_error,
                     [teardown_error],
                 )
-                raise aggregate_error from execution_error
-            raise
+                raise aggregate_error from primary_error
+            if primary_error is execution_error:
+                raise
+            raise primary_error from execution_error
         query_id = str(graph.query_id)
         cleanup_warnings = self._copy_native_cleanup_warnings(result)
         try:
@@ -6978,8 +7329,6 @@ class RayQueryDriverActor:
                 self._get_driver_lifecycle_executor(),
                 self._teardown_plan_resources,
                 plan_id,
-                query_id,
-                drop_fragments=True,
             )
         except asyncio.CancelledError:
             # The owned teardown completed before cancellation was exposed.
@@ -7006,51 +7355,49 @@ class RayQueryDriverActor:
         session: _DriverSession,
         logical_plan: Any,
         plan_id: str,
+        lifecycle: _PlanLifecycle,
     ) -> tuple[Any, Any]:
         """Build a COPY plan on an owned thread without blocking actor control RPCs."""
         with session.operation_lock:
             query_connection = session.connection.cursor()
-            with self._session_lock:
-                if self._sessions.get(str(session_id)) is not session:
-                    query_connection.close()
-                    raise RuntimeError(f"Vane session closed during COPY startup: {session_id}")
-                if plan_id in self._plan_session_ids:
-                    query_connection.close()
-                    raise RuntimeError(f"query plan identity is already active: {plan_id}")
-                session.plan_ids.add(plan_id)
-                self._plan_session_ids[plan_id] = str(session_id)
-                self._plan_connections[plan_id] = query_connection
             try:
-                from vane.runners.ray.worker import (
-                    _configure_duckdb_s3,
-                    _refresh_effective_duckdb_s3_config,
-                )
-
-                use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
-                refreshed_s3_config = _refresh_effective_duckdb_s3_config(
-                    session.config,
-                    session.s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
-                session.s3_config = _configure_duckdb_s3(
-                    query_connection,
-                    refreshed_s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
-                plan = logical_plan.to_physical_plan(
-                    query_connection,
-                    session.s3_config,
-                )
-                physical_plan_id = str(plan.idx())
-                if physical_plan_id != plan_id:
-                    raise RuntimeError(
-                        f"logical/physical query plan identity changed: logical={plan_id!r} "
-                        f"physical={physical_plan_id!r}"
-                    )
-                self._validate_plan_session(session_id, plan, session)
+                with self._session_lock:
+                    if self._sessions.get(str(session_id)) is not session:
+                        raise RuntimeError(f"Vane session closed during COPY startup: {session_id}")
+                    if self._plan_lifecycles.get(plan_id) is not lifecycle:
+                        raise RuntimeError(f"COPY query plan lifecycle changed during preparation: {plan_id}")
+                self._attach_plan_connection(lifecycle, query_connection)
             except BaseException:
-                self._release_plan_session_state(plan_id)
-                raise
+                try:
+                    query_connection.close()
+                finally:
+                    raise
+            from vane.runners.ray.worker import (
+                _configure_duckdb_s3,
+                _refresh_effective_duckdb_s3_config,
+            )
+
+            use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
+            refreshed_s3_config = _refresh_effective_duckdb_s3_config(
+                session.config,
+                session.s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            session.s3_config = _configure_duckdb_s3(
+                query_connection,
+                refreshed_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            plan = logical_plan.to_physical_plan(
+                query_connection,
+                session.s3_config,
+            )
+            physical_plan_id = str(plan.idx())
+            if physical_plan_id != plan_id:
+                raise RuntimeError(
+                    f"logical/physical query plan identity changed: logical={plan_id!r} physical={physical_plan_id!r}"
+                )
+            self._validate_plan_session(session_id, plan, session)
         return plan, query_connection
 
     async def get_next_partition(

@@ -282,8 +282,13 @@ def _make_local_query_driver_actor():
     runner = cls.__new__(cls)
     runner.curr_streams = {}
     runner.curr_plans = {}
+    runner._async_result_streams = {}
     runner._plan_query_ids = {}
     runner._query_terminal_errors = {}
+    runner._leased_result_partition_refs = {}
+    runner._result_partition_ref_counters = {}
+    runner._query_resource_graphs = {}
+    runner._query_allocations = {}
     runner._duckdb_conn = _FakeConnection()
     runner.plan_runner = None
     runner._active_udf_actors = []
@@ -318,6 +323,7 @@ def _make_local_query_driver_actor():
     runner._client_lease_maintenance_failures = 0
     runner._session_lock = threading.RLock()
     runner._closed_session_owners = driver.BoundedReplayMap(capacity=65_536)
+    runner._plan_lifecycles = {}
     runner._plan_session_ids = {}
     runner._plan_connections = {}
     runner._plan_teardown_condition = threading.Condition(runner._session_lock)
@@ -678,17 +684,87 @@ def _bind_test_query_resource_owner(
         ),
     )
     manager.update_unit_state(unit.resource_unit_id, runnable=True)
-    runner._plan_query_ids[str(plan_id)] = query_id
-    runner._plan_session_ids[str(plan_id)] = _TEST_SESSION_ID
-    runner._sessions[_TEST_SESSION_ID].plan_ids.add(str(plan_id))
+    _bind_test_plan_session(runner, plan_id, query_id=query_id)
     return manager
 
 
-def _bind_test_plan_session(runner, plan_id: str, *, query_id: str | None = None) -> None:
+def _bind_test_plan_session(
+    runner,
+    plan_id: str,
+    *,
+    query_id: str | None = None,
+    query_connection=None,
+) -> driver._PlanLifecycle:
     plan_key = str(plan_id)
+    query_key = str(plan_key if query_id is None else query_id)
+    lifecycle = driver._PlanLifecycle(
+        plan_id=plan_key,
+        session_id=_TEST_SESSION_ID,
+    )
+    if query_key:
+        lifecycle.set_query_id(query_key)
+    if query_connection is not None:
+        lifecycle.set_query_connection(query_connection)
+    assert lifecycle.begin_startup()
+    if query_key:
+        assert lifecycle.begin_fragment_execution()
+        assert lifecycle.finish_setup(succeeded=True) is False
+    else:
+        assert lifecycle.finish_setup(succeeded=False) is True
+    runner._plan_lifecycles[plan_key] = lifecycle
     runner._plan_session_ids[plan_key] = _TEST_SESSION_ID
-    runner._plan_query_ids[plan_key] = str(plan_key if query_id is None else query_id)
+    runner._plan_query_ids[plan_key] = query_key
+    if query_connection is not None:
+        runner._plan_connections[plan_key] = query_connection
     runner._sessions[_TEST_SESSION_ID].plan_ids.add(plan_key)
+    return lifecycle
+
+
+def _test_plan_teardown_state(runner, plan_id: str):
+    lifecycle = runner._plan_lifecycles[str(plan_id)]
+    query_id, query_connection, drop_fragments = lifecycle.wait_for_setup()
+    return lifecycle, query_id, query_connection, drop_fragments
+
+
+def _release_test_plan_session_state(cls, runner, plan_id: str) -> None:
+    lifecycle, _query_id, query_connection, _drop_fragments = _test_plan_teardown_state(runner, plan_id)
+    lifecycle.request_close()
+    cls._release_plan_session_state(runner, lifecycle, _query_id, query_connection)
+
+
+def _run_test_plan_preparation(
+    cls,
+    runner,
+    session,
+    logical_plan,
+    plan_id: str,
+    *,
+    copy_plan: bool,
+):
+    lifecycle = cls._register_plan_lifecycle(runner, _TEST_SESSION_ID, session, plan_id)
+    try:
+        if copy_plan:
+            return cls._prepare_copy_plan_sync(
+                runner,
+                _TEST_SESSION_ID,
+                session,
+                logical_plan,
+                plan_id,
+                lifecycle,
+            )
+        return cls._prepare_plan_sync(
+            runner,
+            _TEST_SESSION_ID,
+            session,
+            logical_plan,
+            plan_id,
+            lifecycle,
+        )
+    except BaseException:
+        lifecycle.request_close()
+        lifecycle.finish_setup(succeeded=False)
+        cls._teardown_plan_resources(runner, plan_id)
+        raise
 
 
 def _fake_task_context_info(task_id):
@@ -758,6 +834,10 @@ def test_owned_thread_side_effect_finishes_before_cancellation_is_exposed():
         task.cancel()
         await asyncio.sleep(0)
         assert task.done() is False
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert task.cancelling() == 2
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -784,18 +864,22 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
         _graph,
         _query_connection,
         _session_config,
+        _lifecycle,
     ):
         assert plan is logical_plan.physical_plan
         assert plan_id == "cancelled-plan"
+        assert _lifecycle.begin_fragment_execution()
         started.set()
         assert release.wait(timeout=1.0)
         events.append("started")
+        return True
 
-    def _cleanup(_self, plan_id, query_id, *, drop_fragments):
+    def _cleanup(_self, plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
         assert query_id == "cancelled-plan"
         assert drop_fragments is True
         events.append(("cleanup", plan_id))
-        cls._release_plan_session_state(runner, plan_id)
+        _release_test_plan_session_state(cls, runner, plan_id)
 
     monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub("cancelled-plan"))
     monkeypatch.setattr(cls, "_run_plan_sync", _start)
@@ -812,6 +896,10 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
         task.cancel()
         await asyncio.sleep(0)
         assert task.done() is False
+        task.cancel()
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert task.cancelling() == 2
 
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -822,6 +910,81 @@ def test_query_driver_run_plan_cancellation_waits_for_startup_and_tears_down(mon
     assert events == ["started", ("cleanup", "cancelled-plan")]
     assert "cancelled-plan" not in runner._plan_session_ids
     assert "cancelled-plan" not in runner._sessions[_TEST_SESSION_ID].plan_ids
+
+
+def test_close_plan_waits_for_startup_before_closing_owned_resources(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "close-during-stream-startup"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    startup_started = threading.Event()
+    startup_release = threading.Event()
+
+    class _Pool:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    pool = _Pool()
+
+    def _precreate_vllm_actors(
+        _self,
+        _plan,
+        *,
+        query_connection,
+        session_config,
+    ):
+        assert session_config == _TEST_SESSION_CONFIG
+        startup_started.set()
+        assert startup_release.wait(timeout=2.0)
+        assert query_connection.closed is False
+        runner._active_vllm_actors.append(pool)
+        runner._active_vllm_actors_by_plan[plan_id] = [pool]
+        return [pool]
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", _precreate_vllm_actors)
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_release_query_resources", lambda *_args, **_kwargs: None)
+
+    async def _close_during_startup():
+        run_task = asyncio.create_task(_run_actor_stream_plan(runner, logical_plan))
+        assert await asyncio.to_thread(startup_started.wait, 1.0)
+        query_connection = runner._test_session_connection.cursors[-1]
+        close_task = asyncio.create_task(
+            cls.close_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            )
+        )
+        for _ in range(100):
+            lifecycle = runner._plan_lifecycles[plan_id]
+            if lifecycle.close_requested():
+                break
+            await asyncio.sleep(0.001)
+        assert lifecycle.close_requested() is True
+        assert close_task.done() is False
+        assert query_connection.closed is False
+
+        startup_release.set()
+        with pytest.raises(RuntimeError, match="closed before fragment startup"):
+            await run_task
+        await asyncio.wait_for(close_task, timeout=1.0)
+        return query_connection
+
+    query_connection = asyncio.run(_close_during_startup())
+
+    assert query_connection.closed is True
+    assert pool.shutdown_calls == 1
+    assert runner._active_vllm_actors == []
+    assert runner._active_vllm_actors_by_plan == {}
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._plan_connections
+    assert plan_id not in runner._plan_query_ids
 
 
 def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypatch):
@@ -853,7 +1016,7 @@ def test_session_close_does_not_block_actor_loop_during_stream_startup(monkeypat
     def _cleanup(_self, plan_id):
         runner.curr_plans.pop(plan_id, None)
         runner.curr_streams.pop(plan_id, None)
-        cls._release_plan_session_state(runner, plan_id)
+        _release_test_plan_session_state(cls, runner, plan_id)
 
     monkeypatch.setattr(cls, "_cleanup_finished_plan", _cleanup)
 
@@ -890,10 +1053,11 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     captured = {"lifecycle": []}
 
     class _PlanRunner:
-        def run_copy_plan(self, plan, conn):
+        def run_copy_plan(self, plan, conn, on_execution_started):
             captured["plan"] = plan
             captured["conn"] = conn
             captured["copy_thread"] = threading.current_thread().name
+            on_execution_started()
             return _committed_copy_result(ok=True)
 
     def _precreate_udf_actors(
@@ -968,7 +1132,8 @@ def test_query_driver_copy_progresses_while_default_executor_is_saturated(monkey
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
             copy_started.set()
             assert actor_loop is not None
             producer = asyncio.run_coroutine_threadsafe(
@@ -981,10 +1146,11 @@ def test_query_driver_copy_progresses_while_default_executor_is_saturated(monkey
             producer.result(timeout=1.0)
             return _committed_copy_result()
 
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1028,6 +1194,89 @@ def test_query_driver_copy_progresses_while_default_executor_is_saturated(monkey
     assert outcome.cleanup_state == "complete"
 
 
+def test_close_plan_cancels_queued_copy_before_connection_teardown(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    runner._driver_executors_shutdown = False
+    runner._driver_copy_executor = driver.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="test-queued-copy",
+    )
+    plan_id = "copy-queued-before-native-start"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+    native_calls = 0
+
+    def _occupy_copy_executor():
+        blocker_started.set()
+        assert blocker_release.wait(timeout=10.0)
+
+    blocker = runner._driver_copy_executor.submit(_occupy_copy_executor)
+    assert blocker_started.wait(timeout=1.0)
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            nonlocal native_calls
+            native_calls += 1
+            on_execution_started()
+            return _committed_copy_result()
+
+    def _teardown_once(
+        _self,
+        lifecycle,
+        query_id,
+        query_connection,
+        *,
+        drop_fragments,
+    ):
+        assert query_id == plan_id
+        assert drop_fragments is False
+        cls._release_plan_session_state(runner, lifecycle, query_id, query_connection)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources_once", _teardown_once)
+
+    async def _close_while_copy_is_queued():
+        copy_task = asyncio.create_task(_run_actor_copy_plan(runner, logical_plan))
+        for _ in range(1000):
+            lifecycle = runner._plan_lifecycles.get(plan_id)
+            if lifecycle is not None and lifecycle._startup_future is not None:
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("COPY startup was not queued")
+        query_connection = runner._plan_connections[plan_id]
+        await asyncio.wait_for(
+            cls.close_plan(
+                runner,
+                _TEST_RUNTIME_OWNER_ID,
+                _TEST_SESSION_ID,
+                plan_id,
+            ),
+            timeout=1.0,
+        )
+        with pytest.raises(RuntimeError, match="closed before fragment startup"):
+            await asyncio.wait_for(copy_task, timeout=1.0)
+        return query_connection
+
+    try:
+        query_connection = asyncio.run(_close_while_copy_is_queued())
+        assert blocker_release.is_set() is False
+        assert native_calls == 0
+        assert query_connection.closed is True
+        assert plan_id not in runner._plan_lifecycles
+        assert plan_id not in runner._plan_session_ids
+        assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+    finally:
+        blocker_release.set()
+        blocker.result(timeout=1.0)
+        cls._shutdown_driver_executors(runner)
+
+
 def test_query_driver_committed_copy_preserves_late_actor_initialization_warning(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     physical_plan = _FakePhysicalPlanWithoutPlanAttr("copy-plan-terminal")
@@ -1035,7 +1284,8 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
     teardown_calls = []
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
+            on_execution_started()
             runner._query_terminal_errors["copy-query-terminal"] = "Ray actor UDF pool initialization failed"
             return _committed_copy_result(ok=True)
 
@@ -1048,9 +1298,11 @@ def test_query_driver_committed_copy_preserves_late_actor_initialization_warning
         _query_registration_stub("copy-query-terminal"),
     )
 
-    def _teardown(_self, plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
         teardown_calls.append((plan_id, query_id, drop_fragments))
         runner._query_terminal_errors.pop(query_id, None)
+        _release_test_plan_session_state(cls, runner, plan_id)
 
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
 
@@ -1070,7 +1322,8 @@ def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatc
     teardown_calls = []
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
+            on_execution_started()
             return _committed_copy_result()
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1086,10 +1339,16 @@ def test_query_driver_copy_progress_failure_returns_committed_warning(monkeypatc
         "_build_local_progress_snapshot",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("invalid progress topology")),
     )
+
+    def _teardown(_self, plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
+        teardown_calls.append((plan_id, query_id, drop_fragments))
+        _release_test_plan_session_state(cls, runner, plan_id)
+
     monkeypatch.setattr(
         cls,
         "_teardown_plan_resources",
-        lambda _self, plan_id, query_id, *, drop_fragments: teardown_calls.append((plan_id, query_id, drop_fragments)),
+        _teardown,
     )
 
     outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
@@ -1120,19 +1379,21 @@ def test_query_driver_concurrent_copy_retries_share_one_write(monkeypatch):
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             plan_started.set()
             assert plan_release.wait(timeout=2.0)
             return _committed_copy_result(rows_copied=17)
 
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         nonlocal teardown_calls
         teardown_calls += 1
         assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1167,14 +1428,16 @@ def test_query_driver_copy_result_logging_failure_replays_committed_success(monk
     teardown_calls = []
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             return _committed_copy_result(rows_copied=5)
 
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         teardown_calls.append((actual_plan_id, query_id, drop_fragments))
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1207,18 +1470,20 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     teardown_calls = 0
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             return _committed_copy_result(rows_copied=7)
 
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         nonlocal teardown_calls
         teardown_calls += 1
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
         if teardown_calls == 1:
             raise RuntimeError("planned post-commit teardown failure")
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1262,15 +1527,17 @@ def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     plan_calls = 0
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             raise ValueError("planned failure before commit")
 
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1317,15 +1584,17 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     }
 
     class _PlanRunner:
-        def run_copy_plan(self, _plan, _conn):
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             return unknown_result
 
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is True
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1375,9 +1644,10 @@ def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(plan, _conn):
+        def run_copy_plan(plan, _conn, on_execution_started):
             plan_id = str(plan.idx())
             plan_calls[plan_id] += 1
+            on_execution_started()
             return _committed_copy_result(rows_copied=plan_calls[plan_id])
 
     async def _register(
@@ -1392,10 +1662,11 @@ def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
         assert expected_plan_id == plan_id
         return SimpleNamespace(query_id=plan_id, units=()), object()
 
-    def _teardown(_self, plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
         assert query_id == plan_id
         assert drop_fragments is True
-        cls._release_plan_session_state(runner, plan_id)
+        _release_test_plan_session_state(cls, runner, plan_id)
 
     runner._copy_operation_terminal = driver.BoundedReplayMap(capacity=1)
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1546,7 +1817,8 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
             return _committed_copy_result(ok=True)
 
     def _build_snapshot(_self, query_id, _started_at):
@@ -1556,10 +1828,11 @@ def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypat
         snapshot_finished.set()
         return {"query_id": query_id}
 
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         assert snapshot_finished.is_set()
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         teardown_calls.append((actual_plan_id, query_id, drop_fragments))
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1602,18 +1875,20 @@ def test_query_driver_copy_operation_cancellation_waits_for_native_commit(monkey
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
             nonlocal plan_calls
             plan_calls += 1
+            on_execution_started()
             native_started.set()
             assert native_release.wait(timeout=2.0)
             native_finished.set()
             return _committed_copy_result(rows_copied=11)
 
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
         teardown_started.set()
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
@@ -1658,14 +1933,16 @@ def test_query_driver_copy_teardown_cancellation_reports_cleanup_complete(monkey
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
             return _committed_copy_result(rows_copied=13)
 
-    def _teardown(_self, actual_plan_id, query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert (actual_plan_id, query_id, drop_fragments) == (plan_id, plan_id, True)
         teardown_started.set()
         assert teardown_release.wait(timeout=2.0)
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
         teardown_finished.set()
 
     monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
@@ -1703,7 +1980,8 @@ def test_query_driver_copy_starts_without_eager_actor_or_topology_barriers(monke
 
     class _PlanRunner:
         @staticmethod
-        def run_copy_plan(_plan, _conn):
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
             events.append("plan")
             return _committed_copy_result(rows_copied=1)
 
@@ -2811,8 +3089,6 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         cls._teardown_plan_resources(
             runner,
             plan_id,
-            "teardown-query",
-            drop_fragments=True,
         )
 
     assert "output release failed" in str(exc_info.value)
@@ -2835,8 +3111,6 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     cls._teardown_plan_resources(
         runner,
         plan_id,
-        "teardown-query",
-        drop_fragments=True,
     )
 
     assert calls == [
@@ -2853,6 +3127,61 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     assert plan_id not in runner._plan_session_ids
     assert runner._leased_result_partition_refs == {}
     assert runner._result_partition_ref_counters == {}
+
+
+def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retry(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "query-connection-close-retry"
+    query_id = "query-connection-close-retry-query"
+
+    class _RetryingQueryConnection:
+        def __init__(self):
+            self.close_calls = 0
+            self.closed = False
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("planned query connection close failure")
+            self.closed = True
+
+    query_connection = _RetryingQueryConnection()
+    lifecycle = _bind_test_plan_session(
+        runner,
+        plan_id,
+        query_id=query_id,
+        query_connection=query_connection,
+    )
+    runner._query_terminal_errors[query_id] = "planned terminal marker"
+    fragment_drops = []
+    monkeypatch.setattr(
+        cls,
+        "_drop_query_fragments_sync",
+        lambda _self, actual_query_id: fragment_drops.append(actual_query_id),
+    )
+
+    with pytest.raises(RuntimeError, match="planned query connection close failure"):
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert query_connection.close_calls == 1
+    assert runner._plan_lifecycles[plan_id] is lifecycle
+    assert runner._plan_session_ids[plan_id] == _TEST_SESSION_ID
+    assert runner._plan_query_ids[plan_id] == query_id
+    assert runner._plan_connections[plan_id] is query_connection
+    assert plan_id in runner._sessions[_TEST_SESSION_ID].plan_ids
+    assert runner._query_terminal_errors[query_id] == "planned terminal marker"
+
+    cls._teardown_plan_resources(runner, plan_id)
+
+    assert query_connection.close_calls == 2
+    assert query_connection.closed is True
+    assert fragment_drops == [query_id, query_id]
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._plan_query_ids
+    assert plan_id not in runner._plan_connections
+    assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+    assert query_id not in runner._query_terminal_errors
 
 
 @pytest.mark.parametrize(
@@ -2924,8 +3253,6 @@ def test_failed_execution_owner_cleanup_blocks_query_resource_release(monkeypatc
             cls._teardown_plan_resources(
                 runner,
                 plan_id,
-                query_id,
-                drop_fragments=True,
             )
 
         assert fragment_calls == [(query_id, False)]
@@ -2958,8 +3285,6 @@ def test_teardown_fence_failure_retains_retryable_query_ownership(monkeypatch):
             cls._teardown_plan_resources(
                 runner,
                 plan_id,
-                query_id,
-                drop_fragments=True,
             )
 
         assert runner._plan_query_ids[plan_id] == query_id
@@ -3085,7 +3410,6 @@ def test_close_session_does_not_deadlock_with_plan_teardown(monkeypatch):
 def test_session_close_waits_until_query_connection_is_closed():
     cls, runner = _make_local_query_driver_actor()
     plan_id = "close-during-query-connection-release"
-    _bind_test_plan_session(runner, plan_id, query_id="")
     query_close_started = threading.Event()
     query_close_release = threading.Event()
     errors = []
@@ -3095,7 +3419,13 @@ def test_session_close_waits_until_query_connection_is_closed():
             query_close_started.set()
             assert query_close_release.wait(timeout=1.0)
 
-    runner._plan_connections[plan_id] = _BlockingQueryConnection()
+    query_connection = _BlockingQueryConnection()
+    _bind_test_plan_session(
+        runner,
+        plan_id,
+        query_id="",
+        query_connection=query_connection,
+    )
 
     def _teardown():
         try:
@@ -3355,6 +3685,80 @@ def test_expired_client_reclamation_cancels_owned_active_operation():
 
     assert _TEST_RUNTIME_OWNER_ID not in runner._client_ids
     assert "surviving-owner" in runner._client_ids
+    assert _TEST_SESSION_ID not in runner._sessions
+
+
+def test_expired_client_reclamation_joins_plan_startup_before_session_close(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    runner._client_ids.add("surviving-owner")
+    cls._ensure_client_lease_state(runner)
+    plan_id = "expired-owner-blocked-startup"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    startup_started = threading.Event()
+    startup_release = threading.Event()
+
+    class _Pool:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    pool = _Pool()
+
+    def _precreate_vllm_actors(
+        _self,
+        _plan,
+        *,
+        query_connection,
+        session_config,
+    ):
+        assert session_config == _TEST_SESSION_CONFIG
+        startup_started.set()
+        assert startup_release.wait(timeout=2.0)
+        assert query_connection.closed is False
+        runner._active_vllm_actors.append(pool)
+        runner._active_vllm_actors_by_plan[plan_id] = [pool]
+        return [pool]
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", _precreate_vllm_actors)
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_release_query_resources", lambda *_args, **_kwargs: None)
+
+    async def _expire_during_startup():
+        run_task = asyncio.create_task(_run_actor_stream_plan(runner, logical_plan))
+        assert await asyncio.to_thread(startup_started.wait, 1.0)
+        query_connection = runner._test_session_connection.cursors[-1]
+        runner._client_leases[_TEST_RUNTIME_OWNER_ID].expires_at = 1.0
+        cls._schedule_expired_client_reclamations(runner)
+        cleanup_task = runner._expired_client_cleanup_tasks[_TEST_RUNTIME_OWNER_ID]
+        for _ in range(100):
+            if run_task.cancelling():
+                break
+            await asyncio.sleep(0.001)
+        assert run_task.cancelling() == 1
+        assert run_task.done() is False
+        assert cleanup_task.done() is False
+        assert query_connection.closed is False
+
+        startup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        assert await asyncio.wait_for(cleanup_task, timeout=1.0) is False
+        return query_connection, run_task
+
+    query_connection, run_task = asyncio.run(_expire_during_startup())
+
+    assert run_task.cancelling() == 1
+    assert query_connection.closed is True
+    assert pool.shutdown_calls == 1
+    assert runner._active_vllm_actors == []
+    assert runner._active_vllm_actors_by_plan == {}
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._plan_connections
+    assert plan_id not in runner._plan_query_ids
     assert _TEST_SESSION_ID not in runner._sessions
 
 
@@ -3752,26 +4156,59 @@ def test_driver_rejects_active_plan_identity_collision(copy_plan):
 
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="query plan identity is already active"):
-        if copy_plan:
-            cls._prepare_copy_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                plan_id,
-            )
-        else:
-            cls._prepare_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                plan_id,
-            )
+        _run_test_plan_preparation(
+            cls,
+            runner,
+            session,
+            _LogicalPlan(),
+            plan_id,
+            copy_plan=copy_plan,
+        )
 
-    assert len(session.connection.cursors) == existing_cursor_count + 1
-    assert session.connection.cursors[-1].closed is True
+    assert len(session.connection.cursors) == existing_cursor_count
     assert plan_id not in session.plan_ids
+
+
+@pytest.mark.parametrize("copy_plan", [False, True])
+@pytest.mark.parametrize("orphaned_owner", ["teardown", "vllm_pool", "resource_graph"])
+def test_driver_rejects_plan_identity_with_orphaned_resource_owner(copy_plan, orphaned_owner):
+    cls, runner = _make_local_query_driver_actor()
+    session = runner._sessions[_TEST_SESSION_ID]
+    plan_id = "orphaned-plan-owner"
+    if orphaned_owner == "teardown":
+        runner._plan_teardowns_in_progress.add(plan_id)
+    elif orphaned_owner == "vllm_pool":
+        runner._active_vllm_actors_by_plan[plan_id] = [object()]
+    else:
+        runner._query_resource_graphs[plan_id] = object()
+
+    class _LogicalPlan:
+        @staticmethod
+        def idx():
+            return plan_id
+
+    with pytest.raises(RuntimeError, match="query plan identity is already active"):
+        _run_test_plan_preparation(
+            cls,
+            runner,
+            session,
+            _LogicalPlan(),
+            plan_id,
+            copy_plan=copy_plan,
+        )
+
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in session.plan_ids
+
+
+def test_teardown_fails_closed_for_orphaned_actor_pool():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "orphaned-actor-pool"
+    runner._active_vllm_actors_by_plan[plan_id] = [object()]
+
+    with pytest.raises(RuntimeError, match="active query plan is missing its lifecycle"):
+        cls._teardown_plan_resources(runner, plan_id)
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
@@ -3800,22 +4237,14 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
             raise RuntimeError("planned stop after query cursor configuration")
 
     with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
-        if copy_plan:
-            cls._prepare_copy_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                "s3-config-plan",
-            )
-        else:
-            cls._prepare_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                "s3-config-plan",
-            )
+        _run_test_plan_preparation(
+            cls,
+            runner,
+            session,
+            _LogicalPlan(),
+            "s3-config-plan",
+            copy_plan=copy_plan,
+        )
 
     query_connection = session.connection.cursors[-1]
     assert "SET s3_access_key_id='session-key'" in query_connection.statements
@@ -3860,22 +4289,14 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
             raise RuntimeError("planned stop after explicit S3 baseline reset")
 
     with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
-        if copy_plan:
-            cls._prepare_copy_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                "explicit-s3-config-plan",
-            )
-        else:
-            cls._prepare_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _LogicalPlan(),
-                "explicit-s3-config-plan",
-            )
+        _run_test_plan_preparation(
+            cls,
+            runner,
+            session,
+            _LogicalPlan(),
+            "explicit-s3-config-plan",
+            copy_plan=copy_plan,
+        )
 
     query_connection = session.connection.cursors[-1]
     assert "SET s3_access_key_id=''" in query_connection.statements
@@ -3954,10 +4375,11 @@ def test_copy_resource_registration_does_not_block_actor_loop(monkeypatch):
         assert registration_release.wait(timeout=1.0)
         raise RuntimeError("planned stop after COPY resource registration")
 
-    def _teardown(_self, actual_plan_id, _query_id, *, drop_fragments):
+    def _teardown(_self, actual_plan_id):
         assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         assert drop_fragments is False
-        cls._release_plan_session_state(runner, actual_plan_id)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
 
     monkeypatch.setattr(cls, "_prepare_query_resource_registration", _delayed_registration)
     monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
@@ -4007,22 +4429,14 @@ def test_driver_rejects_logical_to_physical_plan_identity_change(copy_plan):
 
     existing_cursor_count = len(session.connection.cursors)
     with pytest.raises(RuntimeError, match="logical/physical query plan identity changed"):
-        if copy_plan:
-            cls._prepare_copy_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _ChangedIdentityLogicalPlan(),
-                "logical-plan",
-            )
-        else:
-            cls._prepare_plan_sync(
-                runner,
-                _TEST_SESSION_ID,
-                session,
-                _ChangedIdentityLogicalPlan(),
-                "logical-plan",
-            )
+        _run_test_plan_preparation(
+            cls,
+            runner,
+            session,
+            _ChangedIdentityLogicalPlan(),
+            "logical-plan",
+            copy_plan=copy_plan,
+        )
 
     assert len(session.connection.cursors) == existing_cursor_count + 1
     assert session.connection.cursors[-1].closed is True
@@ -5865,7 +6279,8 @@ def test_get_next_partition_surfaces_late_actor_initialization_failure_before_de
     runner._query_terminal_errors[query_id] = "Ray actor UDF pool initialization failed"
     teardown_calls = []
 
-    def _teardown(actual_plan_id, actual_query_id, *, drop_fragments):
+    def _teardown(actual_plan_id):
+        _, actual_query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
         teardown_calls.append((actual_plan_id, actual_query_id, drop_fragments))
         runner._query_terminal_errors.pop(actual_query_id, None)
 
@@ -6587,9 +7002,11 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
     assert scan_task_descriptors
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    execution_started = threading.Event()
     with _registered_low_level_plan(plan, con):
-        result = runner.run_copy_plan(plan, con)
+        result = runner.run_copy_plan(plan, con, execution_started.set)
 
+    assert execution_started.is_set()
     assert result["rows_copied"] == 3
     assert result["copy_output_base_path"] == str(dst)
     assert result["copy_output_run_id"]
