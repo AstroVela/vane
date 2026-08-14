@@ -74,7 +74,7 @@ def _registered_low_level_plan(
     generation = 1
     manager_holder = {}
 
-    def _refresh_phase_allocation(_eligible_unit_ids):
+    def _refresh_phase_allocation(_eligible_unit_ids, allocation_fence_epoch):
         nonlocal generation
         if not refresh_phase_allocation:
             return
@@ -84,7 +84,7 @@ def _registered_low_level_plan(
                 resources=allocation_resources,
                 generation=generation,
             ),
-            admission_open=True,
+            reopen_fence_epoch=allocation_fence_epoch,
         )
 
     manager = register_query_resource_graph(
