@@ -22,6 +22,7 @@ import pytest
 
 import vane
 import vane._ray_cxx as ray_cxx_helpers
+from tests.result_stream_helpers import collect_result_stream
 from vane._ray_errors import RemoteRayException
 from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
 
@@ -425,7 +426,7 @@ def test_worker_submission_preserves_worker_plan_exception_cause(monkeypatch, ma
             RuntimeError,
             match=f"distributed worker task submission failed for query_id={query_id}",
         ) as exc_info:
-            list(stream)
+            collect_result_stream(stream)
     finally:
         runner.drop_query_fragments(query_id)
         con.close()
@@ -3072,9 +3073,24 @@ def test_ray_worker_manager_integration(monkeypatch):
     assert stats["totals"]["existing_total"] == 2
     assert stats["totals"]["lookup_hits"] == 3
 
+    mgr.register_query_owner("query-lifecycle", "query-lifecycle")
     mgr.drop_query_fragments("query-lifecycle")
     assert dummy_worker_handle.fte_prepare_drop_query_calls == ["query-lifecycle"]
     assert dummy_worker_handle.fte_cleanup_query_calls == ["query-lifecycle"]
+
+
+def test_ray_worker_manager_wait_requires_explicit_resource_owner():
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        with pytest.raises(Exception, match="FTE query is closing"):
+            manager.wait_fte_query("unregistered-query", 0.0)
+
+        manager.register_query_owner("nested-query", "resource-query")
+        with pytest.raises(Exception, match="No Ray workers available"):
+            manager.wait_fte_query("nested-query", 0.0)
+        manager.drop_query_fragments("nested-query")
+    finally:
+        manager.shutdown()
 
 
 def test_ray_worker_manager_instances_use_distinct_worker_scopes(monkeypatch):
@@ -3938,6 +3954,7 @@ def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypat
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 2
+    manager.register_query_owner("query-best-effort-drop", "query-best-effort-drop")
 
     with pytest.raises(Exception, match="is dead"):
         manager.drop_query_fragments("query-best-effort-drop")
@@ -4024,6 +4041,7 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 2
+    manager.register_query_owner(query_id, query_id)
 
     with pytest.raises(Exception, match="timed out waiting for FTE query"):
         manager.wait_fte_query(query_id, 1e-9)
@@ -4208,6 +4226,7 @@ def test_ray_worker_manager_shutdown_waits_for_entered_result_collection(monkeyp
     monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
     manager = vane.ray_cxx.RayWorkerManager()
     assert len(manager.worker_snapshots()) == 1
+    manager.register_query_owner("query-entered-before-shutdown", "query-entered-before-shutdown")
 
     wait_outcomes: list[str] = []
 
@@ -4302,6 +4321,7 @@ def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeyp
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+    manager.register_query_owner("query-unmatched-scope", "query-unmatched-scope")
 
     try:
         with pytest.raises(Exception, match="scope did not match any registered fragment"):
@@ -4322,6 +4342,7 @@ def test_ray_worker_manager_scoped_wait_allows_pending_registration(monkeypatch)
             "registration_pending": status_calls == 1,
         },
     )
+    manager.register_query_owner("query-pending-scope", "query-pending-scope")
 
     try:
         manager._wait_fte_query_scoped_for_test("query-pending-scope")
@@ -4342,6 +4363,7 @@ def test_ray_worker_manager_scoped_wait_stops_when_query_is_canceled(monkeypatch
             "message": "query registry is closing",
         },
     )
+    manager.register_query_owner("query-canceled-scope", "query-canceled-scope")
 
     try:
         with pytest.raises(Exception, match="FTE query canceled.*query registry is closing"):
@@ -4365,6 +4387,7 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
+    manager.register_query_owner("query-shutdown-scope", "query-shutdown-scope")
 
     wait_outcomes: list[str] = []
 

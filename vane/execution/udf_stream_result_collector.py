@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import sys
@@ -44,6 +45,8 @@ _CLEANUP_RETRY_INITIAL_DELAY_S = 0.01
 _CLEANUP_RETRY_MAX_DELAY_S = 1.0
 _CLEANUP_RESPONSE_TIMEOUT_S = 1.0
 _CLEANUP_RESPONSE_TIMEOUT_MAX_S = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 def _collector_debug_log(event: str, record: _StreamRecord, **fields: Any) -> None:
@@ -136,8 +139,6 @@ class _StreamRecord:
     next_ref_ready: bool = False
     ready_sequence: int | None = None
     cleanup_started: bool = False
-    cleanup_remaining: int = 0
-    cleanup_error: BaseException | None = None
 
 
 class _CleanupTicket:
@@ -2203,72 +2204,22 @@ class UDFStreamResultCollector:
             return
         record.adapter.mark_drained()
         key = (record.slot_id, record.submit_id)
+        slot_id = record.slot_id
+        submit_id = record.submit_id
+        submission_scope = record.adapter.submission_scope
 
-        def finish_retirement(error: BaseException | None) -> None:
-            with self._cleanup_handoff_lock:
-                with self._cv:
-                    if self._records.get(key) is not record:
-                        if error is not None:
-                            self._terminal_cleanup_errors.append(error)
-                            self._cv.notify_all()
-                        return
-                    dropped_tokens: list[_OutputLeaseToken] = []
-                    if error is not None:
-                        ready = self._ready_by_slot.get(record.slot_id)
-                        if ready is not None:
-                            for queued in ready:
-                                if queued.submit_id == record.submit_id and queued.kind == "data":
-                                    if queued.output_token is not None:
-                                        dropped_tokens.append(queued.output_token)
-                    claimed_tokens = self._claim_output_token_releases_locked(dropped_tokens)
-                try:
-                    self._submit_cleanup_operations(
-                        tuple(self._output_token_release_operation(token) for token in claimed_tokens),
-                        slot_ids=(record.slot_id,),
-                    )
-                except BaseException:
-                    self._restore_output_token_release_claims(claimed_tokens)
-                    raise
-                with self._cv:
-                    if self._records.pop(key, None) is not record:
-                        if error is not None:
-                            self._terminal_cleanup_errors.append(error)
-                            self._cv.notify_all()
-                        return
-                    if error is None:
-                        event = _ReadyEvent(record.slot_id, record.submit_id, "complete", None)
-                    else:
-                        ready = self._ready_by_slot.get(record.slot_id)
-                        if ready is not None:
-                            self._ready_by_slot[record.slot_id] = deque(
-                                queued
-                                for queued in ready
-                                if not (queued.submit_id == record.submit_id and queued.kind == "data")
-                            )
-                        for token in dropped_tokens:
-                            self._active_output_leases.pop((token.request_id, token.lease_id), None)
-                        event = _ReadyEvent(
-                            record.slot_id,
-                            record.submit_id,
-                            "error",
-                            f"{type(error).__name__}: {error}",
-                        )
-                    self._ready_by_slot[record.slot_id].append(event)
-                    self._cv.notify_all()
-            _collector_debug_log("retired" if error is None else "retire_failed", record)
-            self._notify_wakeup()
-
-        def finish_cleanup_operation(error: BaseException | None) -> None:
-            with self._cv:
-                if error is not None and record.cleanup_error is None:
-                    record.cleanup_error = error
-                record.cleanup_remaining -= 1
-                if record.cleanup_remaining < 0:
-                    raise RuntimeError("Ray UDF record cleanup count underflow")
-                if record.cleanup_remaining:
-                    return
-                cleanup_error = record.cleanup_error
-            finish_retirement(cleanup_error)
+        def report_cleanup_result(error: BaseException | None) -> None:
+            if error is None:
+                return
+            logger.warning(
+                "Ray UDF cleanup did not settle after successful stream completion "
+                "(slot=%s, submit=%s, scope=%s): %s: %s",
+                slot_id,
+                submit_id,
+                submission_scope,
+                type(error).__name__,
+                error,
+            )
 
         with self._cleanup_handoff_lock:
             with self._cv:
@@ -2278,26 +2229,29 @@ class UDFStreamResultCollector:
                 record.cleanup_started = True
                 self._signal_readiness_change_locked()
                 cleanup_operations = record.adapter.retire_operations()
-                record.cleanup_remaining = len(cleanup_operations)
-                record.cleanup_error = None
-            if cleanup_operations:
-                try:
-                    self._submit_cleanup_operations(
-                        cleanup_operations,
-                        on_each_done=finish_cleanup_operation,
-                        store_error=False,
-                        slot_ids=(record.slot_id,),
-                    )
-                except BaseException:
-                    with self._cv:
-                        if self._records.get(key) is record:
-                            record.cleanup_started = False
-                            record.cleanup_remaining = 0
-                            record.cleanup_error = None
-                            self._cv.notify_all()
-                    raise
-            else:
-                finish_retirement(None)
+            try:
+                # Data-plane success commits once the cleanup plan has durable
+                # process ownership. These tickets intentionally do not own the
+                # slot, and their control-plane acknowledgements cannot rewrite
+                # data events that have already been produced.
+                self._submit_cleanup_operations(
+                    cleanup_operations,
+                    on_each_done=report_cleanup_result,
+                    store_error=False,
+                )
+            except BaseException:
+                with self._cv:
+                    if self._records.get(key) is record:
+                        record.cleanup_started = False
+                        self._cv.notify_all()
+                raise
+            with self._cv:
+                if self._records.pop(key, None) is not record:
+                    return
+                self._ready_by_slot[slot_id].append(_ReadyEvent(slot_id, submit_id, "complete", None))
+                self._cv.notify_all()
+        _collector_debug_log("retired", record)
+        self._notify_wakeup()
 
     def _fail_record(self, record: _StreamRecord, exc: BaseException) -> None:
         key = (record.slot_id, record.submit_id)

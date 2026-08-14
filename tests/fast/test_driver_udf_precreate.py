@@ -11,6 +11,7 @@ import textwrap
 import threading
 import types
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -237,6 +238,9 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     assert events == ["maintenance-stopped", "workers-shutdown"]
     assert runner._driver_shutdown_started is True
     assert runner._driver_shutdown_complete is True
+    assert runner._driver_executors_shutdown is True
+    with pytest.raises(RuntimeError, match="executor is shut down"):
+        runner_cls._get_driver_lifecycle_executor(runner)
 
 
 def test_driver_actor_rejects_detach_from_non_owner():
@@ -1536,6 +1540,8 @@ def test_actor_activation_recreates_retired_pool_after_phase_reentry(monkeypatch
         _verify_query_task_admission_capability=lambda **_kwargs: "generation-1",
         _capability_targets_inactive_query_generation=lambda *_args: False,
     )
+    native_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-driver-native")
+    runner._get_driver_native_executor = lambda: native_executor
     activations = []
 
     def activate_sync(_locator, _capability):
@@ -1562,7 +1568,10 @@ def test_actor_activation_recreates_retired_pool_after_phase_reentry(monkeypatch
             _QUERY_GENERATION_CAPABILITY,
         )
 
-    assert asyncio.run(scenario()) == {"actor_handles": ["actor-1"]}
+    try:
+        assert asyncio.run(scenario()) == {"actor_handles": ["actor-1"]}
+    finally:
+        native_executor.shutdown(wait=True)
     assert len(activations) == 1
     assert runner._active_udf_actor_by_unit["q1"][resource_unit_id] is activations[0]
 
@@ -1584,6 +1593,8 @@ def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypa
         _verify_query_task_admission_capability=lambda **_kwargs: "generation-1",
         _capability_targets_inactive_query_generation=lambda *_args: False,
     )
+    native_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-driver-native")
+    runner._get_driver_native_executor = lambda: native_executor
     activation_started = threading.Event()
     release_activation = threading.Event()
     activation_count = 0
@@ -1631,6 +1642,7 @@ def test_cancelled_actor_activation_waiter_keeps_shared_creation_cached(monkeypa
         assert asyncio.run(scenario()) == {"actor_handles": ["actor-1"]}
     finally:
         release_activation.set()
+        native_executor.shutdown(wait=True)
     assert activation_count == 1
 
 

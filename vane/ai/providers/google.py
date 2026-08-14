@@ -39,6 +39,16 @@ from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultE
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
+
+def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    normalized = getattr(value, "value", value)
+    if isinstance(normalized, str) and normalized in known:
+        return repr(normalized)
+    return "unsupported"
+
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -690,5 +700,26 @@ class GooglePrompter:
                 exclude={"automatic_function_calling_history", "parsed", "sdk_http_response"},
             )
 
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            feedback = getattr(response, "prompt_feedback", None)
+            reason = getattr(feedback, "block_reason", None) if feedback is not None else None
+            raise _ProviderResultError(
+                f"Google response from model {self._model!r} returned no candidate"
+                + (
+                    f" (prompt block reason {_terminal_state_label(reason, frozenset({'SAFETY', 'OTHER', 'BLOCKED_REASON_UNSPECIFIED'}))})"
+                    if reason is not None
+                    else ""
+                )
+            )
+        candidate = candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        reason_value = getattr(finish_reason, "value", finish_reason)
+        if reason_value != "STOP":
+            raise _ProviderResultError(
+                f"Google response from model {self._model!r} returned finish_reason "
+                f"{_terminal_state_label(reason_value, frozenset({'STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER'}))} "
+                "for Prompt output; expected 'STOP'"
+            )
         text = response.text
         return text if text else None

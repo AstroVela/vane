@@ -1983,7 +1983,7 @@ def test_inflight_block_survives_temporary_downstream_backpressure():
         collector.shutdown()
 
 
-def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
+def test_terminal_stream_publishes_completion_after_cleanup_handoff(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     generator_holder = {}
@@ -2036,43 +2036,100 @@ def test_terminal_stream_is_retired_before_completion_is_published(monkeypatch):
     del source
     capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
     try:
-        events = []
-        deadline = time.monotonic() + 2.0
-        while not retire_started.is_set() and time.monotonic() < deadline:
-            events.extend(collector.drain_results(capacity))
-            time.sleep(0.005)
-        assert retire_started.is_set()
-        events.extend(collector.drain_results(capacity))
-
-        # Completion is the observable retirement boundary. Independent
-        # tickets may finish while one control Future remains pending, but the
-        # record cannot complete until the whole plan settles.
-        assert [item[2] for item in events] == ["data"]
-        assert collector._records
-        assert collector._cleanup_tickets
-        generator = generator_holder["generator"]
-        assert source_ref() is None
-        assert generator.deleted_streams == [generator.completion_ref]
-
-        data = next(item for item in events if item[2] == "data")
-        assert collector.release_output_block_lease(data[4], data[5]) is True
-        del data
-        del events
-
-        retirement.set_result(None)
         events = _drain_until(
             collector,
             capacity,
             predicate=lambda values: any(item[2] == "complete" for item in values),
         )
+        assert retire_started.is_set()
+        assert [item[2] for item in events] == ["data", "complete"]
+        assert retirement.done() is False
+        with collector._cv:
+            assert collector._records == {}
+            assert collector._cleanup_tickets
+            assert collector._cleanup_tickets_by_slot.get(2) is None
 
-        assert [item[2] for item in events] == ["complete"]
-        assert collector._records == {}
-        assert source_ref() is None
-        assert generator.deleted_streams == [generator.completion_ref]
+        generator = generator_holder["generator"]
+        _wait_until(lambda: source_ref() is None)
+        _wait_until(lambda: generator.deleted_streams == [generator.completion_ref])
+
+        data = next(item for item in events if item[2] == "data")
+        assert collector.release_output_block_lease(data[4], data[5]) is True
+        _wait_until(lambda: not collector.slot_has_pending(2))
+        assert collector.retire_slot(2) is None
+        with collector._cv:
+            assert collector._cleanup_tickets
+
+        retirement.set_result(None)
+        _wait_until(lambda: not collector._cleanup_tickets)
     finally:
         if not retirement.done():
             retirement.set_result(None)
+        collector.shutdown()
+
+
+def test_successful_stream_cleanup_timeout_preserves_data_and_completion(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("VANE_UDF_STREAM_CLEANUP_TIMEOUT_S", "0.08")
+    caplog.set_level("WARNING", logger=collector_module.__name__)
+    fake_ray = _FakeRay()
+    driver = _Driver()
+    release_ack = _Ref({"released": True}, ready=False)
+    driver.release_query_task_lease = _DelayedAckRemoteMethod(release_ack)
+    block_ref = _Ref("large-block", ready=False, is_block=True)
+    collector = UDFStreamResultCollector(ray_module=fake_ray)
+    collector.track_generator_ref(
+        2,
+        23,
+        _source(
+            fake_ray,
+            driver,
+            request_id="cleanup-timeout-after-success",
+            submitter=lambda lease: _Generator([block_ref, _Ref(_metadata(lease, size_bytes=64))]),
+        ),
+    )
+    capacity = {2: {"rows": 1, "bytes": 128, "item_bytes": 128}}
+
+    def queued_kinds():
+        with collector._cv:
+            return [event.kind for event in collector._ready_by_slot.get(2, ())]
+
+    try:
+        assert collector.drain_results(capacity) == []
+        fake_ray.make_ready(block_ref)
+        _wait_until(lambda: queued_kinds() == ["data", "complete"])
+        _wait_until(
+            lambda: any(
+                "cleanup did not settle after successful stream completion" in record.getMessage()
+                for record in caplog.records
+            )
+        )
+        _wait_until(lambda: not collector._cleanup_tickets)
+
+        assert release_ack.ready is False
+        assert queued_kinds() == ["data", "complete"]
+        warning_messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "slot=2, submit=23, scope=test-stream:cleanup-timeout-after-success" in message
+            and "TimeoutError: Ray UDF remote cleanup did not terminate within 0.08s" in message
+            for message in warning_messages
+        )
+        with collector._cv:
+            assert collector._records == {}
+            assert len(collector._active_output_leases) == 1
+            assert collector._terminal_cleanup_errors == []
+
+        events = collector.drain_results(capacity)
+        assert [item[2] for item in events] == ["data", "complete"]
+        assert all(item[2] != "error" for item in events)
+        data = events[0]
+        assert collector.release_output_block_lease(data[4], data[5]) is True
+        _wait_until(lambda: not collector.slot_has_pending(2))
+        assert collector.retire_slot(2) is None
+    finally:
+        fake_ray.make_ready(release_ack)
         collector.shutdown()
 
 
@@ -2292,7 +2349,7 @@ def test_blocked_terminal_retirement_does_not_stall_healthy_stream(monkeypatch):
         collector.shutdown()
 
 
-def test_slot_cancel_observes_claimed_terminal_retirement_without_waiting(monkeypatch):
+def test_slot_cancel_ignores_process_owned_terminal_cleanup(monkeypatch):
     fake_ray = _FakeRay()
     driver = _Driver()
     retire_started = threading.Event()
@@ -2336,11 +2393,17 @@ def test_slot_cancel_observes_claimed_terminal_retirement_without_waiting(monkey
         started_at = time.monotonic()
         collector.cancel_slot(4)
         assert time.monotonic() - started_at < 0.1
-        assert collector.slot_has_pending(4)
+        assert collector.slot_has_pending(4) is False
+        assert retirement.done() is False
+        with collector._cv:
+            assert collector._records == {}
+            assert collector._ready_by_slot.get(4) is None
+            assert collector._cleanup_tickets
+            assert collector._cleanup_tickets_by_slot.get(4) is None
+        collector.retire_slot(4)
 
         retirement.set_result(None)
-        _wait_until(lambda: not collector.slot_has_pending(4))
-        collector.retire_slot(4)
+        _wait_until(lambda: not collector._cleanup_tickets)
     finally:
         if not retirement.done():
             retirement.set_result(None)
@@ -2987,9 +3050,11 @@ def test_real_ray_generator_wait_is_non_consuming_and_preserves_pair_order():
         collector.shutdown()
 
 
-def test_empty_stream_completion_progresses_with_zero_data_capacity():
+def test_empty_stream_completion_does_not_wait_for_task_release_ack():
     fake_ray = _FakeRay()
     driver = _Driver()
+    release_ack = _Ref({"released": True}, ready=False)
+    driver.release_query_task_lease = _DelayedAckRemoteMethod(release_ack)
     collector = UDFStreamResultCollector(ray_module=fake_ray)
     collector.track_generator_ref(
         4,
@@ -3009,7 +3074,17 @@ def test_empty_stream_completion_progresses_with_zero_data_capacity():
         )
         assert events == [(4, 40, "complete", None)]
         assert len(driver.release_query_task_lease.calls) == 1
+        assert release_ack.ready is False
+        with collector._cv:
+            assert collector._cleanup_tickets
+            assert collector._cleanup_tickets_by_slot.get(4) is None
+        assert collector.slot_has_pending(4) is False
+        assert collector.retire_slot(4) is None
+
+        fake_ray.make_ready(release_ack)
+        _wait_until(lambda: not collector._cleanup_tickets)
     finally:
+        fake_ray.make_ready(release_ack)
         collector.shutdown()
 
 
@@ -3136,7 +3211,14 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         collector.shutdown()
 
 
-def test_remote_provider_capability_error_preserves_safe_details():
+@pytest.mark.parametrize(
+    ("provider", "expected_provider"),
+    [
+        pytest.param("openai-compatible", "openai-compatible", id="unchanged"),
+        pytest.param("p" * 17_000, "…<truncated>", id="truncated"),
+    ],
+)
+def test_remote_provider_capability_error_preserves_safe_details(provider, expected_provider):
     from vane.ai.provider import ProviderCapabilityError
     from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
 
@@ -3151,7 +3233,7 @@ def test_remote_provider_capability_error_preserves_safe_details():
             "attempt_id": lease["attempt_id"],
         }
         error = ProviderCapabilityError(
-            "openai-compatible",
+            provider,
             "chat-only-model",
             "structured Prompt generation",
             original_error=RuntimeError("endpoint rejected schema"),
@@ -3174,13 +3256,55 @@ def test_remote_provider_capability_error_preserves_safe_details():
         assert [item[2] for item in events] == ["error"]
         message = events[0][3]
         assert "ProviderCapabilityError" in message
-        assert "openai-compatible" in message
+        assert expected_provider in message
         assert "chat-only-model" in message
         assert "structured Prompt generation" in message
         assert "RuntimeError" in message
         assert "endpoint rejected schema" not in message
     finally:
         collector.shutdown()
+
+
+@pytest.mark.parametrize("detail_name", ["provider", "model", "capability", "original_error_summary"])
+def test_provider_capability_error_metadata_bounds_text_details(detail_name):
+    from vane.ai.provider import ProviderCapabilityError
+    from vane.execution import udf_ray_stream_protocol as stream_protocol
+
+    payload = {
+        "query_id": "query",
+        "resource_unit_id": "resource:query:node:1:udf",
+        "task_lease_id": "lease",
+        "attempt_id": "attempt",
+    }
+
+    def encode_detail(value):
+        details = {
+            "provider": "provider",
+            "model": "model",
+            "capability": "capability",
+        }
+        original_error_summary = "RuntimeError"
+        if detail_name == "original_error_summary":
+            original_error_summary = value
+        else:
+            details[detail_name] = value
+        error = ProviderCapabilityError._from_safe_summary(
+            details["provider"],
+            details["model"],
+            details["capability"],
+            original_error_summary,
+        )
+        _, metadata = stream_protocol.make_stream_error_pair(payload, error)
+        validated = stream_protocol.validate_stream_error_metadata(metadata)
+        return validated["exception_details"][detail_name]
+
+    limit = stream_protocol._MAX_ERROR_TEXT_CHARS
+    at_limit = "a" * limit
+    assert encode_detail(at_limit) == at_limit
+
+    suffix = "…<truncated>"
+    oversized = "b" * (limit + 1)
+    assert encode_detail(oversized) == oversized[: limit - len(suffix)] + suffix
 
 
 def test_malformed_metadata_fails_only_its_stream_without_output_admission():

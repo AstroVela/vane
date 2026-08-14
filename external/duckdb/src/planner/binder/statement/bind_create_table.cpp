@@ -348,6 +348,7 @@ unique_ptr<BoundCreateTableInfo> Binder::BindCreateTableInfo(unique_ptr<CreateIn
 unique_ptr<BoundCreateTableInfo> Binder::BindCreateTableCheckpoint(unique_ptr<CreateInfo> info,
                                                                    SchemaCatalogEntry &schema) {
 	auto result = make_uniq<BoundCreateTableInfo>(schema, std::move(info));
+	result->preserve_logical_write_target_identity = true;
 	CreateColumnDependencyManager(*result);
 	return result;
 }

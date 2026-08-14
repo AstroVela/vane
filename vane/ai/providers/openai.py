@@ -39,6 +39,16 @@ from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultE
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
+
+def _terminal_state_label(value: Any, known: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    normalized = getattr(value, "value", value)
+    if isinstance(normalized, str) and normalized in known:
+        return repr(normalized)
+    return "unsupported"
+
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -935,7 +945,25 @@ class OpenAIPrompter:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return cast(str | None, response.choices[0].message.content)
+        choices = getattr(response, "choices", None) or []
+        if len(choices) != 1:
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned {len(choices)} choices; expected exactly one"
+            )
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        refusal = getattr(message, "refusal", None)
+        if finish_reason != "stop" or message is None or refusal is not None:
+            received = f"finish_reason {_terminal_state_label(finish_reason, frozenset({'stop', 'length', 'content_filter', 'tool_calls', 'function_call'}))}"
+            if message is None:
+                received += " with no message"
+            if refusal is not None:
+                received += " with a refusal"
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned {received} for Prompt output; expected finish_reason 'stop'"
+            )
+        return cast(str | None, message.content)
 
     async def _prompt_responses(self, messages: list[dict[str, Any]]) -> str | None:
         """Prompt using the Responses API."""
@@ -961,7 +989,21 @@ class OpenAIPrompter:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
             return serialize_raw_response(response)
-        return cast(str | None, response.output_text)
+        status = getattr(response, "status", None)
+        if status != "completed":
+            raise _ProviderResultError(
+                f"OpenAI response from model {self._model!r} returned status "
+                f"{_terminal_state_label(status, frozenset({'completed', 'failed', 'incomplete', 'cancelled', 'in_progress', 'queued'}))} "
+                "for Prompt output; expected 'completed'"
+            )
+        output = getattr(response, "output", None) or []
+        if any(
+            getattr(block, "type", None) == "message"
+            and any(getattr(content, "type", None) == "refusal" for content in (getattr(block, "content", None) or []))
+            for block in output
+        ):
+            raise _ProviderResultError(f"OpenAI response from model {self._model!r} refused the Prompt request")
+        return cast(str | None, getattr(response, "output_text", None))
 
     async def prompt(self, messages: tuple[Any, ...]) -> str | None:
         chat_messages: list[dict[str, Any]] = []

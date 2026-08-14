@@ -150,7 +150,7 @@ BoundStatement Binder::Bind(UpdateStatement &stmt) {
 		auto &properties = GetStatementProperties();
 		properties.RegisterDBModify(table.catalog, context, DatabaseModificationType::UPDATE_DATA);
 	}
-	auto update = make_uniq<LogicalUpdate>(table);
+	auto update = make_uniq<LogicalUpdate>(context, table);
 
 	// set return_chunk boolean early because it needs uses update_is_del_and_insert logic
 	if (!stmt.returning_list.empty()) {

@@ -452,6 +452,29 @@ TEST_CASE("PhysicalPlanTranslator: plan without root returns error", "[distribut
 	REQUIRE(msg.find("physical plan has no root") != std::string::npos);
 }
 
+TEST_CASE("PhysicalPlanTranslator: unsupported table function bind data is a value error", "[distributed]") {
+	Allocator allocator;
+	auto plan_ptr = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	TableFunction function;
+	function.name = "unsupported_table_scan";
+	auto bind_data = make_uniq<TableFunctionData>();
+	vector<ColumnIndex> column_ids = {ColumnIndex(0)};
+	vector<string> names = {"value"};
+
+	auto &scan = plan_ptr->Make<PhysicalTableScan>(types, function, std::move(bind_data), types, std::move(column_ids),
+	                                               vector<idx_t> {}, std::move(names), nullptr, 0, ExtraOperatorInfo {},
+	                                               vector<Value> {}, virtual_column_map_t {});
+	plan_ptr->SetRoot(scan);
+
+	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
+	REQUIRE(res.is_err());
+	REQUIRE(res.error().type() == DuckDBError::Type::ValueError);
+	auto msg = std::string(res.error().what());
+	REQUIRE(msg.find("unsupported_table_scan") != std::string::npos);
+	REQUIRE(msg.find("Copy not supported for TableFunctionData") != std::string::npos);
+}
+
 TEST_CASE("PhysicalPlanTranslator: auto broadcast only considers semantically safe sides", "[distributed][join]") {
 	ScopedTranslatorEnvironment strategy("VANE_DISTRIBUTED_JOIN_STRATEGY", nullptr);
 	ScopedTranslatorEnvironment threshold("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "64");

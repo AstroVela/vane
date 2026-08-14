@@ -349,6 +349,89 @@ TEST_CASE("Plan result stream: checks errors before receiving after an empty out
 	REQUIRE_FALSE(channel_state->is_empty());
 }
 
+TEST_CASE("Streaming channel: readiness callbacks are race-free and one-shot", "[distributed][streaming_channel]") {
+	for (idx_t iteration = 0; iteration < 128; iteration++) {
+		auto ch_pair_ = create_unbounded_channel<int>();
+		auto sender = std::move(ch_pair_.first);
+		auto receiver = std::move(ch_pair_.second);
+		std::atomic<bool> start {false};
+		std::atomic<idx_t> notifications {0};
+
+		std::thread producer([concurrent_sender = sender.clone(), &start]() mutable {
+			while (!start.load(std::memory_order_acquire)) {
+				std::this_thread::yield();
+			}
+			concurrent_sender.send(42).value();
+		});
+
+		start.store(true, std::memory_order_release);
+		receiver.notify_when_ready([&notifications]() { notifications.fetch_add(1, std::memory_order_release); });
+		producer.join();
+
+		REQUIRE(notifications.load(std::memory_order_acquire) == 1);
+		REQUIRE(sender.send(43).is_ok());
+		REQUIRE(notifications.load(std::memory_order_acquire) == 1);
+	}
+}
+
+TEST_CASE("Streaming channel: readiness callback observes buffered data and closure",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	idx_t notifications = 0;
+
+	REQUIRE(sender.send(42).is_ok());
+	receiver.notify_when_ready([&notifications]() { notifications++; });
+	REQUIRE(notifications == 1);
+	REQUIRE(receiver.try_recv().first);
+
+	receiver.notify_when_ready([&notifications]() { notifications++; });
+	{ auto dropped_sender = std::move(sender); }
+	REQUIRE(notifications == 2);
+}
+
+TEST_CASE("Plan result stream: nonblocking poll wakes for output and exhaustion", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	std::shared_ptr<duckdb::ColumnDataCollection> empty_collection;
+	auto fragment = std::make_shared<ColumnDataResultPartition>(empty_collection);
+	PlanResultStream stream(nullptr, std::move(receiver));
+	idx_t notifications = 0;
+
+	auto pending = stream.try_next();
+	REQUIRE(pending.state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	std::vector<ResultPartitionRef> fragments {fragment};
+	REQUIRE(sender.send(MaterializedOutput(std::move(fragments), nullptr)).is_ok());
+	REQUIRE(notifications == 1);
+
+	auto ready = stream.try_next();
+	REQUIRE(ready.state == PlanResultStream::PollState::READY);
+	REQUIRE(ready.partition == fragment);
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	{ auto dropped_sender = std::move(sender); }
+	REQUIRE(notifications == 2);
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::EXHAUSTED);
+}
+
+TEST_CASE("Plan result stream: nonblocking poll wakes for execution errors", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<MaterializedOutput>();
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto status = std::make_shared<PlanExecutionStatus>();
+	PlanResultStream stream(nullptr, std::move(receiver), status);
+	idx_t notifications = 0;
+
+	REQUIRE(stream.try_next().state == PlanResultStream::PollState::PENDING);
+	stream.NotifyWhenReady([&notifications]() { notifications++; });
+	status->RecordError(DuckDBError::external_error("asynchronous result failure"));
+	REQUIRE(notifications == 1);
+	REQUIRE_THROWS_WITH(stream.try_next(), Catch::Matchers::Contains("asynchronous result failure"));
+}
+
 TEST_CASE("Streaming channel: receiver close races safely with active sender", "[distributed][streaming_channel]") {
 	for (idx_t iteration = 0; iteration < 64; iteration++) {
 		auto ch_pair_ = create_unbounded_channel<int>();

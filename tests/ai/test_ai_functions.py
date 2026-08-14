@@ -2030,7 +2030,7 @@ def test_openai_responses_request_mapping_preserves_part_order():
         "max_output_tokens": 17,
         "top_p": 0.8,
     }
-    response = SimpleNamespace(output_text="answer", usage=None)
+    response = SimpleNamespace(output_text="answer", status="completed", output=[], usage=None)
     prompter._client = MagicMock()
     prompter._client.responses.create = AsyncMock(return_value=response)
 
@@ -2073,7 +2073,7 @@ def test_openai_chat_request_maps_max_output_tokens_and_stop_sequences():
     prompter._official_openai_endpoint = True
     prompter._options = {"max_output_tokens": 11, "stop_sequences": ["STOP"]}
     response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="chat answer"))],
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="chat answer", refusal=None))],
         usage=None,
     )
     prompter._client = MagicMock()
@@ -2189,7 +2189,7 @@ def test_google_request_mapping_preserves_text_image_order():
         "max_output_tokens": 19,
         "stop_sequences": ["END"],
     }
-    response = SimpleNamespace(text="answer", usage_metadata=None)
+    response = SimpleNamespace(text="answer", candidates=[SimpleNamespace(finish_reason="STOP")], usage_metadata=None)
     prompter._client = MagicMock()
     prompter._client.aio.models.generate_content = AsyncMock(return_value=response)
 
@@ -2362,6 +2362,42 @@ def test_anthropic_terminal_result_obeys_prompt_error_policy(on_error):
     else:
         assert _drive(wrapper, table).column("response").to_pylist() == [None]
     assert prompter._client.messages.create.await_count == 1
+
+
+@pytest.mark.parametrize("on_error", ["raise", "ignore"])
+def test_openai_incomplete_result_obeys_prompt_error_policy(on_error):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from vane.ai.functions import _PromptBatch
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.openai import OpenAIPrompter
+
+    prompter = OpenAIPrompter.__new__(OpenAIPrompter)
+    prompter._provider_name = "openai"
+    prompter._model = "gpt-test"
+    prompter._system_message = None
+    prompter._use_chat_completions = False
+    prompter._return_format = None
+    prompter._return_raw_response = False
+    prompter._options = {}
+    prompter._client = MagicMock()
+    prompter._client.responses.create = AsyncMock(
+        return_value=SimpleNamespace(status="incomplete", output_text="partial")
+    )
+
+    class Descriptor:
+        def instantiate(self):
+            return prompter
+
+    wrapper = _PromptBatch(Descriptor(), ["message"], "response", max_retries=3, on_error=on_error)
+    table = pa.table({"message": ["hello"]})
+    if on_error == "raise":
+        with pytest.raises(_ProviderResultError, match="expected 'completed'"):
+            _drive(wrapper, table)
+    else:
+        assert _drive(wrapper, table).column("response").to_pylist() == [None]
+    assert prompter._client.responses.create.await_count == 1
 
 
 def test_prompt_batch_retry_and_row_isolation(monkeypatch):

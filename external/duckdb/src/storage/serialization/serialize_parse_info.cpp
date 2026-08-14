@@ -472,6 +472,7 @@ void RemoveColumnInfo::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(400, "removed_column", removed_column);
 	serializer.WritePropertyWithDefault<bool>(401, "if_column_exists", if_column_exists);
 	serializer.WritePropertyWithDefault<bool>(402, "cascade", cascade);
+	serializer.WritePropertyWithDefault<string>(403, "new_logical_write_target_identity", new_logical_write_target_identity);
 }
 
 unique_ptr<AlterTableInfo> RemoveColumnInfo::Deserialize(Deserializer &deserializer) {
@@ -479,6 +480,7 @@ unique_ptr<AlterTableInfo> RemoveColumnInfo::Deserialize(Deserializer &deseriali
 	deserializer.ReadPropertyWithDefault<string>(400, "removed_column", result->removed_column);
 	deserializer.ReadPropertyWithDefault<bool>(401, "if_column_exists", result->if_column_exists);
 	deserializer.ReadPropertyWithDefault<bool>(402, "cascade", result->cascade);
+	deserializer.ReadPropertyWithDefault<string>(403, "new_logical_write_target_identity", result->new_logical_write_target_identity);
 	return std::move(result);
 }
 

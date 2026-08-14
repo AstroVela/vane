@@ -14,6 +14,7 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
+from packaging.version import Version
 
 import vane
 
@@ -296,10 +297,13 @@ def _requirement_for_extra(extra, package, environment=None):
     return selected[0]
 
 
-def test_distribution_declares_release_version_and_apache_license_expression():
+def test_distribution_declares_canonical_version_and_apache_license_expression():
     package_metadata = metadata("vane-ai")
+    distribution_version = version("vane-ai")
 
-    assert version("vane-ai") == "0.1.0"
+    assert str(Version(distribution_version)) == distribution_version
+    assert package_metadata["Version"] == distribution_version
+    assert vane.__version__ == distribution_version
     assert package_metadata["License-Expression"] == "Apache-2.0"
     assert SpecifierSet(package_metadata["Requires-Python"]) == SpecifierSet(">=3.10,<3.15")
 

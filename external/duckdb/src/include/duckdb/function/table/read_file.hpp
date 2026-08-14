@@ -17,6 +17,8 @@ namespace duckdb {
 struct ReadFileBindData : public TableFunctionData {
 	unique_ptr<BaseFileReaderOptions> options;
 
+	unique_ptr<FunctionData> Copy() const override;
+
 	static constexpr const idx_t FILE_NAME_COLUMN = 0;
 	static constexpr const idx_t FILE_CONTENT_COLUMN = 1;
 	static constexpr const idx_t FILE_SIZE_COLUMN = 2;

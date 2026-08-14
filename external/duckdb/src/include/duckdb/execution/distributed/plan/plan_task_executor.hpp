@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -21,9 +22,16 @@ namespace distributed {
 class PlanExecutionStatus {
 public:
 	void RecordError(const DuckDBError &error) {
-		std::lock_guard<std::mutex> lock(mutex_);
-		if (!error_) {
-			error_ = std::make_shared<DuckDBError>(error);
+		std::function<void()> error_callback;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (!error_) {
+				error_ = std::make_shared<DuckDBError>(error);
+				error_callback = std::move(error_callback_);
+			}
+		}
+		if (error_callback) {
+			error_callback();
 		}
 	}
 
@@ -39,9 +47,30 @@ public:
 		}
 	}
 
+	void NotifyWhenError(std::function<void()> callback) {
+		std::function<void()> error_callback;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (error_) {
+				error_callback = std::move(callback);
+			} else {
+				error_callback_ = std::move(callback);
+			}
+		}
+		if (error_callback) {
+			error_callback();
+		}
+	}
+
+	void ClearErrorCallback() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		error_callback_ = nullptr;
+	}
+
 private:
 	mutable std::mutex mutex_;
 	std::shared_ptr<DuckDBError> error_;
+	std::function<void()> error_callback_;
 };
 
 // Distributed plan-control tasks block on channels and remote FTE completion.

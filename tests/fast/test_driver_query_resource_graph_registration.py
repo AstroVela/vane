@@ -234,6 +234,7 @@ def _runner(events, coordinator):
     runner._detached_client_results = BoundedReplayMap(capacity=65_536)
     runner._session_lock = threading.RLock()
     runner._closed_session_owners = BoundedReplayMap(capacity=65_536)
+    runner._plan_lifecycles = {}
     runner._plan_session_ids = {}
     runner._plan_connections = {}
     runner._plan_teardown_condition = threading.Condition(runner._session_lock)
@@ -260,6 +261,7 @@ def _runner(events, coordinator):
     runner._active_vllm_actors_by_plan = {}
     runner.curr_plans = {}
     runner.curr_streams = {}
+    runner._async_result_streams = {}
     runner._plan_query_ids = {}
     runner._query_terminal_errors = {}
     runner._query_resource_admission_loop = None
@@ -438,12 +440,12 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         max_workers=1,
         thread_name_prefix="vane-test-saturated",
     )
+    runner._driver_native_executor = executor
 
     runner._precreate_udf_actors = lambda *_args, **_kwargs: startup_entered.set() or []
 
     async def _exercise() -> None:
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(executor)
         registration_complete = asyncio.Event()
         blocker_future = None
         register_query_resources = runner_cls._register_query_resources
@@ -466,7 +468,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
                 expected_plan_id=expected_plan_id,
             )
             blocker_future = loop.run_in_executor(
-                None,
+                executor,
                 _occupy_default_executor,
             )
             while not blocker_started.is_set():
@@ -562,7 +564,7 @@ def test_run_plan_cancellation_after_startup_claim_tears_down_once():
 
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
-    assert fragment_drops == [query_id]
+    assert fragment_drops == []
     assert coordinator.released == [(query_id, 7)]
     assert query_id not in runner.curr_plans
     assert query_id not in runner.curr_streams
@@ -617,10 +619,13 @@ def test_copy_registration_keeps_streaming_udf_admission_bounded_when_ray_nodes_
     runner._precreate_udf_actors = lambda *_args, **_kwargs: []
     runner._precreate_vllm_actors = lambda *_args, **_kwargs: []
     runner._get_plan_runner = lambda: SimpleNamespace(
-        run_copy_plan=lambda _plan, _conn: {
-            "rows_copied": 1,
-            "copy_output_committed": True,
-        },
+        run_copy_plan=lambda _plan, _conn, on_execution_started: (
+            on_execution_started()
+            or {
+                "rows_copied": 1,
+                "copy_output_committed": True,
+            }
+        ),
     )
     runner._build_local_progress_snapshot = lambda query_id, _started_at: {
         "query_id": query_id,

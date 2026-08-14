@@ -49,7 +49,7 @@ def _openai_prompter(*, chat: bool, raw: bool, strict: bool = True):
 def test_openai_responses_structured_and_raw_request_contracts():
     structured = _openai_prompter(chat=False, raw=False)
     structured._client.responses.create = AsyncMock(
-        return_value=SimpleNamespace(output_text='{"answer":"ok"}', usage=None)
+        return_value=SimpleNamespace(output_text='{"answer":"ok"}', status="completed", output=[], usage=None)
     )
 
     assert asyncio.run(structured.prompt(("question",))) == '{"answer":"ok"}'
@@ -73,7 +73,9 @@ def test_openai_chat_completions_uses_json_schema_response_format():
     prompter = _openai_prompter(chat=True, raw=False)
     prompter._client.chat.completions.create = AsyncMock(
         return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"answer":"ok"}'))],
+            choices=[
+                SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"answer":"ok"}', refusal=None))
+            ],
             usage=None,
         )
     )
@@ -86,19 +88,113 @@ def test_openai_chat_completions_uses_json_schema_response_format():
     }
 
 
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", None])
+def test_openai_chat_rejects_unsuccessful_terminal_results(finish_reason):
+    from vane.ai.provider import _ProviderResultError
+
+    prompter = _openai_prompter(chat=True, raw=False)
+    prompter._client.chat.completions.create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason=finish_reason,
+                    message=SimpleNamespace(content="partial", refusal=None),
+                )
+            ]
+        )
+    )
+
+    with pytest.raises(_ProviderResultError, match="expected finish_reason 'stop'"):
+        asyncio.run(prompter.prompt(("question",)))
+
+
+def test_openai_chat_rejects_empty_choices_refusal_and_unknown_reason_without_leaking_state():
+    from vane.ai.provider import _ProviderResultError
+
+    prompter = _openai_prompter(chat=True, raw=False)
+    cases = (
+        (SimpleNamespace(choices=[]), ()),
+        (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=None, refusal="blocked"))
+                ]
+            ),
+            ("blocked",),
+        ),
+        (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="secret-" + "x" * 1_048_576,
+                        message=SimpleNamespace(content="partial", refusal=None),
+                    )
+                ]
+            ),
+            ("secret-",),
+        ),
+    )
+    for response, forbidden in cases:
+        prompter._client.chat.completions.create = AsyncMock(return_value=response)
+        with pytest.raises(_ProviderResultError) as error:
+            asyncio.run(prompter.prompt(("question",)))
+        assert len(str(error.value)) < 500
+        for value in forbidden:
+            assert value not in str(error.value)
+
+
+def test_openai_responses_rejects_incomplete_and_refusal_results():
+    from vane.ai.provider import _ProviderResultError
+
+    prompter = _openai_prompter(chat=False, raw=False)
+    prompter._client.responses.create = AsyncMock(
+        return_value=SimpleNamespace(status="incomplete", output_text="partial")
+    )
+    with pytest.raises(_ProviderResultError, match="expected 'completed'"):
+        asyncio.run(prompter.prompt(("question",)))
+
+    for status in (None, "future-" + "x" * 1_048_576):
+        prompter._client.responses.create = AsyncMock(
+            return_value=SimpleNamespace(status=status, output_text="partial")
+        )
+        with pytest.raises(_ProviderResultError) as error:
+            asyncio.run(prompter.prompt(("question",)))
+        assert len(str(error.value)) < 500
+        assert "future-" not in str(error.value)
+
+    prompter._client.responses.create = AsyncMock(
+        return_value=SimpleNamespace(
+            status="completed",
+            output_text="",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="refusal", refusal="blocked")],
+                )
+            ],
+        )
+    )
+    with pytest.raises(_ProviderResultError, match="refused"):
+        asyncio.run(prompter.prompt(("question",)))
+
+
 @pytest.mark.parametrize("chat", [False, True])
 def test_openai_compatible_endpoint_omits_strict_schema_flag(chat):
     prompter = _openai_prompter(chat=chat, raw=False, strict=False)
     if chat:
         prompter._client.chat.completions.create = AsyncMock(
             return_value=SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"answer":"ok"}'))],
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop", message=SimpleNamespace(content='{"answer":"ok"}', refusal=None)
+                    )
+                ],
                 usage=None,
             )
         )
     else:
         prompter._client.responses.create = AsyncMock(
-            return_value=SimpleNamespace(output_text='{"answer":"ok"}', usage=None)
+            return_value=SimpleNamespace(output_text='{"answer":"ok"}', status="completed", output=[], usage=None)
         )
 
     asyncio.run(prompter.prompt(("question",)))
@@ -180,7 +276,9 @@ def test_google_structured_config_and_raw_body_contracts():
     prompter._options = {}
     prompter._client = MagicMock()
     prompter._client.aio.models.generate_content = AsyncMock(
-        return_value=SimpleNamespace(text='{"answer":"ok"}', usage_metadata=None)
+        return_value=SimpleNamespace(
+            text='{"answer":"ok"}', candidates=[SimpleNamespace(finish_reason="STOP")], usage_metadata=None
+        )
     )
 
     assert asyncio.run(prompter.prompt(("question",))) == '{"answer":"ok"}'
@@ -199,3 +297,55 @@ def test_google_structured_config_and_raw_body_contracts():
         )
     )
     assert json.loads(asyncio.run(prompter.prompt(("question",)))) == {"candidates": []}
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("google.genai") is None,
+    reason="google-genai not installed",
+)
+@pytest.mark.parametrize("finish_reason", ["MAX_TOKENS", "SAFETY", None])
+def test_google_rejects_unsuccessful_terminal_results(finish_reason):
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.google import GooglePrompter
+
+    prompter = GooglePrompter.__new__(GooglePrompter)
+    prompter._provider_name = "google"
+    prompter._model = "gemini-test"
+    prompter._system_message = None
+    prompter._return_format = None
+    prompter._return_raw_response = False
+    prompter._options = {}
+    prompter._client = MagicMock()
+    prompter._client.aio.models.generate_content = AsyncMock(
+        return_value=SimpleNamespace(
+            candidates=[SimpleNamespace(finish_reason=finish_reason)],
+            text="partial",
+        )
+    )
+
+    with pytest.raises(_ProviderResultError, match="expected 'STOP'"):
+        asyncio.run(prompter.prompt(("question",)))
+
+
+def test_google_rejects_prompt_block_and_unknown_reason_without_leaking_state():
+    from vane.ai.provider import _ProviderResultError
+    from vane.ai.providers.google import GooglePrompter
+
+    prompter = GooglePrompter.__new__(GooglePrompter)
+    prompter._provider_name = "google"
+    prompter._model = "gemini-test"
+    prompter._system_message = None
+    prompter._return_format = None
+    prompter._return_raw_response = False
+    prompter._options = {}
+    prompter._client = MagicMock()
+    for response in (
+        SimpleNamespace(candidates=[], prompt_feedback=SimpleNamespace(block_reason="secret-" + "x" * 1_048_576)),
+        SimpleNamespace(candidates=[SimpleNamespace(finish_reason="future-" + "x" * 1_048_576)], text="partial"),
+    ):
+        prompter._client.aio.models.generate_content = AsyncMock(return_value=response)
+        with pytest.raises(_ProviderResultError) as error:
+            asyncio.run(prompter.prompt(("question",)))
+        assert len(str(error.value)) < 500
+        assert "secret-" not in str(error.value)
+        assert "future-" not in str(error.value)

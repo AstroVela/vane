@@ -6,7 +6,7 @@
 
 [project]
 name = "vane-ai"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A distributed, multimodal data engine built on DuckDB and Ray"
 readme = "README.md"
 license = "Apache-2.0"
@@ -108,6 +108,7 @@ backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
 	"pybind11[global]>=3.0.0",
+    "setuptools-scm>=9.2.0",
 ]
 
 [tool.scikit-build]
@@ -115,6 +116,18 @@ minimum-version = "0.10"
 cmake.version = ">=3.29.0"
 ninja.version = ">=1.10"
 ninja.make-fallback = false
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]
+version_scheme = "vane_packaging.setuptools_scm_version:version_scheme"
+local_scheme = "no-local-version"
+
+# Initial discovery includes every Vane release tag so clean detached tag
+# checkouts keep their exact version. Non-exact commits are re-described by the
+# custom scheme against either the main or release-line tag set.
+[tool.setuptools_scm.scm.git]
+describe_command = "git describe --dirty --tags --long --abbrev=40 --match v[0-9]*.[0-9]*.[0-9]*"
+pre_parse = "fail_on_shallow"
 
 [tool.scikit-build.wheel]
 cmake = true
@@ -186,6 +199,7 @@ include = [
 
     # Build configuration
     "/build_backend.py",
+    "/vane_packaging/**",
     "/pyproject.toml",
     "/CMakeLists.txt",
     "/vcpkg.json",
@@ -215,8 +229,6 @@ include = [
     "/tests/fast/test_ray_cpp_bindings.py",
     "/tests/fast/test_ray_remote_exceptions.py",
     "/tests/fast/test_ray_result_contract.py",
-    "/tests/fast/test_fte_production_readiness.py",
-    "/multimodal_inference_benchmarks/check_fte_production_readiness.py",
 
     # Source code and stubs
     "src/**",
@@ -450,6 +462,7 @@ build = [
     "ninja>=1.10",
     "pybind11[global]>=3.0.0",
     "scikit_build_core>=0.11.4",
+    "setuptools-scm>=9.2.0",
     "tomli>=1.1; python_version < '3.11'",
 ]
 dev = [ # tooling like uv will install this automatically when syncing the environment

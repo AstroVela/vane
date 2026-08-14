@@ -151,6 +151,9 @@ optional_ptr<CatalogEntry> DuckSchemaEntry::AddEntryInternal(CatalogTransaction 
 }
 
 optional_ptr<CatalogEntry> DuckSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+	if (!info.preserve_logical_write_target_identity) {
+		info.Base().logical_write_target_identity = CreateTableInfo::GenerateLogicalWriteTargetIdentity();
+	}
 	auto table = make_uniq<DuckTableEntry>(catalog, *this, info);
 	auto &dependencies = info.Base().dependencies;
 

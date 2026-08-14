@@ -88,12 +88,17 @@ class FteWorkerPressureAccountingMixin:
         task_class = FteTaskExecutionClass.coerce(execution_class)
         with _FTE_REGISTRY_LOCK:
             self._fte_pressure.reserved_partitions.add(key)
+            self._fte_pressure.assigned_partitions_by_query.setdefault(key[0], set()).add((key[1], key[2]))
             self._fte_pressure.execution_class_by_reservation[key] = task_class.value
             if memory_bytes > 0:
                 self._fte_pressure.memory_bytes_by_reservation[key] = memory_bytes
             else:
                 self._fte_pressure.memory_bytes_by_reservation.pop(key, None)
             self._fte_pressure.last_seen_at = time.time()
+
+    def fte_query_partition_assignment_count(self, query_id: str) -> int:
+        with _FTE_REGISTRY_LOCK:
+            return self._fte_pressure.query_partition_assignment_count(query_id)
 
     def release_fte_partition_reservation(self, query_id: str, fragment_id: str, partition_id: int) -> None:
         key = partition_reservation_key(query_id, fragment_id, partition_id)

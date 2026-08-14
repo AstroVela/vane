@@ -90,6 +90,10 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
+	DuckDBResult<void> abort_and_quiesce_query(const std::string &) override {
+		return DuckDBResult<void>::ok();
+	}
+
 private:
 	std::unordered_map<WorkerId, MockWorker, WorkerIdHash, WorkerIdEqual> workers_;
 };

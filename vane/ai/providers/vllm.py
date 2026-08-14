@@ -156,6 +156,8 @@ def _validate_vllm_prompt_options(options: Mapping[str, Any]) -> dict[str, Any]:
         _require_prompt_number({nested_name: sampling_params["temperature"]}, nested_name, minimum=0, nullable=True)
 
     engine_args = copied.get("engine_args", {})
+    if "model" in engine_args:
+        raise ValueError("Prompt option 'engine_args.model' is not supported; use the top-level 'model' argument")
     if "trust_remote_code" in engine_args and not isinstance(engine_args["trust_remote_code"], bool):
         raise ValueError("Prompt option 'engine_args.trust_remote_code' must be a bool")
     if engine_args.get("trust_remote_code") is True:

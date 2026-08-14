@@ -1,19 +1,17 @@
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
-LogicalMergeInto::LogicalMergeInto(TableCatalogEntry &table)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), table(table) {
+LogicalMergeInto::LogicalMergeInto(ClientContext &context, TableCatalogEntry &table)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), write_target(context, table), table(table) {
 }
 
-LogicalMergeInto::LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO),
-      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->catalog, table_info->schema,
-                                                 table_info->Cast<CreateTableInfo>().table)) {
+LogicalMergeInto::LogicalMergeInto(ClientContext &context, const LogicalWriteTarget &write_target_p)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), write_target(write_target_p),
+      table(write_target_p.Resolve(context)) {
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

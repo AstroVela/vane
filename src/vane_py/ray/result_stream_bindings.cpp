@@ -5,35 +5,43 @@
 
 #include <exception>
 #include <functional>
+#include <mutex>
 
-struct ResultPartitionStream {
+struct ResultPartitionStream : public std::enable_shared_from_this<ResultPartitionStream> {
 	std::shared_ptr<duckdb::distributed::PlanResultStream> stream_;
 	std::shared_ptr<void> keepalive_;
 	std::function<void()> rethrow_pending_error_;
 	mutex stream_mutex_;
+	mutex callback_mutex_;
+	duckdb::distributed::python::ray::SafePyObject callback_loop_;
+	duckdb::distributed::python::ray::SafePyObject ready_callback_;
 
 	explicit ResultPartitionStream(std::shared_ptr<duckdb::distributed::PlanResultStream> stream)
 	    : stream_(std::move(stream)) {
+	}
+	~ResultPartitionStream() {
+		if (stream_) {
+			stream_->ClearReadyCallback();
+		}
 	}
 
 	py::object PartitionToPyObject(const std::shared_ptr<duckdb::distributed::ResultPartition> &part) {
 		return duckdb::distributed::python::ray::ResultPartitionToPyObject(part);
 	}
 
-	py::object blocking_next() {
+	py::object next_nowait() {
 		if (!stream_) {
 			throw py::stop_iteration();
 		}
 
-		std::pair<bool, duckdb::distributed::ResultPartitionRef> opt;
+		duckdb::distributed::PlanResultStream::PollResult poll_result {
+		    duckdb::distributed::PlanResultStream::PollState::EXHAUSTED, nullptr};
 		std::exception_ptr stream_error;
 		{
-			// Release the GIL before contending on the stream mutex. The mutex
-			// must also be released before restoring a Python submission error.
 			py::gil_scoped_release release;
 			lock_guard<mutex> guard(stream_mutex_);
 			try {
-				opt = stream_->next();
+				poll_result = stream_->try_next();
 			} catch (...) {
 				stream_error = std::current_exception();
 			}
@@ -44,11 +52,71 @@ struct ResultPartitionStream {
 			}
 			std::rethrow_exception(stream_error);
 		}
-		if (!opt.first) {
+		if (poll_result.state == duckdb::distributed::PlanResultStream::PollState::EXHAUSTED) {
 			throw py::stop_iteration();
 		}
-		auto part = opt.second;
+		if (poll_result.state == duckdb::distributed::PlanResultStream::PollState::PENDING) {
+			return py::none();
+		}
+		auto part = poll_result.partition;
 		return PartitionToPyObject(part);
+	}
+
+	void set_ready_callback(py::object loop, py::object callback) {
+		if (loop.is_none() || !py::hasattr(loop, "call_soon_threadsafe")) {
+			throw py::type_error("result stream callback loop must provide call_soon_threadsafe()");
+		}
+		if (callback.is_none() || !PyCallable_Check(callback.ptr())) {
+			throw py::type_error("result stream readiness callback must be callable");
+		}
+		lock_guard<mutex> guard(callback_mutex_);
+		callback_loop_ = duckdb::distributed::python::ray::SafePyObject(std::move(loop));
+		ready_callback_ = duckdb::distributed::python::ray::SafePyObject(std::move(callback));
+	}
+
+	void arm_ready_notification() {
+		if (!stream_) {
+			NotifyReady();
+			return;
+		}
+		auto weak_self = weak_from_this();
+		stream_->NotifyWhenReady([weak_self]() {
+			if (auto self = weak_self.lock()) {
+				self->NotifyReady();
+			}
+		});
+	}
+
+	void clear_ready_callback() {
+		if (stream_) {
+			stream_->ClearReadyCallback();
+		}
+		lock_guard<mutex> guard(callback_mutex_);
+		callback_loop_.reset_with_gil();
+		ready_callback_.reset_with_gil();
+	}
+
+private:
+	void NotifyReady() noexcept {
+		try {
+			if (!duckdb::distributed::python::ray::SafePyObjectCanDecRef()) {
+				return;
+			}
+			PythonGILWrapper gil;
+			py::object loop;
+			py::object callback;
+			{
+				lock_guard<mutex> guard(callback_mutex_);
+				if (callback_loop_.empty() || ready_callback_.empty()) {
+					return;
+				}
+				loop = callback_loop_.get();
+				callback = ready_callback_.get();
+			}
+			loop.attr("call_soon_threadsafe")(callback);
+		} catch (...) {
+			// A closed Python loop is equivalent to an abandoned result waiter.
+		}
 	}
 };
 

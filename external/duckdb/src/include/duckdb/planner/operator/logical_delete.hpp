@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/logical_write_target.hpp"
 #include "duckdb/planner/bound_constraint.hpp"
 
 namespace duckdb {
@@ -19,8 +20,10 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_DELETE;
 
 public:
-	explicit LogicalDelete(TableCatalogEntry &table, idx_t table_index);
+	LogicalDelete(ClientContext &context, TableCatalogEntry &table, idx_t table_index);
 
+	//! Bound path, table incarnation, and write-relevant definition of the target
+	LogicalWriteTarget write_target;
 	TableCatalogEntry &table;
 	idx_t table_index;
 	bool return_chunk;
@@ -39,6 +42,6 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalDelete(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalDelete(ClientContext &context, const LogicalWriteTarget &write_target);
 };
 } // namespace duckdb

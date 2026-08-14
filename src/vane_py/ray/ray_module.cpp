@@ -464,6 +464,8 @@ void register_ray_bindings(py::module_ &mod) {
 			         throw duckdb::InternalException(res.error().what());
 		         }
 	         })
+	    .def("register_query_owner", &RayWorkerManager::register_query_owner, py::arg("query_id"),
+	         py::arg("owner_query_id"))
 	    .def("drop_query_fragments", &RayWorkerManager::drop_query_fragments, py::arg("query_id"))
 	    .def(
 	        "wait_fte_query",
@@ -518,12 +520,10 @@ void register_ray_bindings(py::module_ &mod) {
 
 	// Register the higher-level distributed plan / runner / stream stubs
 	py::class_<ResultPartitionStream, std::shared_ptr<ResultPartitionStream>>(m, "ResultPartitionStream")
-	    .def("blocking_next", &ResultPartitionStream::blocking_next)
-	    .def(
-	        "__iter__",
-	        [](std::shared_ptr<ResultPartitionStream> &self) -> std::shared_ptr<ResultPartitionStream> { return self; })
-	    .def("__next__",
-	         [](std::shared_ptr<ResultPartitionStream> &self) -> py::object { return self->blocking_next(); });
+	    .def("next_nowait", &ResultPartitionStream::next_nowait)
+	    .def("set_ready_callback", &ResultPartitionStream::set_ready_callback)
+	    .def("arm_ready_notification", &ResultPartitionStream::arm_ready_notification)
+	    .def("clear_ready_callback", &ResultPartitionStream::clear_ready_callback);
 
 	// Helper function to create PyPhysicalPlanWrapper from capsule (used by task.cpp)
 	// Wraps a raw PhysicalPlan in a DistributedPhysicalPlan for unified execution.
@@ -959,6 +959,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        if (p.serialized_logical_plan_.empty()) {
 			        throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
 		        }
+		        (void)DecodeLogicalPlanEnvelope(p.serialized_logical_plan_);
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,
 		                              p.connection_snapshot_);
 	        },
@@ -971,6 +972,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        if (serialized_plan.empty()) {
 			        throw duckdb::InternalException("PyLogicalPlan deserialization failed: empty logical plan payload");
 		        }
+		        (void)DecodeLogicalPlanEnvelope(serialized_plan);
 		        PyLogicalPlan plan;
 		        plan.query_id_ = std::move(query_id);
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);
@@ -1053,7 +1055,8 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("plan"), py::arg("conn") = py::none())
 	    .def(
 	        "run_copy_plan",
-	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj) -> py::object {
+	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj,
+	           py::object on_execution_started_obj) -> py::object {
 		        if (!py::isinstance<PyPhysicalPlanWrapper>(plan_obj)) {
 			        throw py::type_error("plan must be DistributedPhysicalPlan (PyPhysicalPlanWrapper)");
 		        }
@@ -1103,9 +1106,15 @@ void register_ray_bindings(py::module_ &mod) {
 
 		        duckdb::distributed::python::ray::SafePyObject keepalive;
 		        auto client_context = get_client_context(conn_obj, keepalive);
-		        return self.run_copy_plan(*plan_ptr, client_context, std::move(keepalive));
+		        duckdb::distributed::python::ray::SafePyObject on_execution_started;
+		        if (!on_execution_started_obj.is_none()) {
+			        on_execution_started =
+			            duckdb::distributed::python::ray::SafePyObject(std::move(on_execution_started_obj));
+		        }
+		        return self.run_copy_plan(*plan_ptr, client_context, std::move(keepalive),
+		                                  std::move(on_execution_started));
 	        },
-	        py::arg("plan"), py::arg("conn") = py::none())
+	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
 	    .def(
 	        "finalize_copy",
 	        [](PyPhysicalPlanWrapperRunner &self, py::list file_infos, py::str copy_spec_key, py::str staging_root,
@@ -1139,8 +1148,12 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        py::arg("file_infos"), py::arg("copy_spec"), py::arg("staging_root"), py::arg("conn") = py::none())
 	    .def("drop_query_fragments", &PyPhysicalPlanWrapperRunner::drop_query_fragments, py::arg("query_id"))
-	    .def("_register_query_owner_for_test", &PyPhysicalPlanWrapperRunner::register_query_owner, py::arg("query_id"),
-	         py::arg("owner_query_id"))
+	    .def(
+	        "_register_query_owner_for_test",
+	        [](PyPhysicalPlanWrapperRunner &self, const string &query_id, const string &owner_query_id) {
+		        self.register_query_owner(query_id, owner_query_id);
+	        },
+	        py::arg("query_id"), py::arg("owner_query_id"))
 	    .def("close_session", &PyPhysicalPlanWrapperRunner::close_session, py::arg("session_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
 	    .def("shutdown",

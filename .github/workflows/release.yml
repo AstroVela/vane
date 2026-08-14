@@ -23,6 +23,8 @@ jobs:
   source-package:
     name: Build source package
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.package_version.outputs.version }}
     permissions:
       contents: write
     steps:
@@ -46,12 +48,47 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$GITHUB_REF_TYPE" = "tag"
-          expected_tag="v$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          test "$GITHUB_REF_NAME" = "$expected_tag"
+          release_version="$(python - "${GITHUB_REF_NAME#v}" <<'PY'
+          import sys
 
-          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          from packaging.version import InvalidVersion, Version
+
+          raw_version = sys.argv[1]
+          try:
+              version = Version(raw_version)
+          except InvalidVersion:
+              raise SystemExit(f"release tag does not contain a valid PEP 440 version: {raw_version!r}") from None
+          if str(version) != raw_version:
+              raise SystemExit(f"release tag must use canonical PEP 440 spelling: v{version}")
+          if version.epoch != 0 or len(version.release) != 3:
+              raise SystemExit("release tags must use an X.Y.Z version without an epoch")
+          if version.is_devrelease or version.local is not None:
+              raise SystemExit("release tags cannot use development or local versions")
+          print(version)
+          PY
+          )"
+          test "$GITHUB_REF_NAME" = "v$release_version"
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VANE_AI=$release_version" >> "$GITHUB_ENV"
+
           release_commit="$(git rev-parse HEAD^{commit})"
-          git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main
+          release_branch="$(python - "$release_version" <<'PY'
+          import sys
+          from packaging.version import Version
+
+          version = Version(sys.argv[1])
+          major, minor, patch = version.release
+          if patch == 0 and version.post is None:
+              print("main")
+          else:
+              print(f"release/{major}.{minor}")
+          PY
+          )"
+          release_ref="refs/remotes/origin/$release_branch"
+          git fetch --no-tags origin "refs/heads/$release_branch:$release_ref"
+          git merge-base --is-ancestor "$release_commit" "$release_ref" || {
+            echo "v$release_version must be reachable from $release_branch" >&2
+            exit 1
+          }
 
           release_id="$(
             gh api --paginate \
@@ -90,13 +127,35 @@ jobs:
               raise SystemExit(f"vane-ai {sys.argv[1]} already exists on {index}")
           PY
 
-      - name: Build and validate the source package
+      - name: Build the source package
         run: |
           python -m build --sdist --outdir dist
-          python scripts/check_release_artifacts.py dist/*.tar.gz
+
+      - name: Record and validate the package version
+        id: package_version
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          path="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$path"
+          version="$(python - "$path" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from packaging.utils import parse_sdist_filename
+
+          _, version = parse_sdist_filename(Path(sys.argv[1]).name)
+          print(version)
+          PY
+          )"
+          if test "$OPERATION" = "release"; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          python scripts/check_release_artifacts.py --expected-version "$version" "$path"
 
       - name: Apply private content rules to the source package
-        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -104,6 +163,7 @@ jobs:
           printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
             python scripts/check_release_artifacts.py \
               --content-rules-manifest - \
+              --expected-version "${{ steps.package_version.outputs.version }}" \
               dist/*.tar.gz
 
       - name: Upload source package
@@ -146,16 +206,18 @@ jobs:
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
       - name: Build wheels from the source package
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v4.2.0
         with:
           package-dir: ${{ steps.sdist.outputs.path }}
           output-dir: wheelhouse
           config-file: "{package}/pyproject.toml"
 
       - name: Validate wheels
+        env:
+          EXPECTED_VERSION: ${{ needs['source-package'].outputs.version }}
         run: |
           test "$(find wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
-          python scripts/check_release_artifacts.py wheelhouse/*.whl
+          python scripts/check_release_artifacts.py --expected-version "$EXPECTED_VERSION" wheelhouse/*.whl
 
       - name: Verify the final CPython 3.12 wheel coexists with DuckDB
         run: |
@@ -165,14 +227,16 @@ jobs:
           python scripts/verify_duckdb_coexistence.py "$wheel"
 
       - name: Apply private content rules to wheels
-        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
         env:
+          EXPECTED_VERSION: ${{ needs['source-package'].outputs.version }}
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
           test -n "$RELEASE_ARTIFACT_CONTENT_RULES"
           printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
             python scripts/check_release_artifacts.py \
               --content-rules-manifest - \
+              --expected-version "$EXPECTED_VERSION" \
               wheelhouse/*.whl
 
       - name: Upload wheels
@@ -185,7 +249,7 @@ jobs:
 
   assemble:
     name: Validate, attest and sign artifacts
-    needs: wheels
+    needs: [source-package, wheels]
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
@@ -219,20 +283,26 @@ jobs:
           path: packages
 
       - name: Validate the complete distribution set
+        env:
+          EXPECTED_VERSION: ${{ needs['source-package'].outputs.version }}
         run: |
           test "$(find packages -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
           test "$(find packages -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
-          python scripts/check_release_artifacts.py packages/*.tar.gz packages/*.whl
+          python scripts/check_release_artifacts.py \
+            --expected-version "$EXPECTED_VERSION" \
+            packages/*.tar.gz packages/*.whl
 
       - name: Apply private content rules to the distribution set
-        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' }}
+        if: ${{ inputs.operation == 'release' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
         env:
+          EXPECTED_VERSION: ${{ needs['source-package'].outputs.version }}
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
           test -n "$RELEASE_ARTIFACT_CONTENT_RULES"
           printf '%s' "$RELEASE_ARTIFACT_CONTENT_RULES" |
             python scripts/check_release_artifacts.py \
               --content-rules-manifest - \
+              --expected-version "$EXPECTED_VERSION" \
               packages/*.tar.gz packages/*.whl
 
       - name: Generate checksums
@@ -250,7 +320,7 @@ jobs:
 
       - name: Attest distribution provenance
         id: provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ github.workspace }}/packages/*
 
@@ -305,7 +375,7 @@ jobs:
           path: dist
 
       - name: Publish through trusted publishing
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
           repository-url: https://test.pypi.org/legacy/
@@ -401,7 +471,7 @@ jobs:
           path: dist
 
       - name: Publish through trusted publishing
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -65,11 +66,17 @@ class MockTextEmbedderDescriptor(TextEmbedderDescriptor):
 
 
 class MockPrompter:
+    def __init__(self, return_format: dict[str, Any] | None = None) -> None:
+        self._return_format = return_format
+
     def prompt_batch(self, text: list[str]) -> list[str]:
         return [f"topic:{item}" for item in text]
 
     async def prompt(self, messages: tuple[object, ...]) -> str:
-        return f"topic:{messages[0]}"
+        result = f"topic:{messages[0]}"
+        if self._return_format is not None:
+            return json.dumps({"answer": result})
+        return result
 
 
 @dataclass
@@ -77,6 +84,7 @@ class MockPrompterDescriptor(PrompterDescriptor):
     actor_number: int | None = None
     max_concurrency_per_actor: int | None = None
     num_gpus: float | None = 0
+    return_format: dict[str, Any] | None = None
 
     def get_provider(self) -> str:
         return "mock"
@@ -103,7 +111,7 @@ class MockPrompterDescriptor(PrompterDescriptor):
         )
 
     def instantiate(self) -> MockPrompter:
-        return MockPrompter()
+        return MockPrompter(self.return_format)
 
 
 class MockProvider(Provider):
@@ -129,7 +137,7 @@ class MockProvider(Provider):
         *,
         options: dict[str, object] | None = None,
     ) -> PrompterDescriptor:
-        return MockPrompterDescriptor()
+        return MockPrompterDescriptor(return_format=return_format)
 
 
 def test_prompt_and_embed_ignore_descriptor_execution_defaults():
@@ -994,6 +1002,37 @@ def test_ai_prompt_expression_basic():
     assert rel.select(expr).fetchall() == [("topic:search",), ("topic:ranking",)]
 
 
+def test_ai_prompt_structured_output_preserves_json_control_characters():
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    relation = vane.connect().sql("SELECT concat('line1', chr(10), 'line2', chr(9), chr(1))::VARCHAR AS message")
+    message = vane.col("message")
+    expected = [({"answer": "topic:line1\nline2\t\x01"},)]
+
+    expression_result = relation.select(
+        vane.ai.prompt(message, provider=MockProvider(), return_format=schema).alias("response")
+    )
+    relation_result = vane.ai.prompt(
+        relation,
+        message,
+        provider=MockProvider(),
+        return_format=schema,
+    ).project("response")
+    method_result = relation.prompt(
+        message,
+        provider=MockProvider(),
+        return_format=schema,
+    ).project("response")
+
+    assert expression_result.fetchall() == expected
+    assert relation_result.fetchall() == expected
+    assert method_result.fetchall() == expected
+
+
 def test_ai_prompt_runtime_signature_matches_public_contract():
     signature = inspect.signature(vane.ai.prompt, eval_str=True)
     parameters = signature.parameters
@@ -1573,33 +1612,47 @@ def test_vllm_prompt_injects_structured_schema_without_mutating_callers():
     }
 
 
-def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monkeypatch):
+@pytest.mark.parametrize("entry_point", ["expression", "relation"])
+def test_ai_prompt_vllm_validates_structured_output_and_nulls_invalid_rows(monkeypatch, entry_point):
     import vane.execution.vllm as vllm_executor
 
+    control_text = "line1\nline2\t\x01"
     schema = {
         "type": "object",
         "properties": {"answer": {"type": "string"}},
         "required": ["answer"],
         "additionalProperties": False,
     }
-    executor = _RecordingNativeVLLMExecutor({"valid": '{"answer":"ok"}', "invalid": '{"answer":1}'})
+    executor = _RecordingNativeVLLMExecutor({"valid": json.dumps({"answer": control_text}), "invalid": '{"answer":1}'})
     monkeypatch.setattr(vllm_executor, "build_executor", lambda _model, _options: executor)
     relation = vane.connect().sql(
         "select * from (values (1, 'valid'::VARCHAR), (2, 'invalid'::VARCHAR), "
         "(3, NULL::VARCHAR)) source(id, prompt) order by id"
     )
 
-    result = vane.ai.prompt(
-        relation,
-        vane.col("prompt"),
-        provider="vllm",
-        return_format=schema,
-        on_error="ignore",
-    )
+    if entry_point == "expression":
+        result = relation.select(
+            vane.col("id"),
+            vane.col("prompt"),
+            vane.ai.prompt(
+                vane.col("prompt"),
+                provider="vllm",
+                return_format=schema,
+                on_error="ignore",
+            ).alias("response"),
+        )
+    else:
+        result = vane.ai.prompt(
+            relation,
+            vane.col("prompt"),
+            provider="vllm",
+            return_format=schema,
+            on_error="ignore",
+        )
 
     assert str(result.types[-1]) == "STRUCT(answer VARCHAR)"
     assert sorted(result.fetchall()) == [
-        (1, "valid", {"answer": "ok"}),
+        (1, "valid", {"answer": control_text}),
         (2, "invalid", None),
         (3, None, None),
     ]
