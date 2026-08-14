@@ -164,6 +164,14 @@ public:
 		return res;
 	}
 
+	/// Fence and drain all worker execution for a query before deleting any
+	/// operation-owned output. Implementations must return success only when no
+	/// worker can publish or recreate artifacts for query_id after this call.
+	virtual DuckDBResult<void> quiesce_fte_query(const std::string &query_id) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::invalid_state_error("worker manager does not support FTE query quiescence"));
+	}
+
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
 	wait_fte_query(const std::string &query_id, double timeout_s,
 	               const std::unordered_set<TaskContext, TaskContextHash> &task_contexts,

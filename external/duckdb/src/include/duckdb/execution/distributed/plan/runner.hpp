@@ -680,27 +680,78 @@ public:
 			RemoveDistributedCopyDirectoryTree(fs, staging_root);
 			RemoveDistributedCopyDirectoryIfEmpty(fs, sink_node->staging_root_base());
 		};
+		auto quiesce_copy_workers = [&]() -> DuckDBResult<void> {
+			if (!worker_manager_) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::invalid_state_error("distributed COPY has no worker manager to quiesce"));
+			}
+			if (plan->query_id().empty()) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::invalid_state_error("distributed COPY cannot quiesce workers without a query id"));
+			}
+			try {
+				return worker_manager_->quiesce_fte_query(plan->query_id());
+			} catch (const std::exception &ex) {
+				return DuckDBResult<void>::err(DuckDBError::external_error(
+				    "worker manager threw while quiescing FTE query: " + std::string(ex.what())));
+			} catch (...) {
+				return DuckDBResult<void>::err(
+				    DuckDBError::external_error("worker manager threw an unknown exception while quiescing FTE query"));
+			}
+		};
+		auto fail_after_copy_quiescence = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
+			auto quiesce_res = quiesce_copy_workers();
+			if (quiesce_res.is_err()) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::io_error(
+				    StringUtil::Format("%s; worker quiescence failed: %s; operation-owned output is retained",
+				                       primary_error.what(), quiesce_res.error().what())));
+			}
+			cleanup_sink_output();
+			return DuckDBResult<PlanResult>::err(primary_error);
+		};
 		std::vector<ResultPartitionRef> partitions;
+		std::shared_ptr<DuckDBError> deferred_collection_error;
+		auto capture_execution_error = [&]() {
+			auto execution_error = execute_status->GetError();
+			if (execution_error && !deferred_collection_error) {
+				deferred_collection_error = std::move(execution_error);
+			}
+		};
 		auto staging_write_started = std::chrono::steady_clock::now();
-		while (true) {
-			auto item = receiver.recv();
-			if (auto execute_error = execute_status->GetError()) {
-				cleanup_sink_output();
-				return DuckDBResult<PlanResult>::err(*execute_error);
+		try {
+			while (true) {
+				auto item = receiver.recv();
+				capture_execution_error();
+				if (!item.first) {
+					break;
+				}
+				// Once an execution error is known, consume any queued results until
+				// the plan-control channel reaches its terminal state before entering
+				// the worker barrier.
+				if (deferred_collection_error) {
+					continue;
+				}
+				if (!item.second.has_node_id(sink_node_id)) {
+					continue;
+				}
+				for (auto &part : item.second.fragments()) {
+					partitions.push_back(part);
+				}
 			}
-			if (!item.first) {
-				break;
+		} catch (const std::exception &ex) {
+			if (!deferred_collection_error) {
+				deferred_collection_error = std::make_shared<DuckDBError>(DuckDBError::external_error(ex.what()));
 			}
-			if (!item.second.has_node_id(sink_node_id))
-				continue;
-			for (auto &part : item.second.fragments()) {
-				partitions.push_back(part);
+		} catch (...) {
+			if (!deferred_collection_error) {
+				deferred_collection_error = std::make_shared<DuckDBError>(
+				    DuckDBError::external_error("distributed COPY result collection threw an unknown exception"));
 			}
 		}
 
-		if (auto execute_error = execute_status->GetError()) {
-			cleanup_sink_output();
-			return DuckDBResult<PlanResult>::err(*execute_error);
+		capture_execution_error();
+		if (deferred_collection_error) {
+			return fail_after_copy_quiescence(*deferred_collection_error);
 		}
 
 		auto staging_write_ms = DistributedCopyElapsedMillis(staging_write_started);

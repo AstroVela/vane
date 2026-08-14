@@ -957,6 +957,21 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	}
 }
 
+DuckDBResult<void> RayWorkerManager::quiesce_fte_query(const string &query_id) {
+	if (query_id.empty()) {
+		return DuckDBResult<void>::err(DuckDBError::value_error("FTE query quiescence requires non-empty query_id"));
+	}
+	try {
+		drop_query_fragments(query_id);
+		return DuckDBResult<void>::ok();
+	} catch (const std::exception &ex) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::external_error(string("failed to quiesce FTE query: ") + ex.what()));
+	} catch (...) {
+		return DuckDBResult<void>::err(DuckDBError::external_error("failed to quiesce FTE query: unknown error"));
+	}
+}
+
 DuckDBResult<void> RayWorkerManager::task_input_stream_exhausted_for_query(
     const string &query_id, const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids) {
 	if (query_id.empty()) {

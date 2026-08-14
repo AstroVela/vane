@@ -48,6 +48,7 @@ public:
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
 	    duckdb::distributed::MaterializedOutputCallback on_output) override;
+	DuckDBResult<void> quiesce_fte_query(const string &query_id) override;
 	DuckDBResult<void> task_input_stream_exhausted_for_query(
 	    const string &query_id, const std::unordered_set<duckdb::distributed::SourceNodeId> &source_node_ids) override;
 	DuckDBResult<void> materialization_barrier_completed(const string &query_id,
