@@ -13,6 +13,47 @@ import pickle
 import numpy as np
 import pytest
 
+
+def _instantiate_provider_runtime(provider_name):
+    if provider_name == "transformers":
+        from vane.ai.providers.transformers import TransformersTextEmbedder
+
+        TransformersTextEmbedder("test-model")
+        return
+    if provider_name == "openai":
+        from vane.ai.providers.openai import OpenAITextEmbedder
+
+        OpenAITextEmbedder({}, "test-model", dimensions=8)
+        return
+    if provider_name == "anthropic":
+        from vane.ai.providers.anthropic import AnthropicPrompter
+
+        AnthropicPrompter({}, "test-model")
+        return
+    if provider_name == "google":
+        from vane.ai.providers.google import GoogleTextEmbedder
+
+        GoogleTextEmbedder({}, "test-model", dimensions=8)
+        return
+    if provider_name == "vllm":
+        from vane.execution.vllm import LocalVLLMExecutor
+
+        LocalVLLMExecutor("test-model", {}, {})
+        return
+    raise AssertionError(f"Unexpected provider {provider_name!r}")
+
+
+def _fail_import(monkeypatch, imported_module, error):
+    original_import = builtins.__import__
+
+    def fail_provider_import(name, *args, **kwargs):
+        if name == imported_module:
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_provider_import)
+
+
 # ---------------------------------------------------------------------------
 # Provider loading
 # ---------------------------------------------------------------------------
@@ -35,23 +76,17 @@ class TestProviderLoading:
             ("google", "vane.ai.providers.google"),
         ],
     )
-    def test_provider_module_import_error_reports_missing_extra(self, monkeypatch, provider_name, module_name):
+    def test_provider_module_import_error_is_preserved(self, monkeypatch, provider_name, module_name):
         from vane.ai.provider import ProviderImportError, load_provider
 
         import_error = ImportError(f"cannot import {module_name}")
-        original_import = builtins.__import__
+        _fail_import(monkeypatch, module_name, import_error)
 
-        def fail_provider_import(name, *args, **kwargs):
-            if name == module_name:
-                raise import_error
-            return original_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", fail_provider_import)
-
-        with pytest.raises(ProviderImportError, match=rf"vane-ai\[{provider_name}\]") as exc_info:
+        with pytest.raises(ImportError) as exc_info:
             load_provider(provider_name)
 
-        assert exc_info.value.__cause__ is import_error
+        assert exc_info.value is import_error
+        assert not isinstance(exc_info.value, ProviderImportError)
 
     @pytest.mark.parametrize(
         ("provider_name", "module_name", "class_name"),
@@ -81,6 +116,77 @@ class TestProviderLoading:
 
         assert exc_info.value is import_error
         assert not isinstance(exc_info.value, ProviderImportError)
+
+    @pytest.mark.parametrize(
+        ("provider_name", "imported_module", "missing_module"),
+        [
+            ("transformers", "sentence_transformers", "sentence_transformers"),
+            ("openai", "openai", "openai"),
+            ("anthropic", "anthropic", "anthropic"),
+            ("google", "google.genai", "google.genai"),
+            pytest.param("google", "google.genai", "google", id="google-namespace"),
+            ("vllm", "vllm", "vllm"),
+        ],
+    )
+    def test_missing_provider_dependency_reports_extra(
+        self, monkeypatch, provider_name, imported_module, missing_module
+    ):
+        from vane.ai.provider import ProviderImportError
+
+        import_error = ModuleNotFoundError(f"No module named {missing_module!r}", name=missing_module)
+        _fail_import(monkeypatch, imported_module, import_error)
+
+        with pytest.raises(ProviderImportError, match=rf"vane-ai\[{provider_name}\]") as exc_info:
+            _instantiate_provider_runtime(provider_name)
+
+        assert exc_info.value.__cause__ is import_error
+
+    @pytest.mark.parametrize(
+        ("provider_name", "imported_module"),
+        [
+            ("transformers", "sentence_transformers"),
+            ("openai", "openai"),
+            ("anthropic", "anthropic"),
+            ("google", "google.genai"),
+            ("vllm", "vllm"),
+        ],
+    )
+    def test_provider_dependency_transitive_module_error_is_preserved(
+        self, monkeypatch, provider_name, imported_module
+    ):
+        import_error = ModuleNotFoundError(
+            "No module named 'provider_internal_dependency'",
+            name="provider_internal_dependency",
+        )
+        _fail_import(monkeypatch, imported_module, import_error)
+
+        with pytest.raises(ModuleNotFoundError) as exc_info:
+            _instantiate_provider_runtime(provider_name)
+
+        assert exc_info.value is import_error
+
+    def test_provider_dependency_import_error_is_preserved(self, monkeypatch):
+        import_error = ImportError("cannot import AsyncOpenAI")
+        _fail_import(monkeypatch, "openai", import_error)
+
+        with pytest.raises(ImportError) as exc_info:
+            _instantiate_provider_runtime("openai")
+
+        assert exc_info.value is import_error
+
+    def test_provider_import_error_survives_safe_wrapping_and_pickle(self):
+        from vane.ai.provider import ProviderImportError, _safe_provider_execution_error
+
+        error = ProviderImportError("openai", function="Embed")
+        safe_error = _safe_provider_execution_error("openai", "test-model", "Embed initialization", error)
+        restored = pickle.loads(pickle.dumps(safe_error))
+
+        assert isinstance(safe_error, ProviderImportError)
+        assert safe_error is not error
+        assert isinstance(restored, ProviderImportError)
+        assert restored.extra == "openai"
+        assert restored.function == "Embed"
+        assert str(restored) == "Please `pip install 'vane-ai[openai]'` to use the Embed function with this provider."
 
     def test_load_transformers_provider(self):
         """TransformersProvider can be instantiated (deps mocked if needed)."""

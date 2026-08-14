@@ -22,7 +22,11 @@ from typing import Any, Callable, overload
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
-from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
+from vane.ai.provider import (
+    _safe_provider_execution_error,
+    _SafeProviderError,
+    _translate_missing_provider_dependency,
+)
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -242,7 +246,8 @@ class LocalVLLMExecutor(VLLMExecutor):
         engine_init_timeout_s: float | None = None,
         force_background_thread: bool = False,
     ):
-        from vllm import SamplingParams  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("vllm", "vllm"):
+            from vllm import SamplingParams  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         self.model = model
         self.engine_args = dict(engine_args)
@@ -265,9 +270,10 @@ class LocalVLLMExecutor(VLLMExecutor):
             if isinstance(sampling_params, dict):
                 structured_outputs = sampling_params.get("structured_outputs")
                 if isinstance(structured_outputs, Mapping):
-                    from vllm.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                        StructuredOutputsParams,
-                    )
+                    with _translate_missing_provider_dependency("vllm", "vllm"):
+                        from vllm.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                            StructuredOutputsParams,
+                        )
 
                     sampling_params = dict(sampling_params)
                     sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
@@ -345,10 +351,11 @@ class LocalVLLMExecutor(VLLMExecutor):
         until the engine is fully initialized.
         """
         try:
-            from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                AsyncEngineArgs,
-                AsyncLLMEngine,
-            )
+            with _translate_missing_provider_dependency("vllm", "vllm"):
+                from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                    AsyncEngineArgs,
+                    AsyncLLMEngine,
+                )
 
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)
@@ -364,10 +371,11 @@ class LocalVLLMExecutor(VLLMExecutor):
 
     async def _init_engine(self) -> None:
         try:
-            from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                AsyncEngineArgs,
-                AsyncLLMEngine,
-            )
+            with _translate_missing_provider_dependency("vllm", "vllm"):
+                from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                    AsyncEngineArgs,
+                    AsyncLLMEngine,
+                )
 
             args = AsyncEngineArgs(model=self.model, **self.engine_args)
             self.llm = AsyncLLMEngine.from_engine_args(args)

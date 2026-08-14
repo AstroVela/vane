@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai.options import validate_embed_options
 from vane.ai.protocols import TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _translate_missing_provider_dependency,
+)
 from vane.ai.typing import UDFOptions
 
 if TYPE_CHECKING:
@@ -144,9 +148,10 @@ class TransformersTextEmbedder:
         provider_name: str = "transformers",
         **model_options: Any,
     ):
-        from sentence_transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-            SentenceTransformer,
-        )
+        with _translate_missing_provider_dependency("transformers", "sentence_transformers"):
+            from sentence_transformers import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                SentenceTransformer,
+            )
 
         # Restore plaintext credentials sealed by the descriptor; plain dicts
         # from direct callers pass through unchanged.
@@ -177,7 +182,8 @@ class TransformersTextEmbedder:
         self.dimensions = dimensions
 
     def embed_text(self, text: list[str]) -> list[Embedding]:
-        import torch  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("transformers", "torch"):
+            import torch  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
         with torch.inference_mode():

@@ -18,7 +18,12 @@ from vane.ai.options import (
     _validate_prompt_stop_sequences,
 )
 from vane.ai.protocols import PrompterDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _ProviderResultError,
+    _translate_missing_provider_dependency,
+)
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -191,7 +196,8 @@ class AnthropicPrompter:
         return_raw_response: bool = False,
         provider_name: str = "anthropic",
     ) -> None:
-        from anthropic import AsyncAnthropic  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("anthropic", "anthropic"):
+            from anthropic import AsyncAnthropic  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name

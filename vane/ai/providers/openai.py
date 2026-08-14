@@ -35,7 +35,12 @@ from vane.ai.options import (
     validate_embed_options,
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _ProviderResultError,
+    _translate_missing_provider_dependency,
+)
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -248,7 +253,8 @@ def _build_token_estimator(model: str, *, use_openai_tokenizer: bool) -> _TokenE
     if not use_openai_tokenizer:
         return _TokenEstimator()
 
-    import tiktoken  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    with _translate_missing_provider_dependency("openai", "tiktoken"):
+        import tiktoken  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     return _TokenEstimator(tiktoken.encoding_for_model(model))
 
@@ -558,7 +564,8 @@ class OpenAITextEmbedder:
         dimensions: int | None = None,
         provider_name: str = "openai",
     ):
-        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         encoding_format = options.get("encoding_format", "float")
@@ -649,7 +656,8 @@ class OpenAITextEmbedder:
         return embeddings
 
     async def _embed_batch(self, texts: list[str]) -> list[Embedding]:
-        from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
         try:
@@ -801,7 +809,8 @@ class OpenAIPrompter:
         provider_name: str = "openai",
         strict_structured_outputs: bool | None = None,
     ) -> None:
-        from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("openai", "openai"):
+            from openai import AsyncOpenAI  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         self._provider_name = provider_name
