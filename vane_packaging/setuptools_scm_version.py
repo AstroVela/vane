@@ -50,15 +50,20 @@ def version_scheme(version: _ScmVersion) -> str:
     if version.tag is None:
         raise ValueError("Vane builds require a version tag in Git history")
 
+    discovered = _VersionState(
+        tag=Version(str(version.tag)),
+        distance=int(version.distance or 0),
+        dirty=version.dirty,
+    )
     release_line = _release_line(version)
-    if release_line is None:
-        state = _VersionState(
-            tag=Version(str(version.tag)),
-            distance=int(version.distance or 0),
-            dirty=version.dirty,
-        )
+    if discovered.exact:
+        state = discovered
     else:
-        state = _describe_release_line(Path(version.config.absolute_root), release_line)
+        repository = Path(version.config.absolute_root)
+        if release_line is None:
+            state = _describe_main_line(repository)
+        else:
+            state = _describe_release_line(repository, release_line)
 
     if state.exact and not state.dirty:
         return str(state.tag)
@@ -87,12 +92,14 @@ def _release_line(version: _ScmVersion) -> tuple[int, int] | None:
             raise ValueError("VANE_VERSION_BRANCH must use the form release/X.Y")
         return int(match["major"]), int(match["minor"])
 
-    candidates = (
-        os.getenv("GITHUB_BASE_REF"),
-        os.getenv("GITHUB_HEAD_REF"),
-        os.getenv("GITHUB_REF_NAME"),
-        version.branch,
-    )
+    github_base = os.getenv("GITHUB_BASE_REF")
+    if github_base:
+        match = RELEASE_BRANCH.fullmatch(github_base)
+        if match is None:
+            return None
+        return int(match["major"]), int(match["minor"])
+
+    candidates = (os.getenv("GITHUB_REF_NAME"), version.branch)
     for branch in candidates:
         if not branch:
             continue
@@ -102,8 +109,22 @@ def _release_line(version: _ScmVersion) -> tuple[int, int] | None:
     return None
 
 
+def _describe_main_line(repository: Path) -> _VersionState:
+    state = _describe(repository, "v*.*.0")
+    if state.tag.release[2] != 0:
+        raise ValueError(f"tag {state.tag} is not a minor release")
+    return state
+
+
 def _describe_release_line(repository: Path, release_line: tuple[int, int]) -> _VersionState:
     major, minor = release_line
+    state = _describe(repository, f"v{major}.{minor}.*")
+    if state.tag.release[:2] != release_line:
+        raise ValueError(f"tag {state.tag} is outside release line {major}.{minor}")
+    return state
+
+
+def _describe(repository: Path, tag_pattern: str) -> _VersionState:
     result = subprocess.run(
         [
             "git",
@@ -113,7 +134,7 @@ def _describe_release_line(repository: Path, release_line: tuple[int, int]) -> _
             "--long",
             "--abbrev=40",
             "--match",
-            f"v{major}.{minor}.*",
+            tag_pattern,
         ],
         cwd=repository,
         check=True,
@@ -126,8 +147,6 @@ def _describe_release_line(repository: Path, release_line: tuple[int, int]) -> _
         raise ValueError(f"Git returned an invalid version description: {description!r}")
 
     tag = Version(match["tag"].removeprefix("v"))
-    if tag.release[:2] != release_line:
-        raise ValueError(f"tag {tag} is outside release line {major}.{minor}")
     return _VersionState(
         tag=tag,
         distance=int(match["distance"]),
