@@ -5,8 +5,8 @@
 
 namespace duckdb {
 
-LogicalMergeInto::LogicalMergeInto(TableCatalogEntry &table)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), write_target(table), table(table) {
+LogicalMergeInto::LogicalMergeInto(ClientContext &context, TableCatalogEntry &table)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_MERGE_INTO), write_target(context, table), table(table) {
 }
 
 LogicalMergeInto::LogicalMergeInto(ClientContext &context, const LogicalWriteTarget &write_target_p)

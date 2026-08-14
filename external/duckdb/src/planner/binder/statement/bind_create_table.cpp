@@ -24,6 +24,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/types/uuid.hpp"
 
 namespace duckdb {
 
@@ -589,9 +590,12 @@ static void BindCreateTableConstraints(CreateTableInfo &create_info, CatalogEntr
 unique_ptr<BoundCreateTableInfo> Binder::BindCreateTableInfo(unique_ptr<CreateInfo> info, SchemaCatalogEntry &schema,
                                                              vector<unique_ptr<Expression>> &bound_defaults) {
 	auto &base = info->Cast<CreateTableInfo>();
+	auto &catalog = schema.ParentCatalog();
+	if (catalog.IsDuckCatalog() && base.logical_write_target_identity.empty()) {
+		base.logical_write_target_identity = "duckdb-table:v1:" + UUID::ToString(UUID::GenerateRandomUUID());
+	}
 	auto result = make_uniq<BoundCreateTableInfo>(schema, std::move(info));
 	auto &dependencies = result->dependencies;
-	auto &catalog = schema.ParentCatalog();
 	optional_ptr<StorageManager> storage_manager;
 	if (catalog.IsDuckCatalog() && !catalog.InMemory()) {
 		storage_manager = StorageManager::Get(catalog);

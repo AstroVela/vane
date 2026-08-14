@@ -23,9 +23,9 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_UPDATE;
 
 public:
-	explicit LogicalUpdate(TableCatalogEntry &table);
+	LogicalUpdate(ClientContext &context, TableCatalogEntry &table);
 
-	//! Bound path and table-incarnation identity of the write target
+	//! Bound path, table incarnation, and write-relevant definition of the target
 	LogicalWriteTarget write_target;
 	//! The base table to update
 	TableCatalogEntry &table;

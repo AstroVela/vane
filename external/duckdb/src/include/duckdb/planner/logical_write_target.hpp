@@ -16,10 +16,11 @@ class TableCatalogEntry;
 //!
 //! The catalog path resolves the target on the receiving process. The identity
 //! distinguishes a particular table incarnation from a different table later
-//! created at the same path.
+//! created at the same path, while the definition prevents a plan bound against
+//! an earlier physical column mapping or write-relevant schema from being reused.
 class LogicalWriteTarget {
 public:
-	explicit LogicalWriteTarget(const TableCatalogEntry &table);
+	LogicalWriteTarget(ClientContext &context, TableCatalogEntry &table);
 
 	TableCatalogEntry &Resolve(ClientContext &context) const;
 
@@ -38,9 +39,12 @@ public:
 	const string &Identity() const {
 		return identity;
 	}
+	const string &Definition() const {
+		return definition;
+	}
 
 private:
-	LogicalWriteTarget(string catalog_name, string schema_name, string table_name, string identity);
+	LogicalWriteTarget(string catalog_name, string schema_name, string table_name, string identity, string definition);
 	void Validate() const;
 
 private:
@@ -48,6 +52,7 @@ private:
 	string schema_name;
 	string table_name;
 	string identity;
+	string definition;
 };
 
 } // namespace duckdb

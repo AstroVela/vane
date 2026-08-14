@@ -20,9 +20,9 @@ public:
 	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_DELETE;
 
 public:
-	explicit LogicalDelete(TableCatalogEntry &table, idx_t table_index);
+	LogicalDelete(ClientContext &context, TableCatalogEntry &table, idx_t table_index);
 
-	//! Bound path and table-incarnation identity of the write target
+	//! Bound path, table incarnation, and write-relevant definition of the target
 	LogicalWriteTarget write_target;
 	TableCatalogEntry &table;
 	idx_t table_index;

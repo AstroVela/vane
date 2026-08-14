@@ -110,6 +110,10 @@ public:
 	//! survive catalog persistence and must change when a table is dropped and
 	//! recreated. An empty value means serialized logical writes are unsupported.
 	DUCKDB_API virtual string GetLogicalWriteTargetIdentity() const;
+	//! Returns a canonical definition of the state that a bound logical write
+	//! depends on. A changed definition invalidates serialized logical writes even
+	//! when they still refer to the same table incarnation.
+	DUCKDB_API virtual string GetLogicalWriteTargetDefinition(ClientContext &context);
 
 	DUCKDB_API static string ColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints);
 

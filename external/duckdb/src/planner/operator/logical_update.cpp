@@ -6,8 +6,8 @@
 
 namespace duckdb {
 
-LogicalUpdate::LogicalUpdate(TableCatalogEntry &table)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(table), table(table), table_index(0),
+LogicalUpdate::LogicalUpdate(ClientContext &context, TableCatalogEntry &table)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(context, table), table(table), table_index(0),
       return_chunk(false) {
 }
 

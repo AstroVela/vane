@@ -7,6 +7,7 @@
 #include "catch.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -20,8 +21,11 @@
 #include "duckdb/planner/operator/logical_local_exchange.hpp"
 #include "duckdb/planner/operator/logical_repartition.hpp"
 #include "duckdb/planner/logical_write_target.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "test_helpers.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 
 #include <map>
 #include <set>
@@ -101,6 +105,16 @@ static string GetTableWriteIdentity(Connection &con, const string &table_name,
 	con.context->RunFunctionInTransaction([&]() {
 		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, DEFAULT_SCHEMA, table_name);
 		result = table.GetLogicalWriteTargetIdentity();
+	});
+	return result;
+}
+
+static string GetTableWriteDefinition(Connection &con, const string &table_name,
+                                      const string &catalog_name = INVALID_CATALOG) {
+	string result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, DEFAULT_SCHEMA, table_name);
+		result = table.GetLogicalWriteTargetDefinition(*con.context);
 	});
 	return result;
 }
@@ -236,39 +250,98 @@ TEST_CASE("Serialized DML rejects a replacement at the same catalog path", "[ser
 	}
 }
 
-TEST_CASE("Duck table write identity survives alter and persistence but not replacement", "[serialization][dml]") {
+TEST_CASE("Duck table write target state survives persistence and detects definition changes", "[serialization][dml]") {
 	auto db_path = TestCreatePath("logical_write_target_identity.db");
 	string original_identity;
+	string altered_definition;
+	string altered_plan;
+	string unindexed_definition;
+	string unindexed_plan;
+	string renamed_definition;
+	string renamed_plan;
 	{
 		DuckDB db(db_path);
 		Connection con(db);
 		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
 		original_identity = GetTableWriteIdentity(con, "target");
 		REQUIRE(!original_identity.empty());
+		auto original_definition = GetTableWriteDefinition(con, "target");
+		REQUIRE(!original_definition.empty());
 
 		auto serialized_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET i = 2");
 		REQUIRE_NO_FAIL(con.Query("ALTER TABLE target ADD COLUMN j INTEGER"));
+		REQUIRE_NO_FAIL(con.Query("CREATE INDEX target_i_idx ON target(i)"));
 		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
-		REQUIRE(DeserializePlan(con, serialized_plan) != nullptr);
+		altered_definition = GetTableWriteDefinition(con, "target");
+		REQUIRE(altered_definition != original_definition);
+		REQUIRE_THROWS_WITH(DeserializePlan(con, serialized_plan), Catch::Matchers::Contains("definition changed"));
+		altered_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET i = 3");
+		REQUIRE(DeserializePlan(con, altered_plan) != nullptr);
 		REQUIRE_NO_FAIL(con.Query("PRAGMA force_checkpoint"));
 	}
 	{
 		DuckDB db(db_path);
 		Connection con(db);
 		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		REQUIRE(GetTableWriteDefinition(con, "target") == altered_definition);
+		REQUIRE(DeserializePlan(con, altered_plan) != nullptr);
 		REQUIRE_NO_FAIL(con.Query("SET wal_autocheckpoint = '1TB'"));
 		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("DROP INDEX target_i_idx"));
+		unindexed_definition = GetTableWriteDefinition(con, "target");
+		REQUIRE(unindexed_definition != altered_definition);
+		REQUIRE_THROWS_WITH(DeserializePlan(con, altered_plan), Catch::Matchers::Contains("definition changed"));
+		unindexed_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET i = 4");
+		REQUIRE(DeserializePlan(con, unindexed_plan) != nullptr);
 		REQUIRE_NO_FAIL(con.Query("ALTER TABLE target RENAME COLUMN j TO k"));
 		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		renamed_definition = GetTableWriteDefinition(con, "target");
+		REQUIRE(renamed_definition != unindexed_definition);
+		REQUIRE_THROWS_WITH(DeserializePlan(con, unindexed_plan), Catch::Matchers::Contains("definition changed"));
+		renamed_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET i = 5");
 	}
 	{
 		DuckDB db(db_path);
 		Connection con(db);
 		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		REQUIRE(GetTableWriteDefinition(con, "target") == renamed_definition);
+		REQUIRE(DeserializePlan(con, renamed_plan) != nullptr);
 		REQUIRE_NO_FAIL(con.Query("DROP TABLE target"));
 		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
 		REQUIRE(GetTableWriteIdentity(con, "target") != original_identity);
 	}
+}
+
+TEST_CASE("Serialized DML rejects a remapped physical column", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(a INTEGER, b INTEGER)"));
+
+	auto original_identity = GetTableWriteIdentity(con, "target");
+	auto original_definition = GetTableWriteDefinition(con, "target");
+	auto serialized_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET a = 99");
+	REQUIRE_NO_FAIL(con.Query("ALTER TABLE target DROP COLUMN a"));
+	REQUIRE(GetTableWriteIdentity(con, "target") != original_identity);
+	REQUIRE(GetTableWriteDefinition(con, "target") != original_definition);
+	REQUIRE_THROWS_WITH(DeserializePlan(con, serialized_plan), Catch::Matchers::Contains("was replaced"));
+}
+
+TEST_CASE("Serialized DML rejects changed index state", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(a INTEGER, b INTEGER)"));
+
+	auto without_index_definition = GetTableWriteDefinition(con, "target");
+	auto without_index_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET a = 99");
+	REQUIRE_NO_FAIL(con.Query("CREATE INDEX target_a_idx ON target(a)"));
+	auto with_index_definition = GetTableWriteDefinition(con, "target");
+	REQUIRE(with_index_definition != without_index_definition);
+	REQUIRE_THROWS_WITH(DeserializePlan(con, without_index_plan), Catch::Matchers::Contains("definition changed"));
+
+	auto with_index_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET a = 100");
+	REQUIRE_NO_FAIL(con.Query("DROP INDEX target_a_idx"));
+	REQUIRE(GetTableWriteDefinition(con, "target") == without_index_definition);
+	REQUIRE_THROWS_WITH(DeserializePlan(con, with_index_plan), Catch::Matchers::Contains("definition changed"));
 }
 
 TEST_CASE("Copy database assigns a new table write identity", "[serialization][dml]") {
@@ -294,6 +367,7 @@ TEST_CASE("Logical write targets require a non-empty identity", "[serialization]
 	serializer.WriteProperty<string>(101, "schema_name", "main");
 	serializer.WriteProperty<string>(102, "table_name", "target");
 	serializer.WriteProperty<string>(103, "identity", "");
+	serializer.WriteProperty<string>(104, "definition", "CREATE TABLE memory.main.target(i INTEGER)");
 	serializer.End();
 	stream.Rewind();
 
@@ -301,6 +375,33 @@ TEST_CASE("Logical write targets require a non-empty identity", "[serialization]
 	deserializer.Begin();
 	REQUIRE_THROWS_WITH(LogicalWriteTarget::Deserialize(deserializer),
 	                    Catch::Matchers::Contains("does not provide a logical write target identity"));
+}
+
+TEST_CASE("Checkpoint-loaded tables without an identity remain unsupported", "[serialization][dml]") {
+	auto db_path = TestCreatePath("logical_write_target_legacy.db");
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		con.context->RunFunctionInTransaction([&]() {
+			auto &catalog = Catalog::GetCatalog(*con.context, "");
+			auto &transaction = MetaTransaction::Get(*con.context);
+			transaction.ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::CREATE_CATALOG_ENTRY);
+			auto &schema = catalog.GetSchema(*con.context, DEFAULT_SCHEMA);
+			auto info = make_uniq<CreateTableInfo>(schema, "legacy_target");
+			info->columns.AddColumn(ColumnDefinition("i", LogicalType::INTEGER));
+			auto bound_info = Binder::BindCreateTableCheckpoint(std::move(info), schema);
+			REQUIRE(schema.ParentCatalog().CreateTable(*con.context, *bound_info) != nullptr);
+		});
+		REQUIRE(GetTableWriteIdentity(con, "legacy_target").empty());
+		REQUIRE_NO_FAIL(con.Query("PRAGMA force_checkpoint"));
+	}
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE(GetTableWriteIdentity(con, "legacy_target").empty());
+		REQUIRE_THROWS_WITH(SerializeUnoptimizedPlan(con, "UPDATE legacy_target SET i = 2"),
+		                    Catch::Matchers::Contains("does not provide a logical write target identity"));
+	}
 }
 
 TEST_CASE("Logical repartition round-trips hash random and into-partitions modes", "[serialization][repartition]") {
@@ -361,6 +462,26 @@ TEST_CASE("Logical repartition round-trips hash random and into-partitions modes
 	});
 }
 
+TEST_CASE("Logical repartition serializes rewritten operator expressions", "[serialization][repartition]") {
+	DuckDB db;
+	Connection con(db);
+	duckdb::vector<ExprRef> bind_expressions;
+	bind_expressions.push_back(std::make_shared<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+	LogicalRepartition repartition(RepartitionSpec::create_hash(2, std::move(bind_expressions)));
+
+	// Optimizers rewrite LogicalOperator::expressions without updating the bind-time
+	// HashRepartitionConfig copy. Serialization must follow the rewritten expression.
+	repartition.expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+	auto copied_plan = repartition.Copy(*con.context);
+	auto &copied_repartition = copied_plan->Cast<LogicalRepartition>();
+	auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(copied_repartition.repartition_spec.get());
+	REQUIRE(hash_spec != nullptr);
+	REQUIRE(copied_repartition.expressions.size() == 1);
+	REQUIRE(hash_spec->config()->by.size() == 1);
+	REQUIRE(copied_repartition.expressions[0]->Cast<BoundReferenceExpression>().index == 1);
+	REQUIRE(hash_spec->config()->by[0]->Cast<BoundReferenceExpression>().index == 1);
+}
+
 TEST_CASE("Logical repartition rejects unsupported and malformed wire states", "[serialization][repartition]") {
 	{
 		LogicalRepartition missing_spec(nullptr);
@@ -371,11 +492,19 @@ TEST_CASE("Logical repartition rejects unsupported and malformed wire states", "
 	{
 		duckdb::vector<ExprRef> config_expressions;
 		config_expressions.push_back(std::make_shared<BoundReferenceExpression>(LogicalType::INTEGER, 0));
-		LogicalRepartition inconsistent_hash(RepartitionSpec::create_hash(2, std::move(config_expressions)));
-		inconsistent_hash.expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+		LogicalRepartition empty_hash(RepartitionSpec::create_hash(2, std::move(config_expressions)));
 		MemoryStream stream;
-		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(inconsistent_hash, stream),
-		                    Catch::Matchers::Contains("inconsistent partition expressions"));
+		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(empty_hash, stream),
+		                    Catch::Matchers::Contains("requires at least one partition expression"));
+	}
+	{
+		duckdb::vector<ExprRef> config_expressions;
+		config_expressions.push_back(std::make_shared<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+		LogicalRepartition null_hash(RepartitionSpec::create_hash(2, std::move(config_expressions)));
+		null_hash.expressions.push_back(nullptr);
+		MemoryStream stream;
+		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(null_hash, stream),
+		                    Catch::Matchers::Contains("null partition expression"));
 	}
 	{
 		duckdb::vector<BoundOrderByNode> orders;

@@ -6,9 +6,9 @@
 
 namespace duckdb {
 
-LogicalDelete::LogicalDelete(TableCatalogEntry &table, idx_t table_index)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_DELETE), write_target(table), table(table), table_index(table_index),
-      return_chunk(false) {
+LogicalDelete::LogicalDelete(ClientContext &context, TableCatalogEntry &table, idx_t table_index)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_DELETE), write_target(context, table), table(table),
+      table_index(table_index), return_chunk(false) {
 }
 
 LogicalDelete::LogicalDelete(ClientContext &context, const LogicalWriteTarget &write_target_p)

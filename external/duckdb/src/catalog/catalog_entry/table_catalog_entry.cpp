@@ -110,6 +110,33 @@ string TableCatalogEntry::GetLogicalWriteTargetIdentity() const {
 	return logical_write_target_identity;
 }
 
+string TableCatalogEntry::GetLogicalWriteTargetDefinition(ClientContext &context) {
+	vector<string> index_signatures;
+	auto storage_info = GetStorageInfo(context);
+	index_signatures.reserve(storage_info.index_info.size());
+	for (auto &index : storage_info.index_info) {
+		vector<column_t> columns(index.column_set.begin(), index.column_set.end());
+		std::sort(columns.begin(), columns.end());
+
+		duckdb::stringstream signature;
+		signature << index.is_unique << index.is_primary << index.is_foreign << ":" << columns.size();
+		for (auto column : columns) {
+			signature << ":" << column;
+		}
+		index_signatures.push_back(signature.str());
+	}
+	std::sort(index_signatures.begin(), index_signatures.end());
+
+	auto table_definition = GetInfo()->ToString();
+	duckdb::stringstream result;
+	result << "duckdb-write-definition:v1:" << table_definition.size() << ":" << table_definition << ":"
+	       << index_signatures.size();
+	for (auto &signature : index_signatures) {
+		result << ":" << signature.size() << ":" << signature;
+	}
+	return result.str();
+}
+
 string TableCatalogEntry::ColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints) {
 	duckdb::stringstream ss;
 

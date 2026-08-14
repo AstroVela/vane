@@ -9,9 +9,9 @@ namespace duckdb {
 BoundOnConflictInfo::BoundOnConflictInfo() : action_type(OnConflictAction::THROW), update_is_del_and_insert(false) {
 }
 
-LogicalInsert::LogicalInsert(TableCatalogEntry &table, idx_t table_index)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), write_target(table), table(table), table_index(table_index),
-      return_chunk(false) {
+LogicalInsert::LogicalInsert(ClientContext &context, TableCatalogEntry &table, idx_t table_index)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), write_target(context, table), table(table),
+      table_index(table_index), return_chunk(false) {
 }
 
 LogicalInsert::LogicalInsert(ClientContext &context, const LogicalWriteTarget &write_target_p)

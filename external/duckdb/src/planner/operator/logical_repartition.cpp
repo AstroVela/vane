@@ -72,19 +72,14 @@ void LogicalRepartition::Serialize(Serializer &serializer) const {
 			throw SerializationException("Logical hash repartition has an invalid specification");
 		}
 		auto &config = *hash_spec->config();
-		if (expressions.empty() || config.by.empty() || expressions.size() != config.by.size()) {
-			throw SerializationException("Logical hash repartition has inconsistent partition expressions");
+		if (expressions.empty()) {
+			throw SerializationException("Logical hash repartition requires at least one partition expression");
 		}
+		// LogicalOperator::expressions participates in optimizer rewrites, while
+		// HashRepartitionConfig::by is only the bind-time copy. The operator
+		// expressions are therefore authoritative for serialization and are used to
+		// rebuild the config during deserialization.
 		ValidatePartitionExpressions(expressions);
-		for (idx_t expression_idx = 0; expression_idx < config.by.size(); expression_idx++) {
-			auto &config_expression = config.by[expression_idx];
-			if (!config_expression) {
-				throw SerializationException("Logical hash repartition contains a null partition expression");
-			}
-			if (!config_expression->Equals(*expressions[expression_idx])) {
-				throw SerializationException("Logical hash repartition has inconsistent partition expressions");
-			}
-		}
 		num_partitions = static_cast<uint64_t>(config.num_partitions);
 		break;
 	}
