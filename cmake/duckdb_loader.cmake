@@ -629,7 +629,16 @@ function(duckdb_add_library target_name)
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
   if(TARGET clangd_cache)
-    add_custom_target(vane_duckdb_clangd_cache ALL)
+    add_custom_target(
+      vane_duckdb_clangd_cache ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory
+              "${DUCKDB_SOURCE_PATH}/.cache/clangd"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_BINARY_DIR}/compile_commands.json"
+        "${DUCKDB_SOURCE_PATH}/.cache/clangd/compile_commands.json"
+      COMMENT "Updating DuckDB .cache/clangd"
+      VERBATIM)
     add_dependencies(vane_duckdb_clangd_cache clangd_cache)
   endif()
   _duckdb_enable_identity_refresh()
