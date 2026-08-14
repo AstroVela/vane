@@ -464,6 +464,8 @@ void register_ray_bindings(py::module_ &mod) {
 			         throw duckdb::InternalException(res.error().what());
 		         }
 	         })
+	    .def("register_query_owner", &RayWorkerManager::register_query_owner, py::arg("query_id"),
+	         py::arg("owner_query_id"))
 	    .def("drop_query_fragments", &RayWorkerManager::drop_query_fragments, py::arg("query_id"))
 	    .def(
 	        "wait_fte_query",
@@ -1144,8 +1146,12 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        py::arg("file_infos"), py::arg("copy_spec"), py::arg("staging_root"), py::arg("conn") = py::none())
 	    .def("drop_query_fragments", &PyPhysicalPlanWrapperRunner::drop_query_fragments, py::arg("query_id"))
-	    .def("_register_query_owner_for_test", &PyPhysicalPlanWrapperRunner::register_query_owner, py::arg("query_id"),
-	         py::arg("owner_query_id"))
+	    .def(
+	        "_register_query_owner_for_test",
+	        [](PyPhysicalPlanWrapperRunner &self, const string &query_id, const string &owner_query_id) {
+		        self.register_query_owner(query_id, owner_query_id);
+	        },
+	        py::arg("query_id"), py::arg("owner_query_id"))
 	    .def("close_session", &PyPhysicalPlanWrapperRunner::close_session, py::arg("session_id"))
 	    .def("warm_up", &PyPhysicalPlanWrapperRunner::warm_up)
 	    .def("shutdown",

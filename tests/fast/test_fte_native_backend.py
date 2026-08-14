@@ -2556,7 +2556,9 @@ def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
 
     assert not drop_thread.is_alive()
     assert drop_errors == []
-    assert backend.drop_calls == [query_id]
+    # The first sweep unblocks the in-flight submit; the second catches work
+    # that crossed the fence before that submit returned.
+    assert backend.drop_calls == [query_id, query_id]
     assert backend.handle is not None
     assert backend.handle.release_calls == 1
     con.close()
@@ -2853,7 +2855,7 @@ def test_cxx_backend_requires_drop_query_contract():
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
     runner._register_query_owner_for_test(query_id, query_id)
 
-    with pytest.raises(AttributeError, match="drop_query"):
+    with pytest.raises(RuntimeError, match="drop_query"):
         runner.drop_query_fragments(query_id)
 
     runner.shutdown()
@@ -2863,11 +2865,15 @@ def test_cxx_backend_registration_failure_rolls_back_new_replay_state():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):
             self.drop_calls = []
+            self.registration_side_effect = False
 
         def register_query_owner(self, _query_id, _owner_query_id):
+            self.registration_side_effect = True
             raise RuntimeError("planned lifecycle registration failure")
 
         def drop_query(self, query_id):
+            assert self.registration_side_effect
+            self.registration_side_effect = False
             self.drop_calls.append(str(query_id))
 
     con = vane.connect()
@@ -2882,8 +2888,43 @@ def test_cxx_backend_registration_failure_rolls_back_new_replay_state():
     with pytest.raises(RuntimeError, match="planned lifecycle registration failure"):
         runner.run_plan(plan, con)
 
-    assert backend.drop_calls == []
+    assert backend.drop_calls == [query_id]
+    assert backend.registration_side_effect is False
     assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is None
+
+
+def test_cxx_backend_registration_failure_fences_owner_until_drop():
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.registration_calls = []
+            self.drop_calls = []
+
+        def register_query_owner(self, query_id, owner_query_id):
+            self.registration_calls.append((str(query_id), str(owner_query_id)))
+            if len(self.registration_calls) == 1:
+                raise RuntimeError("planned lifecycle registration failure")
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(str(query_id))
+
+    query_id = f"registration-fence-{uuid.uuid4()}"
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(RuntimeError, match="planned lifecycle registration failure"):
+        runner._register_query_owner_for_test(query_id, query_id)
+
+    with pytest.raises(RuntimeError, match="cannot register closing FTE query lifecycle"):
+        runner._register_query_owner_for_test(query_id, query_id)
+    assert backend.registration_calls == [(query_id, query_id)]
+
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id]
+
+    runner._register_query_owner_for_test(query_id, query_id)
+    assert backend.registration_calls == [(query_id, query_id), (query_id, query_id)]
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id, query_id]
 
 
 def test_cxx_backend_serializes_overlapping_drop_and_reuses_query_id():
@@ -2966,6 +3007,95 @@ def test_cxx_backend_routes_nested_execution_drop_to_registered_resource_owner()
         assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is None
     finally:
         vane.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+        con.close()
+
+
+@pytest.mark.parametrize("cleanup_mode", ["drop", "shutdown"])
+def test_cxx_ray_manager_cleans_nested_execution_resource_owner_state(cleanup_mode):
+    execution_query_id = f"ray-nested-execution-{uuid.uuid4()}"
+    resource_query_id = f"ray-resource-owner-{uuid.uuid4()}"
+    con = vane.connect()
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        f"source-plan-{uuid.uuid4()}",
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    try:
+        assert vane.ray_cxx._register_query_python_replay_state(resource_query_id, plan) is True
+        assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is not None
+
+        runner._register_query_owner_for_test(execution_query_id, resource_query_id)
+        if cleanup_mode == "drop":
+            runner.drop_query_fragments(execution_query_id)
+        else:
+            runner.shutdown()
+
+        assert vane.ray_cxx._lookup_query_connection_snapshot(resource_query_id) is None
+    finally:
+        vane.ray_cxx._cleanup_query_python_replay_state(resource_query_id)
+        con.close()
+
+
+def test_cxx_backend_registers_order_by_internal_queries_under_resource_owner(tmp_path, monkeypatch):
+    from vane.runners.local.runner import _InProcessFragmentExecutor
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES", "1")
+    monkeypatch.setenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES", "1")
+
+    con = vane.connect()
+    for partition_id in range(4):
+        source = tmp_path / f"source-{partition_id}.parquet"
+        con.execute(
+            f"COPY (SELECT i + {partition_id * 1000} AS i FROM range(1000) t(i)) TO '{source}' (FORMAT PARQUET)"
+        )
+
+    resource_query_id = f"orderby-resource-owner-{uuid.uuid4()}"
+    relation = con.sql(f"SELECT i FROM read_parquet('{tmp_path}/source-*.parquet') ORDER BY i DESC")
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        resource_query_id,
+    ).to_physical_plan(con)
+    backend = NativeFteWorkerManagerBackend(
+        execute_fn=_InProcessFragmentExecutor(),
+        max_running_tasks=4,
+        num_workers=2,
+        num_cpus=4,
+    )
+    registrations: list[tuple[str, str]] = []
+    drop_calls: list[str] = []
+    original_register_query_owner = backend.register_query_owner
+    original_drop_query = backend.drop_query
+
+    def register_query_owner(query_id, owner_query_id):
+        registrations.append((str(query_id), str(owner_query_id)))
+        return original_register_query_owner(query_id, owner_query_id)
+
+    def drop_query(query_id):
+        drop_calls.append(str(query_id))
+        return original_drop_query(query_id)
+
+    backend.register_query_owner = register_query_owner
+    backend.drop_query = drop_query
+    try:
+        runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+        partitions = collect_result_stream(runner.run_plan(plan, con))
+        runner.drop_query_fragments(resource_query_id)
+
+        assert partitions
+        assert registrations[0] == (resource_query_id, resource_query_id)
+        internal_query_ids = {query_id for query_id, _owner_query_id in registrations[1:]}
+        assert len(internal_query_ids) == 3
+        assert all(owner_query_id == resource_query_id for _query_id, owner_query_id in registrations)
+        assert {query_id.rsplit("_", 2)[-2] for query_id in internal_query_ids} == {
+            "range",
+            "sample",
+            "stage",
+        }
+        assert drop_calls[-1] == resource_query_id
+        assert set(drop_calls[:-1]) == internal_query_ids
+    finally:
+        backend.shutdown()
         con.close()
 
 
@@ -3442,6 +3572,62 @@ def test_cxx_backend_preserves_owner_state_until_shutdown_retry():
         con.close()
 
 
+def test_cxx_backend_successful_shutdown_releases_unobserved_submission_exception():
+    import gc
+    import weakref
+
+    submission_started = threading.Event()
+    release_submission = threading.Event()
+    exception_refs: list[weakref.ReferenceType[RuntimeError]] = []
+
+    class SubmissionSentinelError(RuntimeError):
+        pass
+
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "shutdown-submission-error-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            submission_started.set()
+            assert release_submission.wait(timeout=5)
+            error = SubmissionSentinelError("planned unobserved submission failure")
+            exception_refs.append(weakref.ref(error))
+            raise error
+
+        def shutdown(self):
+            release_submission.set()
+
+    con = vane.connect()
+    query_id = f"shutdown-submission-error-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    stream = runner.run_plan(plan, con)
+    try:
+        assert submission_started.wait(timeout=5)
+        runner.shutdown()
+        assert exception_refs
+        deadline = time.monotonic() + 5
+        while exception_refs[0]() is not None and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.01)
+        assert exception_refs[0]() is None
+    finally:
+        release_submission.set()
+        del stream
+        con.close()
+
+
 def test_cxx_backend_serializes_concurrent_shutdown_calls():
     shutdown_started = threading.Event()
     allow_shutdown = threading.Event()
@@ -3670,6 +3856,8 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     con, dst, query_id, plan = _captured_native_copy_plan(tmp_path, monkeypatch, local_staging=True)
     submission_calls = []
     dropped_queries = []
+    partial_staging_roots: list[Path] = []
+    drop_observed_partial_output: list[bool] = []
 
     class Backend(_QueryLifecycleBackend):
         def worker_snapshots(self):
@@ -3684,11 +3872,18 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
 
         def submit_tasks(self, tasks):
             submission_calls.append(len(tasks))
+            context = tasks[0].context()
+            staging_root = Path(context["copy_output_base"]) / context["copy_output_run_id"]
+            partial_output = staging_root / "partial-submit-worker" / "part.parquet"
+            partial_output.parent.mkdir(parents=True, exist_ok=True)
+            partial_output.write_bytes(b"partial-submit-output")
+            partial_staging_roots.append(staging_root)
             tasks[0].plan()
             return []
 
         def drop_query(self, actual_query_id):
             dropped_queries.append(actual_query_id)
+            drop_observed_partial_output.append(any(root.exists() for root in partial_staging_roots))
 
     def fail_lookup(actual_query_id):
         raise vane.NotImplementedException(f"copy plan lookup sentinel for {actual_query_id}")
@@ -3710,6 +3905,9 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     assert f"copy plan lookup sentinel for {query_id}" in str(exc_info.value.__cause__)
     assert submission_calls == [1]
     assert dropped_queries == [query_id]
+    assert drop_observed_partial_output == [True]
+    assert partial_staging_roots
+    assert all(not root.exists() for root in partial_staging_roots)
     assert not dst.exists()
 
 
