@@ -436,11 +436,11 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
     blocker_started = threading.Event()
     blocker_release = threading.Event()
     startup_entered = threading.Event()
-    executor = ThreadPoolExecutor(
+    native_executor = ThreadPoolExecutor(
         max_workers=1,
-        thread_name_prefix="vane-test-saturated",
+        thread_name_prefix="vane-test-native-saturated",
     )
-    runner._driver_native_executor = executor
+    runner._driver_native_executor = native_executor
 
     runner._precreate_udf_actors = lambda *_args, **_kwargs: startup_entered.set() or []
 
@@ -450,7 +450,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         blocker_future = None
         register_query_resources = runner_cls._register_query_resources
 
-        def _occupy_default_executor() -> None:
+        def _occupy_native_executor() -> None:
             blocker_started.set()
             assert blocker_release.wait(timeout=2.0)
 
@@ -468,8 +468,8 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
                 expected_plan_id=expected_plan_id,
             )
             blocker_future = loop.run_in_executor(
-                executor,
-                _occupy_default_executor,
+                native_executor,
+                _occupy_native_executor,
             )
             while not blocker_started.is_set():
                 await asyncio.sleep(0)
@@ -506,7 +506,7 @@ def test_run_plan_cancellation_releases_registration_before_startup_worker_claim
         asyncio.run(_exercise())
     finally:
         blocker_release.set()
-        executor.shutdown(wait=True)
+        runner_cls._shutdown_driver_executors(runner)
 
     with pytest.raises(KeyError, match="query resource graph is not registered"):
         get_query_resource_manager(query_id)
