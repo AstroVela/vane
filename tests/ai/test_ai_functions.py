@@ -1517,7 +1517,10 @@ class TestSharedRetryAfterExtraction:
         assert isinstance(err, RetryAfterError)
         assert err.retry_after == 5.0
 
-    @pytest.mark.parametrize("bad_header", ["-1", "-0.5", "nan", "NaN", "inf", "1e999", "soon", ""])
+    @pytest.mark.parametrize(
+        "bad_header",
+        ["-1", "-0.5", "nan", "NaN", "inf", "1e999", "soon", "", "Thu, 13 Bug 2026 15:37:13 GMT"],
+    )
     def test_malformed_header_uses_default(self, bad_header):
         from vane.ai.functions import _retry_after_error
 
@@ -1569,6 +1572,72 @@ class TestSharedRetryAfterExtraction:
         err = _retry_after_error(self._error(status=429, headers={"retry-after": "8"}))
         assert err is not None
         assert err.retry_after == 8.0
+
+    # --- HTTP-date form (RFC 9110 permits it alongside delay-seconds) ------
+
+    def _pin_clock(self, monkeypatch):
+        import datetime
+
+        from vane.ai import functions
+
+        fixed_now = datetime.datetime(2026, 8, 13, 15, 37, 13, tzinfo=datetime.timezone.utc)
+        monkeypatch.setattr(functions, "_utcnow", lambda: fixed_now)
+        return fixed_now
+
+    def _http_date(self, moment):
+        import email.utils
+
+        return email.utils.format_datetime(moment, usegmt=True)
+
+    def test_http_date_header_honored(self, monkeypatch):
+        import datetime
+
+        from vane.ai.functions import _retry_after_error
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now + datetime.timedelta(seconds=30))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 30.0
+
+    def test_http_date_offset_form_honored(self, monkeypatch):
+        """A non-GMT zone offset still resolves to the same instant."""
+        import datetime
+        import email.utils
+
+        from vane.ai.functions import _retry_after_error
+
+        fixed_now = self._pin_clock(monkeypatch)
+        plus_two = datetime.timezone(datetime.timedelta(hours=2))
+        header = email.utils.format_datetime((fixed_now + datetime.timedelta(seconds=45)).astimezone(plus_two))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 45.0
+
+    def test_http_date_in_the_past_clamps_to_zero(self, monkeypatch):
+        """An already-past date means "retry immediately", not "malformed"."""
+        import datetime
+
+        from vane.ai.functions import _retry_after_error, _retry_wait_seconds
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now - datetime.timedelta(seconds=60))
+        err = _retry_after_error(self._error(status=503, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 0.0
+        assert _retry_wait_seconds(err, attempt=0) == 0.0
+
+    def test_http_date_far_future_still_hits_sleep_cap(self, monkeypatch):
+        import datetime
+
+        from vane.ai.functions import _retry_after_error, _retry_wait_seconds
+
+        fixed_now = self._pin_clock(monkeypatch)
+        header = self._http_date(fixed_now + datetime.timedelta(days=365))
+        err = _retry_after_error(self._error(status=429, headers={"Retry-After": header}))
+        assert err is not None
+        assert err.retry_after == 365 * 24 * 3600.0
+        assert _retry_wait_seconds(err, attempt=0) == 120
 
 
 class TestProviderRetryAfterAdoption:

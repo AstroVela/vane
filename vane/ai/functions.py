@@ -29,6 +29,8 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import inspect
 import logging
 import math
@@ -320,13 +322,38 @@ def _provider_status_code(exc: Exception) -> int | None:
     return None
 
 
+def _utcnow() -> datetime.datetime:
+    """Current UTC time; a seam so fixed-clock tests can pin HTTP-date parsing."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _retry_after_http_date_delay(raw: str) -> float | None:
+    """Seconds until an HTTP-date ``Retry-After`` value, or ``None`` when the
+    value is not a parseable date.
+
+    A date already in the past means "retry immediately", so it clamps to zero
+    rather than being rejected as malformed.
+    """
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        # RFC 5322 parses a "-0000" offset to a naive datetime; HTTP-dates are
+        # always GMT, so interpret it as UTC.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - _utcnow()).total_seconds())
+
+
 def _parse_retry_after_header(exc: Exception) -> float | None:
     """Return a usable ``Retry-After`` delay from a provider error's response.
 
-    Returns ``None`` when no response, no header, or a malformed value is
-    present. A negative, NaN, or infinite header (all parseable by ``float()``,
-    e.g. ``"-1"``, ``"nan"``, ``"1e999"``) is treated as malformed and rejected
-    so it never reaches a retry sleep that would raise or hang (issue #469).
+    RFC 9110 permits either delay-seconds or an HTTP-date; both are accepted,
+    a date being converted to the remaining delay. Returns ``None`` when no
+    response, no header, or a malformed value is present. A negative, NaN, or
+    infinite delay-seconds header (all parseable by ``float()``, e.g. ``"-1"``,
+    ``"nan"``, ``"1e999"``) is treated as malformed and rejected so it never
+    reaches a retry sleep that would raise or hang (issue #469).
     """
     response = getattr(exc, "response", None)
     if response is None:
@@ -341,7 +368,10 @@ def _parse_retry_after_header(exc: Exception) -> float | None:
     try:
         parsed = float(raw)
     except (TypeError, ValueError):
-        return None
+        date_delay = _retry_after_http_date_delay(raw) if isinstance(raw, str) else None
+        if date_delay is None:
+            return None
+        parsed = date_delay
     if math.isfinite(parsed) and parsed >= 0:
         return parsed
     return None
