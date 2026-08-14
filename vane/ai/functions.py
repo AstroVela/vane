@@ -203,21 +203,26 @@ class RetryAfterError(Exception):
     falls back to exponential backoff (see :func:`_retry_wait_seconds`).
     """
 
-    status_code: int  # normalized HTTP status, set by ``_retry_after_error``
+    status_code: int  # normalized HTTP status; absent when never discovered
 
-    def __init__(self, retry_after: float, original: Exception | None = None) -> None:
+    def __init__(self, retry_after: float, original: Exception | None = None, status: int | None = None) -> None:
         self.retry_after = retry_after
         if original is None:
             super().__init__("RetryAfterError")
-            return
-        super().__init__(_safe_original_error_summary(original))
-        for name in ("status_code", "status", "code"):
-            try:
-                value = getattr(original, name, None)
-            except Exception:
-                continue
-            if type(value) is int and -999_999 <= value <= 999_999:
-                setattr(self, name, value)
+        else:
+            super().__init__(_safe_original_error_summary(original))
+            for name in ("status_code", "status", "code"):
+                try:
+                    value = getattr(original, name, None)
+                except Exception:
+                    continue
+                if type(value) is int and -999_999 <= value <= 999_999:
+                    setattr(self, name, value)
+        if status is not None:
+            # A status discovered only on the original's attached response is
+            # not a direct attribute, so the whitelist above cannot see it;
+            # the caller's normalized discovery wins over any direct copy.
+            self.status_code = status
 
     def __reduce__(self) -> tuple[Any, ...]:
         # The default BaseException reduction rebuilds via ``__init__(*self.args)``,
@@ -391,17 +396,12 @@ def _retry_after_error(exc: Exception) -> RetryAfterError | None:
     original for its sanitized summary and status attributes only.
     """
     status = _provider_status_code(exc)
-    if status is None or status not in _RATE_LIMIT_STATUS_CODES:
+    if status not in _RATE_LIMIT_STATUS_CODES:
         return None
     retry_after = _parse_retry_after_header(exc)
     if retry_after is None:
         retry_after = _DEFAULT_RETRY_AFTER_SECONDS
-    error = RetryAfterError(retry_after=retry_after, original=exc)
-    # The constructor whitelists only the original's direct attributes, so a
-    # status discovered on the attached response would be lost from warnings
-    # and pickles without this normalized copy.
-    error.status_code = status
-    return error
+    return RetryAfterError(retry_after=retry_after, original=exc, status=status)
 
 
 def _retry_call(
