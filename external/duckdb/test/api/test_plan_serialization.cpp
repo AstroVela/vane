@@ -344,6 +344,21 @@ TEST_CASE("Serialized DML rejects changed index state", "[serialization][dml]") 
 	REQUIRE_THROWS_WITH(DeserializePlan(con, with_index_plan), Catch::Matchers::Contains("definition changed"));
 }
 
+TEST_CASE("Serialized DML rejects changed index expressions", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(a INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE UNIQUE INDEX target_expr_idx ON target((a % 2))"));
+
+	auto modulo_two_definition = GetTableWriteDefinition(con, "target");
+	auto modulo_two_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET a = 99");
+	REQUIRE_NO_FAIL(con.Query("DROP INDEX target_expr_idx"));
+	REQUIRE_NO_FAIL(con.Query("CREATE UNIQUE INDEX target_expr_idx ON target((a % 3))"));
+
+	REQUIRE(GetTableWriteDefinition(con, "target") != modulo_two_definition);
+	REQUIRE_THROWS_WITH(DeserializePlan(con, modulo_two_plan), Catch::Matchers::Contains("definition changed"));
+}
+
 TEST_CASE("Copy database assigns a new table write identity", "[serialization][dml]") {
 	DuckDB db;
 	Connection con(db);

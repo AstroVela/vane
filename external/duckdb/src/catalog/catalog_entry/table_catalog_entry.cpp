@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/exception.hpp"
@@ -110,6 +111,10 @@ string TableCatalogEntry::GetLogicalWriteTargetIdentity() const {
 	return logical_write_target_identity;
 }
 
+static void AppendWriteDefinitionField(duckdb::stringstream &result, const string &field) {
+	result << ":" << field.size() << ":" << field;
+}
+
 string TableCatalogEntry::GetLogicalWriteTargetDefinition(ClientContext &context) {
 	vector<string> index_signatures;
 	auto storage_info = GetStorageInfo(context);
@@ -119,17 +124,57 @@ string TableCatalogEntry::GetLogicalWriteTargetDefinition(ClientContext &context
 		std::sort(columns.begin(), columns.end());
 
 		duckdb::stringstream signature;
-		signature << index.is_unique << index.is_primary << index.is_foreign << ":" << columns.size();
+		signature << "storage-index:v1:" << index.is_unique << index.is_primary << index.is_foreign << ":"
+		          << columns.size();
 		for (auto column : columns) {
 			signature << ":" << column;
 		}
 		index_signatures.push_back(signature.str());
 	}
+
+	// TableStorageInfo captures the columns and constraint flags that affect DML
+	// planning, but intentionally omits standalone index expressions and types.
+	// Include their catalog definitions so replacing an index with another index
+	// over the same columns cannot make a stale write plan appear valid.
+	schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
+		auto &index = entry.Cast<IndexCatalogEntry>();
+		if (!StringUtil::CIEquals(index.GetTableName(), name)) {
+			return;
+		}
+
+		duckdb::stringstream signature;
+		signature << "catalog-index:v1";
+		AppendWriteDefinitionField(signature, index.index_type);
+		signature << ":" << static_cast<uint32_t>(index.index_constraint_type) << ":" << index.column_ids.size();
+		for (auto column : index.column_ids) {
+			signature << ":" << column;
+		}
+		signature << ":" << index.parsed_expressions.size();
+		for (auto &expression : index.parsed_expressions) {
+			if (!expression) {
+				throw SerializationException("Index \"%s\" contains a null parsed expression", index.name);
+			}
+			AppendWriteDefinitionField(signature, expression->ToString());
+		}
+
+		vector<pair<string, string>> options;
+		options.reserve(index.options.size());
+		for (auto &option : index.options) {
+			options.emplace_back(option.first, option.second.ToString());
+		}
+		std::sort(options.begin(), options.end());
+		signature << ":" << options.size();
+		for (auto &option : options) {
+			AppendWriteDefinitionField(signature, option.first);
+			AppendWriteDefinitionField(signature, option.second);
+		}
+		index_signatures.push_back(signature.str());
+	});
 	std::sort(index_signatures.begin(), index_signatures.end());
 
 	auto table_definition = GetInfo()->ToString();
 	duckdb::stringstream result;
-	result << "duckdb-write-definition:v1:" << table_definition.size() << ":" << table_definition << ":"
+	result << "duckdb-write-definition:v2:" << table_definition.size() << ":" << table_definition << ":"
 	       << index_signatures.size();
 	for (auto &signature : index_signatures) {
 		result << ":" << signature.size() << ":" << signature;
