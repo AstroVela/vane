@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - "release/**"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -88,7 +89,7 @@ jobs:
           python scripts/check_release_artifacts.py dist/*.tar.gz
 
       - name: Apply private content rules to the source package
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |
@@ -161,6 +162,7 @@ jobs:
             "ninja>=1.10" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
+            "setuptools_scm>=8.0" \
             mypy \
             packaging \
             "pydantic>=2" \
@@ -180,7 +182,7 @@ jobs:
         run: python scripts/check_release_artifacts.py dist/*.tar.gz dist/*.whl
 
       - name: Apply private content rules to release artifacts
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
         env:
           RELEASE_ARTIFACT_CONTENT_RULES: ${{ secrets.RELEASE_ARTIFACT_CONTENT_RULES }}
         run: |

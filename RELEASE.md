@@ -1,14 +1,16 @@
 # Release process
 
 Vane releases are immutable source and binary artifacts derived from one
-reviewed commit on `main`. The GitHub Release body is the canonical public
-record of user-visible changes; the repository does not maintain a rolling
-changelog or a release-notes template.
+reviewed commit on `main` or a `release/X.Y` maintenance branch. The GitHub
+Release body is the canonical public record of user-visible changes; the
+repository does not maintain a rolling changelog or a release-notes template.
 
 ## Release invariants
 
 - The package version is a valid, previously unused PEP 440 version. Its tag is
   exactly `v<version>` and points to the reviewed commit tested for release.
+- An `X.Y.0` release, including its prereleases, comes from `main`. Patch
+  releases and post releases come from the matching `release/X.Y` branch.
 - One workflow run builds the sdist and all wheels once. The exact same files
   are promoted through TestPyPI, PyPI, and the GitHub Release.
 - A GitHub Release remains a draft until PyPI publication succeeds and all
@@ -18,13 +20,35 @@ changelog or a release-notes template.
   artifacts are never replaced. A bad release is superseded by a new version
   and yanked when necessary.
 
+## Version calculation
+
+Python package versions come from Git through `setuptools-scm`; there is no
+manually maintained version in `pyproject.toml`.
+
+- On `main`, development versions count from the latest `vX.Y.0` tag and use
+  the next minor series: commits after `v0.1.0` are `0.2.0.devN`. Restricting
+  the baseline to minor tags prevents a merged maintenance tag from resetting
+  `N`.
+- On `release/X.Y`, versions count from the latest tag on that release line and
+  use the next patch series: commits after `v0.2.0` are `0.2.1.devN`, and
+  commits after `v0.2.1` are `0.2.2.devN`.
+- Clean exact tags produce the tag version without a development suffix. The
+  release workflow validates the selected tag and supplies that exact version
+  to the isolated source build.
+
+Build from a full Git checkout with release tags available, or from the sdist
+produced by that checkout. For local feature branches based on a maintenance
+line, set `VANE_VERSION_BRANCH=release/X.Y`; pull-request CI infers the same
+line from its base branch.
+
 ## One-time repository configuration
 
 Repository administrators must:
 
 1. Keep `main` as the default branch and protect it with pull-request review,
    required CI and code-quality checks, resolved conversations, and deletion
-   and non-fast-forward update protection.
+   and non-fast-forward update protection. Apply the same protections to every
+   active `release/X.Y` branch.
 2. Create an active tag ruleset with no bypass actors for `refs/tags/v*`. Allow
    initial tag creation, but restrict deletion and block force pushes so the
    tag cannot move between workflow dispatch and publication. GitHub immutable
@@ -48,7 +72,9 @@ configuration has remained unchanged.
 
 ## Prepare the release pull request
 
-1. Set the final PEP 440 version in `pyproject.toml`.
+1. Choose a final canonical PEP 440 version with an `X.Y.Z` release segment.
+   Do not edit `pyproject.toml`; the release tag is the source of the final
+   version.
 2. Put the complete proposed GitHub Release notes in the pull-request
    description. Reviewers approve those notes together with the code; do not
    depend on an unreviewed local notes file.
@@ -71,8 +97,9 @@ configuration has remained unchanged.
    first-party critical or high-severity alert. Record the disposition of
    inherited and third-party findings that affect shipped code.
 8. Confirm that the version is absent from both TestPyPI and PyPI, review known
-   issues and the supported-platform statement, merge the pull request, and
-   record its exact commit SHA.
+   issues and the supported-platform statement, merge an `X.Y.0` pull request
+   into `main` or a patch/post pull request into `release/X.Y`, and record its
+   exact commit SHA.
 
 Run a build-only dry run from the reviewed commit with:
 
@@ -83,10 +110,14 @@ gh workflow run release.yml \
   -f operation=build-only
 ```
 
+For a maintenance release, replace `main` with the matching `release/X.Y`.
+
 ## Create the tag and draft release
 
-1. Confirm the recorded release commit is reachable from `main` and has not
-   changed since the release pull request passed its gates.
+1. Confirm the recorded `X.Y.0` release commit is reachable from `main`, or the
+   recorded patch/post release commit is reachable from the matching
+   `release/X.Y` branch. It must not have changed since the release pull request
+   passed its gates.
 2. Confirm the active `v*` tag ruleset restricts deletion and force pushes and
    has no bypass actors. Create and push the exact `v<version>` tag at the
    recorded commit, then verify that the remote tag resolves to that commit.
@@ -98,9 +129,9 @@ gh workflow run release.yml \
    and `operation=release`.
 
 The workflow rejects a release operation unless the selected ref is the
-matching version tag, the tagged commit is reachable from `main`, the GitHub
-Release exists and is still a draft, and the version is absent from both
-package indexes.
+matching version tag, the tagged commit is reachable from the branch required
+by its version line, the GitHub Release exists and is still a draft, and the
+version is absent from both package indexes.
 
 ## Build, stage, and publish
 

@@ -6,7 +6,7 @@
 
 [project]
 name = "vane-ai"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A distributed, multimodal data engine built on DuckDB and Ray"
 readme = "README.md"
 license = "Apache-2.0"
@@ -108,6 +108,7 @@ backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
 	"pybind11[global]>=3.0.0",
+    "setuptools_scm>=8.0",
 ]
 
 [tool.scikit-build]
@@ -115,6 +116,17 @@ minimum-version = "0.10"
 cmake.version = ">=3.29.0"
 ninja.version = ">=1.10"
 ninja.make-fallback = false
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]
+version_scheme = "vane_packaging.setuptools_scm_version:version_scheme"
+local_scheme = "no-local-version"
+
+# Main counts development distance from the latest minor release. Patch tags
+# merged into main therefore cannot reset the next-minor development series.
+[tool.setuptools_scm.scm.git]
+describe_command = "git describe --dirty --tags --long --abbrev=40 --match v*.*.0"
+pre_parse = "fail_on_shallow"
 
 [tool.scikit-build.wheel]
 cmake = true
@@ -186,6 +198,7 @@ include = [
 
     # Build configuration
     "/build_backend.py",
+    "/vane_packaging/**",
     "/pyproject.toml",
     "/CMakeLists.txt",
     "/vcpkg.json",
@@ -448,6 +461,7 @@ build = [
     "ninja>=1.10",
     "pybind11[global]>=3.0.0",
     "scikit_build_core>=0.11.4",
+    "setuptools_scm>=8.0",
     "tomli>=1.1; python_version < '3.11'",
 ]
 dev = [ # tooling like uv will install this automatically when syncing the environment
