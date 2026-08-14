@@ -1770,7 +1770,9 @@ class TestProviderRetryAfterAdoption:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         error = self._rate_limit_error(status=429, headers={"Retry-After": "10"})
-        success = SimpleNamespace(output_text="answer", usage=None)
+        # A terminal, non-refusing Responses result: #572 requires status
+        # "completed" and inspects output blocks for refusals before returning.
+        success = SimpleNamespace(output_text="answer", usage=None, status="completed", output=[])
         prompter = self._openai_prompter([error, success])
 
         class Descriptor:
