@@ -82,7 +82,7 @@ unique_ptr<BoundMergeIntoAction> Binder::BindMergeAction(LogicalMergeInto &merge
 		// FIXME: this is pretty hacky
 		// construct a dummy projection and update
 		LogicalProjection proj(proj_index, std::move(expressions));
-		LogicalUpdate update(table);
+		LogicalUpdate update(context, table);
 		update.return_chunk = merge_into.return_chunk;
 		update.columns = std::move(result->columns);
 		update.expressions = std::move(result->expressions);
@@ -303,7 +303,7 @@ BoundStatement Binder::Bind(MergeIntoStatement &stmt) {
 	auto &source = join_ref.get().children[inverted ? 1 : 0];
 	auto &get = ExtractLogicalGet(*join_ref.get().children[inverted ? 0 : 1]);
 
-	auto merge_into = make_uniq<LogicalMergeInto>(table);
+	auto merge_into = make_uniq<LogicalMergeInto>(context, table);
 	merge_into->table_index = GenerateTableIndex();
 	if (!stmt.returning_list.empty()) {
 		merge_into->return_chunk = true;

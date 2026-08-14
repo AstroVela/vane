@@ -326,6 +326,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 		throw CatalogException("Cannot rename rowid column");
 	}
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -400,6 +401,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddColumn(ClientContext &context, AddCo
 	}
 
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -709,6 +711,15 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveColumn(ClientContext &context, Re
 	}
 
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	// Removing a column remaps physical column indexes. Assign a new logical-write
+	// identity so a serialized plan can never become valid again after a later
+	// schema change restores the same logical definition. The physical ALTER
+	// selects this value before catalog mutation so the same value is recorded in
+	// the WAL and reused during recovery.
+	if (info.new_logical_write_target_identity.empty()) {
+		throw SerializationException("DROP COLUMN does not provide a new logical write target identity");
+	}
+	create_info->logical_write_target_identity = info.new_logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1037,6 +1048,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context
 
 	auto change_idx = GetColumnIndex(info.column_name);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1154,6 +1166,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetColumnComment(ClientContext &context
 unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKeyInfo &info) {
 	D_ASSERT(info.type == AlterForeignKeyType::AFT_ADD);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1179,6 +1192,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKey
 unique_ptr<CatalogEntry> DuckTableEntry::DropForeignKeyConstraint(ClientContext &context, AlterForeignKeyInfo &info) {
 	D_ASSERT(info.type == AlterForeignKeyType::AFT_DELETE);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;

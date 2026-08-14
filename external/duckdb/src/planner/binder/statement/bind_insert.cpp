@@ -526,7 +526,7 @@ BoundStatement Binder::Bind(InsertStatement &stmt) {
 		properties.RegisterDBModify(table.catalog, context, modification_type);
 	}
 
-	auto insert = make_uniq<LogicalInsert>(table, GenerateTableIndex());
+	auto insert = make_uniq<LogicalInsert>(context, table, GenerateTableIndex());
 
 	auto values_list = stmt.GetValuesList();
 

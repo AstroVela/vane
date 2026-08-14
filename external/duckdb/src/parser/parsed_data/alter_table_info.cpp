@@ -289,7 +289,9 @@ RemoveColumnInfo::~RemoveColumnInfo() {
 }
 
 unique_ptr<AlterInfo> RemoveColumnInfo::Copy() const {
-	return make_uniq_base<AlterInfo, RemoveColumnInfo>(GetAlterEntryData(), removed_column, if_column_exists, cascade);
+	auto result = make_uniq<RemoveColumnInfo>(GetAlterEntryData(), removed_column, if_column_exists, cascade);
+	result->new_logical_write_target_identity = new_logical_write_target_identity;
+	return std::move(result);
 }
 
 string RemoveColumnInfo::ToString() const {

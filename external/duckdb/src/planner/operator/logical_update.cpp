@@ -2,19 +2,18 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
-LogicalUpdate::LogicalUpdate(TableCatalogEntry &table)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), table(table), table_index(0), return_chunk(false) {
+LogicalUpdate::LogicalUpdate(ClientContext &context, TableCatalogEntry &table)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(context, table), table(table), table_index(0),
+      return_chunk(false) {
 }
 
-LogicalUpdate::LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE),
-      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->catalog, table_info->schema,
-                                                 table_info->Cast<CreateTableInfo>().table)) {
+LogicalUpdate::LogicalUpdate(ClientContext &context, const LogicalWriteTarget &write_target_p)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_UPDATE), write_target(write_target_p),
+      table(write_target_p.Resolve(context)) {
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

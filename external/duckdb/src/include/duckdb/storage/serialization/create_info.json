@@ -170,6 +170,11 @@
         "id": 206,
         "name": "options",
         "type": "case_insensitive_map_t<ParsedExpression*>"
+      },
+      {
+        "id": 207,
+        "name": "logical_write_target_identity",
+        "type": "string"
       }
     ]
   },

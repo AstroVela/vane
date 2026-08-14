@@ -43,6 +43,91 @@
     ]
   },
   {
+    "class": "LogicalVLLMProject",
+    "base": "LogicalOperator",
+    "enum": "LOGICAL_VLLM_PROJECT",
+    "members": [
+      {
+        "id": 200,
+        "name": "table_index",
+        "type": "idx_t"
+      },
+      {
+        "id": 201,
+        "name": "vllm_expr",
+        "type": "Expression*"
+      },
+      {
+        "id": 202,
+        "name": "output_column_name",
+        "type": "string"
+      }
+    ],
+    "constructor": [
+      "table_index",
+      "vllm_expr",
+      "output_column_name"
+    ]
+  },
+  {
+    "class": "LogicalUDFProject",
+    "base": "LogicalOperator",
+    "enum": "LOGICAL_UDF_PROJECT",
+    "members": [
+      {
+        "id": 200,
+        "name": "table_index",
+        "type": "idx_t"
+      },
+      {
+        "id": 201,
+        "name": "udf_expr",
+        "type": "Expression*"
+      },
+      {
+        "id": 202,
+        "name": "output_column_name",
+        "type": "string"
+      },
+      {
+        "id": 203,
+        "name": "is_flat_map",
+        "type": "bool"
+      },
+      {
+        "id": 204,
+        "name": "flat_map_output_types",
+        "type": "vector<LogicalType>"
+      },
+      {
+        "id": 205,
+        "name": "flat_map_output_names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 206,
+        "name": "is_scalar_map",
+        "type": "bool"
+      },
+      {
+        "id": 207,
+        "name": "is_row_preserving_batch",
+        "type": "bool"
+      }
+    ],
+    "constructor": [
+      "table_index",
+      "udf_expr",
+      "output_column_name"
+    ]
+  },
+  {
+    "class": "LogicalLocalExchange",
+    "base": "LogicalOperator",
+    "enum": "LOGICAL_LOCAL_EXCHANGE",
+    "custom_implementation": true
+  },
+  {
     "class": "LogicalFilter",
     "base": "LogicalOperator",
     "enum": "LOGICAL_FILTER",
@@ -58,6 +143,12 @@
         "type": "vector<idx_t>"
       }
     ]
+  },
+  {
+    "class": "LogicalRepartition",
+    "base": "LogicalOperator",
+    "enum": "LOGICAL_REPARTITION",
+    "custom_implementation": true
   },
   {
     "class": "LogicalAggregate",
@@ -630,15 +721,13 @@
     "base": "LogicalOperator",
     "enum": "LOGICAL_INSERT",
     "includes": [
-      "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp",
-      "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+      "duckdb/planner/logical_write_target.hpp"
     ],
     "members": [
       {
         "id": 200,
-        "name": "table_info",
-        "type": "CreateInfo*",
-        "serialize_property": "table.GetInfo()"
+        "name": "write_target",
+        "type": "LogicalWriteTarget"
       },
       {
         "id": 201,
@@ -746,7 +835,7 @@
     ],
     "constructor": [
       "$ClientContext",
-      "table_info"
+      "write_target&"
     ]
   },
   {
@@ -756,9 +845,8 @@
     "members": [
       {
         "id": 200,
-        "name": "table_info",
-        "type": "CreateInfo*",
-        "serialize_property": "table.GetInfo()"
+        "name": "write_target",
+        "type": "LogicalWriteTarget"
       },
       {
         "id": 201,
@@ -778,7 +866,7 @@
     ],
     "constructor": [
       "$ClientContext",
-      "table_info&"
+      "write_target&"
     ]
   },
   {
@@ -788,9 +876,8 @@
     "members": [
       {
         "id": 200,
-        "name": "table_info",
-        "type": "CreateInfo*",
-        "serialize_property": "table.GetInfo()"
+        "name": "write_target",
+        "type": "LogicalWriteTarget"
       },
       {
         "id": 201,
@@ -825,7 +912,7 @@
     ],
     "constructor": [
       "$ClientContext",
-      "table_info&"
+      "write_target&"
     ]
   },
   {
@@ -835,9 +922,8 @@
     "members": [
       {
         "id": 200,
-        "name": "table_info",
-        "type": "CreateInfo*",
-        "serialize_property": "table.GetInfo()"
+        "name": "write_target",
+        "type": "LogicalWriteTarget"
       },
       {
         "id": 201,
@@ -870,7 +956,7 @@
         "type": "bool"
       }
     ],
-    "constructor": ["$ClientContext", "table_info&"]
+    "constructor": ["$ClientContext", "write_target&"]
   },
   {
     "class": "BoundMergeIntoAction",

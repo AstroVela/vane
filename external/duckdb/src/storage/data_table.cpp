@@ -408,6 +408,7 @@ TableStorageInfo DataTable::GetStorageInfo() {
 	result.cardinality = GetTotalRows();
 	for (auto &index : info->indexes.Indexes()) {
 		IndexInfo index_info;
+		index_info.name = index.GetIndexName();
 		index_info.is_primary = index.IsPrimary();
 		index_info.is_unique = index.IsUnique() || index_info.is_primary;
 		index_info.is_foreign = index.IsForeign();
