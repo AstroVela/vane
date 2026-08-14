@@ -1646,6 +1646,7 @@ def test_native_append_error_rows_logs_one_warning_per_batch(caplog):
 
     executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
     executor.engine_error_message = "engine init exploded"
+    executor.on_error = "null"
     executor.completed_tasks = deque()
     executor._notify_state_change = lambda **_kwargs: None
     rows = pa.table({"x": [1, 2, 3]})
@@ -1657,3 +1658,23 @@ def test_native_append_error_rows_logs_one_warning_per_batch(caplog):
     messages = [r.getMessage() for r in caplog.records if "substituted NULL" in r.getMessage()]
     assert len(messages) == 1  # bounded: one warning per substituted batch, not per row
     assert "vllm engine init failed: engine init exploded" in messages[0]
+
+
+def test_native_append_error_rows_raise_mode_logs_no_substitution_warning(caplog):
+    """No caller reaches _append_error_rows under raise mode today, but the
+    policy mapping must guard it so a future caller cannot log a substitution
+    that is not happening."""
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.engine_error_message = "engine init exploded"
+    executor.on_error = "raise"
+    executor.completed_tasks = deque()
+    executor._notify_state_change = lambda **_kwargs: None
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        executor._append_error_rows(pa.table({"x": [1]}))
+
+    assert [r for r in caplog.records if "substituted NULL" in r.getMessage()] == []

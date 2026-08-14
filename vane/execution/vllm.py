@@ -445,10 +445,7 @@ class LocalVLLMExecutor(VLLMExecutor):
                             self.error_message = error_message
                 self._notify_state_change(force=True)
             else:
-                # The native "null" policy is the lowered form of the public
-                # on_error="ignore" (vane/ai/providers/vllm.py), so its NULL
-                # substitutions carry the same bounded warning.
-                _log_substituted_failure(exc, on_error="ignore")
+                self._log_null_substitution(exc)
                 if executor_id:
                     self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
                 else:
@@ -464,6 +461,16 @@ class LocalVLLMExecutor(VLLMExecutor):
                     self._per_executor_running_task_count[executor_id] = max(0, remaining)
             self._notify_state_change()
 
+    def _log_null_substitution(self, exc: Exception) -> None:
+        """Emit the bounded substitution warning under the native NULL policy.
+
+        The native "null" policy is the lowered form of the public
+        on_error="ignore" (vane/ai/providers/vllm.py); this is the one place
+        that maps the executor's policy back to the public mode, so raise-mode
+        callers can never log a substitution that is not happening.
+        """
+        _log_substituted_failure(exc, on_error="raise" if self.on_error == "raise" else "ignore")
+
     def _append_error_rows(
         self,
         rows: pa.Table,
@@ -472,12 +479,8 @@ class LocalVLLMExecutor(VLLMExecutor):
     ) -> None:
         rows = _ensure_table(rows)
         # One warning per substituted batch, not per row: every caller routes
-        # the same already-sanitized engine-init failure here under the native
-        # "null" policy (the lowered form of the public on_error="ignore").
-        _log_substituted_failure(
-            _SafeProviderError(f"vllm engine init failed: {self.engine_error_message}"),
-            on_error="ignore",
-        )
+        # the same already-sanitized engine-init failure here.
+        self._log_null_substitution(_SafeProviderError(f"vllm engine init failed: {self.engine_error_message}"))
         for i in range(rows.num_rows):
             row = rows.slice(i, 1)
             if executor_id:
