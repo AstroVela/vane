@@ -2692,9 +2692,7 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
         active = await runner_cls.acquire_query_task_lease(runner, active_request)
         assert active["granted"]
 
-        owner_thread_id = threading.get_ident()
         failed_pending = threading.Event()
-        allow_background_teardown = threading.Event()
         original_fail = runner_cls._fail_query_admission_requests.__get__(
             runner,
             runner_cls,
@@ -2703,8 +2701,6 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
         def controlled_fail(query_key):
             original_fail(query_key)
             failed_pending.set()
-            if threading.get_ident() != owner_thread_id:
-                assert allow_background_teardown.wait(timeout=1)
 
         runner._fail_query_admission_requests = controlled_fail
         teardown = asyncio.create_task(
@@ -2715,7 +2711,20 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
                 reason="test_background_teardown",
             )
         )
-        await asyncio.to_thread(failed_pending.wait, 1)
+        assert await asyncio.to_thread(failed_pending.wait, 1)
+
+        # Keep teardown before table purge until the late request observes the closing fence.
+        late_request = _task_request(
+            runner,
+            query_id,
+            "request:late",
+            "task:late",
+        )
+        denial = await asyncio.wait_for(
+            runner_cls.acquire_query_task_lease(runner, late_request),
+            timeout=0.2,
+        )
+
         assert await runner_cls.release_query_task_lease(
             runner,
             active_request["request_id"],
@@ -2736,19 +2745,7 @@ def test_background_query_teardown_fences_new_admission_before_table_purge():
             [SimpleNamespace(future=Future)],
         ) == {"scheduled": True}
 
-        late_request = _task_request(
-            runner,
-            query_id,
-            "request:late",
-            "task:late",
-        )
-        late_waiter = asyncio.create_task(runner_cls.acquire_query_task_lease(runner, late_request))
-        for _ in range(4):
-            await asyncio.sleep(0)
-        allow_background_teardown.set()
         await teardown
-
-        denial = await asyncio.wait_for(late_waiter, timeout=0.2)
         assert denial["granted"] is False
         assert denial["fatal"] is True
         assert denial["blocked_reason"] == "query_not_registered"
