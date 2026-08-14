@@ -241,6 +241,149 @@ def test_event_scheduler_does_not_lose_enqueue_during_idle_handoff():
     assert scheduler.stats().queued_events == 0
 
 
+def test_event_scheduler_drain_barrier_includes_events_queued_before_it():
+    scheduler = FteQueryScheduler("query-drain-completion")
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    prior_handler_started = threading.Event()
+    release_prior_handler = threading.Event()
+    later_handler_started = threading.Event()
+    release_later_handler = threading.Event()
+    processed = []
+
+    def handle_events(events):
+        value = events[0]["value"]
+        processed.append(value)
+        if value == 1:
+            handler_started.set()
+            assert release_handler.wait(2.0)
+        elif value == 2:
+            prior_handler_started.set()
+            assert release_prior_handler.wait(2.0)
+        elif value == 3:
+            later_handler_started.set()
+            assert release_later_handler.wait(2.0)
+        return []
+
+    scheduler.set_handlers(FteEventHandlers(on_split_events=handle_events))
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 1}],
+        )
+    )
+    drain_thread = threading.Thread(target=scheduler.drain)
+    drain_thread.start()
+    assert handler_started.wait(1.0)
+
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 2}],
+        )
+    )
+    completion = scheduler.enqueue_drain_barrier()
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 3}],
+        )
+    )
+    assert completion.done() is False
+
+    release_handler.set()
+    assert prior_handler_started.wait(1.0)
+    assert completion.done() is False
+    release_prior_handler.set()
+    assert later_handler_started.wait(1.0)
+    assert completion.result(timeout=1.0) is None
+    assert drain_thread.is_alive() is True
+    release_later_handler.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert processed == [1, 2, 3]
+
+
+def test_event_scheduler_drain_barrier_includes_causal_events_enqueued_after_it():
+    scheduler = FteQueryScheduler("query-causal-drain-completion")
+    initial_handler_started = threading.Event()
+    release_descendant_enqueue = threading.Event()
+    descendant_enqueued = threading.Event()
+    release_initial_handler = threading.Event()
+    descendant_handler_started = threading.Event()
+    release_descendant_handler = threading.Event()
+    later_handler_started = threading.Event()
+    release_later_handler = threading.Event()
+    processed = []
+
+    def event(value):
+        return SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": value}],
+        )
+
+    def handle_events(events):
+        value = events[0]["value"]
+        processed.append(value)
+        if value == 1:
+            initial_handler_started.set()
+            assert release_descendant_enqueue.wait(2.0)
+            scheduler.enqueue(event(2))
+            descendant_enqueued.set()
+            assert release_initial_handler.wait(2.0)
+        elif value == 2:
+            descendant_handler_started.set()
+            assert release_descendant_handler.wait(2.0)
+        elif value == 3:
+            later_handler_started.set()
+            assert release_later_handler.wait(2.0)
+        return []
+
+    scheduler.set_handlers(FteEventHandlers(on_split_events=handle_events))
+    scheduler.enqueue(event(1))
+    drain_thread = threading.Thread(target=scheduler.drain)
+    drain_thread.start()
+    assert initial_handler_started.wait(1.0)
+
+    completion = scheduler.enqueue_drain_barrier()
+    release_descendant_enqueue.set()
+    assert descendant_enqueued.wait(1.0)
+    scheduler.enqueue(event(3))
+    release_initial_handler.set()
+
+    assert descendant_handler_started.wait(1.0)
+    assert completion.done() is False
+    release_descendant_handler.set()
+    assert later_handler_started.wait(1.0)
+    assert completion.result(timeout=1.0) is None
+    assert drain_thread.is_alive() is True
+    release_later_handler.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert processed == [1, 2, 3]
+
+
+def test_event_scheduler_drain_barrier_replays_prior_handler_error():
+    scheduler = FteQueryScheduler("query-drain-barrier-error")
+    scheduler.enqueue(
+        SplitEventsSubmitted.from_events(
+            scheduler.query_id,
+            [{"query_id": scheduler.query_id, "value": 1}],
+        )
+    )
+    completion = scheduler.enqueue_drain_barrier()
+
+    def fail_handler(_events):
+        raise TimeoutError("planned handler failure")
+
+    with pytest.raises(TimeoutError, match="planned handler failure"):
+        scheduler.drain(FteEventHandlers(on_split_events=fail_handler))
+    with pytest.raises(TimeoutError, match="planned handler failure"):
+        completion.result(timeout=1.0)
+
+
 def test_scheduler_registry_pending_drain_is_single_flight_and_durable():
     registry = FteSchedulerRegistry()
     registry.get_or_create("query-a")
@@ -265,6 +408,44 @@ def test_scheduler_registry_pending_drain_is_single_flight_and_durable():
     assert registry.run_pending_drain(drain_round) == []
     assert calls == ["query-a", "query-b", "query-a", "query-b"]
     assert max_active_depth == 1
+
+
+def test_scheduler_registry_pending_drain_completion_tracks_request_generation():
+    registry = FteSchedulerRegistry()
+    registry.get_or_create("query-a")
+    drain_started = threading.Event()
+    release_drain = threading.Event()
+    rerun_started = threading.Event()
+    release_rerun = threading.Event()
+    rounds = []
+
+    def drain_round(query_ids):
+        rounds.append(tuple(query_ids))
+        if len(rounds) == 1:
+            drain_started.set()
+            assert release_drain.wait(2.0)
+        elif len(rounds) == 2:
+            rerun_started.set()
+            assert release_rerun.wait(2.0)
+        return []
+
+    drain_thread = threading.Thread(target=registry.run_pending_drain, args=(drain_round,))
+    drain_thread.start()
+    assert drain_started.wait(1.0)
+
+    outputs, completion = registry.run_pending_drain_with_completion(drain_round)
+    assert outputs == []
+    assert completion.done() is False
+
+    release_drain.set()
+    assert rerun_started.wait(1.0)
+    assert completion.done() is False
+    release_rerun.set()
+    drain_thread.join(2.0)
+
+    assert drain_thread.is_alive() is False
+    assert completion.result(timeout=1.0) is None
+    assert rounds == [("query-a",), ("query-a",)]
 
 
 def test_event_scheduler_coalesces_pending_internal_admission_pulses():

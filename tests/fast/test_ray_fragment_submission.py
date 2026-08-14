@@ -20,6 +20,7 @@ ray = pytest.importorskip("ray")
 
 import vane.runners.fte.fte_execution as fte_execution_mod
 import vane.runners.ray.fragment_worker_commands as worker_commands_mod
+import vane.runners.ray.fragment_worker_events as worker_events_mod
 import vane.runners.ray.fragment_worker_failures as worker_failures_mod
 import vane.runners.ray.fragment_worker_placement as worker_placement_mod
 import vane.runners.ray.fragment_worker_selection as worker_selection_mod
@@ -6592,7 +6593,7 @@ def test_fte_worker_failure_event_rejects_cross_manager_scheduler(failed_manager
     scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-cross-manager-failure")
     owner._bind_fte_scheduler_handlers(scheduler)
 
-    scheduled = worker_failures_mod.mark_fte_worker_failed_for_event(
+    scheduled = failed._handles_for_worker_failed_event(
         WorkerFailed(
             query_id=scheduler.query_id,
             worker_id=failed.worker_id,
@@ -6640,7 +6641,7 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
         reconciliation_started.set()
         assert release_reconciliation.wait(timeout=2.0)
         state_published.set()
-        return []
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,))
 
     monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
     monkeypatch.setattr(
@@ -6650,13 +6651,13 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        owner = executor.submit(failed._handles_for_worker_failed_event, event)
         assert reconciliation_started.wait(timeout=1.0)
         duplicate_entered = threading.Event()
 
         def report_duplicate_failure():
             duplicate_entered.set()
-            result = worker_failures_mod.mark_fte_worker_failed_for_event(event)
+            result = failed._handles_for_worker_failed_event(event)
             assert state_published.is_set()
             return result
 
@@ -6673,6 +6674,63 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
 
     assert reconciliation_calls == [event]
     assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_duplicate_fte_worker_failure_scheduler_observer_does_not_block_drain(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-scheduler-failure",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-duplicate-scheduler-{suffix}") for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    reconciliation_started = threading.Event()
+    release_reconciliation = threading.Event()
+    reconciliation_calls = []
+
+    def reconcile_worker_failure(reported_event, **_kwargs):
+        reconciliation_calls.append(reported_event)
+        reconciliation_started.set()
+        assert release_reconciliation.wait(timeout=2.0)
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), schedulers)
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        reconcile_worker_failure,
+    )
+
+    def drain_event(scheduler, event):
+        scheduler.enqueue(event)
+        return scheduler.drain()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(drain_event, schedulers[0], events[0])
+        assert reconciliation_started.wait(timeout=1.0)
+        duplicate = executor.submit(drain_event, schedulers[1], events[1])
+        try:
+            assert duplicate.result(timeout=1.0) == []
+        finally:
+            release_reconciliation.set()
+        assert owner.result(timeout=1.0) == []
+
+    assert reconciliation_calls == [events[0]]
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
 
 
 def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
@@ -6703,7 +6761,7 @@ def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
     def fail_reconciliation(*_args, **_kwargs):
         reconciliation_started.set()
         assert release_reconciliation.wait(timeout=2.0)
-        raise RuntimeError("planned reconciliation failure")
+        raise TimeoutError("planned reconciliation failure")
 
     monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
     monkeypatch.setattr(
@@ -6713,21 +6771,182 @@ def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
     )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        owner = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        owner = executor.submit(failed._handles_for_worker_failed_event, event)
         assert reconciliation_started.wait(timeout=1.0)
-        duplicate = executor.submit(worker_failures_mod.mark_fte_worker_failed_for_event, event)
+        duplicate = executor.submit(failed._handles_for_worker_failed_event, event)
         try:
             assert duplicate_joined.wait(timeout=1.0)
             assert not duplicate.done()
         finally:
             release_reconciliation.set()
 
-        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+        with pytest.raises(TimeoutError, match="planned reconciliation failure"):
             owner.result(timeout=1.0)
-        with pytest.raises(RuntimeError, match="planned reconciliation failure"):
+        with pytest.raises(TimeoutError, match="planned reconciliation failure"):
             duplicate.result(timeout=1.0)
 
     assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+    with pytest.raises(TimeoutError, match="planned reconciliation failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-publication-error",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-worker-failure-error-{suffix}") for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=schedulers[0].query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), schedulers),
+    )
+
+    def fail_pending_drain():
+        raise RuntimeError("planned publication failure")
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        fail_pending_drain,
+    )
+
+    with pytest.raises(RuntimeError, match="planned publication failure"):
+        failed._handles_for_worker_failed_event(event)
+
+    assert {scheduler.stats().state for scheduler in schedulers} == {"FAILED"}
+    with pytest.raises(RuntimeError, match="planned publication failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_fte_worker_failure_barrier_waits_for_reentrant_scheduler_drain(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:reentrant-failure-barrier",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-worker-failure-reentrant-barrier")
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+    admission_started = threading.Event()
+    release_admission = threading.Event()
+    retry_event_enqueued = threading.Event()
+    retry_publication_started = threading.Event()
+    release_retry_publication = threading.Event()
+    retry_published = threading.Event()
+    barrier_wait_started = threading.Event()
+
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_reconcile_fte_worker_failure",
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,)),
+    )
+
+    def blocking_admission_drain(**_kwargs):
+        if not retry_event_enqueued.is_set():
+            admission_started.set()
+            assert release_admission.wait(timeout=2.0)
+            scheduler.enqueue(
+                WorkerReservationCompleted(
+                    scheduler.query_id,
+                    1,
+                    "fragment-retry",
+                    0,
+                    1,
+                    worker_id="replacement-worker",
+                )
+            )
+            retry_event_enqueued.set()
+        return []
+
+    def publish_retry(_event):
+        retry_publication_started.set()
+        assert release_retry_publication.wait(timeout=2.0)
+        retry_published.set()
+        return []
+
+    monkeypatch.setattr(failed, "_drain_fte_pending_tasks", blocking_admission_drain)
+    monkeypatch.setattr(failed, "_handles_for_worker_reservation_completed_event", publish_retry)
+    failed._bind_fte_scheduler_handlers(scheduler)
+
+    def drain_failure_event():
+        scheduler.enqueue(event)
+        return scheduler.drain()
+
+    def wait_for_barrier():
+        barrier_wait_started.set()
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=2.0)
+        assert retry_published.is_set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        owner = executor.submit(drain_failure_event)
+        assert admission_started.wait(timeout=1.0)
+        waiter = executor.submit(wait_for_barrier)
+        assert barrier_wait_started.wait(timeout=1.0)
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not waiter.done()
+        finally:
+            release_admission.set()
+        assert retry_publication_started.wait(timeout=1.0)
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not waiter.done()
+        finally:
+            release_retry_publication.set()
+
+        assert owner.result(timeout=1.0) == []
+        assert waiter.result(timeout=1.0) is None
+
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
+def test_fte_worker_failure_barrier_rejects_invalid_timeout(timeout_s):
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-barrier-timeout",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(ValueError, match="timeout_s must be finite and > 0"):
+        handle.wait_fte_worker_failure_reconciliation(timeout_s=timeout_s)
+
+
+def test_fte_worker_failure_barrier_timeout_identifies_worker_incarnation():
+    handle = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:failure-barrier-timeout-context",
+        manager_instance_id="manager-a",
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match=rf"worker={handle.worker_id} incarnation={handle.worker_incarnation_id}",
+    ):
+        handle.wait_fte_worker_failure_reconciliation(timeout_s=0.01)
 
 
 def test_stale_worker_shutdown_does_not_fail_current_registry_owner(monkeypatch):

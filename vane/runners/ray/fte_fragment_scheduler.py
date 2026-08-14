@@ -9,6 +9,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any
 
 from vane import OutOfMemoryException
@@ -868,8 +869,10 @@ def _store_fte_result_handles(
         _FTE_RESULT_HANDLES_BY_QUERY.setdefault(str(query_id), []).extend(handles)
 
 
-def request_fte_pending_task_drain() -> list[Any]:
-    """Signal and, when elected leader, run the single-flight admission pump."""
+def _request_fte_pending_task_drain(
+    *,
+    with_completion: bool,
+) -> tuple[list[Any], Future[None] | None]:
     from vane.runners.fte.fte_events import ResourceAdmissionChanged
 
     def drain_query(
@@ -919,7 +922,24 @@ def request_fte_pending_task_drain() -> list[Any]:
             drain_execution_class(FteTaskExecutionClass.SPECULATIVE)
         return handles
 
-    return _FTE_SCHEDULERS.run_pending_drain(drain_round)
+    if with_completion:
+        return _FTE_SCHEDULERS.run_pending_drain_with_completion(drain_round)
+    return _FTE_SCHEDULERS.run_pending_drain(drain_round), None
+
+
+def request_fte_pending_task_drain() -> list[Any]:
+    """Signal and, when elected leader, run the single-flight admission pump."""
+
+    handles, _completion = _request_fte_pending_task_drain(with_completion=False)
+    return handles
+
+
+def request_fte_pending_task_drain_with_completion() -> tuple[list[Any], Future[None]]:
+    """Return handles and the completion of the drain round for this request."""
+
+    handles, completion = _request_fte_pending_task_drain(with_completion=True)
+    assert completion is not None
+    return handles, completion
 
 
 def _fte_execution_queries_waiting_for_resource(
