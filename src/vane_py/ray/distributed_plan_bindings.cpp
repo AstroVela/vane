@@ -196,8 +196,10 @@ struct PyPhysicalPlanWrapper {
 			// plan owner with the explicit resource query owner is safe.
 			AssignDataSourceQueryOwner(*root_ptr, resource_query_id_, true);
 		}
-		// Keep connection alive to ensure allocator validity
+		// Keep both the Python connection and its context alive to ensure allocator validity.
+		// The parent connection may close this cursor while the physical plan is still referenced.
 		worker_connection_ = conn_obj;
+		client_context_ = db_conn.context;
 		serialized_root_.clear();
 	}
 

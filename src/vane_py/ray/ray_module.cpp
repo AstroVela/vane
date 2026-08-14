@@ -1456,6 +1456,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        throw py::value_error("PyPhysicalPlanWrapper has no root after deserialization");
 				        }
 				        exec_plan->worker_connection_ = exec_conn;
+				        exec_plan->client_context_ = ExtractPyConnectionWrapper(exec_conn).con.GetConnection().context;
 				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
 				        exec_plan->apply_udf_actor_handles();
 				        auto result = self.execute_native_impl(
