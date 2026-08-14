@@ -1097,6 +1097,137 @@ def test_driver_keeps_aggregate_soft_reservation_when_capacity_moves_nodes():
     assert dropped == []
 
 
+def test_unrelated_rebalance_cannot_reopen_a_pending_phase_frontier():
+    from vane.runners.ray.cluster_resource_coordinator import (
+        ClusterQueryResourceCoordinator,
+    )
+    from vane.runners.ray.driver import RayQueryDriverActor
+    from vane.runners.ray.query_resource_graph import MaterializationBarrierSpec
+    from vane.runners.ray.query_resource_graph_builder import build_query_demand
+    from vane.runners.ray.query_resource_manager import TaskRequest
+    from vane.runners.ray.query_resource_runtime import register_query_resource_graph
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    query_id = "query-phase-fence-rebalance"
+    upstream = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:upstream",
+        physical_node_id="node:upstream:udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(),
+        per_task=ResourceVector(cpu=1, heap_bytes=10),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=None,
+    )
+    materializer = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:materializer",
+        physical_node_id="node:materializer:native-fragment",
+        unit_kind="native_fragment",
+        backend="ray_worker",
+        input_unit_ids=(upstream.resource_unit_id,),
+        per_task=ResourceVector(),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=4,
+    )
+    downstream = ResourceUnitSpec(
+        query_id=query_id,
+        resource_unit_id=f"resource:{query_id}:downstream",
+        physical_node_id="node:downstream:udf",
+        unit_kind="ray_task_udf",
+        backend="ray_task",
+        input_unit_ids=(materializer.resource_unit_id,),
+        per_task=ResourceVector(cpu=1, heap_bytes=20),
+        target_output_block_bytes=0,
+        generator_buffer_blocks=0,
+        max_concurrency=None,
+    )
+    graph = QueryResourceGraph(
+        query_id=query_id,
+        plan_digest="sha256:phase-fence-rebalance",
+        units=(upstream, materializer, downstream),
+        terminal_unit_ids=(downstream.resource_unit_id,),
+        materialization_barriers=(
+            MaterializationBarrierSpec(
+                query_id=query_id,
+                barrier_id=f"barrier:{query_id}:node:materializer",
+                physical_node_id="materializer",
+                materializer_unit_id=materializer.resource_unit_id,
+                materialized_input_unit_ids=(upstream.resource_unit_id,),
+            ),
+        ),
+    )
+    node = NodeCapacity(
+        "node-a",
+        ResourceVector(cpu=2, heap_bytes=30, object_store_bytes=100),
+    )
+    coordinator = ClusterQueryResourceCoordinator((node,))
+    allocation = coordinator.register_query(build_query_demand(graph, (node,)), now=0)
+    transitions = []
+    manager = register_query_resource_graph(
+        graph,
+        allocation,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    for unit in graph.units:
+        manager.update_unit_state(unit.resource_unit_id, runnable=True)
+
+    runner._query_resource_coordinator = coordinator
+    runner._query_resource_graphs = {query_id: graph}
+    runner._query_allocations = {query_id: allocation}
+    runner._query_node_capacities = (node,)
+    runner._query_resource_last_capacity_refresh_at = 0.0
+    runner._query_resource_lock = threading.RLock()
+    runner._session_lock = threading.RLock()
+    runner._plan_teardown_condition = threading.Condition(runner._session_lock)
+    runner._plan_teardowns_in_progress = set()
+    runner._plan_session_ids = {query_id: _SESSION_ID}
+    runner._active_udf_actor_by_unit = {}
+    runner._active_udf_actors = []
+    runner._active_udf_actors_by_plan = {}
+    runner._signal_query_resource_change = lambda _query_id: None
+
+    assert manager.mark_materialization_barrier_completed_for_node("materializer")
+    assert len(transitions) == 1
+    eligible, fence_epoch = transitions[0]
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+    runner_cls._maintain_query_resources_once(
+        runner,
+        capacities=(node,),
+        now=5,
+    )
+    unrelated_generation = coordinator.snapshot()["queries"][query_id]["allocation"]["generation"]
+    assert unrelated_generation > allocation.generation
+
+    blocked = manager.try_acquire_task(
+        TaskRequest(query_id, downstream.resource_unit_id, "before-phase-refresh", "0", None)
+    )
+    pending_snapshot = manager.snapshot()
+    assert pending_snapshot["allocation"]["generation"] == unrelated_generation
+    assert pending_snapshot["allocation_admission_open"] is False
+    assert not blocked.granted and blocked.blocked_reason == "allocation_pending"
+
+    runner_cls._transition_query_execution_phase(
+        runner,
+        query_id,
+        eligible,
+        fence_epoch,
+    )
+
+    opened = manager.try_acquire_task(
+        TaskRequest(query_id, downstream.resource_unit_id, "after-phase-refresh", "0", None)
+    )
+    opened_snapshot = manager.snapshot()
+    assert opened_snapshot["allocation"]["generation"] > unrelated_generation
+    assert opened_snapshot["allocation_admission_open"] is True
+    assert opened.granted
+
+
 def test_driver_keeps_drain_admission_open_after_soft_budget_shrink():
     from vane.runners.ray.driver import RayQueryDriverActor
     from vane.runners.ray.query_resource_manager import TaskRequest

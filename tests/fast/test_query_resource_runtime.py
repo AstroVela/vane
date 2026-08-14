@@ -133,7 +133,10 @@ def test_runtime_can_publish_pending_query_before_minimum_bundle_is_feasible():
     )
     assert blocked.blocked_reason == "allocation_pending"
 
-    manager.update_allocation(_allocation(generation=2), admission_open=True)
+    manager.update_allocation(
+        _allocation(generation=2),
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
+    )
     assert manager.try_acquire_task(
         TaskRequest(
             query_id="q",

@@ -2618,10 +2618,7 @@ class RayQueryDriverActor:
             manager = get_query_resource_manager(query_id)
             current = self._query_allocations[query_id]
             if allocation.generation > current.generation:
-                manager.update_allocation(
-                    allocation,
-                    admission_open=True,
-                )
+                manager.update_allocation(allocation)
                 self._query_allocations[query_id] = allocation
 
     def _apply_query_capacity_snapshot(
@@ -5091,9 +5088,10 @@ class RayQueryDriverActor:
                     admission_open=True,
                     reservation_ratio=float(os.environ.get("VANE_QUERY_RESOURCE_RESERVATION_RATIO", "0.5")),
                     on_change=lambda: self._signal_query_resource_change(graph.query_id),
-                    on_eligible_units_change=lambda eligible: self._transition_query_execution_phase(
+                    on_eligible_units_change=lambda eligible, fence_epoch: self._transition_query_execution_phase(
                         graph.query_id,
                         eligible,
+                        fence_epoch,
                     ),
                 )
                 manager_registered = True
@@ -5209,6 +5207,7 @@ class RayQueryDriverActor:
         self,
         query_id: str,
         eligible_unit_ids: tuple[str, ...],
+        allocation_fence_epoch: int,
     ) -> None:
         """Retire the old phase and recompute reservation for the new frontier."""
 
@@ -5224,11 +5223,12 @@ class RayQueryDriverActor:
                 if query_key not in self._plan_session_ids:
                     return
             eligible = tuple(str(resource_unit_id) for resource_unit_id in eligible_unit_ids)
+            fence_epoch = int(allocation_fence_epoch)
             manager = get_query_resource_manager(query_key)
-            # Validate before touching physical actors. The manager repeats this
-            # check atomically in begin_actor_pool_retirement() to close the race
-            # with a still newer barrier completion.
-            if eligible != manager.current_eligible_resource_unit_ids():
+            # Validate before touching physical actors. Each retirement target
+            # is checked atomically against the current eligible set, and the
+            # complete frontier token is checked again before allocation.
+            if (eligible, fence_epoch) != manager.current_allocation_frontier():
                 return
             self._retire_udf_actor_pools_outside_phase(query_key, eligible)
 
@@ -5238,8 +5238,7 @@ class RayQueryDriverActor:
                 if graph is None or allocation is None:
                     return
                 # Ignore a stale callback overtaken by another completion.
-                current_eligible = manager.current_eligible_resource_unit_ids()
-                if eligible != current_eligible:
+                if (eligible, fence_epoch) != manager.current_allocation_frontier():
                     return
                 demand = build_query_demand(
                     graph,
@@ -5249,12 +5248,17 @@ class RayQueryDriverActor:
                 observed_usage = manager.snapshot()["soft_allocation_usage"]
                 from vane.runners.ray.query_resource_graph import ResourceVector
 
-                self._query_resource_coordinator.refresh_query(
+                phase_allocation = self._query_resource_coordinator.refresh_query(
                     query_key,
                     observed_usage=ResourceVector.from_dict(observed_usage),
                     generation=allocation.generation,
                     demand=demand,
                 )
+                manager.update_allocation(
+                    phase_allocation,
+                    reopen_fence_epoch=fence_epoch,
+                )
+                self._query_allocations[query_key] = phase_allocation
                 self._synchronize_query_allocations()
             self._signal_query_resource_change(query_key)
 
