@@ -26,7 +26,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.utils import canonicalize_name
+from packaging.utils import (
+    InvalidSdistFilename,
+    InvalidWheelFilename,
+    canonicalize_name,
+    parse_sdist_filename,
+    parse_wheel_filename,
+)
+from packaging.version import InvalidVersion, Version
 
 try:
     import tomllib
@@ -36,7 +43,6 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_METADATA = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 EXPECTED_NAME = str(PROJECT_METADATA["name"])
-EXPECTED_VERSION = str(PROJECT_METADATA["version"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 DUCKDB_FORK_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:-dirty)?")
@@ -44,9 +50,6 @@ DUCKDB_UPSTREAM_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
 CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 FORBIDDEN_DISTRIBUTION_ROOTS = {"adbc_driver_duckdb", "duckdb"}
 WHEEL_DISTRIBUTION = re.sub(r"[-_.]+", "_", EXPECTED_NAME)
-WHEEL_VERSION = re.sub(r"[^A-Za-z0-9.]+", "_", EXPECTED_VERSION)
-EXPECTED_ARCHIVE_ROOT = f"{WHEEL_DISTRIBUTION}-{WHEEL_VERSION}"
-EXPECTED_DIST_INFO_ROOT = f"{EXPECTED_ARCHIVE_ROOT}.dist-info"
 EXPECTED_LIBRARY_ROOT = f"{WHEEL_DISTRIBUTION}.libs"
 
 BANNED_PATH_PARTS = (
@@ -87,6 +90,24 @@ class ContentRule(Protocol):
 class ContentMatch:
     rule_id: str
     member_name: str
+
+
+@dataclass(frozen=True)
+class DistributionLayout:
+    version: Version
+    archive_root: str
+    dist_info_root: str
+
+
+def distribution_layout(version: Version | str) -> DistributionLayout:
+    parsed_version = version if isinstance(version, Version) else Version(version)
+    wheel_version = re.sub(r"[^A-Za-z0-9.]+", "_", str(parsed_version))
+    archive_root = f"{WHEEL_DISTRIBUTION}-{wheel_version}"
+    return DistributionLayout(
+        version=parsed_version,
+        archive_root=archive_root,
+        dist_info_root=f"{archive_root}.dist-info",
+    )
 
 
 @dataclass(frozen=True)
@@ -147,6 +168,22 @@ class SdistArtifact:
 
     def close(self) -> None:
         self.archive.close()
+
+
+def _artifact_version(path: Path) -> Version:
+    try:
+        if path.name.endswith(".tar.gz"):
+            name, version = parse_sdist_filename(path.name)
+        elif path.suffix == ".whl":
+            name, version, _, _ = parse_wheel_filename(path.name)
+        else:
+            raise ValueError(f"unsupported artifact type: {path}")
+    except (InvalidSdistFilename, InvalidWheelFilename):
+        raise ValueError(f"{path}: invalid Python distribution filename") from None
+
+    if canonicalize_name(name) != canonicalize_name(EXPECTED_NAME):
+        raise ValueError(f"{path}: unexpected project name {name!r}")
+    return version
 
 
 def _normalized(name: str) -> str:
@@ -324,14 +361,15 @@ def _metadata(artifact: Artifact, path: str):
     return BytesParser().parsebytes(artifact.read(name))
 
 
-def _check_metadata(artifact: Artifact, path: str):
+def _check_metadata(artifact: Artifact, path: str, layout: DistributionLayout):
     metadata = _metadata(artifact, path)
     if metadata["Name"] != EXPECTED_NAME:
         raise ValueError(f"{artifact.path}: unexpected project name {metadata['Name']!r}")
     if metadata["License-Expression"] != "Apache-2.0":
         raise ValueError(f"{artifact.path}: missing Apache-2.0 License-Expression")
-    if metadata["Version"] != EXPECTED_VERSION:
-        raise ValueError(f"{artifact.path}: expected version {EXPECTED_VERSION!r}, found {metadata['Version']!r}")
+    expected_version = str(layout.version)
+    if metadata["Version"] != expected_version:
+        raise ValueError(f"{artifact.path}: expected version {expected_version!r}, found {metadata['Version']!r}")
     return metadata
 
 
@@ -387,8 +425,12 @@ def _checkout_duckdb_fork_revision() -> str | None:
     return revision
 
 
-def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
-    metadata_name = _require_exact_path(artifact.names(), f"{EXPECTED_DIST_INFO_ROOT}/METADATA", artifact.path)
+def _check_wheel_license_files(
+    artifact: WheelArtifact,
+    metadata,
+    layout: DistributionLayout,
+) -> None:
+    metadata_name = _require_exact_path(artifact.names(), f"{layout.dist_info_root}/METADATA", artifact.path)
     license_root = PurePosixPath(metadata_name).parent / "licenses"
     names = artifact.names()
     for relative_path in metadata.get_all("License-File", []):
@@ -401,14 +443,14 @@ def _check_wheel_license_files(artifact: WheelArtifact, metadata) -> None:
             )
 
 
-def _check_sdist(artifact: SdistArtifact) -> None:
+def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
     names = artifact.names()
     for name in names:
         parts = PurePosixPath(name).parts
         possible_source_roots = parts[:2]
         if any(_is_forbidden_import_root(source_root) for source_root in possible_source_roots):
             raise ValueError(f"{artifact.path}: Vane sdist contains conflicting Python package path {name!r}")
-        if not parts or parts[0] != EXPECTED_ARCHIVE_ROOT:
+        if not parts or parts[0] != layout.archive_root:
             raise ValueError(f"{artifact.path}: Vane sdist contains an unexpected archive root: {name!r}")
 
     required_paths = (
@@ -423,6 +465,8 @@ def _check_sdist(artifact: SdistArtifact) -> None:
         "LICENSES/vcpkg-binary-dependencies.txt",
         "external/duckdb/LICENSE",
         "build_backend.py",
+        "vane_packaging/__init__.py",
+        "vane_packaging/setuptools_scm_version.py",
         "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
@@ -473,7 +517,7 @@ def _check_sdist(artifact: SdistArtifact) -> None:
             f"does not match checkout {checkout_upstream_version!r}"
         )
 
-    metadata = _check_metadata(artifact, f"{EXPECTED_ARCHIVE_ROOT}/PKG-INFO")
+    metadata = _check_metadata(artifact, f"{layout.archive_root}/PKG-INFO", layout)
     _check_no_official_duckdb_dependency(artifact, metadata)
     _check_sdist_license_files(artifact, metadata)
 
@@ -483,8 +527,8 @@ def _urlsafe_sha256(data: bytes) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _check_wheel_record(artifact: WheelArtifact) -> None:
-    record_name = _require_exact_path(artifact.names(), f"{EXPECTED_DIST_INFO_ROOT}/RECORD", artifact.path)
+def _check_wheel_record(artifact: WheelArtifact, layout: DistributionLayout) -> None:
+    record_name = _require_exact_path(artifact.names(), f"{layout.dist_info_root}/RECORD", artifact.path)
     try:
         rows = csv.reader(io.StringIO(artifact.read(record_name).decode("utf-8")))
     except UnicodeError:
@@ -513,12 +557,12 @@ def _check_wheel_record(artifact: WheelArtifact) -> None:
         raise ValueError(f"{artifact.path}: files missing from RECORD: {sorted(missing)}")
 
 
-def _check_wheel(artifact: WheelArtifact) -> None:
+def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
     names = artifact.names()
     for name in names:
         parts = PurePosixPath(name).parts
         root = parts[0]
-        if root in {"vane", EXPECTED_DIST_INFO_ROOT, EXPECTED_LIBRARY_ROOT}:
+        if root in {"vane", layout.dist_info_root, EXPECTED_LIBRARY_ROOT}:
             continue
         raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
 
@@ -542,25 +586,32 @@ def _check_wheel(artifact: WheelArtifact) -> None:
         "vane/_native/ray_cxx.pyi",
         "vane/sqltypes/__init__.pyi",
         "vane/udf.pyi",
-        f"{EXPECTED_DIST_INFO_ROOT}/METADATA",
-        f"{EXPECTED_DIST_INFO_ROOT}/WHEEL",
-        f"{EXPECTED_DIST_INFO_ROOT}/RECORD",
+        f"{layout.dist_info_root}/METADATA",
+        f"{layout.dist_info_root}/WHEEL",
+        f"{layout.dist_info_root}/RECORD",
     )
     for required_path in required_paths:
         _require_exact_path(names, required_path, artifact.path)
-    metadata = _check_metadata(artifact, f"{EXPECTED_DIST_INFO_ROOT}/METADATA")
+    metadata = _check_metadata(artifact, f"{layout.dist_info_root}/METADATA", layout)
     _check_no_official_duckdb_dependency(artifact, metadata)
-    _check_wheel_license_files(artifact, metadata)
-    _check_wheel_record(artifact)
+    _check_wheel_license_files(artifact, metadata, layout)
+    _check_wheel_record(artifact, layout)
 
 
 def check_artifact(
     path: Path,
     *,
+    expected_version: Version | str,
     content_rules: tuple[ContentRule, ...] = (),
     text_content_rules: tuple[ContentRule, ...] = (),
 ) -> None:
     """Validate one sdist or wheel."""
+    layout = distribution_layout(expected_version)
+    artifact_version = _artifact_version(path)
+    if artifact_version != layout.version:
+        raise ValueError(
+            f"{path}: expected version {layout.version}, found {artifact_version} in distribution filename"
+        )
     if path.stat().st_size > MAX_ARTIFACT_BYTES:
         raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
 
@@ -576,9 +627,19 @@ def check_artifact(
     try:
         _check_paths(artifact)
         _check_internal_content(artifact, content_rules, text_content_rules)
-        specific_check(artifact)
+        specific_check(artifact, layout)
     finally:
         artifact.close()
+
+
+def _canonical_version_argument(value: str) -> Version:
+    try:
+        version = Version(value)
+    except InvalidVersion:
+        raise argparse.ArgumentTypeError(f"invalid PEP 440 version: {value!r}") from None
+    if str(version) != value:
+        raise argparse.ArgumentTypeError(f"version must use canonical PEP 440 spelling: {version}")
+    return version
 
 
 def main() -> int:
@@ -588,6 +649,11 @@ def main() -> int:
         metavar="PATH",
         help="load private exact-content rules from PATH, or from standard input with '-'",
     )
+    parser.add_argument(
+        "--expected-version",
+        type=_canonical_version_argument,
+        help="require every artifact to carry this canonical PEP 440 version",
+    )
     parser.add_argument("artifacts", nargs="+", type=Path)
     args = parser.parse_args()
 
@@ -596,9 +662,11 @@ def main() -> int:
     if args.content_rules_manifest is not None:
         content_rules, text_content_rules = _load_content_rule_manifest(args.content_rules_manifest)
 
+    expected_version = args.expected_version or _artifact_version(args.artifacts[0])
     for artifact in args.artifacts:
         check_artifact(
             artifact,
+            expected_version=expected_version,
             content_rules=content_rules,
             text_content_rules=text_content_rules,
         )
