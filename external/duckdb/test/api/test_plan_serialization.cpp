@@ -18,6 +18,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_local_exchange.hpp"
 #include "duckdb/planner/operator/logical_repartition.hpp"
 #include "duckdb/planner/logical_write_target.hpp"
@@ -97,6 +98,38 @@ static duckdb::unique_ptr<LogicalOperator> DeserializePlan(Connection &con, cons
 		result = BinaryDeserializer::Deserialize<LogicalOperator>(stream, *con.context, parameters);
 	});
 	return result;
+}
+
+static string SerializeCreatePlanWithIdentity(Connection &con, const string &identity) {
+	string serialized_plan;
+	con.context->RunFunctionInTransaction([&]() {
+		Parser parser;
+		parser.ParseQuery("CREATE TABLE target(a INTEGER)");
+		Planner planner(*con.context);
+		planner.CreatePlan(std::move(parser.statements[0]));
+		auto &create = planner.plan->Cast<LogicalCreateTable>();
+		create.info->Base().logical_write_target_identity = identity;
+
+		MemoryStream stream(Allocator::Get(*con.context));
+		SerializationOptions options;
+		options.serialization_compatibility = SerializationCompatibility::Latest();
+		options.serialize_default_values = true;
+		BinarySerializer::Serialize(*planner.plan, stream, options);
+		serialized_plan.assign(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+	});
+	return serialized_plan;
+}
+
+static void MaterializeSerializedCreatePlan(Connection &con, const string &serialized_plan) {
+	auto plan = DeserializePlan(con, serialized_plan);
+	auto &create = plan->Cast<LogicalCreateTable>();
+	con.context->RunFunctionInTransaction([&]() {
+		auto &catalog = create.schema.catalog;
+		auto &transaction = MetaTransaction::Get(*con.context);
+		transaction.ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::CREATE_CATALOG_ENTRY);
+		REQUIRE(catalog.CreateTable(catalog.GetCatalogTransaction(*con.context), create.schema, *create.info) !=
+		        nullptr);
+	});
 }
 
 static string GetTableWriteIdentity(Connection &con, const string &table_name,
@@ -250,6 +283,25 @@ TEST_CASE("Serialized DML rejects a replacement at the same catalog path", "[ser
 	}
 }
 
+TEST_CASE("Materializing a serialized CREATE TABLE assigns a fresh write identity", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	auto serialized_create = SerializeCreatePlanWithIdentity(con, "reused-serialized-identity");
+
+	MaterializeSerializedCreatePlan(con, serialized_create);
+	auto first_identity = GetTableWriteIdentity(con, "target");
+	REQUIRE(!first_identity.empty());
+	REQUIRE(first_identity != "reused-serialized-identity");
+	auto first_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET a = 2");
+
+	REQUIRE_NO_FAIL(con.Query("DROP TABLE target"));
+	MaterializeSerializedCreatePlan(con, serialized_create);
+	auto second_identity = GetTableWriteIdentity(con, "target");
+	REQUIRE(!second_identity.empty());
+	REQUIRE(second_identity != first_identity);
+	REQUIRE_THROWS_WITH(DeserializePlan(con, first_plan), Catch::Matchers::Contains("was replaced"));
+}
+
 TEST_CASE("Duck table write target state survives persistence and detects definition changes", "[serialization][dml]") {
 	auto db_path = TestCreatePath("logical_write_target_identity.db");
 	string original_identity;
@@ -324,6 +376,36 @@ TEST_CASE("Serialized DML rejects a remapped physical column", "[serialization][
 	REQUIRE(GetTableWriteIdentity(con, "target") != original_identity);
 	REQUIRE(GetTableWriteDefinition(con, "target") != original_definition);
 	REQUIRE_THROWS_WITH(DeserializePlan(con, serialized_plan), Catch::Matchers::Contains("was replaced"));
+}
+
+TEST_CASE("DROP COLUMN write identity survives WAL replay", "[serialization][dml]") {
+	auto db_path = TestCreatePath("logical_write_target_drop_column_wal.db");
+	string post_drop_identity;
+	string post_drop_definition;
+	string post_drop_plan;
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(a INTEGER, b INTEGER)"));
+		auto original_identity = GetTableWriteIdentity(con, "target");
+		REQUIRE_NO_FAIL(con.Query("PRAGMA force_checkpoint"));
+		REQUIRE_NO_FAIL(con.Query("SET wal_autocheckpoint = '1TB'"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE target DROP COLUMN a"));
+		post_drop_identity = GetTableWriteIdentity(con, "target");
+		REQUIRE(!post_drop_identity.empty());
+		REQUIRE(post_drop_identity != original_identity);
+		post_drop_definition = GetTableWriteDefinition(con, "target");
+		post_drop_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET b = 3");
+		REQUIRE(DeserializePlan(con, post_drop_plan) != nullptr);
+	}
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE(GetTableWriteIdentity(con, "target") == post_drop_identity);
+		REQUIRE(GetTableWriteDefinition(con, "target") == post_drop_definition);
+		REQUIRE(DeserializePlan(con, post_drop_plan) != nullptr);
+	}
 }
 
 TEST_CASE("Serialized DML rejects changed index state", "[serialization][dml]") {

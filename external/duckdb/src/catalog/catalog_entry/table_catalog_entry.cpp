@@ -130,46 +130,52 @@ string TableCatalogEntry::GetLogicalWriteTargetDefinition(ClientContext &context
 			signature << ":" << column;
 		}
 		index_signatures.push_back(signature.str());
-	}
 
-	// TableStorageInfo captures the columns and constraint flags that affect DML
-	// planning, but intentionally omits standalone index expressions and types.
-	// Include their catalog definitions so replacing an index with another index
-	// over the same columns cannot make a stale write plan appear valid.
-	schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
-		auto &index = entry.Cast<IndexCatalogEntry>();
-		if (!StringUtil::CIEquals(index.GetTableName(), name)) {
-			return;
+		// TableStorageInfo captures the columns and constraint flags that affect
+		// DML planning, but intentionally omits standalone index expressions and
+		// types. Resolve the catalog entry by this target index's name instead of
+		// scanning every index in the schema.
+		if (index.name.empty()) {
+			continue;
+		}
+		auto entry = schema.GetEntry(schema.GetCatalogTransaction(context), CatalogType::INDEX_ENTRY, index.name);
+		if (!entry) {
+			continue;
+		}
+		auto &catalog_index = entry->Cast<IndexCatalogEntry>();
+		if (!StringUtil::CIEquals(catalog_index.GetTableName(), name)) {
+			continue;
 		}
 
-		duckdb::stringstream signature;
-		signature << "catalog-index:v1";
-		AppendWriteDefinitionField(signature, index.index_type);
-		signature << ":" << static_cast<uint32_t>(index.index_constraint_type) << ":" << index.column_ids.size();
-		for (auto column : index.column_ids) {
-			signature << ":" << column;
+		duckdb::stringstream catalog_signature;
+		catalog_signature << "catalog-index:v1";
+		AppendWriteDefinitionField(catalog_signature, catalog_index.index_type);
+		catalog_signature << ":" << static_cast<uint32_t>(catalog_index.index_constraint_type) << ":"
+		                  << catalog_index.column_ids.size();
+		for (auto column : catalog_index.column_ids) {
+			catalog_signature << ":" << column;
 		}
-		signature << ":" << index.parsed_expressions.size();
-		for (auto &expression : index.parsed_expressions) {
+		catalog_signature << ":" << catalog_index.parsed_expressions.size();
+		for (auto &expression : catalog_index.parsed_expressions) {
 			if (!expression) {
-				throw SerializationException("Index \"%s\" contains a null parsed expression", index.name);
+				throw SerializationException("Index \"%s\" contains a null parsed expression", catalog_index.name);
 			}
-			AppendWriteDefinitionField(signature, expression->ToString());
+			AppendWriteDefinitionField(catalog_signature, expression->ToString());
 		}
 
 		vector<pair<string, string>> options;
-		options.reserve(index.options.size());
-		for (auto &option : index.options) {
+		options.reserve(catalog_index.options.size());
+		for (auto &option : catalog_index.options) {
 			options.emplace_back(option.first, option.second.ToString());
 		}
 		std::sort(options.begin(), options.end());
-		signature << ":" << options.size();
+		catalog_signature << ":" << options.size();
 		for (auto &option : options) {
-			AppendWriteDefinitionField(signature, option.first);
-			AppendWriteDefinitionField(signature, option.second);
+			AppendWriteDefinitionField(catalog_signature, option.first);
+			AppendWriteDefinitionField(catalog_signature, option.second);
 		}
-		index_signatures.push_back(signature.str());
-	});
+		index_signatures.push_back(catalog_signature.str());
+	}
 	std::sort(index_signatures.begin(), index_signatures.end());
 
 	auto table_definition = GetInfo()->ToString();

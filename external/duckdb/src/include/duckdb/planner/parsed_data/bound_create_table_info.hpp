@@ -44,6 +44,8 @@ struct BoundCreateTableInfo {
 	unique_ptr<LogicalOperator> query;
 	//! Indexes created by this table
 	vector<IndexStorageInfo> indexes;
+	//! Preserve the persisted table-incarnation identity when restoring catalog state
+	bool preserve_logical_write_target_identity = false;
 
 	CreateTableInfo &Base() {
 		D_ASSERT(base);

@@ -39,6 +39,8 @@ struct CreateTableInfo : public CreateInfo {
 	case_insensitive_map_t<unique_ptr<ParsedExpression>> options;
 
 public:
+	DUCKDB_API static string GenerateLogicalWriteTargetIdentity();
+
 	DUCKDB_API unique_ptr<CreateInfo> Copy() const override;
 
 	DUCKDB_API void Serialize(Serializer &serializer) const override;

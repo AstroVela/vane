@@ -2,6 +2,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/types/uuid.hpp"
 
 namespace duckdb {
 
@@ -14,6 +15,10 @@ CreateTableInfo::CreateTableInfo(string catalog_p, string schema_p, string name_
 
 CreateTableInfo::CreateTableInfo(SchemaCatalogEntry &schema, string name_p)
     : CreateTableInfo(schema.catalog.GetName(), schema.name, std::move(name_p)) {
+}
+
+string CreateTableInfo::GenerateLogicalWriteTargetIdentity() {
+	return "duckdb-table:v1:" + UUID::ToString(UUID::GenerateRandomUUID());
 }
 
 unique_ptr<CreateInfo> CreateTableInfo::Copy() const {
