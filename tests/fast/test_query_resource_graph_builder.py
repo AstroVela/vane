@@ -122,6 +122,9 @@ def test_builder_delegates_native_process_resources_and_counts_each_ray_process(
     assert cpu_udf_parent.per_task == ResourceVector()
     assert gpu_udf_parent.per_task == ResourceVector()
     assert native_sink.per_task == ResourceVector()
+    assert native_sink.target_output_block_bytes == 0
+    assert native_sink.generator_buffer_blocks == 0
+    assert native_sink.resource_unit_id in graph.terminal_unit_ids
     assert cpu_udf.backend == "ray_task"
     assert cpu_udf.per_task == ResourceVector(cpu=1, heap_bytes=1536 * MIB, object_store_bytes=128 * MIB)
     assert cpu_udf.max_concurrency is None

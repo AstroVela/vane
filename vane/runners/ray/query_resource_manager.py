@@ -983,7 +983,12 @@ class RayQueryResourceManager:
                 liveness=True,
             )
 
-    def try_acquire_task_descriptor(self, request: TaskRequest) -> TaskGrant:
+    def try_acquire_task_descriptor(
+        self,
+        request: TaskRequest,
+        *,
+        recovery: bool = False,
+    ) -> TaskGrant:
         """Atomically admit one non-persistent scheduler descriptor.
 
         Unlike ``try_acquire_queued_task``, a denied descriptor is never
@@ -991,6 +996,11 @@ class RayQueryResourceManager:
         the same downstream-first arbitration domain and win when their rank
         is higher.  This is the FTE submission-window boundary: QRM owns only
         tasks that received a lease, while the FTE scheduler owns backlog.
+
+        ``recovery`` identifies an FTE retry. When that descriptor belongs to
+        a root whose output is required by an already-live downstream task, it
+        may anchor the first bounded liveness escape upstream of the dependent
+        lease; ordinary descriptors retain the strictly downstream chain rule.
         """
         with self._lock:
 
@@ -1069,7 +1079,10 @@ class RayQueryResourceManager:
                 )
             if reason not in _SOFT_TASK_BLOCK_REASONS:
                 return denied(reason)
-            liveness_block = self._queued_liveness_block_reason_locked(evaluations)
+            liveness_block = self._queued_liveness_block_reason_locked(
+                evaluations,
+                recovery_candidate_key=key if recovery else None,
+            )
             if liveness_block is not None:
                 return denied(liveness_block)
             return with_epoch(
@@ -1077,6 +1090,7 @@ class RayQueryResourceManager:
                     request,
                     plan,
                     liveness=True,
+                    recovery_liveness=recovery,
                 )
             )
 
@@ -1690,7 +1704,12 @@ class RayQueryResourceManager:
                 return "liveness_candidate_not_selected"
         return None
 
-    def _task_liveness_chain_available_locked(self, resource_unit_id: str) -> bool:
+    def _task_liveness_chain_available_locked(
+        self,
+        resource_unit_id: str,
+        *,
+        recovery: bool = False,
+    ) -> bool:
         """Keep escaped tasks on one downstream dependency chain.
 
         A query-global-idle escape cannot start a starving downstream UDF while
@@ -1699,6 +1718,11 @@ class RayQueryResourceManager:
         first escape may advance from any live upstream unit; subsequent
         escapes must descend from every active escape, which keeps parallel
         branches closed while allowing a multi-UDF pipeline to drain.
+
+        A retry of a root unit is the bounded exception: a live descendant can
+        depend on the lost root output and cannot release its lease until that
+        output is reproduced. Recovery may extend the same chain back to that
+        root, but it cannot open an unrelated root or a second task in the unit.
         """
 
         resource_unit_key = str(resource_unit_id)
@@ -1708,10 +1732,53 @@ class RayQueryResourceManager:
         active_liveness_unit_ids = set(self._active_liveness_task_lease_ids_by_unit)
         upstream_unit_ids = self._transitive_upstream_unit_ids[resource_unit_key]
         if active_liveness_unit_ids:
-            return active_liveness_unit_ids.issubset(upstream_unit_ids)
+            if active_liveness_unit_ids.issubset(upstream_unit_ids):
+                return True
+            return self._recovery_root_is_upstream_of_units_locked(
+                resource_unit_key,
+                active_liveness_unit_ids,
+                recovery=recovery,
+                require_all=True,
+            )
         if not self._task_leases:
             return True
-        return any(lease.resource_unit_id in upstream_unit_ids for lease in self._task_leases.values())
+        if any(lease.resource_unit_id in upstream_unit_ids for lease in self._task_leases.values()):
+            return True
+        return self._recovery_root_is_upstream_of_units_locked(
+            resource_unit_key,
+            {lease.resource_unit_id for lease in self._task_leases.values()},
+            recovery=recovery,
+            require_all=False,
+        )
+
+    def _recovery_root_is_upstream_of_units_locked(
+        self,
+        resource_unit_id: str,
+        other_unit_ids: set[str],
+        *,
+        recovery: bool,
+        require_all: bool,
+    ) -> bool:
+        if not recovery or self._units[resource_unit_id].spec.input_unit_ids:
+            return False
+        if require_all:
+            # A live liveness token remains part of the bounded chain until its
+            # physical task lease is released, even if completion or a barrier
+            # has already removed its unit from the current admission phase.
+            relevant_unit_ids = other_unit_ids
+        else:
+            eligible_unit_ids = set(self._eligible_resource_unit_ids_locked())
+            relevant_unit_ids = {
+                unit_id
+                for unit_id in other_unit_ids
+                if unit_id in eligible_unit_ids and not self._units[unit_id].completed
+            }
+        if not relevant_unit_ids:
+            return False
+        dependencies = {
+            unit_id for unit_id in relevant_unit_ids if resource_unit_id in self._transitive_upstream_unit_ids[unit_id]
+        }
+        return dependencies == relevant_unit_ids if require_all else bool(dependencies)
 
     def _has_normal_task_candidate_locked(self) -> bool:
         # Liveness arbitration must consider real dispatchable work only. A
@@ -1788,13 +1855,18 @@ class RayQueryResourceManager:
     def _queued_liveness_block_reason_locked(
         self,
         evaluations: tuple[_QueuedTaskEvaluation, ...],
+        *,
+        recovery_candidate_key: tuple[str, str] | None = None,
     ) -> str | None:
         if any(not item.fatal and item.reason is None for item in evaluations):
             return "normal_candidate_available"
         selected = self._select_waiting_task_evaluation_locked(evaluations)
         if selected is None:
             return "no_liveness_candidate"
-        if not self._task_liveness_chain_available_locked(selected.request.resource_unit_id):
+        if not self._task_liveness_chain_available_locked(
+            selected.request.resource_unit_id,
+            recovery=selected.key == recovery_candidate_key,
+        ):
             return "liveness_task_active"
         return None
 
@@ -1812,6 +1884,7 @@ class RayQueryResourceManager:
         plan: _TaskAdmissionPlan,
         *,
         liveness: bool,
+        recovery_liveness: bool = False,
     ) -> TaskGrant:
         unit = self._units[str(request.resource_unit_id)].spec
         if unit.backend == "ray_task":
@@ -1820,8 +1893,11 @@ class RayQueryResourceManager:
         elif not str(plan.node_id or "").strip():
             raise RuntimeError(f"{unit.backend} task lease requires a concrete runtime node")
         resource_unit_id = str(request.resource_unit_id)
-        if liveness and not self._task_liveness_chain_available_locked(resource_unit_id):
-            raise RuntimeError("cannot grant more than one liveness task per downstream chain unit")
+        if liveness and not self._task_liveness_chain_available_locked(
+            resource_unit_id,
+            recovery=recovery_liveness,
+        ):
+            raise RuntimeError("cannot grant a task outside the bounded liveness dependency chain")
 
         actor_index = plan.actor_index
         lease_id = uuid.uuid4().hex
@@ -2232,7 +2308,22 @@ class RayQueryResourceManager:
         # cross-lease deadlock when the producer's sole liveness lease is the
         # partial bundle already waiting downstream.
         return any(
-            self._active_task_count_for_unit_locked(resource_unit_id) == 0 for resource_unit_id in downstream_ids
+            self._active_task_count_for_unit_locked(resource_unit_id) == 0
+            or self._is_native_sink_consumer_locked(resource_unit_id)
+            for resource_unit_id in downstream_ids
+        )
+
+    def _is_native_sink_consumer_locked(self, resource_unit_id: str) -> bool:
+        unit = self._units[resource_unit_id]
+        spec = unit.spec
+        # The graph builder encodes an is_sink native fragment with no output
+        # window. Combined with terminal identity and the backend, this excludes
+        # result-producing native terminals and zero-output Ray UDF test units.
+        return bool(
+            resource_unit_id in self.graph.terminal_unit_ids
+            and spec.backend == "ray_worker"
+            and spec.target_output_block_bytes == 0
+            and spec.generator_buffer_blocks == 0
         )
 
     def _grant_output_block_locked(
