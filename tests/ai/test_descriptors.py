@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import base64
+import builtins
+import importlib
 import pickle
 
 import numpy as np
@@ -22,6 +24,63 @@ class TestProviderLoading:
 
         with pytest.raises(ValueError, match="not supported"):
             load_provider("nonexistent")
+
+    @pytest.mark.parametrize(
+        ("provider_name", "module_name"),
+        [
+            ("transformers", "vane.ai.providers.transformers"),
+            ("openai", "vane.ai.providers.openai"),
+            ("vllm", "vane.ai.providers.vllm"),
+            ("anthropic", "vane.ai.providers.anthropic"),
+            ("google", "vane.ai.providers.google"),
+        ],
+    )
+    def test_provider_module_import_error_reports_missing_extra(self, monkeypatch, provider_name, module_name):
+        from vane.ai.provider import ProviderImportError, load_provider
+
+        import_error = ImportError(f"cannot import {module_name}")
+        original_import = builtins.__import__
+
+        def fail_provider_import(name, *args, **kwargs):
+            if name == module_name:
+                raise import_error
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fail_provider_import)
+
+        with pytest.raises(ProviderImportError, match=rf"vane-ai\[{provider_name}\]") as exc_info:
+            load_provider(provider_name)
+
+        assert exc_info.value.__cause__ is import_error
+
+    @pytest.mark.parametrize(
+        ("provider_name", "module_name", "class_name"),
+        [
+            ("transformers", "vane.ai.providers.transformers", "TransformersProvider"),
+            ("openai", "vane.ai.providers.openai", "OpenAIProvider"),
+            ("vllm", "vane.ai.providers.vllm", "VLLMProvider"),
+            ("anthropic", "vane.ai.providers.anthropic", "AnthropicProvider"),
+            ("google", "vane.ai.providers.google", "GoogleProvider"),
+        ],
+    )
+    def test_provider_constructor_import_error_is_not_reported_as_missing_extra(
+        self, monkeypatch, provider_name, module_name, class_name
+    ):
+        from vane.ai.provider import ProviderImportError, load_provider
+
+        provider_module = importlib.import_module(module_name)
+        import_error = ImportError(f"cannot construct {provider_name}")
+
+        def fail_provider_construction(_name=None):
+            raise import_error
+
+        monkeypatch.setattr(provider_module, class_name, fail_provider_construction)
+
+        with pytest.raises(ImportError) as exc_info:
+            load_provider(provider_name)
+
+        assert exc_info.value is import_error
+        assert not isinstance(exc_info.value, ProviderImportError)
 
     def test_load_transformers_provider(self):
         """TransformersProvider can be instantiated (deps mocked if needed)."""

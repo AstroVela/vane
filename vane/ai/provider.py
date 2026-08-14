@@ -166,46 +166,41 @@ class _ProviderResultError(TypeError):
 def _load_transformers(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.transformers import TransformersProvider
-
-        return TransformersProvider(name)
     except ImportError as e:
         raise ProviderImportError("transformers") from e
+    return TransformersProvider(name)
 
 
 def _load_openai(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.openai import OpenAIProvider
-
-        return OpenAIProvider(name)
     except ImportError as e:
         raise ProviderImportError("openai") from e
+    return OpenAIProvider(name)
 
 
 def _load_vllm(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.vllm import VLLMProvider
-
-        return VLLMProvider(name)
     except ImportError as e:
         raise ProviderImportError("vllm") from e
+    return VLLMProvider(name)
 
 
 def _load_anthropic(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.anthropic import AnthropicProvider
-
-        return AnthropicProvider(name)
     except ImportError as e:
         raise ProviderImportError("anthropic") from e
+    return AnthropicProvider(name)
 
 
 def _load_google(name: str | None = None) -> Provider:
     try:
         from vane.ai.providers.google import GoogleProvider
-
-        return GoogleProvider(name)
     except ImportError as e:
         raise ProviderImportError("google") from e
+    return GoogleProvider(name)
 
 
 PROVIDERS: dict[str, Callable[..., Provider]] = {
