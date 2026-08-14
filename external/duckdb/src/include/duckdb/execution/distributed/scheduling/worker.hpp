@@ -183,6 +183,12 @@ public:
 		}
 		return res;
 	}
+
+	/// Resolve query_id to its resource-query lifecycle, permanently fence task
+	/// ingress, and wait until every owned execution query can no longer produce
+	/// side effects. This is an abort barrier, not final manager teardown:
+	/// adapter-owned lifecycle and result ownership are finalized separately.
+	virtual DuckDBResult<void> abort_and_quiesce_query(const std::string &query_id) = 0;
 };
 
 } // namespace distributed

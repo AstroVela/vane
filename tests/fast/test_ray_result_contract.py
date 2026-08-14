@@ -7701,6 +7701,7 @@ def test_wait_fte_query_propagates_status_errors(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-status-error", "query-status-error")
         with pytest.raises(Exception, match="status exploded"):
             manager.wait_fte_query("query-status-error", 0.01)
         assert failing_worker.status_calls == 1
@@ -7770,6 +7771,7 @@ def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-gil-wait", "query-gil-wait")
         manager.wait_fte_query("query-gil-wait", 1.0)
         assert worker.finished_event.is_set()
         assert worker.status_calls >= 2
@@ -7820,6 +7822,7 @@ def test_wait_fte_query_rejects_malformed_query_status(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-status-malformed", "query-status-malformed")
         with pytest.raises(Exception, match="FTE query status must include boolean 'failed'"):
             manager.wait_fte_query("query-status-malformed", 1.0)
         assert worker.status_calls == 1
@@ -7890,6 +7893,7 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-handle-malformed", "query-handle-malformed")
         with pytest.raises(Exception, match="FTE result handle must provide task_id"):
             manager.wait_fte_query("query-handle-malformed", 1.0)
         assert worker.pop_calls == 1
@@ -7961,6 +7965,7 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-handle-missing-worker", "query-handle-missing-worker")
         with pytest.raises(Exception, match="worker_id"):
             manager.wait_fte_query("query-handle-missing-worker", 1.0)
         assert worker.pop_calls == 1
@@ -8054,6 +8059,7 @@ def test_wait_fte_query_propagates_selected_attempt_handle_errors(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-selected-error", "query-selected-error")
         with pytest.raises(Exception, match="selected attempt failed"):
             manager.wait_fte_query("query-selected-error", 1.0)
         assert worker.pop_calls >= 1
@@ -8179,6 +8185,7 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-retry-loser", "query-retry-loser")
         manager.wait_fte_query("query-retry-loser", 1.0)
         assert worker.pop_calls >= 1
         assert worker.status_calls >= 2
@@ -8292,6 +8299,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-release-failure", "query-release-failure")
         with pytest.raises(Exception, match="planned result payload release failure"):
             manager.wait_fte_query("query-release-failure", 1.0)
 
@@ -8420,6 +8428,7 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-retry-pending", "query-retry-pending")
         manager.wait_fte_query("query-retry-pending", 0.1)
         assert worker.pending_handle is not None
         assert worker.pending_handle.get_result_sync_calls == 0
@@ -8523,6 +8532,7 @@ def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-stale-failed", "query-stale-failed")
         with pytest.raises(Exception, match="FTE query failed"):
             manager.wait_fte_query("query-stale-failed", 0.1)
         assert worker.pending_handle is not None
@@ -8619,6 +8629,7 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-timeout-preserve", "query-timeout-preserve")
         with pytest.raises(Exception, match="timed out waiting for FTE query"):
             manager.wait_fte_query("query-timeout-preserve", 0.001)
         assert worker.handle is not None
@@ -8717,6 +8728,7 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
     manager = vane.ray_cxx.RayWorkerManager()
     try:
         manager.worker_snapshots()
+        manager.register_query_owner("query-drain-timeout", "query-drain-timeout")
         with pytest.raises(Exception, match="timed out draining FTE result handles"):
             manager.wait_fte_query("query-drain-timeout", 0.001)
         assert worker.handle is not None
