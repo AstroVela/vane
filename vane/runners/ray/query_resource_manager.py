@@ -2308,22 +2308,7 @@ class RayQueryResourceManager:
         # cross-lease deadlock when the producer's sole liveness lease is the
         # partial bundle already waiting downstream.
         return any(
-            self._active_task_count_for_unit_locked(resource_unit_id) == 0
-            or self._is_native_sink_consumer_locked(resource_unit_id)
-            for resource_unit_id in downstream_ids
-        )
-
-    def _is_native_sink_consumer_locked(self, resource_unit_id: str) -> bool:
-        unit = self._units[resource_unit_id]
-        spec = unit.spec
-        # The graph builder encodes an is_sink native fragment with no output
-        # window. Combined with terminal identity and the backend, this excludes
-        # result-producing native terminals and zero-output Ray UDF test units.
-        return bool(
-            resource_unit_id in self.graph.terminal_unit_ids
-            and spec.backend == "ray_worker"
-            and spec.target_output_block_bytes == 0
-            and spec.generator_buffer_blocks == 0
+            self._active_task_count_for_unit_locked(resource_unit_id) == 0 for resource_unit_id in downstream_ids
         )
 
     def _grant_output_block_locked(
