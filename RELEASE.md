@@ -25,10 +25,11 @@ repository does not maintain a rolling changelog or a release-notes template.
 Python package versions come from Git through `setuptools-scm`; there is no
 manually maintained version in `pyproject.toml`.
 
-- On `main`, development versions count from the latest `vX.Y.0` tag and use
-  the next minor series: commits after `v0.1.0` are `0.2.0.devN`. Restricting
-  the baseline to minor tags prevents a merged maintenance tag from resetting
-  `N`.
+- On `main`, development versions count from the latest patch-zero final or
+  prerelease tag. Commits after `v0.1.0` are `0.2.0.devN`, commits after
+  `v0.2.0rc1` are `0.2.0rc2.devN`, and commits after the final `v0.2.0` start
+  `0.3.0.devN`. Restricting the baseline to patch-zero tags prevents a merged
+  maintenance or post-release tag from resetting `N`.
 - On `release/X.Y`, versions count from the latest tag on that release line and
   use the next patch series: commits after `v0.2.0` are `0.2.1.devN`, and
   commits after `v0.2.1` are `0.2.2.devN`.

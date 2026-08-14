@@ -42,12 +42,16 @@ def _clear_branch_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_main_development_version_advances_to_next_minor(monkeypatch):
-    version = _ScmVersion(tag=Version("0.1.0"), distance=14)
-    state = setuptools_scm_version._VersionState(Version("0.1.0"), 14, False)
+@pytest.mark.parametrize(
+    ("tag", "distance", "expected"),
+    [("0.1.0", 14, "0.2.0.dev14"), ("0.2.0rc1", 3, "0.2.0rc2.dev3")],
+)
+def test_main_development_version_advances_from_the_latest_main_tag(monkeypatch, tag, distance, expected):
+    version = _ScmVersion(tag=Version(tag), distance=distance)
+    state = setuptools_scm_version._VersionState(Version(tag), distance, False)
     monkeypatch.setattr(setuptools_scm_version, "_describe_main_line", lambda repository: state)
 
-    assert setuptools_scm_version.version_scheme(version) == "0.2.0.dev14"
+    assert setuptools_scm_version.version_scheme(version) == expected
 
 
 def test_project_metadata_uses_scm_without_a_fallback_version():
@@ -55,6 +59,8 @@ def test_project_metadata_uses_scm_without_a_fallback_version():
 
     assert configuration["project"]["dynamic"] == ["version"]
     assert "version" not in configuration["project"]
+    assert "setuptools-scm>=9.2.0" in configuration["build-system"]["requires"]
+    assert "setuptools-scm>=9.2.0" in configuration["dependency-groups"]["build"]
     assert configuration["tool"]["scikit-build"]["metadata"]["version"]["provider"] == (
         "scikit_build_core.metadata.setuptools_scm"
     )
@@ -117,6 +123,7 @@ def test_dirty_exact_tag_is_not_released_as_the_tagged_version():
         ("0.2.1", 0, "0.2.1"),
         ("0.2.2rc1", 2, "0.2.2rc2.dev2"),
         ("0.2.2.post1", 2, "0.2.2.post2.dev2"),
+        ("0.2.2rc1.post1", 2, "0.2.2rc1.post2.dev2"),
     ],
 )
 def test_release_branch_advances_patch_series(monkeypatch, tag, distance, expected):
@@ -156,19 +163,30 @@ def test_release_branch_uses_the_latest_tag_from_its_own_line(monkeypatch):
     }
 
 
-def test_main_uses_the_latest_minor_tag(monkeypatch):
+def test_main_uses_the_latest_patch_zero_final_or_prerelease_tag(monkeypatch):
     captured = {}
 
     def run(command, **kwargs):
         captured["command"] = command
-        return subprocess.CompletedProcess(command, 0, "v0.1.0-14-g0123456789abcdef0123456789abcdef01234567\n", "")
+        return subprocess.CompletedProcess(command, 0, "v0.2.0rc1-3-g0123456789abcdef0123456789abcdef01234567\n", "")
 
     monkeypatch.setattr(setuptools_scm_version.subprocess, "run", run)
 
     state = setuptools_scm_version._describe_main_line(Path("/repository"))
 
-    assert state == setuptools_scm_version._VersionState(Version("0.1.0"), 14, False)
-    assert captured["command"][-2:] == ["--match", "v*.*.0"]
+    assert state == setuptools_scm_version._VersionState(Version("0.2.0rc1"), 3, False)
+    command = captured["command"]
+    assert [command[index + 1] for index, argument in enumerate(command) if argument == "--match"] == [
+        "v[0-9]*.[0-9]*.0",
+        "v[0-9]*.[0-9]*.0a[0-9]*",
+        "v[0-9]*.[0-9]*.0b[0-9]*",
+        "v[0-9]*.[0-9]*.0rc[0-9]*",
+    ]
+    assert [command[index + 1] for index, argument in enumerate(command) if argument == "--exclude"] == [
+        "v*.post*",
+        "v*.dev*",
+        "v*+*",
+    ]
 
 
 def test_release_pull_request_uses_its_base_branch(monkeypatch):

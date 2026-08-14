@@ -19,6 +19,13 @@ GIT_DESCRIBE = re.compile(
     r"^(?P<tag>.+)-(?P<distance>[0-9]+)-g[0-9a-f]{40}(?P<dirty>-dirty)?$",
     re.IGNORECASE,
 )
+MAIN_TAG_PATTERNS = (
+    "v[0-9]*.[0-9]*.0",
+    "v[0-9]*.[0-9]*.0a[0-9]*",
+    "v[0-9]*.[0-9]*.0b[0-9]*",
+    "v[0-9]*.[0-9]*.0rc[0-9]*",
+)
+MAIN_TAG_EXCLUDES = ("v*.post*", "v*.dev*", "v*+*")
 
 
 class _ScmConfiguration(Protocol):
@@ -73,7 +80,11 @@ def version_scheme(version: _ScmVersion) -> str:
 
     major, minor, patch = state.tag.release
     if state.tag.post is not None:
-        next_version = f"{major}.{minor}.{patch}.post{state.tag.post + 1}"
+        prerelease = ""
+        if state.tag.pre is not None:
+            prerelease_type, prerelease_number = state.tag.pre
+            prerelease = f"{prerelease_type}{prerelease_number}"
+        next_version = f"{major}.{minor}.{patch}{prerelease}.post{state.tag.post + 1}"
     elif state.tag.pre is not None:
         prerelease, number = state.tag.pre
         next_version = f"{major}.{minor}.{patch}{prerelease}{number + 1}"
@@ -110,9 +121,9 @@ def _release_line(version: _ScmVersion) -> tuple[int, int] | None:
 
 
 def _describe_main_line(repository: Path) -> _VersionState:
-    state = _describe(repository, "v*.*.0")
-    if state.tag.release[2] != 0:
-        raise ValueError(f"tag {state.tag} is not a minor release")
+    state = _describe(repository, MAIN_TAG_PATTERNS, exclude_patterns=MAIN_TAG_EXCLUDES)
+    if state.tag.release[2] != 0 or state.tag.post is not None:
+        raise ValueError(f"tag {state.tag} is not a main-line release")
     return state
 
 
@@ -124,18 +135,22 @@ def _describe_release_line(repository: Path, release_line: tuple[int, int]) -> _
     return state
 
 
-def _describe(repository: Path, tag_pattern: str) -> _VersionState:
+def _describe(
+    repository: Path,
+    tag_patterns: str | tuple[str, ...],
+    *,
+    exclude_patterns: tuple[str, ...] = (),
+) -> _VersionState:
+    if isinstance(tag_patterns, str):
+        tag_patterns = (tag_patterns,)
+    command = ["git", "describe", "--dirty", "--tags", "--long", "--abbrev=40"]
+    for pattern in tag_patterns:
+        command.extend(("--match", pattern))
+    for pattern in exclude_patterns:
+        command.extend(("--exclude", pattern))
+
     result = subprocess.run(
-        [
-            "git",
-            "describe",
-            "--dirty",
-            "--tags",
-            "--long",
-            "--abbrev=40",
-            "--match",
-            tag_pattern,
-        ],
+        command,
         cwd=repository,
         check=True,
         capture_output=True,
