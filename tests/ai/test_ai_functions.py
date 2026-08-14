@@ -1563,6 +1563,18 @@ class TestSharedRetryAfterExtraction:
         err = _retry_after_error(exc)
         assert err is not None
         assert err.retry_after == 6.0
+        # The status exists only on the attached response, which the
+        # constructor's direct-attribute whitelist cannot see; the helper must
+        # attach its normalized discovery so the status survives the two
+        # serialization surfaces used after retry exhaustion: the bounded
+        # warning summary and a pickle round-trip (Ray worker -> driver).
+        from vane.ai.provider import _safe_original_error_summary
+
+        assert err.status_code == 429
+        assert "status_code=429" in _safe_original_error_summary(err)
+        restored = pickle.loads(pickle.dumps(err))
+        assert restored.status_code == 429
+        assert restored.retry_after == 6.0
 
     def test_header_lookup_accepts_lowercase_key(self):
         """Both header casings providers actually emit are accepted (the exact

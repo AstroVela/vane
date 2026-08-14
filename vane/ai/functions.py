@@ -201,6 +201,8 @@ class RetryAfterError(Exception):
     falls back to exponential backoff (see :func:`_retry_wait_seconds`).
     """
 
+    status_code: int  # normalized HTTP status, set by ``_retry_after_error``
+
     def __init__(self, retry_after: float, original: Exception | None = None) -> None:
         self.retry_after = retry_after
         if original is None:
@@ -386,12 +388,18 @@ def _retry_after_error(exc: Exception) -> RetryAfterError | None:
     usable, otherwise a default wait applies. The returned error carries the
     original for its sanitized summary and status attributes only.
     """
-    if _provider_status_code(exc) not in _RATE_LIMIT_STATUS_CODES:
+    status = _provider_status_code(exc)
+    if status is None or status not in _RATE_LIMIT_STATUS_CODES:
         return None
     retry_after = _parse_retry_after_header(exc)
     if retry_after is None:
         retry_after = _DEFAULT_RETRY_AFTER_SECONDS
-    return RetryAfterError(retry_after=retry_after, original=exc)
+    error = RetryAfterError(retry_after=retry_after, original=exc)
+    # The constructor whitelists only the original's direct attributes, so a
+    # status discovered on the attached response would be lost from warnings
+    # and pickles without this normalized copy.
+    error.status_code = status
+    return error
 
 
 def _retry_call(
