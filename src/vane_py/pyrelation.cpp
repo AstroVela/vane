@@ -28,7 +28,10 @@
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/filter_relation.hpp"
+#include "duckdb/main/relation/delete_relation.hpp"
+#include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/main/relation/unnest_relation.hpp"
+#include "duckdb/main/relation/update_relation.hpp"
 #include "vane_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
@@ -44,6 +47,7 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -1054,7 +1058,12 @@ struct SafeRelationPyObject {
 	}
 };
 
-static std::unordered_map<DatabaseInstance *, SafeRelationPyObject> per_db_runners;
+struct CachedRunnerForDatabase {
+	string runner_type;
+	SafeRelationPyObject runner;
+};
+
+static std::unordered_map<DatabaseInstance *, CachedRunnerForDatabase> per_db_runners;
 
 static DatabaseInstance *GetRelationDatabasePtr(const shared_ptr<Relation> &rel) {
 	if (!rel || !rel->context) {
@@ -1109,8 +1118,8 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 	{
 		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
 		auto it = per_db_runners.find(db_ptr);
-		if (it != per_db_runners.end()) {
-			auto runner = it->second.Get();
+		if (it != per_db_runners.end() && it->second.runner_type == runner_type) {
+			auto runner = it->second.runner.Get();
 			if (!runner.is_none()) {
 				return {db_ptr, std::move(runner)};
 			}
@@ -1134,14 +1143,14 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 
 	{
 		std::lock_guard<std::mutex> guard(per_db_runner_mutex);
-		per_db_runners[db_ptr] = SafeRelationPyObject(runner);
+		per_db_runners[db_ptr] = CachedRunnerForDatabase {runner_type, SafeRelationPyObject(runner)};
 	}
 	return {db_ptr, std::move(runner)};
 }
 
-// Try to dispatch a write relation to the Python runner.
-// Returns true if dispatched, false if this relation should run locally.
-static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner) {
+// COPY keeps its existing runner-selection contract. Relation mutations use
+// ExecuteRelationMutation below and never enter this optional-dispatch path.
+static bool TryDispatchCopyToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner) {
 	auto runner_type = ResolveRunnerType();
 	if (runner_type == "local-fast") {
 		return false;
@@ -1165,6 +1174,50 @@ static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel
 	py::gil_scoped_release release;
 	auto pending_query = context->PendingQuery(rel, stream_result);
 	return DuckDBPyConnection::CompletePendingQuery(*pending_query);
+}
+
+// Python Relation mutations deliberately expose only two execution contracts.
+// Callers must select one explicitly: Ray is always distributed and local-fast
+// executes directly in DuckDB. Distributed failures are never retried locally.
+static string ResolveRelationMutationRunnerType(const string &operation_name) {
+	const char *configured_runner = std::getenv("VANE_RUNNER");
+	if (!configured_runner) {
+		throw InvalidInputException("%s requires VANE_RUNNER to be explicitly set to 'ray' or 'local-fast'",
+		                            operation_name);
+	}
+	auto runner_type = StringUtil::Lower(string(configured_runner));
+	StringUtil::Trim(runner_type);
+	if (runner_type != "ray" && runner_type != "local-fast") {
+		throw InvalidInputException(
+		    "%s requires VANE_RUNNER to be explicitly set to 'ray' or 'local-fast'; configured value is '%s'",
+		    operation_name, runner_type);
+	}
+	return runner_type;
+}
+
+static void ExecuteRelationMutation(const shared_ptr<Relation> &write_rel, const py::object &connection_owner,
+                                    const string &operation_name) {
+	auto runner_type = ResolveRelationMutationRunnerType(operation_name);
+	if (!write_rel || !write_rel->context) {
+		throw InternalException("Cannot execute %s: relation has no context", operation_name);
+	}
+	if (runner_type == "local-fast") {
+		PyExecuteRelation(write_rel);
+		return;
+	}
+
+	auto context = write_rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException("Ray %s requires DuckDB auto-commit mode because distributed execution cannot "
+		                            "participate in the caller's explicit transaction",
+		                            operation_name);
+	}
+	auto runner_for_db = GetOrCreateRunnerForDB(write_rel, "ray");
+	PerDBRunnerCleanupGuard cleanup_guard(runner_for_db.db_ptr);
+	auto py_write_rel = DuckDBPyRelation(write_rel);
+	py_write_rel.SetConnectionOwner(connection_owner);
+	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
+	runner_for_db.runner.attr("run_write")(py_write_rel_obj);
 }
 
 unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
@@ -1790,7 +1843,7 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
 	}
 
 	auto write_parquet = rel->WriteParquetRel(filename, std::move(options));
-	if (TryDispatchToRunner(write_parquet, connection_owner)) {
+	if (TryDispatchCopyToRunner(write_parquet, connection_owner)) {
 		return;
 	}
 	PyExecuteRelation(write_parquet);
@@ -1937,7 +1990,7 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 	}
 
 	auto write_csv = rel->WriteCSVRel(filename, std::move(options));
-	if (TryDispatchToRunner(write_csv, connection_owner)) {
+	if (TryDispatchCopyToRunner(write_csv, connection_owner)) {
 		return;
 	}
 	PyExecuteRelation(write_csv);
@@ -2011,7 +2064,7 @@ void DuckDBPyRelation::InsertInto(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
-	PyExecuteRelation(insert);
+	ExecuteRelationMutation(insert, connection_owner, "INSERT INTO");
 }
 
 void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) {
@@ -2055,7 +2108,34 @@ void DuckDBPyRelation::Update(const py::object &set_p, const py::object &where) 
 		expressions.push_back(py_expr->GetExpression().Copy());
 	}
 
-	return rel->Update(std::move(names), std::move(expressions), std::move(condition));
+	if (rel->type != RelationType::TABLE_RELATION) {
+		throw InvalidInputException("'DuckDBPyRelation.update' can only be used on a table relation");
+	}
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto update = make_shared_ptr<UpdateRelation>(rel->context, std::move(condition), table.description->database,
+	                                              table.description->schema, table.description->table, std::move(names),
+	                                              std::move(expressions));
+	ExecuteRelationMutation(update, connection_owner, "UPDATE");
+}
+
+void DuckDBPyRelation::Delete(const py::object &where) {
+	AssertRelation();
+	if (rel->type != RelationType::TABLE_RELATION) {
+		throw InvalidInputException("'DuckDBPyRelation.delete' can only be used on a table relation");
+	}
+	unique_ptr<ParsedExpression> condition;
+	if (!py::none().is(where)) {
+		shared_ptr<DuckDBPyExpression> py_expr;
+		if (!py::try_cast<shared_ptr<DuckDBPyExpression>>(where, py_expr)) {
+			throw InvalidInputException("Please provide an Expression to 'condition'");
+		}
+		condition = py_expr->GetExpression().Copy();
+	}
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto delete_relation =
+	    make_shared_ptr<DeleteRelation>(rel->context, std::move(condition), table.description->database,
+	                                    table.description->schema, table.description->table);
+	ExecuteRelationMutation(delete_relation, connection_owner, "DELETE");
 }
 
 void DuckDBPyRelation::Insert(const py::object &params) const {
@@ -2064,17 +2144,20 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 		throw InvalidInputException("'DuckDBPyRelation.insert' can only be used on a table relation");
 	}
 	vector<vector<Value>> values {DuckDBPyConnection::TransformPythonParamList(params)};
-
-	D_ASSERT(py::gil_check());
-	py::gil_scoped_release release;
-	rel->Insert(values);
+	vector<string> column_names;
+	auto values_relation =
+	    make_shared_ptr<ValueRelation>(rel->context->GetContext(), values, std::move(column_names), "values");
+	auto &table = static_cast<TableRelation &>(*rel);
+	auto insert =
+	    values_relation->InsertRel(table.description->database, table.description->schema, table.description->table);
+	ExecuteRelationMutation(insert, connection_owner, "INSERT");
 }
 
 void DuckDBPyRelation::Create(const string &table) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto create = rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false);
-	PyExecuteRelation(create);
+	ExecuteRelationMutation(create, connection_owner, "CTAS");
 }
 
 static bool IsPythonClassCallable(const py::object &fun) {

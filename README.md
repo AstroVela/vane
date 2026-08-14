@@ -117,6 +117,12 @@ import vane
 vane.configure(runner="local")
 ```
 
+Python Relation mutations use a stricter execution boundary than read consumers and file writes. Before calling
+`insert`, `insert_into`, `update`, `delete`, `create`, or `to_table`, set `VANE_RUNNER` explicitly to `ray` for
+distributed execution or `local-fast` for direct DuckDB execution. An unset or empty value and the experimental
+`local` runner are rejected for these data-changing APIs. A Ray planning or execution failure is returned to the
+caller and is never retried through the local backend.
+
 ### Distributed Flight Transport
 
 Vane follows [Ray's trusted-cluster model](https://docs.ray.io/en/latest/ray-security/index.html): the driver, workers, submitted code, and east-west network belong to one trusted computing boundary. Same-process local-disk shuffle reads directly from the process-local registry, and object-storage shuffle reads committed manifests. Only cross-worker local-disk shuffle uses Arrow Flight.

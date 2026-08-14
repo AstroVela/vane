@@ -12,6 +12,41 @@ import types
 import pytest
 
 
+_RELATION_MUTATIONS = [
+    ("insert_into", "INSERT INTO"),
+    ("insert_values", "INSERT"),
+    ("update", "UPDATE"),
+    ("delete", "DELETE"),
+    ("ctas", "CTAS"),
+]
+_RELATION_MUTATION_IDS = ["insert-into", "insert-values", "update", "delete", "ctas"]
+
+
+def _execute_relation_mutation(vane, connection, operation):
+    if operation == "insert_into":
+        connection.sql("SELECT 3 AS value").insert_into("target")
+    elif operation == "insert_values":
+        connection.table("target").insert([4])
+    elif operation == "update":
+        connection.table("target").update(
+            {"value": vane.ConstantExpression(42)},
+            condition=vane.ColumnExpression("value") == 1,
+        )
+    elif operation == "delete":
+        connection.table("target").delete(condition=vane.ColumnExpression("value") == 2)
+    elif operation == "ctas":
+        connection.sql("SELECT 7 AS value").create("created_target")
+    else:
+        raise AssertionError(f"unknown relation mutation: {operation}")
+
+
+def _new_mutation_connection(vane):
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.execute("INSERT INTO target VALUES (1), (2)")
+    return connection
+
+
 def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     import vane
@@ -32,6 +67,172 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     assert not target.exists()
+
+
+def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "  RAY  ")
+    import vane
+
+    relation_types = []
+    logical_plans = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            relation_types.append(relation.type)
+            logical_plans.append(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                    relation,
+                    f"relation-mutation-{len(logical_plans)}",
+                )
+            )
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = _new_mutation_connection(vane)
+    for operation, _expected_name in _RELATION_MUTATIONS:
+        _execute_relation_mutation(vane, connection, operation)
+
+    assert relation_types == [
+        "INSERT_RELATION",
+        "INSERT_RELATION",
+        "UPDATE_RELATION",
+        "DELETE_RELATION",
+        "CREATE_TABLE_RELATION",
+    ]
+    assert len(logical_plans) == len(_RELATION_MUTATIONS)
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
+    ).fetchone() == (0,)
+
+
+def test_relation_mutations_run_with_explicit_local_fast(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "  LOCAL-FAST  ")
+    import vane
+
+    connection = _new_mutation_connection(vane)
+    for operation, _expected_name in _RELATION_MUTATIONS:
+        _execute_relation_mutation(vane, connection, operation)
+
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(3,), (4,), (42,)]
+    assert connection.execute("SELECT * FROM created_target").fetchall() == [(7,)]
+
+
+def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    import vane
+
+    local_calls = []
+    ray_calls = []
+
+    class FakeLocalRunner:
+        def run_write(self, relation):
+            local_calls.append(relation.type)
+            monkeypatch.setenv("VANE_RUNNER", "ray")
+            connection.sql("SELECT 42 AS value").insert_into("target")
+            return {"ok": True}
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            ray_calls.append(relation.type)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_local = lambda *_args, **_kwargs: FakeLocalRunner()
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE target (value INTEGER)")
+    connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
+
+    assert local_calls == ["WRITE_PARQUET_RELATION"]
+    assert ray_calls == ["INSERT_RELATION"]
+    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
+def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operation, expected_name):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    import vane
+
+    calls = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            calls.append(relation)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = _new_mutation_connection(vane)
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(
+            vane.InvalidInputException,
+            match=rf"Ray {expected_name} requires DuckDB auto-commit mode",
+        ):
+            _execute_relation_mutation(vane, connection, operation)
+
+        assert calls == []
+        assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+        assert connection.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
+        ).fetchone() == (0,)
+    finally:
+        connection.execute("ROLLBACK")
+
+
+@pytest.mark.parametrize("configured_runner", [None, "", "local", "invalid-runner"])
+@pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
+def test_relation_mutations_require_explicit_ray_or_local_fast(
+    monkeypatch, configured_runner, operation, expected_name
+):
+    if configured_runner is None:
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VANE_RUNNER", configured_runner)
+    import vane
+
+    connection = _new_mutation_connection(vane)
+    with pytest.raises(
+        vane.InvalidInputException,
+        match=rf"{expected_name} requires VANE_RUNNER to be explicitly set to 'ray' or 'local-fast'",
+    ):
+        _execute_relation_mutation(vane, connection, operation)
+
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
+    ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize(("operation", "_expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
+def test_ray_relation_mutation_failures_never_fall_back(monkeypatch, operation, _expected_name):
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    import vane
+
+    class FailingRayRunner:
+        def run_write(self, relation):
+            raise RuntimeError(f"injected distributed {operation} failure")
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FailingRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    connection = _new_mutation_connection(vane)
+    with pytest.raises(RuntimeError, match=rf"injected distributed {operation} failure"):
+        _execute_relation_mutation(vane, connection, operation)
+
+    assert connection.execute("SELECT * FROM target ORDER BY value").fetchall() == [(1,), (2,)]
+    assert connection.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'created_target'"
+    ).fetchone() == (0,)
 
 
 def test_write_failure_releases_cache_and_preserves_configured_native_runner(tmp_path, monkeypatch):
