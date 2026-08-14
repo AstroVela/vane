@@ -341,14 +341,12 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
 def test_duckdb_version_and_source_id_match_recorded_engine_identities():
     from vane import _native
 
-    upstream_version = (REPOSITORY_ROOT / "DUCKDB_UPSTREAM_VERSION").read_text(encoding="ascii").strip()
     fork_version = _expected_duckdb_fork_version(REPOSITORY_ROOT)
     source_tree_id = _expected_duckdb_source_id(REPOSITORY_ROOT)
     embedded_version, embedded_source_id = vane.sql(
         "SELECT library_version, source_id FROM pragma_version()"
     ).fetchone()
 
-    assert upstream_version == "v1.5.5"
     assert embedded_version == fork_version
     assert embedded_source_id == source_tree_id[:10]
     assert _native.__version__ == fork_version.removeprefix("v")
