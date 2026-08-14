@@ -117,11 +117,13 @@ import vane
 vane.configure(runner="local")
 ```
 
-Python Relation mutations use a stricter execution boundary than read consumers and file writes. Before calling
+Python Relation mutations use a stricter dispatch boundary than read consumers and file writes. Before calling
 `insert`, `insert_into`, `update`, `delete`, `create`, or `to_table`, set `VANE_RUNNER` explicitly to `ray` for
-distributed execution or `local-fast` for direct DuckDB execution. An unset or empty value and the experimental
-`local` runner are rejected for these data-changing APIs. A Ray planning or execution failure is returned to the
-caller and is never retried through the local backend.
+distributed dispatch or `local-fast` for direct DuckDB execution. Ray execution succeeds only when the planned
+write has a supported distributed implementation, such as a matching distributed extension-write capability;
+unsupported operations fail before any local mutation. An unset or empty value and the experimental `local` runner
+are rejected for these data-changing APIs. Binding, planning, or execution failures are returned to the caller and
+are never retried through the local backend.
 
 ### Distributed Flight Transport
 
