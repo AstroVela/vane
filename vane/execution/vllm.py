@@ -22,6 +22,7 @@ from typing import Any, Callable, overload
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
+from vane.ai.functions import _log_substituted_failure
 from vane.ai.provider import _safe_provider_execution_error, _SafeProviderError
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
@@ -444,6 +445,10 @@ class LocalVLLMExecutor(VLLMExecutor):
                             self.error_message = error_message
                 self._notify_state_change(force=True)
             else:
+                # The native "null" policy is the lowered form of the public
+                # on_error="ignore" (vane/ai/providers/vllm.py), so its NULL
+                # substitutions carry the same bounded warning.
+                _log_substituted_failure(exc, on_error="ignore")
                 if executor_id:
                     self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
                 else:
@@ -466,6 +471,13 @@ class LocalVLLMExecutor(VLLMExecutor):
         reservation_id: str | None = None,
     ) -> None:
         rows = _ensure_table(rows)
+        # One warning per substituted batch, not per row: every caller routes
+        # the same already-sanitized engine-init failure here under the native
+        # "null" policy (the lowered form of the public on_error="ignore").
+        _log_substituted_failure(
+            _SafeProviderError(f"vllm engine init failed: {self.engine_error_message}"),
+            on_error="ignore",
+        )
         for i in range(rows.num_rows):
             row = rows.slice(i, 1)
             if executor_id:

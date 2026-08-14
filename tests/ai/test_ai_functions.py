@@ -2685,6 +2685,56 @@ class TestSubstitutionLogging:
         assert len(messages) == 1
         assert "_ProviderResultError" in messages[0]
 
+    # --- Seam C: native vLLM structured-output validation ----------------
+
+    def _native_validator(self, on_error):
+        from types import SimpleNamespace
+
+        from vane.ai._schema import OutputValidationError
+        from vane.ai.functions import _ValidateStructuredOutputBatch
+
+        def reject(_raw_text):
+            raise OutputValidationError("structured output rejected")
+
+        return _ValidateStructuredOutputBatch(
+            return_format=SimpleNamespace(validate_json=reject),
+            input_column="raw",
+            output_column="out",
+            on_error=on_error,
+        )
+
+    def test_native_validation_ignore_logs_one_warning_per_bad_row(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = self._native_validator("ignore")(pa.table({"raw": ["bad-1", "bad-2"]}))
+
+        assert result.column("out").to_pylist() == [None, None]
+        messages = _warnings(caplog)
+        assert len(messages) == 2
+        assert all("OutputValidationError" in message for message in messages)
+        assert all("bad-1" not in message and "bad-2" not in message for message in messages)
+
+    def test_native_validation_provider_null_passes_without_warning(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = self._native_validator("ignore")(pa.table({"raw": pa.array([None], type=pa.string())}))
+
+        assert result.column("out").to_pylist() == [None]
+        assert _warnings(caplog) == []
+
+    def test_native_validation_raise_mode_logs_nothing(self, caplog):
+        import logging
+
+        from vane.ai._schema import OutputValidationError
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with pytest.raises(OutputValidationError):
+                self._native_validator("raise")(pa.table({"raw": ["bad"]}))
+
+        assert _warnings(caplog) == []
+
 
 # ---------------------------------------------------------------------------
 # Basic Prompt provider contract

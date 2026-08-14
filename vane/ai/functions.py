@@ -148,8 +148,10 @@ def _log_substituted_failure(exc: Exception, *, on_error: _OnError, attempts: in
     """Record one bounded WARNING when a provider failure is replaced with NULL.
 
     Called at each site that swallows a provider error and yields NULL under
-    ``on_error='ignore'``; a no-op under ``'raise'`` so callers cannot log a
-    failure they are about to re-raise. ``attempts`` is the number of tries made
+    ``on_error='ignore'`` — including the native vLLM executor, whose ``"null"``
+    policy is the lowered form of ``'ignore'`` (see the mapping in
+    ``vane/ai/providers/vllm.py``); a no-op under ``'raise'`` so callers cannot
+    log a failure they are about to re-raise. ``attempts`` is the number of tries made
     when the caller is a retry loop (omitted where no attempt count is
     meaningful). Only the exception class, its sanitized numeric-status summary,
     and that count are emitted — never prompt text, row payloads, option
@@ -1360,9 +1362,10 @@ class _ValidateStructuredOutputBatch:
                 continue
             try:
                 results.append(self._return_format.validate_json(raw_text))
-            except OutputValidationError:
+            except OutputValidationError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 results.append(None)
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
 
