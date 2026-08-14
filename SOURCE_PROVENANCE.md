@@ -21,8 +21,11 @@ The DuckDB engine is imported under `external/duckdb` as a squashed Git subtree
 from `https://github.com/duckdb/duckdb.git`. Subtree metadata records the exact
 official upstream revision, while DuckDB's original history remains in its
 upstream repository rather than becoming an ancestor of Vane's main branch.
-The current official upstream baseline is commit
-`3a3967aa8190d0a2d1931d4ca4f5d920760030b4`.
+The squashed subtree snapshot was imported from the official v1.5.0 tag at
+commit `3a3967aa8190d0a2d1931d4ca4f5d920760030b4`. The reviewed maintenance
+history through the official v1.5.5 tag at commit
+`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa` is preserved as subsequent
+commits under `external/duckdb`.
 
 Vane's engine customizations are retained as normal commits after that subtree
 snapshot. The former `AstroVela/duckdb` history maps to Vane as follows:
@@ -48,7 +51,7 @@ Vane records the reviewed official release line in
 `DUCKDB_UPSTREAM_VERSION`. The build combines that value with the first ten
 characters of the last Vane commit that changed `external/duckdb`, as resolved
 by `git rev-list -1 HEAD -- external/duckdb`. DuckDB therefore reports a
-user-facing version such as `v1.5.0-vane.594c360bbc`, without a manually
+user-facing version such as `v1.5.5-vane.594c360bbc`, without a manually
 maintained counter or `g` prefix. Uncommitted engine changes append `-dirty`;
 uncommitted changes outside the engine do not affect this version. Incremental
 builds refresh a generated version header, so both dirty-state transitions and
@@ -88,7 +91,7 @@ previously released state.
 
 The statically linked DuckDB HTTPFS extension is fetched separately during the
 native build and pinned to commit
-`74f954001f3a740c909181b02259de6c7b942632` by
+`827222fb45a043a7a852d1f7aae46901492a3cda` by
 `external/duckdb/.github/config/extensions/httpfs.cmake`. It is covered by the
 DuckDB MIT license recorded in `LICENSES/DuckDB-MIT.txt`.
 
