@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/logical_write_target.hpp"
 #include "duckdb/common/index_vector.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 
@@ -57,6 +58,8 @@ public:
 	physical_index_vector_t<idx_t> column_index_map;
 	//! The expected types for the INSERT statement (obtained from the column types)
 	vector<LogicalType> expected_types;
+	//! Bound path and table-incarnation identity of the write target
+	LogicalWriteTarget write_target;
 	//! The base table to insert into
 	TableCatalogEntry &table;
 	idx_t table_index;
@@ -82,6 +85,6 @@ protected:
 	string GetName() const override;
 
 private:
-	LogicalInsert(ClientContext &context, const unique_ptr<CreateInfo> table_info);
+	LogicalInsert(ClientContext &context, const LogicalWriteTarget &write_target);
 };
 } // namespace duckdb

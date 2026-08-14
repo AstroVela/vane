@@ -24,6 +24,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/types/uuid.hpp"
 
 namespace duckdb {
 
@@ -81,6 +82,9 @@ DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Bou
                                shared_ptr<DataTable> inherited_storage)
     : TableCatalogEntry(catalog, schema, info.Base()), storage(std::move(inherited_storage)),
       column_dependency_manager(std::move(info.column_dependency_manager)) {
+	if (logical_write_target_identity.empty()) {
+		logical_write_target_identity = "duckdb-table:v1:" + UUID::ToString(UUID::GenerateRandomUUID());
+	}
 	if (storage) {
 		if (!info.indexes.empty()) {
 			storage->SetIndexStorageInfo(std::move(info.indexes));
@@ -326,6 +330,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 		throw CatalogException("Cannot rename rowid column");
 	}
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -400,6 +405,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddColumn(ClientContext &context, AddCo
 	}
 
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -709,6 +715,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveColumn(ClientContext &context, Re
 	}
 
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1037,6 +1044,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context
 
 	auto change_idx = GetColumnIndex(info.column_name);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1154,6 +1162,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetColumnComment(ClientContext &context
 unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKeyInfo &info) {
 	D_ASSERT(info.type == AlterForeignKeyType::AFT_ADD);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;
@@ -1179,6 +1188,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddForeignKeyConstraint(AlterForeignKey
 unique_ptr<CatalogEntry> DuckTableEntry::DropForeignKeyConstraint(ClientContext &context, AlterForeignKeyInfo &info) {
 	D_ASSERT(info.type == AlterForeignKeyType::AFT_DELETE);
 	auto create_info = make_uniq<CreateTableInfo>(schema, name);
+	create_info->logical_write_target_identity = logical_write_target_identity;
 	create_info->temporary = temporary;
 	create_info->comment = comment;
 	create_info->tags = tags;

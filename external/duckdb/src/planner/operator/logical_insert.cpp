@@ -2,7 +2,6 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
@@ -11,14 +10,13 @@ BoundOnConflictInfo::BoundOnConflictInfo() : action_type(OnConflictAction::THROW
 }
 
 LogicalInsert::LogicalInsert(TableCatalogEntry &table, idx_t table_index)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), table(table), table_index(table_index),
+    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), write_target(table), table(table), table_index(table_index),
       return_chunk(false) {
 }
 
-LogicalInsert::LogicalInsert(ClientContext &context, const unique_ptr<CreateInfo> table_info)
-    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT),
-      table(Catalog::GetEntry<TableCatalogEntry>(context, table_info->catalog, table_info->schema,
-                                                 table_info->Cast<CreateTableInfo>().table)) {
+LogicalInsert::LogicalInsert(ClientContext &context, const LogicalWriteTarget &write_target_p)
+    : LogicalOperator(LogicalOperatorType::LOGICAL_INSERT), write_target(write_target_p),
+      table(write_target_p.Resolve(context)) {
 	auto binder = Binder::CreateBinder(context);
 	bound_constraints = binder->BindConstraints(table);
 }

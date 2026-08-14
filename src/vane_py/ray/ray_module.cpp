@@ -957,6 +957,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        if (p.serialized_logical_plan_.empty()) {
 			        throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
 		        }
+		        (void)DecodeLogicalPlanEnvelope(p.serialized_logical_plan_);
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,
 		                              p.connection_snapshot_);
 	        },
@@ -969,6 +970,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        if (serialized_plan.empty()) {
 			        throw duckdb::InternalException("PyLogicalPlan deserialization failed: empty logical plan payload");
 		        }
+		        (void)DecodeLogicalPlanEnvelope(serialized_plan);
 		        PyLogicalPlan plan;
 		        plan.query_id_ = std::move(query_id);
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);

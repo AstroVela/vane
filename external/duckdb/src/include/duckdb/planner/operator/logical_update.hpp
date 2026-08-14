@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/logical_write_target.hpp"
 #include "duckdb/planner/bound_constraint.hpp"
 #include "duckdb/common/index_map.hpp"
 
@@ -24,6 +25,8 @@ public:
 public:
 	explicit LogicalUpdate(TableCatalogEntry &table);
 
+	//! Bound path and table-incarnation identity of the write target
+	LogicalWriteTarget write_target;
 	//! The base table to update
 	TableCatalogEntry &table;
 	//! projection index
@@ -50,6 +53,6 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalUpdate(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalUpdate(ClientContext &context, const LogicalWriteTarget &write_target);
 };
 } // namespace duckdb

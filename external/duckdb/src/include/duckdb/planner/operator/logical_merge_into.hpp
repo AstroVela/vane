@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/logical_write_target.hpp"
 #include "duckdb/common/enums/merge_action_type.hpp"
 #include "duckdb/common/index_vector.hpp"
 
@@ -43,6 +44,8 @@ public:
 public:
 	explicit LogicalMergeInto(TableCatalogEntry &table);
 
+	//! Bound path and table-incarnation identity of the write target
+	LogicalWriteTarget write_target;
 	//! The base table to merge into
 	TableCatalogEntry &table;
 	//! projection index
@@ -69,7 +72,7 @@ protected:
 	void ResolveTypes() override;
 
 private:
-	LogicalMergeInto(ClientContext &context, const unique_ptr<CreateInfo> &table_info);
+	LogicalMergeInto(ClientContext &context, const LogicalWriteTarget &write_target);
 };
 
 } // namespace duckdb

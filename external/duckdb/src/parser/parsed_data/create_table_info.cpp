@@ -19,6 +19,7 @@ CreateTableInfo::CreateTableInfo(SchemaCatalogEntry &schema, string name_p)
 unique_ptr<CreateInfo> CreateTableInfo::Copy() const {
 	auto result = make_uniq<CreateTableInfo>(catalog, schema, table);
 	CopyProperties(*result);
+	result->logical_write_target_identity = logical_write_target_identity;
 	result->columns = columns.Copy();
 	for (auto &constraint : constraints) {
 		result->constraints.push_back(constraint->Copy());

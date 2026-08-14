@@ -25,7 +25,8 @@ constexpr const char *TableCatalogEntry::Name;
 
 TableCatalogEntry::TableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
     : StandardEntry(CatalogType::TABLE_ENTRY, schema, catalog, info.table), columns(std::move(info.columns)),
-      constraints(std::move(info.constraints)) {
+      constraints(std::move(info.constraints)),
+      logical_write_target_identity(std::move(info.logical_write_target_identity)) {
 	this->temporary = info.temporary;
 	this->dependencies = info.dependencies;
 	this->comment = info.comment;
@@ -92,6 +93,7 @@ unique_ptr<CreateInfo> TableCatalogEntry::GetInfo() const {
 	result->catalog = catalog.GetName();
 	result->schema = schema.name;
 	result->table = name;
+	result->logical_write_target_identity = logical_write_target_identity;
 	result->columns = columns.Copy();
 	result->constraints.reserve(constraints.size());
 	result->dependencies = dependencies;
@@ -102,6 +104,10 @@ unique_ptr<CreateInfo> TableCatalogEntry::GetInfo() const {
 	result->comment = comment;
 	result->tags = tags;
 	return std::move(result);
+}
+
+string TableCatalogEntry::GetLogicalWriteTargetIdentity() const {
+	return logical_write_target_identity;
 }
 
 string TableCatalogEntry::ColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Constraint>> &constraints) {

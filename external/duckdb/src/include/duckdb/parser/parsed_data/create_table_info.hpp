@@ -23,6 +23,8 @@ struct CreateTableInfo : public CreateInfo {
 
 	//! Table name to insert to
 	string table;
+	//! Stable identity of this table incarnation, used by serialized logical writes
+	string logical_write_target_identity;
 	//! List of columns of the table
 	ColumnList columns;
 	//! List of constraints on the table

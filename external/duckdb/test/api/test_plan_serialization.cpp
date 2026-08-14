@@ -5,18 +5,27 @@
 // Modified by Vane contributors.
 
 #include "catch.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/serializer/binary_deserializer.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_local_exchange.hpp"
+#include "duckdb/planner/operator/logical_repartition.hpp"
+#include "duckdb/planner/logical_write_target.hpp"
 #include "test_helpers.hpp"
 #include "duckdb/parser/parser.hpp"
 
 #include <map>
 #include <set>
+#include <tuple>
 
 using namespace duckdb;
 using namespace std;
@@ -35,6 +44,65 @@ static const LogicalLocalExchange *FindLocalExchange(const LogicalOperator &op) 
 		}
 	}
 	return nullptr;
+}
+
+static const LogicalRepartition *FindRepartition(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_REPARTITION) {
+		return &op.Cast<LogicalRepartition>();
+	}
+	for (auto &child : op.children) {
+		if (!child) {
+			continue;
+		}
+		auto result = FindRepartition(*child);
+		if (result) {
+			return result;
+		}
+	}
+	return nullptr;
+}
+
+static string SerializeUnoptimizedPlan(Connection &con, const string &sql) {
+	string serialized_plan;
+	con.context->RunFunctionInTransaction([&]() {
+		Parser parser;
+		parser.ParseQuery(sql);
+		if (parser.statements.size() != 1) {
+			throw InternalException("Expected exactly one statement in serialization test");
+		}
+		Planner planner(*con.context);
+		planner.CreatePlan(std::move(parser.statements[0]));
+
+		MemoryStream stream(Allocator::Get(*con.context));
+		SerializationOptions options;
+		options.serialization_compatibility = SerializationCompatibility::Latest();
+		options.serialize_default_values = true;
+		BinarySerializer::Serialize(*planner.plan, stream, options);
+		serialized_plan.assign(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
+	});
+	return serialized_plan;
+}
+
+static duckdb::unique_ptr<LogicalOperator> DeserializePlan(Connection &con, const string &serialized_plan) {
+	duckdb::unique_ptr<LogicalOperator> result;
+	con.context->RunFunctionInTransaction([&]() {
+		MemoryStream stream(Allocator::Get(*con.context));
+		stream.WriteData(const_data_ptr_cast(serialized_plan.data()), serialized_plan.size());
+		stream.Rewind();
+		bound_parameter_map_t parameters;
+		result = BinaryDeserializer::Deserialize<LogicalOperator>(stream, *con.context, parameters);
+	});
+	return result;
+}
+
+static string GetTableWriteIdentity(Connection &con, const string &table_name,
+                                    const string &catalog_name = INVALID_CATALOG) {
+	string result;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(*con.context, catalog_name, DEFAULT_SCHEMA, table_name);
+		result = table.GetLogicalWriteTargetIdentity();
+	});
+	return result;
 }
 
 static void test_helper(string sql, duckdb::vector<string> fixtures = duckdb::vector<string>()) {
@@ -143,6 +211,200 @@ TEST_CASE("Test logical_delete", "[serialization]") {
 
 TEST_CASE("Test logical_update", "[serialization]") {
 	test_helper("UPDATE tbl SET foo=42", {"CREATE TABLE tbl (foo INTEGER)"});
+}
+
+TEST_CASE("Test logical_merge_into", "[serialization]") {
+	test_helper("MERGE INTO tbl USING (VALUES (1)) src(foo) USING (foo) WHEN MATCHED THEN UPDATE",
+	            {"CREATE TABLE tbl (foo INTEGER)"});
+}
+
+TEST_CASE("Serialized DML rejects a replacement at the same catalog path", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
+
+	for (auto &sql : duckdb::vector<string> {
+	         "INSERT INTO target VALUES (1)",
+	         "UPDATE target SET i = 2",
+	         "DELETE FROM target",
+	         "MERGE INTO target USING (VALUES (1)) src(i) USING (i) WHEN MATCHED THEN UPDATE",
+	     }) {
+		auto serialized_plan = SerializeUnoptimizedPlan(con, sql);
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE target"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
+		REQUIRE_THROWS_WITH(DeserializePlan(con, serialized_plan), Catch::Matchers::Contains("was replaced"));
+	}
+}
+
+TEST_CASE("Duck table write identity survives alter and persistence but not replacement", "[serialization][dml]") {
+	auto db_path = TestCreatePath("logical_write_target_identity.db");
+	string original_identity;
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
+		original_identity = GetTableWriteIdentity(con, "target");
+		REQUIRE(!original_identity.empty());
+
+		auto serialized_plan = SerializeUnoptimizedPlan(con, "UPDATE target SET i = 2");
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE target ADD COLUMN j INTEGER"));
+		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		REQUIRE(DeserializePlan(con, serialized_plan) != nullptr);
+		REQUIRE_NO_FAIL(con.Query("PRAGMA force_checkpoint"));
+	}
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		REQUIRE_NO_FAIL(con.Query("SET wal_autocheckpoint = '1TB'"));
+		REQUIRE_NO_FAIL(con.Query("PRAGMA disable_checkpoint_on_shutdown"));
+		REQUIRE_NO_FAIL(con.Query("ALTER TABLE target RENAME COLUMN j TO k"));
+		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+	}
+	{
+		DuckDB db(db_path);
+		Connection con(db);
+		REQUIRE(GetTableWriteIdentity(con, "target") == original_identity);
+		REQUIRE_NO_FAIL(con.Query("DROP TABLE target"));
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE target(i INTEGER)"));
+		REQUIRE(GetTableWriteIdentity(con, "target") != original_identity);
+	}
+}
+
+TEST_CASE("Copy database assigns a new table write identity", "[serialization][dml]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("ATTACH ':memory:' AS source"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH ':memory:' AS target"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE source.main.target(i INTEGER)"));
+
+	auto source_identity = GetTableWriteIdentity(con, "target", "source");
+	REQUIRE(!source_identity.empty());
+	REQUIRE_NO_FAIL(con.Query("COPY FROM DATABASE source TO target (SCHEMA)"));
+	auto copied_identity = GetTableWriteIdentity(con, "target", "target");
+	REQUIRE(!copied_identity.empty());
+	REQUIRE(copied_identity != source_identity);
+}
+
+TEST_CASE("Logical write targets require a non-empty identity", "[serialization][dml]") {
+	MemoryStream stream;
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty<string>(100, "catalog_name", "memory");
+	serializer.WriteProperty<string>(101, "schema_name", "main");
+	serializer.WriteProperty<string>(102, "table_name", "target");
+	serializer.WriteProperty<string>(103, "identity", "");
+	serializer.End();
+	stream.Rewind();
+
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	REQUIRE_THROWS_WITH(LogicalWriteTarget::Deserialize(deserializer),
+	                    Catch::Matchers::Contains("does not provide a logical write target identity"));
+}
+
+TEST_CASE("Logical repartition round-trips hash random and into-partitions modes", "[serialization][repartition]") {
+	DuckDB db;
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE integers(i INTEGER)"));
+
+	for (auto &test_case : duckdb::vector<std::tuple<idx_t, duckdb::vector<string>, RepartitionSpec::Type>> {
+	         {3, {"i"}, RepartitionSpec::Type::Hash},
+	         {0, {"i"}, RepartitionSpec::Type::Hash},
+	         {3, {}, RepartitionSpec::Type::Random},
+	         {0, {}, RepartitionSpec::Type::Random},
+	     }) {
+		auto num_partitions = std::get<0>(test_case);
+		auto partition_by = std::get<1>(test_case);
+		auto expected_type = std::get<2>(test_case);
+		auto relation = con.Table("integers")->Repartition(num_partitions, partition_by);
+		con.context->RunFunctionInTransaction([&]() {
+			auto binder = Binder::CreateBinder(*con.context);
+			auto bound = relation->Bind(*binder);
+			auto copied_plan = bound.plan->Copy(*con.context);
+			auto repartition = FindRepartition(*copied_plan);
+			REQUIRE(repartition != nullptr);
+			REQUIRE(repartition->repartition_spec->type() == expected_type);
+			if (expected_type == RepartitionSpec::Type::Hash) {
+				auto *hash_spec = dynamic_cast<HashRepartitionSpec *>(repartition->repartition_spec.get());
+				REQUIRE(hash_spec != nullptr);
+				REQUIRE(hash_spec->config()->num_partitions == num_partitions);
+				REQUIRE(hash_spec->config()->by.size() == 1);
+				REQUIRE(repartition->expressions.size() == 1);
+			} else {
+				auto *random_spec = dynamic_cast<RandomRepartitionSpec *>(repartition->repartition_spec.get());
+				REQUIRE(random_spec != nullptr);
+				REQUIRE(random_spec->config()->num_partitions == num_partitions);
+				REQUIRE(repartition->expressions.empty());
+			}
+			PhysicalPlanGenerator physical_planner(*con.context);
+			REQUIRE(physical_planner.Plan(std::move(copied_plan)) != nullptr);
+		});
+	}
+
+	auto relation = con.Table("integers");
+	con.context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*con.context);
+		auto bound = relation->Bind(*binder);
+		auto into = make_uniq<LogicalRepartition>(RepartitionSpec::create_into_partitions(5));
+		into->children.push_back(std::move(bound.plan));
+		auto copied_into = into->Copy(*con.context);
+		auto repartition = FindRepartition(*copied_into);
+		REQUIRE(repartition != nullptr);
+		REQUIRE(repartition->repartition_spec->type() == RepartitionSpec::Type::IntoPartitions);
+		auto *into_spec = dynamic_cast<IntoPartitionsRepartitionSpec *>(repartition->repartition_spec.get());
+		REQUIRE(into_spec != nullptr);
+		REQUIRE(into_spec->config()->num_partitions == 5);
+		REQUIRE(repartition->expressions.empty());
+		PhysicalPlanGenerator physical_planner(*con.context);
+		REQUIRE(physical_planner.Plan(std::move(copied_into)) != nullptr);
+	});
+}
+
+TEST_CASE("Logical repartition rejects unsupported and malformed wire states", "[serialization][repartition]") {
+	{
+		LogicalRepartition missing_spec(nullptr);
+		MemoryStream stream;
+		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(missing_spec, stream),
+		                    Catch::Matchers::Contains("missing its repartition specification"));
+	}
+	{
+		duckdb::vector<ExprRef> config_expressions;
+		config_expressions.push_back(std::make_shared<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+		LogicalRepartition inconsistent_hash(RepartitionSpec::create_hash(2, std::move(config_expressions)));
+		inconsistent_hash.expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 1));
+		MemoryStream stream;
+		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(inconsistent_hash, stream),
+		                    Catch::Matchers::Contains("inconsistent partition expressions"));
+	}
+	{
+		duckdb::vector<BoundOrderByNode> orders;
+		orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST,
+		                    make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
+		LogicalRepartition range(RepartitionSpec::create_range(2, std::move(orders), {}));
+		MemoryStream stream;
+		REQUIRE_THROWS_WITH(BinarySerializer::Serialize(range, stream),
+		                    Catch::Matchers::Contains("Range repartition cannot be serialized"));
+	}
+
+	auto deserialize_wire = [](uint8_t wire_type, uint64_t num_partitions) {
+		MemoryStream stream;
+		BinarySerializer serializer(stream);
+		serializer.Begin();
+		serializer.WriteProperty<uint8_t>(200, "repartition_type", wire_type);
+		serializer.WriteProperty<uint64_t>(201, "num_partitions", num_partitions);
+		serializer.WriteProperty<duckdb::vector<duckdb::unique_ptr<Expression>>>(202, "partition_by", {});
+		serializer.End();
+		stream.Rewind();
+		BinaryDeserializer deserializer(stream);
+		deserializer.Begin();
+		return LogicalRepartition::Deserialize(deserializer);
+	};
+
+	REQUIRE_THROWS_WITH(deserialize_wire(1, 3), Catch::Matchers::Contains("requires at least one"));
+	REQUIRE_THROWS_WITH(deserialize_wire(3, 0), Catch::Matchers::Contains("requires a positive partition count"));
+	REQUIRE_THROWS_WITH(deserialize_wire(4, 3), Catch::Matchers::Contains("Range repartition cannot be deserialized"));
+	REQUIRE_THROWS_WITH(deserialize_wire(99, 3), Catch::Matchers::Contains("unknown wire repartition type"));
 }
 
 // TODO(stephwang): revisit this later since it doesn't work yet

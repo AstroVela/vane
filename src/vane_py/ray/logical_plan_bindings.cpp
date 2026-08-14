@@ -5,6 +5,106 @@
 
 struct PyPhysicalPlanWrapper;
 
+static constexpr char LOGICAL_PLAN_ENVELOPE_MAGIC[] = {'V', 'A', 'N', 'E', 'P', 'L', 'A', 'N'};
+static constexpr idx_t LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE = sizeof(LOGICAL_PLAN_ENVELOPE_MAGIC);
+static constexpr uint32_t LOGICAL_PLAN_PROTOCOL_VERSION = 1;
+static constexpr uint32_t LOGICAL_PLAN_MAX_SOURCE_ID_SIZE = 4096;
+
+static void AppendUInt32LE(string &result, uint32_t value) {
+	for (idx_t byte_idx = 0; byte_idx < sizeof(value); byte_idx++) {
+		result.push_back(static_cast<char>((value >> (byte_idx * 8)) & 0xff));
+	}
+}
+
+static void AppendUInt64LE(string &result, uint64_t value) {
+	for (idx_t byte_idx = 0; byte_idx < sizeof(value); byte_idx++) {
+		result.push_back(static_cast<char>((value >> (byte_idx * 8)) & 0xff));
+	}
+}
+
+static uint32_t ReadUInt32LE(const string &envelope, idx_t &offset, const char *field_name) {
+	if (offset > envelope.size() || envelope.size() - offset < sizeof(uint32_t)) {
+		throw InvalidInputException("Logical plan envelope is truncated before %s", field_name);
+	}
+	uint32_t result = 0;
+	for (idx_t byte_idx = 0; byte_idx < sizeof(result); byte_idx++) {
+		result |= static_cast<uint32_t>(static_cast<uint8_t>(envelope[offset++])) << (byte_idx * 8);
+	}
+	return result;
+}
+
+static uint64_t ReadUInt64LE(const string &envelope, idx_t &offset, const char *field_name) {
+	if (offset > envelope.size() || envelope.size() - offset < sizeof(uint64_t)) {
+		throw InvalidInputException("Logical plan envelope is truncated before %s", field_name);
+	}
+	uint64_t result = 0;
+	for (idx_t byte_idx = 0; byte_idx < sizeof(result); byte_idx++) {
+		result |= static_cast<uint64_t>(static_cast<uint8_t>(envelope[offset++])) << (byte_idx * 8);
+	}
+	return result;
+}
+
+static string EncodeLogicalPlanEnvelope(const string &logical_payload) {
+	if (logical_payload.empty()) {
+		throw InternalException("Cannot encode an empty logical plan payload");
+	}
+	string source_id = DuckDB::SourceID();
+	if (source_id.empty() || source_id.size() > LOGICAL_PLAN_MAX_SOURCE_ID_SIZE) {
+		throw InternalException("DuckDB SourceID is empty or exceeds the logical plan envelope limit");
+	}
+
+	string envelope;
+	envelope.reserve(LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE + sizeof(uint32_t) * 2 + sizeof(uint64_t) + source_id.size() +
+	                 logical_payload.size());
+	envelope.append(LOGICAL_PLAN_ENVELOPE_MAGIC, LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE);
+	AppendUInt32LE(envelope, LOGICAL_PLAN_PROTOCOL_VERSION);
+	AppendUInt32LE(envelope, static_cast<uint32_t>(source_id.size()));
+	AppendUInt64LE(envelope, static_cast<uint64_t>(logical_payload.size()));
+	envelope.append(source_id);
+	envelope.append(logical_payload);
+	return envelope;
+}
+
+static string DecodeLogicalPlanEnvelope(const string &envelope) {
+	if (envelope.size() < LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE ||
+	    envelope.compare(0, LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE, LOGICAL_PLAN_ENVELOPE_MAGIC,
+	                     LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE) != 0) {
+		throw InvalidInputException("Logical plan payload is not a Vane logical plan envelope");
+	}
+
+	idx_t offset = LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE;
+	auto protocol_version = ReadUInt32LE(envelope, offset, "protocol version");
+	if (protocol_version != LOGICAL_PLAN_PROTOCOL_VERSION) {
+		throw InvalidInputException("Unsupported logical plan protocol version %u (expected %u)", protocol_version,
+		                            LOGICAL_PLAN_PROTOCOL_VERSION);
+	}
+	auto source_id_size = ReadUInt32LE(envelope, offset, "SourceID length");
+	auto payload_size = ReadUInt64LE(envelope, offset, "payload length");
+	if (source_id_size == 0 || source_id_size > LOGICAL_PLAN_MAX_SOURCE_ID_SIZE) {
+		throw InvalidInputException("Logical plan envelope contains an invalid SourceID length");
+	}
+	if (offset > envelope.size() || source_id_size > envelope.size() - offset) {
+		throw InvalidInputException("Logical plan envelope is truncated inside the SourceID");
+	}
+
+	auto serialized_source_id = envelope.substr(offset, source_id_size);
+	offset += source_id_size;
+	string current_source_id = DuckDB::SourceID();
+	if (current_source_id.empty() || serialized_source_id != current_source_id) {
+		throw InvalidInputException("Logical plan SourceID mismatch: payload was built by %s, current engine is %s",
+		                            serialized_source_id, current_source_id);
+	}
+	if (payload_size == 0) {
+		throw InvalidInputException("Logical plan envelope contains an empty payload");
+	}
+	auto remaining_size = envelope.size() - offset;
+	if (payload_size != static_cast<uint64_t>(remaining_size)) {
+		throw InvalidInputException("Logical plan envelope payload length mismatch: declared %llu bytes, found %llu",
+		                            payload_size, static_cast<uint64_t>(remaining_size));
+	}
+	return envelope.substr(offset, remaining_size);
+}
+
 struct PyLogicalPlan {
 	string query_id_;
 	string serialized_logical_plan_;
@@ -59,7 +159,8 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 		if (data_size == 0) {
 			throw duckdb::InternalException("Logical plan serialization returned empty payload");
 		}
-		serialized_plan = string(reinterpret_cast<const char *>(data_ptr), data_size);
+		auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
+		serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
 	});
 	return serialized_plan;
 }
