@@ -385,12 +385,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("timed out draining FTE result handles"));
 			}
-			if (PyGILState_Check()) {
-				py::gil_scoped_release gil_release;
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			} else {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			}
+			duckdb::SleepWithGILReleasedIfHeld(std::chrono::milliseconds(1));
 		}
 	}
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retained_handles;

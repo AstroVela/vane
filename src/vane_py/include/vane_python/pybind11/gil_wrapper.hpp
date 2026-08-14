@@ -8,6 +8,9 @@
 
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 
+#include <chrono>
+#include <thread>
+
 #if PY_VERSION_HEX < 0x030D0000 && !defined(Py_LIMITED_API)
 extern "C" int _Py_IsFinalizing(void);
 #endif
@@ -72,5 +75,29 @@ private:
 		return true;
 	}
 };
+
+//! Sleep for `duration`, temporarily releasing the GIL if — and only if — the
+//! current thread holds it.
+//!
+//! `PythonGILWrapper` / `PyGILState_Ensure` RESTORE (not release) a GIL the
+//! caller already owned, so a poll loop entered GIL-held would otherwise keep
+//! the GIL for the whole inter-poll sleep and starve the Python threads that
+//! must make progress for the poll to ever observe it. Releasing here keeps
+//! such waits self-contained regardless of the caller's incoming GIL state.
+//!
+//! When the interpreter is unavailable or finalizing, or the GIL is not held,
+//! this is a plain sleep that never touches GIL state. The guard is evaluated
+//! at entry only: if finalization begins while a released sleep is in flight,
+//! the release's destructor still re-acquires the GIL on wake — the same
+//! behavior as the inline guard this helper centralizes.
+template <typename Rep, typename Period>
+inline void SleepWithGILReleasedIfHeld(std::chrono::duration<Rep, Period> duration) {
+	if (Py_IsInitialized() && !PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		std::this_thread::sleep_for(duration);
+		return;
+	}
+	std::this_thread::sleep_for(duration);
+}
 
 } // namespace duckdb
