@@ -11,7 +11,6 @@ import types
 
 import pytest
 
-
 _RELATION_MUTATIONS = [
     ("insert_into", "INSERT INTO"),
     ("insert_values", "INSERT"),
