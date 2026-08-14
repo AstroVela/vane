@@ -1075,6 +1075,8 @@ bool JSONParser::Process(const string &value) {
 	state = JSONState::REGULAR;
 	char quote_char = '"';
 	bool can_parse_value = false;
+	bool in_unquoted_value = false;
+	success = true;
 	pos = 0;
 	for (; success && pos < value.size(); pos++) {
 		auto c = value[pos];
@@ -1103,10 +1105,12 @@ bool JSONParser::Process(const string &value) {
 			case ']': {
 				// closing bracket - move to next line and pop back the separator
 				if (separators.empty() || !SeparatorIsMatching(separators.back(), c)) {
-					throw InternalException("Failed to parse JSON string %s - invalid JSON", value);
+					success = false;
+					break;
 				}
 				separators.pop_back();
 				HandleBracketClose(c);
+				in_unquoted_value = false;
 				break;
 			}
 			case '"':
@@ -1118,6 +1122,7 @@ bool JSONParser::Process(const string &value) {
 			case ',':
 				// comma - move to next line
 				HandleComma(c);
+				in_unquoted_value = false;
 				break;
 			case ':':
 				HandleColon();
@@ -1133,11 +1138,16 @@ bool JSONParser::Process(const string &value) {
 				HandleCharacter(c);
 				break;
 			case ' ':
+				if (in_unquoted_value) {
+					HandleCharacter(c);
+				}
+				break;
 			case '\t':
 			case '\n':
 				// skip whitespace
 				break;
 			default:
+				in_unquoted_value = true;
 				HandleCharacter(c);
 				break;
 			}
@@ -1157,7 +1167,7 @@ bool JSONParser::Process(const string &value) {
 			state = JSONState::IN_QUOTE;
 			HandleCharacter(c);
 		} else {
-			throw InternalException("Invalid json state");
+			success = false;
 		}
 	}
 	if (!success) {
@@ -1522,6 +1532,20 @@ public:
 	explicit JSONHighlighter(BoxRenderValue &render_value) : render_value(render_value) {
 	}
 
+public:
+	bool Highlight(const string &value) {
+		const auto annotation_count = render_value.annotations.size();
+		if (JSONParser::Process(value)) {
+			return true;
+		}
+
+		while (render_value.annotations.size() > annotation_count) {
+			render_value.annotations.pop_back();
+		}
+
+		return false;
+	}
+
 protected:
 	void HandleNull() override {
 		render_value.annotations.emplace_back(ResultRenderType::NULL_VALUE, pos);
@@ -1568,7 +1592,7 @@ void BoxRendererImplementation::HighlightValue(BoxRenderValue &render_value) {
 		return;
 	}
 	JSONHighlighter highlighter(render_value);
-	highlighter.Process(render_value.text);
+	highlighter.Highlight(render_value.text);
 }
 
 void BoxRendererImplementation::PotentiallyExpandRow(BoxRenderRow &row, vector<BoxRenderRow> &rows,
@@ -1907,8 +1931,8 @@ void BoxRendererImplementation::ComputeRenderWidths(vector<RenderDataCollection>
 
 	// check if we shortened any columns that would be rendered and if we can expand them
 	// we only expand columns in the ".mode rows", and only if we haven't hidden any columns
-	if (shortened_columns && config.render_mode == RenderMode::ROWS && row_count + 5 < config.max_rows &&
-	    pruned_columns.empty()) {
+	if (shortened_columns && config.render_mode == RenderMode::ROWS && row_count > 0 &&
+	    row_count + 5 < config.max_rows && pruned_columns.empty()) {
 		max_rows_per_row = MaxValue<idx_t>(1, config.max_rows <= 5 ? 0 : (config.max_rows - 5) / row_count);
 		if (max_rows_per_row > 1) {
 			// we can expand rows - check if we should expand any rows

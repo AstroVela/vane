@@ -9,8 +9,10 @@ using namespace duckdb;
 
 TEST_CASE("Vane fork versions use the SourceID extension identity", "[api][version]") {
 	const string version = DuckDB::LibraryVersion();
+	const string expected_prefix =
+	    StringUtil::Format("v%d.%d.%d-vane.", DUCKDB_MAJOR_VERSION, DUCKDB_MINOR_VERSION, DUCKDB_PATCH_VERSION);
 
-	REQUIRE(StringUtil::StartsWith(version, "v1.5.0-vane."));
+	REQUIRE(StringUtil::StartsWith(version, expected_prefix));
 	REQUIRE(string(duckdb_library_version()) == version);
 	REQUIRE_FALSE(ExtensionHelper::IsRelease(version));
 	REQUIRE(ExtensionHelper::GetVersionDirectoryName() == DuckDB::SourceID());

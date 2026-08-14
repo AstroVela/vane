@@ -892,8 +892,8 @@ static py::dict BuildNativeProgressTopology(duckdb::ClientContext &context,
 		}
 	} plan_guard {prepared_data->physical_plan};
 
-	auto &collector = physical_plan->Make<PhysicalMaterializedCollector>(*prepared_data, true);
-	return build_topology(collector);
+	auto collector = make_uniq<PhysicalMaterializedCollector>(*physical_plan, *prepared_data, true);
+	return build_topology(*collector);
 }
 
 static void AppendDistributedCopyResultMetadata(pybind11::dict &out,
