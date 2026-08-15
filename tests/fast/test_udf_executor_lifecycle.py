@@ -939,6 +939,7 @@ def test_vllm_actor_wait_for_result_finishes_per_executor_before_global_finish()
     import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
+    executor.on_error = "raise"
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._finished_submitting = False

@@ -608,6 +608,13 @@ class LocalVLLMExecutor(VLLMExecutor):
 
         task.add_done_callback(discard)
 
+    def _raise_if_task_failed(self, executor_id: str | None = None) -> None:
+        if self.on_error != "raise":
+            return
+        error_message = self._per_executor_errors.get(executor_id) if executor_id else self.error_message
+        if error_message is not None:
+            raise RuntimeError(f"vllm task failed: {error_message}")
+
     @overload
     def take_ready_result(self, executor_id: None = None) -> tuple[list[str | None], pa.Table] | None: ...
 
@@ -617,10 +624,7 @@ class LocalVLLMExecutor(VLLMExecutor):
     ) -> tuple[list[str | None], pa.Table, list[tuple[str, int]]] | None: ...
 
     def take_ready_result(self, executor_id: str | None = None) -> tuple[Any, ...] | None:
-        if self.on_error == "raise":
-            error_message = self._per_executor_errors.get(executor_id) if executor_id else self.error_message
-            if error_message is not None:
-                raise RuntimeError(f"vllm task failed: {error_message}")
+        self._raise_if_task_failed(executor_id)
 
         source_deque = (
             self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
@@ -910,6 +914,7 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
             while True:
                 has_result, terminal = self._wait_for_result_state(executor_id)
                 if has_result or terminal:
+                    self._raise_if_task_failed(executor_id)
                     return has_result
                 state_changed.clear()
                 has_result, terminal = self._wait_for_result_state(executor_id)
