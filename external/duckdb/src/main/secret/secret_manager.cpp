@@ -517,15 +517,6 @@ void SecretManager::SetEnablePersistentSecrets(bool enabled) {
 	config.allow_persistent_secrets = enabled;
 }
 
-bool SecretManager::TrySetEnablePersistentSecrets(bool enabled) {
-	lock_guard<mutex> lck(manager_lock);
-	if (initialized) {
-		return false;
-	}
-	config.allow_persistent_secrets = enabled;
-	return true;
-}
-
 void SecretManager::ResetEnablePersistentSecrets() {
 	ThrowOnSettingChangeIfInitialized();
 	config.allow_persistent_secrets = SecretManagerConfig::DEFAULT_ALLOW_PERSISTENT_SECRETS;

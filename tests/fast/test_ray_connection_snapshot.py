@@ -611,6 +611,13 @@ def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_p
         resolved_connection = ray_cxx._resolve_query_snapshot_connection(bootstrap_connection, query_id)
 
         assert resolved_connection.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
+        identity_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            resolved_connection.sql("SELECT 1 AS value"),
+            f"{query_id}-identity",
+        )
+        identity_config = identity_plan.__getstate__()[3]["bootstrap"]["config"]
+        assert identity_config["allow_persistent_secrets"] is True
+        assert identity_config["secret_directory"] == str(tmp_path / "source-secrets")
         with pytest.raises(Exception, match="Persistent secrets are disabled"):
             resolved_connection.execute(
                 "CREATE PERSISTENT SECRET forbidden_worker_secret (TYPE HTTP, BEARER_TOKEN 'token')"
@@ -1289,9 +1296,8 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
 
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
-    direct_worker_cursor = vane.connect().cursor()
     direct_result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
-        direct_worker_cursor,
+        planning_conn,
         physical_plan,
         effective_session_config=effective_config,
     )
@@ -1299,8 +1305,8 @@ def test_explicit_connection_s3_settings_override_effective_session_config():
     assert direct_table.column(0).to_pylist() == ["explicit-key"]
     assert direct_table.column(1).to_pylist() == ["explicit-secret"]
     assert direct_table.column(2).to_pylist() == [""]
-    assert direct_worker_cursor.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
-    assert direct_worker_cursor.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
+    assert planning_conn.execute("SELECT current_setting('s3_access_key_id')").fetchone()[0] == "explicit-key"
+    assert planning_conn.execute("SELECT current_setting('s3_session_token')").fetchone()[0] == ""
 
     worker_cursor = vane.connect().cursor()
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(

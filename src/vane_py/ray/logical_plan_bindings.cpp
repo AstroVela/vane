@@ -203,29 +203,20 @@ static bool IsSecretPersistenceSetting(const string &lower_name) {
 	       lower_name == "secret_directory";
 }
 
-static py::dict SanitizeBootstrapConfig(const py::dict &config, bool in_memory_database) {
+static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets) {
 	py::dict sanitized;
-	// Preserve absent options so file-backed connections keep DuckDB's
-	// configuration identity; Vane's build defaults all three settings to OFF.
 	for (auto item : config) {
 		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
 		if (IsExtensionSecuritySetting(name)) {
 			sanitized[py::str(name)] = py::str("false");
 			continue;
 		}
-		if (IsSecretPersistenceSetting(name)) {
-			if (!in_memory_database) {
-				sanitized[item.first] = item.second;
-			}
+		if (disable_persistent_secrets && IsSecretPersistenceSetting(name)) {
 			continue;
 		}
 		sanitized[item.first] = item.second;
 	}
-	// Worker databases never inherit persistent-secret settings from an in-memory
-	// source. File databases retain the settings needed to identify the source
-	// bootstrap; worker execution separately disables persistent secrets and may
-	// force an isolated read-only instance.
-	if (in_memory_database) {
+	if (disable_persistent_secrets) {
 		sanitized[py::str("allow_persistent_secrets")] = py::str("false");
 	}
 	return sanitized;
@@ -421,12 +412,6 @@ static bool SnapshotHasAttachedDatabases(const py::object &snapshot_obj) {
 	return py::len(attached_obj) > 0;
 }
 
-static void DisablePersistentSecretsWhenUnused(DuckDBPyConnection &connection) {
-	auto &context = *connection.con.GetConnection().context;
-	auto &database = duckdb::DatabaseInstance::GetDatabase(context);
-	(void)SecretManager::Get(database).TrySetEnablePersistentSecrets(false);
-}
-
 static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
                                                         bool force_file_read_only = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
@@ -434,7 +419,6 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 		config[py::str("allow_persistent_secrets")] = py::str("false");
 		auto connection = use_instance_cache ? DuckDBPyConnection::Connect(py::str(":memory:"), false, config)
 		                                     : DuckDBPyConnection::ConnectUncached(py::str(":memory:"), false, config);
-		DisablePersistentSecretsWhenUnused(*connection);
 		return py::cast(std::move(connection));
 	}
 
@@ -447,25 +431,25 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 		source_read_only = bootstrap[py::str("read_only")].cast<bool>();
 	}
 
-	py::dict config = py::dict();
+	py::dict bootstrap_config = py::dict();
 	if (bootstrap.contains(py::str("config")) && !bootstrap[py::str("config")].is_none() &&
 	    py::isinstance<py::dict>(bootstrap[py::str("config")])) {
-		config = CopyPyDict(bootstrap[py::str("config")].cast<py::dict>());
+		bootstrap_config = CopyPyDict(bootstrap[py::str("config")].cast<py::dict>());
 	}
-	auto sanitized_config = SanitizeBootstrapConfig(config, in_memory_database);
+	const auto disable_persistent_secrets = !use_instance_cache || in_memory_database;
+	auto connection_config = SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets);
 	auto worker_file_read_only = force_file_read_only && !in_memory_database;
 	if (worker_file_read_only) {
-		sanitized_config = ForceReadOnlyAccessMode(sanitized_config);
+		connection_config = ForceReadOnlyAccessMode(connection_config);
 	}
 	auto connection_read_only = source_read_only || worker_file_read_only;
 	auto connection =
 	    use_instance_cache
-	        ? DuckDBPyConnection::Connect(py::str(database), connection_read_only, sanitized_config)
-	        : DuckDBPyConnection::ConnectUncached(py::str(database), connection_read_only, sanitized_config);
-	DisablePersistentSecretsWhenUnused(*connection);
+	        ? DuckDBPyConnection::Connect(py::str(database), connection_read_only, connection_config)
+	        : DuckDBPyConnection::ConnectUncached(py::str(database), connection_read_only, connection_config);
 	// Keep the source bootstrap identity for connection matching even though
-	// worker security and file access settings are forced off/read-only.
-	connection->SetConnectionBootstrapConfig(database, source_read_only, config);
+	// isolated-instance security and worker file access settings are forced.
+	connection->SetConnectionBootstrapConfig(database, source_read_only, bootstrap_config);
 	return py::cast(std::move(connection));
 }
 

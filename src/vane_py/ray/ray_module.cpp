@@ -78,7 +78,6 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/distributed_extension_manager.hpp>
 #include <duckdb/main/extension_helper.hpp>
-#include <duckdb/main/secret/secret_manager.hpp>
 #include <duckdb/parser/keyword_helper.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/common/types/value.hpp>
