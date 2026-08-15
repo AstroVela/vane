@@ -25,7 +25,7 @@ from vane.runners.ray.fte_fragment_scheduler import (
 if TYPE_CHECKING:
     from vane.runners.fte.fte_scheduler import FteQueryScheduler
 
-_WORKER_FAILURE_RECONCILIATION_LOCK = threading.Lock()
+_WORKER_FAILURE_RECONCILIATION_LOCK = threading.RLock()
 
 
 def _worker_failure_reconciliation_target(
@@ -52,20 +52,33 @@ class _FteWorkerFailureReconciliationResult:
 
 
 class _FteWorkerFailureReconciliationState:
-    """Share local failure fences across one global reconciliation."""
+    """Serialize a dynamically growing worker-failure reconciliation."""
 
-    def __init__(self, failure_key: tuple[str, str, str]) -> None:
+    def __init__(
+        self,
+        failure_key: tuple[str, str, str],
+        *,
+        target: Any | None,
+    ) -> None:
         self.failure_key = failure_key
+        self.target = target
         self.completion: Future[None] = Future()
-        self._lock = threading.Lock()
         self._schedulers: dict[int, FteQueryScheduler] = {}
+        self._pending_schedulers: dict[int, FteQueryScheduler] = {}
+        self._initial_reconciliation_pending = True
+        self._runner_active = False
+        self._pending_publications = 0
+        self._error: BaseException | None = None
+        self._closed = False
 
     def fence_scheduler(self, scheduler: FteQueryScheduler) -> bool:
-        """Record and claim a scheduler fence atomically for this reconciliation."""
+        """Fence a scheduler and enqueue it for reconciliation exactly once."""
 
         scheduler_identity = id(scheduler)
         _manager_instance_id, worker_id, worker_incarnation_id = self.failure_key
-        with self._lock:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed:
+                return False
             if scheduler_identity in self._schedulers:
                 return True
             if not scheduler.record_worker_failure(
@@ -74,11 +87,131 @@ class _FteWorkerFailureReconciliationState:
             ):
                 return False
             self._schedulers[scheduler_identity] = scheduler
+            self._pending_schedulers[scheduler_identity] = scheduler
             return True
 
     def schedulers(self) -> tuple[FteQueryScheduler, ...]:
-        with self._lock:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
             return tuple(self._schedulers.values())
+
+    def try_claim_runner(self) -> bool:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed or self._error is not None or self._runner_active:
+                return False
+            if not self._initial_reconciliation_pending and not self._pending_schedulers:
+                return False
+            self._runner_active = True
+            return True
+
+    def take_reconciliation_batch(self) -> tuple[bool, tuple[FteQueryScheduler, ...]] | None:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed or not self._runner_active:
+                return None
+            if self._error is not None:
+                raise self._error
+            initial_reconciliation = self._initial_reconciliation_pending
+            self._initial_reconciliation_pending = False
+            schedulers = tuple(self._pending_schedulers.values())
+            self._pending_schedulers.clear()
+            if not initial_reconciliation and not schedulers:
+                return None
+            return initial_reconciliation, schedulers
+
+    def add_publication(
+        self,
+        pending_drain: Future[None],
+        schedulers: tuple[FteQueryScheduler, ...],
+    ) -> None:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed or self._error is not None:
+                return
+            self._pending_publications += 1
+
+        publication_lock = threading.Lock()
+        publication_finished = False
+
+        def finish_publication(error: BaseException | None) -> None:
+            nonlocal publication_finished
+            with publication_lock:
+                if publication_finished:
+                    return
+                publication_finished = True
+            self._finish_publication(error)
+
+        def pending_drain_completed(completion: Future[None]) -> None:
+            try:
+                completion.result()
+                drain_completions = [scheduler.enqueue_drain_barrier() for scheduler in schedulers]
+            except BaseException as exc:
+                finish_publication(exc)
+                return
+            if not drain_completions:
+                finish_publication(None)
+                return
+
+            barrier_lock = threading.Lock()
+            remaining = len(drain_completions)
+            first_error: BaseException | None = None
+
+            def drain_completed(drain_completion: Future[None]) -> None:
+                nonlocal remaining, first_error
+                try:
+                    drain_completion.result()
+                except BaseException as exc:
+                    error: BaseException | None = exc
+                else:
+                    error = None
+                with barrier_lock:
+                    if first_error is None and error is not None:
+                        first_error = error
+                    remaining -= 1
+                    all_completed = remaining == 0
+                if all_completed:
+                    finish_publication(first_error)
+
+            for drain_completion in drain_completions:
+                drain_completion.add_done_callback(drain_completed)
+
+        pending_drain.add_done_callback(pending_drain_completed)
+
+    def _finish_publication(self, error: BaseException | None) -> None:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed:
+                return
+            self._pending_publications -= 1
+            if self._error is None and error is not None:
+                self._error = error
+            publication = _close_reconciliation_if_ready_locked(self)
+            if publication is not None:
+                _publish_reconciliation_completion(*publication)
+
+    def release_runner(self) -> bool:
+        """Keep the runner when work arrived, otherwise make completion eligible."""
+
+        publication: _ReconciliationPublication | None
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed:
+                return False
+            if self._error is not None:
+                self._runner_active = False
+                publication = _close_reconciliation_locked(self, self._error)
+            elif self._initial_reconciliation_pending or self._pending_schedulers:
+                return True
+            else:
+                self._runner_active = False
+                publication = _close_reconciliation_if_ready_locked(self)
+            if publication is not None:
+                _publish_reconciliation_completion(*publication)
+        return False
+
+    def fail(self, error: BaseException) -> None:
+        with _WORKER_FAILURE_RECONCILIATION_LOCK:
+            if self._closed:
+                return
+            if self._error is None:
+                self._error = error
+            publication = _close_reconciliation_locked(self, self._error)
+            _publish_reconciliation_completion(*publication)
 
 
 _WORKER_FAILURE_RECONCILIATIONS: dict[
@@ -87,137 +220,146 @@ _WORKER_FAILURE_RECONCILIATIONS: dict[
 ] = {}
 
 
+_ReconciliationPublication = tuple[
+    _FteWorkerFailureReconciliationState,
+    BaseException | None,
+    tuple["FteQueryScheduler", ...],
+]
+
+
+def _close_reconciliation_locked(
+    state: _FteWorkerFailureReconciliationState,
+    error: BaseException | None,
+) -> _ReconciliationPublication:
+    state._closed = True
+    state._runner_active = False
+    state._pending_schedulers.clear()
+    if _WORKER_FAILURE_RECONCILIATIONS.get(state.failure_key) is state:
+        _WORKER_FAILURE_RECONCILIATIONS.pop(state.failure_key, None)
+    return state, error, tuple(state._schedulers.values())
+
+
+def _close_reconciliation_if_ready_locked(
+    state: _FteWorkerFailureReconciliationState,
+) -> _ReconciliationPublication | None:
+    if state._closed or state._runner_active:
+        return None
+    if state._error is not None:
+        return _close_reconciliation_locked(state, state._error)
+    if state._initial_reconciliation_pending or state._pending_schedulers or state._pending_publications:
+        return None
+    return _close_reconciliation_locked(state, None)
+
+
+def _publish_reconciliation_completion(
+    state: _FteWorkerFailureReconciliationState,
+    error: BaseException | None,
+    schedulers: tuple[FteQueryScheduler, ...],
+) -> None:
+    # Closing, publishing, and removing the state share the global lock.  An
+    # observer therefore joins either this state before its linearization
+    # point or a successor after completion, never an unpublished gap.
+    if error is not None:
+        scheduler_errors: list[Exception] = []
+        for scheduler in schedulers:
+            try:
+                scheduler.fail(f"FTE worker failure handling failed: {error}")
+            except Exception as scheduler_error:
+                # The scheduler state transition precedes its callbacks;
+                # completion must still unblock every failure observer.
+                scheduler_errors.append(scheduler_error)
+        if scheduler_errors:
+            original_error = error
+            error = RuntimeError(f"{error}; scheduler failure callback also failed: {scheduler_errors[0]}")
+            error.__cause__ = original_error
+    try:
+        if state.target is not None:
+            state.target._complete_fte_worker_failure_reconciliation(error)
+    except BaseException as exc:
+        if error is None:
+            error = exc
+            for scheduler in schedulers:
+                try:
+                    scheduler.fail(f"FTE worker failure completion publication failed: {exc}")
+                except Exception:
+                    pass
+        else:
+            original_error = error
+            error = RuntimeError(f"{error}; worker failure completion publication also failed: {exc}")
+            error.__cause__ = original_error
+    if error is None:
+        state.completion.set_result(None)
+    else:
+        state.completion.set_exception(error)
+
+
 class _FteWorkerFailureReconciliation:
-    """Own one worker-incarnation failure through final side-effect publication."""
+    """Run one serialized slice of a shared worker-incarnation failure."""
 
     def __init__(
         self,
         event: Any,
         *,
         state: _FteWorkerFailureReconciliationState,
-        target: Any | None,
-        owns_reconciliation: bool,
+        owns_runner: bool,
     ) -> None:
         self.event = event
         self.state = state
         self.failure_key = state.failure_key
         self.completion = state.completion
-        self.target = target
-        self.owns_reconciliation = owns_reconciliation
-        self._completion_lock = threading.Lock()
-        self._completed = False
-
-    def _registered_schedulers(
-        self,
-        schedulers: tuple[FteQueryScheduler, ...] = (),
-    ) -> tuple[FteQueryScheduler, ...]:
-        registered = (*schedulers, *self.state.schedulers())
-        return tuple({id(scheduler): scheduler for scheduler in registered}.values())
-
-    def complete(
-        self,
-        error: BaseException | None,
-        *,
-        schedulers: tuple[FteQueryScheduler, ...] = (),
-    ) -> None:
-        if not self.owns_reconciliation:
-            raise RuntimeError("only the reconciliation owner can publish completion")
-        with self._completion_lock:
-            if self._completed:
-                return
-            self._completed = True
-        schedulers = self._registered_schedulers(schedulers)
-        if error is not None:
-            scheduler_errors: list[Exception] = []
-            for scheduler in schedulers:
-                try:
-                    scheduler.fail(f"FTE worker failure handling failed: {error}")
-                except Exception as scheduler_error:
-                    # The scheduler state transition precedes its callbacks;
-                    # completion must still unblock every failure observer.
-                    scheduler_errors.append(scheduler_error)
-            if scheduler_errors:
-                original_error = error
-                error = RuntimeError(f"{error}; scheduler failure callback also failed: {scheduler_errors[0]}")
-                error.__cause__ = original_error
-        try:
-            if self.target is not None:
-                self.target._complete_fte_worker_failure_reconciliation(error)
-            if error is None:
-                self.completion.set_result(None)
-            else:
-                self.completion.set_exception(error)
-        finally:
-            with _WORKER_FAILURE_RECONCILIATION_LOCK:
-                if _WORKER_FAILURE_RECONCILIATIONS.get(self.failure_key) is self.state:
-                    _WORKER_FAILURE_RECONCILIATIONS.pop(self.failure_key, None)
-
-    def _complete_after_futures(
-        self,
-        futures: list[Future[None]],
-        *,
-        schedulers: tuple[FteQueryScheduler, ...],
-    ) -> None:
-        if not futures:
-            self.complete(None)
-            return
-        lock = threading.Lock()
-        remaining = len(futures)
-        first_error: BaseException | None = None
-
-        def completed(future: Future[None]) -> None:
-            nonlocal remaining, first_error
-            error: BaseException | None
-            try:
-                future.result()
-            except BaseException as exc:
-                error = exc
-            else:
-                error = None
-            should_complete = False
-            with lock:
-                if first_error is None and error is not None:
-                    first_error = error
-                remaining -= 1
-                should_complete = remaining == 0
-            if should_complete:
-                self.complete(first_error, schedulers=schedulers)
-
-        for future in futures:
-            future.add_done_callback(completed)
+        self.owns_runner = owns_runner
 
     def complete_after_pending_drain(
         self,
         schedulers: tuple[FteQueryScheduler, ...],
         pending_drain: Future[None],
     ) -> None:
-        if not self.owns_reconciliation:
-            raise RuntimeError("only the reconciliation owner can publish completion")
+        if not self.owns_runner:
+            raise RuntimeError("only the active reconciliation runner can publish progress")
+        unique_schedulers = tuple({id(scheduler): scheduler for scheduler in schedulers}.values())
+        self.state.add_publication(pending_drain, unique_schedulers)
 
-        def pending_drain_completed(completion: Future[None]) -> None:
-            unique_schedulers = self._registered_schedulers(schedulers)
-            try:
-                completion.result()
-                drain_completions = [scheduler.enqueue_drain_barrier() for scheduler in unique_schedulers]
-            except BaseException as exc:
-                self.complete(exc, schedulers=unique_schedulers)
-                return
-            self._complete_after_futures(
-                drain_completions,
-                schedulers=unique_schedulers,
-            )
-
-        pending_drain.add_done_callback(pending_drain_completed)
-
-    def reconcile(self) -> _FteWorkerFailureReconciliationResult:
+    def reconcile(self) -> _FteWorkerFailureReconciliationResult | None:
+        if not self.owns_runner:
+            raise RuntimeError("only the active reconciliation runner can reconcile")
         manager_instance_id, _worker_id, worker_incarnation_id = self.failure_key
+        quarantine_fte_worker(
+            self.event.worker_id,
+            manager_instance_id=manager_instance_id,
+            worker_incarnation_id=worker_incarnation_id,
+        )
+        affected_query_ids = _query_ids_owned_by_fte_workers(
+            {str(self.event.worker_id)},
+            {str(self.event.worker_id): worker_incarnation_id},
+        )
+        affected_query_ids.add(str(self.event.query_id))
+        for query_id in sorted(affected_query_ids):
+            with _FTE_REGISTRY_LOCK:
+                if query_id in _FTE_CLOSING_QUERIES:
+                    continue
+                scheduler = _FTE_SCHEDULERS.get(query_id)
+            if scheduler is None or not scheduler.is_owned_by_manager_instance(manager_instance_id):
+                continue
+            self.state.fence_scheduler(scheduler)
+        reconciliation_batch = self.state.take_reconciliation_batch()
+        if reconciliation_batch is None:
+            return None
         return _reconcile_fte_worker_failure(
             self.event,
             manager_instance_id=manager_instance_id,
             worker_incarnation_id=worker_incarnation_id,
-            event_query_id=str(self.event.query_id),
-            reconciliation_state=self.state,
+            reconciliation_batch=reconciliation_batch,
         )
+
+    def release_runner(self) -> bool:
+        if not self.owns_runner:
+            raise RuntimeError("only the active reconciliation runner can release ownership")
+        return self.state.release_runner()
+
+    def fail(self, error: BaseException) -> None:
+        if not self.owns_runner:
+            raise RuntimeError("only the active reconciliation runner can fail reconciliation")
+        self.state.fail(error)
 
 
 def begin_fte_worker_failure_reconciliation(event: Any) -> _FteWorkerFailureReconciliation | None:
@@ -240,19 +382,18 @@ def begin_fte_worker_failure_reconciliation(event: Any) -> _FteWorkerFailureReco
     failure_key = (manager_instance_id, worker_id, worker_incarnation_id)
     with _WORKER_FAILURE_RECONCILIATION_LOCK:
         state = _WORKER_FAILURE_RECONCILIATIONS.get(failure_key)
-        owns_reconciliation = state is None
         if state is None:
-            state = _FteWorkerFailureReconciliationState(failure_key)
+            state = _FteWorkerFailureReconciliationState(failure_key, target=target)
             _WORKER_FAILURE_RECONCILIATIONS[failure_key] = state
         if event_scheduler is not None:
             # The local fence must be visible before a duplicate scheduler is
             # allowed to process a causally following CANCELED/ABORTED event.
             state.fence_scheduler(event_scheduler)
+        owns_runner = state.try_claim_runner()
         return _FteWorkerFailureReconciliation(
             event,
             state=state,
-            target=target if owns_reconciliation else None,
-            owns_reconciliation=owns_reconciliation,
+            owns_runner=owns_runner,
         )
 
 
@@ -322,34 +463,16 @@ def _reconcile_fte_worker_failure(
     *,
     manager_instance_id: str,
     worker_incarnation_id: str,
-    event_query_id: str,
-    reconciliation_state: _FteWorkerFailureReconciliationState,
+    reconciliation_batch: tuple[bool, tuple[FteQueryScheduler, ...]],
 ) -> _FteWorkerFailureReconciliationResult:
     failure = _worker_failure_payload(
         event.worker_id,
         event.error,
         worker_incarnation_id=worker_incarnation_id,
     )
-    quarantine_fte_worker(
-        event.worker_id,
-        manager_instance_id=manager_instance_id,
-        worker_incarnation_id=worker_incarnation_id,
-    )
-    affected_query_ids = _query_ids_owned_by_fte_workers(
-        {str(event.worker_id)},
-        {str(event.worker_id): worker_incarnation_id},
-    )
-    affected_query_ids.add(event_query_id)
-    for query_id in sorted(affected_query_ids):
-        with _FTE_REGISTRY_LOCK:
-            if query_id in _FTE_CLOSING_QUERIES:
-                continue
-            scheduler = _FTE_SCHEDULERS.get(query_id)
-        if scheduler is None or not scheduler.is_owned_by_manager_instance(manager_instance_id):
-            continue
-        reconciliation_state.fence_scheduler(scheduler)
+    initial_reconciliation, registered_schedulers = reconciliation_batch
     reconciliation_schedulers: dict[str, FteQueryScheduler] = {}
-    for registered_scheduler in reconciliation_state.schedulers():
+    for registered_scheduler in registered_schedulers:
         query_id = str(registered_scheduler.query_id)
         with _FTE_REGISTRY_LOCK:
             current_scheduler = _FTE_SCHEDULERS.get(query_id)
@@ -362,20 +485,23 @@ def _reconcile_fte_worker_failure(
         if current_scheduler.is_owned_by_manager_instance(manager_instance_id):
             reconciliation_schedulers[query_id] = current_scheduler
     reconciliation_query_ids = set(reconciliation_schedulers)
-    scheduled_by_fragment = _mark_fte_worker_failed(
-        event.worker_id,
-        failure,
-        query_id_filters=reconciliation_query_ids,
-        manager_instance_id=manager_instance_id,
-        worker_incarnation_id=worker_incarnation_id,
-        primary_worker_process_terminated=_worker_actor_death_confirms_quiescence(event.error),
-        reconcile_query=bool(reconciliation_query_ids),
-    )
+    if initial_reconciliation or reconciliation_query_ids:
+        scheduled_by_fragment = _mark_fte_worker_failed(
+            event.worker_id,
+            failure,
+            query_id_filters=reconciliation_query_ids,
+            manager_instance_id=manager_instance_id,
+            worker_incarnation_id=worker_incarnation_id,
+            primary_worker_process_terminated=_worker_actor_death_confirms_quiescence(event.error),
+            reconcile_query=bool(reconciliation_query_ids),
+        )
+    else:
+        scheduled_by_fragment = []
     for query_id, scheduler in reconciliation_schedulers.items():
         delay_s = _fte_retry_remaining_delay_s(query_id)
         if delay_s > 0:
             scheduler.arm_retry_delay(delay_s)
     return _FteWorkerFailureReconciliationResult(
         scheduled_by_fragment=tuple(scheduled_by_fragment),
-        schedulers=reconciliation_state.schedulers(),
+        schedulers=tuple(reconciliation_schedulers.values()),
     )

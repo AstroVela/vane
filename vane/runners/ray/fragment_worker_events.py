@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     from vane.runners.fte.fte_events import ExchangeSelectorUpdated, TaskStatusChanged, WorkerReservationCompleted
+    from vane.runners.fte.fte_scheduler import FteQueryScheduler
 
 
 class FteWorkerEventHandlingMixin:
@@ -107,27 +108,34 @@ class FteWorkerEventHandlingMixin:
         reconciliation = begin_fte_worker_failure_reconciliation(event)
         if reconciliation is None:
             return [], None
-        if not reconciliation.owns_reconciliation:
+        if not reconciliation.owns_runner:
             return [], reconciliation.completion
         handles: list[Any] = []
-        result = None
-        pending_drain_completion = None
         try:
-            try:
-                result = reconciliation.reconcile()
-                scheduled_by_fragment = result.scheduled_by_fragment
-                if scheduled_by_fragment:
-                    handles.extend(self._handles_for_marked_fte_worker_failed(list(scheduled_by_fragment)))
-            finally:
-                drain_handles, pending_drain_completion = request_fte_pending_task_drain_with_completion()
-                handles.extend(drain_handles)
+            while True:
+                reconciled_schedulers: list[FteQueryScheduler] = []
+                try:
+                    while True:
+                        result = reconciliation.reconcile()
+                        if result is None:
+                            break
+                        reconciled_schedulers.extend(result.schedulers)
+                        if result.scheduled_by_fragment:
+                            handles.extend(
+                                self._handles_for_marked_fte_worker_failed(list(result.scheduled_by_fragment))
+                            )
+                finally:
+                    drain_handles, pending_drain_completion = request_fte_pending_task_drain_with_completion()
+                    handles.extend(drain_handles)
+                reconciliation.complete_after_pending_drain(
+                    tuple(reconciled_schedulers),
+                    pending_drain_completion,
+                )
+                if not reconciliation.release_runner():
+                    break
         except BaseException as exc:
-            schedulers = () if result is None else result.schedulers
-            reconciliation.complete(exc, schedulers=schedulers)
+            reconciliation.fail(exc)
             raise
-        assert result is not None
-        assert pending_drain_completion is not None
-        reconciliation.complete_after_pending_drain(result.schedulers, pending_drain_completion)
         return handles, reconciliation.completion
 
     def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:

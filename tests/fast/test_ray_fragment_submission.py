@@ -6701,13 +6701,15 @@ def test_duplicate_fte_worker_failure_scheduler_observer_fences_without_blocking
     )
     reconciliation_started = threading.Event()
     release_reconciliation = threading.Event()
-    reconciliation_calls = []
+    reconciled_scheduler_batches = []
 
-    def reconcile_worker_failure(reported_event, **_kwargs):
-        reconciliation_calls.append(reported_event)
-        reconciliation_started.set()
-        assert release_reconciliation.wait(timeout=2.0)
-        return worker_failures_mod._FteWorkerFailureReconciliationResult((), schedulers)
+    def reconcile_worker_failure(_reported_event, *, reconciliation_batch, **_kwargs):
+        _initial_reconciliation, reconciled_schedulers = reconciliation_batch
+        reconciled_scheduler_batches.append(reconciled_schedulers)
+        if len(reconciled_scheduler_batches) == 1:
+            reconciliation_started.set()
+            assert release_reconciliation.wait(timeout=2.0)
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), reconciled_schedulers)
 
     monkeypatch.setattr(
         worker_failures_mod,
@@ -6733,7 +6735,7 @@ def test_duplicate_fte_worker_failure_scheduler_observer_fences_without_blocking
             release_reconciliation.set()
         assert owner.result(timeout=1.0) == []
 
-    assert reconciliation_calls == [events[0]]
+    assert reconciled_scheduler_batches == [(schedulers[0],), (schedulers[1],)]
     failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
 
 
@@ -6762,8 +6764,8 @@ def test_duplicate_fte_worker_failure_fences_join_owner_reconciliation(monkeypat
     )
     owner = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[0])
     duplicate = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[1])
-    assert owner is not None and owner.owns_reconciliation
-    assert duplicate is not None and not duplicate.owns_reconciliation
+    assert owner is not None and owner.owns_runner
+    assert duplicate is not None and not duplicate.owns_runner
     reconciled_query_ids = set()
 
     monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
@@ -6776,11 +6778,150 @@ def test_duplicate_fte_worker_failure_fences_join_owner_reconciliation(monkeypat
     monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
 
     result = owner.reconcile()
-    owner.complete(None, schedulers=result.schedulers)
+    assert result is not None
+    pending_drain = Future()
+    pending_drain.set_result(None)
+    owner.complete_after_pending_drain(result.schedulers, pending_drain)
+    assert owner.reconcile() is None
+    assert owner.release_runner() is False
 
     assert reconciled_query_ids == {scheduler.query_id for scheduler in schedulers}
     assert {scheduler.query_id for scheduler in result.schedulers} == reconciled_query_ids
     assert duplicate.completion.result(timeout=1.0) is None
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_duplicate_fte_worker_failure_reconciles_scheduler_joining_during_publication(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:late-duplicate-reconciliation",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-late-duplicate-reconciliation-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    reconciled_query_id_batches = []
+    pending_drains = []
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        reconciled_query_id_batches.append(set(query_id_filters))
+        return []
+
+    def request_pending_drain():
+        completion = Future()
+        pending_drains.append(completion)
+        return [], completion
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        request_pending_drain,
+    )
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[0]) == []
+    assert reconciled_query_id_batches == [{schedulers[0].query_id}]
+    assert len(pending_drains) == 1
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[1]) == []
+    assert reconciled_query_id_batches == [
+        {schedulers[0].query_id},
+        {schedulers[1].query_id},
+    ]
+    assert len(pending_drains) == 2
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    for pending_drain in pending_drains:
+        pending_drain.set_result(None)
+
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
+
+
+def test_fte_worker_failure_publication_error_waits_for_active_late_runner(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:late-runner-publication-error",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-late-runner-publication-error-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    late_reconciliation_started = threading.Event()
+    release_late_reconciliation = threading.Event()
+    pending_drains = []
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        if query_id_filters == {schedulers[1].query_id}:
+            late_reconciliation_started.set()
+            assert release_late_reconciliation.wait(timeout=2.0)
+        return []
+
+    def request_pending_drain():
+        completion = Future()
+        pending_drains.append(completion)
+        return [], completion
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        request_pending_drain,
+    )
+
+    assert failed._handles_for_worker_failed_scheduler_event(events[0]) == []
+    assert len(pending_drains) == 1
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        late_runner = executor.submit(failed._handles_for_worker_failed_scheduler_event, events[1])
+        assert late_reconciliation_started.wait(timeout=1.0)
+        pending_drains[0].set_exception(RuntimeError("planned asynchronous publication failure"))
+        try:
+            assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+            assert not late_runner.done()
+        finally:
+            release_late_reconciliation.set()
+        with pytest.raises(RuntimeError, match="planned asynchronous publication failure"):
+            late_runner.result(timeout=1.0)
+
+    assert {scheduler.stats().state for scheduler in schedulers} == {"FAILED"}
+    with pytest.raises(RuntimeError, match="planned asynchronous publication failure"):
+        failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
     assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
 
 
@@ -6865,6 +7006,11 @@ def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(mo
         worker_failures_mod,
         "_reconcile_fte_worker_failure",
         lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), schedulers),
+    )
+    monkeypatch.setattr(
+        worker_failures_mod,
+        "_query_ids_owned_by_fte_workers",
+        lambda *_args, **_kwargs: {scheduler.query_id for scheduler in schedulers},
     )
 
     def fail_pending_drain():
