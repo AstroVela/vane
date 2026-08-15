@@ -296,20 +296,26 @@ Avro, protobuf, or other binary commit metadata inside the opaque payload while
 keeping Vane independent of that schema.
 
 Callback mode has no engine-owned publication marker because Vane cannot
-interpret the extension's catalog state. A retry therefore presents the same
-stable operation ID to the provider. `ValidateDistributedWrite` must reconcile
-any durable state from an earlier attempt, and `FinalizeDistributedWrite` must
-be idempotent for that operation, including when an earlier catalog commit
-succeeded but its response was lost. The explicit retry surface is
+interpret the extension's catalog state. Vane therefore does not implement
+engine-level exactly-once commit, ask validation to determine whether an older
+attempt committed, or short-circuit worker execution as already committed.
+`ValidateDistributedWrite` performs read-only precondition checks. A retry may
+execute the source and worker sink again with the same stable operation ID.
+FTE task-attempt IDs distinguish speculative attempts within one execution but
+may repeat after a complete same-operation resubmission; they are not durable
+artifact names. `FinalizeDistributedWrite` must use the extension's own catalog
+transaction and idempotency mechanism to commit the selected attempt or
+recognize its existing commit without changing catalog state. Retry artifacts
+must use extension-generated, non-overwriting identities so they cannot replace
+objects referenced by the existing commit. The explicit retry surface is
 `relation.insert_into(..., operation_id=<previous-id>)`, which forwards to
 `Runner.run_write(..., operation_id=<previous-id>)`. Callback outcome-unknown
-errors permit only that same-ID reconciliation; the Ray driver rejects a
-different logical plan with the same ID while allowing refreshed connection
-credentials to reconcile the same write intent. File-artifact outcome-unknown
-errors remain non-retryable through this surface because their engine-owned
-fence must be resolved first. Once a callback outcome becomes unknown, a failed
-reconciliation attempt that does not establish a definitive commit result
-retains the same-ID reconciliation requirement.
+errors permit only a same-ID retry; the Ray driver rejects a different logical
+plan with the same ID while allowing refreshed connection credentials for the
+same write intent. File-artifact outcome-unknown errors remain non-retryable
+through this surface because their engine-owned fence must be resolved first.
+Once a callback outcome becomes unknown, a failed retry retains the same-ID
+requirement.
 
 ### Coordinator finalization
 
@@ -340,8 +346,9 @@ refreshable credential values are excluded.
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
 created worker or file output, Vane supplies the stable operation ID and invokes
 abort once for known pre-commit failures, including cases where no result
-envelope was returned. The provider must therefore be able to locate
-operation-owned artifacts from coordinator state and deterministic identities.
+envelope was returned. The provider must locate current-attempt artifacts from
+coordinator state and deterministic identities, consult its catalog, and never
+delete artifacts referenced by a committed attempt with the same operation ID.
 Validation, translation, and setup failures before current-attempt output is
 possible do not invoke abort: the same operation ID may name an earlier attempt
 whose durable state must be preserved. A catalog commit exception is an unknown
@@ -367,7 +374,7 @@ catalog transaction cannot be rolled back.
 A file-mode prepared manifest without a committed marker is therefore not
 retryable by the generic engine. Vane retains its files and rejects automatic
 replay because it cannot prove whether a remote catalog committed before its
-response was lost. Extension-specific reconciliation may establish that
+response was lost. Extension-specific catalog recovery may establish that
 outcome separately.
 
 ## Extension author contract
@@ -394,20 +401,23 @@ For every distributed write provider:
 - register the mode, protocol, codec, and callbacks once in the static
   `DistributedWriteOperatorExtension`; do not duplicate them in the physical
   provider;
-- validate all catalog and output preconditions before workers start;
+- keep `ValidateDistributedWrite` read-only and limit it to catalog and output
+  precondition checks before workers start;
 - use the supplied stable operation ID as the root of the complete speculative
   artifact namespace, including when no worker envelope is returned;
 - accept only the selected task-result envelopes during finalization;
-- reconcile the operation-owned task-attempt namespace against those selected
-  envelopes and remove artifacts from unselected or retried attempts before
-  registering catalog state;
-- make validation and finalization idempotent for a repeated operation ID and
-  reconcile an earlier ambiguous callback-mode commit before new workers run;
+- use the extension catalog's own ACID and idempotency mechanism in
+  `FinalizeDistributedWrite`; Vane does not provide callback exactly-once or a
+  pre-execution committed-result shortcut;
+- when the same operation ID is retried, preserve any existing committed
+  catalog state and its referenced artifacts, and dispose of redundant
+  uncommitted artifacts without overwriting committed objects;
 - register their files or opaque fragments in the active coordinator
   transaction without committing it;
 - return the exact affected row count;
 - implement `AbortDistributedWrite` for known pre-commit failure, including an
-  empty selected-result set;
+  empty selected-result set, while preserving catalog-referenced artifacts from
+  an earlier committed attempt;
 - retain immutable artifacts when a remote catalog commit response is
   ambiguous; never interpret a commit exception as proof of rollback;
 - leave transaction commit and output-lifecycle publication to Vane.
@@ -418,7 +428,11 @@ For callback-mode worker code:
 - treat `worker_bind_data`, fragment payloads, and artifact payloads as portable
   bytes with no process-local pointers;
 - use the supplied operation ID as the artifact namespace and task-attempt ID
-  to make speculative retries independently identifiable and deterministic;
+  to distinguish speculative retries within the current distributed execution;
+- do not treat the task-attempt ID as globally unique across complete
+  same-operation resubmissions; generate immutable, non-overwriting artifact
+  identities and never replace an object that a committed catalog entry may
+  reference;
 - keep artifact creation worker-local and catalog mutation coordinator-only;
 - report exact row and byte counts and stable fragment and artifact IDs;
 - encode every fragment according to the registered opaque codec.

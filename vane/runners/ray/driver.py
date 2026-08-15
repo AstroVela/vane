@@ -361,7 +361,7 @@ class CopyPlanOutcome:
 
 @dataclass(frozen=True)
 class CopyPlanRecovery:
-    """Read-only reconciliation response for one submitted COPY operation."""
+    """Read-only recovery response for one submitted COPY operation."""
 
     operation_id: str
     outcome: CopyPlanOutcome | None = None
@@ -390,7 +390,7 @@ class _CopyOperationIdentity:
     owner_id: str
     session_id: str
     plan_fingerprint: str
-    callback_reconciliation_allowed: bool = False
+    callback_retry_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1587,7 +1587,7 @@ class RayQueryDriverActor:
         )
         # Outcome payloads are bounded, but an admitted identity remains known
         # for the owner's lifetime. Only a callback UNKNOWN record explicitly
-        # authorizes same-plan reconciliation after its payload is evicted.
+        # authorizes a same-plan retry after its payload is evicted.
         self._copy_operation_identities: dict[str, _CopyOperationIdentity] = {}
         # An explicit operation ID is global to the extension commit protocol.
         # Keep its plan fingerprint for the complete driver lifetime so owner
@@ -6877,21 +6877,21 @@ class RayQueryDriverActor:
             if identity is None:
                 raise RuntimeError(f"COPY operation {operation_id} lost its admitted identity") from error
             terminal_error = error
-            if identity.callback_reconciliation_allowed and not (
+            if identity.callback_retry_allowed and not (
                 isinstance(error, CopyOutcomeUnknownError) and error.write_mode == "callback"
             ):
                 terminal_error = CopyOutcomeUnknownError(
                     operation_id,
                     detail=(
-                        "callback reconciliation did not establish a definitive commit outcome: "
-                        + self._copy_cleanup_warning("reconciliation attempt", error)
+                        "same-operation callback retry did not establish a definitive commit outcome: "
+                        + self._copy_cleanup_warning("callback retry attempt", error)
                     ),
                     write_mode="callback",
                 )
             self._copy_operation_identities[operation_id] = replace(
                 identity,
-                callback_reconciliation_allowed=(
-                    identity.callback_reconciliation_allowed
+                callback_retry_allowed=(
+                    identity.callback_retry_allowed
                     or (isinstance(error, CopyOutcomeUnknownError) and error.write_mode == "callback")
                 ),
             )
@@ -6910,7 +6910,7 @@ class RayQueryDriverActor:
                 raise RuntimeError(f"COPY operation {operation_id} lost its admitted identity")
             self._copy_operation_identities[operation_id] = replace(
                 identity,
-                callback_reconciliation_allowed=False,
+                callback_retry_allowed=False,
             )
             self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
                 owner_id=owner_id,
@@ -6930,7 +6930,7 @@ class RayQueryDriverActor:
         session_id: str,
         plan: Any,
     ) -> CopyPlanOutcome:
-        """Run one idempotently identified COPY and replay its terminal outcome."""
+        """Run one operation-identified COPY and replay its retained terminal outcome."""
         self._ensure_copy_operation_state()
         owner_key = str(owner_id).strip()
         session_key = str(session_id).strip()
@@ -6955,7 +6955,7 @@ class RayQueryDriverActor:
                     owner_id=terminal.owner_id,
                     session_id=terminal.session_id,
                     plan_fingerprint=terminal.plan_fingerprint,
-                    callback_reconciliation_allowed=(
+                    callback_retry_allowed=(
                         isinstance(terminal.error, CopyOutcomeUnknownError) and terminal.error.write_mode == "callback"
                     ),
                 ),
@@ -6992,7 +6992,7 @@ class RayQueryDriverActor:
                 operation_id=operation_id,
                 plan_fingerprint=plan_fingerprint,
             )
-            retry_callback_write = retry_callback_write or identity.callback_reconciliation_allowed
+            retry_callback_write = retry_callback_write or identity.callback_retry_allowed
             if not retry_callback_write:
                 raise CopyOutcomeUnknownError(operation_id)
         else:
@@ -7110,7 +7110,7 @@ class RayQueryDriverActor:
                 session_id=session_key,
                 operation_id=operation_key,
             )
-            if identity.callback_reconciliation_allowed:
+            if identity.callback_retry_allowed:
                 raise CopyOutcomeUnknownError(operation_key, write_mode="callback")
         raise CopyOutcomeUnknownError(operation_key)
 

@@ -1644,11 +1644,11 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
 
 
 @pytest.mark.parametrize("evict_terminal", [False, True])
-@pytest.mark.parametrize("fail_reconciliation_once", [False, True])
+@pytest.mark.parametrize("fail_retry_once", [False, True])
 def test_query_driver_callback_outcome_unknown_retries_same_plan_identity(
     monkeypatch,
     evict_terminal,
-    fail_reconciliation_once,
+    fail_retry_once,
 ):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "callback-write-outcome-unknown"
@@ -1668,8 +1668,8 @@ def test_query_driver_callback_outcome_unknown_retries_same_plan_identity(
                     "copy_output_outcome_error": "catalog commit response was lost",
                     "extension_write_mode": "callback",
                 }
-            if fail_reconciliation_once and plan_calls == 2:
-                raise RuntimeError("transient callback reconciliation failure")
+            if fail_retry_once and plan_calls == 2:
+                raise RuntimeError("transient callback retry failure")
             return {
                 **_committed_copy_result(rows_copied=3),
                 "extension_write_mode": "callback",
@@ -1714,18 +1714,18 @@ def test_query_driver_callback_outcome_unknown_retries_same_plan_identity(
     with pytest.raises(ValueError, match="cannot be reused for a different logical plan"):
         asyncio.run(_run_actor_copy_plan(runner, changed_plan))
 
-    if fail_reconciliation_once:
+    if fail_retry_once:
         with pytest.raises(driver.CopyOutcomeUnknownError) as retry_error:
             asyncio.run(_run_actor_copy_plan(runner, logical_plan))
         assert retry_error.value.write_mode == "callback"
         assert retry_error.value.safe_to_retry is True
-        assert "transient callback reconciliation failure" in retry_error.value.detail
+        assert "transient callback retry failure" in retry_error.value.detail
 
-    reconciled = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+    retried = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
 
-    assert reconciled.operation_id == plan_id
-    assert reconciled.result["rows_copied"] == 3
-    assert plan_calls == (3 if fail_reconciliation_once else 2)
+    assert retried.operation_id == plan_id
+    assert retried.result["rows_copied"] == 3
+    assert plan_calls == (3 if fail_retry_once else 2)
 
 
 def test_query_driver_owner_cleanup_retains_copy_fingerprint_tombstone():
@@ -1948,7 +1948,7 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert str(restored) == str(error)
 
 
-def test_callback_outcome_unknown_error_preserves_reconciliation_mode_across_serialization():
+def test_callback_outcome_unknown_error_preserves_retry_mode_across_serialization():
     error = driver.CopyOutcomeUnknownError(
         "unknown-callback-operation",
         detail="catalog response was lost",

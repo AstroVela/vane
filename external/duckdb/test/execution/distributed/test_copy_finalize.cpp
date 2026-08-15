@@ -559,6 +559,66 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(DistributedCopyWorkerBaseMatchesCanonical(fs, root_output_path, root_temporary_output_path));
 }
 
+TEST_CASE("Distributed COPY metadata rejects record delimiters before creating output",
+          "[distributed][copy][lifecycle][path]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_lifecycle_record_delimiters");
+	auto &fs = test_dir.fs;
+	DuckDB db(nullptr);
+	Connection connection(db);
+
+	for (const auto delimiter : {'\n', '\r', '\t'}) {
+		auto output_path = fs.JoinPath(test_dir.path, "copy" + string(1, delimiter) + "output");
+		auto result = WriteDistributedCopyDirectWriteLifecycle(fs, output_path, "run-record-delimiter", 1);
+		REQUIRE(result.is_err());
+		REQUIRE(StringUtil::Contains(result.error().what(), "contains a record delimiter"));
+
+		auto manifest_paths = BuildDistributedCopyFinalizeCommitPaths(fs, output_path, "run-record-delimiter");
+		auto manifest_result = WriteDistributedCopyFinalizeManifest(fs, manifest_paths, output_path, "staging", {});
+		REQUIRE(manifest_result.is_err());
+		REQUIRE(StringUtil::Contains(manifest_result.error().what(), "contains a record delimiter"));
+
+		DistributedCopySpec spec;
+		spec.file_path = fs.JoinPath(test_dir.path, "final-output");
+		spec.file_extension = "parquet";
+		spec.per_thread_output = true;
+		auto staging_root = fs.JoinPath(test_dir.path, "staging" + string(1, delimiter) + "root");
+		auto finalize_result = FinalizeCopyFiles(spec, staging_root, {}, *connection.context, "run-record-delimiter");
+		REQUIRE(finalize_result.is_err());
+		REQUIRE(StringUtil::Contains(finalize_result.error().what(), "contains a record delimiter"));
+
+		idx_t created_entries = 0;
+		fs.ListFiles(test_dir.path, [&](const string &, bool) { created_entries++; });
+		REQUIRE(created_entries == 0);
+	}
+}
+
+TEST_CASE("Distributed COPY validates filename metadata before overwrite side effects",
+          "[distributed][copy][lifecycle][path]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_filename_record_delimiters");
+	auto &fs = test_dir.fs;
+	auto output_path = fs.JoinPath(test_dir.path, "output");
+	auto existing_path = fs.JoinPath(output_path, "existing.parquet");
+	WriteTestFile(fs, existing_path, "preserve");
+
+	DuckDB db(nullptr);
+	Connection connection(db);
+	DistributedCopySpec spec;
+	spec.file_path = output_path;
+	spec.file_extension = "parquet";
+	spec.per_thread_output = true;
+	spec.overwrite_mode = CopyOverwriteMode::COPY_OVERWRITE;
+	spec.filename_pattern.SetFilenamePattern("part\n{i}");
+	auto staging_root = fs.JoinPath(test_dir.path, "staging");
+
+	auto finalize_result = FinalizeCopyFiles(spec, staging_root, {}, *connection.context, "run-record-delimiter");
+
+	REQUIRE(finalize_result.is_err());
+	REQUIRE(StringUtil::Contains(finalize_result.error().what(), "contains a record delimiter"));
+	REQUIRE(fs.FileExists(existing_path));
+	REQUIRE(ReadDistributedCopyTextFile(fs, existing_path).value() == "preserve");
+	REQUIRE_FALSE(fs.DirectoryExists(output_path + ".duckdb_commit"));
+}
+
 TEST_CASE("Distributed COPY temporary direct output preserves the canonical target",
           "[distributed][copy][lifecycle][path]") {
 	CopyFinalizeTestDirectory test_dir("copy_finalize_temporary_replacement");

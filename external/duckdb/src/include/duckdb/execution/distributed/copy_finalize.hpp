@@ -24,6 +24,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace duckdb {
 namespace distributed {
@@ -507,11 +508,37 @@ inline DuckDBResult<void> WriteDistributedCopyTextFileAtomically(FileSystem &fs,
 	}
 }
 
+inline DuckDBResult<void> ValidateDistributedCopyRecordField(const std::string &value, const char *field_name) {
+	if (value.find_first_of("\r\n\t") != std::string::npos) {
+		return DuckDBResult<void>::err(DuckDBError::value_error(
+		    StringUtil::Format("distributed COPY metadata %s contains a record delimiter", field_name)));
+	}
+	return DuckDBResult<void>::ok();
+}
+
 inline DuckDBResult<void> WriteDistributedCopyFinalizeManifest(FileSystem &fs,
                                                                const DistributedCopyFinalizeCommitPaths &paths,
                                                                const std::string &base_path,
                                                                const std::string &staging_root,
                                                                const vector<DistributedCopyFileInfo> &files) {
+	const std::pair<const char *, const std::string *> manifest_fields[] = {{"base_path", &base_path},
+	                                                                        {"staging_root", &staging_root}};
+	for (const auto &field : manifest_fields) {
+		auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
+		if (validate_res.is_err()) {
+			return validate_res;
+		}
+	}
+	for (const auto &file : files) {
+		const std::pair<const char *, const std::string *> file_fields[] = {{"file.staging_path", &file.staging_path},
+		                                                                    {"file.final_path", &file.final_path}};
+		for (const auto &field : file_fields) {
+			auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
+			if (validate_res.is_err()) {
+				return validate_res;
+			}
+		}
+	}
 	try {
 		fs.CreateDirectoriesRecursive(paths.commit_dir);
 	} catch (const std::exception &ex) {
@@ -577,6 +604,14 @@ inline DuckDBResult<void> WriteDistributedCopyDirectWriteLifecycle(
 		return DuckDBResult<void>::err(canonical_worker_res.error());
 	}
 	auto canonical_worker_base_path = std::move(canonical_worker_res).value();
+	const std::pair<const char *, const std::string *> record_fields[] = {
+	    {"base_path", &canonical_base_path}, {"worker_base_path", &canonical_worker_base_path}, {"run_id", &run_id}};
+	for (const auto &field : record_fields) {
+		auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
+		if (validate_res.is_err()) {
+			return validate_res;
+		}
+	}
 	if (!DistributedCopyWorkerBaseMatchesCanonical(fs, canonical_base_path, canonical_worker_base_path)) {
 		return DuckDBResult<void>::err(
 		    DuckDBError::value_error("direct-write lifecycle worker_base_path is outside the COPY namespace"));
@@ -1818,6 +1853,23 @@ FinalizeCopyFiles(const DistributedCopySpec &spec, const string &staging_root, v
 		return DuckDBResult<DistributedCopyResult>::err(
 		    DuckDBError::value_error("distributed COPY worker base is outside the canonical output namespace"));
 	}
+	auto final_path_probe = spec.filename_pattern.CreateFilename(fs, base_path, spec.file_extension, 0);
+	const std::pair<const char *, const std::string *> record_fields[] = {
+	    {"base_path", &base_path},        {"worker_base_path", &worker_base_path}, {"staging_root", &staging_root},
+	    {"run_id", &direct_write_run_id}, {"file.final_path", &final_path_probe},
+	};
+	for (const auto &field : record_fields) {
+		auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
+		if (validate_res.is_err()) {
+			return DuckDBResult<DistributedCopyResult>::err(validate_res.error());
+		}
+	}
+	for (const auto &info : result.files) {
+		auto validate_res = ValidateDistributedCopyRecordField(info.staging_path, "file.staging_path");
+		if (validate_res.is_err()) {
+			return DuckDBResult<DistributedCopyResult>::err(validate_res.error());
+		}
+	}
 
 	const bool output_is_dir = spec.partition_output || spec.per_thread_output || spec.rotate;
 
@@ -2124,13 +2176,6 @@ FinalizeCopyFiles(const DistributedCopySpec &spec, const string &staging_root, v
 				}
 				info.final_path = spec.filename_pattern.CreateFilename(fs, target_dir, spec.file_extension, offset);
 
-				auto parent_dir = StringUtil::GetFilePath(info.final_path);
-				if (!parent_dir.empty() && created_dirs.insert(parent_dir).second) {
-					if (!fs.DirectoryExists(parent_dir)) {
-						fs.CreateDirectoriesRecursive(parent_dir);
-					}
-				}
-
 				if (spec.overwrite_mode == CopyOverwriteMode::COPY_APPEND) {
 					while (fs.FileExists(info.final_path)) {
 						if (!spec.filename_pattern.HasUUID()) {
@@ -2140,7 +2185,20 @@ FinalizeCopyFiles(const DistributedCopySpec &spec, const string &staging_root, v
 						info.final_path =
 						    spec.filename_pattern.CreateFilename(fs, target_dir, spec.file_extension, offset);
 					}
-				} else if (spec.overwrite_mode == CopyOverwriteMode::COPY_OVERWRITE) {
+				}
+				auto validate_res = ValidateDistributedCopyRecordField(info.final_path, "file.final_path");
+				if (validate_res.is_err()) {
+					return DuckDBResult<DistributedCopyResult>::err(validate_res.error());
+				}
+
+				auto parent_dir = StringUtil::GetFilePath(info.final_path);
+				if (!parent_dir.empty() && created_dirs.insert(parent_dir).second) {
+					if (!fs.DirectoryExists(parent_dir)) {
+						fs.CreateDirectoriesRecursive(parent_dir);
+					}
+				}
+
+				if (spec.overwrite_mode == CopyOverwriteMode::COPY_OVERWRITE) {
 					if (fs.FileExists(info.final_path)) {
 						fs.RemoveFile(info.final_path);
 					}

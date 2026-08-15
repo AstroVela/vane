@@ -39,7 +39,7 @@ class CopyOutcomeUnknownError(RuntimeError):
     def _build_message(self) -> str:
         message = f"COPY outcome is unknown for operation {self.operation_id}"
         if self.safe_to_retry:
-            message += "; callback reconciliation must reuse this exact operation identity"
+            message += "; callback retry must reuse this exact operation identity"
         else:
             message += "; refusing to resubmit a potentially committed write"
         if self.base_path or self.run_id:

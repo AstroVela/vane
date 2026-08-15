@@ -16,7 +16,8 @@ namespace distributed {
 
 //! Stable coordinator identity for one distributed write operation. It remains
 //! available even when no worker result envelope was produced, so a provider
-//! can reconcile or abort the complete speculative artifact namespace.
+//! can identify the speculative artifact namespace for validation, finalize,
+//! and abort.
 struct DistributedWriteOperationContext {
 	string operation_id;
 
@@ -44,26 +45,27 @@ public:
 	//! Immutable extension/operator key and extension-owned worker bind envelope.
 	virtual const DistributedExtensionWritePlan &WritePlan() const = 0;
 
-	//! Validate coordinator/catalog state before any worker callback can run.
-	//! The stable operation identity may name an earlier attempt, so callback
-	//! providers must reconcile any durable operation state here without
-	//! committing the caller-owned transaction or creating artifacts for the
-	//! current attempt. A validation failure does not authorize aborting an
-	//! earlier attempt with the same operation identity.
+	//! Read-only validation of coordinator/catalog preconditions before any worker
+	//! callback can run. This hook neither commits nor reconciles an earlier
+	//! attempt and must not create artifacts. A validation failure does not
+	//! authorize aborting an earlier attempt with the same operation identity.
 	virtual void ValidateDistributedWrite(ClientContext &context,
 	                                      const DistributedWriteOperationContext &operation) const = 0;
 
-	//! Register exactly the selected task results in the active coordinator
-	//! catalog transaction. Repeating the same operation must be idempotent,
-	//! including after an earlier commit response was lost. Returns the number
+	//! Commit the selected task results in the active coordinator transaction.
+	//! The extension's catalog is authoritative for transaction atomicity and
+	//! same-operation idempotence, including after an earlier commit response was
+	//! lost. A repeated call may contain new task attempts; it must never replace
+	//! artifacts referenced by an existing committed operation. Returns the number
 	//! of affected rows represented by the selected results.
 	virtual idx_t FinalizeDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
 
-	//! Remove every worker artifact belonging to this operation after the current
-	//! attempt may have produced output and then encountered a known pre-commit
-	//! failure. The provider must be able to clean the operation from coordinator
-	//! state even when no worker envelope was returned.
+	//! Remove uncommitted artifacts from the current attempt after a known
+	//! pre-commit failure. The extension must consult its authoritative catalog
+	//! state and preserve artifacts referenced by any committed attempt with the
+	//! same operation identity. It must support cleanup even when no worker
+	//! envelope was returned.
 	virtual void AbortDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                   const vector<DistributedWriteTaskResult> &selected_results) const = 0;
 };

@@ -21,6 +21,7 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include <typeinfo>
 #include <unordered_set>
@@ -699,6 +700,21 @@ public:
 				return DuckDBResult<PlanResult>::err(worker_base_res.error());
 			}
 			sink_worker_base_path = std::move(worker_base_res).value();
+			auto final_path_probe = copy_sink_node->spec().filename_pattern.CreateFilename(
+			    fs, sink_base_path, copy_sink_node->spec().file_extension, 0);
+			const std::pair<const char *, const std::string *> copy_record_fields[] = {
+			    {"base_path", &sink_base_path},
+			    {"worker_base_path", &sink_worker_base_path},
+			    {"staging_root_base", &copy_sink_node->staging_root_base()},
+			    {"run_id", &copy_sink_node->staging_run_id()},
+			    {"file.final_path", &final_path_probe},
+			};
+			for (const auto &field : copy_record_fields) {
+				auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
+				if (validate_res.is_err()) {
+					return DuckDBResult<PlanResult>::err(validate_res.error());
+				}
+			}
 		}
 
 		if (copy_sink_node && copy_sink_node->staging_root_base().empty()) {

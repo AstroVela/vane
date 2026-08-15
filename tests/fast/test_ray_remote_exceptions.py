@@ -69,7 +69,7 @@ def test_remote_ray_exception_preserves_unknown_copy_recovery_context():
     assert restored.safe_to_retry is False
 
 
-def test_remote_ray_exception_preserves_callback_reconciliation_mode():
+def test_remote_ray_exception_preserves_callback_retry_mode():
     from vane.runners import CopyOutcomeUnknownError
 
     original = CopyOutcomeUnknownError(

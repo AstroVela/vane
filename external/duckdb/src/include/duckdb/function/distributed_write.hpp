@@ -23,7 +23,9 @@ class Serializer;
 enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK = 1 };
 
 //! An immutable object created by a worker write. The extension owns the
-//! artifact codec and payload. URI is optional for non-file artifacts.
+//! artifact codec and payload. URI is optional for non-file artifacts. Retry
+//! attempts must use immutable, non-overwriting objects and must never replace
+//! an object that a committed catalog entry may reference.
 struct DistributedWriteArtifact {
 	string artifact_id;
 	string uri;
@@ -52,7 +54,10 @@ struct DistributedWriteFragment {
 
 //! Runtime identity supplied explicitly to every worker-side callback. An
 //! extension uses operation_id to namespace durable artifacts and
-//! task_attempt_id to make speculative attempts independently identifiable.
+//! task_attempt_id to distinguish speculative attempts within one distributed
+//! execution. A later submission of the same operation may reuse a task attempt
+//! identity, so extensions must generate their own non-overwriting artifact
+//! identity when creating durable objects.
 struct DistributedWriteTaskContext {
 	string operation_id;
 	string task_attempt_id;
