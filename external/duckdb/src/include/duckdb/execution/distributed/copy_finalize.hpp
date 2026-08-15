@@ -600,7 +600,6 @@ inline DuckDBResult<void> WriteDistributedCopyDirectWriteLifecycle(
 	auto direct_write_run_dir = BuildCopyDirectWriteRunDirectory(canonical_worker_base_path, run_id,
 	                                                             fs.PathSeparator(canonical_worker_base_path));
 	std::ostringstream lifecycle;
-	lifecycle << "version=3\n";
 	lifecycle << "mode=direct_write\n";
 	lifecycle << "state=" << DistributedCopyDirectWriteLifecycleStateName(state) << "\n";
 	lifecycle << "base_path=" << canonical_base_path << "\n";
@@ -631,7 +630,6 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 		return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(text_res.error());
 	}
 
-	bool seen_version = false;
 	bool seen_mode = false;
 	bool seen_state = false;
 	bool seen_base_path = false;
@@ -660,17 +658,7 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 		}
 		auto key = line.substr(0, sep);
 		auto value = line.substr(sep + 1);
-		if (key == "version") {
-			if (seen_version) {
-				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
-				    DuckDBError::value_error("direct-write lifecycle duplicate version"));
-			}
-			seen_version = true;
-			if (value != "3") {
-				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
-				    DuckDBError::value_error("unsupported direct-write lifecycle version: " + value));
-			}
-		} else if (key == "mode") {
+		if (key == "mode") {
 			if (seen_mode) {
 				return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
 				    DuckDBError::value_error("direct-write lifecycle duplicate mode"));
@@ -751,7 +739,7 @@ ReadDistributedCopyDirectWriteLifecycle(FileSystem &fs, const DistributedCopyFin
 		}
 	}
 
-	if (!seen_version || !seen_mode || !seen_state || !seen_base_path || !seen_worker_base_path || !seen_run_id ||
+	if (!seen_mode || !seen_state || !seen_base_path || !seen_worker_base_path || !seen_run_id ||
 	    !seen_created_epoch_ms || !seen_direct_write_run_dir) {
 		return DuckDBResult<DistributedCopyDirectWriteLifecycleInfo>::err(
 		    DuckDBError::value_error("direct-write lifecycle missing required fields"));

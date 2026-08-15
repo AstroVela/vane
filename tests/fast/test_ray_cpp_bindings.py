@@ -2322,6 +2322,9 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
         str(base),
         stale_run_id,
     )
+    lifecycle_lines = Path(stale_registration["copy_output_lifecycle_path"]).read_text().splitlines()
+    assert lifecycle_lines[0] == "mode=direct_write"
+    assert not any(line.startswith("version=") for line in lifecycle_lines)
     stale_run_dir = base / f"_vane_direct_write_{stale_run_id}" / "w_failed"
     stale_file = stale_run_dir / "part.parquet"
     stale_file.parent.mkdir(parents=True)
@@ -2569,7 +2572,6 @@ def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
         data_path = f"{run_dir}/w_failed/part.parquet"
         lifecycle = textwrap.dedent(
             f"""\
-            version=3
             mode=direct_write
             state=writing
             base_path={base_path}
