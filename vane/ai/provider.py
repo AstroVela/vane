@@ -58,6 +58,8 @@ def _translate_missing_provider_dependency(extra: str, expected_module: str) -> 
         raise
 
 
+_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset({"anthropic", "google", "openai", "transformers", "vllm"})
+_SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 _MAX_ERROR_TYPE_CHARS = 128
 _SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")
 
@@ -107,8 +109,15 @@ def _safe_provider_execution_error(
     original_error: Exception,
 ) -> ProviderImportError | RuntimeError:
     """Return a public-safe final error after provider retry handling."""
-    if isinstance(original_error, ProviderImportError):
-        return ProviderImportError(original_error.extra, function=original_error.function)
+    if type(original_error) is ProviderImportError:
+        extra = original_error.extra
+        function = original_error.function
+        if (
+            type(extra) is str
+            and extra in _SAFE_PROVIDER_IMPORT_EXTRAS
+            and (function is None or (type(function) is str and function in _SAFE_PROVIDER_IMPORT_FUNCTIONS))
+        ):
+            return ProviderImportError(extra, function=function)
     summary = _safe_original_error_summary(original_error)
     return RuntimeError(f"Provider {provider!r} model {model!r} failed during {operation}; upstream error: {summary}")
 

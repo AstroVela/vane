@@ -174,19 +174,24 @@ class TestProviderLoading:
 
         assert exc_info.value is import_error
 
-    def test_provider_import_error_survives_safe_wrapping_and_pickle(self):
+    def test_provider_import_error_survives_safe_wrapping_and_serialization(self):
+        import cloudpickle
+
         from vane.ai.provider import ProviderImportError, _safe_provider_execution_error
 
         error = ProviderImportError("openai", function="Embed")
         safe_error = _safe_provider_execution_error("openai", "test-model", "Embed initialization", error)
-        restored = pickle.loads(pickle.dumps(safe_error))
 
         assert isinstance(safe_error, ProviderImportError)
         assert safe_error is not error
-        assert isinstance(restored, ProviderImportError)
-        assert restored.extra == "openai"
-        assert restored.function == "Embed"
-        assert str(restored) == "Please `pip install 'vane-ai[openai]'` to use the Embed function with this provider."
+        for serializer in (pickle, cloudpickle):
+            restored = serializer.loads(serializer.dumps(safe_error))
+            assert isinstance(restored, ProviderImportError)
+            assert restored.extra == "openai"
+            assert restored.function == "Embed"
+            assert (
+                str(restored) == "Please `pip install 'vane-ai[openai]'` to use the Embed function with this provider."
+            )
 
     def test_load_transformers_provider(self):
         """TransformersProvider can be instantiated (deps mocked if needed)."""
