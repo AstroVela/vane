@@ -3783,6 +3783,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         ":memory:",
         False,
         (),
+        (),
         "test-source-id",
         (("httpfs", ""),),
         (),
@@ -3922,6 +3923,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         ":memory:",
         False,
         (),
+        (),
         "test-source-id",
         (("httpfs", ""),),
         (),
@@ -4037,6 +4039,7 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
     database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
         ":memory:",
         False,
+        (),
         (),
         "test-source-id",
         (("httpfs", ""),),
@@ -13610,6 +13613,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         ":memory:",
         False,
         (),
+        (),
         "test-source-id",
         (("httpfs", ""),),
         (),
@@ -13985,6 +13989,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
         ":memory:",
         False,
+        (),
         (),
         "test-source-id",
         (("httpfs", ""),),
@@ -14468,6 +14473,7 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
     database_identity = worker_mod.WorkerSnapshotDatabaseIdentity(
         ":memory:",
         False,
+        (),
         (),
         "test-source-id",
         (),

@@ -9,13 +9,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
-#include "duckdb/common/serializer/binary_deserializer.hpp"
-#include "duckdb/common/serializer/binary_serializer.hpp"
-#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/execution/physical_plan.hpp"
-#include "duckdb/function/function_serialization.hpp"
-#include "duckdb/main/client_context.hpp"
-#include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
@@ -36,53 +30,6 @@ ExtraOperatorInfo CopyExtraOperatorInfo(const ExtraOperatorInfo &info) {
 		copy.sample_options = info.sample_options->Copy();
 	}
 	return copy;
-}
-
-struct SerializedTableFunctionBind {
-	TableFunction function;
-	unique_ptr<FunctionData> bind_data;
-};
-
-SerializedTableFunctionBind RoundTripTableFunctionBind(ClientContext &client_context, const TableFunction &function,
-                                                       FunctionData &bind_data) {
-	MemoryStream stream(Allocator::DefaultAllocator());
-	SerializationOptions options;
-	options.serialization_compatibility = SerializationCompatibility::Latest();
-	options.serialize_default_values = true;
-	BinarySerializer serializer(stream, options);
-	serializer.Begin();
-	FunctionSerializer::Serialize(serializer, function, bind_data);
-	serializer.End();
-	stream.Rewind();
-
-	auto &db = DatabaseInstance::GetDatabase(client_context);
-	Connection connection(db);
-	connection.context->config = client_context.config;
-	BinaryDeserializer deserializer(stream);
-	bound_parameter_map_t parameters;
-	SerializedTableFunctionBind result;
-	connection.context->RunFunctionInTransaction([&]() {
-		deserializer.Set<DatabaseInstance &>(db);
-		deserializer.Set<ClientContext &>(*connection.context);
-		deserializer.Set<bound_parameter_map_t &>(parameters);
-		deserializer.Begin();
-		auto entry = FunctionSerializer::DeserializeBase<TableFunction, TableFunctionCatalogEntry>(
-		    deserializer, CatalogType::TABLE_FUNCTION_ENTRY);
-		if (!entry.second) {
-			throw SerializationException("Distributed table function '%s' did not serialize its bind data",
-			                             function.name);
-		}
-		result.function = std::move(entry.first);
-		result.bind_data = FunctionSerializer::FunctionDeserialize(deserializer, result.function);
-		deserializer.End();
-		deserializer.Unset<bound_parameter_map_t>();
-		deserializer.Unset<ClientContext>();
-		deserializer.Unset<DatabaseInstance>();
-	});
-	if (!result.bind_data) {
-		throw SerializationException("Distributed table function '%s' deserialized null bind data", function.name);
-	}
-	return result;
 }
 
 std::vector<std::vector<OpenFileInfo>> GroupFilesByCount(const std::vector<OpenFileInfo> &files, size_t max_tasks) {
@@ -398,7 +345,7 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 
 } // namespace
 
-DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan, optional_ptr<ClientContext> client_context) {
+DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 	Allocator &alloc = Allocator::DefaultAllocator();
 	auto plan = std::make_shared<PhysicalPlan>(alloc);
 
@@ -408,34 +355,18 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan, optional_pt
 		if (!scan.bind_data) {
 			throw SerializationException("Distributed table function '%s' requires bind data", scan.function.name);
 		}
-		if (!client_context) {
-			throw SerializationException("Distributed table function '%s' requires a ClientContext to serialize its "
-			                             "worker bind data",
-			                             scan.function.name);
-		}
 		if (!scan.function.HasSerializationCallbacks()) {
 			throw SerializationException("Distributed table function '%s' requires complete serialize and deserialize "
 			                             "callbacks; worker rebind is not supported",
 			                             scan.function.name);
 		}
-		const auto &source_callbacks = scan.function.GetDistributedScanCallbacks();
-		source_callbacks.Validate(scan.function.name);
-		auto serialized_bind = RoundTripTableFunctionBind(*client_context, scan.function, *scan.bind_data);
-		function = std::move(serialized_bind.function);
-		bind_data = std::move(serialized_bind.bind_data);
-		if (!function.HasDistributedScanCallbacks()) {
-			throw SerializationException("Distributed table function '%s' lost its distributed scan callbacks while "
-			                             "resolving the serialized worker bind",
-			                             scan.function.name);
-		}
-		const auto &callbacks = function.GetDistributedScanCallbacks();
+		const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 		callbacks.Validate(scan.function.name);
-		if (callbacks.GetCapability() != source_callbacks.GetCapability() ||
-		    callbacks.task_codec != source_callbacks.task_codec) {
-			throw SerializationException("Distributed table function '%s' resolved a different worker protocol",
-			                             scan.function.name);
+		bind_data = callbacks.create_worker_bind(MakeDistributedScanInput(scan));
+		if (!bind_data) {
+			throw InvalidInputException("Distributed table function '%s' returned null from create_worker_bind",
+			                            scan.function.name);
 		}
-		callbacks.prepare_bind(MakeDistributedScanInput(scan), *bind_data);
 	} else {
 		if (!scan.bind_data) {
 			throw NotImplementedException("Distributed execution does not support table function \"%s\": bind data is "

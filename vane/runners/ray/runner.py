@@ -165,14 +165,23 @@ class RayRunner(Runner):
         finally:
             del relation
 
-    def run_write(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
-        """Execute a distributed COPY or extension-write plan."""
+    def run_write(
+        self,
+        relation: vane.DuckDBPyRelation,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute a write, reusing an ambiguous callback's ID only with the same plan."""
+        if operation_id is not None and not isinstance(operation_id, str):
+            raise TypeError("distributed write operation_id must be a string")
+        query_id = str(uuid.uuid4()) if operation_id is None else operation_id.strip()
+        if not query_id:
+            raise ValueError("distributed write operation_id must not be empty")
+
         PyLogicalPlan = require_ray_cxx_attr(
             "PyLogicalPlan",
             hint="Ensure the C++ ray extension is built and importable in worker processes.",
         )
-
-        query_id = str(uuid.uuid4())
 
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
         session_id = str(logical_plan.session_id())

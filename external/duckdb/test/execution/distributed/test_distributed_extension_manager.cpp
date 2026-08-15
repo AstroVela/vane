@@ -117,7 +117,9 @@ static vector<DistributedScanTask> DistributedOverloadPlan(const TableFunctionDi
 	return {};
 }
 
-static void DistributedOverloadPrepare(const TableFunctionDistributedScanInput &, FunctionData &) {
+static unique_ptr<FunctionData> DistributedOverloadCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
+	input.bind_data.Cast<DistributedOverloadBindData>();
+	return make_uniq<DistributedOverloadBindData>();
 }
 
 static void DistributedOverloadApply(FunctionData &, const vector<DistributedScanTask> &) {
@@ -143,7 +145,7 @@ static TableFunction DistributedOverloadFunction(const LogicalType &argument) {
 	callbacks.protocol_version = 1;
 	callbacks.task_codec = {"distributed-overload.task", 1};
 	callbacks.plan = DistributedOverloadPlan;
-	callbacks.prepare_bind = DistributedOverloadPrepare;
+	callbacks.create_worker_bind = DistributedOverloadCreateWorkerBind;
 	callbacks.apply_tasks = DistributedOverloadApply;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;

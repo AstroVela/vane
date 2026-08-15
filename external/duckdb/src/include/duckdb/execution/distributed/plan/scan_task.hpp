@@ -87,8 +87,8 @@ bool ValidateScanTaskAssignments(const duckdb::PhysicalPlan &plan, const set<idx
 bool ValidateDistributedScanTasksApplied(const duckdb::PhysicalPlan &plan, std::string *error = nullptr);
 
 //! Returns true when the plan contains a table scan tagged as a distributed
-//! worker scan target. Such a plan must not execute from its detached bind
-//! state without an explicit static or FTE task assignment.
+//! worker scan target. Such a plan must not execute from its task-free worker
+//! bind without an explicit static or FTE task assignment.
 bool HasDistributedScanTaskTargets(const duckdb::PhysicalPlan &plan);
 
 } // namespace distributed

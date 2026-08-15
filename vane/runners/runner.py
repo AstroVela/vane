@@ -36,6 +36,6 @@ class Runner:
         ...
 
     @abstractmethod
-    def run_write(self, relation: Any) -> dict[str, Any]:
-        """Execute a COPY or extension-write relation through the runner."""
+    def run_write(self, relation: Any, *, operation_id: str | None = None) -> dict[str, Any]:
+        """Execute a write, optionally reconciling the same plan under its prior operation ID."""
         ...

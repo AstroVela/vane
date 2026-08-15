@@ -306,6 +306,7 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         ":memory:",
         False,
         (("threads", "2"),),
+        (),
         "test-source-id",
         (),
         (),

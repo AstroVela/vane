@@ -13,6 +13,7 @@
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
 
@@ -35,7 +36,7 @@ struct DistributedScanTask {
 };
 
 //! Physical scan information available while an extension creates its task
-//! envelopes or detaches a serialized worker bind.
+//! envelopes or constructs a worker bind.
 struct TableFunctionDistributedScanInput {
 	TableFunctionDistributedScanInput(const FunctionData &bind_data_p, const vector<ColumnIndex> &column_ids_p,
 	                                  const vector<idx_t> &projection_ids_p,
@@ -55,11 +56,12 @@ struct TableFunctionDistributedScanInput {
 typedef vector<DistributedScanTask> (*table_function_plan_distributed_scan_t)(
     const TableFunctionDistributedScanInput &input);
 
-//! Remove coordinator-only task state from an independently deserialized bind
-//! object before it is transported with the worker physical plan. This is not
-//! a rebind: the ordinary table-function serde creates and transports the bind.
-typedef void (*table_function_prepare_distributed_scan_bind_t)(const TableFunctionDistributedScanInput &input,
-                                                               FunctionData &worker_bind_data);
+//! Construct a new, independently owned worker bind by explicitly selecting
+//! portable coordinator state. This callback must not mutate the input. The
+//! returned bind must not retain coordinator-only tasks or mutable process-local
+//! state. The ordinary table-function serde transports it.
+typedef unique_ptr<FunctionData> (*table_function_create_distributed_worker_bind_t)(
+    const TableFunctionDistributedScanInput &input);
 
 //! Decode and install the assigned opaque envelopes into a deserialized worker
 //! bind object. An empty vector must install an empty scan.
@@ -76,7 +78,7 @@ struct TableFunctionDistributedScanCallbacks {
 	idx_t protocol_version = 0;
 	DistributedPayloadCodec task_codec;
 	table_function_plan_distributed_scan_t plan = nullptr;
-	table_function_prepare_distributed_scan_bind_t prepare_bind = nullptr;
+	table_function_create_distributed_worker_bind_t create_worker_bind = nullptr;
 	table_function_apply_distributed_scan_tasks_t apply_tasks = nullptr;
 
 	DUCKDB_API void ValidateDefinition(const string &function_name) const;

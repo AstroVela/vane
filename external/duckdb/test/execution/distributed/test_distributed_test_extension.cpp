@@ -42,6 +42,7 @@ static constexpr idx_t DISTRIBUTED_TEST_WRITE_CODEC_VERSION = 1;
 static const string DISTRIBUTED_TEST_SCAN_CODEC = "distributed-test.scan-task";
 static const string DISTRIBUTED_TEST_WRITE_CODEC = "distributed-test.opaque-write-fragment";
 static const string DISTRIBUTED_TEST_WRITE_NAME = "distributed_test_opaque_write";
+static atomic<idx_t> distributed_test_create_worker_bind_calls {0};
 
 struct DistributedTestRuntimeTask {
 	idx_t task_id = 0;
@@ -75,6 +76,7 @@ struct DistributedTestScanGlobalState : public GlobalTableFunctionState {
 };
 
 static atomic<idx_t> distributed_test_bind_calls {0};
+static atomic<idx_t> distributed_test_deserialize_calls {0};
 
 static string FileResource(idx_t task_id) {
 	return "synthetic-file://partition-" + std::to_string(task_id) + ".parquet";
@@ -336,6 +338,7 @@ static void DistributedTestScanSerialize(Serializer &serializer, const optional_
 }
 
 static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &deserializer, TableFunction &) {
+	distributed_test_deserialize_calls++;
 	auto result = make_uniq<DistributedTestScanBindData>();
 	result->requested_task_count = deserializer.ReadProperty<idx_t>(100, "requested_task_count");
 	deserializer.ReadList(101, "tasks", [&](Deserializer::List &tasks, idx_t) {
@@ -350,10 +353,12 @@ static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &des
 	return std::move(result);
 }
 
-static void DistributedTestPrepareWorkerBind(const TableFunctionDistributedScanInput &,
-                                             FunctionData &worker_bind_data) {
-	auto &worker_bind = worker_bind_data.Cast<DistributedTestScanBindData>();
-	worker_bind.tasks.clear();
+static unique_ptr<FunctionData> DistributedTestCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
+	distributed_test_create_worker_bind_calls++;
+	auto &source_bind = input.bind_data.Cast<DistributedTestScanBindData>();
+	auto worker_bind = make_uniq<DistributedTestScanBindData>();
+	worker_bind->requested_task_count = source_bind.requested_task_count;
+	return std::move(worker_bind);
 }
 
 static vector<DistributedScanTask> DistributedTestPlanTasks(const TableFunctionDistributedScanInput &input) {
@@ -409,7 +414,7 @@ static TableFunction DistributedTestScanFunction() {
 	callbacks.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
 	callbacks.task_codec = {DISTRIBUTED_TEST_SCAN_CODEC, DISTRIBUTED_TEST_TASK_CODEC_VERSION};
 	callbacks.plan = DistributedTestPlanTasks;
-	callbacks.prepare_bind = DistributedTestPrepareWorkerBind;
+	callbacks.create_worker_bind = DistributedTestCreateWorkerBind;
 	callbacks.apply_tasks = DistributedTestApplyTasks;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;
@@ -449,11 +454,16 @@ static PlannedDistributedTestScan PlanDistributedTestScan(DuckDB &db, Connection
 	}
 	auto coordinator_plan = distributed::DuckPhysicalPlanRef(generated_plan.release());
 	auto &coordinator_scan = coordinator_plan->Root().Cast<PhysicalTableScan>();
-	REQUIRE_THROWS_WITH(coordinator_scan.bind_data->Copy(), Catch::Matchers::Contains("Copy not supported"));
+	auto coordinator_task_count = coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size();
 	distributed::DuckDBExecutionConfig config;
 	config.set_distributed_worker_slots(worker_slots);
 	PlannedDistributedTestScan result;
-	result.worker_plan = distributed::MakeTableScanPlan(coordinator_scan, connection.context.get());
+	auto create_calls_before_plan = distributed_test_create_worker_bind_calls.load();
+	auto deserialize_calls_before_plan = distributed_test_deserialize_calls.load();
+	result.worker_plan = distributed::MakeTableScanPlan(coordinator_scan);
+	REQUIRE(distributed_test_create_worker_bind_calls.load() == create_calls_before_plan + 1);
+	REQUIRE(distributed_test_deserialize_calls.load() == deserialize_calls_before_plan);
+	REQUIRE(coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == coordinator_task_count);
 	auto task_set = distributed::MakeTableScanTasks(coordinator_scan, config, db.instance);
 	REQUIRE_FALSE(task_set.known_empty);
 	result.tasks = std::move(task_set.tasks);
@@ -479,7 +489,7 @@ static distributed::DuckPhysicalPlanRef CloneAndApply(Connection &worker,
 
 } // namespace
 
-TEST_CASE("Distributed synthetic extension transports file tasks with non-copyable bind data",
+TEST_CASE("Distributed synthetic extension transports file tasks with an explicit worker bind",
           "[distributed][extension][extension-scan]") {
 	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBytes(""),
 	                    Catch::Matchers::Contains("empty scan task descriptor"));
@@ -491,6 +501,11 @@ TEST_CASE("Distributed synthetic extension transports file tasks with non-copyab
 	invalid_callbacks.protocol_version = 0;
 	REQUIRE_THROWS_WITH(invalid_function.SetDistributedScanCallbacks(std::move(invalid_callbacks)),
 	                    Catch::Matchers::Contains("greater than zero"));
+	auto incomplete_function = DistributedTestScanFunction();
+	auto incomplete_callbacks = incomplete_function.GetDistributedScanCallbacks();
+	incomplete_callbacks.create_worker_bind = nullptr;
+	REQUIRE_THROWS_WITH(incomplete_function.SetDistributedScanCallbacks(std::move(incomplete_callbacks)),
+	                    Catch::Matchers::Contains("create_worker_bind"));
 
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
@@ -599,6 +614,29 @@ TEST_CASE("Distributed synthetic extension transports file tasks with non-copyab
 	REQUIRE_THROWS_WITH(distributed::ClonePhysicalPlanOrThrow(no_serde_plan, "distributed_test_missing_scan_serde",
 	                                                          worker.context.get()),
 	                    Catch::Matchers::Contains("worker rebind is not supported"));
+}
+
+TEST_CASE("Distributed extension scan constructs its worker bind without FunctionData::Copy",
+          "[distributed][extension][extension-scan]") {
+	DuckDB coordinator_db(nullptr);
+	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
+	Connection coordinator(coordinator_db);
+	auto logical_plan = coordinator.ExtractPlan("SELECT * FROM distributed_test_scan(1)");
+	REQUIRE(logical_plan != nullptr);
+	PhysicalPlanGenerator generator(*coordinator.context);
+	auto generated_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(generated_plan != nullptr);
+	REQUIRE(generated_plan->Root().type == PhysicalOperatorType::TABLE_SCAN);
+	auto &coordinator_scan = generated_plan->Root().Cast<PhysicalTableScan>();
+	auto &coordinator_bind = coordinator_scan.bind_data->Cast<DistributedTestScanBindData>();
+	REQUIRE(coordinator_bind.tasks.size() == 1);
+	REQUIRE_THROWS_WITH(coordinator_bind.Copy(), Catch::Matchers::Contains("Copy not supported"));
+
+	auto worker_plan = distributed::MakeTableScanPlan(coordinator_scan);
+	auto &worker_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
+	REQUIRE(worker_bind.requested_task_count == coordinator_bind.requested_task_count);
+	REQUIRE(worker_bind.tasks.empty());
+	REQUIRE(coordinator_bind.tasks.size() == 1);
 }
 
 TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fat fragment payloads",

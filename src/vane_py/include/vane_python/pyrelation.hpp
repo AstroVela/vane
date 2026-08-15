@@ -269,7 +269,7 @@ public:
 	// Update the internal result of the relation
 	DuckDBPyRelation &Execute();
 
-	void InsertInto(const string &table);
+	void InsertInto(const string &table, const py::object &operation_id = py::none());
 
 	void Insert(const py::object &params = py::list()) const;
 	void Update(const py::object &set, const py::object &where = py::none());

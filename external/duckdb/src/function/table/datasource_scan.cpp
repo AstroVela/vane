@@ -45,9 +45,13 @@ static vector<DistributedScanTask> DataSourcePlanDistributedScan(const TableFunc
 	return tasks;
 }
 
-static void DataSourcePrepareDistributedBind(const TableFunctionDistributedScanInput &,
-                                             FunctionData &worker_bind_data) {
-	worker_bind_data.Cast<DataSourceScanBindData>().pickled_tasks.clear();
+static unique_ptr<FunctionData> DataSourceCreateDistributedWorkerBind(const TableFunctionDistributedScanInput &input) {
+	auto &source_bind = input.bind_data.Cast<DataSourceScanBindData>();
+	auto worker_bind = make_uniq<DataSourceScanBindData>();
+	worker_bind->pickled_source = source_bind.pickled_source;
+	worker_bind->query_id = source_bind.query_id;
+	worker_bind->produce_stream = nullptr;
+	return std::move(worker_bind);
 }
 
 static bool IsCanonicalDataSourceTaskId(const string &task_id) {
@@ -300,7 +304,7 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	distributed_scan.protocol_version = 1;
 	distributed_scan.task_codec = {DATASOURCE_TASK_CODEC, 1};
 	distributed_scan.plan = DataSourcePlanDistributedScan;
-	distributed_scan.prepare_bind = DataSourcePrepareDistributedBind;
+	distributed_scan.create_worker_bind = DataSourceCreateDistributedWorkerBind;
 	distributed_scan.apply_tasks = DataSourceApplyDistributedTasks;
 	func.SetDistributedScanCallbacks(std::move(distributed_scan));
 	func.BindDistributedScanCapability("vane_core");

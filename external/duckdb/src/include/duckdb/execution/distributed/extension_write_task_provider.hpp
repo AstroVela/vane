@@ -47,7 +47,9 @@ public:
 	//! Validate coordinator/catalog state before any worker callback can run.
 	//! The stable operation identity may name an earlier attempt, so callback
 	//! providers must reconcile any durable operation state here without
-	//! committing the caller-owned transaction.
+	//! committing the caller-owned transaction or creating artifacts for the
+	//! current attempt. A validation failure does not authorize aborting an
+	//! earlier attempt with the same operation identity.
 	virtual void ValidateDistributedWrite(ClientContext &context,
 	                                      const DistributedWriteOperationContext &operation) const = 0;
 
@@ -58,9 +60,10 @@ public:
 	virtual idx_t FinalizeDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
 
-	//! Remove every worker artifact belonging to this operation after a known
-	//! pre-commit failure. The provider must be able to clean the operation from
-	//! coordinator state even when no worker envelope was returned.
+	//! Remove every worker artifact belonging to this operation after the current
+	//! attempt may have produced output and then encountered a known pre-commit
+	//! failure. The provider must be able to clean the operation from coordinator
+	//! state even when no worker envelope was returned.
 	virtual void AbortDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
 	                                   const vector<DistributedWriteTaskResult> &selected_results) const = 0;
 };

@@ -427,7 +427,13 @@ class LocalRunner(Runner):
             started_at=started_at,
         )
 
-    def run_write(self, relation: Any) -> dict[str, Any]:
+    def run_write(self, relation: Any, *, operation_id: str | None = None) -> dict[str, Any]:
+        if operation_id is not None and not isinstance(operation_id, str):
+            raise TypeError("distributed write operation_id must be a string")
+        query_id = str(uuid.uuid4()) if operation_id is None else operation_id.strip()
+        if not query_id:
+            raise ValueError("distributed write operation_id must not be empty")
+
         import vane
 
         _preload_arrow_dataset_imports()
@@ -435,7 +441,6 @@ class LocalRunner(Runner):
         PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
-        query_id = str(uuid.uuid4())
         logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
         conn = vane.connect()
         fragment_executor = _InProcessFragmentExecutor()

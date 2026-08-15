@@ -255,6 +255,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     database: str
     read_only: bool
     config: tuple[tuple[str, str], ...]
+    settings: tuple[tuple[str, str, str], ...]
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
     distributed_extension_contracts: tuple[str, ...]
@@ -296,6 +297,30 @@ def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSna
     if len({key for key, _value in config}) != len(config):
         raise ValueError("query connection snapshot bootstrap has duplicate case-insensitive config keys")
 
+    raw_settings = snapshot.get("settings")
+    if not isinstance(raw_settings, list):
+        raise TypeError("query connection snapshot settings must be a list")
+    settings: list[tuple[str, str, str]] = []
+    setting_names: set[str] = set()
+    for raw_setting in raw_settings:
+        if not isinstance(raw_setting, Mapping):
+            raise TypeError("query connection snapshot setting entry must be a mapping")
+        name = _snapshot_nonempty_string(raw_setting, "name", "setting")
+        value = raw_setting.get("value")
+        if not isinstance(value, str):
+            raise TypeError("query connection snapshot setting value must be a string")
+        input_type = raw_setting.get("input_type")
+        if not isinstance(input_type, str) or not input_type:
+            raise TypeError("query connection snapshot setting input_type must be a non-empty string")
+        normalized_name = name.lower()
+        if normalized_name in setting_names:
+            raise ValueError(f"query connection snapshot has duplicate setting name: {name}")
+        setting_names.add(normalized_name)
+        if normalized_name in _CONNECTION_SNAPSHOT_SECURITY_SETTINGS:
+            continue
+        settings.append((normalized_name, value, input_type.upper()))
+    settings.sort()
+
     duckdb_source_id = snapshot.get("duckdb_source_id")
     if not isinstance(duckdb_source_id, str) or not duckdb_source_id:
         raise TypeError("query connection snapshot duckdb_source_id must be a non-empty string")
@@ -335,6 +360,7 @@ def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSna
         database,
         read_only,
         config,
+        tuple(settings),
         duckdb_source_id,
         tuple(extensions),
         tuple(distributed_contracts),

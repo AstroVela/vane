@@ -416,7 +416,9 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 
 	    // Aren't these also technically consumers?
 	    .def("insert_into", &DuckDBPyRelation::InsertInto,
-	         "Inserts the relation object into an existing table named table_name", py::arg("table_name"));
+	         "Inserts the relation object into an existing table, optionally reusing a prior distributed callback "
+	         "operation identity",
+	         py::arg("table_name"), py::kw_only(), py::arg("operation_id") = py::none());
 
 	DefineMethod({"create", "to_table"}, relation_module, &DuckDBPyRelation::Create,
 	             "Creates a new table named table_name with the contents of the relation object",

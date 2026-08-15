@@ -156,7 +156,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 		op.extra_info.scan_group_id = op.extra_info.scan_node_id;
 	}
 
-	scan_plan = MakeTableScanPlan(op, client_context_);
+	scan_plan = MakeTableScanPlan(op);
 	auto scan_task_set = MakeTableScanTasks(op, *exec_cfg, plan_config_.db);
 	require_scan_tasks = !scan_task_set.known_empty;
 	scan_tasks = std::move(scan_task_set.tasks);

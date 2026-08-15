@@ -69,6 +69,23 @@ def test_remote_ray_exception_preserves_unknown_copy_recovery_context():
     assert restored.safe_to_retry is False
 
 
+def test_remote_ray_exception_preserves_callback_reconciliation_mode():
+    from vane.runners import CopyOutcomeUnknownError
+
+    original = CopyOutcomeUnknownError(
+        "callback-operation",
+        detail="catalog response was lost",
+        write_mode="callback",
+    )
+
+    restored = pickle.loads(pickle.dumps(RemoteRayException.from_exception(original))).restore()
+
+    assert type(restored) is CopyOutcomeUnknownError
+    assert restored.operation_id == original.operation_id
+    assert restored.write_mode == "callback"
+    assert restored.safe_to_retry is True
+
+
 @pytest.mark.parametrize(
     ("original", "attributes"),
     [

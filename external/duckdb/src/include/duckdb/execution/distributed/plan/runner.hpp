@@ -515,7 +515,7 @@ public:
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a ClientContext"));
 		}
 
-		// ── Step 1: Translate physical plan → pipeline node ──
+		// ── Step 1: Validate extension writes, then translate the physical plan ──
 		auto physical_plan = plan->physical_plan();
 		if (!physical_plan || !physical_plan->HasRoot()) {
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a physical plan root"));
@@ -523,6 +523,23 @@ public:
 		auto extension_write_provider = physical_plan->Root().GetExtensionWriteTaskProvider();
 		unique_ptr<DistributedExtensionWriteInfo> extension_write_info;
 		DistributedWriteOperationContext extension_write_operation;
+		vector<DistributedWriteTaskResult> selected_task_results;
+		bool extension_abort_attempted = false;
+		auto abort_extension_write = [&]() -> string {
+			if (!extension_write_provider || extension_abort_attempted) {
+				return string();
+			}
+			extension_abort_attempted = true;
+			try {
+				extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation,
+				                                                selected_task_results);
+				return string();
+			} catch (const std::exception &ex) {
+				return ex.what();
+			} catch (...) {
+				return "unknown abort failure";
+			}
+		};
 		if (extension_write_provider) {
 			if (physical_plan->Root().type != PhysicalOperatorType::EXTENSION) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
@@ -541,6 +558,18 @@ public:
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    "distributed extension write requires DuckDB auto-commit mode so Vane can own its catalog "
 				    "transaction boundary"));
+			}
+			if (!client_context_->transaction.HasActiveTransaction()) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
+			}
+			try {
+				extension_write_provider->ValidateDistributedWrite(*client_context_, extension_write_operation);
+			} catch (const std::exception &ex) {
+				return DuckDBResult<PlanResult>::err(DuckDBError(ex.what()));
+			} catch (...) {
+				return DuckDBResult<PlanResult>::err(
+				    DuckDBError::external_error("distributed extension write validation threw an unknown exception"));
 			}
 		}
 		auto exec_cfg = plan->execution_config();
@@ -579,13 +608,15 @@ public:
 		if (client_context_ && client_context_->db) {
 			cfg.db = client_context_->db;
 		}
-
 		DuckDBResult<std::shared_ptr<DistributedPipelineNode>> pipeline_res;
 		try {
 			pipeline_res = physical_plan_to_pipeline_node_wrapper(cfg, physical_plan, client_context_.get(),
 			                                                      extension_write_info.get());
 		} catch (const std::exception &ex) {
 			return DuckDBResult<PlanResult>::err(DuckDBError(std::string("Failed to translate plan: ") + ex.what()));
+		} catch (...) {
+			return DuckDBResult<PlanResult>::err(
+			    DuckDBError::external_error("physical plan translation threw an unknown exception"));
 		}
 		if (pipeline_res.is_err()) {
 			return DuckDBResult<PlanResult>::err(pipeline_res.error());
@@ -629,6 +660,9 @@ public:
 				copy_sink_node->copy_sink()->SetOperationIdentity(plan->query_id());
 			} catch (const std::exception &ex) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(ex.what()));
+			} catch (...) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::external_error(
+				    "distributed COPY operation identity assignment threw an unknown exception"));
 			}
 		}
 		if (extension_write_provider) {
@@ -732,8 +766,6 @@ public:
 			}
 		}
 
-		vector<DistributedWriteTaskResult> selected_task_results;
-		bool extension_abort_attempted = false;
 		auto cleanup_copy_output = [&]() -> DuckDBResult<void> {
 			try {
 				if (!copy_sink_node) {
@@ -764,20 +796,13 @@ public:
 				    DuckDBError::io_error("distributed write output cleanup threw an unknown exception"));
 			}
 		};
-		auto abort_extension_write = [&]() -> string {
-			if (!extension_write_provider || extension_abort_attempted) {
-				return string();
+		auto fail_after_copy_cleanup = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
+			auto copy_cleanup_res = cleanup_copy_output();
+			if (copy_cleanup_res.is_err()) {
+				return DuckDBResult<PlanResult>::err(DuckDBError::io_error(StringUtil::Format(
+				    "%s; cleanup failed: %s", primary_error.what(), copy_cleanup_res.error().what())));
 			}
-			extension_abort_attempted = true;
-			try {
-				extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation,
-				                                                selected_task_results);
-				return string();
-			} catch (const std::exception &ex) {
-				return ex.what();
-			} catch (...) {
-				return "unknown abort failure";
-			}
+			return DuckDBResult<PlanResult>::err(primary_error);
 		};
 		auto fail_after_write_cleanup = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
 			auto copy_cleanup_res = cleanup_copy_output();
@@ -824,32 +849,19 @@ public:
 			return fail_after_write_cleanup(primary_error);
 		};
 
-		if (extension_write_provider) {
-			if (!client_context_->transaction.HasActiveTransaction()) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
-				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
-			}
-			try {
-				extension_write_provider->ValidateDistributedWrite(*client_context_, extension_write_operation);
-			} catch (const std::exception &ex) {
-				return fail_after_write_cleanup(DuckDBError(ex.what()));
-			} catch (...) {
-				return fail_after_write_cleanup(
-				    DuckDBError::external_error("distributed extension write validation threw an unknown exception"));
-			}
-		}
-
 		bool streaming_channel_state_installed = false;
+		bool direct_write_lifecycle_may_exist = false;
 		bool execution_may_have_started = false;
 		try {
 			if (copy_sink_node && copy_sink_node->staging_root_base().empty()) {
 				// Persist lifecycle metadata for explicit operator-managed cleanup. Starting a COPY must not age out
 				// other runs: elapsed time alone does not establish that another run is abandoned.
 				auto &fs = FileSystem::GetFileSystem(*client_context_);
+				direct_write_lifecycle_may_exist = true;
 				auto lifecycle_res = WriteDistributedCopyDirectWriteLifecycle(
 				    fs, sink_base_path, copy_sink_node->staging_run_id(), 0, sink_worker_base_path);
 				if (lifecycle_res.is_err()) {
-					return fail_after_write_cleanup(lifecycle_res.error());
+					return fail_after_copy_cleanup(lifecycle_res.error());
 				}
 			}
 
@@ -865,10 +877,9 @@ public:
 			}
 			auto task_executor = std::make_shared<PlanTaskExecutor>(client_context_, execute_status);
 
-			auto self = std::shared_ptr<PlanRunner>(this->shared_from_this());
+			auto self = this->weak_from_this().lock();
 			if (!self) {
-				return DuckDBResult<PlanResult>::err(
-				    DuckDBError("PlanRunner requires shared_ptr ownership; create via std::make_shared"));
+				throw InternalException("PlanRunner requires shared_ptr ownership; create via std::make_shared");
 			}
 			auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
 			auto initial_inputs_ptr = std::make_shared<TaskInputs>(std::move(initial_inputs));
@@ -1102,7 +1113,10 @@ public:
 			if (streaming_channel_state_installed && worker_manager_) {
 				worker_manager_->clear_streaming_results_channel_state();
 			}
-			return fail_after_write_cleanup(execution_error);
+			if (direct_write_lifecycle_may_exist) {
+				return fail_after_copy_cleanup(execution_error);
+			}
+			return DuckDBResult<PlanResult>::err(execution_error);
 		} catch (...) {
 			const auto execution_error =
 			    DuckDBError::external_error("distributed write setup or execution threw an unknown exception");
@@ -1116,7 +1130,10 @@ public:
 			if (streaming_channel_state_installed && worker_manager_) {
 				worker_manager_->clear_streaming_results_channel_state();
 			}
-			return fail_after_write_cleanup(execution_error);
+			if (direct_write_lifecycle_may_exist) {
+				return fail_after_copy_cleanup(execution_error);
+			}
+			return DuckDBResult<PlanResult>::err(execution_error);
 		}
 	}
 

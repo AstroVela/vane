@@ -226,6 +226,16 @@ class _FakeLogicalPlan:
     def idx(self) -> str:
         return self.physical_plan.idx()
 
+    def operation_fingerprint(self) -> str:
+        return repr(
+            (
+                self.physical_plan._plan_id,
+                self.physical_plan._session_id,
+                sorted(self.physical_plan._session_config.items()),
+                getattr(self, "retry_variant", ""),
+            )
+        )
+
     def to_physical_plan(self, _conn, _effective_session_config):
         return self.physical_plan
 
@@ -1630,6 +1640,91 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert plan_calls == 1
 
 
+@pytest.mark.parametrize("evict_terminal", [False, True])
+@pytest.mark.parametrize("fail_reconciliation_once", [False, True])
+def test_query_driver_callback_outcome_unknown_retries_same_plan_identity(
+    monkeypatch,
+    evict_terminal,
+    fail_reconciliation_once,
+):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "callback-write-outcome-unknown"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
+            nonlocal plan_calls
+            plan_calls += 1
+            on_execution_started()
+            if plan_calls == 1:
+                return {
+                    "rows_copied": 3,
+                    "copy_output_committed": False,
+                    "copy_output_outcome_unknown": True,
+                    "copy_output_outcome_error": "catalog commit response was lost",
+                    "extension_write_mode": "callback",
+                }
+            if fail_reconciliation_once and plan_calls == 2:
+                raise RuntimeError("transient callback reconciliation failure")
+            return {
+                **_committed_copy_result(rows_copied=3),
+                "extension_write_mode": "callback",
+            }
+
+    def _teardown(_self, actual_plan_id):
+        assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert drop_fragments is True
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    with pytest.raises(driver.CopyOutcomeUnknownError) as first_error:
+        asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert first_error.value.operation_id == plan_id
+    assert first_error.value.write_mode == "callback"
+    assert first_error.value.safe_to_retry is True
+
+    if evict_terminal:
+        del runner._copy_operation_terminal[plan_id]
+        with pytest.raises(driver.CopyOutcomeUnknownError) as evicted_error:
+            asyncio.run(
+                cls.recover_copy_plan(
+                    runner,
+                    _TEST_RUNTIME_OWNER_ID,
+                    _TEST_SESSION_ID,
+                    plan_id,
+                )
+            )
+        assert evicted_error.value.write_mode == "callback"
+        assert evicted_error.value.safe_to_retry is True
+
+    changed_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    changed_plan.retry_variant = "different-write"
+    with pytest.raises(ValueError, match="cannot be reused for a different logical plan"):
+        asyncio.run(_run_actor_copy_plan(runner, changed_plan))
+
+    if fail_reconciliation_once:
+        with pytest.raises(driver.CopyOutcomeUnknownError) as retry_error:
+            asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+        assert retry_error.value.write_mode == "callback"
+        assert retry_error.value.safe_to_retry is True
+        assert "transient callback reconciliation failure" in retry_error.value.detail
+
+    reconciled = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert reconciled.operation_id == plan_id
+    assert reconciled.result["rows_copied"] == 3
+    assert plan_calls == (3 if fail_reconciliation_once else 2)
+
+
 def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     first_plan_id = "copy-evicted-terminal-first"
@@ -1733,13 +1828,15 @@ def test_query_driver_copy_recovery_timeout_preserves_inflight_write(monkeypatch
             return outcome
 
         operation_task = asyncio.create_task(_finish_copy())
-        runner._copy_operation_identities[operation_id] = (
-            _TEST_RUNTIME_OWNER_ID,
-            _TEST_SESSION_ID,
+        runner._copy_operation_identities[operation_id] = driver._CopyOperationIdentity(
+            owner_id=_TEST_RUNTIME_OWNER_ID,
+            session_id=_TEST_SESSION_ID,
+            plan_fingerprint="test-plan-fingerprint",
         )
         runner._copy_operations_inflight[operation_id] = driver._CopyOperationInFlight(
             owner_id=_TEST_RUNTIME_OWNER_ID,
             session_id=_TEST_SESSION_ID,
+            plan_fingerprint="test-plan-fingerprint",
             task=operation_task,
         )
         try:
@@ -1794,8 +1891,24 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert restored.committed_marker_path == error.committed_marker_path
     assert restored.detail == error.detail
     assert restored.cleanup_warnings == error.cleanup_warnings
+    assert restored.write_mode == ""
     assert restored.safe_to_retry is False
     assert str(restored) == str(error)
+
+
+def test_callback_outcome_unknown_error_preserves_reconciliation_mode_across_serialization():
+    error = driver.CopyOutcomeUnknownError(
+        "unknown-callback-operation",
+        detail="catalog response was lost",
+        write_mode="callback",
+    )
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert restored.operation_id == error.operation_id
+    assert restored.write_mode == "callback"
+    assert restored.safe_to_retry is True
+    assert "reuse this exact operation identity" in str(restored)
 
 
 def test_copy_outcome_unknown_error_is_exported_from_ray_runner_package():
@@ -4473,6 +4586,10 @@ def test_driver_revalidates_physical_plan_session(
         @staticmethod
         def idx():
             return "physical-session-plan"
+
+        @staticmethod
+        def operation_fingerprint():
+            return "physical-session-plan-fingerprint"
 
         @staticmethod
         def session_id():
@@ -9260,6 +9377,54 @@ def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
 
     assert result is expected
     assert calls == ["copy-cleanup-runner-retry"]
+
+
+def test_ray_runner_reuses_explicit_callback_operation_identity(monkeypatch):
+    from vane.runners.ray import runner as runner_module
+
+    captured = {}
+    relation = object()
+
+    class _LogicalPlan:
+        @staticmethod
+        def from_duckdb_relation(actual_relation, operation_id):
+            captured["relation"] = actual_relation
+            captured["operation_id"] = operation_id
+            return _LogicalPlan()
+
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+    class _FakeClient:
+        @staticmethod
+        def run_copy_plan(plan):
+            captured["plan"] = plan
+            return {"copy_operation_id": captured["operation_id"]}
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    ray_runner._client_for_session = lambda session_id: (
+        captured.setdefault("session_id", session_id),
+        _FakeClient(),
+    )[1]
+    monkeypatch.setattr(
+        runner_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: _LogicalPlan,
+    )
+
+    result = ray_runner.run_write(relation, operation_id="stable-callback-operation")
+
+    assert result == {"copy_operation_id": "stable-callback-operation"}
+    assert captured["relation"] is relation
+    assert captured["operation_id"] == "stable-callback-operation"
+    assert captured["session_id"] == "session-a"
+    assert isinstance(captured["plan"], _LogicalPlan)
+
+    with pytest.raises(ValueError, match="operation_id must not be empty"):
+        ray_runner.run_write(relation, operation_id="  ")
+    with pytest.raises(TypeError, match="operation_id must be a string"):
+        ray_runner.run_write(relation, operation_id=1)
 
 
 def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):

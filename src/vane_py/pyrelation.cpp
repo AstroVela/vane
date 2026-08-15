@@ -1142,9 +1142,25 @@ static RunnerForDatabase GetOrCreateRunnerForDB(const shared_ptr<Relation> &rel,
 // Try to dispatch a write relation to the Python runner.
 // Returns true if dispatched, false if this relation should run locally.
 static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py::object &connection_owner,
-                                bool require_ray_auto_commit = false) {
+                                bool require_ray_auto_commit = false, const py::object &operation_id = py::none()) {
+	py::object normalized_operation_id = py::none();
+	if (!operation_id.is_none()) {
+		if (!py::isinstance<py::str>(operation_id)) {
+			throw InvalidInputException("distributed write operation_id must be a string");
+		}
+		auto operation_id_string = operation_id.cast<string>();
+		StringUtil::Trim(operation_id_string);
+		if (operation_id_string.empty()) {
+			throw InvalidInputException("distributed write operation_id must not be empty");
+		}
+		normalized_operation_id = py::str(operation_id_string);
+	}
 	auto runner_type = ResolveRunnerType();
 	if (runner_type == "local-fast") {
+		if (!normalized_operation_id.is_none()) {
+			throw InvalidInputException(
+			    "distributed write operation_id requires a distributed runner, not VANE_RUNNER=local-fast");
+		}
 		return false;
 	}
 	if (runner_type == "ray" && require_ray_auto_commit) {
@@ -1163,7 +1179,11 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	auto py_write_rel = DuckDBPyRelation(write_rel);
 	py_write_rel.SetConnectionOwner(connection_owner);
 	auto py_write_rel_obj = py::cast(std::move(py_write_rel));
-	runner_for_db.runner.attr("run_write")(py_write_rel_obj);
+	if (normalized_operation_id.is_none()) {
+		runner_for_db.runner.attr("run_write")(py_write_rel_obj);
+	} else {
+		runner_for_db.runner.attr("run_write")(py_write_rel_obj, py::arg("operation_id") = normalized_operation_id);
+	}
 	return true;
 }
 
@@ -2019,11 +2039,11 @@ DuckDBPyRelation &DuckDBPyRelation::Execute() {
 	return *this;
 }
 
-void DuckDBPyRelation::InsertInto(const string &table) {
+void DuckDBPyRelation::InsertInto(const string &table, const py::object &operation_id) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
 	auto insert = rel->InsertRel(parsed_info.catalog, parsed_info.schema, parsed_info.name);
-	if (TryDispatchToRunner(insert, connection_owner, true)) {
+	if (TryDispatchToRunner(insert, connection_owner, true, operation_id)) {
 		return;
 	}
 	PyExecuteRelation(insert);

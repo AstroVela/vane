@@ -119,6 +119,16 @@ struct PyLogicalPlan {
 		return query_id_;
 	}
 
+	string operation_fingerprint() const {
+		if (serialized_logical_plan_.empty()) {
+			throw InternalException("PyLogicalPlan missing serialized logical plan");
+		}
+		MD5Context digest;
+		digest.Add("vane-distributed-write-plan:");
+		digest.Add(serialized_logical_plan_);
+		return digest.FinishHex();
+	}
+
 	string session_id() const;
 	py::dict session_config() const;
 	bool has_explicit_s3_credentials() const;

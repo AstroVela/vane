@@ -56,6 +56,9 @@ class _FakeLogicalPlan:
     def idx(self):
         return self._physical_plan.idx()
 
+    def operation_fingerprint(self):
+        return f"test-plan:{self._physical_plan.idx()}"
+
     def session_id(self):
         return _SESSION_ID
 

@@ -118,9 +118,9 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 }
 
 void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &function_name) const {
-	if (!plan || !prepare_bind || !apply_tasks) {
+	if (!plan || !create_worker_bind || !apply_tasks) {
 		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan, "
-		                            "prepare_bind, and apply_tasks",
+		                            "create_worker_bind, and apply_tasks",
 		                            function_name);
 	}
 	if (protocol_version == 0) {
@@ -171,7 +171,7 @@ const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallb
 
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
 	return protocol_version == other.protocol_version && capability == other.capability &&
-	       task_codec == other.task_codec && plan == other.plan && prepare_bind == other.prepare_bind &&
+	       task_codec == other.task_codec && plan == other.plan && create_worker_bind == other.create_worker_bind &&
 	       apply_tasks == other.apply_tasks;
 }
 

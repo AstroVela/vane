@@ -88,6 +88,17 @@ struct PyPhysicalPlanWrapper {
 		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, options);
 	}
 
+	py::object resolve_execution_connection(py::object conn_obj) const {
+		if (!worker_connection_.is_none()) {
+			auto &worker_connection = ExtractPyConnectionWrapper(worker_connection_);
+			if (worker_connection.con.ConnectionIsClosed()) {
+				throw py::value_error("DistributedPhysicalPlan binding connection is closed");
+			}
+			return worker_connection_;
+		}
+		return ResolveConnectionForSnapshot(conn_obj, connection_snapshot_);
+	}
+
 	void apply_udf_actor_handles() {
 		if (udf_actor_handles_.is_none() || !has_root()) {
 			return;
@@ -3948,7 +3959,7 @@ struct PyPhysicalPlanWrapperRunner {
 	py::object execute_native(py::object conn_obj, const PyPhysicalPlanWrapper &plan) {
 		try {
 			auto &mutable_plan = const_cast<PyPhysicalPlanWrapper &>(plan);
-			py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+			py::object exec_conn = plan.resolve_execution_connection(conn_obj);
 			mutable_plan.ensure_connection_snapshot(exec_conn);
 			mutable_plan.apply_udf_actor_handles();
 

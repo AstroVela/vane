@@ -84,6 +84,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/common/algorithm.hpp>
+#include <duckdb/common/crypto/md5.hpp>
 #include <duckdb/parallel/interrupt.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
@@ -651,10 +652,10 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (snapshot.is_none()) {
 			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
 		    }
-		    // Ray workers cache this connection by the snapshot's exact engine and
-		    // extension identity. Always create its DatabaseInstance independently
-		    // from the session bootstrap so an extension loaded for one query cannot
-		    // contaminate another query's exact extension contract.
+		    // Ray workers cache this connection by the snapshot's exact engine,
+		    // extension, and replay-setting identity. Always create its
+		    // DatabaseInstance independently from the session bootstrap so
+		    // database-global state from one query cannot contaminate another.
 		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true);
 	    },
 	    py::arg("connection"), py::arg("query_id"));
@@ -1046,6 +1047,7 @@ void register_ray_bindings(py::module_ &mod) {
 		                }
 	                })
 	    .def("idx", &PyLogicalPlan::idx)
+	    .def("operation_fingerprint", &PyLogicalPlan::operation_fingerprint)
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
@@ -1546,7 +1548,12 @@ void register_ray_bindings(py::module_ &mod) {
 			        PyPhysicalPlanWrapper deferred_exec_plan;
 
 			        try {
-				        py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+				        // A materialized physical plan owns objects bound to the
+				        // DatabaseInstance retained by worker_connection_. Replacing that
+				        // connection here can destroy the bound instance while operators
+				        // still reference it. Deferred worker plans have no retained
+				        // connection and are materialized against conn_obj below.
+				        py::object exec_conn = plan.resolve_execution_connection(conn_obj);
 				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
 				        // Establish the exact extension set before refreshed AWS
 				        // settings can load httpfs into this DatabaseInstance. Replay the

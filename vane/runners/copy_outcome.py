@@ -19,6 +19,7 @@ class CopyOutcomeUnknownError(RuntimeError):
         committed_marker_path: str = "",
         detail: str = "",
         cleanup_warnings: tuple[str, ...] = (),
+        write_mode: str = "",
     ) -> None:
         self.operation_id = str(operation_id)
         self.base_path = str(base_path)
@@ -27,14 +28,20 @@ class CopyOutcomeUnknownError(RuntimeError):
         self.committed_marker_path = str(committed_marker_path)
         self.detail = str(detail)
         self.cleanup_warnings = tuple(str(warning) for warning in cleanup_warnings)
-        self.safe_to_retry = False
+        if not isinstance(write_mode, str):
+            raise TypeError("distributed write mode must be a string")
+        self.write_mode = write_mode.strip().lower()
+        if self.write_mode not in {"", "callback", "file_artifact"}:
+            raise ValueError(f"unsupported distributed write mode: {self.write_mode}")
+        self.safe_to_retry = self.write_mode == "callback"
         super().__init__(self._build_message())
 
     def _build_message(self) -> str:
-        message = (
-            f"COPY outcome is unknown for operation {self.operation_id}; "
-            "refusing to resubmit a potentially committed write"
-        )
+        message = f"COPY outcome is unknown for operation {self.operation_id}"
+        if self.safe_to_retry:
+            message += "; callback reconciliation must reuse this exact operation identity"
+        else:
+            message += "; refusing to resubmit a potentially committed write"
         if self.base_path or self.run_id:
             message += f"; base_path={self.base_path!r}, run_id={self.run_id!r}"
         if self.detail:
@@ -74,13 +81,14 @@ class CopyOutcomeUnknownError(RuntimeError):
             str(result.get("copy_output_committed_marker_path") or ""),
             str(result.get("copy_output_outcome_error") or ""),
             cleanup_warnings,
+            result.get("extension_write_mode") or "",
         )
 
     def __reduce__(
         self,
     ) -> tuple[
         type[CopyOutcomeUnknownError],
-        tuple[str, str, str, str, str, str, tuple[str, ...]],
+        tuple[str, str, str, str, str, str, tuple[str, ...], str],
     ]:
         return CopyOutcomeUnknownError, (
             self.operation_id,
@@ -90,4 +98,5 @@ class CopyOutcomeUnknownError(RuntimeError):
             self.committed_marker_path,
             self.detail,
             self.cleanup_warnings,
+            self.write_mode,
         )

@@ -49,7 +49,7 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
     scan_callbacks.protocol_version = 1;
     scan_callbacks.task_codec = {"iceberg.scan-task", 1};
     scan_callbacks.plan = IcebergPlanScanTasks;
-    scan_callbacks.prepare_bind = IcebergPrepareWorkerBind;
+    scan_callbacks.create_worker_bind = IcebergCreateWorkerBind;
     scan_callbacks.apply_tasks = IcebergApplyScanTasks;
     scan_functions.SetDistributedScanCallbacks(std::move(scan_callbacks));
     // This remains the ordinary DuckDB catalog registration. The loader
@@ -79,7 +79,7 @@ worker:
 - ordinary worker-safe scalar functions, types, casts, and collations use their
   normal DuckDB registrations after the exact extension is loaded;
 - table sources that require distributed partitioning add portable task
-  enumeration, detached bind serialization, and worker task application;
+  enumeration, explicit worker-bind construction, and worker task application;
 - custom write roots add either the fixed file adapter or a worker fragment
   sink plus coordinator commit behavior;
 - replacement scans and parser, planner, and optimizer hooks normally run on
@@ -129,9 +129,11 @@ credential fallback. An extension operation that requires a DuckDB secret on a
 worker is unsupported unless it also accepts credentials through Vane's explicit
 session or connection-setting path. Persistent source databases are opened
 read-only, and exact snapshot databases are retained for the worker lifetime.
-Read-only worker instances let the same source file support isolated exact
-extension identities without sharing a mutable catalog; extension catalog
-commits remain coordinator-only.
+The worker database identity includes the canonical set of replayed settings,
+so snapshots with different global-only setting values never mutate the same
+DatabaseInstance. Read-only worker instances let the same source file support
+isolated exact extension and setting identities without sharing a mutable
+catalog; extension catalog commits remain coordinator-only.
 
 Connection snapshots can contain explicit S3 connection settings, session
 configuration, and executable attachment declarations. They are trusted
@@ -143,12 +145,27 @@ cluster; they are not an untrusted interchange format or a persistence format.
 ### Worker bind serialization
 
 An extension scan must implement both of DuckDB's normal table-function
-`serialize` and `deserialize` callbacks. The coordinator round-trips the bind
-through that normal DuckDB binary DTO path to create an independent worker bind,
-then invokes the distributed `prepare_bind` callback to remove coordinator-only
-task collections. `FunctionData::Copy()` is not part of the distributed scan
-contract. The detached bind is serialized normally when the worker physical
-plan is transported.
+`serialize` and `deserialize` callbacks. Its distributed `create_worker_bind`
+callback constructs a new bind by explicitly selecting only state required by
+worker execution. It must not retain coordinator task collections, catalog or
+client-context pointers, or other mutable process-local state. The returned
+bind is serialized normally when the worker physical plan is transported.
+`FunctionData::Copy()` keeps its ordinary DuckDB meaning and is not used to
+construct this distributed worker bind.
+
+```cpp
+unique_ptr<FunctionData>
+IcebergCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
+    const auto &source = input.bind_data.Cast<IcebergScanBindData>();
+    auto worker = make_uniq<IcebergScanBindData>();
+    worker->snapshot_id = source.snapshot_id;
+    worker->schema = source.schema;
+    worker->projected_columns = source.projected_columns;
+    worker->filters = source.filters;
+    worker->scan_options = source.scan_options;
+    return worker;
+}
+```
 
 After loading the required static extension, each worker resolves the normal
 DuckDB table function from its catalog and calls its `deserialize` callback.
@@ -162,7 +179,7 @@ DuckDB `TableFunction`. It provides the table-function capability protocol
 version, a task codec identity, and three operations:
 
 1. `plan` expands coordinator bind state into elementary opaque task envelopes.
-2. `prepare_bind` removes coordinator-only tasks from the deserialized worker bind.
+2. `create_worker_bind` constructs the minimal task-free worker bind.
 3. `apply_tasks` decodes and installs an assigned subset after worker bind
    deserialization.
 
@@ -215,6 +232,14 @@ cannot override that static contract.
 contract before translation, task selection, or artifact creation. There is no
 mode inference: the physical shape must exactly match the declared mode.
 
+Python relation `insert_into` follows the selected backend strictly. An unset,
+empty, or explicit `VANE_RUNNER=ray` dispatches the INSERT to Ray and requires
+the target to translate to a registered distributed extension write; an
+ordinary DuckDB table target therefore reports an unsupported distributed
+operator instead of executing locally. `VANE_RUNNER=local-fast` selects native
+DuckDB execution as a separate backend. Neither backend falls back to the
+other.
+
 ### File-artifact mode
 
 `FILE_ARTIFACT` is the fixed adapter for extension operators whose single child
@@ -231,8 +256,10 @@ catalog must reference the exact immutable paths produced by workers. Before
 provider finalization, Vane persists a `catalog_commit_pending` lifecycle fence
 so age-based cleanup cannot delete files that a remote catalog may already
 reference. After the owned catalog transaction commits, Vane publishes the
-committed file marker. A retry with the same query identity returns that marker
-without invoking the provider again.
+committed file marker. PlanRunner's replay path for the same query identity
+validates the provider and then returns that marker without invoking worker
+execution or provider finalization again. The Ray driver may instead replay an
+outcome already present in its terminal cache without re-entering PlanRunner.
 
 ### Callback mode
 
@@ -271,14 +298,24 @@ interpret the extension's catalog state. A retry therefore presents the same
 stable operation ID to the provider. `ValidateDistributedWrite` must reconcile
 any durable state from an earlier attempt, and `FinalizeDistributedWrite` must
 be idempotent for that operation, including when an earlier catalog commit
-succeeded but its response was lost.
+succeeded but its response was lost. The explicit retry surface is
+`relation.insert_into(..., operation_id=<previous-id>)`, which forwards to
+`Runner.run_write(..., operation_id=<previous-id>)`. Callback outcome-unknown
+errors permit only that same-ID reconciliation; the Ray driver rejects a
+different logical plan with the same ID while allowing refreshed connection
+credentials to reconcile the same write intent. File-artifact outcome-unknown
+errors remain non-retryable through this surface because their engine-owned
+fence must be resolved first. Once a callback outcome becomes unknown, a failed
+reconciliation attempt that does not establish a definitive commit result
+retains the same-ID reconciliation requirement.
 
 ### Coordinator finalization
 
 Both modes use the same coordinator sequence:
 
 1. Validate the complete provider and worker protocol, passing the stable Vane
-   operation/query ID, before side effects.
+   operation/query ID, before physical source translation, task enumeration, or
+   side effects.
 2. Execute worker sinks and select successful task attempts.
 3. Validate and aggregate their opaque result envelopes.
 4. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
@@ -287,24 +324,32 @@ Both modes use the same coordinator sequence:
 6. Commit through DuckDB's transaction manager.
 7. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
 
-`AbortDistributedWrite` is mandatory. Vane supplies the stable operation ID
-and invokes it once for known pre-commit failures, including cases where no
-result envelope was returned, so the provider must be able to locate
+A Ray-driver terminal cache hit returns the previously recorded outcome and
+does not repeat this coordinator sequence.
+
+`AbortDistributedWrite` is mandatory. Once the current attempt may have
+created worker or file output, Vane supplies the stable operation ID and invokes
+abort once for known pre-commit failures, including cases where no result
+envelope was returned. The provider must therefore be able to locate
 operation-owned artifacts from coordinator state and deterministic identities.
-A catalog commit exception is an unknown
-outcome: Vane retains all opaque or file artifacts and does not call abort.
+Validation, translation, and setup failures before current-attempt output is
+possible do not invoke abort: the same operation ID may name an earlier attempt
+whose durable state must be preserved. A catalog commit exception is an unknown
+outcome, so Vane retains all opaque or file artifacts and does not call abort.
 
 Extension writes require DuckDB auto-commit mode. Vane owns that transaction
 boundary; an explicit caller-managed transaction is rejected before workers
 start because Vane could not safely publish a marker before the caller's later
-commit. File-artifact retries inspect the stable namespace before validation or
-worker scheduling. A valid committed marker returns the persisted result
-without invoking the provider again.
+commit. After provider validation, file-artifact retries inspect the stable
+namespace before worker scheduling. A valid committed marker returns the
+persisted result without invoking provider finalization again.
 
-A worker, validation, provider, or other failure known to precede catalog
-commit rolls back the transaction and invokes explicit cleanup. If the catalog
-commit call itself fails, Vane retains the artifacts and reports an unknown
-outcome: a remote catalog may have committed before its response was lost.
+A worker or provider failure known to precede catalog commit rolls back the
+transaction. Once current-attempt output may exist, that failure also invokes
+explicit cleanup. Failures before that side-effect boundary return without
+aborting durable state. If the catalog commit call itself fails, Vane retains
+the artifacts and reports an unknown outcome: a remote catalog may have
+committed before its response was lost.
 Failure to publish the file-mode marker after a known successful catalog commit
 is also reported as an unknown output-lifecycle outcome because the committed
 catalog transaction cannot be rolled back.
@@ -323,8 +368,9 @@ For distributed table-function scan callbacks:
   ordinary `RegisterFunction` call derive the complete capability identity;
 - emit deterministic task payloads without process-local pointers;
 - implement complete DuckDB bind `serialize`/`deserialize` callbacks and make
-  the deserializer accept detached task state;
-- detach coordinator-only tasks without changing the original bind object;
+  the deserializer accept a task-free worker bind;
+- construct the worker bind by explicitly copying only required portable state;
+  do not retain coordinator tasks, catalog/context pointers, or mutable caches;
 - make subset application idempotent and valid before global scan state starts;
 - keep coordinator task enumeration free of logical query side effects;
 - preserve schema, projection, filters, partitions, and delete semantics after
@@ -400,7 +446,7 @@ distributed tests before an extension is enabled in release builds.
 ## Framework test matrix
 
 The engine-level suite covers scan callback discovery, opaque fat-task payload
-serialization, detached worker bind serde, task subset application,
+serialization, explicit worker bind serde, task subset application,
 empty assignments, schema validation, file and callback write translation,
 write callback execution, binary fragment and artifact envelopes, runtime
 operation/task-attempt identity, pre-write validation, selected-result propagation,

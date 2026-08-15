@@ -52,6 +52,26 @@ def test_logical_plan_pickle_uses_a_versioned_envelope():
     assert restored.to_physical_plan(connection) is not None
 
 
+def test_logical_plan_operation_fingerprint_is_stable_and_plan_specific():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    relation = connection.sql("SELECT i FROM range(4) values_table(i)")
+    first = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "operation-a")
+    repeated = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "operation-b")
+    different = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        connection.sql("SELECT i FROM range(5) values_table(i)"),
+        "operation-a",
+    )
+
+    connection.execute("SET GLOBAL http_proxy_username='refreshed-user'")
+    refreshed_snapshot = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "operation-a")
+
+    assert first.operation_fingerprint() == repeated.operation_fingerprint()
+    assert first.operation_fingerprint() != different.operation_fingerprint()
+    assert first.operation_fingerprint() == refreshed_snapshot.operation_fingerprint()
+    assert pickle.loads(pickle.dumps(first)).operation_fingerprint() == first.operation_fingerprint()
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

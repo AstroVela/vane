@@ -29,6 +29,7 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         "/tmp/vane-worker-snapshot.duckdb",
         False,
         (("threads", "2"),),
+        (),
         "test-source-id",
         (),
         (),
@@ -82,6 +83,7 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
         "duckdb_source_id": "test-source-id",
         "extensions": [],
         "distributed_extension_contracts": [],
+        "settings": [],
     }
     httpfs_snapshot = {
         **base_snapshot,
@@ -142,6 +144,86 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
     assert actor._active_snapshot_execution_cursors == 0
 
 
+def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch):
+    actor_class, actor = _worker_actor()
+    base_snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    proxy_snapshot = {
+        **base_snapshot,
+        "settings": [
+            {
+                "name": "http_proxy_username",
+                "value": "query-a",
+                "input_type": "VARCHAR",
+            }
+        ],
+    }
+    identities = {
+        "default": worker_module._worker_snapshot_database_identity(base_snapshot),
+        "proxy": worker_module._worker_snapshot_database_identity(proxy_snapshot),
+    }
+    assert identities["default"] != identities["proxy"]
+    assert identities["proxy"] == worker_module._worker_snapshot_database_identity(
+        {
+            **base_snapshot,
+            "settings": [
+                {
+                    "name": "HTTP_PROXY_USERNAME",
+                    "value": "query-a",
+                    "input_type": "varchar",
+                }
+            ],
+        }
+    )
+
+    created_connections = []
+
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def close(self):
+            return None
+
+    class ResolvedConnection:
+        def __init__(self, query_id):
+            self.query_id = query_id
+
+        def cursor(self):
+            return Cursor(self)
+
+    def resolve(_connection, query_id):
+        connection = ResolvedConnection(query_id)
+        created_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        worker_module,
+        "_query_worker_snapshot_database_identity",
+        lambda query_id: identities[query_id],
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: resolve,
+    )
+
+    default_cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "default")
+    proxy_cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "proxy")
+
+    assert default_cursor.connection is not proxy_cursor.connection
+    assert len(created_connections) == 2
+    assert len(actor._snapshot_connections) == 2
+
+    actor_class._close_snapshot_execution_cursor(actor, proxy_cursor)
+    actor_class._close_snapshot_execution_cursor(actor, default_cursor)
+    assert actor._active_snapshot_execution_cursors == 0
+
+
 def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
     snapshot = {
         "bootstrap": {
@@ -152,6 +234,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
         "duckdb_source_id": "test-source-id",
         "extensions": [],
         "distributed_extension_contracts": [],
+        "settings": [],
     }
     string_config_snapshot = {
         **snapshot,
@@ -166,7 +249,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
 @pytest.mark.parametrize(
     ("snapshot", "message"),
     [
-        ({"extensions": [], "distributed_extension_contracts": []}, "duckdb_source_id"),
+        ({"extensions": [], "distributed_extension_contracts": [], "settings": []}, "duckdb_source_id"),
         (
             {
                 "duckdb_source_id": "test-source-id",
@@ -175,6 +258,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
                     {"name": "httpfs", "version": "test-version"},
                 ],
                 "distributed_extension_contracts": [],
+                "settings": [],
             },
             "duplicate extension name",
         ),
@@ -190,6 +274,7 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
     database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
         ":memory:",
         False,
+        (),
         (),
         "test-source-id",
         (),
@@ -228,6 +313,7 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
     database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
         ":memory:",
         False,
+        (),
         (),
         "test-source-id",
         (),
