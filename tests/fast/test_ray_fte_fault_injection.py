@@ -154,6 +154,9 @@ class _FteControlFaultActor:
         self.statuses.clear()
         return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
+    def prepare_shutdown(self):
+        """Acknowledge the production worker quiescence handshake."""
+
     def created_requests(self):
         return [
             {

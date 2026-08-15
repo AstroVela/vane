@@ -707,6 +707,8 @@ class FteQueryScheduler:
             while True:
                 callbacks: list[Callable[[], None]] = []
                 barrier_deferred = False
+                event: FteEvent | _FteSchedulerDrainBarrier | None
+                event_handlers: FteEventHandlers | None
                 with self._lock:
                     if not self._events:
                         # Publish idle in the same critical section as the

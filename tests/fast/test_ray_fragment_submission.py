@@ -6677,7 +6677,7 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
     failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
 
 
-def test_duplicate_fte_worker_failure_scheduler_observer_does_not_block_drain(monkeypatch):
+def test_duplicate_fte_worker_failure_scheduler_observer_fences_without_blocking_drain(monkeypatch):
     failed = RayWorkerActorHandle(
         _FakeActor(),
         memory_capacity_bytes=1 << 60,
@@ -6725,12 +6725,63 @@ def test_duplicate_fte_worker_failure_scheduler_observer_does_not_block_drain(mo
         duplicate = executor.submit(drain_event, schedulers[1], events[1])
         try:
             assert duplicate.result(timeout=1.0) == []
+            assert schedulers[1].worker_failure_is_recorded(
+                failed.worker_id,
+                worker_incarnation_id=failed.worker_incarnation_id,
+            )
         finally:
             release_reconciliation.set()
         assert owner.result(timeout=1.0) == []
 
     assert reconciliation_calls == [events[0]]
     failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_duplicate_fte_worker_failure_fences_join_owner_reconciliation(monkeypatch):
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:duplicate-scheduler-reconciliation",
+        manager_instance_id="manager-a",
+    )
+    schedulers = tuple(
+        worker_handle_mod._FTE_SCHEDULERS.get_or_create(f"query-duplicate-reconciliation-{suffix}")
+        for suffix in ("a", "b")
+    )
+    for scheduler in schedulers:
+        failed._bind_fte_scheduler_handlers(scheduler)
+    events = tuple(
+        WorkerFailed(
+            query_id=scheduler.query_id,
+            worker_id=failed.worker_id,
+            worker_incarnation_id=failed.worker_incarnation_id,
+            manager_instance_id=failed.manager_instance_id,
+            error=RuntimeError("planned duplicate failure"),
+        )
+        for scheduler in schedulers
+    )
+    owner = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[0])
+    duplicate = worker_failures_mod.begin_fte_worker_failure_reconciliation(events[1])
+    assert owner is not None and owner.owns_reconciliation
+    assert duplicate is not None and not duplicate.owns_reconciliation
+    reconciled_query_ids = set()
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+
+    def mark_worker_failed(*_args, query_id_filters, **_kwargs):
+        reconciled_query_ids.update(query_id_filters)
+        return []
+
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", mark_worker_failed)
+
+    result = owner.reconcile()
+    owner.complete(None, schedulers=result.schedulers)
+
+    assert reconciled_query_ids == {scheduler.query_id for scheduler in schedulers}
+    assert {scheduler.query_id for scheduler in result.schedulers} == reconciled_query_ids
+    assert duplicate.completion.result(timeout=1.0) is None
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
 
 
 def test_duplicate_fte_worker_failure_replays_reconciliation_error(monkeypatch):
