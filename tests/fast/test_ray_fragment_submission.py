@@ -3791,8 +3791,15 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         "test-s3-identity",
         True,
     )
+    operation_lock = threading.Lock()
+    actor._session_operation_locks = {"session-a": operation_lock}
     actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
+
+    def _get_snapshot_execution_cursor(_connection, _query_id, *, database_identity):
+        assert operation_lock.locked()
+        return cleanup_cursor
+
+    actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
 
     def refresh(config, cached, *, use_session_credentials):
@@ -13913,9 +13920,27 @@ def test_repeated_native_interrupt_barrier_retains_ownership_when_canceled():
 def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
+
+    class _CountingOperationLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.entry_count = 0
+            self.held = False
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.entry_count += 1
+            self.held = True
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            self.held = False
+            self._lock.release()
+
+    operation_lock = _CountingOperationLock()
     actor._session_connections_lock = threading.RLock()
     actor._session_s3_configs = {}
-    actor._session_operation_locks = {}
+    actor._session_operation_locks = {"session-a": operation_lock}
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._shutdown_started = False
     actor._native_execution_condition = threading.Condition()
@@ -14032,7 +14057,32 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         return shared_conn
 
     actor._get_session_conn = _get_session_conn
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
+
+    original_refresh = actor_cls._refresh_session_s3_config_locked
+
+    def _refresh_session_s3_config_locked(
+        session_id,
+        session_config,
+        connection,
+        *,
+        use_session_credentials,
+    ):
+        assert operation_lock.held is True
+        return original_refresh(
+            actor,
+            session_id,
+            session_config,
+            connection,
+            use_session_credentials=use_session_credentials,
+        )
+
+    actor._refresh_session_s3_config_locked = _refresh_session_s3_config_locked
+
+    def _get_snapshot_execution_cursor(connection, _query_id, *, database_identity):
+        assert operation_lock.held is True
+        return connection.cursor()
+
+    actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._get_plan_runner = lambda: _FakePlanRunner()
     plan_object = _FakePlan()
@@ -14106,6 +14156,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "AWS_ACCESS_KEY_ID": "session-a-key",
         "AWS_SECRET_ACCESS_KEY": "session-a-secret",
     }
+    assert operation_lock.entry_count == 1
     assert lifecycle == ["execute", "cursor-close"]
 
 

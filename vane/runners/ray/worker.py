@@ -1918,30 +1918,46 @@ class RayWorkerActor:
     ) -> dict[str, str]:
         operation_lock = self._get_session_operation_lock(session_id)
         with operation_lock:
-            with self._session_connections_lock:
-                if self._shutdown_started:
-                    raise RuntimeError("Ray worker runtime is shutting down")
-                if session_id in self._closed_session_ids:
-                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
-                record = self._session_connections.get(session_id)
-                if record is None or record[1] is not connection:
-                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
-                effective_s3_config = dict(self._session_s3_configs.get(session_id, session_config))
-            effective_s3_config = _refresh_effective_duckdb_s3_config(
+            return self._refresh_session_s3_config_locked(
+                session_id,
                 session_config,
-                effective_s3_config,
+                connection,
                 use_session_credentials=use_session_credentials,
             )
-            with self._session_connections_lock:
-                if self._shutdown_started:
-                    raise RuntimeError("Ray worker runtime is shutting down")
-                if session_id in self._closed_session_ids:
-                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
-                record = self._session_connections.get(session_id)
-                if record is None or record[1] is not connection:
-                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
-                self._session_s3_configs[session_id] = effective_s3_config
-            return effective_s3_config
+
+    def _refresh_session_s3_config_locked(
+        self,
+        session_id: str,
+        session_config: dict[str, str],
+        connection: Any,
+        *,
+        use_session_credentials: bool,
+    ) -> dict[str, str]:
+        """Refresh credentials while the caller holds the session operation lock."""
+        with self._session_connections_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if session_id in self._closed_session_ids:
+                raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+            record = self._session_connections.get(session_id)
+            if record is None or record[1] is not connection:
+                raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+            effective_s3_config = dict(self._session_s3_configs.get(session_id, session_config))
+        effective_s3_config = _refresh_effective_duckdb_s3_config(
+            session_config,
+            effective_s3_config,
+            use_session_credentials=use_session_credentials,
+        )
+        with self._session_connections_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if session_id in self._closed_session_ids:
+                raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+            record = self._session_connections.get(session_id)
+            if record is None or record[1] is not connection:
+                raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+            self._session_s3_configs[session_id] = effective_s3_config
+        return effective_s3_config
 
     def _register_native_query_cleanup_context(
         self,
@@ -2023,18 +2039,17 @@ class RayWorkerActor:
             with self._session_connections_lock:
                 if cleanup_context.session_id in getattr(self, "_session_connections", {}):
                     self._session_s3_configs[cleanup_context.session_id] = effective_s3_config
-
-        database_identity = _query_worker_snapshot_database_identity(
-            cleanup_context.connection_snapshot_query_id,
-            session_id=cleanup_context.session_id,
-            effective_s3_config=effective_s3_config,
-            use_session_credentials=cleanup_context.use_session_credentials,
-        )
-        cleanup_cursor = self._get_snapshot_execution_cursor(
-            self._get_shared_conn(),
-            cleanup_context.connection_snapshot_query_id,
-            database_identity=database_identity,
-        )
+            database_identity = _query_worker_snapshot_database_identity(
+                cleanup_context.connection_snapshot_query_id,
+                session_id=cleanup_context.session_id,
+                effective_s3_config=effective_s3_config,
+                use_session_credentials=cleanup_context.use_session_credentials,
+            )
+            cleanup_cursor = self._get_snapshot_execution_cursor(
+                self._get_shared_conn(),
+                cleanup_context.connection_snapshot_query_id,
+                database_identity=database_identity,
+            )
         try:
             if database_identity.has_static_extension("httpfs"):
                 _configure_duckdb_s3(
@@ -2535,12 +2550,6 @@ class RayWorkerActor:
             session_config,
             use_session_credentials=use_session_credentials,
         )
-        effective_s3_config = self._refresh_session_s3_config(
-            session_id,
-            session_config,
-            conn,
-            use_session_credentials=use_session_credentials,
-        )
         cursor = None
         cursor_registered = False
         worker_log_context = dict(debug_context)
@@ -2550,6 +2559,12 @@ class RayWorkerActor:
         try:
             operation_lock = self._get_session_operation_lock(session_id)
             with operation_lock:
+                effective_s3_config = self._refresh_session_s3_config_locked(
+                    session_id,
+                    session_config,
+                    conn,
+                    use_session_credentials=use_session_credentials,
+                )
                 with self._session_connections_lock:
                     if self._shutdown_started:
                         raise RuntimeError("Ray worker runtime is shutting down")
