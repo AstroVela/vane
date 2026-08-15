@@ -655,16 +655,20 @@ void register_ray_bindings(py::module_ &mod) {
 		    // extension, and replay-setting identity. Always create its
 		    // DatabaseInstance independently from the session bootstrap so
 		    // database-global state from one query cannot contaminate another.
-		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true);
+		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true, true);
 	    },
 	    py::arg("connection"), py::arg("query_id"));
 
 	m.def(
 	    "_register_query_python_replay_state",
-	    [](const string &query_id, const PyPhysicalPlanWrapper &plan) {
+	    [](const string &query_id, PyPhysicalPlanWrapper &plan) {
 		    if (query_id.empty()) {
 			    throw duckdb::InternalException("Query Python replay registration requires a non-empty query_id");
 		    }
+		    // Worker resource settings are owned by the Ray actor allocation, not
+		    // by the source connection. Remove them from every worker-side replay
+		    // before the snapshot is registered or used to resolve a database.
+		    plan.connection_snapshot_ = PrepareWorkerConnectionSnapshot(plan.connection_snapshot_);
 		    // The resource query owns this lifecycle. A retried FTE task can carry a
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,

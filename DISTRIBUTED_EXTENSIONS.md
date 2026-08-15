@@ -326,6 +326,11 @@ Both modes use the same coordinator sequence:
 
 A Ray-driver terminal cache hit returns the previously recorded outcome and
 does not repeat this coordinator sequence.
+The driver also retains a lightweight operation-ID-to-plan-fingerprint
+tombstone until that driver exits. The fingerprint survives session closure and
+terminal-result eviction. Detaching an owner may discard result payloads and
+ownership records, but it never makes the operation ID available to a different
+write intent while another client keeps the driver alive.
 
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
 created worker or file output, Vane supplies the stable operation ID and invokes

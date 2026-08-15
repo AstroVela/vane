@@ -1551,6 +1551,10 @@ class RayWorkerActor:
         conn.execute("SET allow_persistent_secrets=false")
         _configure_ray_worker_conn(conn, self._duckdb_memory_bytes)
 
+    def _configure_snapshot_conn(self, conn: Any) -> None:
+        """Apply actor-owned resource limits to an isolated snapshot database."""
+        _configure_ray_worker_conn(conn, self._duckdb_memory_bytes)
+
     def _get_shared_conn(self) -> Any:
         """Return the shared DuckDB connection, creating it lazily on first use.
 
@@ -1604,6 +1608,20 @@ class RayWorkerActor:
                     connection = cast(Any, resolve(bootstrap_connection, str(connection_snapshot_query_id)))
                     if connection is bootstrap_connection:
                         raise RuntimeError("non-default worker snapshot unexpectedly reused the bootstrap connection")
+                    try:
+                        self._configure_snapshot_conn(connection)
+                    except BaseException as config_error:
+                        close = getattr(connection, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except BaseException as close_error:
+                                raise RuntimeError(
+                                    "worker snapshot configuration failed and its isolated "
+                                    "DuckDB connection could not be closed: "
+                                    f"{type(close_error).__name__}: {close_error}"
+                                ) from config_error
+                        raise
                     snapshot_connections[database_identity] = connection
                 return connection.cursor()
         except BaseException:

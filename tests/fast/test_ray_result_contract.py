@@ -1112,6 +1112,9 @@ def test_query_driver_run_copy_plan_passes_distributed_physical_plan_wrapper(mon
     assert outcome.result["copy_write_state"] == "committed"
     assert outcome.result["copy_cleanup_state"] == "complete"
     assert outcome.final_progress_snapshot == {"query_id": "copy-plan", "state": "FINISHED"}
+    assert runner._copy_operation_fingerprints == {
+        "copy-plan": logical_plan.operation_fingerprint(),
+    }
     assert captured["plan"] is physical_plan
     assert captured["conn"] is runner._test_session_connection.cursors[-1]
     assert captured["actor_init_thread"].startswith("vane-driver-native")
@@ -1723,6 +1726,55 @@ def test_query_driver_callback_outcome_unknown_retries_same_plan_identity(
     assert reconciled.operation_id == plan_id
     assert reconciled.result["rows_copied"] == 3
     assert plan_calls == (3 if fail_reconciliation_once else 2)
+
+
+def test_query_driver_owner_cleanup_retains_copy_fingerprint_tombstone():
+    cls, runner = _make_local_query_driver_actor()
+    operation_id = "detached-owner-copy-operation"
+    original_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(operation_id))
+    plan_fingerprint = original_plan.operation_fingerprint()
+    cls._ensure_copy_operation_state(runner)
+    runner._copy_operation_fingerprints[operation_id] = plan_fingerprint
+    runner._copy_operation_identities[operation_id] = driver._CopyOperationIdentity(
+        owner_id=_TEST_RUNTIME_OWNER_ID,
+        session_id=_TEST_SESSION_ID,
+        plan_fingerprint=plan_fingerprint,
+    )
+    runner._copy_operation_terminal[operation_id] = driver._CopyOperationTerminal(
+        owner_id=_TEST_RUNTIME_OWNER_ID,
+        session_id=_TEST_SESSION_ID,
+        plan_fingerprint=plan_fingerprint,
+        outcome=driver.CopyPlanOutcome(
+            result=_committed_copy_result(),
+            final_progress_snapshot=None,
+            operation_id=operation_id,
+        ),
+    )
+
+    next_owner = "next-runtime-owner"
+    runner._client_ids.add(next_owner)
+    runner._sessions[_TEST_SESSION_ID] = driver._DriverSession(
+        owner_id=next_owner,
+        config=dict(_TEST_SESSION_CONFIG),
+        connection=runner._duckdb_conn.cursor(),
+        s3_config={},
+    )
+    changed_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(operation_id))
+    changed_plan.retry_variant = "different-write"
+
+    with pytest.raises(PermissionError, match="does not belong"):
+        asyncio.run(cls.run_copy_plan(runner, next_owner, _TEST_SESSION_ID, changed_plan))
+
+    cls._discard_copy_operation_state_for_owner(runner, _TEST_RUNTIME_OWNER_ID)
+
+    assert operation_id not in runner._copy_operation_identities
+    assert runner._copy_operation_terminal.get(operation_id) is None
+    assert runner._copy_operation_fingerprints == {operation_id: plan_fingerprint}
+
+    with pytest.raises(ValueError, match="cannot be reused for a different logical plan"):
+        asyncio.run(cls.run_copy_plan(runner, next_owner, _TEST_SESSION_ID, changed_plan))
+    with pytest.raises(driver.CopyOutcomeUnknownError, match=operation_id):
+        asyncio.run(cls.run_copy_plan(runner, next_owner, _TEST_SESSION_ID, original_plan))
 
 
 def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):

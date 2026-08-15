@@ -1589,6 +1589,10 @@ class RayQueryDriverActor:
         # for the owner's lifetime. Only a callback UNKNOWN record explicitly
         # authorizes same-plan reconciliation after its payload is evicted.
         self._copy_operation_identities: dict[str, _CopyOperationIdentity] = {}
+        # An explicit operation ID is global to the extension commit protocol.
+        # Keep its plan fingerprint for the complete driver lifetime so owner
+        # cleanup can never make the ID available to a different write intent.
+        self._copy_operation_fingerprints: dict[str, str] = {}
         self._copy_cleanup_tasks: dict[str, asyncio.Task[CopyPlanOutcome]] = {}
         self._driver_handle = ray.get_runtime_context().current_actor
         # Avoid referencing C++ types at import time; store opaque plan objects and
@@ -6697,6 +6701,8 @@ class RayQueryDriverActor:
             self._copy_operation_terminal = BoundedReplayMap(capacity=_COPY_OPERATION_REPLAY_CAPACITY)
         if not isinstance(getattr(self, "_copy_operation_identities", None), dict):
             self._copy_operation_identities = {}
+        if not isinstance(getattr(self, "_copy_operation_fingerprints", None), dict):
+            self._copy_operation_fingerprints = {}
         if not isinstance(getattr(self, "_copy_cleanup_tasks", None), dict):
             self._copy_cleanup_tasks = {}
 
@@ -6932,6 +6938,7 @@ class RayQueryDriverActor:
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
         plan_fingerprint = self._copy_plan_fingerprint(plan)
+        retained_fingerprint = self._copy_operation_fingerprints.get(operation_id)
         retry_callback_write = False
         terminal = self._copy_operation_terminal.get(operation_id)
         if terminal is not None:
@@ -6989,6 +6996,11 @@ class RayQueryDriverActor:
             if not retry_callback_write:
                 raise CopyOutcomeUnknownError(operation_id)
         else:
+            if retained_fingerprint is not None:
+                if retained_fingerprint != plan_fingerprint:
+                    raise ValueError(f"COPY operation {operation_id} cannot be reused for a different logical plan")
+                raise CopyOutcomeUnknownError(operation_id)
+            self._copy_operation_fingerprints[operation_id] = plan_fingerprint
             self._copy_operation_identities[operation_id] = _CopyOperationIdentity(
                 owner_id=owner_key,
                 session_id=session_key,

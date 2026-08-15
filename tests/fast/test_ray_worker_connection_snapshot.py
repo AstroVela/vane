@@ -20,6 +20,7 @@ def _worker_actor():
     actor._shutdown_started = False
     actor._snapshot_connections = {}
     actor._snapshot_connections_lock = threading.Lock()
+    actor._configure_snapshot_conn = lambda _connection: None
     return actor_class, actor
 
 
@@ -36,6 +37,7 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     )
     cursors = []
     resolve_calls = []
+    lifecycle = []
 
     class Cursor:
         def close(self):
@@ -43,12 +45,20 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
 
     class ResolvedConnection:
         def cursor(self):
+            lifecycle.append("cursor")
             cursor = Cursor()
             cursors.append(cursor)
             return cursor
 
     bootstrap_connection = object()
     resolved_connection = ResolvedConnection()
+    configured_connections = []
+
+    def configure(connection):
+        configured_connections.append(connection)
+        lifecycle.append("configure")
+
+    actor._configure_snapshot_conn = configure
     monkeypatch.setattr(
         worker_module,
         "_query_worker_snapshot_database_identity",
@@ -60,8 +70,9 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         lambda name, *, hint: (
             lambda connection, query_id: (
                 resolve_calls.append((connection, query_id)),
+                lifecycle.append("resolve"),
                 resolved_connection,
-            )[1]
+            )[2]
         ),
     )
 
@@ -71,9 +82,58 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     assert first is cursors[0]
     assert second is cursors[1]
     assert resolve_calls == [(bootstrap_connection, "query-a")]
+    assert configured_connections == [resolved_connection]
+    assert lifecycle == ["resolve", "configure", "cursor", "cursor"]
     assert actor._snapshot_connections == {database_identity: resolved_connection}
     actor_class._close_snapshot_execution_cursor(actor, second)
     actor_class._close_snapshot_execution_cursor(actor, first)
+    assert actor._active_snapshot_execution_cursors == 0
+
+
+def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypatch):
+    actor_class, actor = _worker_actor()
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (),
+        (),
+    )
+
+    class ResolvedConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        def cursor(self):
+            raise AssertionError("cursor must not be created after configuration failure")
+
+    resolved_connection = ResolvedConnection()
+
+    def fail_configuration(_connection):
+        raise RuntimeError("snapshot configuration failed")
+
+    actor._configure_snapshot_conn = fail_configuration
+    monkeypatch.setattr(
+        worker_module,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id: database_identity,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot configuration failed"):
+        actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
+
+    assert resolved_connection.closed is True
+    assert actor._snapshot_connections == {}
     assert actor._active_snapshot_execution_cursors == 0
 
 

@@ -457,13 +457,23 @@ def test_connection_snapshot_does_not_transport_duckdb_secrets():
     ).fetchone() == (0,)
 
 
-def test_worker_nondefault_snapshot_reuses_database():
+def test_worker_nondefault_snapshot_reuses_database(monkeypatch):
     from vane.runners.ray import worker as worker_module
 
     ray_cxx = _require_ray_cxx()
     query_id = "snapshot-nondefault-worker-database"
     source_connection = vane.connect(":memory:", config={"threads": "2"})
+    source_connection.execute("SET threads=3")
+    source_connection.execute("SET memory_limit='1GB'")
+    source_connection.execute("SET local_exchange_buffer_bytes='64MB'")
+    source_connection.execute("SET local_exchange_streaming=false")
+    source_connection.execute("SET arrow_large_buffer_size=false")
     source_connection.execute("SET allow_persistent_secrets=false")
+    source_memory_limit = source_connection.execute("SELECT current_setting('memory_limit')").fetchone()
+    source_exchange_buffer = source_connection.execute(
+        "SELECT current_setting('local_exchange_buffer_bytes')"
+    ).fetchone()
+    monkeypatch.setenv("VANE_DUCKDB_THREADS", "1")
     bootstrap_connection = vane.connect()
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_class)
@@ -474,19 +484,53 @@ def test_worker_nondefault_snapshot_reuses_database():
     actor._closing_native_queries = set()
     actor._closing_native_tasks = set()
     actor._shutdown_started = False
+    actor._duckdb_memory_bytes = 256 * 1024**2
     first_cursor = None
     second_cursor = None
     try:
         physical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
-            source_connection.sql("SELECT 1 AS value"),
-            query_id,
+            source_connection.sql("SELECT 1 AS value"), query_id
         ).to_physical_plan(source_connection)
-        assert ray_cxx._register_query_python_replay_state(query_id, physical_plan) is True
+        worker_plan = pickle.loads(pickle.dumps(physical_plan))
+        assert ray_cxx._register_query_python_replay_state(query_id, worker_plan) is True
+        worker_snapshot = ray_cxx._lookup_query_connection_snapshot(query_id)
+        worker_setting_names = {setting["name"].lower() for setting in worker_snapshot["settings"]}
+        assert worker_setting_names.isdisjoint(
+            {
+                "max_memory",
+                "memory_limit",
+                "threads",
+                "worker_threads",
+                "local_exchange_streaming",
+                "local_exchange_buffer_bytes",
+                "arrow_large_buffer_size",
+            }
+        )
 
         first_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
         second_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
         assert len(actor._snapshot_connections) == 1
         assert first_cursor.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
+        configured_memory_limit = first_cursor.execute("SELECT current_setting('memory_limit')").fetchone()
+        configured_exchange_buffer = first_cursor.execute(
+            "SELECT current_setting('local_exchange_buffer_bytes')"
+        ).fetchone()
+        assert configured_memory_limit != source_memory_limit
+        assert configured_exchange_buffer != source_exchange_buffer
+        assert first_cursor.execute("SELECT current_setting('threads')").fetchone() == (1,)
+        assert first_cursor.execute("SELECT current_setting('local_exchange_streaming')").fetchone() == (True,)
+        assert first_cursor.execute("SELECT current_setting('arrow_large_buffer_size')").fetchone() == (True,)
+
+        result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(first_cursor, worker_plan)
+        assert _table_from_native_result(result).column(0).to_pylist() == [1]
+        assert first_cursor.execute("SELECT current_setting('memory_limit')").fetchone() == configured_memory_limit
+        assert (
+            first_cursor.execute("SELECT current_setting('local_exchange_buffer_bytes')").fetchone()
+            == configured_exchange_buffer
+        )
+        assert first_cursor.execute("SELECT current_setting('threads')").fetchone() == (1,)
+        assert first_cursor.execute("SELECT current_setting('local_exchange_streaming')").fetchone() == (True,)
+        assert first_cursor.execute("SELECT current_setting('arrow_large_buffer_size')").fetchone() == (True,)
 
         first_cursor.execute("CREATE TABLE cached_snapshot_table AS SELECT 42 AS value")
         assert second_cursor.execute("SELECT value FROM cached_snapshot_table").fetchall() == [(42,)]
@@ -504,7 +548,7 @@ def test_worker_nondefault_snapshot_reuses_database():
         source_connection.close()
 
 
-def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_path):
+def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_path, monkeypatch):
     from vane.runners.ray import worker as worker_module
 
     ray_cxx = _require_ray_cxx()
@@ -539,6 +583,8 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
     actor._native_execution_condition = threading.Condition()
     actor._active_snapshot_execution_cursors = 0
     actor._shutdown_started = False
+    actor._duckdb_memory_bytes = 256 * 1024**2
+    monkeypatch.setenv("VANE_DUCKDB_THREADS", "1")
     bootstrap_connection = vane.connect()
     first_cursor = None
     second_cursor = None
@@ -559,13 +605,13 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
         assert _table_from_native_result(second_result).column(0).to_pylist() == [42]
         assert first_cursor.execute("SELECT current_setting('access_mode'), current_setting('threads')").fetchone() == (
             "read_only",
-            2,
+            1,
         )
         assert second_cursor.execute(
             "SELECT current_setting('access_mode'), current_setting('threads')"
         ).fetchone() == (
             "read_only",
-            3,
+            1,
         )
         assert first_cursor.execute("SELECT * FROM snapshot_items").fetchall() == [(42,)]
         assert second_cursor.execute("SELECT * FROM snapshot_items").fetchall() == [(42,)]

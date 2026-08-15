@@ -203,7 +203,14 @@ static bool IsSecretPersistenceSetting(const string &lower_name) {
 	       lower_name == "secret_directory";
 }
 
-static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets) {
+static bool IsWorkerResourceSetting(const string &lower_name) {
+	return lower_name == "max_memory" || lower_name == "memory_limit" || lower_name == "threads" ||
+	       lower_name == "worker_threads" || lower_name == "local_exchange_streaming" ||
+	       lower_name == "local_exchange_buffer_bytes" || lower_name == "arrow_large_buffer_size";
+}
+
+static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets,
+                                        bool remove_worker_resource_settings = false) {
 	py::dict sanitized;
 	for (auto item : config) {
 		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
@@ -212,6 +219,9 @@ static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_per
 			continue;
 		}
 		if (disable_persistent_secrets && IsSecretPersistenceSetting(name)) {
+			continue;
+		}
+		if (remove_worker_resource_settings && IsWorkerResourceSetting(name)) {
 			continue;
 		}
 		sanitized[item.first] = item.second;
@@ -370,6 +380,33 @@ static py::object NormalizeBootstrapSnapshot(const py::dict &bootstrap_obj) {
 	return bootstrap;
 }
 
+static py::object PrepareWorkerConnectionSnapshot(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		return snapshot_obj;
+	}
+	auto snapshot = CopyPyDict(snapshot_obj.cast<py::dict>());
+	auto settings_key = py::str("settings");
+	if (!snapshot.contains(settings_key) || !py::isinstance<py::list>(snapshot[settings_key])) {
+		return snapshot;
+	}
+
+	py::list worker_settings;
+	for (auto item : snapshot[settings_key].cast<py::list>()) {
+		if (py::isinstance<py::dict>(item)) {
+			auto setting = py::reinterpret_borrow<py::dict>(item);
+			if (setting.contains(py::str("name")) && py::isinstance<py::str>(setting[py::str("name")])) {
+				auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
+				if (IsWorkerResourceSetting(name)) {
+					continue;
+				}
+			}
+		}
+		worker_settings.append(item);
+	}
+	snapshot[settings_key] = std::move(worker_settings);
+	return snapshot;
+}
+
 static bool PythonObjectsEqual(const py::handle &lhs, const py::handle &rhs) {
 	int compare_result = PyObject_RichCompareBool(lhs.ptr(), rhs.ptr(), Py_EQ);
 	if (compare_result < 0) {
@@ -413,7 +450,8 @@ static bool SnapshotHasAttachedDatabases(const py::object &snapshot_obj) {
 }
 
 static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
-                                                        bool force_file_read_only = false) {
+                                                        bool force_file_read_only = false,
+                                                        bool remove_worker_resource_settings = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		py::dict config;
 		config[py::str("allow_persistent_secrets")] = py::str("false");
@@ -437,7 +475,8 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 		bootstrap_config = CopyPyDict(bootstrap[py::str("config")].cast<py::dict>());
 	}
 	const auto disable_persistent_secrets = !use_instance_cache || in_memory_database;
-	auto connection_config = SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets);
+	auto connection_config =
+	    SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets, remove_worker_resource_settings);
 	auto worker_file_read_only = force_file_read_only && !in_memory_database;
 	if (worker_file_read_only) {
 		connection_config = ForceReadOnlyAccessMode(connection_config);
@@ -448,7 +487,7 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	        ? DuckDBPyConnection::Connect(py::str(database), connection_read_only, connection_config)
 	        : DuckDBPyConnection::ConnectUncached(py::str(database), connection_read_only, connection_config);
 	// Keep the source bootstrap identity for connection matching even though
-	// isolated-instance security and worker file access settings are forced.
+	// isolated-instance security, actor resources, and worker file access are forced.
 	connection->SetConnectionBootstrapConfig(database, source_read_only, bootstrap_config);
 	return py::cast(std::move(connection));
 }
