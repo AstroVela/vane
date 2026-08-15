@@ -29,7 +29,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import inspect
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -132,11 +135,62 @@ def _provider_is_loop_bound(provider: Any, method_name: str) -> bool:
 
 _OnError = Literal["raise", "ignore"]
 
+logger = logging.getLogger(__name__)
+
 
 def _validate_on_error(on_error: object) -> _OnError:
     if not isinstance(on_error, str) or on_error not in ("raise", "ignore"):
         raise ValueError("on_error must be 'raise' or 'ignore'")
     return cast(_OnError, on_error)
+
+
+def _log_substituted_failure(exc: Exception, *, on_error: _OnError, attempts: int | None = None) -> None:
+    """Record one bounded WARNING when a provider failure is replaced with NULL.
+
+    Called at each site that swallows a provider error and yields NULL under
+    ``on_error='ignore'`` — including the native vLLM executor, whose ``"null"``
+    policy is the lowered form of ``'ignore'`` (see the mapping in
+    ``vane/ai/providers/vllm.py``); a no-op under ``'raise'`` so callers cannot
+    log a failure they are about to re-raise. ``attempts`` is the number of tries made
+    when the caller is a retry loop (omitted where no attempt count is
+    meaningful). Only the exception class, its sanitized numeric-status summary,
+    and that count are emitted — never prompt text, row payloads, option
+    mappings, credentials, or a traceback (vane#105) — so a silent data
+    degradation becomes observable without leaking sensitive input.
+    """
+    if on_error == "raise":
+        return
+    summary = _safe_original_error_summary(exc)
+    if attempts is not None:
+        logger.warning(
+            "vane.ai substituted NULL after %d attempt(s) for a failed provider call: %s",
+            attempts,
+            summary,
+        )
+    else:
+        logger.warning("vane.ai substituted NULL for a failed provider call: %s", summary)
+
+
+# Sentinel a retry-helper caller can pass as ``default`` to tell an
+# already-logged substituted failure apart from a genuine provider NULL —
+# the two must not be conflated, or a NULL that fails downstream result
+# validation would be swallowed without its own warning.
+_SUBSTITUTED_FAILURE = object()
+
+
+def _rebuild_retry_after_error(args: tuple[Any, ...], state: dict[str, Any]) -> RetryAfterError:
+    """Reconstruct a pickled :class:`RetryAfterError` from its sanitized state.
+
+    The constructor derives the message and status attributes from an
+    ``original`` exception, so feeding a pickled message back through it would
+    misassign the message string to ``retry_after`` and require re-transporting
+    the original provider error — defeating the sanitization. Rebuild the
+    instance directly from its already-sanitized state instead.
+    """
+    exc = RetryAfterError.__new__(RetryAfterError)
+    exc.args = args
+    exc.__dict__.update(state)
+    return exc
 
 
 class RetryAfterError(Exception):
@@ -149,19 +203,35 @@ class RetryAfterError(Exception):
     falls back to exponential backoff (see :func:`_retry_wait_seconds`).
     """
 
-    def __init__(self, retry_after: float, original: Exception | None = None) -> None:
+    status_code: int  # normalized HTTP status; absent when never discovered
+
+    def __init__(self, retry_after: float, original: Exception | None = None, status: int | None = None) -> None:
         self.retry_after = retry_after
         if original is None:
             super().__init__("RetryAfterError")
-            return
-        super().__init__(_safe_original_error_summary(original))
-        for name in ("status_code", "status", "code"):
-            try:
-                value = getattr(original, name, None)
-            except Exception:
-                continue
-            if type(value) is int and -999_999 <= value <= 999_999:
-                setattr(self, name, value)
+        else:
+            super().__init__(_safe_original_error_summary(original))
+            for name in ("status_code", "status", "code"):
+                try:
+                    value = getattr(original, name, None)
+                except Exception:
+                    continue
+                if type(value) is int and -999_999 <= value <= 999_999:
+                    setattr(self, name, value)
+        if status is not None:
+            # A status discovered only on the original's attached response is
+            # not a direct attribute, so the whitelist above cannot see it;
+            # the caller's normalized discovery wins over any direct copy.
+            self.status_code = status
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The default BaseException reduction rebuilds via ``__init__(*self.args)``,
+        # which feeds the sanitized message in as ``retry_after`` and regenerates
+        # a generic message — losing the summary across a pickle boundary (Ray
+        # worker -> driver). Rebuild from the already-sanitized instance state
+        # (numeric ``retry_after`` plus whitelisted status attributes) without
+        # re-running constructor sanitization or resurrecting the original error.
+        return (_rebuild_retry_after_error, (self.args, dict(self.__dict__)))
 
 
 def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
@@ -239,6 +309,101 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     return False
 
 
+_RATE_LIMIT_STATUS_CODES = frozenset({429, 503})
+_DEFAULT_RETRY_AFTER_SECONDS = 5.0
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    """Discover an HTTP status from a provider SDK error.
+
+    Providers surface the status differently — OpenAI/Anthropic expose
+    ``status_code``, Google exposes ``code``, and some attach it to the
+    response — so probe the common locations in a stable order.
+    """
+    for status in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+        getattr(getattr(exc, "response", None), "status", None),
+    ):
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _utcnow() -> datetime.datetime:
+    """Current UTC time; a seam so fixed-clock tests can pin HTTP-date parsing."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _retry_after_http_date_delay(raw: str) -> float | None:
+    """Seconds until an HTTP-date ``Retry-After`` value, or ``None`` when the
+    value is not a parseable date.
+
+    A date already in the past means "retry immediately", so it clamps to zero
+    rather than being rejected as malformed.
+    """
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        # RFC 5322 parses a "-0000" offset to a naive datetime; HTTP-dates are
+        # always GMT, so interpret it as UTC.
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - _utcnow()).total_seconds())
+
+
+def _parse_retry_after_header(exc: Exception) -> float | None:
+    """Return a usable ``Retry-After`` delay from a provider error's response.
+
+    RFC 9110 permits either delay-seconds or an HTTP-date; both are accepted,
+    a date being converted to the remaining delay. Returns ``None`` when no
+    response, no header, or a malformed value is present. A negative, NaN, or
+    infinite delay-seconds header (all parseable by ``float()``, e.g. ``"-1"``,
+    ``"nan"``, ``"1e999"``) is treated as malformed and rejected so it never
+    reaches a retry sleep that would raise or hang (issue #469).
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None) or {}
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        date_delay = _retry_after_http_date_delay(raw) if isinstance(raw, str) else None
+        if date_delay is None:
+            return None
+        parsed = date_delay
+    if math.isfinite(parsed) and parsed >= 0:
+        return parsed
+    return None
+
+
+def _retry_after_error(exc: Exception) -> RetryAfterError | None:
+    """Build a :class:`RetryAfterError` for a rate-limited/unavailable provider
+    error, or ``None`` when the error does not qualify.
+
+    Shared by every HTTP provider (issue #148) so 429/503 retry timing is
+    uniform: the server-requested ``Retry-After`` is honoured when present and
+    usable, otherwise a default wait applies. The returned error carries the
+    original for its sanitized summary and status attributes only.
+    """
+    status = _provider_status_code(exc)
+    if status not in _RATE_LIMIT_STATUS_CODES:
+        return None
+    retry_after = _parse_retry_after_header(exc)
+    if retry_after is None:
+        retry_after = _DEFAULT_RETRY_AFTER_SECONDS
+    return RetryAfterError(retry_after=retry_after, original=exc, status=status)
+
+
 def _retry_call(
     fn: Any,
     *args: Any,
@@ -267,7 +432,9 @@ def _retry_call(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -304,6 +471,7 @@ def _retry_call(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 
@@ -325,7 +493,9 @@ async def _retry_call_async(
     """
     _validate_on_error(on_error)
     last_exc: Exception | None = None
+    attempts = 0
     for attempt in range(1 + max(0, max_retries)):
+        attempts = attempt + 1
         wait: float | None = None
         try:
             result = fn(*args, **kwargs)
@@ -351,6 +521,7 @@ async def _retry_call_async(
     assert last_exc is not None
     if on_error == "raise":
         raise last_exc
+    _log_substituted_failure(last_exc, on_error=on_error, attempts=attempts)
     return default
 
 
@@ -778,9 +949,10 @@ class _EmbedTextBatch:
                 embedding = self._coerce_embedding(value)
                 if normalize:
                     embedding = self._coerce_embedding(_normalize_embedding(embedding))
-            except _ProviderResultError:
+            except _ProviderResultError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 embeddings.append(None)
                 continue
             embeddings.append(embedding)
@@ -829,9 +1001,10 @@ class _EmbedTextBatch:
             return self._invoke_embedder(texts)
         except _MissingAsyncRuntimeError:
             raise
-        except ProviderCapabilityError:
+        except ProviderCapabilityError as exc:
             if self._on_error == "raise":
                 raise
+            _log_substituted_failure(exc, on_error=self._on_error)
             return [None] * len(texts)
         except Exception:
             if self._on_error == "raise":
@@ -839,13 +1012,17 @@ class _EmbedTextBatch:
 
         # A batch-level failure does not identify the failing row. Isolate the
         # inputs so on_error="ignore" nulls only rows that fail independently.
+        # The batch error itself is not logged here: each isolated row that
+        # actually fails logs its own substitution below (a row that recovers
+        # on isolation is not a substitution and must stay silent).
         isolated: list[np.ndarray | None] = []
         for text in texts:
             try:
                 isolated.append(self._invoke_embedder([text])[0])
             except _MissingAsyncRuntimeError:
                 raise
-            except Exception:
+            except Exception as exc:
+                _log_substituted_failure(exc, on_error=self._on_error)
                 isolated.append(None)
         return isolated
 
@@ -1104,6 +1281,7 @@ class _PromptBatch:
                     row_messages[index],
                     max_retries=max_retries,
                     on_error=on_error,
+                    default=_SUBSTITUTED_FAILURE,
                     on_awaitable=self._mark_loop_bound,
                 )
             except ProviderCapabilityError as exc:
@@ -1117,11 +1295,16 @@ class _PromptBatch:
             if provider_error is not None:
                 provider, model = _descriptor_identity(self._descriptor)
                 raise _safe_provider_execution_error(provider, model, "Prompt execution", provider_error) from None
+            if result is _SUBSTITUTED_FAILURE:
+                # The retry helper already logged this substitution before
+                # returning the sentinel; surface it as a NULL row.
+                return None
             try:
                 return self._validate_result(result)
-            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError):
+            except (_ProviderResultError, OutputValidationError, RawResponseSerializationError) as exc:
                 if on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=on_error)
                 return None
 
         async def run_all(indices: list[int]) -> list[str | None]:
@@ -1179,9 +1362,10 @@ class _ValidateStructuredOutputBatch:
                 continue
             try:
                 results.append(self._return_format.validate_json(raw_text))
-            except OutputValidationError:
+            except OutputValidationError as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 results.append(None)
         return pa.table({self._output_column: pa.array(results, type=pa.string())})
 

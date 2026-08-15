@@ -22,6 +22,7 @@ from typing import Any, Callable, overload
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
+from vane.ai.functions import _log_substituted_failure
 from vane.ai.provider import (
     _safe_provider_execution_error,
     _SafeProviderError,
@@ -452,6 +453,7 @@ class LocalVLLMExecutor(VLLMExecutor):
                             self.error_message = error_message
                 self._notify_state_change(force=True)
             else:
+                self._log_null_substitution(exc)
                 if executor_id:
                     self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
                 else:
@@ -467,6 +469,16 @@ class LocalVLLMExecutor(VLLMExecutor):
                     self._per_executor_running_task_count[executor_id] = max(0, remaining)
             self._notify_state_change()
 
+    def _log_null_substitution(self, exc: Exception) -> None:
+        """Emit the bounded substitution warning under the native NULL policy.
+
+        The native "null" policy is the lowered form of the public
+        on_error="ignore" (vane/ai/providers/vllm.py); this is the one place
+        that maps the executor's policy back to the public mode, so raise-mode
+        callers can never log a substitution that is not happening.
+        """
+        _log_substituted_failure(exc, on_error="raise" if self.on_error == "raise" else "ignore")
+
     def _append_error_rows(
         self,
         rows: pa.Table,
@@ -474,6 +486,9 @@ class LocalVLLMExecutor(VLLMExecutor):
         reservation_id: str | None = None,
     ) -> None:
         rows = _ensure_table(rows)
+        # One warning per substituted batch, not per row: every caller routes
+        # the same already-sanitized engine-init failure here.
+        self._log_null_substitution(_SafeProviderError(f"vllm engine init failed: {self.engine_error_message}"))
         for i in range(rows.num_rows):
             row = rows.slice(i, 1)
             if executor_id:

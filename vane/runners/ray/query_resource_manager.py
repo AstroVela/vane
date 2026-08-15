@@ -299,7 +299,7 @@ class RayQueryResourceManager:
         admission_open: bool = True,
         reservation_ratio: float = 0.5,
         on_change: Callable[[], None] | None = None,
-        on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
+        on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
     ) -> None:
         ratio = float(reservation_ratio)
         if not math.isfinite(ratio) or ratio < 0 or ratio > 1:
@@ -307,11 +307,13 @@ class RayQueryResourceManager:
         self.graph = graph
         self.allocation = allocation
         self._allocation_admission_open = bool(admission_open)
+        self._allocation_admission_closed = False
         self.reservation_ratio = ratio
         self._on_change = on_change
         self._on_eligible_units_change = on_eligible_units_change
         self._lock = threading.RLock()
         self._admission_epoch = 0
+        self._allocation_fence_epoch = 0
         self._units = {
             unit.resource_unit_id: _ResourceUnitState(
                 spec=unit,
@@ -396,8 +398,9 @@ class RayQueryResourceManager:
         completed: bool = False,
     ) -> None:
         unit_key = str(resource_unit_id)
-        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_callback: Callable[[tuple[str, ...], int], None] | None = None
         eligible_unit_ids: tuple[str, ...] = ()
+        allocation_fence_epoch = 0
         with self._lock:
             unit = self._units.get(unit_key)
             if unit is None:
@@ -432,20 +435,23 @@ class RayQueryResourceManager:
                     # coordinator can publish the corresponding allocation.
                     # Preserve live leases, but fence every new grant from the
                     # old generation during that handoff.
+                    self._allocation_fence_epoch += 1
                     self._allocation_admission_open = False
                 self._publish_change_locked()
                 if bool(completed) and not before[-1]:
                     eligible_callback = self._on_eligible_units_change
                     eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+                    allocation_fence_epoch = self._allocation_fence_epoch
         if eligible_callback is not None:
-            eligible_callback(eligible_unit_ids)
+            eligible_callback(eligible_unit_ids, allocation_fence_epoch)
 
     def mark_materialization_barrier_completed_for_node(self, physical_node_id: str) -> bool:
         """Advance the execution phase after a true barrier completes."""
 
         barrier = self.graph.barrier_for_physical_node(str(physical_node_id))
-        eligible_callback: Callable[[tuple[str, ...]], None] | None = None
+        eligible_callback: Callable[[tuple[str, ...], int], None] | None = None
         eligible_unit_ids: tuple[str, ...] = ()
+        allocation_fence_epoch = 0
         with self._lock:
             if barrier.barrier_id in self._completed_materialization_barrier_ids:
                 return False
@@ -454,17 +460,25 @@ class RayQueryResourceManager:
             # next phase allocation. Fence only new grants during that short
             # handoff so downstream work cannot consume the previous phase's
             # reservation; live tasks and output leases continue unchanged.
+            self._allocation_fence_epoch += 1
             self._allocation_admission_open = False
             self._publish_change_locked()
             eligible_callback = self._on_eligible_units_change
             eligible_unit_ids = self._eligible_resource_unit_ids_locked()
+            allocation_fence_epoch = self._allocation_fence_epoch
         if eligible_callback is not None:
-            eligible_callback(eligible_unit_ids)
+            eligible_callback(eligible_unit_ids, allocation_fence_epoch)
         return True
 
     def current_eligible_resource_unit_ids(self) -> tuple[str, ...]:
         with self._lock:
             return self._eligible_resource_unit_ids_locked()
+
+    def current_allocation_frontier(self) -> tuple[tuple[str, ...], int]:
+        """Return the eligible units and the token authorized to reopen them."""
+
+        with self._lock:
+            return self._eligible_resource_unit_ids_locked(), int(self._allocation_fence_epoch)
 
     def _eligible_resource_unit_ids_locked(self) -> tuple[str, ...]:
         if self._cancelled:
@@ -939,23 +953,44 @@ class RayQueryResourceManager:
         self,
         allocation: QueryAllocation,
         *,
-        admission_open: bool,
+        reopen_fence_epoch: int | None = None,
     ) -> None:
+        """Apply a newer soft budget and optionally acknowledge its frontier.
+
+        Ordinary cluster rebalances preserve the current admission gate. Only
+        the phase transition that owns the current fence epoch may reopen it.
+        """
+
         with self._lock:
             if allocation.generation <= self.allocation.generation:
                 raise ValueError(
                     "allocation generation must increase: "
                     f"current={self.allocation.generation} new={allocation.generation}"
                 )
+            resolved_reopen_epoch = None if reopen_fence_epoch is None else int(reopen_fence_epoch)
+            if resolved_reopen_epoch is not None and resolved_reopen_epoch < 0:
+                raise ValueError("allocation fence epoch must be >= 0")
+            if resolved_reopen_epoch is not None and resolved_reopen_epoch > self._allocation_fence_epoch:
+                raise ValueError(
+                    "allocation fence epoch is from the future: "
+                    f"current={self._allocation_fence_epoch} reopen={resolved_reopen_epoch}"
+                )
             self.allocation = allocation
-            self._allocation_admission_open = bool(admission_open) and not self._failed and not self._cancelled
+            if resolved_reopen_epoch == self._allocation_fence_epoch:
+                self._allocation_admission_open = (
+                    not self._allocation_admission_closed and not self._failed and not self._cancelled
+                )
             self._publish_change_locked()
 
     def close_admission(self) -> None:
-        """Fence new grants while preserving live leases for ordered teardown."""
+        """Permanently fence new grants while preserving live leases for teardown."""
         with self._lock:
-            if not self._allocation_admission_open:
+            if self._allocation_admission_closed:
                 return
+            # Invalidate an in-flight phase callback even when another phase
+            # transition has already closed admission.
+            self._allocation_admission_closed = True
+            self._allocation_fence_epoch += 1
             self._allocation_admission_open = False
             self._publish_change_locked()
 
@@ -2647,6 +2682,8 @@ class RayQueryResourceManager:
                     soft_allocation_usage.object_store_bytes - self.allocation.resources.object_store_bytes,
                 ),
                 "allocation_admission_open": self._allocation_admission_open,
+                "allocation_admission_closed": self._allocation_admission_closed,
+                "allocation_fence_epoch": int(self._allocation_fence_epoch),
                 "admission_epoch": int(self._admission_epoch),
                 "reservation_ratio": self.reservation_ratio,
                 "execution_phase": {

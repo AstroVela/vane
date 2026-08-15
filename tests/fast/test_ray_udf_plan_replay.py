@@ -47,6 +47,7 @@ def _execute_fresh_physical_plan(target, physical):
 def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connection():
     source = vane.connect()
     target = None
+    physical = None
     try:
         left = source.sql("SELECT * FROM (VALUES (1), (2)) data(id)").set_alias("l")
         right = source.sql("SELECT * FROM (VALUES (1, 10), (2, 20)) data(id, value)").set_alias("r")
@@ -60,6 +61,8 @@ def test_qualified_join_projection_survives_logical_plan_pickle_to_fresh_connect
     finally:
         if target is not None:
             target.close()
+        # The plan must retain the execution cursor context after its parent connection closes.
+        physical = None
         source.close()
 
 

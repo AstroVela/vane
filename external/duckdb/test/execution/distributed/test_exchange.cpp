@@ -494,29 +494,24 @@ TEST_CASE("Exchange: FlightExchangeTicket parse errors", "[distributed][exchange
 	REQUIRE(FlightExchangeTicket::Parse("v1\nepoch\nexchange\nnode\n1\n2x").is_err());
 }
 
-TEST_CASE("Exchange: Flight timeouts resolve from the worker environment", "[distributed][exchange]") {
+TEST_CASE("Exchange: Flight call timeout resolves from the worker environment", "[distributed][exchange]") {
 	SECTION("configured values") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "12.5");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "3.25");
 		auto config = ResolveFlightExchangeConfigFromEnv();
 		REQUIRE(config.flight_timeout_seconds == Approx(12.5));
-		REQUIRE(config.flight_read_timeout_seconds == Approx(3.25));
 	}
 
-	SECTION("zero explicitly disables a timeout") {
+	SECTION("zero explicitly disables the timeout") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "0");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "0");
 		auto config = ResolveFlightExchangeConfigFromEnv();
 		REQUIRE(config.flight_timeout_seconds == 0.0);
-		REQUIRE(config.flight_read_timeout_seconds == 0.0);
 	}
 
-	SECTION("invalid values retain safe defaults") {
+	SECTION("invalid values retain the five-minute default") {
 		ScopedEnvVar call_timeout("VANE_FLIGHT_CALL_TIMEOUT_S", "not-a-timeout");
-		ScopedEnvVar read_timeout("VANE_FLIGHT_READ_TIMEOUT_S", "-1");
 		auto config = ResolveFlightExchangeConfigFromEnv();
-		REQUIRE(config.flight_timeout_seconds == FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS);
-		REQUIRE(config.flight_read_timeout_seconds == FlightExchangeConfig::DEFAULT_FLIGHT_READ_TIMEOUT_SECONDS);
+		REQUIRE(config.flight_timeout_seconds == Approx(300.0));
+		REQUIRE(FlightExchangeConfig::DEFAULT_FLIGHT_TIMEOUT_SECONDS == Approx(300.0));
 	}
 }
 
@@ -1145,7 +1140,7 @@ TEST_CASE("Exchange: process-local Flight shutdown is bounded and keeps its serv
 	REQUIRE(registry.RetireQuery(query_id).is_ok());
 }
 
-TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "[distributed][exchange]") {
+TEST_CASE("Exchange: Flight call deadline cancels a stalled batch read", "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
 	auto state = std::make_shared<BlockingFlightState>();
@@ -1153,11 +1148,10 @@ TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "
 	StartTestFlightServer(server);
 
 	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_read_timeout")};
+	config.local_dirs = {TestCreatePath("flight_batch_call_deadline")};
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
-	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 0.5;
+	config.flight_timeout_seconds = 0.5;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {
@@ -1178,44 +1172,7 @@ TEST_CASE("Exchange: Flight source read timeout cancels a stalled batch read", "
 
 	REQUIRE(read_started);
 	REQUIRE(read_stopped);
-	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight read batch timed out"));
-	REQUIRE(shutdown_status.ok());
-}
-
-TEST_CASE("Exchange: Flight source read timeout cancels a stalled initial schema", "[distributed][exchange]") {
-	DuckDB db(nullptr);
-	Connection conn(db);
-	auto state = std::make_shared<BlockingFlightState>();
-	BlockingDoGetFlightServer server(state);
-	StartTestFlightServer(server);
-
-	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_schema_read_timeout")};
-	config.node_id = "reader-node";
-	config.expected_types = {LogicalType::INTEGER};
-	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 0.5;
-	auto handle = MakeRemoteSourceHandle(server.port());
-	auto read_future = std::async(std::launch::async, [&]() {
-		try {
-			ReadSourceRows(*conn.context, config, {std::move(handle)});
-			return string();
-		} catch (const std::exception &ex) {
-			return string(ex.what());
-		}
-	});
-
-	const bool do_get_started = state->WaitUntilStarted(std::chrono::seconds(2));
-	const bool read_stopped =
-	    do_get_started && read_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-	state->Release();
-	REQUIRE(read_future.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
-	auto read_error = read_future.get();
-	auto shutdown_status = server.Shutdown();
-
-	REQUIRE(do_get_started);
-	REQUIRE(read_stopped);
-	REQUIRE_THAT(read_error, Catch::Matchers::Contains("flight get schema timed out"));
+	REQUIRE_THAT(read_error, Catch::Matchers::Contains("Deadline Exceeded"));
 	REQUIRE(shutdown_status.ok());
 }
 
@@ -1231,7 +1188,6 @@ TEST_CASE("Exchange: Flight call deadline bounds a stalled initial schema", "[di
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
 	config.flight_timeout_seconds = 0.5;
-	config.flight_read_timeout_seconds = 5.0;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {
@@ -1264,11 +1220,10 @@ TEST_CASE("Exchange: query interrupt cancels a stalled Flight DoGet", "[distribu
 	StartTestFlightServer(server);
 
 	FlightExchangeConfig config;
-	config.local_dirs = {TestCreatePath("flight_interrupt_watchdog")};
+	config.local_dirs = {TestCreatePath("flight_interrupt_cancellation")};
 	config.node_id = "reader-node";
 	config.expected_types = {LogicalType::INTEGER};
 	config.flight_timeout_seconds = 5.0;
-	config.flight_read_timeout_seconds = 5.0;
 	auto handle = MakeRemoteSourceHandle(server.port());
 	auto read_future = std::async(std::launch::async, [&]() {
 		try {

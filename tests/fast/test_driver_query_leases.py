@@ -2872,7 +2872,6 @@ def test_task_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
                 resources=resources,
                 generation=2,
             ),
-            admission_open=True,
         )
         runner_cls._run_query_task_admission_pump(runner, query_id)
 
@@ -2956,7 +2955,6 @@ def test_output_admission_pump_drains_a_bounded_batch_per_event_loop_turn():
                 resources=expanded_resources,
                 generation=2,
             ),
-            admission_open=True,
         )
         runner_cls._run_query_output_admission_pump(runner, query_id)
 

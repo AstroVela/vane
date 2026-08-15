@@ -93,6 +93,10 @@ set(DUCKDB_LINK_LIBS
     duckdb_yyjson
     duckdb_zstd)
 
+if(JEMALLOC_ENABLED)
+  list(APPEND DUCKDB_LINK_LIBS duckdb_jemalloc)
+endif()
+
 foreach(LINK_LIB ${DUCKDB_LINK_LIBS})
   list(APPEND LINK_OBJECTS $<TARGET_OBJECTS:${LINK_LIB}>)
 endforeach(LINK_LIB)
@@ -152,9 +156,11 @@ install(
   FILES_MATCHING
   PATTERN "*.hpp"
   PATTERN "*.ipp")
-install(FILES "${PROJECT_SOURCE_DIR}/src/include/duckdb.hpp"
-              "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
-        DESTINATION "${INSTALL_INCLUDE_DIR}")
+install(
+  FILES "${PROJECT_SOURCE_DIR}/src/include/duckdb.hpp"
+        "${PROJECT_SOURCE_DIR}/src/include/duckdb.h"
+        "${PROJECT_SOURCE_DIR}/src/include/duckdb_extension.h"
+  DESTINATION "${INSTALL_INCLUDE_DIR}")
 
 install(
   TARGETS duckdb duckdb_static

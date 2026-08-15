@@ -21,7 +21,7 @@ using namespace std;
 namespace {
 
 get_result_collector_t CountingResultCollector(idx_t &calls) {
-	return [&calls](ClientContext &context, PreparedStatementData &data) -> PhysicalOperator & {
+	return [&calls](ClientContext &context, PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
 		calls++;
 		return PhysicalResultCollector::GetResultCollector(context, data);
 	};
@@ -95,8 +95,9 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 	try {
 		Connection connection(db);
 		PendingQueryParameters parameters;
-		parameters.get_result_collector = [](ClientContext &, PreparedStatementData &data) -> PhysicalOperator & {
-			return data.physical_plan->Make<PhysicalBatchCollector>(data);
+		parameters.get_result_collector = [](ClientContext &,
+		                                     PreparedStatementData &data) -> duckdb::unique_ptr<PhysicalOperator> {
+			return make_uniq<PhysicalBatchCollector>(*data.physical_plan, data);
 		};
 		auto pending = connection.PendingQuery("SELECT 42", parameters);
 		if (pending->HasError()) {
@@ -136,6 +137,43 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 	REQUIRE(caught_message == "trigger exception unwinding");
 	REQUIRE(finished_before_catch);
 	REQUIRE(interrupted_before_catch);
+}
+
+TEST_CASE("Successful query cleanup clears executor cancellation interrupt", "[api][executor][lifecycle]") {
+	DuckDB db(nullptr);
+	Connection setup(db);
+	REQUIRE_NO_FAIL(setup.Query("SET threads = 2"));
+
+	Connection connection(db);
+	auto pending = connection.PendingQuery("SELECT 42");
+	REQUIRE(!pending->HasError());
+
+	auto state = make_shared_ptr<BlockingExecutorTaskState>();
+	auto &executor = connection.context->GetExecutor();
+	duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
+	std::thread executor_task([task = std::move(task)]() mutable {
+		task->Execute(TaskExecutionMode::PROCESS_ALL);
+		task.reset();
+	});
+
+	{
+		std::unique_lock<std::mutex> lock(state->lock);
+		if (!state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->started; })) {
+			state->release = true;
+			state->cv.notify_all();
+			lock.unlock();
+			executor_task.join();
+			FAIL("executor task did not start");
+		}
+	}
+
+	auto result = pending->Execute();
+	executor_task.join();
+
+	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+	REQUIRE(state->finished);
+	REQUIRE(state->interrupted);
+	REQUIRE(!connection.context->IsInterrupted());
 }
 
 TEST_CASE("Test Pending Query API", "[api][.]") {
@@ -288,8 +326,8 @@ TEST_CASE("Pending query result collector overrides are query-local", "[api][res
 	}
 
 	SECTION("collector initialization failure") {
-		parameters.get_result_collector = [&query_collector_calls](ClientContext &,
-		                                                           PreparedStatementData &) -> PhysicalOperator & {
+		parameters.get_result_collector =
+		    [&query_collector_calls](ClientContext &, PreparedStatementData &) -> duckdb::unique_ptr<PhysicalOperator> {
 			query_collector_calls++;
 			throw InvalidInputException("injected result collector failure");
 		};

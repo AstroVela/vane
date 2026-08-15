@@ -375,7 +375,7 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
         downstream,
         resources=_r(cpu=2, heap=30),
         barriers=(barrier,),
-        on_eligible_units_change=transitions.append,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
     )
     _ready(
         manager,
@@ -389,7 +389,12 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
 
     assert manager.mark_materialization_barrier_completed_for_node("materializer") is True
     assert manager.mark_materialization_barrier_completed_for_node("materializer") is False
-    assert transitions == [(materializer.resource_unit_id, downstream.resource_unit_id)]
+    assert transitions == [
+        (
+            (materializer.resource_unit_id, downstream.resource_unit_id),
+            1,
+        )
+    ]
     assert manager.current_eligible_resource_unit_ids() == (
         materializer.resource_unit_id,
         downstream.resource_unit_id,
@@ -399,9 +404,19 @@ def test_barrier_completion_retires_old_eligible_units_and_opens_next_phase():
     opened_downstream = manager.try_acquire_task(_task(downstream.resource_unit_id, 0))
     assert retired_upstream.blocked_reason == "allocation_pending"
     assert opened_downstream.blocked_reason == "allocation_pending"
+
+    # A newer allocation from an unrelated cluster rebalance must not reopen
+    # the phase handoff. Only the allocation refresh that owns this fence token
+    # can authorize the new frontier.
     manager.update_allocation(
         _allocation(_r(cpu=2, heap=30), generation=2),
-        admission_open=True,
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+    assert manager.try_acquire_task(_task(downstream.resource_unit_id, 1)).blocked_reason == "allocation_pending"
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=30), generation=3),
+        reopen_fence_epoch=transitions[-1][1],
     )
     retired_upstream = manager.try_acquire_task(_task(upstream.resource_unit_id, 0))
     final_materializer = manager.try_acquire_task(_task(materializer.resource_unit_id, 0, node_id="node-a"))
@@ -429,7 +444,7 @@ def test_unit_completion_fences_old_allocation_until_eligible_demand_refreshes()
         remaining,
         resources=_r(cpu=2, heap=20),
         terminals=(finished.resource_unit_id, remaining.resource_unit_id),
-        on_eligible_units_change=transitions.append,
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
     )
     _ready(manager, finished.resource_unit_id, remaining.resource_unit_id)
 
@@ -439,15 +454,97 @@ def test_unit_completion_fences_old_allocation_until_eligible_demand_refreshes()
         completed=True,
     )
 
-    assert transitions == [(remaining.resource_unit_id,)]
+    assert transitions == [((remaining.resource_unit_id,), 1)]
     assert manager.snapshot()["allocation_admission_open"] is False
     assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).blocked_reason == "allocation_pending"
 
     manager.update_allocation(
         _allocation(_r(cpu=2, heap=20), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=transitions[-1][1],
     )
     assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).granted
+
+
+def test_stale_allocation_fence_epoch_cannot_reopen_a_newer_frontier():
+    first = _unit("resource:f:first", target=0, blocks=0)
+    second = _unit("resource:f:second", target=0, blocks=0)
+    remaining = _unit("resource:f:remaining", target=0, blocks=0)
+    transitions = []
+    manager = _manager(
+        first,
+        second,
+        remaining,
+        resources=_r(cpu=3, heap=30),
+        terminals=(first.resource_unit_id, second.resource_unit_id, remaining.resource_unit_id),
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    _ready(manager, first.resource_unit_id, second.resource_unit_id, remaining.resource_unit_id)
+
+    manager.update_unit_state(first.resource_unit_id, runnable=False, completed=True)
+    manager.update_unit_state(second.resource_unit_id, runnable=False, completed=True)
+
+    assert [fence_epoch for _eligible, fence_epoch in transitions] == [1, 2]
+    manager.update_allocation(
+        _allocation(_r(cpu=3, heap=30), generation=2),
+        reopen_fence_epoch=transitions[0][1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+    manager.update_allocation(
+        _allocation(_r(cpu=3, heap=30), generation=3),
+        reopen_fence_epoch=transitions[1][1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is True
+    assert manager.try_acquire_task(_task(remaining.resource_unit_id, 0)).granted
+
+
+def test_close_admission_invalidates_an_in_flight_frontier_refresh():
+    completed = _unit("resource:f:completed", target=0, blocks=0)
+    remaining = _unit("resource:f:remaining", target=0, blocks=0)
+    transitions = []
+    manager = _manager(
+        completed,
+        remaining,
+        resources=_r(cpu=2, heap=20),
+        terminals=(completed.resource_unit_id, remaining.resource_unit_id),
+        on_eligible_units_change=lambda eligible, fence_epoch: transitions.append((eligible, fence_epoch)),
+    )
+    _ready(manager, completed.resource_unit_id, remaining.resource_unit_id)
+
+    manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
+    phase_fence_epoch = transitions[-1][1]
+    manager.close_admission()
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=20), generation=2),
+        reopen_fence_epoch=phase_fence_epoch,
+    )
+    snapshot = manager.snapshot()
+    assert snapshot["allocation_fence_epoch"] == phase_fence_epoch + 1
+    assert snapshot["allocation_admission_closed"] is True
+    assert snapshot["allocation_admission_open"] is False
+
+    manager.update_allocation(
+        _allocation(_r(cpu=2, heap=20), generation=3),
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
+    )
+    assert manager.snapshot()["allocation_admission_open"] is False
+
+
+def test_allocation_rejects_a_future_fence_epoch_without_mutation():
+    unit = _unit("resource:f:future-fence", target=0, blocks=0)
+    manager = _manager(unit, resources=_r(cpu=1, heap=10))
+    before = manager.snapshot()
+
+    with pytest.raises(ValueError, match="allocation fence epoch is from the future"):
+        manager.update_allocation(
+            _allocation(_r(cpu=2, heap=20), generation=2),
+            reopen_fence_epoch=before["allocation_fence_epoch"] + 1,
+        )
+
+    after = manager.snapshot()
+    assert after["allocation"] == before["allocation"]
+    assert after["allocation_admission_open"] is True
 
 
 def test_completed_resource_unit_cannot_be_reopened():
@@ -742,7 +839,6 @@ def test_failed_manager_fences_new_work_but_preserves_live_physical_usage():
 
     manager.update_allocation(
         _allocation(_r(cpu=1, heap=100, store=20), generation=2),
-        admission_open=True,
     )
     assert manager.snapshot()["allocation_admission_open"] is False
 
@@ -939,7 +1035,6 @@ def test_fixed_actor_soft_debt_does_not_block_zero_increment_invocations():
     manager.update_unit_state(actor.resource_unit_id, runnable=True)
     manager.update_allocation(
         _allocation(_r(cpu=0.5, gpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
 
     invocation = manager.try_acquire_task(_task(actor.resource_unit_id, 0))
@@ -991,7 +1086,6 @@ def test_persistent_soft_actor_debt_warns_once_after_ray_data_delay(monkeypatch,
     manager.set_submitted_actor_slots(actor.resource_unit_id, {0})
     manager.update_allocation(
         _allocation(_r(cpu=0.5, gpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
     clock = iter((0.0, 59.0, 60.0, 61.0))
     monkeypatch.setattr(manager_module.time, "monotonic", lambda: next(clock))
@@ -1057,7 +1151,6 @@ def test_allocation_shrink_keeps_live_lease_and_uses_liveness_after_drain():
 
     manager.update_allocation(
         _allocation(_r(cpu=0.5, heap=50), generation=2),
-        admission_open=True,
     )
     blocked = manager.try_acquire_task(_task(task.resource_unit_id, 1))
     snapshot = manager.snapshot()
@@ -1199,7 +1292,7 @@ def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
     manager.update_unit_state(upstream.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     _assert_object_store_budget_invariants(manager.snapshot())
 
@@ -1207,7 +1300,6 @@ def test_object_store_ledgers_remain_disjoint_through_a_mixed_lifecycle():
     assert downstream_task.granted
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=40), generation=3),
-        admission_open=True,
     )
     _assert_object_store_budget_invariants(manager.snapshot())
 
@@ -1326,7 +1418,6 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
                         ),
                         generation=allocation_generation,
                     ),
-                    admission_open=True,
                 )
             elif step >= 30:
                 completable = [
@@ -1342,7 +1433,7 @@ def test_object_store_ledgers_hold_across_seeded_lifecycle_traces():
                             _r(cpu=100, heap=1_000, store=randomizer.choice((7, 31, 64))),
                             generation=allocation_generation,
                         ),
-                        admission_open=True,
+                        reopen_fence_epoch=manager.current_allocation_frontier()[1],
                     )
 
             snapshot = manager.snapshot()
@@ -1512,7 +1603,7 @@ def test_ineligible_usage_at_or_above_the_limit_zeroes_current_reservations(reta
     manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
 
     snapshot = manager.snapshot()
@@ -1554,7 +1645,7 @@ def test_completed_producer_can_handoff_an_already_waiting_output_without_a_rese
     manager.update_unit_state(unit.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=10), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     before = manager.snapshot()
     _assert_object_store_budget_invariants(before)
@@ -1587,7 +1678,6 @@ def test_allocation_shrink_preserves_output_credit_and_growth_restores_shared_cr
 
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
     )
     shrunk = manager.snapshot()
     assert shrunk["units"][unit.resource_unit_id]["object_store_budget"] == {
@@ -1616,7 +1706,6 @@ def test_allocation_shrink_preserves_output_credit_and_growth_restores_shared_cr
 
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=300), generation=3),
-        admission_open=True,
     )
     assert manager._normal_task_block_reason_locked(_task(unit.resource_unit_id, 1, retained=0))[0] is None
 
@@ -1637,7 +1726,7 @@ def test_completing_an_idle_unit_reassigns_its_protected_reservation():
     manager.update_unit_state(completed.resource_unit_id, runnable=False, completed=True)
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     after = manager.snapshot()
     assert after["units"][completed.resource_unit_id]["object_store_budget"]["task_reserved_bytes"] == 0
@@ -1894,7 +1983,7 @@ def test_ineligible_output_usage_reduces_current_phase_reservations():
     )
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=100, store=100), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
 
     budget = manager.snapshot()["admission"]["object_store"]
@@ -2849,7 +2938,6 @@ def test_output_liveness_cannot_move_back_upstream():
     downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0))
     manager.update_allocation(
         _allocation(_r(cpu=10, heap=1_000, store=10), generation=2),
-        admission_open=True,
     )
 
     downstream_output = manager.try_acquire_output_block(

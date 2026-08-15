@@ -460,6 +460,12 @@ void Executor::VerifyPipelines() {
 #endif
 }
 
+void Executor::Initialize(unique_ptr<PhysicalOperator> physical_plan_p) {
+	Reset();
+	owned_plan = std::move(physical_plan_p);
+	InitializeInternal(*owned_plan, true);
+}
+
 void Executor::Initialize(PhysicalOperator &plan) {
 	Reset();
 	InitializeInternal(plan, true);
@@ -652,7 +658,9 @@ void Executor::AddToBeRescheduled(shared_ptr<Task> &task_p) {
 	if (to_be_rescheduled_tasks.find(task_p.get()) != to_be_rescheduled_tasks.end()) {
 		return;
 	}
-	to_be_rescheduled_tasks[task_p.get()] = std::move(task_p);
+	// Save raw pointer before move — evaluation order of operator[] key and assignment value is unspecified pre-C++17
+	auto raw_ptr = task_p.get();
+	to_be_rescheduled_tasks[raw_ptr] = std::move(task_p);
 }
 
 bool Executor::ExecutionIsFinished() {

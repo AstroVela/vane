@@ -21,7 +21,7 @@ def register_query_resource_graph(
     admission_open: bool = True,
     reservation_ratio: float = 0.5,
     on_change: Callable[[], None] | None = None,
-    on_eligible_units_change: Callable[[tuple[str, ...]], None] | None = None,
+    on_eligible_units_change: Callable[[tuple[str, ...], int], None] | None = None,
 ) -> RayQueryResourceManager:
     """Atomically publish the driver-local resource manager for a query."""
 

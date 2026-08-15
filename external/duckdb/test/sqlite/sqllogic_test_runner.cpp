@@ -195,6 +195,13 @@ void SQLLogicTestRunner::Reconnect() {
 	}
 }
 
+void StringReplaceLoopIterator(string &text, const string &loop_iterator_name, const string &replacement) {
+	auto loop_it = "{" + loop_iterator_name + "}";
+	auto deprecated_loop_it = "$" + loop_it;
+	text = StringUtil::Replace(text, deprecated_loop_it, replacement);
+	text = StringUtil::Replace(text, loop_it, replacement);
+}
+
 string SQLLogicTestRunner::ReplaceLoopIterator(string text, string loop_iterator_name, string replacement) {
 	replacement = ReplaceKeywords(replacement);
 	if (StringUtil::Contains(loop_iterator_name, ",")) {
@@ -205,11 +212,12 @@ string SQLLogicTestRunner::ReplaceLoopIterator(string text, string loop_iterator
 			     ") does not match number of commas in replacement (" + replacement + ")");
 		}
 		for (idx_t i = 0; i < name_splits.size(); i++) {
-			text = StringUtil::Replace(text, "${" + name_splits[i] + "}", replacement_splits[i]);
+			StringReplaceLoopIterator(text, name_splits[i], replacement_splits[i]);
 		}
 		return text;
 	} else {
-		return StringUtil::Replace(text, "${" + loop_iterator_name + "}", replacement);
+		StringReplaceLoopIterator(text, loop_iterator_name, replacement);
+		return text;
 	}
 }
 
@@ -451,7 +459,7 @@ RequireResult SQLLogicTestRunner::CheckRequire(SQLLogicParser &parser, const vec
 		return RequireResult::PRESENT;
 	}
 
-	if (param == "noforcestorage") {
+	if (param == "noforcestorage" || param == "no_force_storage") {
 		if (TestConfiguration::TestForceStorage()) {
 			return RequireResult::MISSING;
 		}
@@ -597,6 +605,12 @@ RequireResult SQLLogicTestRunner::CheckRequire(SQLLogicParser &parser, const vec
 	}
 	if (param == "allow_unsigned_extensions") {
 		if (Settings::Get<AllowUnsignedExtensionsSetting>(*config)) {
+			return RequireResult::PRESENT;
+		}
+		return RequireResult::MISSING;
+	}
+	if (param == "vacuum_rebuild_indexes") {
+		if (Settings::Get<VacuumRebuildIndexesSetting>(*config) > 0) {
 			return RequireResult::PRESENT;
 		}
 		return RequireResult::MISSING;
@@ -1100,10 +1114,12 @@ void SQLLogicTestRunner::ExecuteFile(string script) {
 
 			auto &test_config = TestConfiguration::Get();
 			auto env_var = token.parameters[0];
-			auto test_env_result = test_config.GetTestEnv(env_var, "");
+			auto test_env_defined = test_config.HasTestEnv(env_var);
+			string env_actual_value;
 			const char *env_actual = nullptr;
-			if (!test_env_result.empty()) {
-				env_actual = test_env_result.c_str();
+			if (test_env_defined) {
+				env_actual_value = test_config.GetTestEnv(env_var, "");
+				env_actual = env_actual_value.c_str();
 			} else {
 				env_actual = std::getenv(env_var.c_str());
 			}
@@ -1133,7 +1149,7 @@ void SQLLogicTestRunner::ExecuteFile(string script) {
 				file_tags.emplace_back(StringUtil::Format("env[%s]=%s", token.parameters[0], token.parameters[1]));
 			}
 
-			if (environment_variables.count(env_var)) {
+			if (!test_env_defined && environment_variables.count(env_var)) {
 				parser.Fail(StringUtil::Format("Environment variable '%s' has already been defined", env_var));
 			}
 			environment_variables[env_var] = env_actual;

@@ -267,6 +267,7 @@ class AnthropicPrompter:
             }
 
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             response = await self._client.messages.create(**kwargs)
         except Exception as exc:
@@ -278,7 +279,15 @@ class AnthropicPrompter:
                     original_error=exc,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(exc)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
 

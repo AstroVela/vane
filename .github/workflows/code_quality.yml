@@ -103,6 +103,15 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
 
+      - name: Validate ignored DuckDB additions
+        run: |
+          fixture="external/duckdb/test/format-helper-ignored.db"
+          touch "$fixture"
+          git add --force "$fixture"
+          scripts/format duckdb --changed --check
+          git reset -- "$fixture"
+          rm "$fixture"
+
       - name: Run checks for the changed range
         env:
           EVENT_NAME: ${{ github.event_name }}

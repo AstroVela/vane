@@ -294,7 +294,7 @@ DuckDBResult<void> ConvertArrowRecordBatchToChunk(ClientContext &context, const 
 }
 
 // FlightClient::DoGet reads the initial schema before returning its FlightStreamReader. Use Arrow's exported
-// transport stream directly so the watchdog can obtain a cancellation handle before the first blocking read.
+// transport stream directly so query interruption can cancel the first blocking read.
 DuckDBResult<std::unique_ptr<arrow::flight::internal::ClientTransport>>
 ConnectFlightExchangeTransport(const std::string &location_string) {
 	auto location_res = arrow::flight::Location::Parse(location_string);
@@ -368,53 +368,14 @@ private:
 
 } // namespace
 
-enum class FlightWatchdogStopReason : uint8_t { NONE = 0, INTERRUPTED = 1, READ_TIMEOUT = 2 };
-
-class FlightStreamWatchdog {
+class FlightStreamInterrupter {
 public:
-	FlightStreamWatchdog(ClientContext &context, double read_timeout_seconds)
-	    : context_(context), read_timeout_seconds_(read_timeout_seconds), watchdog_thread_([this]() { Run(); }) {
+	explicit FlightStreamInterrupter(ClientContext &context)
+	    : context_(context), interrupt_thread_([this]() { Run(); }) {
 	}
 
-	~FlightStreamWatchdog() {
+	~FlightStreamInterrupter() {
 		Stop();
-	}
-
-	FlightWatchdogStopReason Arm() {
-		arrow::flight::internal::ClientDataStream *stream = nullptr;
-		FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
-		{
-			std::lock_guard<std::mutex> guard(mutex_);
-			if (stop_reason_ != FlightWatchdogStopReason::NONE || stopping_) {
-				return stop_reason_;
-			}
-			operation_active_ = true;
-			operation_generation_++;
-			if (read_timeout_seconds_ > 0.0) {
-				deadline_ = Clock::now() + std::chrono::duration_cast<Clock::duration>(
-				                               std::chrono::duration<double>(read_timeout_seconds_));
-			}
-			if (context_.IsInterrupted()) {
-				reason = FlightWatchdogStopReason::INTERRUPTED;
-				stop_reason_ = reason;
-				operation_active_ = false;
-				operation_generation_++;
-				stream = stream_;
-			}
-		}
-		condition_.notify_all();
-		if (reason != FlightWatchdogStopReason::NONE) {
-			RequestCancellation(stream);
-		}
-		return reason;
-	}
-
-	FlightWatchdogStopReason Disarm() {
-		std::lock_guard<std::mutex> guard(mutex_);
-		operation_active_ = false;
-		operation_generation_++;
-		condition_.notify_all();
-		return stop_reason_;
 	}
 
 	void SetStream(arrow::flight::internal::ClientDataStream *stream) {
@@ -422,8 +383,12 @@ public:
 		{
 			std::lock_guard<std::mutex> guard(mutex_);
 			stream_ = stream;
-			cancel_stream = stream_ && stop_reason_ != FlightWatchdogStopReason::NONE;
+			if (stream_ && (cancellation_requested_ || context_.IsInterrupted())) {
+				cancellation_requested_ = true;
+				cancel_stream = true;
+			}
 		}
+		condition_.notify_all();
 		if (cancel_stream) {
 			stream->TryCancel();
 		}
@@ -433,84 +398,46 @@ public:
 		{
 			std::lock_guard<std::mutex> guard(mutex_);
 			stopping_ = true;
-			operation_active_ = false;
-			operation_generation_++;
+			stream_ = nullptr;
 		}
 		condition_.notify_all();
-		if (watchdog_thread_.joinable()) {
-			watchdog_thread_.join();
+		if (interrupt_thread_.joinable()) {
+			interrupt_thread_.join();
 		}
 	}
 
 private:
-	using Clock = std::chrono::steady_clock;
 	static constexpr std::chrono::milliseconds INTERRUPT_POLL_INTERVAL {25};
-
-	void RequestCancellation(arrow::flight::internal::ClientDataStream *stream) {
-		if (stream) {
-			stream->TryCancel();
-		}
-	}
 
 	void Run() {
 		std::unique_lock<std::mutex> guard(mutex_);
 		while (!stopping_) {
-			if (!operation_active_) {
-				condition_.wait(guard, [&]() { return stopping_ || operation_active_; });
+			if (cancellation_requested_) {
+				condition_.wait(guard, [&]() { return stopping_; });
 				continue;
 			}
-
-			const auto generation = operation_generation_;
-			auto wake_at = Clock::now() + INTERRUPT_POLL_INTERVAL;
-			if (read_timeout_seconds_ > 0.0 && deadline_ < wake_at) {
-				wake_at = deadline_;
-			}
-			condition_.wait_until(guard, wake_at);
-			if (stopping_ || !operation_active_ || generation != operation_generation_) {
+			condition_.wait_for(guard, INTERRUPT_POLL_INTERVAL);
+			if (stopping_ || !context_.IsInterrupted()) {
 				continue;
 			}
-
-			FlightWatchdogStopReason reason = FlightWatchdogStopReason::NONE;
-			if (context_.IsInterrupted()) {
-				reason = FlightWatchdogStopReason::INTERRUPTED;
-			} else if (read_timeout_seconds_ > 0.0 && Clock::now() >= deadline_) {
-				reason = FlightWatchdogStopReason::READ_TIMEOUT;
-			}
-			if (reason == FlightWatchdogStopReason::NONE) {
-				continue;
-			}
-
-			stop_reason_ = reason;
-			operation_active_ = false;
-			operation_generation_++;
+			cancellation_requested_ = true;
 			auto *stream = stream_;
 			guard.unlock();
-			RequestCancellation(stream);
+			if (stream) {
+				stream->TryCancel();
+			}
 			guard.lock();
 		}
 	}
 
 	ClientContext &context_;
-	double read_timeout_seconds_;
 	std::mutex mutex_;
 	std::condition_variable condition_;
-	Clock::time_point deadline_;
 	arrow::flight::internal::ClientDataStream *stream_ = nullptr;
-	FlightWatchdogStopReason stop_reason_ = FlightWatchdogStopReason::NONE;
-	uint64_t operation_generation_ = 0;
-	bool operation_active_ = false;
+	bool cancellation_requested_ = false;
 	bool stopping_ = false;
-	std::thread watchdog_thread_;
+	std::thread interrupt_thread_;
 };
-
-DuckDBError FlightWatchdogError(FlightWatchdogStopReason reason, const char *operation, double read_timeout_seconds) {
-	if (reason == FlightWatchdogStopReason::INTERRUPTED) {
-		return DuckDBError::external_error(std::string(operation) + " canceled by query interruption");
-	}
-	std::ostringstream message;
-	message << operation << " timed out after " << read_timeout_seconds << " seconds";
-	return DuckDBError::external_error(message.str());
-}
 
 namespace {
 
@@ -1191,8 +1118,8 @@ struct FlightExchangeSource::PartitionStreamState {
 	enum class Kind : uint8_t { LOCAL_FILES = 1, FLIGHT = 2 };
 
 	~PartitionStreamState() {
-		if (flight_watchdog) {
-			flight_watchdog->Stop();
+		if (flight_interrupter) {
+			flight_interrupter->Stop();
 		}
 		if (flight_data_stream) {
 			flight_data_stream->TryCancel();
@@ -1216,7 +1143,7 @@ struct FlightExchangeSource::PartitionStreamState {
 	std::unique_ptr<arrow::flight::internal::ClientTransport> flight_transport;
 	std::shared_ptr<arrow::flight::internal::ClientDataStream> flight_data_stream;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> flight_reader;
-	unique_ptr<FlightStreamWatchdog> flight_watchdog;
+	unique_ptr<FlightStreamInterrupter> flight_interrupter;
 
 	unique_ptr<ArrowTableSchema> arrow_table;
 	vector<LogicalType> arrow_types;
@@ -1379,22 +1306,12 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 	if (config_.flight_timeout_seconds > 0.0) {
 		call_options.timeout = arrow::flight::TimeoutDuration(config_.flight_timeout_seconds);
 	}
-	stream->flight_watchdog = make_uniq<FlightStreamWatchdog>(*context_, config_.flight_read_timeout_seconds);
-	auto watchdog_reason = stream->flight_watchdog->Arm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
-	}
+	stream->flight_interrupter = make_uniq<FlightStreamInterrupter>(*context_);
 	std::unique_ptr<arrow::flight::internal::ClientDataStream> data_stream;
 	auto do_get_status = stream->flight_transport->DoGet(call_options, flight_ticket, &data_stream);
 	if (data_stream) {
 		stream->flight_data_stream = std::move(data_stream);
-		stream->flight_watchdog->SetStream(stream->flight_data_stream.get());
-	}
-	watchdog_reason = stream->flight_watchdog->Disarm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight do_get", config_.flight_read_timeout_seconds));
+		stream->flight_interrupter->SetStream(stream->flight_data_stream.get());
 	}
 	if (!do_get_status.ok()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
@@ -1404,22 +1321,12 @@ FlightExchangeSource::OpenPartitionStream(const ExchangeSourceHandle &handle) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    DuckDBError::external_error("flight do_get returned no data stream"));
 	}
-	watchdog_reason = stream->flight_watchdog->Arm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
-	}
 	auto memory_manager = call_options.memory_manager;
 	if (!memory_manager) {
 		memory_manager = arrow::CPUDevice::Instance()->default_memory_manager();
 	}
 	auto message_reader = std::make_unique<FlightExchangeIpcMessageReader>(stream->flight_data_stream, memory_manager);
 	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(std::move(message_reader), call_options.read_options);
-	watchdog_reason = stream->flight_watchdog->Disarm();
-	if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
-		    FlightWatchdogError(watchdog_reason, "flight get schema", config_.flight_read_timeout_seconds));
-	}
 	if (!reader_res.ok()) {
 		return DuckDBResult<std::unique_ptr<PartitionStreamState>>::err(
 		    FlightExchangeArrowToError(reader_res.status(), "flight get schema"));
@@ -1444,18 +1351,8 @@ DuckDBResult<bool> FlightExchangeSource::ReadStreamChunk(DataChunk &chunk) {
 	}
 	if (stream_state_->kind == PartitionStreamState::Kind::FLIGHT) {
 		while (true) {
-			auto watchdog_reason = stream_state_->flight_watchdog->Arm();
-			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-				return DuckDBResult<bool>::err(
-				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
-			}
 			std::shared_ptr<arrow::RecordBatch> batch;
 			auto next_status = stream_state_->flight_reader->ReadNext(&batch);
-			watchdog_reason = stream_state_->flight_watchdog->Disarm();
-			if (watchdog_reason != FlightWatchdogStopReason::NONE) {
-				return DuckDBResult<bool>::err(
-				    FlightWatchdogError(watchdog_reason, "flight read batch", config_.flight_read_timeout_seconds));
-			}
 			if (!next_status.ok()) {
 				return DuckDBResult<bool>::err(FlightExchangeArrowToError(next_status, "flight read batch"));
 			}

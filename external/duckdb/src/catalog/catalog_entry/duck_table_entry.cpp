@@ -1,4 +1,5 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/transaction/commit_state.hpp"
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
@@ -64,10 +65,13 @@ static void CheckTypeIsSupported(const LogicalType &logical_type, AttachedDataba
 				auto required = GetStorageVersionName(Geometry::VERSION_ADDED, false);
 				auto current = GetStorageVersionName(storage_version, false);
 
-				throw InvalidInputException(
-				    "GEOMETRY columns with coordinate reference system identifiers are not supported in storage "
-				    "versions prior %s (database \"%s\" is using storage version %s)",
-				    required, db.GetName(), current);
+				// TODO: Turn this into a hard error
+				auto &logger = Logger::Get(db.GetDatabase());
+				logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_WARNING,
+				                "GEOMETRY columns with coordinate reference system identifiers are not supported in "
+				                "storage versions prior "
+				                "to %s (database \"%s\" is using storage version %s). CRS will not be persisted.",
+				                required, db.GetName(), current);
 			}
 		} break;
 		default:
@@ -75,6 +79,10 @@ static void CheckTypeIsSupported(const LogicalType &logical_type, AttachedDataba
 		}
 		return false;
 	});
+}
+
+static void SetAlterDependencies(BoundCreateTableInfo &info, AlterInfo &alter_info) {
+	alter_info.new_dependencies = make_uniq<LogicalDependencyList>(info.Base().dependencies);
 }
 
 DuckTableEntry::DuckTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, BoundCreateTableInfo &info,
@@ -389,6 +397,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RenameColumn(ClientContext &context, Re
 	}
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage);
 }
 
@@ -428,6 +437,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddColumn(ClientContext &context, AddCo
 
 	vector<unique_ptr<Expression>> bound_defaults;
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema, bound_defaults);
+	SetAlterDependencies(*bound_create_info, info);
 	auto new_storage = make_shared_ptr<DataTable>(context, *storage, info.new_column, *bound_defaults.back());
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage);
 }
@@ -753,6 +763,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::RemoveColumn(ClientContext &context, Re
 	                              dropped_column_is_generated);
 
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 	if (columns.GetColumn(LogicalIndex(removed_index)).Generated()) {
 		return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage);
 	}
@@ -976,6 +987,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetDefault(ClientContext &context, SetD
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage);
 }
 
@@ -1004,6 +1016,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::SetNotNull(ClientContext &context, SetN
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 
 	// Early return
 	if (has_not_null) {
@@ -1037,6 +1050,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::DropNotNull(ClientContext &context, Dro
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage);
 }
 
@@ -1129,6 +1143,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::ChangeColumnType(ClientContext &context
 	}
 
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 
 	vector<StorageIndex> storage_oids;
 	for (idx_t i = 0; i < bound_columns.size(); i++) {
@@ -1211,6 +1226,7 @@ unique_ptr<CatalogEntry> DuckTableEntry::DropForeignKeyConstraint(ClientContext 
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 	return make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, storage);
 }
 
@@ -1283,7 +1299,8 @@ unique_ptr<CatalogEntry> DuckTableEntry::AddConstraint(ClientContext &context, A
 	// We create a physical table with a new constraint and a new unique index.
 	const auto binder = Binder::CreateBinder(context);
 	const auto bound_constraint = binder->BindConstraint(*info.constraint, table_info.table, table_info.columns);
-	const auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	auto bound_create_info = binder->BindCreateTableInfo(std::move(create_info), schema);
+	SetAlterDependencies(*bound_create_info, info);
 
 	auto new_storage = make_shared_ptr<DataTable>(context, *storage, *bound_constraint);
 	auto new_entry = make_uniq<DuckTableEntry>(catalog, schema, *bound_create_info, new_storage);
@@ -1304,7 +1321,7 @@ void DuckTableEntry::SetAsRoot() {
 	storage->SetTableName(name);
 }
 
-void DuckTableEntry::CommitAlter(string &column_name) {
+void DuckTableEntry::CommitAlter(string &column_name, CommitDropState &drop_state) {
 	D_ASSERT(!column_name.empty());
 	optional_idx removed_index;
 	for (auto &col : columns.Logical()) {
@@ -1320,11 +1337,11 @@ void DuckTableEntry::CommitAlter(string &column_name) {
 
 	auto logical_column_index = LogicalIndex(removed_index.GetIndex());
 	auto column_index = columns.LogicalToPhysical(logical_column_index).index;
-	storage->CommitDropColumn(column_index);
+	storage->CommitDropColumn(column_index, drop_state);
 }
 
-void DuckTableEntry::CommitDrop() {
-	storage->CommitDropTable();
+void DuckTableEntry::CommitDrop(CommitDropState &drop_state) {
+	storage->CommitDropTable(drop_state);
 }
 
 DataTable &DuckTableEntry::GetStorage() {
