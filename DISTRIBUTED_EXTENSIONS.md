@@ -333,9 +333,10 @@ Both modes use the same coordinator sequence:
 7. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
 
 A Ray-driver terminal cache hit returns the previously recorded outcome and
-does not repeat this coordinator sequence.
-The driver also retains a lightweight operation-ID-to-plan-fingerprint
-tombstone until that driver exits. The fingerprint survives session closure and
+does not repeat this coordinator sequence. Both the Ray and local distributed
+runners retain a lightweight operation-ID-to-plan-fingerprint tombstone until
+that runner exits, so a callback retry cannot reuse an operation ID for a
+different write intent. For Ray, the fingerprint survives session closure and
 terminal-result eviction. Detaching an owner may discard result payloads and
 ownership records, but it never makes the operation ID available to a different
 write intent while another client keeps the driver alive. The fingerprint

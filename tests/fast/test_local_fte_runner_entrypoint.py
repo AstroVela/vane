@@ -143,6 +143,87 @@ def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
     assert error.safe_to_retry is False
 
 
+def test_local_runner_binds_callback_retry_operation_id_to_original_plan(monkeypatch):
+    import vane
+    from vane.runners import CopyOutcomeUnknownError
+    from vane.runners.local import runner as runner_module
+
+    executions = []
+    connections = []
+
+    class FakeLogicalPlan:
+        def __init__(self, fingerprint):
+            self.fingerprint = fingerprint
+
+        @classmethod
+        def from_duckdb_relation(cls, relation, operation_id):
+            assert operation_id == "stable-callback-operation"
+            return cls(relation)
+
+        def operation_fingerprint(self):
+            return self.fingerprint
+
+        def to_physical_plan(self, _conn):
+            return object()
+
+    class FakePlanRunner:
+        def __init__(self, _backend):
+            pass
+
+        @staticmethod
+        def run_copy_plan(_physical_plan, _conn):
+            executions.append(True)
+            return {
+                "copy_output_outcome_unknown": True,
+                "extension_write_mode": "callback",
+            }
+
+    class FakeFragmentExecutor:
+        close_timeout_s = 1.0
+
+        @staticmethod
+        def retain_resources(*_resources):
+            pass
+
+    def require_attr(name):
+        if name == "PyLogicalPlan":
+            return FakeLogicalPlan
+        if name == "DistributedPhysicalPlanRunner":
+            return FakePlanRunner
+        raise AssertionError(f"unexpected native attribute: {name}")
+
+    monkeypatch.setattr(runner_module, "_preload_arrow_dataset_imports", lambda: None)
+    monkeypatch.setattr(runner_module, "require_ray_cxx_attr", require_attr)
+    monkeypatch.setattr(runner_module, "_InProcessFragmentExecutor", FakeFragmentExecutor)
+    monkeypatch.setattr(runner_module, "NativeFteWorkerManagerBackend", lambda **_kwargs: object())
+    monkeypatch.setattr(runner_module, "progress_enabled", lambda _runner: False)
+    monkeypatch.setattr(runner_module, "_shutdown_local_write_resources", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "vane.execution.udf_subprocess.ensure_local_subprocess_actor_pools_for_plan",
+        lambda *_args, **_kwargs: ([], None),
+    )
+    monkeypatch.setattr(vane, "connect", lambda: connections.append(object()) or connections[-1])
+
+    local_runner = runner_module.LocalRunner()
+    for relation in ("plan-a", "plan-a"):
+        try:
+            local_runner.run_write(relation, operation_id="stable-callback-operation")
+        except CopyOutcomeUnknownError as error:
+            assert error.safe_to_retry is True
+        else:
+            raise AssertionError("callback write should report an unknown outcome")
+
+    try:
+        local_runner.run_write("plan-b", operation_id="stable-callback-operation")
+    except ValueError as error:
+        assert "cannot be reused for a different logical plan" in str(error)
+    else:
+        raise AssertionError("operation identity must remain bound to the original plan")
+
+    assert len(executions) == 2
+    assert len(connections) == 2
+
+
 def test_local_runner_rejects_invalid_num_workers():
     from vane.runners.local import _normalize_num_workers
     from vane.runners.local.runner import _normalize_num_workers as normalize_runner
