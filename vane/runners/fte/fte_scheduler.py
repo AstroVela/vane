@@ -430,6 +430,12 @@ class FteAttemptStatusWatcher:
             self._stop.wait(self.poll_interval_s)
 
 
+@dataclass(frozen=True)
+class FteRetryDelayResult:
+    outputs: tuple[Any, ...]
+    completion: Future[None]
+
+
 @dataclass
 class FteEventHandlers:
     on_split_events: Callable[[list[dict[str, Any]]], list[Any] | None] | None = None
@@ -439,7 +445,7 @@ class FteEventHandlers:
     on_memory_pressure_detected: Callable[[MemoryPressureDetected], list[Any] | None] | None = None
     on_resource_admission_changed: Callable[[ResourceAdmissionChanged], list[Any] | None] | None = None
     on_worker_reservation_completed: Callable[[WorkerReservationCompleted], list[Any] | None] | None = None
-    on_retry_delay_expired: Callable[[RetryDelayExpired], list[Any] | None] | None = None
+    on_retry_delay_expired: Callable[[RetryDelayExpired], FteRetryDelayResult | None] | None = None
     on_exchange_selector_updated: Callable[[ExchangeSelectorUpdated], list[Any] | None] | None = None
     on_query_abort: Callable[[QueryAbort], list[Any] | None] | None = None
 
@@ -592,6 +598,8 @@ class FteQueryScheduler:
         self._failure_reason: str | None = None
         self._retry_delay_generation = 0
         self._retry_delay_timer: threading.Timer | None = None
+        self._retry_delay_completions: list[Future[None]] = []
+        self._retry_delay_effect_completions: list[Future[None]] = []
         self._draining = False
         self._drainer_thread_id: int | None = None
         self._active_causal_generation: int | None = None
@@ -822,6 +830,7 @@ class FteQueryScheduler:
     def fail(self, reason: Any = None) -> None:
         callbacks: list[Callable[[], None]] = []
         barriers: list[Future[None]] = []
+        retry_delay_completions: list[Future[None]] = []
         with self._lock:
             if self._state in {"CLOSED", "FAILED"}:
                 return
@@ -829,20 +838,19 @@ class FteQueryScheduler:
             self._failure_reason = "" if reason is None else str(reason)
             barriers = self._clear_queued_events_locked()
             self._queued_internal_admission_classes.clear()
-            if self._retry_delay_timer is not None:
-                self._retry_delay_timer.cancel()
-                self._retry_delay_timer = None
+            retry_delay_completions = self._cancel_retry_delay_locked()
             callbacks.extend(self._task_source_resume_callbacks_locked())
         try:
             self._run_task_source_callbacks(callbacks)
         except BaseException as exc:
-            _settle_futures(barriers, exc)
+            _settle_futures([*barriers, *retry_delay_completions], exc)
             raise
-        _settle_futures(barriers)
+        _settle_futures([*barriers, *retry_delay_completions])
 
     def close(self) -> None:
         callbacks: list[Callable[[], None]] = []
         barriers: list[Future[None]] = []
+        retry_delay_completions: list[Future[None]] = []
         with self._lock:
             for registration in self._task_sources.values():
                 if registration.paused and registration.resume is not None:
@@ -854,15 +862,13 @@ class FteQueryScheduler:
             self._fragment_states.clear()
             self._failed_worker_incarnations.clear()
             self._task_sources.clear()
-            if self._retry_delay_timer is not None:
-                self._retry_delay_timer.cancel()
-                self._retry_delay_timer = None
+            retry_delay_completions = self._cancel_retry_delay_locked()
         try:
             self._run_task_source_callbacks(callbacks)
         except BaseException as exc:
-            _settle_futures(barriers, exc)
+            _settle_futures([*barriers, *retry_delay_completions], exc)
             raise
-        _settle_futures(barriers)
+        _settle_futures([*barriers, *retry_delay_completions])
 
     def stats(self) -> FteSchedulerStats:
         with self._lock:
@@ -929,21 +935,41 @@ class FteQueryScheduler:
         with self._lock:
             return self._retry_delay_generation
 
-    def arm_retry_delay(self, delay_s: float) -> int:
+    def arm_retry_delay(self, delay_s: float) -> Future[None]:
+        """Complete after the latest delay, handler effect, and causal drain."""
+
         delay_s = max(0.0, float(delay_s))
+        completion: Future[None] = Future()
+        completed_delays: list[Future[None]] = []
         with self._lock:
             self._retry_delay_generation += 1
             generation = self._retry_delay_generation
             if self._retry_delay_timer is not None:
                 self._retry_delay_timer.cancel()
                 self._retry_delay_timer = None
+            self._retry_delay_effect_completions.clear()
+            self._retry_delay_completions.append(completion)
             if delay_s <= 0 or self._state != "RUNNING":
-                return generation
-            timer = threading.Timer(delay_s, self._fire_retry_delay, args=(generation,))
-            timer.daemon = True
-            self._retry_delay_timer = timer
-            timer.start()
-            return generation
+                completed_delays = self._take_retry_delay_completions_locked()
+            else:
+                timer = threading.Timer(delay_s, self._fire_retry_delay, args=(generation,))
+                timer.daemon = True
+                self._retry_delay_timer = timer
+                timer.start()
+        _settle_futures(completed_delays)
+        return completion
+
+    def _take_retry_delay_completions_locked(self) -> list[Future[None]]:
+        completions = self._retry_delay_completions
+        self._retry_delay_completions = []
+        return completions
+
+    def _cancel_retry_delay_locked(self) -> list[Future[None]]:
+        if self._retry_delay_timer is not None:
+            self._retry_delay_timer.cancel()
+            self._retry_delay_timer = None
+        self._retry_delay_effect_completions.clear()
+        return self._take_retry_delay_completions_locked()
 
     def _task_source_pause_callbacks_locked(self) -> list[Callable[[], None]]:
         queue_size = self._queued_event_count_locked()
@@ -977,7 +1003,95 @@ class FteQueryScheduler:
             self.enqueue(RetryDelayExpired(self.query_id, generation))
             self.drain()
         except Exception as exc:
+            self._settle_retry_delay(generation, exc)
             self.fail(f"FTE retry delay handler failed: {exc}")
+
+    def _complete_retry_delay(
+        self,
+        generation: int,
+        drain_completion: Future[None],
+    ) -> None:
+        try:
+            drain_completion.result()
+        except BaseException as exc:
+            error: BaseException | None = exc
+        else:
+            error = None
+        if error is not None:
+            self._settle_retry_delay(generation, error)
+            return
+        with self._lock:
+            if generation != self._retry_delay_generation:
+                return
+            effect_completions = tuple(self._retry_delay_effect_completions)
+        if not effect_completions:
+            self._settle_retry_delay(generation, None)
+            return
+
+        effect_lock = threading.Lock()
+        remaining_effects = len(effect_completions)
+        effects_finished = False
+
+        def finish_effects(error: BaseException | None) -> None:
+            nonlocal effects_finished
+            with effect_lock:
+                if effects_finished:
+                    return
+                effects_finished = True
+            if error is not None:
+                self._settle_retry_delay(generation, error)
+                return
+            # An external admission round can complete after enqueueing back
+            # into this still-active scheduler.  Checkpoint once more so that
+            # re-entrant event is published before the retry delay completes.
+            checkpoint = self.enqueue_drain_barrier()
+            checkpoint.add_done_callback(
+                lambda completion: self._settle_retry_delay_after_checkpoint(generation, completion)
+            )
+
+        def effect_completed(completion: Future[None]) -> None:
+            nonlocal remaining_effects
+            try:
+                completion.result()
+            except BaseException as exc:
+                effect_error: BaseException | None = exc
+            else:
+                effect_error = None
+            with effect_lock:
+                remaining_effects -= 1
+                all_completed = remaining_effects == 0
+            if effect_error is not None:
+                finish_effects(effect_error)
+            elif all_completed:
+                finish_effects(None)
+
+        for effect_completion in effect_completions:
+            effect_completion.add_done_callback(effect_completed)
+
+    def _settle_retry_delay_after_checkpoint(
+        self,
+        generation: int,
+        checkpoint: Future[None],
+    ) -> None:
+        try:
+            checkpoint.result()
+        except BaseException as exc:
+            error: BaseException | None = exc
+        else:
+            error = None
+        self._settle_retry_delay(generation, error)
+
+    def _settle_retry_delay(
+        self,
+        generation: int,
+        error: BaseException | None,
+    ) -> None:
+        with self._lock:
+            if generation != self._retry_delay_generation:
+                return
+            self._retry_delay_effect_completions.clear()
+            completions = self._take_retry_delay_completions_locked()
+        _settle_futures(completions, error)
 
     def _handle_event(
         self,
@@ -1025,25 +1139,35 @@ class FteQueryScheduler:
                 if event.generation != self._retry_delay_generation:
                     return []
                 self._retry_delay_timer = None
+            checkpoint = self.enqueue_drain_barrier()
+            checkpoint.add_done_callback(lambda completion: self._complete_retry_delay(event.generation, completion))
             if handlers.on_retry_delay_expired is None:
                 return []
-            return list(handlers.on_retry_delay_expired(event) or [])
+            result = handlers.on_retry_delay_expired(event)
+            if result is None:
+                return []
+            with self._lock:
+                if event.generation == self._retry_delay_generation:
+                    self._retry_delay_effect_completions.append(result.completion)
+            return list(result.outputs)
         if isinstance(event, ExchangeSelectorUpdated):
             if handlers.on_exchange_selector_updated is None:
                 return []
             return list(handlers.on_exchange_selector_updated(event) or [])
         if isinstance(event, QueryAbort):
             barriers: list[Future[None]] = []
+            retry_delay_completions: list[Future[None]] = []
             with self._lock:
                 self._state = "ABORTED"
                 barriers = self._clear_queued_events_locked()
                 self._queued_internal_admission_classes.clear()
+                retry_delay_completions = self._cancel_retry_delay_locked()
             try:
                 outputs = [] if handlers.on_query_abort is None else list(handlers.on_query_abort(event) or [])
             except BaseException as exc:
-                _settle_futures(barriers, exc)
+                _settle_futures([*barriers, *retry_delay_completions], exc)
                 raise
-            _settle_futures(barriers)
+            _settle_futures([*barriers, *retry_delay_completions])
             return outputs
         return []
 

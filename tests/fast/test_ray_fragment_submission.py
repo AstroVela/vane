@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import vane
+import vane.runners.fte.fte_scheduler as fte_scheduler_mod
 from vane._ray_errors import RemoteRayException
 
 ray = pytest.importorskip("ray")
@@ -6641,7 +6642,7 @@ def test_duplicate_fte_worker_failure_waits_for_active_reconciliation(monkeypatc
         reconciliation_started.set()
         assert release_reconciliation.wait(timeout=2.0)
         state_published.set()
-        return worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,))
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,), ())
 
     monkeypatch.setattr(worker_failures_mod, "Future", _ObservedReconciliation)
     monkeypatch.setattr(
@@ -6709,7 +6710,7 @@ def test_duplicate_fte_worker_failure_scheduler_observer_fences_without_blocking
         if len(reconciled_scheduler_batches) == 1:
             reconciliation_started.set()
             assert release_reconciliation.wait(timeout=2.0)
-        return worker_failures_mod._FteWorkerFailureReconciliationResult((), reconciled_schedulers)
+        return worker_failures_mod._FteWorkerFailureReconciliationResult((), reconciled_schedulers, ())
 
     monkeypatch.setattr(
         worker_failures_mod,
@@ -6781,7 +6782,11 @@ def test_duplicate_fte_worker_failure_fences_join_owner_reconciliation(monkeypat
     assert result is not None
     pending_drain = Future()
     pending_drain.set_result(None)
-    owner.complete_after_pending_drain(result.schedulers, pending_drain)
+    owner.complete_after_pending_drain(
+        result.schedulers,
+        pending_drain,
+        result.retry_delay_completions,
+    )
     assert owner.reconcile() is None
     assert owner.release_runner() is False
 
@@ -7001,11 +7006,16 @@ def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(mo
         manager_instance_id=failed.manager_instance_id,
         error=RuntimeError("planned failure"),
     )
+    retry_delay_completion = Future()
 
     monkeypatch.setattr(
         worker_failures_mod,
         "_reconcile_fte_worker_failure",
-        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), schedulers),
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult(
+            (),
+            schedulers,
+            (retry_delay_completion,),
+        ),
     )
     monkeypatch.setattr(
         worker_failures_mod,
@@ -7014,7 +7024,9 @@ def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(mo
     )
 
     def fail_pending_drain():
-        raise RuntimeError("planned publication failure")
+        completion = Future()
+        completion.set_exception(RuntimeError("planned publication failure"))
+        return [], completion
 
     monkeypatch.setattr(
         worker_events_mod,
@@ -7025,9 +7037,90 @@ def test_fte_worker_failure_publication_error_fails_all_reconciled_schedulers(mo
     with pytest.raises(RuntimeError, match="planned publication failure"):
         failed._handles_for_worker_failed_event(event)
 
+    assert retry_delay_completion.done() is False
     assert {scheduler.stats().state for scheduler in schedulers} == {"FAILED"}
     with pytest.raises(RuntimeError, match="planned publication failure"):
         failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+
+
+def test_fte_worker_failure_barrier_waits_for_armed_retry_delay(monkeypatch):
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
+    failed = RayWorkerActorHandle(
+        _FakeActor(),
+        memory_capacity_bytes=1 << 60,
+        worker_id="manager-a:node-a:delayed-retry-failure-barrier",
+        manager_instance_id="manager-a",
+    )
+    scheduler = worker_handle_mod._FTE_SCHEDULERS.get_or_create("query-worker-failure-delayed-retry-barrier")
+    failed._bind_fte_scheduler_handlers(scheduler)
+    event = WorkerFailed(
+        query_id=scheduler.query_id,
+        worker_id=failed.worker_id,
+        worker_incarnation_id=failed.worker_incarnation_id,
+        manager_instance_id=failed.manager_instance_id,
+        error=RuntimeError("planned failure"),
+    )
+
+    monkeypatch.setattr(worker_failures_mod, "quarantine_fte_worker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker_failures_mod, "_query_ids_owned_by_fte_workers", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(worker_failures_mod, "_mark_fte_worker_failed", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(worker_failures_mod, "_fte_retry_remaining_delay_s", lambda _query_id: 10.0)
+
+    retry_admission_completion = Future()
+    pending_drain_calls = []
+
+    def controlled_pending_drain():
+        pending_drain_calls.append(None)
+        if len(pending_drain_calls) == 2:
+            return [], retry_admission_completion
+        completion = Future()
+        completion.set_result(None)
+        return [], completion
+
+    monkeypatch.setattr(
+        worker_events_mod,
+        "request_fte_pending_task_drain_with_completion",
+        controlled_pending_drain,
+    )
+
+    scheduler.enqueue(event)
+    assert scheduler.drain() == []
+
+    assert len(timers) == 1
+    assert timers[0].interval == 10.0
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+
+    timers[0].fire()
+
+    assert len(pending_drain_calls) == 2
+    assert failed._fte_worker_failure_reconciliation_complete.is_set() is False
+    retry_admission_completion.set_result(None)
+
+    failed.wait_fte_worker_failure_reconciliation(timeout_s=1.0)
+    assert scheduler.stats().event_counts == {
+        "WorkerFailed": 1,
+        "RetryDelayExpired": 1,
+    }
+    assert worker_failures_mod._WORKER_FAILURE_RECONCILIATIONS == {}
 
 
 def test_fte_worker_failure_barrier_waits_for_reentrant_scheduler_drain(monkeypatch):
@@ -7056,7 +7149,7 @@ def test_fte_worker_failure_barrier_waits_for_reentrant_scheduler_drain(monkeypa
     monkeypatch.setattr(
         worker_failures_mod,
         "_reconcile_fte_worker_failure",
-        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,)),
+        lambda *_args, **_kwargs: worker_failures_mod._FteWorkerFailureReconciliationResult((), (scheduler,), ()),
     )
 
     def blocking_admission_drain(**_kwargs):
@@ -10175,6 +10268,27 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     monkeypatch.setenv("VANE_FTE_RETRY_DELAY_SCALE_FACTOR", "2")
     now = [100.0]
     monkeypatch.setattr(worker_handle_mod.time, "monotonic", lambda: now[0])
+    timer_started = threading.Event()
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            timer_started.set()
+
+        def cancel(self):
+            pass
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
     monkeypatch.setattr(
         RayWorkerActorHandle,
         "_fte_task_handle_cls",
@@ -10198,26 +10312,28 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
         "query-fte-retry-delay.0.0.0"
     ]
 
-    retries = handle1.mark_fte_worker_failed(
-        "worker-0",
-        RuntimeError("actor died"),
-        worker_incarnation_id=handle0.worker_incarnation_id,
-    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        failure = executor.submit(
+            handle1.mark_fte_worker_failed,
+            "worker-0",
+            RuntimeError("actor died"),
+            worker_incarnation_id=handle0.worker_incarnation_id,
+        )
+        try:
+            assert timer_started.wait(timeout=1.0)
+            assert len(timers) == 1
+            assert timers[0].interval == 0.5
+            assert failure.done() is False
+            assert [call for call in actor1.fte_calls if call[0] == "create"] == []
+            assert handle1.pop_fte_result_handles("query-fte-retry-delay") == []
+        finally:
+            now[0] += 0.5
+            if timers:
+                timers[-1].fire()
+        retries = failure.result(timeout=1.0)
 
     assert retries == []
-    assert [call for call in actor1.fte_calls if call[0] == "create"] == []
-    assert handle1.pop_fte_result_handles("query-fte-retry-delay") == []
-
-    now[0] += 0.5
-    scheduler = worker_handle_mod._FTE_SCHEDULERS.get("query-fte-retry-delay")
-    assert scheduler is not None
-    scheduler.enqueue(
-        worker_handle_mod.RetryDelayExpired(
-            "query-fte-retry-delay",
-            scheduler.retry_delay_generation(),
-        )
-    )
-    scheduled = scheduler.drain()
+    scheduled = handle1.pop_fte_result_handles("query-fte-retry-delay")
 
     assert len(scheduled) == 1
     assert scheduled[0].worker_handle is handle1

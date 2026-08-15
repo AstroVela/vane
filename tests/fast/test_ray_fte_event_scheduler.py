@@ -6,9 +6,11 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
 
 import pytest
 
+import vane.runners.fte.fte_scheduler as fte_scheduler_mod
 from vane.runners.fte import FteTaskAttemptId, FteTaskId
 from vane.runners.fte.fte_events import (
     MemoryPressureDetected,
@@ -26,6 +28,7 @@ from vane.runners.fte.fte_scheduler import (
     FteEventDrivenTaskSource,
     FteEventHandlers,
     FteQueryScheduler,
+    FteRetryDelayResult,
     FteSchedulerRegistry,
 )
 from vane.runners.ray.safe_get import QueryDeadlineExceeded
@@ -759,25 +762,106 @@ def test_event_scheduler_close_resumes_paused_task_source():
 def test_event_scheduler_dispatches_current_retry_delay_generation_only():
     scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay")
     calls = []
-    stale_generation = scheduler.arm_retry_delay(0)
-    current_generation = scheduler.arm_retry_delay(0)
+    scheduler.arm_retry_delay(0)
+    stale_generation = scheduler.retry_delay_generation()
+    scheduler.arm_retry_delay(0)
+    current_generation = scheduler.retry_delay_generation()
 
     scheduler.enqueue(RetryDelayExpired("query-retry-delay", stale_generation))
     scheduler.enqueue(RetryDelayExpired("query-retry-delay", current_generation))
 
-    outputs = scheduler.drain(
-        FteEventHandlers(
-            on_retry_delay_expired=lambda event: calls.append(event.generation) or ["retry"],
-        )
-    )
+    completion = Future()
+    completion.set_result(None)
+
+    def retry_delay_expired(event):
+        calls.append(event.generation)
+        return FteRetryDelayResult(("retry",), completion)
+
+    outputs = scheduler.drain(FteEventHandlers(on_retry_delay_expired=retry_delay_expired))
 
     assert outputs == ["retry"]
     assert calls == [current_generation]
 
 
+def test_event_scheduler_retry_delay_completion_follows_latest_generation(monkeypatch):
+    timers = []
+
+    class _ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(fte_scheduler_mod.threading, "Timer", _ManualTimer)
+    scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay-completion")
+    calls = []
+    admission_completion = Future()
+
+    def retry_delay_expired(event):
+        calls.append(("retry", event.generation))
+        scheduler.enqueue(
+            ResourceAdmissionChanged(
+                scheduler.query_id,
+                execution_class="retry-descendant",
+            )
+        )
+        return FteRetryDelayResult((), admission_completion)
+
+    scheduler.set_handlers(
+        FteEventHandlers(
+            on_retry_delay_expired=retry_delay_expired,
+            on_resource_admission_changed=lambda event: calls.append(("descendant", event.execution_class)) or [],
+        )
+    )
+
+    first_completion = scheduler.arm_retry_delay(10)
+    first_generation = scheduler.retry_delay_generation()
+    second_completion = scheduler.arm_retry_delay(20)
+    second_generation = scheduler.retry_delay_generation()
+
+    assert timers[0].cancelled is True
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+
+    timers[0].fire()
+
+    assert calls == []
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+
+    timers[1].fire()
+
+    assert first_completion.done() is False
+    assert second_completion.done() is False
+    admission_completion.set_result(None)
+
+    assert first_completion.result(timeout=1.0) is None
+    assert second_completion.result(timeout=1.0) is None
+    assert first_generation != second_generation
+    assert calls == [
+        ("retry", second_generation),
+        ("descendant", "retry-descendant"),
+    ]
+
+
 def test_event_scheduler_retry_delay_timer_records_handler_failure():
     scheduler = FteSchedulerRegistry().get_or_create("query-retry-delay-failure")
-    generation = scheduler.arm_retry_delay(0)
+    completion = scheduler.arm_retry_delay(60)
+    generation = scheduler.retry_delay_generation()
+    assert scheduler._retry_delay_timer is not None
+    scheduler._retry_delay_timer.cancel()
 
     def fail_retry_delay(_event):
         raise RuntimeError("retry drain failed")
@@ -785,6 +869,8 @@ def test_event_scheduler_retry_delay_timer_records_handler_failure():
     scheduler.set_handlers(FteEventHandlers(on_retry_delay_expired=fail_retry_delay))
     scheduler._fire_retry_delay(generation)
 
+    with pytest.raises(RuntimeError, match="retry drain failed"):
+        completion.result(timeout=1.0)
     stats = scheduler.stats().to_dict()
     assert stats["state"] == "FAILED"
     assert stats["queued_events"] == 0

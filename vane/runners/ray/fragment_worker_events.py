@@ -11,7 +11,7 @@ from vane.runners.fte import (
     FteWorkerReservationUnavailable,
 )
 from vane.runners.fte.fte_events import WorkerFailed
-from vane.runners.fte.fte_scheduler import FteEventHandlers
+from vane.runners.fte.fte_scheduler import FteEventHandlers, FteRetryDelayResult
 from vane.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_FRAGMENT_EXECUTIONS,
@@ -114,12 +114,14 @@ class FteWorkerEventHandlingMixin:
         try:
             while True:
                 reconciled_schedulers: list[FteQueryScheduler] = []
+                retry_delay_completions: list[Future[None]] = []
                 try:
                     while True:
                         result = reconciliation.reconcile()
                         if result is None:
                             break
                         reconciled_schedulers.extend(result.schedulers)
+                        retry_delay_completions.extend(result.retry_delay_completions)
                         if result.scheduled_by_fragment:
                             handles.extend(
                                 self._handles_for_marked_fte_worker_failed(list(result.scheduled_by_fragment))
@@ -130,6 +132,7 @@ class FteWorkerEventHandlingMixin:
                 reconciliation.complete_after_pending_drain(
                     tuple(reconciled_schedulers),
                     pending_drain_completion,
+                    tuple(retry_delay_completions),
                 )
                 if not reconciliation.release_runner():
                     break
@@ -375,6 +378,10 @@ class FteWorkerEventHandlingMixin:
                 query_id_filter=scheduler.query_id,
             )
 
+        def on_retry_delay_expired(_event: Any) -> FteRetryDelayResult:
+            handles, completion = request_fte_pending_task_drain_with_completion()
+            return FteRetryDelayResult(tuple(handles), completion)
+
         scheduler.bind_manager_instance(
             self.manager_instance_id,
             handlers=FteEventHandlers(
@@ -392,7 +399,7 @@ class FteWorkerEventHandlingMixin:
                     execution_class_filter=event.execution_class,
                 ),
                 on_worker_reservation_completed=self._handles_for_worker_reservation_completed_event,
-                on_retry_delay_expired=lambda _event: request_fte_pending_task_drain(),
+                on_retry_delay_expired=on_retry_delay_expired,
                 on_exchange_selector_updated=self._handles_for_exchange_selector_updated_event,
             ),
         )

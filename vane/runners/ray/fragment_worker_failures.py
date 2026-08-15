@@ -49,6 +49,7 @@ def _worker_failure_reconciliation_target(
 class _FteWorkerFailureReconciliationResult:
     scheduled_by_fragment: tuple[tuple[str, str, list[Any], list[Any]], ...]
     schedulers: tuple[FteQueryScheduler, ...]
+    retry_delay_completions: tuple[Future[None], ...]
 
 
 class _FteWorkerFailureReconciliationState:
@@ -121,6 +122,7 @@ class _FteWorkerFailureReconciliationState:
         self,
         pending_drain: Future[None],
         schedulers: tuple[FteQueryScheduler, ...],
+        retry_delay_completions: tuple[Future[None], ...],
     ) -> None:
         with _WORKER_FAILURE_RECONCILIATION_LOCK:
             if self._closed or self._error is not None:
@@ -138,9 +140,11 @@ class _FteWorkerFailureReconciliationState:
                 publication_finished = True
             self._finish_publication(error)
 
-        def pending_drain_completed(completion: Future[None]) -> None:
+        def prerequisites_completed(error: BaseException | None) -> None:
+            if error is not None:
+                finish_publication(error)
+                return
             try:
-                completion.result()
                 drain_completions = [scheduler.enqueue_drain_barrier() for scheduler in schedulers]
             except BaseException as exc:
                 finish_publication(exc)
@@ -172,7 +176,27 @@ class _FteWorkerFailureReconciliationState:
             for drain_completion in drain_completions:
                 drain_completion.add_done_callback(drain_completed)
 
-        pending_drain.add_done_callback(pending_drain_completed)
+        prerequisite_lock = threading.Lock()
+        remaining_prerequisites = 1 + len(retry_delay_completions)
+
+        def prerequisite_completed(completion: Future[None]) -> None:
+            nonlocal remaining_prerequisites
+            try:
+                completion.result()
+            except BaseException as exc:
+                error: BaseException | None = exc
+            else:
+                error = None
+            with prerequisite_lock:
+                remaining_prerequisites -= 1
+                all_completed = remaining_prerequisites == 0
+            if error is not None:
+                finish_publication(error)
+            elif all_completed:
+                prerequisites_completed(None)
+
+        for prerequisite in (pending_drain, *retry_delay_completions):
+            prerequisite.add_done_callback(prerequisite_completed)
 
     def _finish_publication(self, error: BaseException | None) -> None:
         with _WORKER_FAILURE_RECONCILIATION_LOCK:
@@ -313,11 +337,19 @@ class _FteWorkerFailureReconciliation:
         self,
         schedulers: tuple[FteQueryScheduler, ...],
         pending_drain: Future[None],
+        retry_delay_completions: tuple[Future[None], ...],
     ) -> None:
         if not self.owns_runner:
             raise RuntimeError("only the active reconciliation runner can publish progress")
         unique_schedulers = tuple({id(scheduler): scheduler for scheduler in schedulers}.values())
-        self.state.add_publication(pending_drain, unique_schedulers)
+        unique_retry_delay_completions = tuple(
+            {id(completion): completion for completion in retry_delay_completions}.values()
+        )
+        self.state.add_publication(
+            pending_drain,
+            unique_schedulers,
+            unique_retry_delay_completions,
+        )
 
     def reconcile(self) -> _FteWorkerFailureReconciliationResult | None:
         if not self.owns_runner:
@@ -497,11 +529,13 @@ def _reconcile_fte_worker_failure(
         )
     else:
         scheduled_by_fragment = []
+    retry_delay_completions: list[Future[None]] = []
     for query_id, scheduler in reconciliation_schedulers.items():
         delay_s = _fte_retry_remaining_delay_s(query_id)
         if delay_s > 0:
-            scheduler.arm_retry_delay(delay_s)
+            retry_delay_completions.append(scheduler.arm_retry_delay(delay_s))
     return _FteWorkerFailureReconciliationResult(
         scheduled_by_fragment=tuple(scheduled_by_fragment),
         schedulers=tuple(reconciliation_schedulers.values()),
+        retry_delay_completions=tuple(retry_delay_completions),
     )
