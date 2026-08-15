@@ -79,12 +79,12 @@ bool ApplyFteScanSourceQueuesToPlan(duckdb::PhysicalPlan &plan,
 //! Validate the complete static-plus-FTE assignment domain before either
 //! assignment mechanism mutates the worker plan.
 bool ValidateScanTaskAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
-                                 std::string *error = nullptr);
+                                 string *error = nullptr);
 
 //! Require every distributed table scan in a worker plan to have received an
 //! explicit task assignment. A legal empty scan is represented by an applied
 //! empty descriptor, including through an FTE queue.
-bool ValidateDistributedScanTasksApplied(const duckdb::PhysicalPlan &plan, std::string *error = nullptr);
+bool ValidateDistributedScanTasksApplied(const duckdb::PhysicalPlan &plan, string *error = nullptr);
 
 //! Returns true when the plan contains a table scan tagged as a distributed
 //! worker scan target. Such a plan must not execute from its task-free worker

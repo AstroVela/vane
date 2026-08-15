@@ -426,6 +426,7 @@ def test_transport_replays_attached_catalog_on_isolated_planning_connection(tmp_
     physical_plan = transported_plan.to_physical_plan(target_conn)
 
     assert physical_plan.idx() == "snapshot-attached-catalog"
+    assert "attached_databases" not in physical_plan.__getstate__()[6]
     assert target_conn.execute(
         "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'attached_catalog'"
     ).fetchone() == (0,)
@@ -678,24 +679,26 @@ def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_p
 def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
     ray_cxx = _require_ray_cxx()
 
+    worker_cursor = vane.connect().cursor()
+    worker_threads = worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0]
+    source_threads = 2 if worker_threads == 1 else 1
     source_conn = vane.connect()
-    source_conn.execute("SET threads=3")
+    source_conn.execute(f"SET threads={source_threads}")
     source_conn.execute("SET TimeZone='UTC'")
     relation = source_conn.sql("SELECT * FROM (VALUES (1), (2), (3)) AS t(a)")
 
     plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "snapshot-execute-native")
     physical_plan = plan.to_physical_plan(vane.connect())
+    assert "threads" not in {setting["name"].lower() for setting in physical_plan.__getstate__()[6]["settings"]}
     restored_plan = pickle.loads(pickle.dumps(physical_plan))
 
-    worker_cursor = vane.connect().cursor()
-    assert worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0] != 3
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
 
     result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_cursor, restored_plan)
     table = _table_from_native_result(result)
 
     assert table.num_rows == 3
-    assert worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0] == 3
+    assert worker_cursor.execute("SELECT current_setting('threads')").fetchone()[0] == worker_threads
     assert worker_cursor.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
 
 

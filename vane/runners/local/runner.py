@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.fte import FteTaskAttemptId
 from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 from vane.runners.progress import ProgressRenderer, build_progress_snapshot, progress_enabled
@@ -344,6 +345,7 @@ class _InProcessFragmentExecutor:
         cursor_registered = False
         try:
             request_payload = dict(request)
+            task_attempt_id = FteTaskAttemptId.coerce(request_payload.get("task_id"))
             context = NativeFteWorkerManagerBackend.materialize_task_context(
                 request_payload,
                 merge_scan_task_descriptors=require_ray_cxx_attr("merge_scan_task_descriptors"),
@@ -377,6 +379,7 @@ class _InProcessFragmentExecutor:
                 request_payload.get("fte_exchange_source_queues"),
                 request_payload.get("dynamic_filter_domains"),
                 request_payload.get("native_progress_callback"),
+                {"task_id": str(task_attempt_id)},
             )
         finally:
             try:
@@ -406,8 +409,6 @@ class LocalRunner(Runner):
         self.num_workers = _normalize_num_workers(num_workers)
         self.max_running_tasks = _normalize_max_running_tasks(max_running_tasks)
         self.execution_mode = _normalize_execution_mode(execution_mode)
-        self._copy_operation_fingerprints: dict[str, str] = {}
-        self._copy_operation_fingerprint_lock = threading.Lock()
         os.environ["VANE_LOCAL_FTE_WORKERS"] = str(self.num_workers)
         os.environ["VANE_LOCAL_FTE_EXECUTION_MODE"] = self.execution_mode
 
@@ -429,34 +430,7 @@ class LocalRunner(Runner):
             started_at=started_at,
         )
 
-    @staticmethod
-    def _copy_plan_fingerprint(plan: Any) -> str:
-        fingerprint = getattr(plan, "operation_fingerprint", None)
-        if not callable(fingerprint):
-            raise TypeError("COPY logical plan is missing operation_fingerprint()")
-        raw_value = fingerprint()
-        if not isinstance(raw_value, str):
-            raise TypeError("COPY logical plan operation fingerprint must be a string")
-        value = raw_value.strip()
-        if not value:
-            raise ValueError("COPY logical plan operation fingerprint must not be empty")
-        return value
-
-    def _bind_copy_operation_fingerprint(self, operation_id: str, plan: Any) -> None:
-        plan_fingerprint = self._copy_plan_fingerprint(plan)
-        with self._copy_operation_fingerprint_lock:
-            retained_fingerprint = self._copy_operation_fingerprints.get(operation_id)
-            if retained_fingerprint is not None and retained_fingerprint != plan_fingerprint:
-                raise ValueError(f"COPY operation {operation_id} cannot be reused for a different logical plan")
-            self._copy_operation_fingerprints.setdefault(operation_id, plan_fingerprint)
-
-    def run_write(self, relation: Any, *, operation_id: str | None = None) -> dict[str, Any]:
-        if operation_id is not None and not isinstance(operation_id, str):
-            raise TypeError("distributed write operation_id must be a string")
-        query_id = str(uuid.uuid4()) if operation_id is None else operation_id.strip()
-        if not query_id:
-            raise ValueError("distributed write operation_id must not be empty")
-
+    def run_write(self, relation: Any) -> dict[str, Any]:
         import vane
 
         _preload_arrow_dataset_imports()
@@ -464,8 +438,8 @@ class LocalRunner(Runner):
         PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
-        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
-        self._bind_copy_operation_fingerprint(query_id, logical_plan)
+        query_id = str(uuid.uuid4())
+        logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
         conn = vane.connect()
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(

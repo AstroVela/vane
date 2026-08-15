@@ -14,16 +14,6 @@ class ClientContext;
 
 namespace distributed {
 
-//! Stable coordinator identity for one distributed write operation. It remains
-//! available even when no worker result envelope was produced, so a provider
-//! can identify the speculative artifact namespace for validation, finalize,
-//! and abort.
-struct DistributedWriteOperationContext {
-	string operation_id;
-
-	DUCKDB_API void Validate() const;
-};
-
 //! Dynamic coordinator state supplied by one physical extension root. Static
 //! mode, protocol, and codec information is resolved from the registered write
 //! operator contract and cannot be overridden by a plan.
@@ -46,27 +36,21 @@ public:
 	virtual const DistributedExtensionWritePlan &WritePlan() const = 0;
 
 	//! Read-only validation of coordinator/catalog preconditions before any worker
-	//! callback can run. This hook neither commits nor reconciles an earlier
-	//! attempt and must not create artifacts. A validation failure does not
-	//! authorize aborting an earlier attempt with the same operation identity.
-	virtual void ValidateDistributedWrite(ClientContext &context,
-	                                      const DistributedWriteOperationContext &operation) const = 0;
+	//! callback can run. This hook must not create artifacts.
+	virtual void ValidateDistributedWrite(ClientContext &context) const = 0;
 
 	//! Commit the selected task results in the active coordinator transaction.
-	//! The extension's catalog is authoritative for transaction atomicity and
-	//! same-operation idempotence, including after an earlier commit response was
-	//! lost. A repeated call may contain new task attempts; it must never replace
-	//! artifacts referenced by an existing committed operation. Returns the number
-	//! of affected rows represented by the selected results.
-	virtual idx_t FinalizeDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
+	//! Vane invokes this hook at most once and never retries it. Once invocation
+	//! starts, any failure is terminal with an unknown commit outcome and Vane
+	//! does not call AbortDistributedWrite. The extension's catalog transaction
+	//! is authoritative. Returns the represented affected-row count.
+	virtual idx_t FinalizeDistributedWrite(ClientContext &context,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
 
-	//! Remove uncommitted artifacts from the current attempt after a known
-	//! pre-commit failure. The extension must consult its authoritative catalog
-	//! state and preserve artifacts referenced by any committed attempt with the
-	//! same operation identity. It must support cleanup even when no worker
-	//! envelope was returned.
-	virtual void AbortDistributedWrite(ClientContext &context, const DistributedWriteOperationContext &operation,
+	//! Remove artifacts after a failure that is known to precede coordinator
+	//! finalization. This hook is never called once FinalizeDistributedWrite has
+	//! started. It must support cleanup when no worker envelope was returned.
+	virtual void AbortDistributedWrite(ClientContext &context,
 	                                   const vector<DistributedWriteTaskResult> &selected_results) const = 0;
 };
 
@@ -94,20 +78,17 @@ DUCKDB_API DistributedExtensionWriteInfo
 ResolveDistributedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWritePlan &plan);
 
 DUCKDB_API vector<DistributedWriteTaskResult>
-EncodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info,
-                                  const DistributedWriteOperationContext &operation,
+EncodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info, const string &query_id,
                                   const vector<DistributedCopyFileInfo> &files);
 DUCKDB_API vector<DistributedCopyFileInfo>
 DecodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info,
-                                  const DistributedWriteOperationContext &operation,
                                   const vector<DistributedWriteTaskResult> &results);
 
 //! Decode the one-column BLOB output produced by
 //! PhysicalDistributedExtensionWrite and enforce the coordinator plan's exact
 //! capability and fragment codec.
 DUCKDB_API vector<DistributedWriteTaskResult>
-ParseDistributedWriteTaskResults(const DistributedExtensionWriteInfo &info,
-                                 const DistributedWriteOperationContext &operation,
+ParseDistributedWriteTaskResults(const DistributedExtensionWriteInfo &info, const string &query_id,
                                  const vector<ResultPartitionRef> &partitions);
 
 } // namespace distributed

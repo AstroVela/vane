@@ -828,11 +828,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		deserializer.ReadObject(103, "distributed_write_info", [&](Deserializer &object) {
 			info = DistributedExtensionWriteInfo::Deserialize(object);
 		});
-		auto operation_id = deserializer.ReadProperty<string>(104, "operation_id");
+		auto query_id = deserializer.ReadProperty<string>(104, "query_id");
 		auto task_attempt_id = deserializer.ReadProperty<string>(105, "task_attempt_id");
 		auto result =
 		    make_uniq<PhysicalDistributedExtensionWrite>(physical_plan, std::move(info), estimated_cardinality);
-		if (!operation_id.empty() || !task_attempt_id.empty()) {
+		if (!query_id.empty() || !task_attempt_id.empty()) {
 			throw SerializationException("distributed extension write plan must not transport a runtime task context");
 		}
 		return std::move(result);

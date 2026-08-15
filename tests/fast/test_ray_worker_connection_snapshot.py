@@ -7,6 +7,7 @@ import threading
 
 import pytest
 
+import vane
 from vane.runners.ray import worker as worker_module
 
 
@@ -15,6 +16,7 @@ def _worker_actor():
     actor = object.__new__(actor_class)
     actor._native_execution_condition = threading.Condition()
     actor._active_snapshot_execution_cursors = 0
+    actor._active_snapshot_cursors = set()
     actor._closing_native_queries = set()
     actor._closing_native_tasks = set()
     actor._shutdown_started = False
@@ -22,6 +24,27 @@ def _worker_actor():
     actor._snapshot_connections_lock = threading.Lock()
     actor._configure_snapshot_conn = lambda _connection: None
     return actor_class, actor
+
+
+def test_worker_shared_database_disables_persistent_secrets_at_connect(monkeypatch):
+    actor_class, actor = _worker_actor()
+    actor._shared_conn = None
+    actor._shared_conn_lock = threading.Lock()
+    actor._duckdb_memory_bytes = 4096
+    configured_connections = []
+    connect_calls = []
+    connection = object()
+    actor._configure_conn = configured_connections.append
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr(vane, "connect", connect)
+
+    assert actor_class._get_shared_conn(actor) is connection
+    assert connect_calls == [((), {"config": {"allow_persistent_secrets": False}})]
+    assert configured_connections == [connection]
 
 
 def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch):
@@ -85,9 +108,11 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     assert configured_connections == [resolved_connection]
     assert lifecycle == ["resolve", "configure", "cursor", "cursor"]
     assert actor._snapshot_connections == {database_identity: resolved_connection}
+    assert actor._active_snapshot_cursors == {first, second}
     actor_class._close_snapshot_execution_cursor(actor, second)
     actor_class._close_snapshot_execution_cursor(actor, first)
     assert actor._active_snapshot_execution_cursors == 0
+    assert actor._active_snapshot_cursors == set()
 
 
 def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypatch):

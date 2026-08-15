@@ -54,6 +54,7 @@
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
+#include "duckdb/execution/operator/set/physical_union.hpp"
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
@@ -76,6 +77,7 @@
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
+#include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
 #include "test_helpers.hpp"
 
 #include <memory>
@@ -109,11 +111,10 @@ public:
 		return plan;
 	}
 
-	void ValidateDistributedWrite(ClientContext &, const DistributedWriteOperationContext &) const override {
+	void ValidateDistributedWrite(ClientContext &) const override {
 	}
 
-	idx_t FinalizeDistributedWrite(ClientContext &, const DistributedWriteOperationContext &,
-	                               const vector<DistributedWriteTaskResult> &results) const override {
+	idx_t FinalizeDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
 		idx_t rows = 0;
 		for (const auto &result : results) {
 			rows += result.RowCount();
@@ -121,8 +122,7 @@ public:
 		return rows;
 	}
 
-	void AbortDistributedWrite(ClientContext &, const DistributedWriteOperationContext &,
-	                           const vector<DistributedWriteTaskResult> &) const override {
+	void AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const override {
 	}
 
 private:
@@ -315,7 +315,7 @@ TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker si
 	REQUIRE(worker_write.info.Name() == write_sink->write_info().Name());
 	REQUIRE(worker_write.info.fragment_codec == write_sink->write_info().fragment_codec);
 	REQUIRE(worker_write.info.worker_bind_data == write_sink->write_info().worker_bind_data);
-	REQUIRE(worker_write.task_context.operation_id.empty());
+	REQUIRE(worker_write.task_context.query_id.empty());
 	REQUIRE(worker_write.task_context.task_attempt_id.empty());
 	REQUIRE(worker_write.children.size() == 1);
 	REQUIRE_FALSE(tasks.poll_next().first);
@@ -699,7 +699,7 @@ TEST_CASE("PhysicalPlanTranslator: null plan returns error", "[distributed]") {
 	DuckPhysicalPlanRef null_plan;
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, null_plan);
 	REQUIRE(res.is_err());
-	auto msg = std::string(res.error().what());
+	auto msg = string(res.error().what());
 	REQUIRE(msg.find("physical plan is null") != std::string::npos);
 }
 
@@ -730,7 +730,7 @@ TEST_CASE("PhysicalPlanTranslator: unsupported table function bind data is a val
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
 	REQUIRE(res.is_err());
 	REQUIRE(res.error().type() == DuckDBError::Type::ValueError);
-	auto msg = std::string(res.error().what());
+	auto msg = string(res.error().what());
 	REQUIRE(msg.find("unsupported_table_scan") != std::string::npos);
 	REQUIRE(msg.find("Copy not supported for TableFunctionData") != std::string::npos);
 	DuckDBExecutionConfig config;
@@ -755,9 +755,9 @@ TEST_CASE("PhysicalPlanTranslator: missing table function bind data is a value e
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
 	REQUIRE(res.is_err());
 	REQUIRE(res.error().type() == DuckDBError::Type::ValueError);
-	auto msg = std::string(res.error().what());
-	REQUIRE(msg.find("missing_bind_table_scan") != std::string::npos);
-	REQUIRE(msg.find("bind data is missing") != std::string::npos);
+	auto msg = string(res.error().what());
+	REQUIRE(msg.find("missing_bind_table_scan") != string::npos);
+	REQUIRE(msg.find("bind data is missing") != string::npos);
 }
 
 TEST_CASE("PhysicalPlanTranslator: auto broadcast only considers semantically safe sides", "[distributed][join]") {
@@ -1326,10 +1326,66 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	REQUIRE_FALSE(ValidateDistributedScanTasksApplied(*worker_plan, &assignment_error));
 	REQUIRE(StringUtil::Contains(assignment_error, "no explicit worker task assignment"));
 
+	auto missing_fte_descriptor_plan =
+	    ClonePhysicalPlanOrThrow(worker_plan, "parquet_missing_fte_descriptor", conn.context.get());
+	auto &missing_fte_descriptor_scan = missing_fte_descriptor_plan->Root().Cast<PhysicalTableScan>();
+	auto missing_fte_descriptor_queue = std::make_shared<FteSplitQueue>();
+	missing_fte_descriptor_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> missing_fte_descriptor_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(missing_fte_descriptor_queue)}};
+	REQUIRE(
+	    ApplyFteScanSourceQueuesToPlan(*missing_fte_descriptor_plan, missing_fte_descriptor_queues, &assignment_error));
+	REQUIRE_THROWS_WITH(missing_fte_descriptor_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles(),
+	                    Catch::Matchers::Contains("without an explicit task descriptor"));
+
+	auto empty_fte_descriptor_plan =
+	    ClonePhysicalPlanOrThrow(worker_plan, "parquet_empty_fte_descriptor", conn.context.get());
+	auto &empty_fte_descriptor_scan = empty_fte_descriptor_plan->Root().Cast<PhysicalTableScan>();
+	auto empty_fte_descriptor_queue = std::make_shared<FteSplitQueue>();
+	ScanTaskDescriptor empty_descriptor;
+	empty_descriptor.source_task_partition_id = 0;
+	empty_fte_descriptor_queue->AddSplit(TaskInput::make_scan_task(empty_descriptor.SerializeToBytes()));
+	empty_fte_descriptor_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> empty_fte_descriptor_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(empty_fte_descriptor_queue)}};
+	assignment_error.clear();
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*empty_fte_descriptor_plan, empty_fte_descriptor_queues, &assignment_error));
+	REQUIRE(empty_fte_descriptor_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
+
+	auto duplicate_fte_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
+	auto &left_duplicate_scan = ClonePhysicalPlanRootIntoPlanOrThrow(worker_plan, *duplicate_fte_plan,
+	                                                                 "parquet_duplicate_fte_left", conn.context.get())
+	                                .Cast<PhysicalTableScan>();
+	auto &right_duplicate_scan = ClonePhysicalPlanRootIntoPlanOrThrow(worker_plan, *duplicate_fte_plan,
+	                                                                  "parquet_duplicate_fte_right", conn.context.get())
+	                                 .Cast<PhysicalTableScan>();
+	const auto duplicate_scan_node_id = static_cast<idx_t>(scan_source->node_id());
+	left_duplicate_scan.extra_info.scan_node_id = optional_idx(duplicate_scan_node_id);
+	left_duplicate_scan.extra_info.scan_group_id = optional_idx(duplicate_scan_node_id);
+	right_duplicate_scan.extra_info.scan_node_id = optional_idx(duplicate_scan_node_id);
+	right_duplicate_scan.extra_info.scan_group_id = optional_idx(duplicate_scan_node_id);
+	ArenaLinkedList<reference<PhysicalOperator>> duplicate_children(duplicate_fte_plan->ArenaRef());
+	duplicate_children.push_back(left_duplicate_scan);
+	duplicate_children.push_back(right_duplicate_scan);
+	auto &duplicate_union =
+	    duplicate_fte_plan->Make<PhysicalUnion>(left_duplicate_scan.GetTypes(), duplicate_children, 0, false);
+	duplicate_fte_plan->SetRoot(duplicate_union);
+	auto duplicate_fte_queue = std::make_shared<FteSplitQueue>();
+	duplicate_fte_queue->AddSplit(TaskInput::make_scan_task(empty_descriptor.SerializeToBytes()));
+	duplicate_fte_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> duplicate_fte_queues {
+	    {duplicate_scan_node_id, std::move(duplicate_fte_queue)}};
+	assignment_error.clear();
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*duplicate_fte_plan, duplicate_fte_queues, &assignment_error));
+	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != right_duplicate_scan.extra_info.scan_node_id);
+	REQUIRE(left_duplicate_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
+	REQUIRE(right_duplicate_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
+	REQUIRE(ValidateDistributedScanTasksApplied(*duplicate_fte_plan, &assignment_error));
+
 	REQUIRE(next_task.second.task()->inputs().size() == 1);
 	const auto &task_input = next_task.second.task()->inputs().begin()->second;
 	REQUIRE(task_input.kind == TaskInput::Kind::ScanTask);
-	std::unordered_map<idx_t, ScanTaskDescriptor> assignments;
+	unordered_map<idx_t, ScanTaskDescriptor> assignments;
 	assignments.emplace(static_cast<idx_t>(scan_source->node_id()),
 	                    ScanTaskDescriptor::DeserializeFromBytes(task_input.scan_task_bytes));
 	assignment_error.clear();

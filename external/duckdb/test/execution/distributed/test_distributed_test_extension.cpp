@@ -5,6 +5,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/operator/set/physical_union.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
@@ -28,8 +30,6 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-
-#include <limits>
 
 using namespace duckdb;
 
@@ -138,7 +138,7 @@ static idx_t ParseTaskId(const string &task_id, const string &prefix) {
 			throw InvalidInputException("distributed test task '%s' has an invalid numeric identity", task_id);
 		}
 		const auto digit = NumericCast<idx_t>(character - '0');
-		if (result > (std::numeric_limits<idx_t>::max() - digit) / 10) {
+		if (result > (NumericLimits<idx_t>::Maximum() - digit) / 10) {
 			throw InvalidInputException("distributed test task '%s' numeric identity overflows idx_t", task_id);
 		}
 		result = result * 10 + digit;
@@ -230,13 +230,13 @@ static vector<DistributedWriteFragment> DistributedTestWriteFinalize(ClientConte
 	auto &global_state = global_state_p.Cast<DistributedTestWriteGlobalState>();
 	DistributedWriteArtifact artifact;
 	artifact.artifact_id = "manifest";
-	artifact.uri = "synthetic-write://" + task.operation_id + "/" + task.task_attempt_id;
+	artifact.uri = "synthetic-write://" + task.query_id + "/" + task.task_attempt_id;
 	artifact.codec = {"distributed-test.manifest", 1};
 	artifact.payload.push_back('\0');
 	artifact.payload += "rows=" + std::to_string(global_state.row_count);
 
 	DistributedWriteFragment fragment;
-	fragment.fragment_id = task.operation_id + "/" + task.task_attempt_id + "/fragment";
+	fragment.fragment_id = task.query_id + "/" + task.task_attempt_id + "/fragment";
 	fragment.payload.push_back('\0');
 	fragment.payload += "sum=" + std::to_string(global_state.value_sum);
 	fragment.artifacts.push_back(std::move(artifact));
@@ -587,7 +587,7 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	missing_fte_descriptor_scan.extra_info.scan_node_id = optional_idx(9);
 	auto empty_queue = std::make_shared<distributed::FteSplitQueue>();
 	empty_queue->NoMoreSplits();
-	std::unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> missing_fte_descriptor_queues;
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> missing_fte_descriptor_queues;
 	missing_fte_descriptor_queues.emplace(9, std::move(empty_queue));
 	string missing_fte_descriptor_error;
 	REQUIRE_FALSE(distributed::ApplyFteScanSourceQueuesToPlan(
@@ -602,12 +602,69 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	auto empty_descriptor_queue = std::make_shared<distributed::FteSplitQueue>();
 	empty_descriptor_queue->AddSplit(distributed::TaskInput::make_scan_task(empty_planned.tasks[0].SerializeToBytes()));
 	empty_descriptor_queue->NoMoreSplits();
-	std::unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> empty_fte_queues;
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> empty_fte_queues;
 	empty_fte_queues.emplace(10, std::move(empty_descriptor_queue));
 	string empty_fte_error;
 	REQUIRE(distributed::ApplyFteScanSourceQueuesToPlan(*empty_fte_plan, empty_fte_queues, &empty_fte_error));
 	REQUIRE(empty_fte_scan.distributed_scan_tasks_applied);
 	REQUIRE(empty_fte_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+
+	auto duplicate_fte_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
+	auto &left_duplicate_scan = distributed::ClonePhysicalPlanRootIntoPlanOrThrow(
+	                                empty_planned.worker_plan, *duplicate_fte_plan,
+	                                "distributed_test_extension_duplicate_fte_left", worker.context.get())
+	                                .Cast<PhysicalTableScan>();
+	auto &right_duplicate_scan = distributed::ClonePhysicalPlanRootIntoPlanOrThrow(
+	                                 empty_planned.worker_plan, *duplicate_fte_plan,
+	                                 "distributed_test_extension_duplicate_fte_right", worker.context.get())
+	                                 .Cast<PhysicalTableScan>();
+	auto &third_duplicate_scan = distributed::ClonePhysicalPlanRootIntoPlanOrThrow(
+	                                 empty_planned.worker_plan, *duplicate_fte_plan,
+	                                 "distributed_test_extension_duplicate_fte_third", worker.context.get())
+	                                 .Cast<PhysicalTableScan>();
+	left_duplicate_scan.extra_info.scan_node_id = optional_idx(11);
+	left_duplicate_scan.extra_info.scan_group_id = optional_idx(11);
+	right_duplicate_scan.extra_info.scan_node_id = optional_idx(12);
+	right_duplicate_scan.extra_info.scan_group_id = optional_idx(11);
+	third_duplicate_scan.extra_info.scan_node_id = optional_idx(12);
+	third_duplicate_scan.extra_info.scan_group_id = optional_idx(11);
+	ArenaLinkedList<reference<PhysicalOperator>> duplicate_children(duplicate_fte_plan->ArenaRef());
+	duplicate_children.push_back(left_duplicate_scan);
+	duplicate_children.push_back(right_duplicate_scan);
+	duplicate_children.push_back(third_duplicate_scan);
+	auto &duplicate_union =
+	    duplicate_fte_plan->Make<PhysicalUnion>(left_duplicate_scan.GetTypes(), duplicate_children, 0, false);
+	duplicate_fte_plan->SetRoot(duplicate_union);
+	auto left_descriptor = planned.tasks[0];
+	auto right_descriptor = planned.tasks[0];
+	right_descriptor.extension_tasks[0].task_id = "file-1";
+	right_descriptor.extension_tasks[0].payload = FileResource(1);
+	right_descriptor.Validate();
+	auto left_queue = std::make_shared<distributed::FteSplitQueue>();
+	left_queue->AddSplit(distributed::TaskInput::make_scan_task(left_descriptor.SerializeToBytes()));
+	left_queue->NoMoreSplits();
+	auto right_queue = std::make_shared<distributed::FteSplitQueue>();
+	right_queue->AddSplit(distributed::TaskInput::make_scan_task(right_descriptor.SerializeToBytes()));
+	right_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> duplicate_fte_queues;
+	duplicate_fte_queues.emplace(11, std::move(left_queue));
+	duplicate_fte_queues.emplace(12, std::move(right_queue));
+	string duplicate_fte_error;
+	REQUIRE(
+	    distributed::ApplyFteScanSourceQueuesToPlan(*duplicate_fte_plan, duplicate_fte_queues, &duplicate_fte_error));
+	REQUIRE(left_duplicate_scan.distributed_scan_tasks_applied);
+	REQUIRE(right_duplicate_scan.distributed_scan_tasks_applied);
+	REQUIRE(third_duplicate_scan.distributed_scan_tasks_applied);
+	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != right_duplicate_scan.extra_info.scan_node_id);
+	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != third_duplicate_scan.extra_info.scan_node_id);
+	REQUIRE(right_duplicate_scan.extra_info.scan_node_id != third_duplicate_scan.extra_info.scan_node_id);
+	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
+	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
+	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
+	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(0));
+	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(1));
+	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(1));
+	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*duplicate_fte_plan));
 
 	auto no_serde_plan = planned.worker_plan;
 	no_serde_plan->Root().Cast<PhysicalTableScan>().function.serialize = nullptr;
@@ -758,10 +815,7 @@ TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fat frag
 
 TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
           "[distributed][extension][extension-write]") {
-	distributed::DistributedWriteOperationContext missing_operation;
-	REQUIRE_THROWS_WITH(missing_operation.Validate(), Catch::Matchers::Contains("non-empty operation identity"));
-	distributed::DistributedWriteOperationContext operation {"distributed-test-file-write"};
-	REQUIRE_NOTHROW(operation.Validate());
+	const string query_id = "distributed-test-file-write";
 
 	DistributedExtensionWriteInfo info;
 	info.capability.extension_name = "distributed_test";
@@ -782,10 +836,12 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	file.column_statistics = Value("binary-safe-statistics");
 	file.partition_keys = Value("partition=0");
 
-	auto encoded = distributed::EncodeDistributedFileWriteResults(info, operation, {file});
+	REQUIRE_THROWS_WITH(distributed::EncodeDistributedFileWriteResults(info, "", {file}),
+	                    Catch::Matchers::Contains("non-empty query identity"));
+	auto encoded = distributed::EncodeDistributedFileWriteResults(info, query_id, {file});
 	REQUIRE(encoded.size() == 1);
-	REQUIRE(encoded[0].operation_id == operation.operation_id);
-	REQUIRE_THROWS_WITH(distributed::EncodeDistributedFileWriteResults(info, operation, {file, file}),
+	REQUIRE(encoded[0].query_id == query_id);
+	REQUIRE_THROWS_WITH(distributed::EncodeDistributedFileWriteResults(info, query_id, {file, file}),
 	                    Catch::Matchers::Contains("selected file"));
 	REQUIRE(encoded[0].RowCount() == 3);
 	REQUIRE(encoded[0].ByteCount() == 128);
@@ -797,7 +853,7 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	auto invalid_result = roundtrip;
 	invalid_result.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	REQUIRE_THROWS_WITH(invalid_result.Validate(), Catch::Matchers::Contains("not a write operator"));
-	auto decoded = distributed::DecodeDistributedFileWriteResults(info, operation, {roundtrip});
+	auto decoded = distributed::DecodeDistributedFileWriteResults(info, {roundtrip});
 	REQUIRE(decoded.size() == 1);
 	REQUIRE(decoded[0].staging_path == file.staging_path);
 	REQUIRE(decoded[0].final_path == file.final_path);
@@ -808,16 +864,18 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	REQUIRE(decoded[0].partition_keys == file.partition_keys);
 
 	roundtrip.fragments[0].artifacts[0].codec = {"distributed-test.invalid-file", 1};
-	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, operation, {roundtrip}),
+	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, {roundtrip}),
 	                    Catch::Matchers::Contains("invalid file artifact"));
 	roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
 	roundtrip.fragments[0].artifacts[0].payload = "unexpected";
-	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, operation, {roundtrip}),
+	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, {roundtrip}),
 	                    Catch::Matchers::Contains("invalid file artifact"));
 	roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
-	distributed::DistributedWriteOperationContext different_operation {"different-operation"};
-	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, different_operation, {roundtrip}),
-	                    Catch::Matchers::Contains("mismatched task result protocol"));
+	auto different_query = roundtrip;
+	different_query.query_id = "different-query";
+	REQUIRE_THROWS_WITH(distributed::DecodeDistributedFileWriteResults(info, {roundtrip, different_query}),
+	                    Catch::Matchers::Contains("multiple query identities"));
+	REQUIRE(distributed::DecodeDistributedFileWriteResults(info, {}).empty());
 }
 
 TEST_CASE("Distributed synthetic extension produces opaque write fragments through registered callbacks",
@@ -833,12 +891,11 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	REQUIRE(write_operator->fragment_codec.version == DISTRIBUTED_TEST_WRITE_CODEC_VERSION);
 
 	DistributedWriteTaskContext missing_task_context;
-	REQUIRE_THROWS_WITH(missing_task_context.Validate(), Catch::Matchers::Contains("operation identity"));
-	missing_task_context.operation_id = "query-1";
+	REQUIRE_THROWS_WITH(missing_task_context.Validate(), Catch::Matchers::Contains("query identity"));
+	missing_task_context.query_id = "query-1";
 	REQUIRE_THROWS_WITH(missing_task_context.Validate(), Catch::Matchers::Contains("task-attempt identity"));
 	const DistributedWriteTaskContext task_context {"query-1", "fragment-2.partition-3.attempt-4"};
 	REQUIRE_NOTHROW(task_context.Validate());
-	distributed::DistributedWriteOperationContext operation {task_context.operation_id};
 	auto global_state = callbacks.initialize_global(*worker.context, info, task_context);
 	ThreadContext thread_context(*worker.context);
 	ExecutionContext execution_context(*worker.context, thread_context, nullptr);
@@ -864,12 +921,12 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	DistributedWriteTaskResult task_result;
 	task_result.capability = info.capability;
 	task_result.fragment_codec = info.fragment_codec;
-	task_result.operation_id = task_context.operation_id;
+	task_result.query_id = task_context.query_id;
 	task_result.task_attempt_id = task_context.task_attempt_id;
 	task_result.fragments = std::move(fragments);
 	auto envelope = task_result.SerializeToBytes();
 	auto roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(envelope);
-	REQUIRE(roundtrip.operation_id == task_context.operation_id);
+	REQUIRE(roundtrip.query_id == task_context.query_id);
 	REQUIRE(roundtrip.task_attempt_id == task_context.task_attempt_id);
 	REQUIRE(roundtrip.fragments[0].payload[0] == '\0');
 	REQUIRE(roundtrip.fragments[0].artifacts[0].payload[0] == '\0');
@@ -883,7 +940,7 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	collection->Append(envelope_chunk);
 	vector<distributed::ResultPartitionRef> partitions;
 	partitions.push_back(std::make_shared<distributed::ColumnDataResultPartition>(collection));
-	auto parsed = distributed::ParseDistributedWriteTaskResults(info, operation, partitions);
+	auto parsed = distributed::ParseDistributedWriteTaskResults(info, task_context.query_id, partitions);
 	REQUIRE(parsed.size() == 1);
 	REQUIRE(parsed[0].RowCount() == 3);
 	REQUIRE(parsed[0].ByteCount() == 3 * sizeof(uint64_t));
@@ -901,11 +958,12 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	vector<distributed::ResultPartitionRef> extra_envelope_partitions;
 	extra_envelope_partitions.push_back(
 	    std::make_shared<distributed::ColumnDataResultPartition>(extra_envelope_collection));
-	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, operation, extra_envelope_partitions),
-	                    Catch::Matchers::Contains("exactly one task envelope"));
+	REQUIRE_THROWS_WITH(
+	    distributed::ParseDistributedWriteTaskResults(info, task_context.query_id, extra_envelope_partitions),
+	    Catch::Matchers::Contains("exactly one task envelope"));
 
 	partitions.push_back(partitions[0]);
-	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, operation, partitions),
+	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, task_context.query_id, partitions),
 	                    Catch::Matchers::Contains("more than once"));
 	partitions.pop_back();
 	auto duplicate_fragment = roundtrip;
@@ -922,11 +980,10 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	    std::make_shared<ColumnDataCollection>(Allocator::DefaultAllocator(), vector<LogicalType> {LogicalType::BLOB});
 	duplicate_fragment_collection->Append(duplicate_fragment_chunk);
 	partitions.push_back(std::make_shared<distributed::ColumnDataResultPartition>(duplicate_fragment_collection));
-	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, operation, partitions),
+	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, task_context.query_id, partitions),
 	                    Catch::Matchers::Contains("selected fragment"));
 	partitions.pop_back();
-	distributed::DistributedWriteOperationContext different_operation {"different-operation"};
-	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, different_operation, partitions),
+	REQUIRE_THROWS_WITH(distributed::ParseDistributedWriteTaskResults(info, "different-query", partitions),
 	                    Catch::Matchers::Contains("mismatched task result protocol"));
 
 	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
@@ -937,14 +994,14 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	plan->SetRoot(write);
 	auto cloned = distributed::ClonePhysicalPlanOrThrow(plan, "distributed_test_opaque_write", worker.context.get());
 	auto &cloned_write = cloned->Root().Cast<PhysicalDistributedExtensionWrite>();
-	REQUIRE(cloned_write.task_context.operation_id.empty());
+	REQUIRE(cloned_write.task_context.query_id.empty());
 	REQUIRE(cloned_write.task_context.task_attempt_id.empty());
 	REQUIRE(cloned_write.info.worker_bind_data == DistributedTestWriteBindData());
 	REQUIRE(ValidateDistributedWriteTaskContextAssignment(*cloned, task_context) == 1);
-	REQUIRE(cloned_write.task_context.operation_id.empty());
+	REQUIRE(cloned_write.task_context.query_id.empty());
 	REQUIRE(cloned_write.task_context.task_attempt_id.empty());
 	REQUIRE(ApplyDistributedWriteTaskContext(*cloned, task_context) == 1);
-	REQUIRE(cloned_write.task_context.operation_id == task_context.operation_id);
+	REQUIRE(cloned_write.task_context.query_id == task_context.query_id);
 	REQUIRE(cloned_write.task_context.task_attempt_id == task_context.task_attempt_id);
 	REQUIRE_NOTHROW(ApplyDistributedWriteTaskContext(*cloned, task_context));
 	auto changed_task_context = task_context;
@@ -954,7 +1011,7 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	REQUIRE_THROWS_WITH(ApplyDistributedWriteTaskContext(*cloned, changed_task_context),
 	                    Catch::Matchers::Contains("cannot change"));
 	changed_task_context = task_context;
-	changed_task_context.operation_id += "-different";
+	changed_task_context.query_id += "-different";
 	REQUIRE_THROWS_WITH(ApplyDistributedWriteTaskContext(*cloned, changed_task_context),
 	                    Catch::Matchers::Contains("cannot change"));
 	auto ambiguous_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
@@ -971,12 +1028,12 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	                    Catch::Matchers::Contains("more than one distributed extension write operator"));
 	REQUIRE_THROWS_WITH(ApplyDistributedWriteTaskContext(*ambiguous_plan, task_context),
 	                    Catch::Matchers::Contains("more than one distributed extension write operator"));
-	REQUIRE(inner_write.task_context.operation_id.empty());
-	REQUIRE(outer_write.task_context.operation_id.empty());
+	REQUIRE(inner_write.task_context.query_id.empty());
+	REQUIRE(outer_write.task_context.query_id.empty());
 
 	auto recloned =
 	    distributed::ClonePhysicalPlanOrThrow(cloned, "distributed_test_opaque_write_reclone", worker.context.get());
-	REQUIRE(recloned->Root().Cast<PhysicalDistributedExtensionWrite>().task_context.operation_id.empty());
+	REQUIRE(recloned->Root().Cast<PhysicalDistributedExtensionWrite>().task_context.query_id.empty());
 
 	MemoryStream injected_identity_stream(Allocator::DefaultAllocator());
 	BinarySerializer injected_identity_serializer(injected_identity_stream);
@@ -986,7 +1043,7 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	injected_identity_serializer.WriteProperty<idx_t>(102, "estimated_cardinality", 1);
 	injected_identity_serializer.WriteObject(103, "distributed_write_info",
 	                                         [&](Serializer &object) { info.Serialize(object); });
-	injected_identity_serializer.WriteProperty(104, "operation_id", task_context.operation_id);
+	injected_identity_serializer.WriteProperty(104, "query_id", task_context.query_id);
 	injected_identity_serializer.WriteProperty(105, "task_attempt_id", task_context.task_attempt_id);
 	injected_identity_serializer.WriteList(198, "children", 0, [](Serializer::List &, idx_t) {});
 	injected_identity_serializer.End();
@@ -1034,7 +1091,7 @@ TEST_CASE("Distributed synthetic extension produces opaque write fragments throu
 	REQUIRE(materialized != nullptr);
 	REQUIRE(materialized->RowCount() == 1);
 	auto executed = DistributedWriteTaskResult::DeserializeFromBytes(StringValue::Get(materialized->GetValue(0, 0)));
-	REQUIRE(executed.operation_id == execution_task_context.operation_id);
+	REQUIRE(executed.query_id == execution_task_context.query_id);
 	REQUIRE(executed.task_attempt_id == execution_task_context.task_attempt_id);
 	REQUIRE(executed.RowCount() == 2);
 	REQUIRE(executed.ByteCount() == 2 * sizeof(uint64_t));
@@ -1094,7 +1151,7 @@ TEST_CASE("Distributed synthetic extension composes opaque scan and write callba
 	REQUIRE(materialized != nullptr);
 	REQUIRE(materialized->RowCount() == 1);
 	auto result = DistributedWriteTaskResult::DeserializeFromBytes(StringValue::Get(materialized->GetValue(0, 0)));
-	REQUIRE(result.operation_id == task_context.operation_id);
+	REQUIRE(result.query_id == task_context.query_id);
 	REQUIRE(result.task_attempt_id == task_context.task_attempt_id);
 	REQUIRE(result.RowCount() == 3);
 	REQUIRE(result.ByteCount() == 3 * sizeof(uint64_t));

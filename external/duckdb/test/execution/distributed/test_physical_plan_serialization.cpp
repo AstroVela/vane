@@ -2295,15 +2295,15 @@ TEST_CASE("Static and FTE exchange assignments apply as validated disjoint subse
 	embedded_handle.node_id = "node-1";
 	auto &embedded_source =
 	    plan.Make<PhysicalRemoteExchangeSource>(types, 1, "embedded-exchange", vector<idx_t> {0},
-	                                            std::vector<distributed::ExchangeSourceHandle> {embedded_handle},
+	                                            vector<distributed::ExchangeSourceHandle> {embedded_handle},
 	                                            exchange_mgr, source_nodes)
 	        .Cast<PhysicalRemoteExchangeSource>();
 	auto &static_source = plan.Make<PhysicalRemoteExchangeSource>(types, 1, "static-exchange", vector<idx_t>(),
-	                                                              std::vector<distributed::ExchangeSourceHandle>(),
+	                                                              vector<distributed::ExchangeSourceHandle>(),
 	                                                              exchange_mgr, source_nodes, optional_idx(42))
 	                          .Cast<PhysicalRemoteExchangeSource>();
 	auto &fte_source = plan.Make<PhysicalRemoteExchangeSource>(types, 1, "fte-exchange", vector<idx_t>(),
-	                                                           std::vector<distributed::ExchangeSourceHandle>(),
+	                                                           vector<distributed::ExchangeSourceHandle>(),
 	                                                           exchange_mgr, source_nodes, optional_idx(43))
 	                       .Cast<PhysicalRemoteExchangeSource>();
 	fte_source.children.push_back(embedded_source);
@@ -2316,9 +2316,9 @@ TEST_CASE("Static and FTE exchange assignments apply as validated disjoint subse
 	handle.partition_id = 0;
 	handle.node_id = "node-1";
 	descriptor.source_handles.push_back(handle);
-	std::unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> static_tasks {{42, descriptor}};
+	unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> static_tasks {{42, descriptor}};
 	auto queue = std::make_shared<distributed::FteSplitQueue>();
-	std::unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> fte_queues {{43, queue}};
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> fte_queues {{43, queue}};
 
 	string error;
 	REQUIRE(distributed::ValidateExchangeSourceAssignments(plan, set<idx_t> {42, 43}, &error));

@@ -5,14 +5,13 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
-
-#include <limits>
 
 namespace duckdb {
 
@@ -23,7 +22,7 @@ static const string &WriteName(const DistributedExtensionWriteInfo &info) {
 }
 
 static idx_t AddCount(idx_t total, idx_t value, const char *name) {
-	if (value > std::numeric_limits<idx_t>::max() - total) {
+	if (value > NumericLimits<idx_t>::Maximum() - total) {
 		throw SerializationException("distributed write %s total exceeds idx_t", name);
 	}
 	return total + value;
@@ -132,8 +131,8 @@ DistributedWriteFragment DistributedWriteFragment::Deserialize(Deserializer &des
 }
 
 void DistributedWriteTaskContext::Validate() const {
-	if (operation_id.empty()) {
-		throw InvalidInputException("distributed extension write task requires a non-empty operation identity");
+	if (query_id.empty()) {
+		throw InvalidInputException("distributed extension write task requires a non-empty query identity");
 	}
 	if (task_attempt_id.empty()) {
 		throw InvalidInputException("distributed extension write task requires a non-empty task-attempt identity");
@@ -146,8 +145,8 @@ void DistributedWriteTaskResult::Validate() const {
 		throw SerializationException("distributed write task result capability is not a write operator");
 	}
 	fragment_codec.Validate("Distributed write task result");
-	if (operation_id.empty()) {
-		throw SerializationException("distributed write task result has an empty operation_id");
+	if (query_id.empty()) {
+		throw SerializationException("distributed write task result has an empty query_id");
 	}
 	if (task_attempt_id.empty()) {
 		throw SerializationException("distributed write task result has an empty task_attempt_id");
@@ -184,7 +183,7 @@ void DistributedWriteTaskResult::Serialize(Serializer &serializer) const {
 	Validate();
 	serializer.WriteObject(1, "capability", [&](Serializer &object) { capability.Serialize(object); });
 	serializer.WriteObject(2, "fragment_codec", [&](Serializer &object) { fragment_codec.Serialize(object); });
-	serializer.WriteProperty(3, "operation_id", operation_id);
+	serializer.WriteProperty(3, "query_id", query_id);
 	serializer.WriteProperty(4, "task_attempt_id", task_attempt_id);
 	serializer.WriteList(5, "fragments", fragments.size(), [&](Serializer::List &list, idx_t index) {
 		list.WriteObject([&](Serializer &object) { fragments[index].Serialize(object); });
@@ -199,7 +198,7 @@ DistributedWriteTaskResult DistributedWriteTaskResult::Deserialize(Deserializer 
 	deserializer.ReadObject(2, "fragment_codec", [&](Deserializer &object) {
 		result.fragment_codec = DistributedPayloadCodec::Deserialize(object);
 	});
-	result.operation_id = deserializer.ReadProperty<string>(3, "operation_id");
+	result.query_id = deserializer.ReadProperty<string>(3, "query_id");
 	result.task_attempt_id = deserializer.ReadProperty<string>(4, "task_attempt_id");
 	deserializer.ReadList(5, "fragments", [&](Deserializer::List &list, idx_t) {
 		list.ReadObject(
@@ -342,17 +341,13 @@ DistributedExtensionWriteInfo ResolveDistributedExtensionWriteInfo(ClientContext
 	return result;
 }
 
-void DistributedWriteOperationContext::Validate() const {
-	if (operation_id.empty()) {
-		throw InvalidInputException("distributed extension write requires a non-empty operation identity");
-	}
-}
-
 vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info,
-                                                                     const DistributedWriteOperationContext &operation,
+                                                                     const string &query_id,
                                                                      const vector<DistributedCopyFileInfo> &files) {
 	info.Validate();
-	operation.Validate();
+	if (query_id.empty()) {
+		throw InvalidInputException("distributed extension write requires a non-empty query identity");
+	}
 	if (info.mode != DistributedWriteMode::FILE_ARTIFACT) {
 		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", WriteName(info));
 	}
@@ -384,7 +379,7 @@ vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const Distr
 		DistributedWriteTaskResult result;
 		result.capability = info.capability;
 		result.fragment_codec = info.fragment_codec;
-		result.operation_id = operation.operation_id;
+		result.query_id = query_id;
 		result.task_attempt_id = "file:" + path;
 		result.fragments.push_back(std::move(fragment));
 		result.Validate();
@@ -394,21 +389,25 @@ vector<DistributedWriteTaskResult> EncodeDistributedFileWriteResults(const Distr
 }
 
 vector<DistributedCopyFileInfo> DecodeDistributedFileWriteResults(const DistributedExtensionWriteInfo &info,
-                                                                  const DistributedWriteOperationContext &operation,
                                                                   const vector<DistributedWriteTaskResult> &results) {
 	info.Validate();
-	operation.Validate();
 	if (info.mode != DistributedWriteMode::FILE_ARTIFACT) {
 		throw InvalidInputException("distributed extension write '%s' is not a file-artifact write", WriteName(info));
 	}
 	vector<DistributedCopyFileInfo> files;
 	set<string> task_attempt_ids;
 	set<string> fragment_ids;
+	string query_id;
 	for (const auto &result : results) {
 		result.Validate();
-		if (result.operation_id != operation.operation_id || result.capability != info.capability ||
-		    result.fragment_codec != info.fragment_codec) {
+		if (result.capability != info.capability || result.fragment_codec != info.fragment_codec) {
 			throw InvalidInputException("distributed file write '%s' received a mismatched task result protocol",
+			                            WriteName(info));
+		}
+		if (query_id.empty()) {
+			query_id = result.query_id;
+		} else if (result.query_id != query_id) {
+			throw InvalidInputException("distributed file write '%s' received results from multiple query identities",
 			                            WriteName(info));
 		}
 		if (!task_attempt_ids.insert(result.task_attempt_id).second) {
@@ -440,10 +439,12 @@ vector<DistributedCopyFileInfo> DecodeDistributedFileWriteResults(const Distribu
 }
 
 vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const DistributedExtensionWriteInfo &info,
-                                                                    const DistributedWriteOperationContext &operation,
+                                                                    const string &query_id,
                                                                     const vector<ResultPartitionRef> &partitions) {
 	info.Validate();
-	operation.Validate();
+	if (query_id.empty()) {
+		throw InvalidInputException("distributed extension write requires a non-empty query identity");
+	}
 	if (info.mode != DistributedWriteMode::CALLBACK) {
 		throw InvalidInputException("distributed extension write '%s' is not a callback write", WriteName(info));
 	}
@@ -483,7 +484,7 @@ vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const Distri
 					                            WriteName(info));
 				}
 				auto result = DistributedWriteTaskResult::DeserializeFromBytes(StringValue::Get(value));
-				if (result.operation_id != operation.operation_id || result.capability != info.capability ||
+				if (result.query_id != query_id || result.capability != info.capability ||
 				    result.fragment_codec != info.fragment_codec) {
 					throw InvalidInputException(
 					    "distributed extension write '%s' received a mismatched task result protocol", WriteName(info));

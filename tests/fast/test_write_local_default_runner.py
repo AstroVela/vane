@@ -69,72 +69,6 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("runner_value", [None, "", "ray"])
-def test_insert_into_with_default_or_explicit_ray_forwards_operation_identity_without_local_execution(
-    monkeypatch,
-    runner_value,
-):
-    if runner_value is None:
-        monkeypatch.delenv("VANE_RUNNER", raising=False)
-    else:
-        monkeypatch.setenv("VANE_RUNNER", runner_value)
-    import vane
-
-    calls = []
-
-    class FakeRayRunner:
-        def run_write(self, relation, *, operation_id=None):
-            logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, operation_id)
-            calls.append((relation, operation_id, logical_plan.operation_fingerprint()))
-            return {"ok": True}
-
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
-
-    connection = vane.connect()
-    connection.execute("CREATE TABLE target (value INTEGER)")
-    source = connection.sql("SELECT 42 AS value")
-    for _ in range(2):
-        source.insert_into(
-            "target",
-            operation_id="stable-callback-operation",
-        )
-
-    assert len(calls) == 2
-    assert [call[1] for call in calls] == ["stable-callback-operation"] * 2
-    assert calls[0][2] == calls[1][2]
-    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
-
-
-def test_insert_into_with_ray_runner_rejects_explicit_transaction(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "ray")
-    import vane
-
-    calls = []
-
-    class FakeRayRunner:
-        def run_write(self, relation):
-            calls.append(relation)
-            return {"ok": True}
-
-    runners = types.ModuleType("vane.runners")
-    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
-    monkeypatch.setitem(sys.modules, "vane.runners", runners)
-
-    connection = vane.connect()
-    connection.execute("CREATE TABLE target (value INTEGER)")
-    connection.execute("BEGIN")
-    try:
-        with pytest.raises(vane.InvalidInputException, match="Ray INSERT INTO requires DuckDB auto-commit mode"):
-            connection.sql("SELECT 42 AS value").insert_into("target")
-
-        assert calls == []
-        assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
-    finally:
-        connection.execute("ROLLBACK")
-
-
-@pytest.mark.parametrize("runner_value", [None, "", "ray"])
 def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, runner_value):
     if runner_value is None:
         monkeypatch.delenv("VANE_RUNNER", raising=False)
@@ -149,7 +83,7 @@ def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, ru
         def run_write(self, relation, **_kwargs):
             relation_types.append(relation.type)
             logical_plans.append(
-                vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
                     relation,
                     f"relation-mutation-{len(logical_plans)}",
                 )
@@ -258,7 +192,7 @@ def test_ray_relation_mutations_reject_explicit_transactions(monkeypatch, operat
 
 
 @pytest.mark.parametrize(("operation", "expected_name"), _RELATION_MUTATIONS, ids=_RELATION_MUTATION_IDS)
-def test_relation_mutations_reject_legacy_local_runner(monkeypatch, operation, expected_name):
+def test_relation_mutations_reject_local_fte_runner(monkeypatch, operation, expected_name):
     monkeypatch.setenv("VANE_RUNNER", "local")
     import vane
 
@@ -363,7 +297,6 @@ import sys
 
 import vane
 import vane.runners.ray.runner as ray_runner_module
-import vane
 
 os.environ["VANE_RUNNER"] = "ray"
 connection = None
@@ -417,22 +350,6 @@ def test_write_csv_with_local_fast_runner(tmp_path, monkeypatch):
     conn.sql("select 1 as x").write_csv(str(target))
 
     assert conn.sql(f"select * from read_csv('{target}')").fetchall() == [(1,)]
-
-
-def test_insert_into_with_local_fast_rejects_distributed_operation_identity(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    import vane
-
-    connection = vane.connect()
-    connection.execute("CREATE TABLE target (value INTEGER)")
-
-    with pytest.raises(vane.InvalidInputException, match="requires a distributed runner"):
-        connection.sql("SELECT 42 AS value").insert_into(
-            "target",
-            operation_id="distributed-operation",
-        )
-
-    assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
 
 def test_invalid_runner_env_raises_clear_error(monkeypatch):

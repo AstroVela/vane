@@ -16,7 +16,7 @@ public:
 	shared_ptr<const DistributedWriteOperatorExtension> write_operator;
 	unique_ptr<DistributedWriteGlobalState> extension_state;
 	DistributedWriteTaskResult result;
-	bool finalized = false;
+	bool finalize_started = false;
 };
 
 class DistributedExtensionWriteLocalSinkState final : public LocalSinkState {
@@ -68,9 +68,8 @@ static void ValidateExistingTaskContext(const PhysicalOperator &op, const Distri
 			throw InternalException("DISTRIBUTED_EXTENSION_WRITE has an unexpected physical implementation");
 		}
 		const auto &existing = write->task_context;
-		if ((!existing.operation_id.empty() || !existing.task_attempt_id.empty()) &&
-		    (existing.operation_id != task_context.operation_id ||
-		     existing.task_attempt_id != task_context.task_attempt_id)) {
+		if ((!existing.query_id.empty() || !existing.task_attempt_id.empty()) &&
+		    (existing.query_id != task_context.query_id || existing.task_attempt_id != task_context.task_attempt_id)) {
 			throw InvalidInputException("distributed extension write '%s' runtime task context cannot change",
 			                            write->info.Name());
 		}
@@ -146,17 +145,19 @@ SinkCombineResultType PhysicalDistributedExtensionWrite::Combine(ExecutionContex
 SinkFinalizeType PhysicalDistributedExtensionWrite::Finalize(Pipeline &, Event &, ClientContext &context,
                                                              OperatorSinkFinalizeInput &input) const {
 	auto &global = input.global_state.Cast<DistributedExtensionWriteGlobalSinkState>();
-	if (global.finalized) {
+	if (global.finalize_started) {
 		throw InternalException("distributed extension write '%s' finalized more than once", info.Name());
 	}
+	// Mark the invocation before entering extension code. A throwing callback is
+	// terminal for this task attempt and must never be invoked a second time.
+	global.finalize_started = true;
 	global.result.capability = info.capability;
 	global.result.fragment_codec = info.fragment_codec;
-	global.result.operation_id = task_context.operation_id;
+	global.result.query_id = task_context.query_id;
 	global.result.task_attempt_id = task_context.task_attempt_id;
 	global.result.fragments =
 	    global.write_operator->callbacks.finalize(context, info, task_context, *global.extension_state);
 	global.result.Validate();
-	global.finalized = true;
 	return SinkFinalizeType::READY;
 }
 
@@ -174,7 +175,7 @@ SourceResultType PhysicalDistributedExtensionWrite::GetDataInternal(ExecutionCon
 		throw InternalException("distributed extension write '%s' has no finalized sink state", info.Name());
 	}
 	auto &global = sink_state->Cast<DistributedExtensionWriteGlobalSinkState>();
-	if (!global.finalized) {
+	if (!global.finalize_started) {
 		throw InternalException("distributed extension write '%s' source ran before sink finalization", info.Name());
 	}
 	auto bytes = global.result.SerializeToBytes();
@@ -186,9 +187,8 @@ SourceResultType PhysicalDistributedExtensionWrite::GetDataInternal(ExecutionCon
 
 void PhysicalDistributedExtensionWrite::ApplyRuntimeTaskContext(DistributedWriteTaskContext context) {
 	context.Validate();
-	if ((!task_context.operation_id.empty() || !task_context.task_attempt_id.empty()) &&
-	    (task_context.operation_id != context.operation_id ||
-	     task_context.task_attempt_id != context.task_attempt_id)) {
+	if ((!task_context.query_id.empty() || !task_context.task_attempt_id.empty()) &&
+	    (task_context.query_id != context.query_id || task_context.task_attempt_id != context.task_attempt_id)) {
 		throw InvalidInputException("distributed extension write '%s' runtime task context cannot change", info.Name());
 	}
 	task_context = std::move(context);
@@ -207,7 +207,7 @@ void PhysicalDistributedExtensionWrite::SerializeOperatorData(Serializer &serial
 	// Runtime identities are intentionally never transported in a cached plan
 	// template. The selected task attempt installs them immediately before
 	// worker execution.
-	serializer.WriteProperty(104, "operation_id", string());
+	serializer.WriteProperty(104, "query_id", string());
 	serializer.WriteProperty(105, "task_attempt_id", string());
 }
 

@@ -49,7 +49,7 @@ bool ApplyExchangeSourceTasksToPlan(duckdb::PhysicalPlan &plan,
 //! Validate the complete static-plus-FTE assignment domain before either
 //! assignment mechanism mutates the worker plan.
 bool ValidateExchangeSourceAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
-                                       std::string *error = nullptr);
+                                       string *error = nullptr);
 
 } // namespace distributed
 } // namespace duckdb

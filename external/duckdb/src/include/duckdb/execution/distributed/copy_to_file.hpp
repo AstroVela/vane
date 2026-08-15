@@ -86,7 +86,7 @@ struct DistributedCopyFileInfo {
 };
 
 struct DistributedCopyResult {
-	vector<DistributedCopyFileInfo> files;
+	std::vector<DistributedCopyFileInfo> files;
 	idx_t rows_copied = 0;
 	idx_t staging_write_ms = 0;
 	idx_t finalize_ms = 0;
@@ -101,7 +101,6 @@ struct DistributedCopyResult {
 	bool output_direct_write = false;
 	bool output_committed = false;
 	bool output_outcome_unknown = false;
-	bool output_prepared_manifest_replayed = false;
 };
 
 // ── Shared path utilities (used by scheduler + worker) ──────────────────────

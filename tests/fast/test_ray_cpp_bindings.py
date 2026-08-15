@@ -2322,9 +2322,6 @@ def test_cleanup_uncommitted_copy_direct_write_run_public_api(tmp_path):
         str(base),
         stale_run_id,
     )
-    lifecycle_lines = Path(stale_registration["copy_output_lifecycle_path"]).read_text().splitlines()
-    assert lifecycle_lines[0] == "mode=direct_write"
-    assert not any(line.startswith("version=") for line in lifecycle_lines)
     stale_run_dir = base / f"_vane_direct_write_{stale_run_id}" / "w_failed"
     stale_file = stale_run_dir / "part.parquet"
     stale_file.parent.mkdir(parents=True)
@@ -2453,25 +2450,12 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
         committed=True,
     )
 
-    catalog_pending_run_id = "run-lifecycle-catalog-pending"
-    catalog_pending, catalog_pending_file = _register_direct_write_lifecycle_run(
-        base,
-        catalog_pending_run_id,
-        created_epoch_ms=1_000,
-        worker_dir="w_catalog_pending",
-    )
-    catalog_pending_lifecycle = Path(catalog_pending["copy_output_lifecycle_path"])
-    catalog_pending_lifecycle.write_text(
-        catalog_pending_lifecycle.read_text().replace("state=writing", "state=catalog_commit_pending")
-    )
-
     result = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(str(base), min_age_ms=5_000, now_epoch_ms=10_000)
 
-    assert result["scanned_runs"] == 4
+    assert result["scanned_runs"] == 3
     assert result["cleaned_runs"] == 1
     assert result["committed_runs"] == 1
     assert result["active_runs"] == 1
-    assert result["catalog_commit_pending_runs"] == 1
     assert result["skipped_unregistered_runs"] == 0
     assert result["errors"] == 0
     assert result["cleaned_run_ids"] == [stale_run_id]
@@ -2481,8 +2465,6 @@ def test_cleanup_expired_copy_direct_write_runs_public_api(tmp_path):
     assert Path(active["copy_output_lifecycle_path"]).exists()
     assert committed_file.exists()
     assert Path(committed["copy_output_lifecycle_path"]).exists()
-    assert catalog_pending_file.exists()
-    assert catalog_pending_lifecycle.exists()
 
 
 def test_copy_direct_write_lifecycle_uses_trimmed_base_path(tmp_path):
@@ -2572,8 +2554,8 @@ def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
         data_path = f"{run_dir}/w_failed/part.parquet"
         lifecycle = textwrap.dedent(
             f"""\
+            version=2
             mode=direct_write
-            state=writing
             base_path={base_path}
             worker_base_path={base_path}
             run_id={run_id}

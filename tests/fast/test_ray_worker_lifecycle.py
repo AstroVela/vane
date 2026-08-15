@@ -286,10 +286,14 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
     from vane.runners.ray import worker as worker_module
 
     cursor_closed = threading.Event()
+    cursor_interrupted = threading.Event()
     database_closed = threading.Event()
     shutdown_started = threading.Event()
 
     class Cursor:
+        def interrupt(self):
+            cursor_interrupted.set()
+
         def close(self):
             cursor_closed.set()
 
@@ -328,6 +332,7 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         _closing_native_queries: set[str] = set()
         _closing_native_tasks: set[str] = set()
         _active_snapshot_execution_cursors = 1
+        _active_snapshot_cursors: set[object] = set()
         _shutdown_started = False
         _shutdown_prepared = False
         _shutdown_complete = False
@@ -337,6 +342,8 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         _fte_task_manager = TaskManager()
 
     actor = DummyActor()
+    cursor = Cursor()
+    actor._active_snapshot_cursors.add(cursor)
     actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
     shutdown_errors = []
 
@@ -351,8 +358,9 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
     assert shutdown_started.wait(timeout=5)
     assert actor._shutdown_started is True
     assert database_closed.is_set() is False
+    assert cursor_interrupted.wait(timeout=5)
 
-    actor_class._close_snapshot_execution_cursor(actor, Cursor())
+    actor_class._close_snapshot_execution_cursor(actor, cursor)
     shutdown_thread.join(timeout=5)
 
     assert shutdown_thread.is_alive() is False

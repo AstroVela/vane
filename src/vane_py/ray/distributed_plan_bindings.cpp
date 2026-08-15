@@ -821,9 +821,16 @@ struct PyPhysicalPlanWrapper {
 					max_id = id;
 				}
 			}
-			idx_t next_id = max_id + 1;
-			std::unordered_map<idx_t, idx_t> base_for_group;
-			std::unordered_map<idx_t, idx_t> dup_to_base;
+			idx_t last_id = max_id;
+			unordered_map<idx_t, idx_t> base_node_for_group;
+			unordered_map<idx_t, idx_t> group_for_node;
+			unordered_map<idx_t, idx_t> alias_to_parent;
+			auto allocate_node_id = [&]() {
+				if (last_id == NumericLimits<idx_t>::Maximum()) {
+					throw InvalidInputException("cannot allocate a unique distributed scan node identity");
+				}
+				return ++last_id;
+			};
 			std::function<void(PhysicalOperator &)> normalize = [&](PhysicalOperator &op) -> void {
 				if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 					auto &scan = op.Cast<PhysicalTableScan>();
@@ -831,24 +838,36 @@ struct PyPhysicalPlanWrapper {
 						if (scan.extra_info.scan_node_id.IsValid()) {
 							scan.extra_info.scan_group_id = scan.extra_info.scan_node_id;
 						} else {
-							scan.extra_info.scan_group_id = optional_idx(next_id++);
+							scan.extra_info.scan_group_id = optional_idx(allocate_node_id());
 						}
 					}
 					if (!scan.extra_info.scan_node_id.IsValid()) {
-						scan.extra_info.scan_node_id = optional_idx(next_id++);
+						scan.extra_info.scan_node_id = optional_idx(allocate_node_id());
 					}
 					const auto group_id = scan.extra_info.scan_group_id.GetIndex();
 					auto node_id = scan.extra_info.scan_node_id.GetIndex();
-					auto it = base_for_group.find(group_id);
-					if (it == base_for_group.end()) {
-						base_for_group[group_id] = node_id;
-					} else {
-						auto base_id = it->second;
-						if (node_id == base_id) {
-							node_id = next_id++;
-							scan.extra_info.scan_node_id = optional_idx(node_id);
+					const auto original_node_id = node_id;
+					auto existing_node = group_for_node.find(node_id);
+					if (existing_node != group_for_node.end()) {
+						if (existing_node->second != group_id) {
+							throw InvalidInputException(
+							    "distributed scan node identity %llu is reused by scan groups %llu and %llu",
+							    static_cast<unsigned long long>(node_id),
+							    static_cast<unsigned long long>(existing_node->second),
+							    static_cast<unsigned long long>(group_id));
 						}
-						dup_to_base[node_id] = base_id;
+						node_id = allocate_node_id();
+						scan.extra_info.scan_node_id = optional_idx(node_id);
+						group_for_node.emplace(node_id, group_id);
+						alias_to_parent.emplace(node_id, original_node_id);
+					} else {
+						group_for_node.emplace(node_id, group_id);
+						auto group_entry = base_node_for_group.find(group_id);
+						if (group_entry == base_node_for_group.end()) {
+							base_node_for_group.emplace(group_id, node_id);
+						} else if (node_id != group_entry->second) {
+							alias_to_parent.emplace(node_id, group_entry->second);
+						}
 					}
 				}
 				for (auto &child : op.children) {
@@ -857,16 +876,27 @@ struct PyPhysicalPlanWrapper {
 			};
 			normalize(plan_->physical_plan()->Root());
 
-			idx_t copied = 0;
-			for (const auto &kv : dup_to_base) {
+			for (const auto &kv : alias_to_parent) {
 				auto dup_key = py::str(std::to_string(kv.first));
 				if (out.contains(dup_key)) {
 					continue;
 				}
-				auto base_key = py::str(std::to_string(kv.second));
-				if (out.contains(base_key)) {
-					out[dup_key] = out[base_key];
-					copied++;
+				set<idx_t> visited;
+				auto assignment_id = kv.first;
+				while (!out.contains(py::str(std::to_string(assignment_id)))) {
+					if (!visited.insert(assignment_id).second) {
+						throw InternalException("distributed scan node alias cycle detected at node %llu",
+						                        static_cast<unsigned long long>(assignment_id));
+					}
+					auto alias = alias_to_parent.find(assignment_id);
+					if (alias == alias_to_parent.end()) {
+						break;
+					}
+					assignment_id = alias->second;
+				}
+				auto assignment_key = py::str(std::to_string(assignment_id));
+				if (out.contains(assignment_key)) {
+					out[dup_key] = out[assignment_key];
 				}
 			}
 		}
@@ -1103,7 +1133,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.worker_connection_ = planning_conn;
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
-	plan_wrapper.connection_snapshot_ = connection_snapshot_;
+	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
 	validate_serialization(py::cast(plan_wrapper));
@@ -3018,24 +3048,20 @@ struct PyPhysicalPlanWrapperRunner {
 					try {
 						client_context->RunFunctionInTransaction([&]() {
 							plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started);
-							if (plan_res.is_err()) {
+							if (plan_res.is_err() ||
+							    (plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE &&
+							     plan_res.value().extension_write_result.outcome_unknown)) {
 								throw PlanResultRollbackException();
 							}
 						});
 					} catch (const PlanResultRollbackException &) {
-						D_ASSERT(plan_res.is_err());
 					} catch (...) {
 						if (plan_res.is_ok() &&
 						    plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE) {
-							if (!plan_res.value().extension_write_result.catalog_committed) {
-								// Provider finalization completed, but the owned catalog
-								// transaction did not report a definitive outcome. The remote
-								// catalog may already contain these fragments, so neither file
-								// nor opaque artifacts can be deleted safely.
-								extension_catalog_commit_error = std::current_exception();
-							}
-							// Otherwise a file publication marker already proved that the
-							// matching provider transaction completed on an earlier attempt.
+							// Provider finalization returned, but the coordinator transaction
+							// did not report a definitive outcome. The extension catalog may
+							// already reference the selected artifacts.
+							extension_catalog_commit_error = std::current_exception();
 						} else {
 							throw;
 						}
@@ -3060,31 +3086,8 @@ struct PyPhysicalPlanWrapperRunner {
 								extension_result.file_result.output_outcome_unknown = true;
 								extension_result.file_result.output_outcome_error = extension_result.outcome_error;
 							}
-						} else if (!extension_result.catalog_committed) {
+						} else if (!extension_result.outcome_unknown && !extension_result.catalog_committed) {
 							extension_result.catalog_committed = true;
-							if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
-								DuckDBResult<DistributedCopyResult> commit_res;
-								try {
-									client_context->RunFunctionInTransaction([&]() {
-										commit_res = CommitPreparedDistributedCopyDirectWriteResult(
-										    extension_result.file_result, *client_context);
-									});
-								} catch (...) {
-									commit_res = DuckDBResult<DistributedCopyResult>::err(DuckDBError::io_error(
-									    "failed to publish distributed extension output lifecycle: " +
-									    exception_message(std::current_exception())));
-								}
-								if (commit_res.is_err()) {
-									extension_result.outcome_unknown = true;
-									extension_result.outcome_error = StringUtil::Format(
-									    "extension catalog committed but output lifecycle commit was inconclusive: %s",
-									    commit_res.error().what());
-									extension_result.file_result.output_outcome_unknown = true;
-									extension_result.file_result.output_outcome_error = extension_result.outcome_error;
-								} else {
-									extension_result.file_result = std::move(commit_res).value();
-								}
-							}
 						}
 						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
 							res = DuckDBResult<DistributedCopyResult>::ok(extension_result.file_result);
@@ -3119,7 +3122,7 @@ struct PyPhysicalPlanWrapperRunner {
 				rethrow_submission_error(plan.idx());
 				throw py::value_error("distributed COPY completed without a committed output marker");
 			}
-			std::vector<string> post_commit_warnings;
+			vector<string> post_commit_warnings;
 			try {
 				rethrow_submission_error(plan.idx());
 			} catch (...) {
@@ -3334,7 +3337,7 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 		}
 		duckdb::DistributedWriteTaskContext distributed_write_task_context;
-		distributed_write_task_context.operation_id = plan_id;
+		distributed_write_task_context.query_id = plan_id;
 		distributed_write_task_context.task_attempt_id = distributed_write_task_attempt_id;
 		duckdb::ValidateDistributedWriteTaskContextAssignment(*physical_plan, distributed_write_task_context);
 		const bool worker_task_execution = !distributed_write_task_attempt_id.empty() || scan_task_map != nullptr ||

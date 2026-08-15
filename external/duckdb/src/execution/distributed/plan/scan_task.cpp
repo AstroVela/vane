@@ -11,6 +11,7 @@
 #include "duckdb/execution/distributed/plan/scan_task.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/optional_idx.hpp"
@@ -25,7 +26,6 @@
 #include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
 
 #include <mutex>
-#include <limits>
 
 namespace duckdb {
 namespace distributed {
@@ -55,6 +55,7 @@ private:
 		mutable std::mutex mutex;
 		mutable std::mutex load_mutex;
 		vector<OpenFileInfo> files;
+		bool received_descriptor = false;
 		bool finished = false;
 	};
 
@@ -180,8 +181,16 @@ private:
 		}
 		auto next = state->queue->WaitForNext();
 		std::lock_guard<std::mutex> lock(state->mutex);
-		if (next.state == FteSplitQueue::GetResult::CANCELED || next.state == FteSplitQueue::GetResult::FINISHED) {
+		if (next.state == FteSplitQueue::GetResult::CANCELED) {
 			state->finished = true;
+			throw InvalidInputException("FTE MultiFile scan source queue was canceled");
+		}
+		if (next.state == FteSplitQueue::GetResult::FINISHED) {
+			state->finished = true;
+			if (!state->received_descriptor) {
+				throw InvalidInputException(
+				    "FTE MultiFile scan source queue finished without an explicit task descriptor");
+			}
 			return false;
 		}
 		if (next.state != FteSplitQueue::GetResult::SPLIT) {
@@ -194,6 +203,7 @@ private:
 		if (descriptor.kind != ScanTaskKind::FILES) {
 			throw InvalidInputException("dynamic MultiFile scan source received an extension scan task");
 		}
+		state->received_descriptor = true;
 		if (descriptor.files.empty()) {
 			return true;
 		}
@@ -258,8 +268,16 @@ static bool CollectRequiredScanNodeIds(const PhysicalOperator &op, set<idx_t> &n
 	return true;
 }
 
-static void NormalizeScanNodeIdsByGroup(PhysicalOperator &op, std::unordered_map<idx_t, idx_t> &base_for_group,
-                                        std::unordered_map<idx_t, idx_t> &dup_to_base, idx_t &next_id,
+static idx_t AllocateScanNodeId(idx_t &last_id) {
+	if (last_id == NumericLimits<idx_t>::Maximum()) {
+		throw InvalidInputException("cannot allocate a unique distributed scan node identity");
+	}
+	return ++last_id;
+}
+
+static void NormalizeScanNodeIdsByGroup(PhysicalOperator &op, unordered_map<idx_t, idx_t> &base_node_for_group,
+                                        unordered_map<idx_t, idx_t> &group_for_node,
+                                        unordered_map<idx_t, idx_t> &alias_to_parent, idx_t &last_id,
                                         ApplyScanTasksStats &stats) {
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &scan = op.Cast<PhysicalTableScan>();
@@ -268,31 +286,62 @@ static void NormalizeScanNodeIdsByGroup(PhysicalOperator &op, std::unordered_map
 			if (scan.extra_info.scan_node_id.IsValid()) {
 				scan.extra_info.scan_group_id = scan.extra_info.scan_node_id;
 			} else {
-				scan.extra_info.scan_group_id = optional_idx(next_id++);
+				scan.extra_info.scan_group_id = optional_idx(AllocateScanNodeId(last_id));
 			}
 		}
 		if (!scan.extra_info.scan_node_id.IsValid()) {
-			scan.extra_info.scan_node_id = optional_idx(next_id++);
+			scan.extra_info.scan_node_id = optional_idx(AllocateScanNodeId(last_id));
 		}
 
 		const idx_t group_id = scan.extra_info.scan_group_id.GetIndex();
 		idx_t node_id = scan.extra_info.scan_node_id.GetIndex();
-		auto it = base_for_group.find(group_id);
-		if (it == base_for_group.end()) {
-			base_for_group[group_id] = node_id;
-		} else {
-			const idx_t base_id = it->second;
-			if (node_id == base_id) {
-				const idx_t new_id = next_id++;
-				scan.extra_info.scan_node_id = optional_idx(new_id);
-				node_id = new_id;
-				stats.duplicate_node_id++;
+		const idx_t original_node_id = node_id;
+		auto existing_node = group_for_node.find(node_id);
+		if (existing_node != group_for_node.end()) {
+			if (existing_node->second != group_id) {
+				throw InvalidInputException(
+				    "distributed scan node identity %llu is reused by scan groups %llu and %llu",
+				    static_cast<unsigned long long>(node_id), static_cast<unsigned long long>(existing_node->second),
+				    static_cast<unsigned long long>(group_id));
 			}
-			dup_to_base[node_id] = base_id;
+			node_id = AllocateScanNodeId(last_id);
+			scan.extra_info.scan_node_id = optional_idx(node_id);
+			group_for_node.emplace(node_id, group_id);
+			alias_to_parent.emplace(node_id, original_node_id);
+			stats.duplicate_node_id++;
+		} else {
+			group_for_node.emplace(node_id, group_id);
+			auto group_entry = base_node_for_group.find(group_id);
+			if (group_entry == base_node_for_group.end()) {
+				base_node_for_group.emplace(group_id, node_id);
+			} else if (node_id != group_entry->second) {
+				alias_to_parent.emplace(node_id, group_entry->second);
+			}
 		}
 	}
 	for (auto &child : op.children) {
-		NormalizeScanNodeIdsByGroup(child.get(), base_for_group, dup_to_base, next_id, stats);
+		NormalizeScanNodeIdsByGroup(child.get(), base_node_for_group, group_for_node, alias_to_parent, last_id, stats);
+	}
+}
+
+template <class MAP>
+static typename MAP::const_iterator
+ResolveScanNodeAlias(const MAP &assignments, const unordered_map<idx_t, idx_t> &alias_to_parent, idx_t node_id) {
+	set<idx_t> visited;
+	while (true) {
+		auto assignment = assignments.find(node_id);
+		if (assignment != assignments.end()) {
+			return assignment;
+		}
+		if (!visited.insert(node_id).second) {
+			throw InternalException("distributed scan node alias cycle detected at node %llu",
+			                        static_cast<unsigned long long>(node_id));
+		}
+		auto alias = alias_to_parent.find(node_id);
+		if (alias == alias_to_parent.end()) {
+			return assignments.end();
+		}
+		node_id = alias->second;
 	}
 }
 static bool ApplyExtensionScanTasks(PhysicalTableScan &scan, const ScanTaskDescriptor &descriptor, string *error) {
@@ -323,7 +372,7 @@ static bool ApplyExtensionScanTasks(PhysicalTableScan &scan, const ScanTaskDescr
 	return true;
 }
 
-using ScanTaskReferenceMap = std::unordered_map<idx_t, const ScanTaskDescriptor *>;
+using ScanTaskReferenceMap = unordered_map<idx_t, const ScanTaskDescriptor *>;
 
 static bool ApplyScanTasksToOperator(PhysicalOperator &op, const ScanTaskReferenceMap &tasks, set<idx_t> &matched_tasks,
                                      ApplyScanTasksStats &stats, string *error) {
@@ -388,7 +437,7 @@ static bool ApplyScanTasksToOperator(PhysicalOperator &op, const ScanTaskReferen
 } // namespace
 
 static idx_t SaturatingAddScanTaskEstimate(idx_t left, idx_t right) {
-	const auto maximum = std::numeric_limits<idx_t>::max();
+	const auto maximum = NumericLimits<idx_t>::Maximum();
 	return right > maximum - left ? maximum : left + right;
 }
 
@@ -624,17 +673,18 @@ bool ApplyScanTasksToPlan(duckdb::PhysicalPlan &plan, const std::unordered_map<i
 			max_id = kv.first;
 		}
 	}
-	idx_t next_id = max_id + 1;
-	std::unordered_map<idx_t, idx_t> base_for_group;
-	std::unordered_map<idx_t, idx_t> dup_to_base;
-	NormalizeScanNodeIdsByGroup(plan.Root(), base_for_group, dup_to_base, next_id, stats);
-	for (const auto &kv : dup_to_base) {
+	idx_t last_id = max_id;
+	unordered_map<idx_t, idx_t> base_node_for_group;
+	unordered_map<idx_t, idx_t> group_for_node;
+	unordered_map<idx_t, idx_t> alias_to_parent;
+	NormalizeScanNodeIdsByGroup(plan.Root(), base_node_for_group, group_for_node, alias_to_parent, last_id, stats);
+	for (const auto &kv : alias_to_parent) {
 		if (task_references.find(kv.first) != task_references.end()) {
 			continue;
 		}
-		auto base_it = task_references.find(kv.second);
-		if (base_it != task_references.end()) {
-			task_references.emplace(kv.first, base_it->second);
+		auto assignment = ResolveScanNodeAlias(task_references, alias_to_parent, kv.first);
+		if (assignment != task_references.end()) {
+			task_references.emplace(kv.first, assignment->second);
 			stats.copied_tasks++;
 		}
 	}
@@ -675,8 +725,16 @@ bool ApplyScanTasksToPlan(duckdb::PhysicalPlan &plan, const std::unordered_map<i
 
 namespace {
 
+using FteExtensionDescriptorCache = unordered_map<const FteSplitQueue *, ScanTaskDescriptor>;
+using FteDynamicFileListCache = unordered_map<const FteSplitQueue *, shared_ptr<MultiFileList>>;
+
 static bool ApplyFteExtensionScanTasks(PhysicalTableScan &scan, const std::shared_ptr<FteSplitQueue> &queue,
-                                       string *error) {
+                                       FteExtensionDescriptorCache &descriptor_cache, string *error) {
+	auto cached_descriptor = descriptor_cache.find(queue.get());
+	if (cached_descriptor != descriptor_cache.end()) {
+		return ApplyExtensionScanTasks(scan, cached_descriptor->second, error);
+	}
+
 	ScanTaskDescriptor merged;
 	bool has_descriptor = false;
 	while (true) {
@@ -707,16 +765,19 @@ static bool ApplyFteExtensionScanTasks(PhysicalTableScan &scan, const std::share
 			merged.Merge(std::move(descriptor));
 		}
 	}
-	if (has_descriptor) {
-		return ApplyExtensionScanTasks(scan, merged, error);
+	if (!has_descriptor) {
+		SetApplyError(error, "FTE extension scan source queue finished without an explicit task descriptor");
+		return false;
 	}
-	SetApplyError(error, "FTE extension scan source queue finished without an explicit task descriptor");
-	return false;
+	auto inserted = descriptor_cache.emplace(queue.get(), std::move(merged));
+	return ApplyExtensionScanTasks(scan, inserted.first->second, error);
 }
 
 bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
                                         const std::unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> &queues,
-                                        set<idx_t> &matched_queues, std::string *error, idx_t &applied) {
+                                        FteExtensionDescriptorCache &extension_descriptor_cache,
+                                        FteDynamicFileListCache &dynamic_file_list_cache, set<idx_t> &matched_queues,
+                                        string *error, idx_t &applied) {
 	bool ok = true;
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &scan = op.Cast<PhysicalTableScan>();
@@ -739,12 +800,18 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 					return false;
 				}
 				if (scan.function.HasDistributedScanCallbacks()) {
-					if (!ApplyFteExtensionScanTasks(scan, entry->second, error)) {
+					if (!ApplyFteExtensionScanTasks(scan, entry->second, extension_descriptor_cache, error)) {
 						return false;
 					}
 					applied++;
 				} else if (auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get())) {
-					multi_bind->file_list = make_shared_ptr<FteDynamicScanFileList>(entry->second);
+					auto cached_file_list = dynamic_file_list_cache.find(entry->second.get());
+					if (cached_file_list == dynamic_file_list_cache.end()) {
+						auto file_list = make_shared_ptr<FteDynamicScanFileList>(entry->second);
+						cached_file_list =
+						    dynamic_file_list_cache.emplace(entry->second.get(), std::move(file_list)).first;
+					}
+					multi_bind->file_list = cached_file_list->second;
 					scan.extra_info.total_files = optional_idx();
 					scan.extra_info.filtered_files = optional_idx();
 					scan.distributed_scan_tasks_applied = true;
@@ -762,7 +829,8 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 		}
 	}
 	for (auto &child : op.children) {
-		if (!ApplyFteScanSourceQueuesToOperator(child.get(), queues, matched_queues, error, applied)) {
+		if (!ApplyFteScanSourceQueuesToOperator(child.get(), queues, extension_descriptor_cache,
+		                                        dynamic_file_list_cache, matched_queues, error, applied)) {
 			ok = false;
 		}
 	}
@@ -803,9 +871,35 @@ bool ApplyFteScanSourceQueuesToPlan(duckdb::PhysicalPlan &plan,
 			return false;
 		}
 	}
+	ApplyScanTasksStats stats;
+	idx_t max_id = MaxScanNodeId(plan.Root(), 0);
+	for (const auto &entry : queues) {
+		if (entry.first > max_id) {
+			max_id = entry.first;
+		}
+	}
+	idx_t last_id = max_id;
+	unordered_map<idx_t, idx_t> base_node_for_group;
+	unordered_map<idx_t, idx_t> group_for_node;
+	unordered_map<idx_t, idx_t> alias_to_parent;
+	NormalizeScanNodeIdsByGroup(plan.Root(), base_node_for_group, group_for_node, alias_to_parent, last_id, stats);
+	auto queue_references = queues;
+	for (const auto &entry : alias_to_parent) {
+		if (queue_references.find(entry.first) != queue_references.end()) {
+			continue;
+		}
+		auto assignment = ResolveScanNodeAlias(queue_references, alias_to_parent, entry.first);
+		if (assignment != queue_references.end()) {
+			queue_references.emplace(entry.first, assignment->second);
+		}
+	}
+
 	idx_t applied = 0;
 	set<idx_t> matched_queues;
-	if (!ApplyFteScanSourceQueuesToOperator(plan.Root(), queues, matched_queues, error, applied)) {
+	FteExtensionDescriptorCache extension_descriptor_cache;
+	FteDynamicFileListCache dynamic_file_list_cache;
+	if (!ApplyFteScanSourceQueuesToOperator(plan.Root(), queue_references, extension_descriptor_cache,
+	                                        dynamic_file_list_cache, matched_queues, error, applied)) {
 		return false;
 	}
 	for (const auto &entry : queues) {
@@ -826,8 +920,7 @@ bool ApplyFteScanSourceQueuesToPlan(duckdb::PhysicalPlan &plan,
 	return true;
 }
 
-bool ValidateScanTaskAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
-                                 std::string *error) {
+bool ValidateScanTaskAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids, string *error) {
 	if (!plan.HasRoot()) {
 		SetApplyError(error, "plan has no root");
 		return false;
@@ -879,7 +972,7 @@ static bool ValidateDistributedScanTasksAppliedToOperator(const PhysicalOperator
 
 } // namespace
 
-bool ValidateDistributedScanTasksApplied(const duckdb::PhysicalPlan &plan, std::string *error) {
+bool ValidateDistributedScanTasksApplied(const duckdb::PhysicalPlan &plan, string *error) {
 	if (!plan.HasRoot()) {
 		SetApplyError(error, "plan has no root");
 		return false;

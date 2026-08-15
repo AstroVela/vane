@@ -337,7 +337,7 @@ const char *FteSplitQueueGetResultName(FteSplitQueue::GetResult result) {
 
 namespace {
 
-bool CollectFteExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, std::string *error) {
+bool CollectFteExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, string *error) {
 	if (op.type == PhysicalOperatorType::EXCHANGE_SOURCE) {
 		auto *source = dynamic_cast<const PhysicalRemoteExchangeSource *>(&op);
 		if (!source) {

@@ -7,13 +7,13 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/execution/physical_plan.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
-#include <limits>
 
 namespace duckdb {
 namespace distributed {
@@ -100,7 +100,7 @@ bool HasPositiveSizes(const std::vector<uint64_t> &sizes) {
 }
 
 uint64_t SaturatingAddExtensionScanEstimate(uint64_t left, uint64_t right) {
-	const auto maximum = std::numeric_limits<uint64_t>::max();
+	const auto maximum = NumericLimits<uint64_t>::Maximum();
 	return right > maximum - left ? maximum : left + right;
 }
 
@@ -129,8 +129,8 @@ size_t ResolveScanTaskTargetCount(size_t source_count, const DuckDBExecutionConf
 	return target;
 }
 
-std::vector<std::vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_tasks) {
-	std::vector<std::vector<idx_t>> groups;
+vector<vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_tasks) {
+	vector<vector<idx_t>> groups;
 	if (count == 0) {
 		return groups;
 	}
@@ -138,7 +138,7 @@ std::vector<std::vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_task
 	const idx_t per_task = (count + tasks - 1) / tasks;
 	for (idx_t start = 0; start < count; start += per_task) {
 		const idx_t end = std::min(count, start + per_task);
-		std::vector<idx_t> group;
+		vector<idx_t> group;
 		group.reserve(end - start);
 		for (idx_t idx = start; idx < end; ++idx) {
 			group.push_back(idx);
@@ -148,9 +148,8 @@ std::vector<std::vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_task
 	return groups;
 }
 
-std::vector<std::vector<idx_t>> GroupWeightedIndexesByTargetCount(const std::vector<uint64_t> &weights,
-                                                                  size_t target_groups) {
-	std::vector<std::vector<idx_t>> groups;
+vector<vector<idx_t>> GroupWeightedIndexesByTargetCount(const vector<uint64_t> &weights, size_t target_groups) {
+	vector<vector<idx_t>> groups;
 	const auto item_count = static_cast<idx_t>(weights.size());
 	if (item_count == 0) {
 		return groups;
@@ -168,7 +167,7 @@ std::vector<std::vector<idx_t>> GroupWeightedIndexesByTargetCount(const std::vec
 	}
 
 	size_t remaining_groups = target_groups;
-	std::vector<idx_t> current;
+	vector<idx_t> current;
 	current.reserve(static_cast<size_t>(item_count + target_groups - 1) / target_groups);
 	long double current_weight = 0;
 
@@ -288,7 +287,7 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	auto &elementary_tasks = validation_descriptor.extension_tasks;
 
 	auto target_count = ResolveScanTaskTargetCount(elementary_tasks.size(), exec_cfg);
-	std::vector<std::vector<idx_t>> groups;
+	vector<vector<idx_t>> groups;
 	vector<uint64_t> weights;
 	weights.reserve(elementary_tasks.size());
 	bool complete_weights = true;
@@ -404,7 +403,7 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 
 TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
                                     const shared_ptr<DatabaseInstance> &db) {
-	std::vector<ScanTaskDescriptor> tasks;
+	vector<ScanTaskDescriptor> tasks;
 
 	if (!scan.bind_data) {
 		throw NotImplementedException("Distributed execution does not support table function \"%s\": bind data is "
@@ -515,7 +514,7 @@ TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBE
 			                                          exec_cfg.scan_task_open_cost_bytes(), min_partitions);
 			groups = PackFilesByMaxSplitBytes(files, sizes, max_split, exec_cfg.scan_task_open_cost_bytes());
 			if (target_task_count > 0 && groups.size() > target_task_count) {
-				std::vector<uint64_t> group_weights;
+				vector<uint64_t> group_weights;
 				group_weights.reserve(groups.size());
 				for (const auto &group : groups) {
 					group_weights.push_back(estimate_bytes_for_group(group));

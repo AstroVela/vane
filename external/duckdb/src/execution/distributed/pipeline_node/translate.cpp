@@ -54,7 +54,7 @@ namespace distributed {
 
 namespace {
 
-void ValidateResolvedExtensionWriteInfo(const DistributedExtensionWriteInfo &info,
+void ValidateResolvedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                         const DistributedExtensionWritePlan &plan) {
 	info.Validate();
 	plan.Validate();
@@ -64,6 +64,15 @@ void ValidateResolvedExtensionWriteInfo(const DistributedExtensionWriteInfo &inf
 		throw InvalidInputException(
 		    "Pre-resolved distributed extension write protocol does not match physical operator "
 		    "plan '%s.%s'",
+		    plan.extension_name, plan.operator_name);
+	}
+	auto authoritative = ResolveDistributedExtensionWriteInfo(context, plan);
+	if (info.capability != authoritative.capability || info.mode != authoritative.mode ||
+	    info.fragment_codec != authoritative.fragment_codec ||
+	    info.worker_bind_data != authoritative.worker_bind_data) {
+		throw InvalidInputException(
+		    "Pre-resolved distributed extension write protocol does not match the database-local registration for "
+		    "'%s.%s'",
 		    plan.extension_name, plan.operator_name);
 	}
 }
@@ -361,7 +370,7 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 		DistributedExtensionWriteInfo owned_write_info;
 		optional_ptr<const DistributedExtensionWriteInfo> write_info = resolved_extension_write_info_;
 		if (write_info) {
-			ValidateResolvedExtensionWriteInfo(*write_info, provider->WritePlan());
+			ValidateResolvedExtensionWriteInfo(*client_context_, *write_info, provider->WritePlan());
 		} else {
 			owned_write_info = ResolveDistributedExtensionWriteInfo(*client_context_, provider->WritePlan());
 			write_info = &owned_write_info;
@@ -475,7 +484,12 @@ physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCon
 	};
 	update_max(plan->Root());
 
-	idx_t next_id = max_id + 1;
+	auto allocate_scan_node_id = [&]() {
+		if (max_id == NumericLimits<idx_t>::Maximum()) {
+			throw InvalidInputException("Cannot allocate a distributed scan node ID: the ID space is exhausted");
+		}
+		return ++max_id;
+	};
 	std::function<void(PhysicalOperator &)> collect;
 	collect = [&](PhysicalOperator &op) -> void {
 		if (op.type == PhysicalOperatorType::TABLE_SCAN) {
@@ -484,11 +498,11 @@ physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCon
 				if (scan.extra_info.scan_node_id.IsValid()) {
 					scan.extra_info.scan_group_id = scan.extra_info.scan_node_id;
 				} else {
-					scan.extra_info.scan_group_id = optional_idx(next_id++);
+					scan.extra_info.scan_group_id = optional_idx(allocate_scan_node_id());
 				}
 			}
 			if (!scan.extra_info.scan_node_id.IsValid()) {
-				scan.extra_info.scan_node_id = optional_idx(next_id++);
+				scan.extra_info.scan_node_id = optional_idx(allocate_scan_node_id());
 			}
 
 			auto task_set = MakeTableScanTasks(scan, *exec_cfg, db);

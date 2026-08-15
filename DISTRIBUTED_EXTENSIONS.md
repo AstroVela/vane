@@ -118,9 +118,10 @@ This validation occurs before task scheduling.
 
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning
-DatabaseInstance, and attached catalogs are recreated only there. Worker
-physical plans consume the immutable bind state serialized by the table
-function and never repeat coordinator metadata binding.
+DatabaseInstance, and attached catalogs are recreated only there. The
+declarations are removed when the coordinator produces a physical worker plan.
+Workers consume the immutable bind state serialized by the table function and
+never receive attachment SQL or repeat coordinator metadata binding.
 
 Connection snapshots do not transport DuckDB `CREATE SECRET` objects. A Ray
 worker disables host persistent-secret loading before a newly opened snapshot
@@ -135,10 +136,11 @@ DatabaseInstance. Read-only worker instances let the same source file support
 isolated exact extension and setting identities without sharing a mutable
 catalog; extension catalog commits remain coordinator-only.
 
-Connection snapshots can contain explicit S3 connection settings, session
-configuration, and executable attachment declarations. They are trusted
-coordinator-to-worker payloads and must remain inside the authenticated Ray
-cluster; they are not an untrusted interchange format or a persistence format.
+Connection snapshots can contain explicit S3 connection settings and session
+configuration. These are trusted coordinator-to-worker payloads and must remain
+inside the authenticated Ray cluster; they are not an untrusted interchange
+format or a persistence format. Executable attachment declarations travel only
+as far as the isolated coordinator planning connection.
 
 ## Distributed scans
 
@@ -223,10 +225,17 @@ original file list is never retained as a worker fallback.
 `ExtensionWriteTaskProvider` is the coordinator-side contract exposed by the
 extension's ordinary physical root. That root is never serialized or run on a
 worker. It returns only a `DistributedExtensionWritePlan`: the extension name,
-write-operator name, and opaque dynamic worker bind bytes. Vane resolves the
-mode, capability protocol, fragment codec, and worker callbacks from the
+write-operator name, plus opaque dynamic worker bind bytes for callback mode.
+File-artifact plans must leave the worker bind empty. Vane resolves the mode,
+capability protocol, fragment codec, and worker callbacks from the
 database-local immutable `DistributedWriteOperatorExtension`. A physical plan
 cannot override that static contract.
+
+In callback mode, the worker bind may carry an extension-created write handle
+and artifact namespace, analogous to a connector insert handle. The physical
+provider retains the coordinator half of that state. This extension-owned
+handle, not Vane's query ID, is what finalization and pre-finalize abort use to
+identify the write.
 
 `PlanRunner` validates the capability, codec, provider, and worker callback
 contract before translation, task selection, or artifact creation. There is no
@@ -246,22 +255,22 @@ backend falls back to the other.
 
 `FILE_ARTIFACT` is the fixed adapter for extension operators whose single child
 is DuckDB COPY configured to return `WRITTEN_FILE_STATISTICS`. Workers execute
-the COPY child and write directly to a stable namespace derived from the query
-identity and COPY sink ID. Vane selects successful attempts and converts every
+the COPY child and write immutable output paths scoped to the current execution
+and COPY sink. Vane selects successful attempts and converts every
 selected file DTO into the common opaque result envelope. The provider receives
-those envelopes and can decode them with `DecodeDistributedFileWriteResults`,
-passing the same operation context, to obtain the exact paths, row counts,
-sizes, footer sizes, column statistics, and partition keys.
+those envelopes and can decode them with `DecodeDistributedFileWriteResults`
+to obtain the exact paths, row counts, sizes, footer sizes, column statistics,
+and partition keys. An empty selected-result set decodes to an empty file set;
+the provider does not need Vane's query ID.
 
 Coordinator staging and rename-based publication are rejected because the
-catalog must reference the exact immutable paths produced by workers. Before
-provider finalization, Vane persists a `catalog_commit_pending` lifecycle fence
-so age-based cleanup cannot delete files that a remote catalog may already
-reference. After the owned catalog transaction commits, Vane publishes the
-committed file marker. PlanRunner's replay path for the same query identity
-validates the provider and then returns that marker without invoking worker
-execution or provider finalization again. The Ray driver may instead replay an
-outcome already present in its terminal cache without re-entering PlanRunner.
+catalog must reference the exact immutable paths produced by workers. DuckDB's
+ordinary distributed COPY finalizer records only whether the selected worker
+artifacts were published successfully. That marker is not an extension catalog
+commit and cannot prove that extension finalization ran. An ambiguous
+publication result therefore terminates the extension write with an unknown
+outcome; Vane does not invoke extension finalization, and it retains the
+artifacts.
 
 ### Callback mode
 
@@ -275,9 +284,9 @@ this is deliberately separate from catalog-function registration. The
 distributed translator replaces the coordinator-only extension root with a
 generic streaming sink on each worker input task. The sink passes the
 extension's opaque `worker_bind_data` and an explicit
-`DistributedWriteTaskContext` containing the stable operation ID and runtime
-FTE task-attempt ID to every callback. Extensions never parse Vane's internal
-task-attempt naming scheme to recover the operation namespace.
+`DistributedWriteTaskContext` containing the current execution query ID and
+runtime FTE task-attempt ID to every callback. These values correlate work
+within one execution; neither is a durable commit or idempotency key.
 
 `finalize` returns zero or more `DistributedWriteFragment` values. A fragment
 has a stable ID, opaque payload, row and byte counts, and zero or more
@@ -285,9 +294,9 @@ has a stable ID, opaque payload, row and byte counts, and zero or more
 URI, codec identity, and opaque payload. Binary NUL bytes are valid in all
 opaque fields. Vane wraps this data in a DuckDB-binary
 `DistributedWriteTaskResult`, emits one BLOB row per selected worker task, and
-validates the exact operation ID, capability, fragment codec, unique
+validates the exact query ID, capability, fragment codec, unique
 task-attempt IDs, globally unique fragment IDs, and count overflows before
-calling the provider. Every result envelope repeats both the operation and
+calling the provider. Every result envelope repeats both the query and
 task-attempt identities supplied to its worker callback.
 
 The outer envelope is the engine DTO; extension payloads are not required to be
@@ -296,71 +305,44 @@ Avro, protobuf, or other binary commit metadata inside the opaque payload while
 keeping Vane independent of that schema.
 
 Callback mode has no engine-owned publication marker because Vane cannot
-interpret the extension's catalog state. Vane therefore does not implement
-engine-level exactly-once commit, ask validation to determine whether an older
-attempt committed, or short-circuit worker execution as already committed.
-`ValidateDistributedWrite` performs read-only precondition checks. A retry may
-execute the source and worker sink again with the same stable operation ID.
-FTE task-attempt IDs distinguish speculative attempts within one execution but
-may repeat after a complete same-operation resubmission; they are not durable
-artifact names. `FinalizeDistributedWrite` must use the extension's own catalog
-transaction and idempotency mechanism to commit the selected attempt or
-recognize its existing commit without changing catalog state. Retry artifacts
-must use extension-generated, non-overwriting identities so they cannot replace
-objects referenced by the existing commit. The explicit retry surface is
-`relation.insert_into(..., operation_id=<previous-id>)`, which forwards to
-`Runner.run_write(..., operation_id=<previous-id>)`. Callback outcome-unknown
-errors permit only a same-ID retry; the Ray driver rejects a different logical
-plan with the same ID while allowing refreshed connection credentials for the
-same write intent. File-artifact outcome-unknown errors remain non-retryable
-through this surface because their engine-owned fence must be resolved first.
-Once a callback outcome becomes unknown, a failed retry retains the same-ID
-requirement.
+interpret the extension's catalog state. The extension's own catalog
+transaction and ACID rules are authoritative. Worker attempts may be retried or
+speculated before coordinator finalization, so they must create immutable,
+non-overwriting artifacts. Vane selects successful attempts and invokes
+`FinalizeDistributedWrite` at most once for that execution. The extension write
+hook layer does not retry, reconcile, or deduplicate that coordinator call.
 
 ### Coordinator finalization
 
 Both modes use the same coordinator sequence:
 
-1. Validate the complete provider and worker protocol, passing the stable Vane
-   operation/query ID, before physical source translation, task enumeration, or
-   side effects.
+1. Validate the complete provider and worker protocol before physical source
+   translation, task enumeration, or side effects.
 2. Execute worker sinks and select successful task attempts.
 3. Validate and aggregate their opaque result envelopes.
-4. Call `FinalizeDistributedWrite` with exactly the selected envelopes inside
-   Vane's active coordinator transaction.
+4. Call `FinalizeDistributedWrite` once with exactly the selected envelopes
+   inside Vane's active coordinator transaction.
 5. Require the provider's affected-row count to match the envelope total.
 6. Commit through DuckDB's transaction manager.
-7. For `FILE_ARTIFACT`, publish the committed file marker after catalog commit.
-
-A Ray-driver terminal cache hit returns the previously recorded outcome and
-does not repeat this coordinator sequence. Both the Ray and local distributed
-runners retain a lightweight operation-ID-to-plan-fingerprint tombstone until
-that runner exits, so a callback retry cannot reuse an operation ID for a
-different write intent. For Ray, the fingerprint survives session closure and
-terminal-result eviction. Detaching an owner may discard result payloads and
-ownership records, but it never makes the operation ID available to a different
-write intent while another client keeps the driver alive. The fingerprint
-covers the serialized logical plan, semantic connection replay state, and the
-transported Python UDF implementations. Transport-only session identities and
-refreshable credential values are excluded.
 
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
-created worker or file output, Vane supplies the stable operation ID and invokes
-abort once for known pre-commit failures, including cases where no result
-envelope was returned. The provider must locate current-attempt artifacts from
-coordinator state and deterministic identities, consult its catalog, and never
-delete artifacts referenced by a committed attempt with the same operation ID.
-Validation, translation, and setup failures before current-attempt output is
-possible do not invoke abort: the same operation ID may name an earlier attempt
-whose durable state must be preserved. A catalog commit exception is an unknown
-outcome, so Vane retains all opaque or file artifacts and does not call abort.
+created worker or file output, Vane invokes abort once for a known failure only
+while coordinator finalization has not started. The provider uses its own
+coordinator state and extension-planned artifact namespace to locate output from
+this execution.
+Validation, translation, and setup failures before output is possible do not
+invoke abort.
+
+Once `FinalizeDistributedWrite` starts, Vane never invokes abort, deletes
+selected artifacts, or retries finalization. A provider exception, an affected
+row-count mismatch, or an exception while committing the surrounding DuckDB
+transaction is terminal with an unknown outcome. The extension catalog may
+already reference the selected artifacts, so Vane retains them and leaves
+catalog inspection or repair to the extension or operator.
 
 Extension writes require DuckDB auto-commit mode. Vane owns that transaction
 boundary; an explicit caller-managed transaction is rejected before workers
-start because Vane could not safely publish a marker before the caller's later
-commit. After provider validation, file-artifact retries inspect the stable
-namespace before worker scheduling. A valid committed marker returns the
-persisted result without invoking provider finalization again.
+start. This check also applies when `Runner.run_write` is called directly.
 
 A worker or provider failure known to precede catalog commit rolls back the
 transaction. Once current-attempt output may exist, that failure also invokes
@@ -368,15 +350,6 @@ explicit cleanup. Failures before that side-effect boundary return without
 aborting durable state. If the catalog commit call itself fails, Vane retains
 the artifacts and reports an unknown outcome: a remote catalog may have
 committed before its response was lost.
-Failure to publish the file-mode marker after a known successful catalog commit
-is also reported as an unknown output-lifecycle outcome because the committed
-catalog transaction cannot be rolled back.
-
-A file-mode prepared manifest without a committed marker is therefore not
-retryable by the generic engine. Vane retains its files and rejects automatic
-replay because it cannot prove whether a remote catalog committed before its
-response was lost. Extension-specific catalog recovery may establish that
-outcome separately.
 
 ## Extension author contract
 
@@ -404,36 +377,26 @@ For every distributed write provider:
   provider;
 - keep `ValidateDistributedWrite` read-only and limit it to catalog and output
   precondition checks before workers start;
-- use the supplied stable operation ID as the root of the complete speculative
-  artifact namespace, including when no worker envelope is returned;
 - accept only the selected task-result envelopes during finalization;
-- use the extension catalog's own ACID and idempotency mechanism in
-  `FinalizeDistributedWrite`; Vane does not provide callback exactly-once or a
-  pre-execution committed-result shortcut;
-- when the same operation ID is retried, preserve any existing committed
-  catalog state and its referenced artifacts, and dispose of redundant
-  uncommitted artifacts without overwriting committed objects;
-- register their files or opaque fragments in the active coordinator
-  transaction without committing it;
+- use the extension catalog's own transaction and ACID mechanism in
+  `FinalizeDistributedWrite` and do not depend on Vane retrying that call;
+- register or commit exactly the selected files or opaque fragments from that
+  one coordinator invocation;
 - return the exact affected row count;
-- implement `AbortDistributedWrite` for known pre-commit failure, including an
-  empty selected-result set, while preserving catalog-referenced artifacts from
-  an earlier committed attempt;
+- implement `AbortDistributedWrite` for known failures before finalization
+  starts, including an empty selected-result set;
 - retain immutable artifacts when a remote catalog commit response is
   ambiguous; never interpret a commit exception as proof of rollback;
-- leave transaction commit and output-lifecycle publication to Vane.
+- never require query or task-attempt IDs to be durable idempotency keys.
 
 For callback-mode worker code:
 
 - register all five callbacks as one `DistributedWriteOperatorExtension` hook;
 - treat `worker_bind_data`, fragment payloads, and artifact payloads as portable
   bytes with no process-local pointers;
-- use the supplied operation ID as the artifact namespace and task-attempt ID
-  to distinguish speculative retries within the current distributed execution;
-- do not treat the task-attempt ID as globally unique across complete
-  same-operation resubmissions; generate immutable, non-overwriting artifact
-  identities and never replace an object that a committed catalog entry may
-  reference;
+- use the query and task-attempt IDs only to correlate the current execution;
+- generate immutable, non-overwriting artifact identities for speculative or
+  retried worker attempts;
 - keep artifact creation worker-local and catalog mutation coordinator-only;
 - report exact row and byte counts and stable fragment and artifact IDs;
 - encode every fragment according to the registered opaque codec.
@@ -474,9 +437,9 @@ The engine-level suite covers scan callback discovery, opaque fat-task payload
 serialization, explicit worker bind serde, task subset application,
 empty assignments, schema validation, file and callback write translation,
 write callback execution, binary fragment and artifact envelopes, runtime
-operation/task-attempt identity, pre-write validation, selected-result propagation,
-row-count validation, transaction ordering, abort behavior, output cleanup,
-catalog-commit fencing, and final marker publication.
+query/task-attempt identity, pre-write validation, selected-result propagation,
+row-count validation, transaction ordering, pre-finalize abort behavior, and
+terminal unknown outcomes after finalization starts.
 
 Each concrete extension adds its own adapter tests for catalog pinning, task
 semantics, object storage, commit behavior, and failure boundaries.

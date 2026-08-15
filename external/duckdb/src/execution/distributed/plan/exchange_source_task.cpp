@@ -25,7 +25,7 @@ namespace distributed {
 
 namespace {
 
-bool CollectExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, std::string *error) {
+bool CollectExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids, string *error) {
 	if (op.type == PhysicalOperatorType::EXCHANGE_SOURCE) {
 		auto *source = dynamic_cast<const PhysicalRemoteExchangeSource *>(&op);
 		if (!source) {
@@ -216,7 +216,7 @@ bool ApplyExchangeSourceTasksToPlan(duckdb::PhysicalPlan &plan,
 }
 
 bool ValidateExchangeSourceAssignments(const duckdb::PhysicalPlan &plan, const set<idx_t> &assigned_node_ids,
-                                       std::string *error) {
+                                       string *error) {
 	if (!plan.HasRoot()) {
 		if (error) {
 			*error = "plan has no root";

@@ -382,7 +382,7 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     assert captured, "expected local write relation to be captured"
 
     query_id = str(uuid.uuid4())
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         query_id,
     ).to_physical_plan(con)
@@ -3921,7 +3921,7 @@ def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, mon
         max_running_tasks=2,
     )
     query_id = f"copy-cleanup-failure-{uuid.uuid4()}"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         relation,
         query_id,
     ).to_physical_plan(con)
@@ -3960,7 +3960,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
     try:
         runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         for _ in range(2):
-            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
                 relation,
                 str(uuid.uuid4()),
             ).to_physical_plan(con)
@@ -4087,10 +4087,12 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()
-    request = {"fragment_plan": FakePlan(), "context": {}}
+    requests = [
+        {"fragment_plan": FakePlan(), "context": {}, "task_id": _task_id(partition_id)} for partition_id in range(2)
+    ]
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(executor, request) for _ in range(2)]
+            futures = [pool.submit(executor, request) for request in requests]
             results = [future.result(timeout=5.0) for future in futures]
 
         assert {result["conn_id"] for result in results} == {0, 1}
@@ -4156,7 +4158,10 @@ def test_in_process_fragment_executor_close_does_not_release_live_resources(monk
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert execute_started.wait(timeout=1.0)
         try:
             with pytest.raises(RuntimeError, match="did not drain.*active_executions=1"):
@@ -4222,7 +4227,10 @@ def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatc
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert close_started.wait(timeout=1.0)
         try:
             executor.request_shutdown()
@@ -4407,7 +4415,7 @@ def test_in_process_fragment_executor_registration_failure_releases_execution_ow
     monkeypatch.setattr(executor, "_register_cursor", fail_register)
 
     with pytest.raises(RuntimeError, match="cursor registration failed"):
-        executor({"fragment_plan": object(), "context": {}})
+        executor({"fragment_plan": object(), "context": {}, "task_id": _task_id(0)})
 
     assert executor._in_flight == 0
     assert conn.cursor_instance.closed is True

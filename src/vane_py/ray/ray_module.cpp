@@ -37,6 +37,7 @@
 #include <duckdb/execution/distributed/utils/channel.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <duckdb/common/file_system.hpp>
+#include <duckdb/common/limits.hpp>
 #include <duckdb/common/local_file_system.hpp>
 #include <duckdb/common/map.hpp>
 #include <duckdb/common/set.hpp>
@@ -83,7 +84,6 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/common/algorithm.hpp>
-#include <duckdb/common/crypto/md5.hpp>
 #include <duckdb/parallel/interrupt.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
@@ -172,12 +172,10 @@ public:
 		return plan;
 	}
 
-	void ValidateDistributedWrite(ClientContext &,
-	                              const distributed::DistributedWriteOperationContext &) const override {
+	void ValidateDistributedWrite(ClientContext &) const override {
 	}
 
-	idx_t FinalizeDistributedWrite(ClientContext &, const distributed::DistributedWriteOperationContext &,
-	                               const vector<DistributedWriteTaskResult> &results) const override {
+	idx_t FinalizeDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
 		idx_t rows = 0;
 		for (const auto &result : results) {
 			rows += result.RowCount();
@@ -185,8 +183,7 @@ public:
 		return rows;
 	}
 
-	void AbortDistributedWrite(ClientContext &, const distributed::DistributedWriteOperationContext &,
-	                           const vector<DistributedWriteTaskResult> &) const override {
+	void AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const override {
 	}
 
 protected:
@@ -1021,28 +1018,20 @@ void register_ray_bindings(py::module_ &mod) {
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",
 	                [](py::object relation_obj, py::object query_id_obj) {
-		                if (!py::isinstance<duckdb::DuckDBPyRelation>(relation_obj)) {
-			                throw py::type_error("Expected a Vane DuckDBPyRelation object");
-		                }
 		                try {
-			                auto &pyrel = relation_obj.cast<duckdb::DuckDBPyRelation &>();
-			                auto rel = pyrel.GetRelation();
-			                string query_id = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
-			                PyLogicalPlan plan;
-			                plan.query_id_ = std::move(query_id);
-			                plan.serialized_logical_plan_ = SerializeLogicalPlanFromRelation(rel);
-			                auto connection_owner = pyrel.GetConnectionOwner();
-			                if (connection_owner && !connection_owner.is_none() &&
-			                    py::isinstance<DuckDBPyConnection>(connection_owner)) {
-				                auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
-				                plan.source_connection_ = connection_owner;
-				                auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
-				                if (py::len(registrations) > 0) {
-					                plan.udf_registrations_ = std::move(registrations);
-				                }
-				                plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper);
-			                }
-			                return plan;
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     false);
+		                } catch (const py::error_already_set &) {
+			                throw;
+		                } catch (const std::exception &ex) {
+			                throw py::value_error(ex.what());
+		                }
+	                })
+	    .def_static("from_duckdb_write_relation",
+	                [](py::object relation_obj, py::object query_id_obj) {
+		                try {
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     true);
 		                } catch (const py::error_already_set &) {
 			                throw;
 		                } catch (const std::exception &ex) {
@@ -1050,7 +1039,6 @@ void register_ray_bindings(py::module_ &mod) {
 		                }
 	                })
 	    .def("idx", &PyLogicalPlan::idx)
-	    .def("operation_fingerprint", &PyLogicalPlan::operation_fingerprint)
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
@@ -1294,7 +1282,7 @@ void register_ray_bindings(py::module_ &mod) {
 			        }
 			        try {
 				        auto value = std::stoull(key_str);
-				        if (value >= std::numeric_limits<idx_t>::max()) {
+				        if (value >= NumericLimits<idx_t>::Maximum()) {
 					        throw std::out_of_range("node_id exceeds the valid idx_t range");
 				        }
 				        return static_cast<idx_t>(value);
@@ -1776,7 +1764,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    auto cleanup = std::move(cleanup_res).value();
 		    py::dict out;
 		    out["skipped_committed"] = cleanup.skipped_committed;
-		    out["skipped_catalog_commit_pending"] = cleanup.skipped_catalog_commit_pending;
 		    out["data_run_dir_existed"] = cleanup.data_run_dir_existed;
 		    out["data_run_dir_removed"] = cleanup.data_run_dir_removed;
 		    out["commit_dir_existed"] = cleanup.commit_dir_existed;
@@ -1921,7 +1908,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    out["cleaned_runs"] = cleanup.cleaned_runs;
 		    out["committed_runs"] = cleanup.committed_runs;
 		    out["active_runs"] = cleanup.active_runs;
-		    out["catalog_commit_pending_runs"] = cleanup.catalog_commit_pending_runs;
 		    out["skipped_unregistered_runs"] = cleanup.skipped_unregistered_runs;
 		    out["errors"] = cleanup.errors;
 		    py::list cleaned_run_ids;
@@ -4764,7 +4750,6 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.use_tmp_file = use_tmp_file;
 		    try {
 			    auto sink = std::make_shared<CopySinkNode>(1, PipelineNodeRef(), std::move(spec));
-			    sink->SetOperationIdentity("distributed-copy-sink-mode-test");
 			    out["construct_error"] = false;
 			    out["error"] = "";
 			    out["staging_root_base"] = sink->staging_root_base();

@@ -53,7 +53,7 @@ protected:
 	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
-//! Validate the selected operation and FTE task-attempt identities before any
+//! Validate the selected execution and FTE task-attempt identities before any
 //! worker-plan mutation. Returns the number of target write operators.
 DUCKDB_API idx_t ValidateDistributedWriteTaskContextAssignment(const PhysicalPlan &plan,
                                                                const DistributedWriteTaskContext &task_context);

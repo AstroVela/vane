@@ -361,7 +361,7 @@ class CopyPlanOutcome:
 
 @dataclass(frozen=True)
 class CopyPlanRecovery:
-    """Read-only recovery response for one submitted COPY operation."""
+    """Read-only reconciliation response for one submitted COPY operation."""
 
     operation_id: str
     outcome: CopyPlanOutcome | None = None
@@ -372,7 +372,6 @@ class CopyPlanRecovery:
 class _CopyOperationInFlight:
     owner_id: str
     session_id: str
-    plan_fingerprint: str
     task: asyncio.Task[CopyPlanOutcome]
 
 
@@ -380,17 +379,8 @@ class _CopyOperationInFlight:
 class _CopyOperationTerminal:
     owner_id: str
     session_id: str
-    plan_fingerprint: str
     outcome: CopyPlanOutcome | None = None
     error: BaseException | None = None
-
-
-@dataclass(frozen=True)
-class _CopyOperationIdentity:
-    owner_id: str
-    session_id: str
-    plan_fingerprint: str
-    callback_retry_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1585,14 +1575,10 @@ class RayQueryDriverActor:
         self._copy_operation_terminal = BoundedReplayMap[str, _CopyOperationTerminal](
             capacity=_COPY_OPERATION_REPLAY_CAPACITY
         )
-        # Outcome payloads are bounded, but an admitted identity remains known
-        # for the owner's lifetime. Only a callback UNKNOWN record explicitly
-        # authorizes a same-plan retry after its payload is evicted.
-        self._copy_operation_identities: dict[str, _CopyOperationIdentity] = {}
-        # An explicit operation ID is global to the extension commit protocol.
-        # Keep its plan fingerprint for the complete driver lifetime so owner
-        # cleanup can never make the ID available to a different write intent.
-        self._copy_operation_fingerprints: dict[str, str] = {}
+        # Outcome payloads are bounded, but an admitted identity must remain
+        # known for the owner's lifetime. Evicting a payload may make recovery
+        # impossible; it must never authorize the same write to run again.
+        self._copy_operation_identities: dict[str, tuple[str, str]] = {}
         self._copy_cleanup_tasks: dict[str, asyncio.Task[CopyPlanOutcome]] = {}
         self._driver_handle = ray.get_runtime_context().current_actor
         # Avoid referencing C++ types at import time; store opaque plan objects and
@@ -2042,10 +2028,7 @@ class RayQueryDriverActor:
         import vane
         from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 
-        self._duckdb_conn = vane.connect()
-        # Distributed planning never reads persistent secrets from the
-        # query-driver host.
-        self._duckdb_conn.execute("SET allow_persistent_secrets=false")
+        self._duckdb_conn = vane.connect(config={"allow_persistent_secrets": False})
         _apply_duckdb_thread_setting(self._duckdb_conn)
         apply_duckdb_memory_limit(self._duckdb_conn, self._driver_duckdb_memory_bytes)
         return self._duckdb_conn
@@ -6701,8 +6684,6 @@ class RayQueryDriverActor:
             self._copy_operation_terminal = BoundedReplayMap(capacity=_COPY_OPERATION_REPLAY_CAPACITY)
         if not isinstance(getattr(self, "_copy_operation_identities", None), dict):
             self._copy_operation_identities = {}
-        if not isinstance(getattr(self, "_copy_operation_fingerprints", None), dict):
-            self._copy_operation_fingerprints = {}
         if not isinstance(getattr(self, "_copy_cleanup_tasks", None), dict):
             self._copy_cleanup_tasks = {}
 
@@ -6710,8 +6691,8 @@ class RayQueryDriverActor:
         self._ensure_copy_operation_state()
         operation_ids = {
             operation_id
-            for operation_id, record in self._copy_operation_identities.items()
-            if record.owner_id == owner_id
+            for operation_id, (record_owner_id, _) in self._copy_operation_identities.items()
+            if record_owner_id == owner_id
         }
         for operation_id in operation_ids:
             self._copy_operation_identities.pop(operation_id, None)
@@ -6727,49 +6708,31 @@ class RayQueryDriverActor:
         return operation_id
 
     @staticmethod
-    def _copy_plan_fingerprint(plan: Any) -> str:
-        fingerprint = getattr(plan, "operation_fingerprint", None)
-        if not callable(fingerprint):
-            raise TypeError("COPY logical plan is missing operation_fingerprint()")
-        raw_value = fingerprint()
-        if not isinstance(raw_value, str):
-            raise TypeError("COPY logical plan operation fingerprint must be a string")
-        value = raw_value.strip()
-        if not value:
-            raise ValueError("COPY logical plan operation fingerprint must not be empty")
-        return value
-
-    @staticmethod
     def _validate_copy_operation_identity(
         record: _CopyOperationInFlight | _CopyOperationTerminal,
         *,
         owner_id: str,
         session_id: str | None,
         operation_id: str,
-        plan_fingerprint: str | None = None,
     ) -> None:
         if record.owner_id != owner_id or (session_id is not None and record.session_id != session_id):
             raise PermissionError(
                 f"COPY operation {operation_id} does not belong to the requested runtime owner and session"
             )
-        if plan_fingerprint is not None and record.plan_fingerprint != plan_fingerprint:
-            raise ValueError(f"COPY operation {operation_id} cannot be reused for a different logical plan")
 
     @staticmethod
     def _validate_copy_identity_tombstone(
-        identity: _CopyOperationIdentity,
+        identity: tuple[str, str],
         *,
         owner_id: str,
         session_id: str | None,
         operation_id: str,
-        plan_fingerprint: str | None = None,
     ) -> None:
-        if identity.owner_id != owner_id or (session_id is not None and identity.session_id != session_id):
+        record_owner_id, record_session_id = identity
+        if record_owner_id != owner_id or (session_id is not None and record_session_id != session_id):
             raise PermissionError(
                 f"COPY operation {operation_id} does not belong to the requested runtime owner and session"
             )
-        if plan_fingerprint is not None and identity.plan_fingerprint != plan_fingerprint:
-            raise ValueError(f"COPY operation {operation_id} cannot be reused for a different logical plan")
 
     @staticmethod
     def _copy_terminal_result(record: _CopyOperationTerminal) -> CopyPlanOutcome:
@@ -6860,7 +6823,6 @@ class RayQueryDriverActor:
         session: _DriverSession,
         plan: Any,
         operation_id: str,
-        plan_fingerprint: str,
     ) -> CopyPlanOutcome:
         try:
             self._begin_session_operation(session, session_id)
@@ -6873,49 +6835,16 @@ class RayQueryDriverActor:
             finally:
                 self._end_session_operation(session)
         except BaseException as error:
-            identity = self._copy_operation_identities.get(operation_id)
-            if identity is None:
-                raise RuntimeError(f"COPY operation {operation_id} lost its admitted identity") from error
-            terminal_error = error
-            if identity.callback_retry_allowed and not (
-                isinstance(error, CopyOutcomeUnknownError) and error.write_mode == "callback"
-            ):
-                terminal_error = CopyOutcomeUnknownError(
-                    operation_id,
-                    detail=(
-                        "same-operation callback retry did not establish a definitive commit outcome: "
-                        + self._copy_cleanup_warning("callback retry attempt", error)
-                    ),
-                    write_mode="callback",
-                )
-            self._copy_operation_identities[operation_id] = replace(
-                identity,
-                callback_retry_allowed=(
-                    identity.callback_retry_allowed
-                    or (isinstance(error, CopyOutcomeUnknownError) and error.write_mode == "callback")
-                ),
-            )
             self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
                 owner_id=owner_id,
                 session_id=session_id,
-                plan_fingerprint=plan_fingerprint,
-                error=terminal_error,
+                error=error,
             )
-            if terminal_error is error:
-                raise
-            raise terminal_error from error
+            raise
         else:
-            identity = self._copy_operation_identities.get(operation_id)
-            if identity is None:
-                raise RuntimeError(f"COPY operation {operation_id} lost its admitted identity")
-            self._copy_operation_identities[operation_id] = replace(
-                identity,
-                callback_retry_allowed=False,
-            )
             self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
                 owner_id=owner_id,
                 session_id=session_id,
-                plan_fingerprint=plan_fingerprint,
                 outcome=outcome,
             )
             return outcome
@@ -6930,16 +6859,13 @@ class RayQueryDriverActor:
         session_id: str,
         plan: Any,
     ) -> CopyPlanOutcome:
-        """Run one operation-identified COPY and replay its retained terminal outcome."""
+        """Run one idempotently identified COPY and replay its terminal outcome."""
         self._ensure_copy_operation_state()
         owner_key = str(owner_id).strip()
         session_key = str(session_id).strip()
         operation_id = self._copy_operation_id(plan)
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
-        plan_fingerprint = self._copy_plan_fingerprint(plan)
-        retained_fingerprint = self._copy_operation_fingerprints.get(operation_id)
-        retry_callback_write = False
         terminal = self._copy_operation_terminal.get(operation_id)
         if terminal is not None:
             self._validate_copy_operation_identity(
@@ -6947,24 +6873,12 @@ class RayQueryDriverActor:
                 owner_id=owner_key,
                 session_id=session_key,
                 operation_id=operation_id,
-                plan_fingerprint=plan_fingerprint,
             )
             self._copy_operation_identities.setdefault(
                 operation_id,
-                _CopyOperationIdentity(
-                    owner_id=terminal.owner_id,
-                    session_id=terminal.session_id,
-                    plan_fingerprint=terminal.plan_fingerprint,
-                    callback_retry_allowed=(
-                        isinstance(terminal.error, CopyOutcomeUnknownError) and terminal.error.write_mode == "callback"
-                    ),
-                ),
+                (terminal.owner_id, terminal.session_id),
             )
-            if isinstance(terminal.error, CopyOutcomeUnknownError) and terminal.error.write_mode == "callback":
-                del self._copy_operation_terminal[operation_id]
-                retry_callback_write = True
-            else:
-                return self._copy_terminal_result(terminal)
+            return self._copy_terminal_result(terminal)
         in_flight = self._copy_operations_inflight.get(operation_id)
         if in_flight is not None:
             self._validate_copy_operation_identity(
@@ -6972,15 +6886,10 @@ class RayQueryDriverActor:
                 owner_id=owner_key,
                 session_id=session_key,
                 operation_id=operation_id,
-                plan_fingerprint=plan_fingerprint,
             )
             self._copy_operation_identities.setdefault(
                 operation_id,
-                _CopyOperationIdentity(
-                    owner_id=in_flight.owner_id,
-                    session_id=in_flight.session_id,
-                    plan_fingerprint=in_flight.plan_fingerprint,
-                ),
+                (in_flight.owner_id, in_flight.session_id),
             )
             return await self._await_copy_operation(in_flight.task)
         identity = self._copy_operation_identities.get(operation_id)
@@ -6990,22 +6899,12 @@ class RayQueryDriverActor:
                 owner_id=owner_key,
                 session_id=session_key,
                 operation_id=operation_id,
-                plan_fingerprint=plan_fingerprint,
             )
-            retry_callback_write = retry_callback_write or identity.callback_retry_allowed
-            if not retry_callback_write:
-                raise CopyOutcomeUnknownError(operation_id)
-        else:
-            if retained_fingerprint is not None:
-                if retained_fingerprint != plan_fingerprint:
-                    raise ValueError(f"COPY operation {operation_id} cannot be reused for a different logical plan")
-                raise CopyOutcomeUnknownError(operation_id)
-            self._copy_operation_fingerprints[operation_id] = plan_fingerprint
-            self._copy_operation_identities[operation_id] = _CopyOperationIdentity(
-                owner_id=owner_key,
-                session_id=session_key,
-                plan_fingerprint=plan_fingerprint,
-            )
+            raise CopyOutcomeUnknownError(operation_id)
+        self._copy_operation_identities[operation_id] = (
+            owner_key,
+            session_key,
+        )
         task = asyncio.create_task(
             self._execute_copy_operation(
                 owner_key,
@@ -7013,14 +6912,12 @@ class RayQueryDriverActor:
                 session,
                 plan,
                 operation_id,
-                plan_fingerprint,
             ),
             name=f"vane-copy-operation:{operation_id}",
         )
         self._copy_operations_inflight[operation_id] = _CopyOperationInFlight(
             owner_id=owner_key,
             session_id=session_key,
-            plan_fingerprint=plan_fingerprint,
             task=task,
         )
         return await self._await_copy_operation(task)
@@ -7110,8 +7007,6 @@ class RayQueryDriverActor:
                 session_id=session_key,
                 operation_id=operation_key,
             )
-            if identity.callback_retry_allowed:
-                raise CopyOutcomeUnknownError(operation_key, write_mode="callback")
         raise CopyOutcomeUnknownError(operation_key)
 
     async def recover_copy_plan(

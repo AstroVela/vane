@@ -1047,6 +1047,7 @@ class RayWorkerActor:
         self._closing_native_queries: set[str] = set()
         self._closing_native_tasks: set[str] = set()
         self._active_snapshot_execution_cursors = 0
+        self._active_snapshot_cursors: set[Any] = set()
         self._shutdown_started = False
         self._shutdown_prepared = False
         self._shutdown_complete = False
@@ -1545,10 +1546,6 @@ class RayWorkerActor:
 
     def _configure_conn(self, conn: Any) -> None:
         """Apply standard DuckDB settings (S3, threading, etc.) to a connection."""
-        # Distributed execution never reads persistent secrets from the Ray
-        # host. Credentials must come from an explicit supported session or
-        # connection-setting path.
-        conn.execute("SET allow_persistent_secrets=false")
         _configure_ray_worker_conn(conn, self._duckdb_memory_bytes)
 
     def _configure_snapshot_conn(self, conn: Any) -> None:
@@ -1569,7 +1566,7 @@ class RayWorkerActor:
                 return self._shared_conn
             import vane
 
-            conn = vane.connect()
+            conn = vane.connect(config={"allow_persistent_secrets": False})
             self._configure_conn(conn)
             self._shared_conn = conn
             return conn
@@ -1586,6 +1583,7 @@ class RayWorkerActor:
             if self._shutdown_started:
                 raise RuntimeError("Ray worker runtime is shutting down")
             self._active_snapshot_execution_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0)) + 1
+        cursor = None
         try:
             if database_identity is None:
                 database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
@@ -1623,9 +1621,18 @@ class RayWorkerActor:
                                 ) from config_error
                         raise
                     snapshot_connections[database_identity] = connection
-                return connection.cursor()
+                cursor = connection.cursor()
+            with self._native_execution_condition:
+                active_snapshot_cursors = getattr(self, "_active_snapshot_cursors", None)
+                if active_snapshot_cursors is None:
+                    active_snapshot_cursors = set()
+                    self._active_snapshot_cursors = active_snapshot_cursors
+                active_snapshot_cursors.add(cursor)
+            return cursor
         except BaseException:
             with self._native_execution_condition:
+                if cursor is not None:
+                    getattr(self, "_active_snapshot_cursors", set()).discard(cursor)
                 active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
                 if active_cursors <= 0:
                     raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
@@ -1639,6 +1646,7 @@ class RayWorkerActor:
             cursor.close()
         finally:
             with self._native_execution_condition:
+                getattr(self, "_active_snapshot_cursors", set()).discard(cursor)
                 active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
                 if active_cursors <= 0:
                     raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
@@ -2140,6 +2148,7 @@ class RayWorkerActor:
                 self._closing_native_queries = set()
                 self._closing_native_tasks = set()
                 self._active_snapshot_execution_cursors = 0
+                self._active_snapshot_cursors = set()
             with native_condition:
                 self._shutdown_started = True
             task_manager = getattr(self, "_fte_task_manager", None)
@@ -2175,7 +2184,8 @@ class RayWorkerActor:
                 with native_condition:
                     active_executions = int(getattr(self, "_native_execution_count", 0))
                     active_snapshot_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
-                    active_cursors = list(getattr(self, "_active_native_cursors", ()))
+                    active_cursors = set(getattr(self, "_active_native_cursors", ()))
+                    active_cursors.update(getattr(self, "_active_snapshot_cursors", ()))
                 if active_executions == 0 and active_snapshot_cursors == 0:
                     break
                 for cursor in active_cursors:

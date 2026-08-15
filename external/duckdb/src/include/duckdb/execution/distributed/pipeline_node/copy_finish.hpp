@@ -64,7 +64,7 @@ public:
 	/// 3. Cleans up staging directory
 	/// Returns the aggregated copy result.
 	DuckDBResult<DistributedCopyResult> finalize(const std::vector<ResultPartitionRef> &partitions,
-	                                             ClientContext &context, bool mark_direct_write_committed = true) {
+	                                             ClientContext &context) {
 		// Step 1: parse worker output fragments → file infos
 		auto file_infos_res = ParseCopyPartitions(partitions);
 		if (file_infos_res.is_err()) {
@@ -81,8 +81,7 @@ public:
 			auto &fs = FileSystem::GetFileSystem(context);
 			staging_root = fs.JoinPath(staging_root_base(), staging_run_id());
 		}
-		return FinalizeCopyFiles(spec(), staging_root, std::move(files), context, staging_run_id(),
-		                         mark_direct_write_committed);
+		return FinalizeCopyFiles(spec(), staging_root, std::move(files), context, staging_run_id());
 	}
 
 	std::vector<std::string> multiline_display(bool /*verbose*/) const override {

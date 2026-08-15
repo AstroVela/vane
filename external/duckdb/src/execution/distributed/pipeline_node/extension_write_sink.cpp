@@ -4,12 +4,11 @@
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/main/client_context.hpp"
-
-#include <mutex>
-#include <unordered_map>
 
 namespace duckdb {
 namespace distributed {
@@ -49,8 +48,8 @@ SubmittableTaskStream<WorkerTask> ExtensionWriteSinkNode::produce_tasks(PlanExec
 	auto node_id_value = node_id();
 	auto node_context = context().to_hashmap();
 	auto *client_context = plan_context.client_context();
-	auto fragment_plan_cache = std::make_shared<std::unordered_map<DuckPhysicalPlanRef, DuckPhysicalPlanRef>>();
-	auto fragment_plan_cache_lock = std::make_shared<std::mutex>();
+	auto fragment_plan_cache = make_shared_ptr<unordered_map<DuckPhysicalPlanRef, DuckPhysicalPlanRef>>();
+	auto fragment_plan_cache_lock = make_shared_ptr<mutex>();
 	if (!client_context) {
 		throw InvalidInputException("ExtensionWriteSinkNode requires ClientContext for plan cloning");
 	}

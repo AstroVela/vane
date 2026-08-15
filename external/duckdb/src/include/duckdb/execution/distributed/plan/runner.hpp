@@ -17,17 +17,16 @@
 #include <cctype>
 #include <functional>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <sstream>
 #include <thread>
-#include <utility>
 
 #include <typeinfo>
 #include <unordered_set>
 
 #include "duckdb/execution/distributed/plan/distributed_physical_plan.hpp"
 
+#include "duckdb/common/limits.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
 #include "duckdb/execution/distributed/utils/channel.hpp"
@@ -473,8 +472,8 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
-	/// Unified result type: streaming (SELECT), finalized COPY, or a prepared
-	/// extension write whose catalog transaction is committed by the caller.
+	/// Unified result type: streaming (SELECT), finalized COPY, or an extension
+	/// write whose coordinator hook ran in the Vane-owned transaction.
 	struct PlanResult {
 		enum Tag { STREAMING, COPY, EXTENSION_WRITE };
 		Tag tag;
@@ -515,6 +514,9 @@ public:
 		if (!client_context_) {
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a ClientContext"));
 		}
+		if (!plan) {
+			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a distributed physical plan"));
+		}
 
 		// ── Step 1: Validate extension writes, then translate the physical plan ──
 		auto physical_plan = plan->physical_plan();
@@ -523,17 +525,28 @@ public:
 		}
 		auto extension_write_provider = physical_plan->Root().GetExtensionWriteTaskProvider();
 		unique_ptr<DistributedExtensionWriteInfo> extension_write_info;
-		DistributedWriteOperationContext extension_write_operation;
+		string extension_write_query_id;
 		vector<DistributedWriteTaskResult> selected_task_results;
 		bool extension_abort_attempted = false;
+		bool extension_finalize_started = false;
+		auto extension_outcome_unknown = [&](DistributedExtensionWriteResult result,
+		                                     string error) -> DuckDBResult<PlanResult> {
+			result.catalog_committed = false;
+			result.outcome_unknown = true;
+			result.outcome_error = std::move(error);
+			if (result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+				result.file_result.output_outcome_unknown = true;
+				result.file_result.output_outcome_error = result.outcome_error;
+			}
+			return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
+		};
 		auto abort_extension_write = [&]() -> string {
-			if (!extension_write_provider || extension_abort_attempted) {
+			if (!extension_write_provider || extension_abort_attempted || extension_finalize_started) {
 				return string();
 			}
 			extension_abort_attempted = true;
 			try {
-				extension_write_provider->AbortDistributedWrite(*client_context_, extension_write_operation,
-				                                                selected_task_results);
+				extension_write_provider->AbortDistributedWrite(*client_context_, selected_task_results);
 				return string();
 			} catch (const std::exception &ex) {
 				return ex.what();
@@ -547,8 +560,10 @@ public:
 				    "distributed extension write provider must be exposed by an EXTENSION physical root"));
 			}
 			try {
-				extension_write_operation.operation_id = plan->query_id();
-				extension_write_operation.Validate();
+				extension_write_query_id = plan->query_id();
+				if (extension_write_query_id.empty()) {
+					throw InvalidInputException("distributed extension write requires a non-empty query identity");
+				}
 				extension_write_info = make_uniq<DistributedExtensionWriteInfo>(
 				    ResolveDistributedExtensionWriteInfo(*client_context_, extension_write_provider->WritePlan()));
 			} catch (const std::exception &ex) {
@@ -565,7 +580,7 @@ public:
 				    "distributed extension write requires an active Vane-owned auto-commit transaction"));
 			}
 			try {
-				extension_write_provider->ValidateDistributedWrite(*client_context_, extension_write_operation);
+				extension_write_provider->ValidateDistributedWrite(*client_context_);
 			} catch (const std::exception &ex) {
 				return DuckDBResult<PlanResult>::err(DuckDBError(ex.what()));
 			} catch (...) {
@@ -656,16 +671,6 @@ public:
 			}
 		};
 		find_sinks(pipeline_node);
-		if (copy_sink_node) {
-			try {
-				copy_sink_node->copy_sink()->SetOperationIdentity(plan->query_id());
-			} catch (const std::exception &ex) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(ex.what()));
-			} catch (...) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::external_error(
-				    "distributed COPY operation identity assignment threw an unknown exception"));
-			}
-		}
 		if (extension_write_provider) {
 			if (extension_write_info->mode == DistributedWriteMode::FILE_ARTIFACT &&
 			    (copy_sink_count != 1 || callback_sink_count != 0)) {
@@ -700,86 +705,6 @@ public:
 				return DuckDBResult<PlanResult>::err(worker_base_res.error());
 			}
 			sink_worker_base_path = std::move(worker_base_res).value();
-			auto final_path_probe = copy_sink_node->spec().filename_pattern.CreateFilename(
-			    fs, sink_base_path, copy_sink_node->spec().file_extension, 0);
-			const std::pair<const char *, const std::string *> copy_record_fields[] = {
-			    {"base_path", &sink_base_path},
-			    {"worker_base_path", &sink_worker_base_path},
-			    {"staging_root_base", &copy_sink_node->staging_root_base()},
-			    {"run_id", &copy_sink_node->staging_run_id()},
-			    {"file.final_path", &final_path_probe},
-			};
-			for (const auto &field : copy_record_fields) {
-				auto validate_res = ValidateDistributedCopyRecordField(*field.second, field.first);
-				if (validate_res.is_err()) {
-					return DuckDBResult<PlanResult>::err(validate_res.error());
-				}
-			}
-		}
-
-		if (copy_sink_node && copy_sink_node->staging_root_base().empty()) {
-			auto &fs = FileSystem::GetFileSystem(*client_context_);
-			auto inspection_res =
-			    InspectDistributedCopyDirectWriteRun(fs, sink_base_path, copy_sink_node->staging_run_id());
-			if (inspection_res.is_err()) {
-				return DuckDBResult<PlanResult>::err(inspection_res.error());
-			}
-			auto inspection = std::move(inspection_res).value();
-			if (inspection.state == DistributedCopyDirectWriteRunState::UNKNOWN) {
-				return DuckDBResult<PlanResult>::err(DuckDBError::io_error(
-				    "distributed COPY cannot determine the existing direct-write commit state: " + inspection.error));
-			}
-			if (inspection.state == DistributedCopyDirectWriteRunState::COMMITTED) {
-				auto committed_result = std::move(inspection.committed_result);
-				if (extension_write_provider) {
-					DistributedExtensionWriteResult result;
-					result.info = *extension_write_info;
-					result.selected_task_results = EncodeDistributedFileWriteResults(
-					    *extension_write_info, extension_write_operation, committed_result.files);
-					result.rows_written = committed_result.rows_copied;
-					for (const auto &task_result : result.selected_task_results) {
-						if (task_result.ByteCount() > std::numeric_limits<idx_t>::max() - result.bytes_written) {
-							return DuckDBResult<PlanResult>::err(
-							    DuckDBError::invalid_state_error("distributed extension write byte count overflow"));
-						}
-						result.bytes_written += task_result.ByteCount();
-					}
-					result.file_result = std::move(committed_result);
-					result.catalog_committed = true;
-					return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
-				}
-				return DuckDBResult<PlanResult>::ok(PlanResult::make_copy(std::move(committed_result)));
-			}
-			if (extension_write_provider) {
-				auto lifecycle_exists_res = CheckDistributedCopyFileExists(fs, inspection.paths.lifecycle_path);
-				if (lifecycle_exists_res.is_err()) {
-					return DuckDBResult<PlanResult>::err(lifecycle_exists_res.error());
-				}
-				if (lifecycle_exists_res.value()) {
-					auto lifecycle_res = ReadDistributedCopyDirectWriteLifecycle(fs, inspection.paths, sink_base_path,
-					                                                             copy_sink_node->staging_run_id());
-					if (lifecycle_res.is_err()) {
-						return DuckDBResult<PlanResult>::err(lifecycle_res.error());
-					}
-					if (lifecycle_res.value().state ==
-					    DistributedCopyDirectWriteLifecycleState::CATALOG_COMMIT_PENDING) {
-						return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
-						    "distributed extension write %s has a catalog-commit-pending lifecycle; its catalog "
-						    "commit outcome is unknown, so automatic retry is refused and output is retained",
-						    extension_write_info->Name())));
-					}
-				}
-				auto prepared_manifest_res = CheckDistributedCopyFileExists(fs, inspection.paths.manifest_path);
-				if (prepared_manifest_res.is_err()) {
-					return DuckDBResult<PlanResult>::err(prepared_manifest_res.error());
-				}
-				if (prepared_manifest_res.value()) {
-					return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
-					    "distributed extension write %s has a prepared output manifest but no committed marker; "
-					    "its catalog commit outcome is unknown, so automatic retry is refused and output is retained",
-					    extension_write_info->Name())));
-				}
-			}
 		}
 
 		auto cleanup_copy_output = [&]() -> DuckDBResult<void> {
@@ -821,8 +746,11 @@ public:
 			return DuckDBResult<PlanResult>::err(primary_error);
 		};
 		auto fail_after_write_cleanup = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
-			auto copy_cleanup_res = cleanup_copy_output();
+			if (extension_finalize_started) {
+				return DuckDBResult<PlanResult>::err(primary_error);
+			}
 			auto abort_error = abort_extension_write();
+			auto copy_cleanup_res = cleanup_copy_output();
 			vector<string> cleanup_errors;
 			if (copy_cleanup_res.is_err()) {
 				cleanup_errors.push_back(copy_cleanup_res.error().what());
@@ -859,7 +787,7 @@ public:
 			auto abort_res = abort_write_workers();
 			if (abort_res.is_err()) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::io_error(
-				    StringUtil::Format("%s; worker abort barrier failed: %s; operation-owned output is retained",
+				    StringUtil::Format("%s; worker abort barrier failed: %s; current-execution output is retained",
 				                       primary_error.what(), abort_res.error().what())));
 			}
 			return fail_after_write_cleanup(primary_error);
@@ -925,8 +853,7 @@ public:
 					output_lifetime_guard.reset();
 				} catch (const std::exception &ex) {
 					clear_worker_channel();
-					DuckDBError error =
-					    DuckDBError::external_error(std::string("execute_plan task threw: ") + ex.what());
+					DuckDBError error = DuckDBError::external_error(string("execute_plan task threw: ") + ex.what());
 					publish_error(error);
 					output_lifetime_guard.reset();
 				} catch (...) {
@@ -949,7 +876,7 @@ public:
 
 			const auto sink_node_id =
 			    callback_sink_node ? callback_sink_node->node_id() : copy_sink_node->copy_sink()->node_id();
-			std::vector<ResultPartitionRef> partitions;
+			vector<ResultPartitionRef> partitions;
 			std::shared_ptr<DuckDBError> deferred_collection_error;
 			auto capture_execution_error = [&]() {
 				auto execution_error = execute_status->GetError();
@@ -1005,8 +932,7 @@ public:
 
 			if (copy_sink_node) {
 				auto worker_write_ms = DistributedCopyElapsedMillis(worker_write_started);
-				auto finalize_res =
-				    copy_sink_node->finalize(partitions, *client_context_, extension_write_provider ? false : true);
+				auto finalize_res = copy_sink_node->finalize(partitions, *client_context_);
 				if (finalize_res.is_err()) {
 					if (extension_write_provider) {
 						return fail_after_write_cleanup(finalize_res.error());
@@ -1018,15 +944,25 @@ public:
 				if (!extension_write_provider) {
 					return DuckDBResult<PlanResult>::ok(PlanResult::make_copy(std::move(copy_result)));
 				}
-				if (copy_result.output_prepared_manifest_replayed && !copy_result.output_committed) {
-					return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(StringUtil::Format(
-					    "distributed extension write %s encountered a concurrently prepared output manifest but no "
-					    "committed marker; its catalog commit outcome is unknown, so output is retained",
-					    extension_write_info->Name())));
+				if (copy_result.output_outcome_unknown) {
+					DistributedExtensionWriteResult result;
+					result.info = *extension_write_info;
+					result.rows_written = copy_result.rows_copied;
+					result.file_result = std::move(copy_result);
+					return extension_outcome_unknown(std::move(result),
+					                                 "worker artifact publication outcome is unknown; extension "
+					                                 "finalization was not invoked and artifacts "
+					                                 "were retained");
+				}
+				if (!copy_result.output_committed) {
+					return fail_after_write_cleanup(DuckDBError::invalid_state_error(StringUtil::Format(
+					    "distributed file-artifact write %s did not publish worker artifacts definitively: %s",
+					    extension_write_info->Name(), copy_result.output_outcome_error)));
 				}
 				try {
+					vector<DistributedCopyFileInfo> extension_files(copy_result.files.begin(), copy_result.files.end());
 					selected_task_results = EncodeDistributedFileWriteResults(
-					    *extension_write_info, extension_write_operation, copy_result.files);
+					    *extension_write_info, extension_write_query_id, extension_files);
 				} catch (const std::exception &ex) {
 					return fail_after_write_cleanup(DuckDBError(ex.what()));
 				} catch (...) {
@@ -1037,88 +973,100 @@ public:
 				result.info = *extension_write_info;
 				result.rows_written = copy_result.rows_copied;
 				for (const auto &task_result : selected_task_results) {
-					if (task_result.ByteCount() > std::numeric_limits<idx_t>::max() - result.bytes_written) {
+					if (task_result.ByteCount() > NumericLimits<idx_t>::Maximum() - result.bytes_written) {
 						return fail_after_write_cleanup(
 						    DuckDBError::invalid_state_error("distributed extension write byte count overflow"));
 					}
 					result.bytes_written += task_result.ByteCount();
 				}
-				// A committed marker proves the matching provider transaction completed
-				// on an earlier attempt. Never finalize that operation twice.
-				if (copy_result.output_committed) {
-					result.selected_task_results = std::move(selected_task_results);
-					result.file_result = std::move(copy_result);
-					result.catalog_committed = true;
-					return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
-				}
-				// From this point onward, a process or transaction error can leave the
-				// provider catalog commit outcome unknowable. Persist the fence before
-				// invoking the provider so age-based COPY cleanup can never delete files
-				// that a remote catalog may reference. Known failures below use the
-				// explicit worker-base cleanup path and remove the fence with the output.
-				auto &fs = FileSystem::GetFileSystem(*client_context_);
-				auto protect_res = ProtectDistributedCopyDirectWriteCatalogCommit(fs, sink_base_path,
-				                                                                  copy_sink_node->staging_run_id());
-				if (protect_res.is_err()) {
-					return fail_after_write_cleanup(protect_res.error());
-				}
-				try {
-					auto affected_rows = extension_write_provider->FinalizeDistributedWrite(
-					    *client_context_, extension_write_operation, selected_task_results);
-					if (affected_rows != copy_result.rows_copied) {
-						throw InvalidInputException("Distributed extension write %s finalized %llu rows from worker "
-						                            "metadata totaling %llu rows",
-						                            extension_write_info->Name(),
-						                            static_cast<unsigned long long>(affected_rows),
-						                            static_cast<unsigned long long>(copy_result.rows_copied));
-					}
-				} catch (const std::exception &ex) {
-					return fail_after_write_cleanup(DuckDBError(ex.what()));
-				} catch (...) {
-					return fail_after_write_cleanup(
-					    DuckDBError::external_error("distributed file write finalization threw an unknown exception"));
-				}
 				result.selected_task_results = std::move(selected_task_results);
 				result.file_result = std::move(copy_result);
-				return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
+				extension_finalize_started = true;
+				try {
+					auto affected_rows = extension_write_provider->FinalizeDistributedWrite(
+					    *client_context_, result.selected_task_results);
+					if (affected_rows != result.rows_written) {
+						auto mismatch_error = StringUtil::Format("extension coordinator finalization returned %llu "
+						                                         "rows; worker fragments contained %llu rows; "
+						                                         "artifacts were retained",
+						                                         static_cast<unsigned long long>(affected_rows),
+						                                         static_cast<unsigned long long>(result.rows_written));
+						return extension_outcome_unknown(std::move(result), std::move(mismatch_error));
+					}
+					return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
+				} catch (const std::exception &ex) {
+					return extension_outcome_unknown(
+					    std::move(result),
+					    "extension coordinator finalization outcome is unknown; artifacts were retained: " +
+					        string(ex.what()));
+				} catch (...) {
+					return extension_outcome_unknown(
+					    std::move(result),
+					    "extension coordinator finalization outcome is unknown; artifacts were retained");
+				}
 			}
 
+			DistributedExtensionWriteResult result;
+			result.info = *extension_write_info;
 			try {
 				vector<ResultPartitionRef> extension_partitions(partitions.begin(), partitions.end());
 				selected_task_results = ParseDistributedWriteTaskResults(
-				    *extension_write_info, extension_write_operation, extension_partitions);
-				DistributedExtensionWriteResult result;
-				result.info = *extension_write_info;
+				    *extension_write_info, extension_write_query_id, extension_partitions);
 				for (const auto &task_result : selected_task_results) {
 					auto task_rows = task_result.RowCount();
 					auto task_bytes = task_result.ByteCount();
-					if (task_rows > std::numeric_limits<idx_t>::max() - result.rows_written ||
-					    task_bytes > std::numeric_limits<idx_t>::max() - result.bytes_written) {
+					if (task_rows > NumericLimits<idx_t>::Maximum() - result.rows_written ||
+					    task_bytes > NumericLimits<idx_t>::Maximum() - result.bytes_written) {
 						throw InvalidInputException("distributed extension write '%s' result counts overflow",
 						                            extension_write_info->Name());
 					}
 					result.rows_written += task_rows;
 					result.bytes_written += task_bytes;
 				}
-				auto affected_rows = extension_write_provider->FinalizeDistributedWrite(
-				    *client_context_, extension_write_operation, selected_task_results);
-				if (affected_rows != result.rows_written) {
-					throw InvalidInputException(
-					    "Distributed extension write %s finalized %llu rows from worker fragments totaling %llu rows",
-					    extension_write_info->Name(), static_cast<unsigned long long>(affected_rows),
-					    static_cast<unsigned long long>(result.rows_written));
-				}
-				result.selected_task_results = std::move(selected_task_results);
-				return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
 			} catch (const std::exception &ex) {
 				return fail_after_write_cleanup(DuckDBError(ex.what()));
 			} catch (...) {
 				return fail_after_write_cleanup(
-				    DuckDBError::external_error("distributed callback write finalization threw an unknown exception"));
+				    DuckDBError::external_error("distributed callback result parsing threw an unknown exception"));
+			}
+			result.selected_task_results = std::move(selected_task_results);
+			extension_finalize_started = true;
+			try {
+				auto affected_rows =
+				    extension_write_provider->FinalizeDistributedWrite(*client_context_, result.selected_task_results);
+				if (affected_rows != result.rows_written) {
+					auto mismatch_error = StringUtil::Format(
+					    "extension coordinator finalization returned %llu rows; worker fragments contained %llu rows; "
+					    "artifacts were retained",
+					    static_cast<unsigned long long>(affected_rows),
+					    static_cast<unsigned long long>(result.rows_written));
+					return extension_outcome_unknown(std::move(result), std::move(mismatch_error));
+				}
+				return DuckDBResult<PlanResult>::ok(PlanResult::make_extension_write(std::move(result)));
+			} catch (const std::exception &ex) {
+				return extension_outcome_unknown(
+				    std::move(result),
+				    "extension coordinator finalization outcome is unknown; artifacts were retained: " +
+				        string(ex.what()));
+			} catch (...) {
+				return extension_outcome_unknown(
+				    std::move(result),
+				    "extension coordinator finalization outcome is unknown; artifacts were retained");
 			}
 		} catch (const std::exception &ex) {
 			const auto execution_error =
 			    DuckDBError::external_error("distributed write setup or execution threw: " + string(ex.what()));
+			if (extension_finalize_started) {
+				if (streaming_channel_state_installed && worker_manager_) {
+					worker_manager_->clear_streaming_results_channel_state();
+				}
+				DistributedExtensionWriteResult result;
+				result.info = *extension_write_info;
+				return extension_outcome_unknown(
+				    std::move(result),
+				    "extension coordinator finalization outcome is unknown; artifacts were retained: " +
+				        string(ex.what()));
+			}
 			if (execution_may_have_started) {
 				auto result = fail_after_worker_abort(execution_error);
 				if (streaming_channel_state_installed && worker_manager_) {
@@ -1136,6 +1084,16 @@ public:
 		} catch (...) {
 			const auto execution_error =
 			    DuckDBError::external_error("distributed write setup or execution threw an unknown exception");
+			if (extension_finalize_started) {
+				if (streaming_channel_state_installed && worker_manager_) {
+					worker_manager_->clear_streaming_results_channel_state();
+				}
+				DistributedExtensionWriteResult result;
+				result.info = *extension_write_info;
+				return extension_outcome_unknown(
+				    std::move(result),
+				    "extension coordinator finalization outcome is unknown; artifacts were retained");
+			}
 			if (execution_may_have_started) {
 				auto result = fail_after_worker_abort(execution_error);
 				if (streaming_channel_state_installed && worker_manager_) {

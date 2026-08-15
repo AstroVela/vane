@@ -23,9 +23,8 @@ class Serializer;
 enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK = 1 };
 
 //! An immutable object created by a worker write. The extension owns the
-//! artifact codec and payload. URI is optional for non-file artifacts. Retry
-//! attempts must use immutable, non-overwriting objects and must never replace
-//! an object that a committed catalog entry may reference.
+//! artifact codec and payload. URI is optional for non-file artifacts. Worker
+//! attempts must use immutable, non-overwriting objects.
 struct DistributedWriteArtifact {
 	string artifact_id;
 	string uri;
@@ -52,28 +51,26 @@ struct DistributedWriteFragment {
 	DUCKDB_API static DistributedWriteFragment Deserialize(Deserializer &deserializer);
 };
 
-//! Runtime identity supplied explicitly to every worker-side callback. An
-//! extension uses operation_id to namespace durable artifacts and
-//! task_attempt_id to distinguish speculative attempts within one distributed
-//! execution. A later submission of the same operation may reuse a task attempt
-//! identity, so extensions must generate their own non-overwriting artifact
-//! identity when creating durable objects.
+//! Runtime identity supplied explicitly to every worker-side callback. query_id
+//! groups all attempts from one execution; task_attempt_id distinguishes
+//! speculative and retried worker attempts. Neither value is a durable commit
+//! idempotency key.
 struct DistributedWriteTaskContext {
-	string operation_id;
+	string query_id;
 	string task_attempt_id;
 
 	DUCKDB_API void Validate() const;
 };
 
-//! Versioned outer envelope returned by a selected callback worker task. The
+//! Portable outer envelope returned by a selected callback worker task. The
 //! fixed file adapter uses the same shape with one deterministic synthetic
-//! task_attempt_id per selected file. The operation, capability, and codec
-//! identities are repeated in every envelope so a coordinator never decodes
-//! bytes under a different write operation or extension contract.
+//! task_attempt_id per selected file. Query, capability, and codec identities
+//! are repeated in every envelope so a coordinator never mixes worker output
+//! from different executions or extension interfaces.
 struct DistributedWriteTaskResult {
 	DistributedExtensionCapabilityReference capability;
 	DistributedPayloadCodec fragment_codec;
-	string operation_id;
+	string query_id;
 	string task_attempt_id;
 	vector<DistributedWriteFragment> fragments;
 
