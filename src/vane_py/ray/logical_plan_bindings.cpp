@@ -119,15 +119,7 @@ struct PyLogicalPlan {
 		return query_id_;
 	}
 
-	string operation_fingerprint() const {
-		if (serialized_logical_plan_.empty()) {
-			throw InternalException("PyLogicalPlan missing serialized logical plan");
-		}
-		MD5Context digest;
-		digest.Add("vane-distributed-write-plan:");
-		digest.Add(serialized_logical_plan_);
-		return digest.FinishHex();
-	}
+	string operation_fingerprint() const;
 
 	string session_id() const;
 	py::dict session_config() const;
@@ -645,6 +637,296 @@ static bool IsS3CredentialConnectionSetting(const string &name) {
 	    "s3_session_token",
 	};
 	return names.find(duckdb::StringUtil::Lower(name)) != names.end();
+}
+
+static bool IsRefreshableConnectionCredentialSetting(const string &name) {
+	auto lower_name = duckdb::StringUtil::Lower(name);
+	return IsS3CredentialConnectionSetting(lower_name) || lower_name == "http_proxy_username" ||
+	       lower_name == "http_proxy_password";
+}
+
+static bool IsRefreshableSessionCredential(const string &name) {
+	static const std::unordered_set<string> names {
+	    "AWS_ACCESS_KEY_ID", "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SECURITY_TOKEN",
+	    "AWS_SESSION_TOKEN",
+	};
+	return names.find(name) != names.end();
+}
+
+static void AppendFingerprintString(string &result, const string &value) {
+	AppendUInt64LE(result, static_cast<uint64_t>(value.size()));
+	result.append(value);
+}
+
+static void AppendCanonicalFingerprintValue(string &result, const py::handle &value) {
+	if (value.is_none()) {
+		result.push_back('n');
+		return;
+	}
+	if (py::isinstance<py::bool_>(value)) {
+		result.push_back('b');
+		result.push_back(py::cast<bool>(value) ? '\x01' : '\x00');
+		return;
+	}
+	if (py::isinstance<py::str>(value)) {
+		result.push_back('s');
+		AppendFingerprintString(result, py::cast<string>(value));
+		return;
+	}
+	if (py::isinstance<py::bytes>(value)) {
+		result.push_back('y');
+		AppendFingerprintString(result, py::cast<string>(value));
+		return;
+	}
+	if (py::isinstance<py::int_>(value)) {
+		result.push_back('i');
+		AppendFingerprintString(result, py::str(value).cast<string>());
+		return;
+	}
+	if (py::isinstance<py::float_>(value)) {
+		result.push_back('f');
+		AppendFingerprintString(result, py::repr(value).cast<string>());
+		return;
+	}
+	if (py::isinstance<py::dict>(value)) {
+		auto dictionary = py::reinterpret_borrow<py::dict>(value);
+		vector<std::pair<string, py::object>> entries;
+		entries.reserve(py::len(dictionary));
+		for (auto item : dictionary) {
+			if (!py::isinstance<py::str>(item.first)) {
+				throw InvalidInputException("Distributed write fingerprint dictionaries require string keys");
+			}
+			entries.emplace_back(py::str(item.first).cast<string>(), py::reinterpret_borrow<py::object>(item.second));
+		}
+		std::sort(entries.begin(), entries.end(),
+		          [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+		result.push_back('d');
+		AppendUInt64LE(result, static_cast<uint64_t>(entries.size()));
+		for (const auto &entry : entries) {
+			AppendFingerprintString(result, entry.first);
+			AppendCanonicalFingerprintValue(result, entry.second);
+		}
+		return;
+	}
+	if (py::isinstance<py::list>(value) || py::isinstance<py::tuple>(value)) {
+		auto sequence = py::reinterpret_borrow<py::sequence>(value);
+		result.push_back('l');
+		AppendUInt64LE(result, static_cast<uint64_t>(py::len(sequence)));
+		for (auto item : sequence) {
+			AppendCanonicalFingerprintValue(result, item);
+		}
+		return;
+	}
+	throw InvalidInputException("Distributed write fingerprint contains unsupported Python value type %s",
+	                            py::str(py::type::of(value)).cast<string>());
+}
+
+static string CanonicalFingerprintValue(const py::handle &value) {
+	string result;
+	AppendCanonicalFingerprintValue(result, value);
+	return result;
+}
+
+static py::list SortFingerprintList(const py::handle &value, const char *field_name) {
+	if (!py::isinstance<py::list>(value) && !py::isinstance<py::tuple>(value)) {
+		throw InvalidInputException("Distributed write fingerprint field %s must be a list", field_name);
+	}
+	vector<std::pair<string, py::object>> entries;
+	for (auto item : py::reinterpret_borrow<py::sequence>(value)) {
+		auto object = py::reinterpret_borrow<py::object>(item);
+		entries.emplace_back(CanonicalFingerprintValue(object), std::move(object));
+	}
+	std::sort(entries.begin(), entries.end(), [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+	py::list result;
+	for (auto &entry : entries) {
+		result.append(std::move(entry.second));
+	}
+	return result;
+}
+
+static py::dict NormalizeFingerprintConfig(const py::handle &value, bool session_config) {
+	if (!py::isinstance<py::dict>(value)) {
+		throw InvalidInputException("Distributed write fingerprint configuration must be a dict");
+	}
+	py::dict result;
+	for (auto item : py::reinterpret_borrow<py::dict>(value)) {
+		if (!py::isinstance<py::str>(item.first)) {
+			throw InvalidInputException("Distributed write fingerprint configuration requires string keys");
+		}
+		auto name = py::str(item.first).cast<string>();
+		if (name.empty()) {
+			throw InvalidInputException("Distributed write fingerprint configuration keys must not be empty");
+		}
+		auto normalized_name = session_config ? name : duckdb::StringUtil::Lower(name);
+		auto refreshable = session_config ? IsRefreshableSessionCredential(normalized_name)
+		                                  : IsRefreshableConnectionCredentialSetting(normalized_name);
+		result[py::str(normalized_name)] =
+		    refreshable ? py::object(py::str("<refreshable-credential>")) : py::object(py::str(item.second));
+	}
+	return result;
+}
+
+static py::dict NormalizeFingerprintConnectionSetting(const py::handle &value) {
+	if (!py::isinstance<py::dict>(value)) {
+		throw InvalidInputException("Distributed write fingerprint connection setting must be a dict");
+	}
+	auto setting = py::reinterpret_borrow<py::dict>(value);
+	if (!setting.contains(py::str("name")) || !setting.contains(py::str("value"))) {
+		throw InvalidInputException("Distributed write fingerprint connection setting is missing name or value");
+	}
+	py::dict result = CopyPyDict(setting);
+	auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
+	if (name.empty()) {
+		throw InvalidInputException("Distributed write fingerprint connection setting name must not be empty");
+	}
+	result[py::str("name")] = py::str(name);
+	result[py::str("value")] = IsRefreshableConnectionCredentialSetting(name)
+	                               ? py::object(py::str("<refreshable-credential>"))
+	                               : py::object(py::str(setting[py::str("value")]));
+	if (setting.contains(py::str("input_type"))) {
+		result[py::str("input_type")] =
+		    py::str(duckdb::StringUtil::Upper(py::str(setting[py::str("input_type")]).cast<string>()));
+	}
+	return result;
+}
+
+static py::object NormalizeConnectionSnapshotForFingerprint(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none()) {
+		return py::none();
+	}
+	if (!py::isinstance<py::dict>(snapshot_obj)) {
+		throw InvalidInputException("Distributed write fingerprint connection snapshot must be a dict");
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	py::dict result = CopyPyDict(snapshot);
+
+	if (snapshot.contains(py::str("vane_session"))) {
+		if (!py::isinstance<py::dict>(snapshot[py::str("vane_session")])) {
+			throw InvalidInputException("Distributed write fingerprint Vane session must be a dict");
+		}
+		auto session = snapshot[py::str("vane_session")].cast<py::dict>();
+		py::dict normalized_session;
+		for (auto item : session) {
+			auto name = py::str(item.first).cast<string>();
+			if (name == "id") {
+				continue;
+			}
+			normalized_session[item.first] = item.second;
+		}
+		if (!session.contains(py::str("config"))) {
+			throw InvalidInputException("Distributed write fingerprint Vane session is missing config");
+		}
+		normalized_session[py::str("config")] = NormalizeFingerprintConfig(session[py::str("config")], true);
+		result[py::str("vane_session")] = std::move(normalized_session);
+	}
+
+	if (snapshot.contains(py::str("bootstrap")) && !snapshot[py::str("bootstrap")].is_none()) {
+		if (!py::isinstance<py::dict>(snapshot[py::str("bootstrap")])) {
+			throw InvalidInputException("Distributed write fingerprint bootstrap must be a dict");
+		}
+		auto bootstrap = snapshot[py::str("bootstrap")].cast<py::dict>();
+		py::dict normalized_bootstrap = CopyPyDict(bootstrap);
+		if (bootstrap.contains(py::str("config"))) {
+			normalized_bootstrap[py::str("config")] = NormalizeFingerprintConfig(bootstrap[py::str("config")], false);
+		}
+		result[py::str("bootstrap")] = std::move(normalized_bootstrap);
+	}
+
+	if (snapshot.contains(py::str("settings"))) {
+		auto settings = snapshot[py::str("settings")];
+		if (!py::isinstance<py::list>(settings) && !py::isinstance<py::tuple>(settings)) {
+			throw InvalidInputException("Distributed write fingerprint settings must be a list");
+		}
+		py::list normalized_settings;
+		std::unordered_set<string> setting_names;
+		for (auto item : py::reinterpret_borrow<py::sequence>(settings)) {
+			auto normalized_setting = NormalizeFingerprintConnectionSetting(item);
+			auto name = py::str(normalized_setting[py::str("name")]).cast<string>();
+			if (!setting_names.insert(name).second) {
+				throw InvalidInputException("Distributed write fingerprint settings contain duplicate name %s", name);
+			}
+			normalized_settings.append(std::move(normalized_setting));
+		}
+		result[py::str("settings")] = SortFingerprintList(normalized_settings, "settings");
+	}
+	if (snapshot.contains(py::str("extensions"))) {
+		result[py::str("extensions")] = SortFingerprintList(snapshot[py::str("extensions")], "extensions");
+	}
+	if (snapshot.contains(py::str("distributed_extension_contracts"))) {
+		result[py::str("distributed_extension_contracts")] = SortFingerprintList(
+		    snapshot[py::str("distributed_extension_contracts")], "distributed_extension_contracts");
+	}
+	return std::move(result);
+}
+
+static py::list NormalizeUDFRegistrationsForFingerprint(const py::object &registrations_obj) {
+	if (registrations_obj.is_none()) {
+		return py::list();
+	}
+	if (!py::isinstance<py::list>(registrations_obj) && !py::isinstance<py::tuple>(registrations_obj)) {
+		throw InvalidInputException("Distributed write fingerprint UDF registrations must be a list");
+	}
+	std::unordered_set<string> registration_names;
+	py::list normalized_registrations;
+	for (auto item : py::reinterpret_borrow<py::sequence>(registrations_obj)) {
+		if (!py::isinstance<py::dict>(item)) {
+			throw InvalidInputException("Distributed write fingerprint UDF registration must be a dict");
+		}
+		auto registration = py::reinterpret_borrow<py::dict>(item);
+		for (const auto *field : {"kind", "name", "digest", "function_pickle"}) {
+			if (!registration.contains(py::str(field))) {
+				throw InvalidInputException("Distributed write fingerprint UDF registration is missing %s", field);
+			}
+		}
+		if (!py::isinstance<py::str>(registration[py::str("name")])) {
+			throw InvalidInputException("Distributed write fingerprint UDF registration name must be a string");
+		}
+		auto name = duckdb::StringUtil::Lower(py::str(registration[py::str("name")]).cast<string>());
+		if (name.empty()) {
+			throw InvalidInputException("Distributed write fingerprint UDF registration name must not be empty");
+		}
+		if (!registration_names.insert(name).second) {
+			throw InvalidInputException("Distributed write fingerprint UDF registrations contain duplicate name %s",
+			                            name);
+		}
+
+		auto normalized_registration = CopyPyDict(registration);
+		if (!py::isinstance<py::str>(registration[py::str("kind")])) {
+			throw InvalidInputException("Distributed write fingerprint UDF registration kind must be a string");
+		}
+		auto kind = py::str(registration[py::str("kind")]).cast<string>();
+		if (duckdb::StringUtil::CIEquals(kind, "table")) {
+			if (!registration.contains(py::str("schema")) ||
+			    !py::isinstance<py::dict>(registration[py::str("schema")])) {
+				throw InvalidInputException(
+				    "Distributed write fingerprint table UDF registration requires a schema dict");
+			}
+			py::list ordered_schema;
+			for (auto schema_item : registration[py::str("schema")].cast<py::dict>()) {
+				ordered_schema.append(py::make_tuple(schema_item.first, schema_item.second));
+			}
+			normalized_registration[py::str("schema")] = std::move(ordered_schema);
+		}
+		normalized_registrations.append(std::move(normalized_registration));
+	}
+	return SortFingerprintList(normalized_registrations, "UDF registrations");
+}
+
+string PyLogicalPlan::operation_fingerprint() const {
+	if (serialized_logical_plan_.empty()) {
+		throw InternalException("PyLogicalPlan missing serialized logical plan");
+	}
+	auto normalized_snapshot = NormalizeConnectionSnapshotForFingerprint(connection_snapshot_);
+	auto normalized_udfs = NormalizeUDFRegistrationsForFingerprint(udf_registrations_);
+	string semantic_state;
+	AppendFingerprintString(semantic_state, serialized_logical_plan_);
+	AppendCanonicalFingerprintValue(semantic_state, normalized_snapshot);
+	AppendCanonicalFingerprintValue(semantic_state, normalized_udfs);
+
+	MD5Context digest;
+	digest.Add("vane-distributed-write-plan-semantic:");
+	digest.Add(semantic_state);
+	return digest.FinishHex();
 }
 
 static string QuoteSQLStringLiteral(const string &value) {

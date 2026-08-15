@@ -273,6 +273,7 @@ public:
 
 	void Insert(const py::object &params = py::list()) const;
 	void Update(const py::object &set, const py::object &where = py::none());
+	void Delete(const py::object &where = py::none());
 
 	void Create(const string &table);
 

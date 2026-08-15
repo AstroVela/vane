@@ -232,13 +232,15 @@ cannot override that static contract.
 contract before translation, task selection, or artifact creation. There is no
 mode inference: the physical shape must exactly match the declared mode.
 
-Python relation `insert_into` follows the selected backend strictly. An unset,
-empty, or explicit `VANE_RUNNER=ray` dispatches the INSERT to Ray and requires
-the target to translate to a registered distributed extension write; an
-ordinary DuckDB table target therefore reports an unsupported distributed
-operator instead of executing locally. `VANE_RUNNER=local-fast` selects native
-DuckDB execution as a separate backend. Neither backend falls back to the
-other.
+Python relation INSERT, UPDATE, DELETE, and CTAS mutations follow the selected
+backend strictly. This includes `insert_into`, row-value `insert`, `update`,
+`delete`, and `create`/`to_table`. An unset, empty, or explicit
+`VANE_RUNNER=ray` dispatches the mutation to Ray and requires the target to
+translate to a registered distributed extension write; an ordinary DuckDB
+table target therefore reports an unsupported distributed operator instead of
+executing locally. `VANE_RUNNER=local-fast` selects native DuckDB execution as
+a separate backend. Other runner values are not mutation backends, and neither
+backend falls back to the other.
 
 ### File-artifact mode
 
@@ -330,7 +332,10 @@ The driver also retains a lightweight operation-ID-to-plan-fingerprint
 tombstone until that driver exits. The fingerprint survives session closure and
 terminal-result eviction. Detaching an owner may discard result payloads and
 ownership records, but it never makes the operation ID available to a different
-write intent while another client keeps the driver alive.
+write intent while another client keeps the driver alive. The fingerprint
+covers the serialized logical plan, semantic connection replay state, and the
+transported Python UDF implementations. Transport-only session identities and
+refreshable credential values are excluded.
 
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
 created worker or file output, Vane supplies the stable operation ID and invokes
