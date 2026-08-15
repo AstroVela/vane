@@ -652,6 +652,7 @@ class OpenAITextEmbedder:
         from openai import OpenAIError  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             encoding_format = getattr(self, "_encoding_format", "float")
             kwargs: dict[str, Any] = {
@@ -696,7 +697,15 @@ class OpenAITextEmbedder:
                     original_error=ex,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(ex)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         raise AssertionError("OpenAI embedding request completed without a result")
@@ -925,6 +934,7 @@ class OpenAIPrompter:
         """Prompt using the Chat Completions API."""
         options = self._chat_completions_options()
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -940,7 +950,15 @@ class OpenAIPrompter:
                     original_error=exc,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(exc)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):
@@ -969,6 +987,7 @@ class OpenAIPrompter:
         """Prompt using the Responses API."""
         options = self._responses_options()
         capability_error: ProviderCapabilityError | None = None
+        retry_error: Exception | None = None
         try:
             response = await self._client.responses.create(
                 model=self._model,
@@ -984,7 +1003,15 @@ class OpenAIPrompter:
                     original_error=exc,
                 )
             else:
-                raise
+                from vane.ai.functions import _retry_after_error
+
+                retry_error = _retry_after_error(exc)
+                if retry_error is None:
+                    raise
+        if retry_error is not None:
+            # Raised outside the handler so the raw SDK error is not retained
+            # as __context__ (mirrors the Google provider's raise shape).
+            raise retry_error from None
         if capability_error is not None:
             raise capability_error from None
         if getattr(self, "_return_raw_response", False):

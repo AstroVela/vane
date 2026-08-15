@@ -1584,3 +1584,97 @@ def test_remote_ref_cleanup_does_not_initialize_ray(monkeypatch):
     executor._cancel_refs([object()])
 
     assert calls == ["checked"]
+
+
+def test_native_generate_substitution_logs_bounded_warning(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._ray_actor_mode = True
+    executor.engine_error_message = None
+    executor.llm = None  # generation fails before any engine interaction
+    executor.on_error = "null"  # the lowered form of the public on_error="ignore"
+    executor.completed_tasks = deque()
+    executor.task_count_lock = threading.Lock()
+    executor.running_task_count = 1
+    executor._notify_state_change = lambda **_kwargs: None
+    row = pa.table({"x": [1]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        asyncio.run(executor._generate("prompt text", row))
+
+    assert list(executor.completed_tasks) == [(None, row)]
+    messages = [r.getMessage() for r in caplog.records if "substituted NULL" in r.getMessage()]
+    assert len(messages) == 1
+    assert "vllm engine not initialized" in messages[0]
+    assert "prompt text" not in messages[0]
+
+
+def test_native_generate_raise_mode_logs_no_substitution_warning(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._ray_actor_mode = True
+    executor.engine_error_message = None
+    executor.llm = None
+    executor.on_error = "raise"
+    executor.model = "test-model"
+    executor.completed_tasks = deque()
+    executor.error_message = None
+    executor.error_lock = threading.Lock()
+    executor.task_count_lock = threading.Lock()
+    executor.running_task_count = 1
+    executor._notify_state_change = lambda **_kwargs: None
+    row = pa.table({"x": [1]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        asyncio.run(executor._generate("prompt text", row))
+
+    assert executor.error_message is not None
+    assert list(executor.completed_tasks) == []
+    assert [r for r in caplog.records if "substituted NULL" in r.getMessage()] == []
+
+
+def test_native_append_error_rows_logs_one_warning_per_batch(caplog):
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.engine_error_message = "engine init exploded"
+    executor.on_error = "null"
+    executor.completed_tasks = deque()
+    executor._notify_state_change = lambda **_kwargs: None
+    rows = pa.table({"x": [1, 2, 3]})
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        executor._append_error_rows(rows)
+
+    assert [output for output, _row in executor.completed_tasks] == [None, None, None]
+    messages = [r.getMessage() for r in caplog.records if "substituted NULL" in r.getMessage()]
+    assert len(messages) == 1  # bounded: one warning per substituted batch, not per row
+    assert "vllm engine init failed: engine init exploded" in messages[0]
+
+
+def test_native_append_error_rows_raise_mode_logs_no_substitution_warning(caplog):
+    """No caller reaches _append_error_rows under raise mode today, but the
+    policy mapping must guard it so a future caller cannot log a substitution
+    that is not happening."""
+    import logging
+
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.engine_error_message = "engine init exploded"
+    executor.on_error = "raise"
+    executor.completed_tasks = deque()
+    executor._notify_state_change = lambda **_kwargs: None
+
+    with caplog.at_level(logging.WARNING, logger="vane.ai.functions"):
+        executor._append_error_rows(pa.table({"x": [1]}))
+
+    assert [r for r in caplog.records if "substituted NULL" in r.getMessage()] == []
