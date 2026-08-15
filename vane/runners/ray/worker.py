@@ -40,7 +40,7 @@ from vane.runners.fte.debug_memory import (
 from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
 from vane.runners.fte.fte_failures import FteTaskTerminalControlError, _safe_failure_message
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
-from vane.runners.ray.admission_ledger import BoundedReplayMap
+from vane.runners.ray.admission_ledger import BoundedReplayMap, BoundedSet
 from vane.runners.ray.fte_scheduler_config import _fte_control_rpc_timeout_s
 from vane.runners.ray.ray_env import build_explicit_session_process_env, scrub_shared_runtime_session_env
 
@@ -260,12 +260,18 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
     distributed_extension_contracts: tuple[str, ...]
+    s3_session_id: str
     effective_s3_config_identity: str
     use_session_credentials: bool
 
     def has_static_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
         return any(name.lower() == normalized_name for name, _version in self.extensions)
+
+    def replaces_s3_identity(self, other: WorkerSnapshotDatabaseIdentity) -> bool:
+        if not self.s3_session_id or self == other:
+            return False
+        return self._replace(effective_s3_config_identity="") == other._replace(effective_s3_config_identity="")
 
 
 def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description: str) -> str:
@@ -278,6 +284,7 @@ def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description:
 def _worker_snapshot_database_identity(
     snapshot: Mapping[str, Any],
     *,
+    session_id: str,
     effective_s3_config: Mapping[str, str],
     use_session_credentials: bool,
 ) -> WorkerSnapshotDatabaseIdentity:
@@ -364,14 +371,24 @@ def _worker_snapshot_database_identity(
         seen_distributed_contracts.add(raw_contract)
         distributed_contracts.append(raw_contract)
     distributed_contracts.sort()
-    s3_config = tuple(
-        (key, str(effective_s3_config[key]))
-        for key in _DUCKDB_S3_SESSION_KEYS
-        if str(effective_s3_config.get(key, "")).strip()
-    )
-    s3_config_identity = hashlib.sha256(
-        json.dumps(s3_config, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    has_httpfs = any(name.lower() == "httpfs" for name, _version in extensions)
+    if has_httpfs:
+        s3_session_id = str(session_id).strip()
+        if not s3_session_id:
+            raise ValueError("worker snapshot httpfs database identity requires a Vane session_id")
+        s3_config = tuple(
+            (key, str(effective_s3_config[key]))
+            for key in _DUCKDB_S3_SESSION_KEYS
+            if str(effective_s3_config.get(key, "")).strip()
+        )
+        s3_config_identity = hashlib.sha256(
+            json.dumps(s3_config, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        identity_uses_session_credentials = bool(use_session_credentials)
+    else:
+        s3_session_id = ""
+        s3_config_identity = ""
+        identity_uses_session_credentials = False
     return WorkerSnapshotDatabaseIdentity(
         database,
         read_only,
@@ -380,14 +397,16 @@ def _worker_snapshot_database_identity(
         duckdb_source_id,
         tuple(extensions),
         tuple(distributed_contracts),
+        s3_session_id,
         s3_config_identity,
-        bool(use_session_credentials),
+        identity_uses_session_credentials,
     )
 
 
 def _query_worker_snapshot_database_identity(
     connection_snapshot_query_id: str,
     *,
+    session_id: str,
     effective_s3_config: Mapping[str, str],
     use_session_credentials: bool,
 ) -> WorkerSnapshotDatabaseIdentity:
@@ -405,6 +424,7 @@ def _query_worker_snapshot_database_identity(
         raise TypeError("query connection snapshot must be a mapping")
     return _worker_snapshot_database_identity(
         snapshot,
+        session_id=session_id,
         effective_s3_config=effective_s3_config,
         use_session_credentials=use_session_credentials,
     )
@@ -1056,6 +1076,10 @@ class RayWorkerActor:
         self._shared_conn_lock = threading.Lock()
         self._snapshot_connections: dict[WorkerSnapshotDatabaseIdentity, Any] = {}
         self._snapshot_connections_lock = threading.Lock()
+        self._snapshot_connection_active_cursors: dict[WorkerSnapshotDatabaseIdentity, int] = {}
+        self._snapshot_cursor_database_identities: dict[Any, WorkerSnapshotDatabaseIdentity] = {}
+        self._retired_snapshot_database_identities: set[WorkerSnapshotDatabaseIdentity] = set()
+        self._retired_snapshot_session_ids = BoundedSet[str](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
         self._session_connections: dict[str, tuple[dict[str, str], Any]] = {}
         self._session_s3_configs: dict[str, dict[str, str]] = {}
         self._session_operation_locks: dict[str, threading.Lock] = {}
@@ -1598,6 +1622,74 @@ class RayWorkerActor:
             self._shared_conn = conn
             return conn
 
+    def _close_retired_snapshot_databases_locked(self) -> None:
+        snapshot_connections = getattr(self, "_snapshot_connections", {})
+        active_cursors = getattr(self, "_snapshot_connection_active_cursors", {})
+        retired_identities = getattr(self, "_retired_snapshot_database_identities", set())
+        for database_identity in tuple(retired_identities):
+            if active_cursors.get(database_identity, 0) > 0:
+                continue
+            connection = snapshot_connections.get(database_identity)
+            if connection is None:
+                retired_identities.discard(database_identity)
+                active_cursors.pop(database_identity, None)
+                continue
+            connection.close()
+            if snapshot_connections.get(database_identity) is connection:
+                snapshot_connections.pop(database_identity, None)
+                active_cursors.pop(database_identity, None)
+                retired_identities.discard(database_identity)
+
+    def _activate_snapshot_database_identity_locked(
+        self,
+        database_identity: WorkerSnapshotDatabaseIdentity,
+    ) -> bool:
+        active_cursors = getattr(self, "_snapshot_connection_active_cursors", None)
+        if active_cursors is None:
+            active_cursors = {}
+            self._snapshot_connection_active_cursors = active_cursors
+        retired_identities = getattr(self, "_retired_snapshot_database_identities", None)
+        if retired_identities is None:
+            retired_identities = set()
+            self._retired_snapshot_database_identities = retired_identities
+        retired_session_ids = getattr(self, "_retired_snapshot_session_ids", ())
+        retire_after_use = bool(
+            database_identity.s3_session_id and database_identity.s3_session_id in retired_session_ids
+        )
+
+        if database_identity in retired_identities and active_cursors.get(database_identity, 0) == 0:
+            self._close_retired_snapshot_databases_locked()
+        if not retire_after_use:
+            retired_identities.discard(database_identity)
+        for existing_identity in getattr(self, "_snapshot_connections", {}):
+            if database_identity.replaces_s3_identity(existing_identity):
+                retired_identities.add(existing_identity)
+        self._close_retired_snapshot_databases_locked()
+        return retire_after_use
+
+    def _retire_snapshot_databases_for_session(self, session_id: str) -> None:
+        session_key = str(session_id).strip()
+        if not session_key:
+            return
+        snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+        if snapshot_connections_lock is None:
+            snapshot_connections_lock = threading.Lock()
+            self._snapshot_connections_lock = snapshot_connections_lock
+        with snapshot_connections_lock:
+            retired_session_ids = getattr(self, "_retired_snapshot_session_ids", None)
+            if retired_session_ids is None:
+                retired_session_ids = BoundedSet[str](capacity=_SESSION_CLOSE_REPLAY_CAPACITY)
+                self._retired_snapshot_session_ids = retired_session_ids
+            retired_session_ids.add(session_key)
+            retired_identities = getattr(self, "_retired_snapshot_database_identities", None)
+            if retired_identities is None:
+                retired_identities = set()
+                self._retired_snapshot_database_identities = retired_identities
+            for database_identity in getattr(self, "_snapshot_connections", {}):
+                if database_identity.s3_session_id == session_key:
+                    retired_identities.add(database_identity)
+            self._close_retired_snapshot_databases_locked()
+
     def _get_snapshot_execution_cursor(
         self,
         bootstrap_connection: Any,
@@ -1621,6 +1713,7 @@ class RayWorkerActor:
                 if snapshot_connections is None:
                     snapshot_connections = {}
                     self._snapshot_connections = snapshot_connections
+                retire_after_use = self._activate_snapshot_database_identity_locked(database_identity)
                 connection: Any = snapshot_connections.get(database_identity)
                 if connection is None:
                     resolve = require_ray_cxx_attr(
@@ -1646,6 +1739,18 @@ class RayWorkerActor:
                         raise
                     snapshot_connections[database_identity] = connection
                 cursor = connection.cursor()
+                active_cursors = getattr(self, "_snapshot_connection_active_cursors", None)
+                if active_cursors is None:
+                    active_cursors = {}
+                    self._snapshot_connection_active_cursors = active_cursors
+                active_cursors[database_identity] = active_cursors.get(database_identity, 0) + 1
+                cursor_identities = getattr(self, "_snapshot_cursor_database_identities", None)
+                if cursor_identities is None:
+                    cursor_identities = {}
+                    self._snapshot_cursor_database_identities = cursor_identities
+                cursor_identities[cursor] = database_identity
+                if retire_after_use:
+                    self._retired_snapshot_database_identities.add(database_identity)
             with self._native_execution_condition:
                 active_snapshot_cursors = getattr(self, "_active_snapshot_cursors", None)
                 if active_snapshot_cursors is None:
@@ -1669,13 +1774,32 @@ class RayWorkerActor:
         try:
             cursor.close()
         finally:
-            with self._native_execution_condition:
-                getattr(self, "_active_snapshot_cursors", set()).discard(cursor)
-                active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
-                if active_cursors <= 0:
-                    raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
-                self._active_snapshot_execution_cursors = active_cursors - 1
-                self._native_execution_condition.notify_all()
+            try:
+                snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+                if snapshot_connections_lock is None:
+                    raise RuntimeError("Ray worker snapshot database identity lock is unavailable")
+                with snapshot_connections_lock:
+                    cursor_identities = getattr(self, "_snapshot_cursor_database_identities", {})
+                    database_identity = cursor_identities.pop(cursor, None)
+                    if database_identity is None:
+                        raise RuntimeError("Ray worker snapshot cursor database identity is unavailable")
+                    active_cursors_by_database = getattr(self, "_snapshot_connection_active_cursors", {})
+                    database_active_cursors = active_cursors_by_database.get(database_identity, 0)
+                    if database_active_cursors <= 0:
+                        raise RuntimeError("Ray worker snapshot database cursor ownership underflow")
+                    if database_active_cursors == 1:
+                        active_cursors_by_database.pop(database_identity, None)
+                    else:
+                        active_cursors_by_database[database_identity] = database_active_cursors - 1
+                    self._close_retired_snapshot_databases_locked()
+            finally:
+                with self._native_execution_condition:
+                    getattr(self, "_active_snapshot_cursors", set()).discard(cursor)
+                    active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
+                    if active_cursors <= 0:
+                        raise RuntimeError("Ray worker snapshot execution cursor ownership underflow")
+                    self._active_snapshot_execution_cursors = active_cursors - 1
+                    self._native_execution_condition.notify_all()
 
     def _get_session_operation_lock(
         self,
@@ -1898,6 +2022,7 @@ class RayWorkerActor:
 
         database_identity = _query_worker_snapshot_database_identity(
             cleanup_context.connection_snapshot_query_id,
+            session_id=cleanup_context.session_id,
             effective_s3_config=effective_s3_config,
             use_session_credentials=cleanup_context.use_session_credentials,
         )
@@ -1952,21 +2077,21 @@ class RayWorkerActor:
             operation_lock = self._get_session_operation_lock(session_key, allow_closed=True)
             with self._session_connections_lock:
                 self._closed_session_ids[session_key] = True
+            self._retire_snapshot_databases_for_session(session_key)
             with operation_lock:
                 with self._session_connections_lock:
                     record = self._session_connections.get(session_key)
-                if record is None:
+                if record is not None:
+                    _, connection = record
+                    connection.close()
                     with self._session_connections_lock:
-                        operation_locks = getattr(self, "_session_operation_locks", {})
-                        if operation_locks.get(session_key) is operation_lock:
-                            operation_locks.pop(session_key, None)
-                    return
-                _, connection = record
-                connection.close()
+                        if self._session_connections.get(session_key) is record:
+                            self._session_connections.pop(session_key, None)
+                            getattr(self, "_session_s3_configs", {}).pop(session_key, None)
+                self._retire_snapshot_databases_for_session(session_key)
                 with self._session_connections_lock:
-                    if self._session_connections.get(session_key) is record:
-                        self._session_connections.pop(session_key, None)
-                        getattr(self, "_session_s3_configs", {}).pop(session_key, None)
+                    operation_locks = getattr(self, "_session_operation_locks", {})
+                    if operation_locks.get(session_key) is operation_lock:
                         getattr(self, "_session_operation_locks", {}).pop(session_key, None)
 
         await _to_thread_with_owned_side_effects(_close)
@@ -2267,6 +2392,11 @@ class RayWorkerActor:
                     with snapshot_connections_lock:
                         if self._snapshot_connections.get(database_identity) is snapshot_connection:
                             self._snapshot_connections.pop(database_identity, None)
+                            getattr(self, "_snapshot_connection_active_cursors", {}).pop(
+                                database_identity,
+                                None,
+                            )
+                            getattr(self, "_retired_snapshot_database_identities", set()).discard(database_identity)
             for session_id, record in session_connections:
                 with session_connections_lock:
                     if getattr(self, "_session_connections", {}).get(session_id) is not record:
@@ -2414,30 +2544,41 @@ class RayWorkerActor:
         start = time.monotonic()
 
         try:
-            database_identity = _query_worker_snapshot_database_identity(
-                connection_snapshot_query_id,
-                effective_s3_config=effective_s3_config,
-                use_session_credentials=use_session_credentials,
-            )
-            cursor = self._get_snapshot_execution_cursor(
-                conn,
-                connection_snapshot_query_id,
-                database_identity=database_identity,
-            )
-            with self._session_connections_lock:
-                if self._shutdown_started:
-                    raise RuntimeError("Ray worker runtime is shutting down")
-                if session_id in self._closed_session_ids:
-                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
-                record = self._session_connections.get(session_id)
-                if record is None or record[1] is not conn:
-                    raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
-                query_admitted = self._register_native_cursor(
-                    cursor,
-                    native_query_id,
-                    native_task_id,
+            operation_lock = self._get_session_operation_lock(session_id)
+            with operation_lock:
+                with self._session_connections_lock:
+                    if self._shutdown_started:
+                        raise RuntimeError("Ray worker runtime is shutting down")
+                    if session_id in self._closed_session_ids:
+                        raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                    record = self._session_connections.get(session_id)
+                    if record is None or record[1] is not conn:
+                        raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+                database_identity = _query_worker_snapshot_database_identity(
+                    connection_snapshot_query_id,
+                    session_id=session_id,
+                    effective_s3_config=effective_s3_config,
+                    use_session_credentials=use_session_credentials,
                 )
-                cursor_registered = True
+                cursor = self._get_snapshot_execution_cursor(
+                    conn,
+                    connection_snapshot_query_id,
+                    database_identity=database_identity,
+                )
+                with self._session_connections_lock:
+                    if self._shutdown_started:
+                        raise RuntimeError("Ray worker runtime is shutting down")
+                    if session_id in self._closed_session_ids:
+                        raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                    record = self._session_connections.get(session_id)
+                    if record is None or record[1] is not conn:
+                        raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
+                    query_admitted = self._register_native_cursor(
+                        cursor,
+                        native_query_id,
+                        native_task_id,
+                    )
+                    cursor_registered = True
             if not query_admitted:
                 if self._worker_native_query_is_closing(native_query_id):
                     raise RuntimeError(f"native query is closing: {native_query_id}")

@@ -314,11 +314,14 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
 
     class DummyActor:
+        _close_retired_snapshot_databases_locked = actor_class._close_retired_snapshot_databases_locked
         _shutdown_lock = threading.Lock()
         _shared_conn_lock = threading.Lock()
         _snapshot_connections_lock = threading.Lock()
@@ -335,6 +338,10 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         _closing_native_tasks: set[str] = set()
         _active_snapshot_execution_cursors = 1
         _active_snapshot_cursors: set[object] = set()
+        _snapshot_connection_active_cursors = {database_identity: 1}
+        _snapshot_cursor_database_identities: dict[object, worker_module.WorkerSnapshotDatabaseIdentity] = {}
+        _retired_snapshot_database_identities: set[worker_module.WorkerSnapshotDatabaseIdentity] = set()
+        _retired_snapshot_session_ids: set[str] = set()
         _shutdown_started = False
         _shutdown_prepared = False
         _shutdown_complete = False
@@ -346,7 +353,7 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
     actor = DummyActor()
     cursor = Cursor()
     actor._active_snapshot_cursors.add(cursor)
-    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    actor._snapshot_cursor_database_identities[cursor] = database_identity
     shutdown_errors = []
 
     def prepare_shutdown():

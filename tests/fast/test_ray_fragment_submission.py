@@ -3787,6 +3787,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "session-a",
         "test-s3-identity",
         True,
     )
@@ -3929,8 +3930,9 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "session-a",
         "test-s3-identity",
-        True,
+        False,
     )
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
@@ -4048,6 +4050,7 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "session-a",
         "test-s3-identity",
         True,
     )
@@ -13623,6 +13626,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "session-a",
         "test-s3-identity",
         True,
     )
@@ -14002,6 +14006,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "session-a",
         "test-s3-identity",
         True,
     )
@@ -14488,8 +14493,9 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
     actor._session_connections = {"session-a": ({}, shared_conn)}
 

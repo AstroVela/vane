@@ -22,6 +22,10 @@ def _worker_actor():
     actor._shutdown_started = False
     actor._snapshot_connections = {}
     actor._snapshot_connections_lock = threading.Lock()
+    actor._snapshot_connection_active_cursors = {}
+    actor._snapshot_cursor_database_identities = {}
+    actor._retired_snapshot_database_identities = set()
+    actor._retired_snapshot_session_ids = set()
     actor._configure_snapshot_conn = lambda _connection: None
     return actor_class, actor
 
@@ -31,9 +35,11 @@ def _snapshot_database_identity(
     *,
     effective_s3_config=None,
     use_session_credentials=True,
+    session_id="test-session",
 ):
     return worker_module._worker_snapshot_database_identity(
         snapshot,
+        session_id=session_id,
         effective_s3_config=effective_s3_config or {},
         use_session_credentials=use_session_credentials,
     )
@@ -70,8 +76,9 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
     cursors = []
     resolve_calls = []
@@ -135,6 +142,89 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     assert actor._active_snapshot_cursors == set()
 
 
+def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(monkeypatch):
+    actor_class, actor = _worker_actor()
+    snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [{"name": "httpfs", "version": "test-version"}],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    old_identity = _snapshot_database_identity(
+        snapshot,
+        session_id="session-a",
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "old-key",
+            "AWS_SECRET_ACCESS_KEY": "old-secret",
+        },
+    )
+    new_identity = _snapshot_database_identity(
+        snapshot,
+        session_id="session-a",
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "new-key",
+            "AWS_SECRET_ACCESS_KEY": "new-secret",
+        },
+    )
+    connections = []
+
+    class Cursor:
+        def close(self):
+            return None
+
+    class ResolvedConnection:
+        def __init__(self):
+            self.closed = False
+
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            self.closed = True
+
+    def resolve(_connection, _query_id):
+        connection = ResolvedConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(worker_module, "require_ray_cxx_attr", lambda name, *, hint: resolve)
+
+    old_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "old-query",
+        database_identity=old_identity,
+    )
+    new_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "new-query",
+        database_identity=new_identity,
+    )
+
+    assert len(actor._snapshot_connections) == 2
+    assert connections[0].closed is False
+    actor_class._close_snapshot_execution_cursor(actor, old_cursor)
+    assert connections[0].closed is True
+    assert actor._snapshot_connections == {new_identity: connections[1]}
+
+    actor_class._close_snapshot_execution_cursor(actor, new_cursor)
+    actor_class._retire_snapshot_databases_for_session(actor, "session-a")
+    assert connections[1].closed is True
+    assert actor._snapshot_connections == {}
+
+    late_cleanup_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "late-cleanup",
+        database_identity=new_identity,
+    )
+    assert actor._snapshot_connections == {new_identity: connections[2]}
+    actor_class._close_snapshot_execution_cursor(actor, late_cleanup_cursor)
+    assert connections[2].closed is True
+    assert actor._snapshot_connections == {}
+
+
 def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypatch):
     actor_class, actor = _worker_actor()
     database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
@@ -145,8 +235,9 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
 
     class ResolvedConnection:
@@ -411,6 +502,37 @@ def test_worker_snapshot_database_identity_isolates_effective_s3_configuration()
     assert "secret-a" not in repr(first)
 
 
+def test_worker_snapshot_database_identity_omits_s3_state_without_httpfs():
+    snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    first = _snapshot_database_identity(
+        snapshot,
+        session_id="session-a",
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "key-a",
+            "AWS_SECRET_ACCESS_KEY": "secret-a",
+        },
+    )
+    second = _snapshot_database_identity(
+        snapshot,
+        session_id="session-b",
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "key-b",
+            "AWS_SECRET_ACCESS_KEY": "secret-b",
+        },
+        use_session_credentials=False,
+    )
+
+    assert first == second
+    assert first.s3_session_id == ""
+    assert first.effective_s3_config_identity == ""
+    assert first.use_session_credentials is False
+
+
 @pytest.mark.parametrize(
     ("snapshot", "message"),
     [
@@ -444,8 +566,9 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
 
     class Cursor:
@@ -485,8 +608,9 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
         "test-source-id",
         (),
         (),
-        "test-s3-identity",
-        True,
+        "",
+        "",
+        False,
     )
 
     class Connection:

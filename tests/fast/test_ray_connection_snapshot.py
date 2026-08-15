@@ -510,6 +510,7 @@ def test_worker_nondefault_snapshot_reuses_database(monkeypatch):
 
         database_identity = worker_module._query_worker_snapshot_database_identity(
             query_id,
+            session_id="test-session",
             effective_s3_config={},
             use_session_credentials=True,
         )
@@ -612,11 +613,13 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
 
         first_identity = worker_module._query_worker_snapshot_database_identity(
             first_query_id,
+            session_id="test-session",
             effective_s3_config={},
             use_session_credentials=True,
         )
         second_identity = worker_module._query_worker_snapshot_database_identity(
             second_query_id,
+            session_id="test-session",
             effective_s3_config={},
             use_session_credentials=True,
         )
