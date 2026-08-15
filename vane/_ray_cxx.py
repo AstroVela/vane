@@ -20,7 +20,6 @@ class _CleanupFlightShuffleForQuery(Protocol):
         connection_snapshot_query_id: str = ...,
         apply_snapshot_s3_credentials: bool = ...,
         effective_session_config: object | None = ...,
-        snapshot_secrets_prepared: bool = ...,
     ) -> dict[str, int | str]: ...
 
 
@@ -88,12 +87,6 @@ def require_ray_cxx_attr(
 def require_ray_cxx_attr(
     name: Literal["_resolve_query_snapshot_connection"], *, hint: str | None = None
 ) -> Callable[[object, str], object]: ...
-
-
-@overload
-def require_ray_cxx_attr(
-    name: Literal["_prepare_query_secret_snapshot"], *, hint: str | None = None
-) -> Callable[[object, str, bool], None]: ...
 
 
 @overload

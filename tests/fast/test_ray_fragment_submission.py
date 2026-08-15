@@ -3667,7 +3667,6 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
             snapshot_query_id,
             apply_snapshot_s3_credentials,
             effective_session_config,
-            snapshot_secrets_prepared,
         ):
             calls.append(
                 (
@@ -3676,7 +3675,6 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
                     snapshot_query_id,
                     apply_snapshot_s3_credentials,
                     effective_session_config,
-                    snapshot_secrets_prepared,
                     hint,
                 )
             )
@@ -3709,7 +3707,6 @@ def test_worker_flight_shuffle_cleanup_helper_passes_cleanup_connection_and_snap
             "resource-query",
             False,
             {"AWS_REGION": "region-a"},
-            False,
             "Ensure the C++ ray extension is built with Flight shuffle cleanup support.",
         )
     ]
@@ -3793,8 +3790,6 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
-    actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: None
-    actor._release_worker_secret_snapshot = lambda _identity: None
 
     def refresh(config, cached, *, use_session_credentials):
         events.append(("refresh", dict(config), dict(cached), use_session_credentials))
@@ -3815,7 +3810,6 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         *,
         apply_snapshot_s3_credentials=True,
         effective_session_config=None,
-        snapshot_secrets_prepared=False,
     ):
         if connection is None:
             events.append(("probe", query_id))
@@ -3935,8 +3929,6 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
-    actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: None
-    actor._release_worker_secret_snapshot = lambda _identity: None
     cleanup_calls = []
 
     def cleanup(
@@ -3946,7 +3938,6 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         *,
         apply_snapshot_s3_credentials=True,
         effective_session_config=None,
-        snapshot_secrets_prepared=False,
     ):
         cleanup_calls.append(
             (
@@ -13954,7 +13945,6 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
             native_progress_callback,
             runtime_context,
             effective_session_config,
-            snapshot_secrets_prepared,
         ):
             lifecycle.append("execute")
             calls.append(
@@ -13971,7 +13961,6 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
                     native_progress_callback,
                     runtime_context,
                     effective_session_config,
-                    snapshot_secrets_prepared,
                 )
             )
             return "ok"
@@ -14026,15 +14015,6 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._get_plan_runner = lambda: _FakePlanRunner()
-    secret_identity = worker_mod.WorkerSecretSnapshotIdentity(b"s" * 32, 1)
-    actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: secret_identity
-
-    def _release_secret_snapshot(identity):
-        assert identity == secret_identity
-        assert shared_conn.cursor_obj.closed is True
-        lifecycle.append("secret-release")
-
-    actor._release_worker_secret_snapshot = _release_secret_snapshot
     plan_object = _FakePlan()
     configured = []
 
@@ -14087,7 +14067,6 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         native_progress_callback,
         runtime_context,
         effective_session_config,
-        snapshot_secrets_prepared,
     ) = calls[0]
     assert plan is plan_object
     assert scan_task_arg == {"1": b"scan"}
@@ -14101,14 +14080,13 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     assert fte_scan_source_queues is None
     assert fte_exchange_source_queues is None
     assert dynamic_filter_domains == dynamic_domains
-    assert snapshot_secrets_prepared is True
     assert native_progress_callback is None
     assert runtime_context == {"query_id": "q1", "fragment_id": "f1", "task_id": "q1.2.3.4"}
     assert effective_session_config == {
         "AWS_ACCESS_KEY_ID": "session-a-key",
         "AWS_SECRET_ACCESS_KEY": "session-a-secret",
     }
-    assert lifecycle == ["execute", "cursor-close", "secret-release"]
+    assert lifecycle == ["execute", "cursor-close"]
 
 
 def test_execute_native_task_rejects_conflicting_runtime_task_identity():
@@ -14536,15 +14514,12 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
             _native_progress_callback,
             _runtime_context,
             _effective_session_config,
-            _snapshot_secrets_prepared,
         ):
             calls.append((cursor, fte_scan_source_queues, fte_exchange_source_queues))
             return "ok"
 
     shared_runner = _FakePlanRunner()
     actor._get_plan_runner = lambda: shared_runner
-    actor._acquire_worker_secret_snapshot = lambda *_args, **_kwargs: None
-    actor._release_worker_secret_snapshot = lambda _identity: None
 
     scan_queues = {"1": object()}
     exchange_queues = {"2": object()}

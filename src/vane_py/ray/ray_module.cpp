@@ -230,8 +230,7 @@ private:
 static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_connection,
                                                         const py::object &connection_snapshot,
                                                         const py::object &effective_session_config,
-                                                        bool apply_snapshot_s3_credentials,
-                                                        bool snapshot_secrets_prepared = false) {
+                                                        bool apply_snapshot_s3_credentials) {
 	auto resolved_connection = connection_snapshot.is_none()
 	                               ? cleanup_connection
 	                               : ResolveConnectionForSnapshot(cleanup_connection, connection_snapshot);
@@ -242,7 +241,6 @@ static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_conne
 	ConnectionSnapshotApplyOptions snapshot_options;
 	snapshot_options.apply_session_config = false;
 	snapshot_options.apply_s3_credentials = apply_snapshot_s3_credentials;
-	snapshot_options.apply_secrets = apply_snapshot_s3_credentials && !snapshot_secrets_prepared;
 	ValidateConnectionSnapshotExtensions(resolved_connection, connection_snapshot,
 	                                     snapshot_options.enforce_extension_security);
 	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot, "httpfs")) {
@@ -662,30 +660,6 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("connection"), py::arg("query_id"));
 
 	m.def(
-	    "_prepare_query_secret_snapshot",
-	    [](py::object connection, const string &query_id, bool include_snapshot_secrets) {
-		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
-		    if (snapshot.is_none()) {
-			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
-		    }
-		    auto &connection_wrapper = ExtractPyConnectionWrapper(connection);
-		    CloseOpenPythonConnectionResult(connection_wrapper);
-		    if (!include_snapshot_secrets) {
-			    py::dict empty_snapshot;
-			    empty_snapshot[py::str("secrets")] = py::list();
-			    ApplySecretSnapshot(*connection_wrapper.con.GetConnection().context, empty_snapshot);
-			    return;
-		    }
-		    ConnectionSnapshotApplyOptions options;
-		    options.apply_session_config = false;
-		    options.apply_s3_credentials = false;
-		    options.apply_settings = false;
-		    options.apply_secrets = true;
-		    ApplyConnectionSnapshot(connection, snapshot, options);
-	    },
-	    py::arg("connection"), py::arg("query_id"), py::arg("include_snapshot_secrets") = true);
-
-	m.def(
 	    "_register_query_python_replay_state",
 	    [](const string &query_id, const PyPhysicalPlanWrapper &plan) {
 		    if (query_id.empty()) {
@@ -758,7 +732,7 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "cleanup_flight_shuffle_for_query",
 	    [](const string &query_id, py::object cleanup_connection, const string &connection_snapshot_query_id,
-	       bool apply_snapshot_s3_credentials, py::object effective_session_config, bool snapshot_secrets_prepared) {
+	       bool apply_snapshot_s3_credentials, py::object effective_session_config) {
 		    py::dict out;
 		    if (query_id.empty()) {
 			    out["registry_entries_removed"] = 0;
@@ -784,8 +758,7 @@ void register_ray_bindings(py::module_ &mod) {
 				    snapshot = LookupQueryConnectionSnapshot(connection_snapshot_query_id);
 				    if (!snapshot.is_none()) {
 					    resolved_cleanup_connection = ResolveFlightShuffleCleanupConnection(
-					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials,
-					        snapshot_secrets_prepared);
+					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials);
 				    } else {
 					    ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
 				    }
@@ -819,8 +792,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    return out;
 	    },
 	    py::arg("query_id"), py::arg("cleanup_connection") = py::none(), py::arg("connection_snapshot_query_id") = "",
-	    py::arg("apply_snapshot_s3_credentials") = true, py::arg("effective_session_config") = py::none(),
-	    py::arg("snapshot_secrets_prepared") = false);
+	    py::arg("apply_snapshot_s3_credentials") = true, py::arg("effective_session_config") = py::none());
 
 	m.def(
 	    "_resolve_flight_shuffle_cleanup_connection_for_test",
@@ -1298,7 +1270,7 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
-	           py::object effective_session_config_obj, bool snapshot_secrets_prepared) {
+	           py::object effective_session_config_obj) {
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
 		        auto parse_node_id = [](py::handle key, const char *map_name) -> idx_t {
 			        if (!py::isinstance<py::str>(key)) {
@@ -1585,8 +1557,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
 					                                        effective_session_config_obj);
 				        }
-				        plan.ensure_connection_snapshot(exec_conn, apply_snapshot_session_config,
-				                                        !snapshot_secrets_prepared);
+				        plan.ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
 				        // Handle deferred deserialization (from pickle round-trip)
 				        if (!plan.has_root() && !plan.serialized_root_.empty()) {
 					        // Materialize into a temporary wrapper so any physical-plan
@@ -1602,8 +1573,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        deferred_exec_plan.connection_snapshot_ = plan.connection_snapshot_;
 					        deferred_exec_plan.serialized_root_ = plan.serialized_root_;
 					        deferred_exec_plan.worker_connection_ = exec_conn;
-					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config,
-					                                                     !snapshot_secrets_prepared);
+					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config);
 					        exec_plan = &deferred_exec_plan;
 				        }
 
@@ -1612,8 +1582,7 @@ void register_ray_bindings(py::module_ &mod) {
 				        }
 				        exec_plan->worker_connection_ = exec_conn;
 				        exec_plan->client_context_ = ExtractPyConnectionWrapper(exec_conn).con.GetConnection().context;
-				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config,
-				                                              !snapshot_secrets_prepared);
+				        exec_plan->ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
 				        exec_plan->apply_udf_actor_handles();
 				        auto result = self.execute_native_impl(
 				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
@@ -1635,8 +1604,7 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
-	        py::arg("effective_session_config") = py::none(), py::arg("snapshot_secrets_prepared") = false,
-	        "Execute physical plan using DuckDB's native Executor");
+	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
 
 	// Merge multiple raw-bytes ScanTaskDescriptors into one. File descriptors
 	// concatenate files; extension descriptors concatenate opaque envelopes only

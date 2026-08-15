@@ -79,14 +79,12 @@ struct PyPhysicalPlanWrapper {
 		return plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot();
 	}
 
-	void ensure_connection_snapshot(py::object conn_obj, bool apply_session_config = true,
-	                                bool apply_secrets = true) const {
+	void ensure_connection_snapshot(py::object conn_obj, bool apply_session_config = true) const {
 		if (connection_snapshot_.is_none()) {
 			return;
 		}
 		ConnectionSnapshotApplyOptions options;
 		options.apply_session_config = apply_session_config;
-		options.apply_secrets = apply_secrets;
 		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, options);
 	}
 
@@ -159,14 +157,14 @@ struct PyPhysicalPlanWrapper {
 
 	// Materialize deferred serialized_root_ into the plan's PhysicalPlan.
 	// Requires a DuckDB connection for deserialization context.
-	void materialize_deferred_root(py::object conn_obj, bool apply_session_config = true, bool apply_secrets = true) {
+	void materialize_deferred_root(py::object conn_obj, bool apply_session_config = true) {
 		if (serialized_root_.empty())
 			return;
 		if (has_root())
 			return; // Already has a root
 
 		ensure_plan_identity();
-		ensure_connection_snapshot(conn_obj, apply_session_config, apply_secrets);
+		ensure_connection_snapshot(conn_obj, apply_session_config);
 
 		auto &py_conn = ExtractPyConnectionWrapper(conn_obj);
 		auto &db_conn = py_conn.con.GetConnection();
@@ -1042,7 +1040,6 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	ConnectionSnapshotApplyOptions snapshot_options;
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;
-	snapshot_options.apply_secrets = !shares_source_database;
 	snapshot_options.apply_attached_databases = !shares_source_database;
 	// Validate and load the exact static extension set before refreshed AWS
 	// settings are allowed to execute LOAD httpfs. A snapshot that does not

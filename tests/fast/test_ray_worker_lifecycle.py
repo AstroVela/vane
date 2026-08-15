@@ -327,7 +327,6 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         _closing_native_queries: set[str] = set()
         _closing_native_tasks: set[str] = set()
         _active_snapshot_execution_cursors = 1
-        _active_secret_snapshot_leases = 0
         _shutdown_started = False
         _shutdown_prepared = False
         _shutdown_complete = False

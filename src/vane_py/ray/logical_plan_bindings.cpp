@@ -211,10 +211,10 @@ static py::dict SanitizeBootstrapConfig(const py::dict &config, bool in_memory_d
 		}
 		sanitized[item.first] = item.second;
 	}
-	// A transported in-memory plan carries the complete source secret snapshot.
-	// File databases retain the settings needed to identify the source
-	// bootstrap; worker execution may separately force an isolated read-only
-	// instance.
+	// Worker databases never inherit persistent-secret settings from an in-memory
+	// source. File databases retain the settings needed to identify the source
+	// bootstrap; worker execution separately disables persistent secrets and may
+	// force an isolated read-only instance.
 	if (in_memory_database) {
 		sanitized[py::str("allow_persistent_secrets")] = py::str("false");
 	}
@@ -411,24 +411,6 @@ static bool SnapshotHasAttachedDatabases(const py::object &snapshot_obj) {
 	return py::len(attached_obj) > 0;
 }
 
-static bool SnapshotHasSecrets(const py::object &snapshot_obj) {
-	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
-		return false;
-	}
-	auto snapshot = snapshot_obj.cast<py::dict>();
-	if (!snapshot.contains(py::str("secrets"))) {
-		return false;
-	}
-	auto secrets_obj = snapshot[py::str("secrets")];
-	if (secrets_obj.is_none()) {
-		return false;
-	}
-	if (!py::isinstance<py::list>(secrets_obj)) {
-		throw InvalidInputException("Connection snapshot secrets must be a list");
-	}
-	return py::len(secrets_obj) > 0;
-}
-
 static void DisablePersistentSecretsWhenUnused(DuckDBPyConnection &connection) {
 	auto &context = *connection.con.GetConnection().context;
 	auto &database = duckdb::DatabaseInstance::GetDatabase(context);
@@ -525,11 +507,16 @@ static py::object ResolveConnectionForSnapshot(py::object conn_obj, const py::ob
 static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, const py::object &source_conn_obj,
                                                        const py::object &snapshot_obj) {
 	auto bootstrap_obj = LookupBootstrapSnapshot(snapshot_obj);
-	if (SnapshotHasAttachedDatabases(snapshot_obj) || SnapshotHasSecrets(snapshot_obj)) {
-		if (!source_conn_obj.is_none() && ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
+	if (source_conn_obj.is_none()) {
+		// A transported logical plan must not inherit database-global state from
+		// the caller's planning connection, including temporary or persistent
+		// secrets that are intentionally absent from the snapshot.
+		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
+	}
+	if (SnapshotHasAttachedDatabases(snapshot_obj)) {
+		if (ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
 			// Local execution can keep using the source DatabaseInstance where the
-			// catalog and secrets already exist. A transported logical plan has no
-			// source connection, so it gets an isolated planning DatabaseInstance.
+			// attached catalog already exists.
 			return py::cast(ExtractPyConnectionWrapper(source_conn_obj).Cursor());
 		}
 		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
@@ -538,7 +525,7 @@ static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, cons
 	    ConnectionMatchesBootstrapSnapshot(conn_obj, snapshot_obj)) {
 		return conn_obj;
 	}
-	if (!BootstrapUsesInMemoryDatabase(bootstrap_obj) && !source_conn_obj.is_none() &&
+	if (!BootstrapUsesInMemoryDatabase(bootstrap_obj) &&
 	    ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
 		// The source DatabaseInstance may still be alive. Reopening its file with
 		// the sanitized worker configuration violates DuckDB's instance cache;
@@ -971,177 +958,6 @@ static vector<string> ParseDistributedExtensionContracts(const py::dict &snapsho
 	return result;
 }
 
-static string SerializeSecretForSnapshot(duckdb::ClientContext &context, const BaseSecret &secret) {
-	if (!secret.IsSerializable()) {
-		throw InvalidInputException("Distributed connection snapshot cannot transport secret '%s'", secret.GetName());
-	}
-
-	MemoryStream stream(Allocator::Get(context));
-	SerializationOptions options;
-	options.serialization_compatibility = SerializationCompatibility::Latest();
-	options.serialize_default_values = true;
-	BinarySerializer serializer(stream, options);
-	serializer.Begin();
-	secret.Serialize(serializer);
-	serializer.End();
-
-	auto data_size = stream.GetPosition();
-	if (data_size == 0) {
-		throw InternalException("Distributed connection snapshot serialized secret '%s' to an empty payload",
-		                        secret.GetName());
-	}
-	auto data_ptr = stream.GetData();
-	return string(reinterpret_cast<const char *>(data_ptr), data_size);
-}
-
-static py::list CaptureSecretSnapshot(DuckDBPyConnection &conn_wrapper) {
-	auto &context = *conn_wrapper.con.GetConnection().context;
-	struct SerializedSecret {
-		string storage;
-		string name;
-		string payload;
-	};
-	vector<SerializedSecret> serialized_secrets;
-	case_insensitive_set_t serialized_secret_names;
-	context.RunFunctionInTransaction([&]() {
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto secrets = SecretManager::Get(context).AllSecrets(transaction);
-		serialized_secrets.reserve(secrets.size());
-		for (const auto &entry : secrets) {
-			if (!entry.secret) {
-				throw InternalException("Distributed connection snapshot encountered a null secret");
-			}
-			if (!serialized_secret_names.insert(entry.secret->GetName()).second) {
-				throw InvalidInputException("Distributed connection snapshot cannot transport multiple secrets named "
-				                            "'%s' from different storages",
-				                            entry.secret->GetName());
-			}
-			if (entry.storage_mode.empty() || entry.secret->GetName().empty()) {
-				throw InternalException("Distributed connection snapshot encountered a secret without storage or name");
-			}
-			serialized_secrets.push_back(
-			    {entry.storage_mode, entry.secret->GetName(), SerializeSecretForSnapshot(context, *entry.secret)});
-		}
-	});
-	std::sort(serialized_secrets.begin(), serialized_secrets.end(),
-	          [](const SerializedSecret &left, const SerializedSecret &right) {
-		          return std::tie(left.storage, left.name) < std::tie(right.storage, right.name);
-	          });
-
-	py::list secrets_obj;
-	for (const auto &entry : serialized_secrets) {
-		py::dict secret_obj;
-		secret_obj[py::str("storage")] = py::str(entry.storage);
-		secret_obj[py::str("name")] = py::str(entry.name);
-		secret_obj[py::str("payload")] = py::bytes(entry.payload);
-		secrets_obj.append(std::move(secret_obj));
-	}
-	return secrets_obj;
-}
-
-static void ApplySecretSnapshot(duckdb::ClientContext &context, const py::dict &snapshot) {
-	if (!snapshot.contains(py::str("secrets"))) {
-		return;
-	}
-	auto secrets_obj = snapshot[py::str("secrets")];
-	if (secrets_obj.is_none()) {
-		return;
-	}
-	if (!py::isinstance<py::list>(secrets_obj)) {
-		throw InvalidInputException("Connection snapshot secrets must be a list");
-	}
-	struct SnapshotSecret {
-		pair<string, string> identity;
-		unique_ptr<BaseSecret> secret;
-	};
-	vector<SnapshotSecret> snapshot_secrets;
-	map<pair<string, string>, string> snapshot_secret_payloads;
-	case_insensitive_set_t snapshot_secret_names;
-	auto &secret_manager = SecretManager::Get(context);
-	for (auto item : secrets_obj.cast<py::list>()) {
-		if (!py::isinstance<py::dict>(item)) {
-			throw InvalidInputException("Connection snapshot secret entry must be a dict");
-		}
-		auto secret_obj = py::reinterpret_borrow<py::dict>(item);
-		if (!secret_obj.contains(py::str("storage")) || !py::isinstance<py::str>(secret_obj[py::str("storage")])) {
-			throw InvalidInputException("Connection snapshot secret entry is missing its storage");
-		}
-		if (!secret_obj.contains(py::str("name")) || !py::isinstance<py::str>(secret_obj[py::str("name")])) {
-			throw InvalidInputException("Connection snapshot secret entry is missing its name");
-		}
-		if (!secret_obj.contains(py::str("payload")) || !py::isinstance<py::bytes>(secret_obj[py::str("payload")])) {
-			throw InvalidInputException("Connection snapshot secret entry is missing its binary payload");
-		}
-		auto storage = secret_obj[py::str("storage")].cast<string>();
-		auto secret_name = secret_obj[py::str("name")].cast<string>();
-		string payload = py::bytes(secret_obj[py::str("payload")]);
-		if (storage.empty() || secret_name.empty() || payload.empty()) {
-			throw InvalidInputException("Connection snapshot secret entry has an empty storage, name, or payload");
-		}
-		auto identity = make_pair(std::move(storage), secret_name);
-		if (!snapshot_secret_payloads.emplace(identity, payload).second) {
-			throw InvalidInputException("Connection snapshot has duplicate secret '%s' in storage '%s'", secret_name,
-			                            identity.first);
-		}
-
-		MemoryStream stream(Allocator::Get(context));
-		stream.WriteData(reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
-		stream.Rewind();
-		BinaryDeserializer deserializer(stream);
-		deserializer.Begin();
-		auto secret = secret_manager.DeserializeSecret(deserializer);
-		deserializer.End();
-		if (!secret || secret->GetName() != secret_name) {
-			throw InvalidInputException("Connection snapshot secret name does not match its binary payload");
-		}
-		if (!snapshot_secret_names.insert(secret_name).second) {
-			throw InvalidInputException(
-			    "Connection snapshot cannot replay multiple secrets named '%s' from different storages", secret_name);
-		}
-		snapshot_secrets.push_back({std::move(identity), std::move(secret)});
-	}
-
-	context.RunFunctionInTransaction([&]() {
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		set<pair<string, string>> matching_persistent_secrets;
-		auto existing_secrets = secret_manager.AllSecrets(transaction);
-		vector<pair<string, string>> temporary_secrets;
-		for (const auto &entry : existing_secrets) {
-			if (!entry.secret) {
-				throw InternalException("Worker secret manager returned a null secret");
-			}
-			if (entry.persist_type == SecretPersistType::PERSISTENT) {
-				auto identity = make_pair(entry.storage_mode, entry.secret->GetName());
-				auto snapshot_entry = snapshot_secret_payloads.find(identity);
-				if (snapshot_entry == snapshot_secret_payloads.end() ||
-				    snapshot_entry->second != SerializeSecretForSnapshot(context, *entry.secret)) {
-					throw InvalidInputException(
-					    "Worker persistent secret '%s' is not identical to the source connection snapshot",
-					    entry.secret->GetName());
-				}
-				matching_persistent_secrets.insert(std::move(identity));
-				continue;
-			}
-			if (entry.persist_type != SecretPersistType::TEMPORARY) {
-				throw InternalException("Worker secret '%s' has an unresolved persistence mode",
-				                        entry.secret->GetName());
-			}
-			temporary_secrets.emplace_back(entry.secret->GetName(), entry.storage_mode);
-		}
-		for (const auto &entry : temporary_secrets) {
-			secret_manager.DropSecretByName(transaction, entry.first, OnEntryNotFound::RETURN_NULL,
-			                                SecretPersistType::TEMPORARY, entry.second);
-		}
-		for (auto &snapshot_secret : snapshot_secrets) {
-			if (matching_persistent_secrets.find(snapshot_secret.identity) != matching_persistent_secrets.end()) {
-				continue;
-			}
-			secret_manager.RegisterSecret(transaction, std::move(snapshot_secret.secret),
-			                              OnCreateConflict::REPLACE_ON_CONFLICT, SecretPersistType::TEMPORARY);
-		}
-	});
-}
-
 static py::list CaptureAttachedDatabaseSnapshot(DuckDBPyConnection &conn_wrapper) {
 	py::list attached_obj;
 	auto &context = *conn_wrapper.con.GetConnection().context;
@@ -1269,7 +1085,6 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	auto &source_database = DatabaseInstance::GetDatabase(*conn_wrapper.con.GetConnection().context);
 	snapshot_obj[py::str("distributed_extension_contracts")] = CaptureDistributedExtensionContracts(source_database);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
-	snapshot_obj[py::str("secrets")] = CaptureSecretSnapshot(conn_wrapper);
 	snapshot_obj[py::str("attached_databases")] = CaptureAttachedDatabaseSnapshot(conn_wrapper);
 	if (VaneRaySessionLifecycleEnabled()) {
 		conn_wrapper.MarkVaneRaySessionOpened();
@@ -1282,7 +1097,6 @@ struct ConnectionSnapshotApplyOptions {
 	bool enforce_extension_security = true;
 	bool apply_s3_credentials = true;
 	bool apply_settings = true;
-	bool apply_secrets = false;
 	bool apply_attached_databases = false;
 };
 
@@ -1320,7 +1134,6 @@ static void ValidateConnectionSnapshotExtensions(py::object conn_obj, const py::
 	validation_options.enforce_extension_security = enforce_extension_security;
 	validation_options.apply_s3_credentials = false;
 	validation_options.apply_settings = false;
-	validation_options.apply_secrets = false;
 	validation_options.apply_attached_databases = false;
 	ApplyConnectionSnapshot(conn_obj, snapshot_obj, validation_options);
 }
@@ -1372,9 +1185,7 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	auto distributed_extension_contracts = ParseDistributedExtensionContracts(snapshot);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
 	// Snapshot replay starts a new unit of work on this Python cursor. Close a
-	// partially consumed DB-API result before touching ClientContext directly;
-	// clearing that older result afterwards can otherwise discard temporary
-	// secrets registered by the replay.
+	// partially consumed DB-API result before mutating connection state.
 	CloseOpenPythonConnectionResult(conn_wrapper);
 	auto &conn = conn_wrapper.con.GetConnection();
 	if (options.enforce_extension_security) {
@@ -1385,9 +1196,6 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	LoadStaticRayExtensions(conn, extensions);
 	DistributedExtensionManager::Get(DatabaseInstance::GetDatabase(*conn.context))
 	    .ValidateExact(distributed_extension_contracts);
-	if (options.apply_secrets) {
-		ApplySecretSnapshot(*conn.context, snapshot);
-	}
 
 	if (options.apply_session_config) {
 		ApplyVaneSessionConfig(conn, snapshot_obj);

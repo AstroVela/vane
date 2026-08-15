@@ -116,31 +116,27 @@ The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
 This validation occurs before task scheduling.
 
-The snapshot also carries serializable DuckDB secrets and the declarations of
-attached catalogs needed to plan a transported logical plan. Secrets are
-recreated as temporary worker-local secrets; non-serializable secrets are
-rejected. Attached catalogs are recreated only on an isolated planning
-connection. Worker physical plans consume the immutable bind state serialized by
-the table function and never repeat coordinator metadata binding.
+The snapshot also carries declarations of attached catalogs needed to plan a
+transported logical plan. Transported logical plans use an isolated planning
+DatabaseInstance, and attached catalogs are recreated only there. Worker
+physical plans consume the immutable bind state serialized by the table
+function and never repeat coordinator metadata binding.
 
-The secret list is authoritative for its DatabaseInstance. Transported plans
-with secrets use an isolated driver planning database. A Ray worker disables
-host persistent-secret loading before a newly opened snapshot database first
-uses its secret manager, opens persistent source databases read-only, retains
-exact snapshot databases for the worker lifetime, and leases one exact
-snapshot-plus-secret digest through execution. Read-only worker instances let
-the same source file support isolated exact extension identities without
-sharing a mutable catalog; extension catalog commits remain coordinator-only.
-Tasks with the same digest may execute concurrently; a different digest waits
-until every current lease is released before replacing temporary secrets. If a
-reused database had already loaded persistent secrets, every such secret must
-be byte-identical to the source snapshot. Any extra or different persistent
-secret is rejected rather than inherited, overwritten, or used as a fallback.
+Connection snapshots do not transport DuckDB `CREATE SECRET` objects. A Ray
+worker disables host persistent-secret loading before a newly opened snapshot
+database first uses its secret manager, so host secrets are never an implicit
+credential fallback. An extension operation that requires a DuckDB secret on a
+worker is unsupported unless it also accepts credentials through Vane's explicit
+session or connection-setting path. Persistent source databases are opened
+read-only, and exact snapshot databases are retained for the worker lifetime.
+Read-only worker instances let the same source file support isolated exact
+extension identities without sharing a mutable catalog; extension catalog
+commits remain coordinator-only.
 
-Connection snapshots contain credential material and executable attachment
-declarations. They are trusted coordinator-to-worker payloads and must remain
-inside the authenticated Ray cluster; they are not an untrusted interchange
-format or a persistence format.
+Connection snapshots can contain explicit S3 connection settings, session
+configuration, and executable attachment declarations. They are trusted
+coordinator-to-worker payloads and must remain inside the authenticated Ray
+cluster; they are not an untrusted interchange format or a persistence format.
 
 ## Distributed scans
 
