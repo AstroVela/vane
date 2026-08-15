@@ -1625,7 +1625,11 @@ class RayWorkerActor:
     def _close_retired_snapshot_databases_locked(self) -> None:
         snapshot_connections = getattr(self, "_snapshot_connections", {})
         active_cursors = getattr(self, "_snapshot_connection_active_cursors", {})
-        retired_identities = getattr(self, "_retired_snapshot_database_identities", set())
+        retired_identities: set[WorkerSnapshotDatabaseIdentity] = getattr(
+            self,
+            "_retired_snapshot_database_identities",
+            set(),
+        )
         for database_identity in tuple(retired_identities):
             if active_cursors.get(database_identity, 0) > 0:
                 continue
