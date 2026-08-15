@@ -3787,6 +3787,8 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
@@ -3849,7 +3851,7 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
@@ -3927,6 +3929,8 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
@@ -3988,7 +3992,7 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     result = actor_class._cleanup_flight_shuffle_for_query_with_context(actor, "query-drop")
@@ -4044,6 +4048,8 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._get_shared_conn = object
     actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
@@ -4076,7 +4082,7 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     with pytest.raises(RuntimeError, match="cleanup configuration failed"):
@@ -13617,6 +13623,8 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._session_connections = {
         "session-a": (
@@ -13643,7 +13651,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     def _fail_configuration(_connection, _config, *, use_session_credentials):
@@ -13994,6 +14002,8 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "test-source-id",
         (("httpfs", ""),),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._session_connections = {
         "session-a": (
@@ -14031,7 +14041,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
@@ -14478,6 +14488,8 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
         "test-source-id",
         (),
         (),
+        "test-s3-identity",
+        True,
     )
     actor._session_connections = {"session-a": ({}, shared_conn)}
 
@@ -14502,7 +14514,7 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
     monkeypatch.setattr(
         worker_mod,
         "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        lambda _query_id, **_kwargs: database_identity,
     )
 
     class _FakePlanRunner:

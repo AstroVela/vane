@@ -26,6 +26,19 @@ def _worker_actor():
     return actor_class, actor
 
 
+def _snapshot_database_identity(
+    snapshot,
+    *,
+    effective_s3_config=None,
+    use_session_credentials=True,
+):
+    return worker_module._worker_snapshot_database_identity(
+        snapshot,
+        effective_s3_config=effective_s3_config or {},
+        use_session_credentials=use_session_credentials,
+    )
+
+
 def test_worker_shared_database_disables_persistent_secrets_at_connect(monkeypatch):
     actor_class, actor = _worker_actor()
     actor._shared_conn = None
@@ -57,6 +70,8 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         "test-source-id",
         (),
         (),
+        "test-s3-identity",
+        True,
     )
     cursors = []
     resolve_calls = []
@@ -84,11 +99,6 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     actor._configure_snapshot_conn = configure
     monkeypatch.setattr(
         worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
-    )
-    monkeypatch.setattr(
-        worker_module,
         "require_ray_cxx_attr",
         lambda name, *, hint: (
             lambda connection, query_id: (
@@ -99,8 +109,18 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         ),
     )
 
-    first = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, "query-a")
-    second = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, "query-b")
+    first = actor_class._get_snapshot_execution_cursor(
+        actor,
+        bootstrap_connection,
+        "query-a",
+        database_identity=database_identity,
+    )
+    second = actor_class._get_snapshot_execution_cursor(
+        actor,
+        bootstrap_connection,
+        "query-b",
+        database_identity=database_identity,
+    )
 
     assert first is cursors[0]
     assert second is cursors[1]
@@ -125,6 +145,8 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
         "test-source-id",
         (),
         (),
+        "test-s3-identity",
+        True,
     )
 
     class ResolvedConnection:
@@ -145,17 +167,17 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
     actor._configure_snapshot_conn = fail_configuration
     monkeypatch.setattr(
         worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
-    )
-    monkeypatch.setattr(
-        worker_module,
         "require_ray_cxx_attr",
         lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
     )
 
     with pytest.raises(RuntimeError, match="snapshot configuration failed"):
-        actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
+        actor_class._get_snapshot_execution_cursor(
+            actor,
+            object(),
+            "query-a",
+            database_identity=database_identity,
+        )
 
     assert resolved_connection.closed is True
     assert actor._snapshot_connections == {}
@@ -175,9 +197,9 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
         "extensions": [{"name": "httpfs", "version": "test-version"}],
     }
     identities = {
-        "plain-a": worker_module._worker_snapshot_database_identity(base_snapshot),
-        "plain-b": worker_module._worker_snapshot_database_identity(base_snapshot),
-        "httpfs": worker_module._worker_snapshot_database_identity(httpfs_snapshot),
+        "plain-a": _snapshot_database_identity(base_snapshot),
+        "plain-b": _snapshot_database_identity(base_snapshot),
+        "httpfs": _snapshot_database_identity(httpfs_snapshot),
     }
     assert identities["plain-a"] == identities["plain-b"]
     assert identities["plain-a"] != identities["httpfs"]
@@ -205,18 +227,28 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
 
     monkeypatch.setattr(
         worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda query_id: identities[query_id],
-    )
-    monkeypatch.setattr(
-        worker_module,
         "require_ray_cxx_attr",
         lambda name, *, hint: resolve,
     )
 
-    plain_a = actor_class._get_snapshot_execution_cursor(actor, object(), "plain-a")
-    plain_b = actor_class._get_snapshot_execution_cursor(actor, object(), "plain-b")
-    httpfs = actor_class._get_snapshot_execution_cursor(actor, object(), "httpfs")
+    plain_a = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "plain-a",
+        database_identity=identities["plain-a"],
+    )
+    plain_b = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "plain-b",
+        database_identity=identities["plain-b"],
+    )
+    httpfs = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "httpfs",
+        database_identity=identities["httpfs"],
+    )
 
     assert plain_a.connection is plain_b.connection
     assert httpfs.connection is not plain_a.connection
@@ -248,11 +280,11 @@ def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch
         ],
     }
     identities = {
-        "default": worker_module._worker_snapshot_database_identity(base_snapshot),
-        "proxy": worker_module._worker_snapshot_database_identity(proxy_snapshot),
+        "default": _snapshot_database_identity(base_snapshot),
+        "proxy": _snapshot_database_identity(proxy_snapshot),
     }
     assert identities["default"] != identities["proxy"]
-    assert identities["proxy"] == worker_module._worker_snapshot_database_identity(
+    assert identities["proxy"] == _snapshot_database_identity(
         {
             **base_snapshot,
             "settings": [
@@ -288,17 +320,22 @@ def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch
 
     monkeypatch.setattr(
         worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda query_id: identities[query_id],
-    )
-    monkeypatch.setattr(
-        worker_module,
         "require_ray_cxx_attr",
         lambda name, *, hint: resolve,
     )
 
-    default_cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "default")
-    proxy_cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "proxy")
+    default_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "default",
+        database_identity=identities["default"],
+    )
+    proxy_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "proxy",
+        database_identity=identities["proxy"],
+    )
 
     assert default_cursor.connection is not proxy_cursor.connection
     assert len(created_connections) == 2
@@ -326,9 +363,52 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
         "bootstrap": {**snapshot["bootstrap"], "config": {"threads": "2"}},
     }
 
-    assert worker_module._worker_snapshot_database_identity(
-        snapshot
-    ) == worker_module._worker_snapshot_database_identity(string_config_snapshot)
+    assert _snapshot_database_identity(snapshot) == _snapshot_database_identity(string_config_snapshot)
+
+
+def test_worker_snapshot_database_identity_isolates_effective_s3_configuration():
+    snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [{"name": "httpfs", "version": "test-version"}],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    first = _snapshot_database_identity(
+        snapshot,
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "key-a",
+            "AWS_SECRET_ACCESS_KEY": "secret-a",
+            "AWS_REGION": "region-a",
+        },
+    )
+    second = _snapshot_database_identity(
+        snapshot,
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "key-b",
+            "AWS_SECRET_ACCESS_KEY": "secret-b",
+            "AWS_REGION": "region-a",
+        },
+    )
+    explicit_snapshot_credentials = _snapshot_database_identity(
+        snapshot,
+        effective_s3_config={"AWS_REGION": "region-a"},
+        use_session_credentials=False,
+    )
+    first_with_different_refresh_deadline = _snapshot_database_identity(
+        snapshot,
+        effective_s3_config={
+            "AWS_ACCESS_KEY_ID": "key-a",
+            "AWS_SECRET_ACCESS_KEY": "secret-a",
+            "AWS_REGION": "region-a",
+            worker_module._AWS_CREDENTIAL_REFRESH_AT_KEY: "12345",
+        },
+    )
+
+    assert first != second
+    assert first != explicit_snapshot_credentials
+    assert first == first_with_different_refresh_deadline
+    assert "key-a" not in repr(first)
+    assert "secret-a" not in repr(first)
 
 
 @pytest.mark.parametrize(
@@ -351,7 +431,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
 )
 def test_worker_snapshot_database_identity_rejects_ambiguous_contract(snapshot, message):
     with pytest.raises((TypeError, ValueError), match=message):
-        worker_module._worker_snapshot_database_identity(snapshot)
+        _snapshot_database_identity(snapshot)
 
 
 def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(monkeypatch):
@@ -364,11 +444,8 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
         "test-source-id",
         (),
         (),
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        "test-s3-identity",
+        True,
     )
 
     class Cursor:
@@ -387,7 +464,12 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
         lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
     )
 
-    cursor = actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
+    cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        object(),
+        "query-a",
+        database_identity=database_identity,
+    )
     actor_class._close_snapshot_execution_cursor(actor, cursor)
 
     assert actor._active_snapshot_execution_cursors == 0
@@ -403,11 +485,8 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
         "test-source-id",
         (),
         (),
-    )
-    monkeypatch.setattr(
-        worker_module,
-        "_query_worker_snapshot_database_identity",
-        lambda _query_id: database_identity,
+        "test-s3-identity",
+        True,
     )
 
     class Connection:
@@ -422,7 +501,12 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
     )
 
     try:
-        actor_class._get_snapshot_execution_cursor(actor, object(), "query-a")
+        actor_class._get_snapshot_execution_cursor(
+            actor,
+            object(),
+            "query-a",
+            database_identity=database_identity,
+        )
     except RuntimeError as exc:
         assert str(exc) == "cursor creation failed"
     else:

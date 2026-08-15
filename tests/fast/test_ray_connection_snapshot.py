@@ -508,8 +508,23 @@ def test_worker_nondefault_snapshot_reuses_database(monkeypatch):
             }
         )
 
-        first_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
-        second_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, query_id)
+        database_identity = worker_module._query_worker_snapshot_database_identity(
+            query_id,
+            effective_s3_config={},
+            use_session_credentials=True,
+        )
+        first_cursor = actor_class._get_snapshot_execution_cursor(
+            actor,
+            bootstrap_connection,
+            query_id,
+            database_identity=database_identity,
+        )
+        second_cursor = actor_class._get_snapshot_execution_cursor(
+            actor,
+            bootstrap_connection,
+            query_id,
+            database_identity=database_identity,
+        )
         assert len(actor._snapshot_connections) == 1
         assert first_cursor.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
         configured_memory_limit = first_cursor.execute("SELECT current_setting('memory_limit')").fetchone()
@@ -595,8 +610,28 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
         assert ray_cxx._register_query_python_replay_state(first_query_id, first_plan) is True
         assert ray_cxx._register_query_python_replay_state(second_query_id, second_plan) is True
 
-        first_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, first_query_id)
-        second_cursor = actor_class._get_snapshot_execution_cursor(actor, bootstrap_connection, second_query_id)
+        first_identity = worker_module._query_worker_snapshot_database_identity(
+            first_query_id,
+            effective_s3_config={},
+            use_session_credentials=True,
+        )
+        second_identity = worker_module._query_worker_snapshot_database_identity(
+            second_query_id,
+            effective_s3_config={},
+            use_session_credentials=True,
+        )
+        first_cursor = actor_class._get_snapshot_execution_cursor(
+            actor,
+            bootstrap_connection,
+            first_query_id,
+            database_identity=first_identity,
+        )
+        second_cursor = actor_class._get_snapshot_execution_cursor(
+            actor,
+            bootstrap_connection,
+            second_query_id,
+            database_identity=second_identity,
+        )
 
         assert len(actor._snapshot_connections) == 2
         plan_runner = ray_cxx.DistributedPhysicalPlanRunner()

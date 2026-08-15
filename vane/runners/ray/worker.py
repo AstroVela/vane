@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -259,6 +260,8 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
     distributed_extension_contracts: tuple[str, ...]
+    effective_s3_config_identity: str
+    use_session_credentials: bool
 
     def has_static_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
@@ -272,7 +275,12 @@ def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description:
     return value
 
 
-def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSnapshotDatabaseIdentity:
+def _worker_snapshot_database_identity(
+    snapshot: Mapping[str, Any],
+    *,
+    effective_s3_config: Mapping[str, str],
+    use_session_credentials: bool,
+) -> WorkerSnapshotDatabaseIdentity:
     raw_bootstrap = snapshot.get("bootstrap")
     if raw_bootstrap is None:
         database = ":memory:"
@@ -356,6 +364,14 @@ def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSna
         seen_distributed_contracts.add(raw_contract)
         distributed_contracts.append(raw_contract)
     distributed_contracts.sort()
+    s3_config = tuple(
+        (key, str(effective_s3_config[key]))
+        for key in _DUCKDB_S3_SESSION_KEYS
+        if str(effective_s3_config.get(key, "")).strip()
+    )
+    s3_config_identity = hashlib.sha256(
+        json.dumps(s3_config, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return WorkerSnapshotDatabaseIdentity(
         database,
         read_only,
@@ -364,10 +380,17 @@ def _worker_snapshot_database_identity(snapshot: Mapping[str, Any]) -> WorkerSna
         duckdb_source_id,
         tuple(extensions),
         tuple(distributed_contracts),
+        s3_config_identity,
+        bool(use_session_credentials),
     )
 
 
-def _query_worker_snapshot_database_identity(connection_snapshot_query_id: str) -> WorkerSnapshotDatabaseIdentity:
+def _query_worker_snapshot_database_identity(
+    connection_snapshot_query_id: str,
+    *,
+    effective_s3_config: Mapping[str, str],
+    use_session_credentials: bool,
+) -> WorkerSnapshotDatabaseIdentity:
     lookup = require_ray_cxx_attr(
         "_lookup_query_connection_snapshot",
         hint="Ensure the C++ ray extension is built with query replay lifecycle support.",
@@ -380,7 +403,11 @@ def _query_worker_snapshot_database_identity(connection_snapshot_query_id: str) 
         )
     if not isinstance(snapshot, Mapping):
         raise TypeError("query connection snapshot must be a mapping")
-    return _worker_snapshot_database_identity(snapshot)
+    return _worker_snapshot_database_identity(
+        snapshot,
+        effective_s3_config=effective_s3_config,
+        use_session_credentials=use_session_credentials,
+    )
 
 
 def _query_cleanup_connection_identity(
@@ -1576,7 +1603,7 @@ class RayWorkerActor:
         bootstrap_connection: Any,
         connection_snapshot_query_id: str,
         *,
-        database_identity: WorkerSnapshotDatabaseIdentity | None = None,
+        database_identity: WorkerSnapshotDatabaseIdentity,
     ) -> Any:
         """Return a task cursor on the snapshot's stable DatabaseInstance."""
         with self._native_execution_condition:
@@ -1585,9 +1612,6 @@ class RayWorkerActor:
             self._active_snapshot_execution_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0)) + 1
         cursor = None
         try:
-            if database_identity is None:
-                database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
-
             snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
             if snapshot_connections_lock is None:
                 snapshot_connections_lock = threading.Lock()
@@ -1872,7 +1896,11 @@ class RayWorkerActor:
                 if cleanup_context.session_id in getattr(self, "_session_connections", {}):
                     self._session_s3_configs[cleanup_context.session_id] = effective_s3_config
 
-        database_identity = _query_worker_snapshot_database_identity(cleanup_context.connection_snapshot_query_id)
+        database_identity = _query_worker_snapshot_database_identity(
+            cleanup_context.connection_snapshot_query_id,
+            effective_s3_config=effective_s3_config,
+            use_session_credentials=cleanup_context.use_session_credentials,
+        )
         cleanup_cursor = self._get_snapshot_execution_cursor(
             self._get_shared_conn(),
             cleanup_context.connection_snapshot_query_id,
@@ -2386,7 +2414,11 @@ class RayWorkerActor:
         start = time.monotonic()
 
         try:
-            database_identity = _query_worker_snapshot_database_identity(connection_snapshot_query_id)
+            database_identity = _query_worker_snapshot_database_identity(
+                connection_snapshot_query_id,
+                effective_s3_config=effective_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
             cursor = self._get_snapshot_execution_cursor(
                 conn,
                 connection_snapshot_query_id,
