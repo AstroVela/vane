@@ -2112,7 +2112,6 @@ def test_recovery_descriptor_can_restart_root_behind_live_downstream_lease():
     assert unrelated_task.granted and not unrelated_task.liveness
     manager.update_allocation(
         _allocation(_r(store=20), generation=2),
-        admission_open=True,
     )
     retry = _task(
         root.resource_unit_id,
@@ -2322,7 +2321,7 @@ def test_recovery_descriptor_keeps_retiring_liveness_tokens_in_the_chain():
     )
     manager.update_allocation(
         _allocation(_r(), generation=2),
-        admission_open=True,
+        reopen_fence_epoch=manager.current_allocation_frontier()[1],
     )
     assert left_root.resource_unit_id not in manager.current_eligible_resource_unit_ids()
 
