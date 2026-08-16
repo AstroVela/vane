@@ -39,6 +39,7 @@ from vane.ai.options import (
 from vane.ai.protocols import NativePrompterPlan
 from vane.ai.provider import Provider
 from vane.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_ENGINE_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
     _NATIVE_OPTIONS_PUBLIC_KEY,
     _NATIVE_OPTIONS_RESERVED_KEYS,
@@ -270,6 +271,7 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> dict[str,
         _NATIVE_OPTIONS_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
         _NATIVE_OPTIONS_PUBLIC_KEY: public_options_json,
         _NATIVE_OPTIONS_SECRET_KEY: secret_payload,
+        _NATIVE_OPTIONS_ENGINE_KEY: "vllm",
     }
 
 

@@ -393,7 +393,7 @@ static unique_ptr<VLLMExecutor> CreatePythonVLLMExecutor(ClientContext &context,
 } // namespace
 
 void RegisterVLLMExecutorFactory() {
-	SetVLLMExecutorFactory(CreatePythonVLLMExecutor);
+	RegisterEngineExecutorFactory("vllm", CreatePythonVLLMExecutor);
 }
 
 } // namespace duckdb
