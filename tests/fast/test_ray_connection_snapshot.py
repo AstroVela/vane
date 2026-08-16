@@ -288,15 +288,17 @@ def test_plan_pickles_reject_pre_session_state_shapes():
     logical_state = logical_plan.__getstate__()
     malformed_logical = ray_cxx.PyLogicalPlan.__new__(ray_cxx.PyLogicalPlan)
 
-    with pytest.raises(Exception, match="Invalid state for PyLogicalPlan"):
-        malformed_logical.__setstate__(logical_state[:3])
+    for legacy_state in (logical_state[:3], logical_state[:4]):
+        with pytest.raises(Exception, match="Invalid state for PyLogicalPlan"):
+            malformed_logical.__setstate__(legacy_state)
 
     physical_plan = logical_plan.to_physical_plan(vane.connect())
     physical_state = physical_plan.__getstate__()
     malformed_physical = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
 
-    with pytest.raises(Exception, match="Invalid state for PyPhysicalPlanWrapper pickle"):
-        malformed_physical.__setstate__(physical_state[:6])
+    for legacy_state in (physical_state[:6], physical_state[:7]):
+        with pytest.raises(Exception, match="Invalid state for PyPhysicalPlanWrapper pickle"):
+            malformed_physical.__setstate__(legacy_state)
 
     missing_resource_owner = list(physical_state)
     missing_resource_owner[3] = ""

@@ -10,6 +10,551 @@ static constexpr idx_t LOGICAL_PLAN_ENVELOPE_MAGIC_SIZE = sizeof(LOGICAL_PLAN_EN
 static constexpr uint32_t LOGICAL_PLAN_PROTOCOL_VERSION = 1;
 static constexpr uint32_t LOGICAL_PLAN_MAX_SOURCE_ID_SIZE = 4096;
 
+static constexpr uint32_t SCOPED_SECRET_REF_VERSION = 1;
+static constexpr uint8_t SCOPED_SECRET_CAPABILITY_READ = 1 << 0;
+static constexpr uint8_t SCOPED_SECRET_CAPABILITY_WRITE = 1 << 1;
+static constexpr uint8_t SCOPED_SECRET_CAPABILITY_MASK = SCOPED_SECRET_CAPABILITY_READ | SCOPED_SECRET_CAPABILITY_WRITE;
+static constexpr idx_t SCOPED_SECRET_MAX_REFERENCES = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_USES = 100000;
+static constexpr idx_t SCOPED_SECRET_MAX_IDENTITY_SIZE = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_SCOPE_SIZE = 65536;
+
+struct ScopedSecretRef {
+	uint32_t version = SCOPED_SECRET_REF_VERSION;
+	string reference_id;
+	string owner_query_id;
+	string owner_session_id;
+	string secret_type;
+	string provider;
+	string normalized_scope;
+	uint8_t capabilities = 0;
+};
+
+struct ScopedSecretUse {
+	string uri;
+	uint8_t capabilities = 0;
+};
+
+// This source-only binding gives the opaque reference a local identity for
+// freshness checks. Secret names, storage names, and resource URIs are never
+// copied into logical/physical pickle state.
+struct ScopedSecretBinding {
+	string reference_id;
+	string storage_name;
+	string secret_name;
+	string secret_type;
+	string provider;
+	string normalized_scope;
+	vector<ScopedSecretUse> uses;
+};
+
+struct ScopedSecretDiscovery {
+	vector<ScopedSecretRef> references;
+	vector<ScopedSecretBinding> source_bindings;
+};
+
+struct ScopedSecretSelection {
+	string storage_name;
+	string secret_name;
+	string secret_type;
+	string provider;
+	string normalized_scope;
+};
+
+static void AppendScopedSecretIdentityField(string &identity_material, const string &value) {
+	auto value_size = static_cast<uint64_t>(value.size());
+	for (idx_t byte_idx = 0; byte_idx < sizeof(value_size); byte_idx++) {
+		identity_material.push_back(static_cast<char>((value_size >> (byte_idx * 8)) & 0xff));
+	}
+	identity_material.append(value);
+}
+
+static string CreateScopedSecretReferenceId(const ScopedSecretSelection &selection, const string &owner_query_id,
+                                            const string &owner_session_id) {
+	string identity_material;
+	AppendScopedSecretIdentityField(identity_material, "vane.scoped-secret-ref.v1");
+	AppendScopedSecretIdentityField(identity_material, owner_session_id);
+	AppendScopedSecretIdentityField(identity_material, owner_query_id);
+	AppendScopedSecretIdentityField(identity_material, selection.storage_name);
+	AppendScopedSecretIdentityField(identity_material, selection.secret_name);
+	AppendScopedSecretIdentityField(identity_material, selection.secret_type);
+	AppendScopedSecretIdentityField(identity_material, selection.provider);
+	AppendScopedSecretIdentityField(identity_material, selection.normalized_scope);
+
+	char digest[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_BYTES];
+	duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(identity_material.data(), identity_material.size(), digest);
+	data_t identity[16];
+	memcpy(identity, digest, sizeof(identity));
+	// RFC 9562 UUIDv8 and variant bits. SHA-256 keeps the identifier
+	// deterministic, while storage/name inputs remain opaque in plan state.
+	identity[6] = static_cast<data_t>((identity[6] & 0x0f) | 0x80);
+	identity[8] = static_cast<data_t>((identity[8] & 0x3f) | 0x80);
+	return UUID::ToString(BaseUUID::FromBlob(identity));
+}
+
+static bool IsSupportedScopedSecretType(const string &secret_type) {
+	return secret_type == "s3" || secret_type == "r2" || secret_type == "gcs" || secret_type == "aws";
+}
+
+static bool IsSupportedScopedSecretProvider(const string &secret_type, const string &provider) {
+	return IsSupportedScopedSecretType(secret_type) && (provider == "config" || provider == "credential_chain");
+}
+
+static bool ScopedSecretRefLess(const ScopedSecretRef &left, const ScopedSecretRef &right) {
+	return std::tie(left.secret_type, left.provider, left.normalized_scope, left.reference_id, left.capabilities) <
+	       std::tie(right.secret_type, right.provider, right.normalized_scope, right.reference_id, right.capabilities);
+}
+
+static bool ScopedSecretRefsEqual(const vector<ScopedSecretRef> &left, const vector<ScopedSecretRef> &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (idx_t ref_idx = 0; ref_idx < left.size(); ref_idx++) {
+		auto &lhs = left[ref_idx];
+		auto &rhs = right[ref_idx];
+		if (lhs.version != rhs.version || lhs.reference_id != rhs.reference_id ||
+		    lhs.owner_query_id != rhs.owner_query_id || lhs.owner_session_id != rhs.owner_session_id ||
+		    lhs.secret_type != rhs.secret_type || lhs.provider != rhs.provider ||
+		    lhs.normalized_scope != rhs.normalized_scope || lhs.capabilities != rhs.capabilities) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool ContainsNul(const string &value) {
+	return value.find('\0') != string::npos;
+}
+
+static void ValidateScopedSecretIdentityField(const string &value, const char *field_name, idx_t max_size,
+                                              bool allow_empty = false) {
+	if ((!allow_empty && value.empty()) || value.size() > max_size || ContainsNul(value)) {
+		throw InvalidInputException("Scoped secret reference contains an invalid %s", field_name);
+	}
+}
+
+static void ValidateScopedSecretRefs(const vector<ScopedSecretRef> &references, const string &expected_owner_query_id,
+                                     const string &expected_session_id, const char *boundary) {
+	if (references.size() > SCOPED_SECRET_MAX_REFERENCES) {
+		throw InvalidInputException("Scoped secret reference state at %s exceeds the maximum reference count",
+		                            boundary);
+	}
+	if (references.empty()) {
+		return;
+	}
+	ValidateScopedSecretIdentityField(expected_owner_query_id, "expected owner query ID",
+	                                  SCOPED_SECRET_MAX_IDENTITY_SIZE);
+	ValidateScopedSecretIdentityField(expected_session_id, "expected session ID", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+
+	std::unordered_set<string> reference_ids;
+	for (idx_t ref_idx = 0; ref_idx < references.size(); ref_idx++) {
+		auto &reference = references[ref_idx];
+		if (reference.version != SCOPED_SECRET_REF_VERSION) {
+			throw InvalidInputException("Unsupported scoped secret reference version %u at %s (expected %u)",
+			                            reference.version, boundary, SCOPED_SECRET_REF_VERSION);
+		}
+		ValidateScopedSecretIdentityField(reference.reference_id, "opaque ID", BaseUUID::STRING_SIZE);
+		hugeint_t parsed_reference_id;
+		if (!UUID::FromString(reference.reference_id, parsed_reference_id, true) ||
+		    UUID::ToString(parsed_reference_id) != reference.reference_id || reference.reference_id[14] != '8' ||
+		    (reference.reference_id[19] != '8' && reference.reference_id[19] != '9' &&
+		     reference.reference_id[19] != 'a' && reference.reference_id[19] != 'b')) {
+			throw InvalidInputException("Scoped secret reference at %s has an invalid opaque ID", boundary);
+		}
+		if (!reference_ids.insert(reference.reference_id).second) {
+			throw InvalidInputException("Scoped secret reference state at %s contains a duplicate opaque ID", boundary);
+		}
+
+		ValidateScopedSecretIdentityField(reference.owner_query_id, "owner query ID", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		if (reference.owner_query_id != expected_owner_query_id) {
+			throw InvalidInputException(
+			    "Scoped secret reference '%s' is stale or belongs to a different query (expected owner '%s')",
+			    reference.reference_id, expected_owner_query_id);
+		}
+		ValidateScopedSecretIdentityField(reference.owner_session_id, "owner session ID",
+		                                  SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		if (reference.owner_session_id != expected_session_id) {
+			throw InvalidInputException("Scoped secret reference '%s' belongs to a different Vane session",
+			                            reference.reference_id);
+		}
+		ValidateScopedSecretIdentityField(reference.secret_type, "secret type", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		ValidateScopedSecretIdentityField(reference.provider, "provider", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		if (!IsSupportedScopedSecretProvider(reference.secret_type, reference.provider)) {
+			throw InvalidInputException(
+			    "Scoped secret reference '%s' uses unsupported type/provider '%s/%s'; supported object-storage "
+			    "providers are config and credential_chain",
+			    reference.reference_id, reference.secret_type, reference.provider);
+		}
+		ValidateScopedSecretIdentityField(reference.normalized_scope, "normalized scope", SCOPED_SECRET_MAX_SCOPE_SIZE,
+		                                  true);
+		if (reference.capabilities == 0 || (reference.capabilities & ~SCOPED_SECRET_CAPABILITY_MASK) != 0) {
+			throw InvalidInputException("Scoped secret reference '%s' has invalid capabilities at %s",
+			                            reference.reference_id, boundary);
+		}
+
+		if (ref_idx > 0 && !ScopedSecretRefLess(references[ref_idx - 1], reference)) {
+			throw InvalidInputException("Scoped secret reference state at %s is not in canonical order", boundary);
+		}
+		for (idx_t prior_idx = 0; prior_idx < ref_idx; prior_idx++) {
+			auto &prior = references[prior_idx];
+			if (prior.secret_type == reference.secret_type && prior.provider == reference.provider &&
+			    prior.normalized_scope == reference.normalized_scope) {
+				throw InvalidInputException(
+				    "Scoped secret reference state at %s is ambiguous for type/provider/scope '%s/%s/%s'", boundary,
+				    reference.secret_type, reference.provider, reference.normalized_scope);
+			}
+		}
+	}
+}
+
+static py::tuple ScopedSecretRefsToPython(const vector<ScopedSecretRef> &references) {
+	py::tuple result(references.size());
+	for (idx_t ref_idx = 0; ref_idx < references.size(); ref_idx++) {
+		auto &reference = references[ref_idx];
+		result[ref_idx] = py::make_tuple(reference.version, reference.reference_id, reference.owner_query_id,
+		                                 reference.owner_session_id, reference.secret_type, reference.provider,
+		                                 reference.normalized_scope, reference.capabilities);
+	}
+	return result;
+}
+
+static py::list DescribeScopedSecretRefs(const vector<ScopedSecretRef> &references) {
+	py::list result;
+	for (auto &reference : references) {
+		py::list capabilities;
+		if ((reference.capabilities & SCOPED_SECRET_CAPABILITY_READ) != 0) {
+			capabilities.append(py::str("read"));
+		}
+		if ((reference.capabilities & SCOPED_SECRET_CAPABILITY_WRITE) != 0) {
+			capabilities.append(py::str("write"));
+		}
+		py::dict description;
+		description[py::str("version")] = py::int_(reference.version);
+		description[py::str("reference_id")] = py::str(reference.reference_id);
+		description[py::str("owner_query_id")] = py::str(reference.owner_query_id);
+		description[py::str("owner_session_id")] = py::str(reference.owner_session_id);
+		description[py::str("type")] = py::str(reference.secret_type);
+		description[py::str("provider")] = py::str(reference.provider);
+		description[py::str("scope")] = py::str(reference.normalized_scope);
+		description[py::str("capabilities")] = std::move(capabilities);
+		result.append(std::move(description));
+	}
+	return result;
+}
+
+static string ScopedSecretRefTupleString(const py::tuple &reference, idx_t field_idx, const char *field_name) {
+	if (!py::isinstance<py::str>(reference[field_idx])) {
+		throw InvalidInputException("Scoped secret reference %s must be a string", field_name);
+	}
+	return reference[field_idx].cast<string>();
+}
+
+static vector<ScopedSecretRef> ScopedSecretRefsFromPython(py::handle state, const string &expected_owner_query_id,
+                                                          const string &expected_session_id, const char *boundary) {
+	if (!py::isinstance<py::tuple>(state)) {
+		throw InvalidInputException("Scoped secret reference state at %s must be a tuple", boundary);
+	}
+	auto state_tuple = py::reinterpret_borrow<py::tuple>(state);
+	if (state_tuple.size() > SCOPED_SECRET_MAX_REFERENCES) {
+		throw InvalidInputException("Scoped secret reference state at %s exceeds the maximum reference count",
+		                            boundary);
+	}
+	vector<ScopedSecretRef> references;
+	references.reserve(state_tuple.size());
+	for (auto item : state_tuple) {
+		if (!py::isinstance<py::tuple>(item)) {
+			throw InvalidInputException("Scoped secret reference entry at %s must be a tuple", boundary);
+		}
+		auto reference_tuple = py::reinterpret_borrow<py::tuple>(item);
+		if (reference_tuple.size() != 8) {
+			throw InvalidInputException("Scoped secret reference entry at %s must contain exactly 8 fields", boundary);
+		}
+		if (!py::isinstance<py::int_>(reference_tuple[0]) || py::isinstance<py::bool_>(reference_tuple[0])) {
+			throw InvalidInputException("Scoped secret reference version at %s must be an integer", boundary);
+		}
+		if (!py::isinstance<py::int_>(reference_tuple[7]) || py::isinstance<py::bool_>(reference_tuple[7])) {
+			throw InvalidInputException("Scoped secret reference capabilities at %s must be an integer", boundary);
+		}
+		auto version = reference_tuple[0].cast<int64_t>();
+		auto capabilities = reference_tuple[7].cast<int64_t>();
+		if (version < 0 || version > NumericLimits<uint32_t>::Maximum()) {
+			throw InvalidInputException("Scoped secret reference version at %s is out of range", boundary);
+		}
+		if (capabilities < 0 || capabilities > NumericLimits<uint8_t>::Maximum()) {
+			throw InvalidInputException("Scoped secret reference capabilities at %s are out of range", boundary);
+		}
+		ScopedSecretRef reference;
+		reference.version = static_cast<uint32_t>(version);
+		reference.reference_id = ScopedSecretRefTupleString(reference_tuple, 1, "opaque ID");
+		reference.owner_query_id = ScopedSecretRefTupleString(reference_tuple, 2, "owner query ID");
+		reference.owner_session_id = ScopedSecretRefTupleString(reference_tuple, 3, "owner session ID");
+		reference.secret_type = ScopedSecretRefTupleString(reference_tuple, 4, "secret type");
+		reference.provider = ScopedSecretRefTupleString(reference_tuple, 5, "provider");
+		reference.normalized_scope = ScopedSecretRefTupleString(reference_tuple, 6, "normalized scope");
+		reference.capabilities = static_cast<uint8_t>(capabilities);
+		references.push_back(std::move(reference));
+	}
+	ValidateScopedSecretRefs(references, expected_owner_query_id, expected_session_id, boundary);
+	return references;
+}
+
+static bool IsSupportedObjectStorageURI(const string &uri) {
+	auto lower_uri = StringUtil::Lower(uri);
+	static constexpr const char *SUPPORTED_PREFIXES[] = {"s3://", "s3a://", "s3n://", "r2://", "gcs://", "gs://"};
+	for (auto prefix : SUPPORTED_PREFIXES) {
+		if (StringUtil::StartsWith(lower_uri, prefix)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string NormalizedMatchedSecretScope(const BaseSecret &secret, const string &uri) {
+	auto matched_score = secret.MatchScore(uri);
+	int64_t longest_scope_size = NumericLimits<int64_t>::Minimum();
+	string normalized_scope;
+	if (secret.GetScope().empty()) {
+		longest_scope_size = 0;
+	}
+	for (auto &scope : secret.GetScope()) {
+		if (!scope.empty() && !StringUtil::StartsWith(uri, scope)) {
+			continue;
+		}
+		auto scope_size = NumericCast<int64_t>(scope.size());
+		if (scope_size > longest_scope_size || (scope_size == longest_scope_size && scope < normalized_scope)) {
+			longest_scope_size = scope_size;
+			normalized_scope = scope;
+		}
+	}
+	if (longest_scope_size == NumericLimits<int64_t>::Minimum() || matched_score != longest_scope_size) {
+		throw InvalidInputException(
+		    "Distributed scoped secrets require DuckDB's standard longest-prefix scope matching semantics");
+	}
+	ValidateScopedSecretIdentityField(normalized_scope, "normalized scope", SCOPED_SECRET_MAX_SCOPE_SIZE, true);
+	return normalized_scope;
+}
+
+static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientContext &context, const string &uri) {
+	static constexpr const char *SECRET_TYPE_PRECEDENCE[] = {"s3", "r2", "gcs", "aws"};
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto &secret_manager = SecretManager::Get(context);
+	for (auto secret_type : SECRET_TYPE_PRECEDENCE) {
+		auto match = secret_manager.LookupSecret(transaction, uri, secret_type);
+		if (!match.HasMatch()) {
+			continue;
+		}
+		auto &entry = *match.secret_entry;
+		auto &secret = *entry.secret;
+		auto selected_type = StringUtil::Lower(secret.GetType());
+		auto provider = StringUtil::Lower(secret.GetProvider());
+		if (selected_type != secret_type || secret.GetType() != selected_type || secret.GetProvider() != provider) {
+			throw InvalidInputException(
+			    "Distributed scoped secret metadata must use canonical lowercase type/provider names");
+		}
+		if (!IsSupportedScopedSecretProvider(selected_type, provider)) {
+			throw InvalidInputException(
+			    "Distributed scoped secrets do not support type/provider '%s/%s'; supported object-storage providers "
+			    "are config and credential_chain",
+			    selected_type, provider);
+		}
+		ValidateScopedSecretIdentityField(entry.storage_mode, "source storage name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		ValidateScopedSecretIdentityField(secret.GetName(), "source secret name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+
+		ScopedSecretSelection selection;
+		selection.storage_name = entry.storage_mode;
+		selection.secret_name = secret.GetName();
+		selection.secret_type = std::move(selected_type);
+		selection.provider = std::move(provider);
+		selection.normalized_scope = NormalizedMatchedSecretScope(secret, uri);
+		return selection;
+	}
+
+	// HTTPFS falls through to an HTTP secret for S3-compatible requests when
+	// this setting is enabled. HTTP secrets are deliberately outside the first
+	// distributed object-storage contract, so reject an actually selected one
+	// instead of silently producing a plan with missing secret state.
+	Value merge_http_secret;
+	if (context.TryGetCurrentSetting("merge_http_secret_into_s3_request", merge_http_secret) &&
+	    !merge_http_secret.IsNull() && merge_http_secret.GetValue<bool>()) {
+		auto http_match = secret_manager.LookupSecret(transaction, uri, "http");
+		if (http_match.HasMatch()) {
+			auto &secret = *http_match.secret_entry->secret;
+			throw InvalidInputException(
+			    "Distributed scoped secrets do not support type/provider '%s/%s' selected for an object-storage URI",
+			    secret.GetType(), secret.GetProvider());
+		}
+	}
+	return std::nullopt;
+}
+
+static bool ScopedSecretSelectionMatchesBinding(const ScopedSecretSelection &selection,
+                                                const ScopedSecretBinding &binding) {
+	return selection.storage_name == binding.storage_name && selection.secret_name == binding.secret_name &&
+	       selection.secret_type == binding.secret_type && selection.provider == binding.provider &&
+	       selection.normalized_scope == binding.normalized_scope;
+}
+
+static void AddScopedSecretUse(vector<ScopedSecretUse> &uses, const string &uri, uint8_t capability) {
+	if (!IsSupportedObjectStorageURI(uri)) {
+		return;
+	}
+	if (uses.size() >= SCOPED_SECRET_MAX_USES) {
+		throw InvalidInputException("Distributed plan exceeds the maximum supported remote object-storage URI count");
+	}
+	uses.push_back({uri, capability});
+}
+
+static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector<ScopedSecretUse> &uses) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.function.get_bind_info) {
+			auto bind_info = get.function.get_bind_info(get.bind_data.get());
+			if (bind_info.type == ScanType::EXTERNAL) {
+				auto file_paths = bind_info.options.find("file_path");
+				if (file_paths != bind_info.options.end()) {
+					auto &path_list = file_paths->second;
+					if (path_list.IsNull() || path_list.type().id() != LogicalTypeId::LIST ||
+					    ListType::GetChildType(path_list.type()) != LogicalType::VARCHAR) {
+						throw InvalidInputException(
+						    "Distributed external scan file_path discovery requires LIST(VARCHAR) bind metadata");
+					}
+					for (auto &path : ListValue::GetChildren(path_list)) {
+						if (path.IsNull() || path.type() != LogicalType::VARCHAR) {
+							throw InvalidInputException(
+							    "Distributed external scan file_path discovery contains a non-VARCHAR URI");
+						}
+						AddScopedSecretUse(uses, path.GetValue<string>(), SCOPED_SECRET_CAPABILITY_READ);
+					}
+				}
+			}
+		}
+		// Multi-file bind metadata deliberately displays the original glob. The
+		// glob lookup itself and every expanded object can select different
+		// scopes, so force expansion before submission and capture both.
+		auto multi_file_bind = dynamic_cast<const MultiFileBindData *>(get.bind_data.get());
+		if (multi_file_bind && multi_file_bind->file_list) {
+			for (auto &file : multi_file_bind->file_list->Files()) {
+				AddScopedSecretUse(uses, file.path, SCOPED_SECRET_CAPABILITY_READ);
+			}
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
+		auto &copy = op.Cast<LogicalCopyToFile>();
+		AddScopedSecretUse(uses, copy.file_path, SCOPED_SECRET_CAPABILITY_WRITE);
+	}
+	for (auto &child : op.children) {
+		CollectLogicalPlanScopedSecretUses(*child, uses);
+	}
+}
+
+static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, vector<ScopedSecretUse> uses,
+                                                      const string &owner_query_id, const string &owner_session_id) {
+	std::sort(uses.begin(), uses.end(), [](const ScopedSecretUse &left, const ScopedSecretUse &right) {
+		return std::tie(left.uri, left.capabilities) < std::tie(right.uri, right.capabilities);
+	});
+	vector<ScopedSecretUse> canonical_uses;
+	for (auto &use : uses) {
+		if (!canonical_uses.empty() && canonical_uses.back().uri == use.uri) {
+			canonical_uses.back().capabilities |= use.capabilities;
+		} else {
+			canonical_uses.push_back(std::move(use));
+		}
+	}
+
+	ScopedSecretDiscovery discovery;
+	for (auto &use : canonical_uses) {
+		auto selection = SelectScopedSecretForURI(context, use.uri);
+		if (!selection) {
+			continue;
+		}
+		if (owner_query_id.empty() || owner_session_id.empty()) {
+			throw InvalidInputException(
+			    "Distributed object-storage secrets require non-empty query and Vane session ownership");
+		}
+
+		optional_idx existing_ref_idx;
+		for (idx_t ref_idx = 0; ref_idx < discovery.references.size(); ref_idx++) {
+			auto &reference = discovery.references[ref_idx];
+			auto &binding = discovery.source_bindings[ref_idx];
+			if (ScopedSecretSelectionMatchesBinding(*selection, binding)) {
+				existing_ref_idx = ref_idx;
+				break;
+			}
+			if (reference.secret_type == selection->secret_type && reference.provider == selection->provider &&
+			    reference.normalized_scope == selection->normalized_scope) {
+				throw InvalidInputException(
+				    "Distributed scoped secret selection is ambiguous for type/provider/scope '%s/%s/%s'",
+				    selection->secret_type, selection->provider, selection->normalized_scope);
+			}
+		}
+
+		if (existing_ref_idx.IsValid()) {
+			auto ref_idx = existing_ref_idx.GetIndex();
+			discovery.references[ref_idx].capabilities |= use.capabilities;
+			discovery.source_bindings[ref_idx].uses.push_back(use);
+			continue;
+		}
+		if (discovery.references.size() >= SCOPED_SECRET_MAX_REFERENCES) {
+			throw InvalidInputException("Distributed plan exceeds the maximum scoped secret reference count");
+		}
+
+		ScopedSecretRef reference;
+		reference.reference_id = CreateScopedSecretReferenceId(*selection, owner_query_id, owner_session_id);
+		reference.owner_query_id = owner_query_id;
+		reference.owner_session_id = owner_session_id;
+		reference.secret_type = selection->secret_type;
+		reference.provider = selection->provider;
+		reference.normalized_scope = selection->normalized_scope;
+		reference.capabilities = use.capabilities;
+
+		ScopedSecretBinding binding;
+		binding.reference_id = reference.reference_id;
+		binding.storage_name = selection->storage_name;
+		binding.secret_name = selection->secret_name;
+		binding.secret_type = selection->secret_type;
+		binding.provider = selection->provider;
+		binding.normalized_scope = selection->normalized_scope;
+		binding.uses.push_back(use);
+
+		discovery.references.push_back(std::move(reference));
+		discovery.source_bindings.push_back(std::move(binding));
+	}
+
+	std::sort(discovery.references.begin(), discovery.references.end(), ScopedSecretRefLess);
+	ValidateScopedSecretRefs(discovery.references, owner_query_id, owner_session_id, "logical plan capture");
+	return discovery;
+}
+
+static void ValidateSourceScopedSecretBindings(ClientContext &context, const vector<ScopedSecretRef> &references,
+                                               const vector<ScopedSecretBinding> &bindings) {
+	if (bindings.empty()) {
+		return;
+	}
+	if (bindings.size() != references.size()) {
+		throw InternalException("Source scoped secret binding count does not match the reference count");
+	}
+	for (auto &binding : bindings) {
+		auto reference = std::find_if(references.begin(), references.end(), [&](const ScopedSecretRef &candidate) {
+			return candidate.reference_id == binding.reference_id;
+		});
+		if (reference == references.end()) {
+			throw InternalException("Source scoped secret binding has no matching opaque reference");
+		}
+		uint8_t capabilities = 0;
+		for (auto &use : binding.uses) {
+			auto selection = SelectScopedSecretForURI(context, use.uri);
+			if (!selection || !ScopedSecretSelectionMatchesBinding(*selection, binding)) {
+				throw InvalidInputException(
+				    "Scoped secret reference '%s' is stale because DuckDB now selects a different secret for its scope",
+				    binding.reference_id);
+			}
+			capabilities |= use.capabilities;
+		}
+		if (capabilities != reference->capabilities) {
+			throw InternalException("Source scoped secret binding capabilities do not match the reference");
+		}
+	}
+}
+
 static void AppendUInt32LE(string &result, uint32_t value) {
 	for (idx_t byte_idx = 0; byte_idx < sizeof(value); byte_idx++) {
 		result.push_back(static_cast<char>((value >> (byte_idx * 8)) & 0xff));
@@ -112,6 +657,9 @@ struct PyLogicalPlan {
 	py::object source_connection_ = py::none();
 	py::object udf_registrations_ = py::none();
 	py::object connection_snapshot_ = py::none();
+	vector<ScopedSecretRef> scoped_secret_refs_;
+	// Source secret names, storage identities, and URIs never cross pickle.
+	vector<ScopedSecretBinding> source_scoped_secret_bindings_;
 
 	PyLogicalPlan() = default;
 
@@ -122,22 +670,37 @@ struct PyLogicalPlan {
 	string session_id() const;
 	py::dict session_config() const;
 	bool has_explicit_s3_credentials() const;
+	py::list scoped_secret_refs() const {
+		return DescribeScopedSecretRefs(scoped_secret_refs_);
+	}
 
 	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
-static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
+struct SerializedLogicalPlanCapture {
+	string serialized_plan;
+	ScopedSecretDiscovery scoped_secrets;
+};
+
+static SerializedLogicalPlanCapture SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel,
+                                                                     const string &owner_query_id,
+                                                                     const string &owner_session_id) {
 	if (!rel) {
 		throw duckdb::InternalException("Relation is null");
 	}
 	auto client_context = rel->context->GetContext();
-	string serialized_plan;
+	SerializedLogicalPlanCapture capture;
 	client_context->RunFunctionInTransaction([&]() {
 		auto statement_binder = duckdb::Binder::CreateBinder(*client_context);
 		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel, *statement_binder);
 		duckdb::Planner planner(*client_context);
 		planner.CreatePlan(std::move(relation_stmt));
 		auto logical_plan = std::move(planner.plan);
+
+		vector<ScopedSecretUse> scoped_secret_uses;
+		CollectLogicalPlanScopedSecretUses(*logical_plan, scoped_secret_uses);
+		capture.scoped_secrets =
+		    DiscoverScopedSecretRefs(*client_context, std::move(scoped_secret_uses), owner_query_id, owner_session_id);
 
 		// NOTE: We intentionally do NOT run the Optimizer here.
 		// The unoptimized (bound) logical plan is serialized and sent to the Driver,
@@ -160,9 +723,9 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 			throw duckdb::InternalException("Logical plan serialization returned empty payload");
 		}
 		auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
-		serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
+		capture.serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
 	});
-	return serialized_plan;
+	return capture;
 }
 
 static DuckDBPyConnection &ExtractPyConnectionWrapper(py::object conn_obj) {
@@ -569,14 +1132,17 @@ struct QueryPythonReplayState {
 	duckdb::distributed::python::ray::SafePyObject udf_registrations;
 	duckdb::distributed::python::ray::SafePyObject udf_actor_handles;
 	duckdb::distributed::python::ray::SafePyObject connection_snapshot;
+	vector<ScopedSecretRef> scoped_secret_refs;
 
 	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
-	                       py::object udf_actor_handles_p, py::object connection_snapshot_p)
+	                       py::object udf_actor_handles_p, py::object connection_snapshot_p,
+	                       vector<ScopedSecretRef> scoped_secret_refs_p)
 	    : session_id(std::move(session_id_p)),
 	      session_config(duckdb::distributed::python::ray::SafePyObject(std::move(session_config_p))),
 	      udf_registrations(duckdb::distributed::python::ray::SafePyObject(std::move(udf_registrations_p))),
 	      udf_actor_handles(duckdb::distributed::python::ray::SafePyObject(std::move(udf_actor_handles_p))),
-	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))) {
+	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))),
+	      scoped_secret_refs(std::move(scoped_secret_refs_p)) {
 	}
 };
 
@@ -1153,11 +1719,20 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 
 	PyLogicalPlan plan;
 	plan.query_id_ = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
-	plan.serialized_logical_plan_ = SerializeLogicalPlanFromRelation(rel);
 	auto connection_owner = pyrel.GetConnectionOwner();
+	string owner_session_id;
 	if (connection_owner && !connection_owner.is_none() && py::isinstance<DuckDBPyConnection>(connection_owner)) {
 		auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
 		plan.source_connection_ = connection_owner;
+		owner_session_id = conn_wrapper.GetVaneSessionId();
+	}
+	auto serialized_capture = SerializeLogicalPlanFromRelation(rel, plan.query_id_, owner_session_id);
+	plan.serialized_logical_plan_ = std::move(serialized_capture.serialized_plan);
+	plan.scoped_secret_refs_ = std::move(serialized_capture.scoped_secrets.references);
+	plan.source_scoped_secret_bindings_ = std::move(serialized_capture.scoped_secrets.source_bindings);
+
+	if (!plan.source_connection_.is_none()) {
+		auto &conn_wrapper = plan.source_connection_.cast<DuckDBPyConnection &>();
 		auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
 		if (py::len(registrations) > 0) {
 			plan.udf_registrations_ = std::move(registrations);
@@ -1330,6 +1905,7 @@ enum class QueryPythonReplayField : uint8_t {
 	UDFRegistrations,
 	UDFActorHandles,
 	ConnectionSnapshot,
+	ScopedSecretRefs,
 };
 
 static py::object LookupQueryPythonReplayState(const string &query_id, QueryPythonReplayField field) {
@@ -1348,26 +1924,31 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 		return entry->second->udf_actor_handles.get();
 	case QueryPythonReplayField::ConnectionSnapshot:
 		return entry->second->connection_snapshot.get();
+	case QueryPythonReplayField::ScopedSecretRefs:
+		return ScopedSecretRefsToPython(entry->second->scoped_secret_refs);
 	default:
 		throw duckdb::InternalException("Unknown query Python replay field");
 	}
 }
 
 static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
-                                           const py::object &udf_actor_handles, const py::object &connection_snapshot) {
+                                           const py::object &udf_actor_handles, const py::object &connection_snapshot,
+                                           const vector<ScopedSecretRef> &scoped_secret_refs) {
 	if (query_id.empty()) {
 		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
 	}
 	auto session_id = VaneSessionIdFromSnapshot(connection_snapshot);
 	py::object session_config = VaneSessionConfigFromSnapshot(connection_snapshot);
+	ValidateScopedSecretRefs(scoped_secret_refs, query_id, session_id, "query replay registration");
 	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
 	auto entry = g_query_python_replay_states.find(query_id);
 	if (entry == g_query_python_replay_states.end()) {
-		g_query_python_replay_states.emplace(query_id, std::make_unique<QueryPythonReplayState>(
-		                                                   std::move(session_id), std::move(session_config),
-		                                                   py::reinterpret_borrow<py::object>(udf_registrations),
-		                                                   py::reinterpret_borrow<py::object>(udf_actor_handles),
-		                                                   py::reinterpret_borrow<py::object>(connection_snapshot)));
+		g_query_python_replay_states.emplace(
+		    query_id, std::make_unique<QueryPythonReplayState>(std::move(session_id), std::move(session_config),
+		                                                       py::reinterpret_borrow<py::object>(udf_registrations),
+		                                                       py::reinterpret_borrow<py::object>(udf_actor_handles),
+		                                                       py::reinterpret_borrow<py::object>(connection_snapshot),
+		                                                       scoped_secret_refs));
 		return true;
 	}
 	auto &state = *entry->second;
@@ -1386,6 +1967,10 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		throw duckdb::InvalidInputException("Query " + query_id +
 		                                    " was registered with different Python UDF actor handles");
 	}
+	if (!ScopedSecretRefsEqual(state.scoped_secret_refs, scoped_secret_refs)) {
+		throw duckdb::InvalidInputException("Query " + query_id +
+		                                    " was registered with different scoped secret references");
+	}
 	return false;
 }
 
@@ -1399,6 +1984,10 @@ static py::object LookupQueryConnectionSnapshot(const string &query_id) {
 
 static py::object LookupQueryUDFActorHandles(const string &query_id) {
 	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::UDFActorHandles);
+}
+
+static py::object LookupQueryScopedSecretRefs(const string &query_id) {
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::ScopedSecretRefs);
 }
 
 static void CleanupQueryPythonReplayState(const string &query_id) {

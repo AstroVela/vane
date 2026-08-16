@@ -43,8 +43,10 @@
 #include <duckdb/common/set.hpp>
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
+#include "mbedtls_wrapper.hpp"
 
 #include <exception>
+#include <cstring>
 #include <optional>
 #include <tuple>
 
@@ -79,7 +81,11 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/distributed_extension_manager.hpp>
 #include <duckdb/main/extension_helper.hpp>
+#include <duckdb/main/secret/secret_manager.hpp>
 #include <duckdb/parser/keyword_helper.hpp>
+#include <duckdb/planner/operator/logical_copy_to_file.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/common/multi_file/multi_file_states.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
@@ -646,7 +652,8 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_create_physical_plan_from_capsule",
 	    [](py::capsule capsule, py::object query_id_obj, py::object resource_query_id_obj,
-	       py::object udf_registrations_obj, py::object udf_actor_handles_obj, py::object connection_snapshot_obj) {
+	       py::object udf_registrations_obj, py::object udf_actor_handles_obj, py::object connection_snapshot_obj,
+	       py::object scoped_secret_refs_obj) {
 		    auto *plan_ptr = static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(capsule.get_pointer());
 		    if (!plan_ptr || !*plan_ptr) {
 			    return PyPhysicalPlanWrapper();
@@ -678,13 +685,14 @@ void register_ray_bindings(py::module_ &mod) {
 		    result.udf_registrations_ = udf_registrations_obj;
 		    result.udf_actor_handles_ = udf_actor_handles_obj;
 		    result.connection_snapshot_ = connection_snapshot_obj;
-		    (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
+		    auto session_id = VaneSessionIdFromSnapshot(result.connection_snapshot_);
 		    (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
+		    result.scoped_secret_refs_ = ScopedSecretRefsFromPython(scoped_secret_refs_obj, result.resource_query_id_,
+		                                                            session_id, "worker physical plan reconstruction");
 		    return result;
 	    },
-	    py::arg("capsule"), py::arg("query_id") = py::none(), py::arg("resource_query_id") = py::none(),
-	    py::arg("udf_registrations") = py::none(), py::arg("udf_actor_handles") = py::none(),
-	    py::arg("connection_snapshot") = py::none(),
+	    py::arg("capsule"), py::arg("query_id"), py::arg("resource_query_id"), py::arg("udf_registrations"),
+	    py::arg("udf_actor_handles"), py::arg("connection_snapshot"), py::arg("scoped_secret_refs"),
 	    "Internal helper to create PyPhysicalPlanWrapper from C++ capsule");
 
 	m.def(
@@ -698,6 +706,10 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_lookup_query_connection_snapshot",
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
+
+	m.def(
+	    "_lookup_query_scoped_secret_refs",
+	    [](const string &query_id) { return LookupQueryScopedSecretRefs(query_id); }, py::arg("query_id"));
 
 	m.def(
 	    "_resolve_query_snapshot_connection",
@@ -727,7 +739,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // The resource query owns this lifecycle. A retried FTE task can carry a
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
-		                                          plan.connection_snapshot_);
+		                                          plan.connection_snapshot_, plan.scoped_secret_refs_);
 	    },
 	    py::arg("query_id"), py::arg("plan"));
 
@@ -902,6 +914,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyPhysicalPlanWrapper::session_id)
 	    .def("session_config", &PyPhysicalPlanWrapper::session_config)
 	    .def("has_explicit_s3_credentials", &PyPhysicalPlanWrapper::has_explicit_s3_credentials)
+	    .def("scoped_secret_refs", &PyPhysicalPlanWrapper::scoped_secret_refs)
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
 	    .def("clone", &PyPhysicalPlanWrapper::clone, py::arg("conn") = py::none())
 	    .def("num_partitions", &PyPhysicalPlanWrapper::num_partitions)
@@ -921,24 +934,33 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def(py::pickle(
 	        // __getstate__: serialize the plan
 	        [](const PyPhysicalPlanWrapper &p) {
+		        string scoped_secret_session_id;
+		        if (!p.scoped_secret_refs_.empty()) {
+			        scoped_secret_session_id = VaneSessionIdFromSnapshot(p.connection_snapshot_);
+		        }
+		        ValidateScopedSecretRefs(p.scoped_secret_refs_, p.resource_query_id_, scoped_secret_session_id,
+		                                 "physical plan pickle");
+		        auto scoped_secret_state = ScopedSecretRefsToPython(p.scoped_secret_refs_);
 		        // An absent plan is an explicit optional state. A materialized
 		        // or deferred root must always carry a non-empty payload.
 		        if (!p.has_root()) {
 			        if (!p.serialized_root_.empty()) {
 				        return py::make_tuple(true, py::bytes(p.serialized_root_), p.query_id_, p.resource_query_id_,
-				                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
+				                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_,
+				                              scoped_secret_state);
 			        }
 			        return py::make_tuple(false, py::bytes(""), p.query_id_, p.resource_query_id_, p.udf_registrations_,
-			                              p.udf_actor_handles_, p.connection_snapshot_);
+			                              p.udf_actor_handles_, p.connection_snapshot_, scoped_secret_state);
 		        }
 
 		        auto serialized_root = p.serialize_root_for_clone();
 		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.resource_query_id_,
-		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
+		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_,
+		                              scoped_secret_state);
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {
-		        if (t.size() != 7) {
+		        if (t.size() != 8) {
 			        throw duckdb::InternalException("Invalid state for PyPhysicalPlanWrapper pickle");
 		        }
 		        bool has_data = t[0].cast<bool>();
@@ -964,8 +986,10 @@ void register_ray_bindings(py::module_ &mod) {
 		        result.udf_registrations_ = t[4];
 		        result.udf_actor_handles_ = t[5];
 		        result.connection_snapshot_ = t[6];
-		        (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
+		        auto session_id = VaneSessionIdFromSnapshot(result.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
+		        result.scoped_secret_refs_ = ScopedSecretRefsFromPython(t[7], result.resource_query_id_, session_id,
+		                                                                "physical plan pickle deserialization");
 		        result.ensure_plan_identity();
 
 		        if (has_data) {
@@ -1097,6 +1121,40 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("execution_query_id"), py::arg("resource_query_id") = py::none(),
 	    "Resolve the query that owns a retained submission exception.");
 
+	m.def(
+	    "_attach_scoped_secret_uses_for_test",
+	    [](PyLogicalPlan &plan, py::iterable source_uris, py::iterable sink_uris) {
+		    if (!plan.scoped_secret_refs_.empty() || !plan.source_scoped_secret_bindings_.empty()) {
+			    throw duckdb::InvalidInputException("test logical plan already contains scoped secret references");
+		    }
+		    if (plan.source_connection_.is_none()) {
+			    throw duckdb::InternalException("test scoped secret discovery requires the source connection");
+		    }
+		    vector<ScopedSecretUse> uses;
+		    auto append_uris = [&](py::iterable values, uint8_t capability) {
+			    for (auto value : values) {
+				    if (!py::isinstance<py::str>(value)) {
+					    throw py::type_error("test scoped secret URIs must be strings");
+				    }
+				    AddScopedSecretUse(uses, py::reinterpret_borrow<py::str>(value).cast<string>(), capability);
+			    }
+		    };
+		    append_uris(source_uris, SCOPED_SECRET_CAPABILITY_READ);
+		    append_uris(sink_uris, SCOPED_SECRET_CAPABILITY_WRITE);
+
+		    auto session_id = VaneSessionIdFromSnapshot(plan.connection_snapshot_);
+		    auto &source_wrapper = ExtractPyConnectionWrapper(plan.source_connection_);
+		    auto source_context = source_wrapper.con.GetConnection().context;
+		    ScopedSecretDiscovery discovery;
+		    source_context->RunFunctionInTransaction([&]() {
+			    discovery = DiscoverScopedSecretRefs(*source_context, std::move(uses), plan.query_id_, session_id);
+		    });
+		    plan.scoped_secret_refs_ = std::move(discovery.references);
+		    plan.source_scoped_secret_bindings_ = std::move(discovery.source_bindings);
+	    },
+	    py::arg("plan"), py::arg("source_uris"), py::arg("sink_uris"),
+	    "Attach explicit remote URI uses for scoped-secret contract tests.");
+
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",
 	                [](py::object relation_obj, py::object query_id_obj) {
@@ -1128,6 +1186,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
+	    .def("scoped_secret_refs", &PyLogicalPlan::scoped_secret_refs)
 	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none(),
 	         py::arg("effective_session_config") = py::none())
 	    .def(py::pickle(
@@ -1136,11 +1195,24 @@ void register_ray_bindings(py::module_ &mod) {
 			        throw duckdb::InternalException("PyLogicalPlan missing serialized logical plan");
 		        }
 		        (void)DecodeLogicalPlanEnvelope(p.serialized_logical_plan_);
+		        auto session_id = VaneSessionIdFromSnapshot(p.connection_snapshot_);
+		        ValidateScopedSecretRefs(p.scoped_secret_refs_, p.query_id_, session_id, "logical plan pickle");
+		        if (!p.source_scoped_secret_bindings_.empty()) {
+			        if (p.source_connection_.is_none()) {
+				        throw duckdb::InternalException("Source scoped secret bindings require the source connection");
+			        }
+			        auto &source_wrapper = ExtractPyConnectionWrapper(p.source_connection_);
+			        auto source_context = source_wrapper.con.GetConnection().context;
+			        source_context->RunFunctionInTransaction([&]() {
+				        ValidateSourceScopedSecretBindings(*source_context, p.scoped_secret_refs_,
+				                                           p.source_scoped_secret_bindings_);
+			        });
+		        }
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,
-		                              p.connection_snapshot_);
+		                              p.connection_snapshot_, ScopedSecretRefsToPython(p.scoped_secret_refs_));
 	        },
 	        [](py::tuple t) {
-		        if (t.size() != 4)
+		        if (t.size() != 5)
 			        throw duckdb::InternalException("Invalid state for PyLogicalPlan");
 		        string query_id = py::cast<string>(t[0]);
 		        py::bytes serialized_bytes = py::cast<py::bytes>(t[1]);
@@ -1154,8 +1226,10 @@ void register_ray_bindings(py::module_ &mod) {
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);
 		        plan.udf_registrations_ = t[2];
 		        plan.connection_snapshot_ = t[3];
-		        (void)VaneSessionIdFromSnapshot(plan.connection_snapshot_);
+		        auto session_id = VaneSessionIdFromSnapshot(plan.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(plan.connection_snapshot_);
+		        plan.scoped_secret_refs_ =
+		            ScopedSecretRefsFromPython(t[4], plan.query_id_, session_id, "logical plan pickle deserialization");
 		        return plan;
 	        }));
 
@@ -1657,6 +1731,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        deferred_exec_plan.udf_registrations_ = plan.udf_registrations_;
 					        deferred_exec_plan.udf_actor_handles_ = plan.udf_actor_handles_;
 					        deferred_exec_plan.connection_snapshot_ = plan.connection_snapshot_;
+					        deferred_exec_plan.scoped_secret_refs_ = plan.scoped_secret_refs_;
 					        deferred_exec_plan.serialized_root_ = plan.serialized_root_;
 					        deferred_exec_plan.worker_connection_ = exec_conn;
 					        deferred_exec_plan.materialize_deferred_root(exec_conn, apply_snapshot_session_config);
