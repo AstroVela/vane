@@ -15,10 +15,10 @@
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "duckdb/main/secret/secret.hpp"
 
 namespace duckdb {
 
-class BaseSecret;
 class Catalog;
 class CatalogSet;
 struct CatalogTransaction;
@@ -26,6 +26,19 @@ class DatabaseInstance;
 struct SecretMatch;
 struct SecretEntry;
 class SecretManager;
+
+//! Non-sensitive view of a secret entry. The referenced fields remain valid
+//! only for the duration of a ScanSecretMetadata callback.
+struct SecretMetadata {
+	SecretPersistType persist_type;
+	const string &storage_mode;
+	const string &name;
+	const string &type;
+	const string &provider;
+	const vector<string> &scope;
+};
+
+using secret_metadata_callback_t = std::function<bool(const SecretMetadata &)>;
 
 //! Base class for SecretStorage API
 class SecretStorage {
@@ -53,6 +66,10 @@ public:
 	                                            optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
 	//! Get all secrets
 	virtual vector<SecretEntry> AllSecrets(optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
+	//! Scan non-sensitive secret metadata without cloning credential values.
+	//! Returns false when the callback requests early termination.
+	virtual bool ScanSecretMetadata(const secret_metadata_callback_t &callback,
+	                                optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
 	//! Drop secret by name
 	virtual void DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
 	                              optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
@@ -111,6 +128,8 @@ public:
 	unique_ptr<SecretEntry> StoreSecret(unique_ptr<const BaseSecret> secret, OnCreateConflict on_conflict,
 	                                    optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	vector<SecretEntry> AllSecrets(optional_ptr<CatalogTransaction> transaction = nullptr) override;
+	bool ScanSecretMetadata(const secret_metadata_callback_t &callback,
+	                        optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	void DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
 	                      optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	SecretMatch LookupSecret(const string &path, const string &type,

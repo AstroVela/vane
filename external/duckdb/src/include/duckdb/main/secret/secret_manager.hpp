@@ -136,6 +136,9 @@ public:
 	                                 const string &storage = "");
 	//! List all secrets from all secret storages
 	DUCKDB_API vector<SecretEntry> AllSecrets(CatalogTransaction transaction);
+	//! Visit non-sensitive metadata for secrets that participate in lookups without cloning credential values.
+	//! Returns false when the callback requests early termination.
+	DUCKDB_API bool ScanSecretMetadata(CatalogTransaction transaction, const secret_metadata_callback_t &callback);
 
 	//! List all secret types
 	DUCKDB_API vector<SecretType> AllSecretTypes();

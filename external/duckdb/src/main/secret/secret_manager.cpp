@@ -494,6 +494,21 @@ vector<SecretEntry> SecretManager::AllSecrets(CatalogTransaction transaction) {
 	return result;
 }
 
+bool SecretManager::ScanSecretMetadata(CatalogTransaction transaction, const secret_metadata_callback_t &callback) {
+	InitializeSecrets(transaction);
+
+	for (const auto &storage_ref : GetSecretStorages()) {
+		auto &storage = storage_ref.get();
+		if (!storage.IncludeInLookups()) {
+			continue;
+		}
+		if (!storage.ScanSecretMetadata(callback, &transaction)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 vector<SecretType> SecretManager::AllSecretTypes() {
 	unique_lock<mutex> lck(manager_lock);
 	vector<SecretType> result;

@@ -18,6 +18,12 @@ static constexpr idx_t SCOPED_SECRET_MAX_REFERENCES = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_USES = 100000;
 static constexpr idx_t SCOPED_SECRET_MAX_IDENTITY_SIZE = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_SCOPE_SIZE = 65536;
+static constexpr idx_t SCOPED_SECRET_MAX_METADATA_ENTRIES = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_METADATA_SCOPES = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_METADATA_BYTES = 16 * 1024 * 1024;
+static constexpr idx_t SCOPED_SECRET_MAX_GENERATED_BOUNDARIES = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_GENERATED_BOUNDARY_BYTES = 16 * 1024 * 1024;
+static constexpr char SCOPED_SECRET_GENERATED_PROBE_SUFFIX[] = "__vane_generated_copy_scope_probe__";
 
 struct ScopedSecretRef {
 	uint32_t version = SCOPED_SECRET_REF_VERSION;
@@ -33,6 +39,10 @@ struct ScopedSecretRef {
 struct ScopedSecretUse {
 	string uri;
 	uint8_t capabilities = 0;
+	// Ray COPY rewrites every remote output to generated task-owned paths.
+	// This marker stays source-only and proves that every secret scope beneath
+	// the generated namespace selects the same opaque identity.
+	bool covers_generated_copy_namespace = false;
 };
 
 // This source-only binding gives the opaque reference a local identity for
@@ -51,6 +61,7 @@ struct ScopedSecretBinding {
 struct ScopedSecretDiscovery {
 	vector<ScopedSecretRef> references;
 	vector<ScopedSecretBinding> source_bindings;
+	vector<ScopedSecretUse> source_unmatched_uses;
 };
 
 struct ScopedSecretSelection {
@@ -94,6 +105,12 @@ static string CreateScopedSecretReferenceId(const ScopedSecretSelection &selecti
 
 static bool IsSupportedScopedSecretType(const string &secret_type) {
 	return secret_type == "s3" || secret_type == "r2" || secret_type == "gcs" || secret_type == "aws";
+}
+
+static bool IsScopedSecretSelectionType(const string &secret_type, bool include_http) {
+	return StringUtil::CIEquals(secret_type, "s3") || StringUtil::CIEquals(secret_type, "r2") ||
+	       StringUtil::CIEquals(secret_type, "gcs") || StringUtil::CIEquals(secret_type, "aws") ||
+	       (include_http && StringUtil::CIEquals(secret_type, "http"));
 }
 
 static bool IsSupportedScopedSecretProvider(const string &secret_type, const string &provider) {
@@ -334,6 +351,12 @@ static string NormalizedMatchedSecretScope(const BaseSecret &secret, const strin
 	return normalized_scope;
 }
 
+static bool MergeHTTPSecretIntoS3Request(ClientContext &context) {
+	Value merge_http_secret;
+	return context.TryGetCurrentSetting("merge_http_secret_into_s3_request", merge_http_secret) &&
+	       !merge_http_secret.IsNull() && merge_http_secret.GetValue<bool>();
+}
+
 static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientContext &context, const string &uri) {
 	static constexpr const char *SECRET_TYPE_PRECEDENCE[] = {"s3", "r2", "gcs", "aws"};
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
@@ -369,13 +392,12 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientConte
 		return selection;
 	}
 
-	// HTTPFS falls through to an HTTP secret for S3-compatible requests when
-	// this setting is enabled. HTTP secrets are deliberately outside the first
-	// distributed object-storage contract, so reject an actually selected one
-	// instead of silently producing a plan with missing secret state.
-	Value merge_http_secret;
-	if (context.TryGetCurrentSetting("merge_http_secret_into_s3_request", merge_http_secret) &&
-	    !merge_http_secret.IsNull() && merge_http_secret.GetValue<bool>()) {
+	// KeyValueSecretReader stops at the first matching type. Therefore an HTTP
+	// secret participates only when none of the S3-compatible types above match
+	// and this setting leaves HTTP in the reader's type list. HTTP secrets are
+	// deliberately outside the first distributed object-storage contract, so
+	// reject an actually selected one instead of silently omitting it.
+	if (MergeHTTPSecretIntoS3Request(context)) {
 		auto http_match = secret_manager.LookupSecret(transaction, uri, "http");
 		if (http_match.HasMatch()) {
 			auto &secret = *http_match.secret_entry->secret;
@@ -394,14 +416,149 @@ static bool ScopedSecretSelectionMatchesBinding(const ScopedSecretSelection &sel
 	       selection.normalized_scope == binding.normalized_scope;
 }
 
-static void AddScopedSecretUse(vector<ScopedSecretUse> &uses, const string &uri, uint8_t capability) {
+static bool ScopedSecretSelectionsEqual(const std::optional<ScopedSecretSelection> &left,
+                                        const std::optional<ScopedSecretSelection> &right) {
+	if (left.has_value() != right.has_value()) {
+		return false;
+	}
+	if (!left) {
+		return true;
+	}
+	return left->storage_name == right->storage_name && left->secret_name == right->secret_name &&
+	       left->secret_type == right->secret_type && left->provider == right->provider &&
+	       left->normalized_scope == right->normalized_scope;
+}
+
+static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientContext &context,
+                                                                     const ScopedSecretUse &use) {
+	if (!use.covers_generated_copy_namespace) {
+		return SelectScopedSecretForURI(context, use.uri);
+	}
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto canonical_root = distributed::CanonicalDistributedCopyBasePath(fs, use.uri);
+	if (canonical_root.is_err()) {
+		throw InvalidInputException("Distributed COPY secret discovery could not canonicalize its output namespace");
+	}
+	auto canonical_base = std::move(canonical_root).value();
+	auto separator = fs.PathSeparator(canonical_base);
+	if (separator.empty()) {
+		throw InvalidInputException("Distributed COPY secret discovery requires a non-empty path separator");
+	}
+	auto with_trailing_separator = [&](string path) {
+		if (!StringUtil::EndsWith(path, separator)) {
+			path += separator;
+		}
+		return path;
+	};
+	auto data_namespace_prefix = with_trailing_separator(canonical_base);
+	auto commit_namespace_prefix = with_trailing_separator(canonical_base + ".duckdb_commit");
+
+	// Selecting at the common child prefix includes a secret scoped exactly to
+	// the output directory without inventing a filename that could accidentally
+	// match an otherwise unused narrower scope. Direct-write lifecycle,
+	// manifest, and committed-marker paths must use that same identity.
+	auto baseline = SelectScopedSecretForURI(context, data_namespace_prefix);
+	auto commit_selection = SelectScopedSecretForURI(context, commit_namespace_prefix);
+	if (!ScopedSecretSelectionsEqual(baseline, commit_selection)) {
+		throw InvalidInputException(
+		    "Distributed COPY generated output paths can select different scoped secrets; use one invariant "
+		    "secret identity for the complete output namespace");
+	}
+
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto &secret_manager = SecretManager::Get(context);
+	vector<string> boundary_probes;
+	std::unordered_set<string> unique_boundaries;
+	idx_t metadata_entry_count = 0;
+	idx_t metadata_scope_count = 0;
+	idx_t total_metadata_bytes = 0;
+	idx_t total_boundary_bytes = 0;
+	bool metadata_limit_exceeded = false;
+	const bool include_http_boundaries = MergeHTTPSecretIntoS3Request(context);
+	auto metadata_scan_completed = secret_manager.ScanSecretMetadata(transaction, [&](const SecretMetadata &metadata) {
+		if (metadata_entry_count >= SCOPED_SECRET_MAX_METADATA_ENTRIES ||
+		    metadata.scope.size() > SCOPED_SECRET_MAX_METADATA_SCOPES - metadata_scope_count) {
+			metadata_limit_exceeded = true;
+			return false;
+		}
+		metadata_entry_count++;
+		metadata_scope_count += metadata.scope.size();
+		auto consume_metadata_bytes = [&](idx_t size) {
+			if (size > SCOPED_SECRET_MAX_METADATA_BYTES - total_metadata_bytes) {
+				metadata_limit_exceeded = true;
+				return false;
+			}
+			total_metadata_bytes += size;
+			return true;
+		};
+		if (!consume_metadata_bytes(metadata.storage_mode.size()) || !consume_metadata_bytes(metadata.name.size()) ||
+		    !consume_metadata_bytes(metadata.type.size()) || !consume_metadata_bytes(metadata.provider.size())) {
+			return false;
+		}
+
+		const bool affects_selection = IsScopedSecretSelectionType(metadata.type, include_http_boundaries);
+		for (auto &scope : metadata.scope) {
+			if (!consume_metadata_bytes(scope.size())) {
+				return false;
+			}
+			if (!affects_selection) {
+				continue;
+			}
+			bool is_nested_boundary = false;
+			for (auto namespace_prefix : {data_namespace_prefix, commit_namespace_prefix}) {
+				if (scope.size() > namespace_prefix.size() && StringUtil::StartsWith(scope, namespace_prefix)) {
+					is_nested_boundary = true;
+					break;
+				}
+			}
+			if (!is_nested_boundary) {
+				continue;
+			}
+			ValidateScopedSecretIdentityField(scope, "generated COPY scope", SCOPED_SECRET_MAX_SCOPE_SIZE);
+			if (unique_boundaries.find(scope) != unique_boundaries.end()) {
+				continue;
+			}
+			auto boundary_bytes = scope.size() + sizeof(SCOPED_SECRET_GENERATED_PROBE_SUFFIX) - 1;
+			if (unique_boundaries.size() >= SCOPED_SECRET_MAX_GENERATED_BOUNDARIES ||
+			    boundary_bytes > SCOPED_SECRET_MAX_GENERATED_BOUNDARY_BYTES - total_boundary_bytes) {
+				metadata_limit_exceeded = true;
+				return false;
+			}
+			unique_boundaries.insert(scope);
+			total_boundary_bytes += boundary_bytes;
+			boundary_probes.push_back(scope + SCOPED_SECRET_GENERATED_PROBE_SUFFIX);
+		}
+		return true;
+	});
+	if (!metadata_scan_completed) {
+		if (!metadata_limit_exceeded) {
+			throw InternalException("DuckDB secret metadata scan stopped unexpectedly");
+		}
+		throw InvalidInputException(
+		    "Distributed COPY output namespace exceeds the scoped secret metadata validation limit");
+	}
+	std::sort(boundary_probes.begin(), boundary_probes.end());
+	for (auto &probe : boundary_probes) {
+		auto selected = SelectScopedSecretForURI(context, probe);
+		if (!ScopedSecretSelectionsEqual(baseline, selected)) {
+			throw InvalidInputException(
+			    "Distributed COPY generated output paths can select different scoped secrets; use one invariant "
+			    "secret identity for the complete output namespace");
+		}
+	}
+	return baseline;
+}
+
+static void AddScopedSecretUse(vector<ScopedSecretUse> &uses, const string &uri, uint8_t capability,
+                               bool covers_generated_copy_namespace = false) {
 	if (!IsSupportedObjectStorageURI(uri)) {
 		return;
 	}
 	if (uses.size() >= SCOPED_SECRET_MAX_USES) {
 		throw InvalidInputException("Distributed plan exceeds the maximum supported remote object-storage URI count");
 	}
-	uses.push_back({uri, capability});
+	uses.push_back({uri, capability, covers_generated_copy_namespace});
 }
 
 static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector<ScopedSecretUse> &uses) {
@@ -439,7 +596,7 @@ static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 		auto &copy = op.Cast<LogicalCopyToFile>();
-		AddScopedSecretUse(uses, copy.file_path, SCOPED_SECRET_CAPABILITY_WRITE);
+		AddScopedSecretUse(uses, copy.file_path, SCOPED_SECRET_CAPABILITY_WRITE, true);
 	}
 	for (auto &child : op.children) {
 		CollectLogicalPlanScopedSecretUses(*child, uses);
@@ -449,11 +606,13 @@ static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector
 static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, vector<ScopedSecretUse> uses,
                                                       const string &owner_query_id, const string &owner_session_id) {
 	std::sort(uses.begin(), uses.end(), [](const ScopedSecretUse &left, const ScopedSecretUse &right) {
-		return std::tie(left.uri, left.capabilities) < std::tie(right.uri, right.capabilities);
+		return std::tie(left.uri, left.covers_generated_copy_namespace, left.capabilities) <
+		       std::tie(right.uri, right.covers_generated_copy_namespace, right.capabilities);
 	});
 	vector<ScopedSecretUse> canonical_uses;
 	for (auto &use : uses) {
-		if (!canonical_uses.empty() && canonical_uses.back().uri == use.uri) {
+		if (!canonical_uses.empty() && canonical_uses.back().uri == use.uri &&
+		    canonical_uses.back().covers_generated_copy_namespace == use.covers_generated_copy_namespace) {
 			canonical_uses.back().capabilities |= use.capabilities;
 		} else {
 			canonical_uses.push_back(std::move(use));
@@ -462,8 +621,9 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 
 	ScopedSecretDiscovery discovery;
 	for (auto &use : canonical_uses) {
-		auto selection = SelectScopedSecretForURI(context, use.uri);
+		auto selection = SelectScopedSecretForUse(context, use);
 		if (!selection) {
+			discovery.source_unmatched_uses.push_back(use);
 			continue;
 		}
 		if (owner_query_id.empty() || owner_session_id.empty()) {
@@ -525,10 +685,8 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 }
 
 static void ValidateSourceScopedSecretBindings(ClientContext &context, const vector<ScopedSecretRef> &references,
-                                               const vector<ScopedSecretBinding> &bindings) {
-	if (bindings.empty()) {
-		return;
-	}
+                                               const vector<ScopedSecretBinding> &bindings,
+                                               const vector<ScopedSecretUse> &unmatched_uses) {
 	if (bindings.size() != references.size()) {
 		throw InternalException("Source scoped secret binding count does not match the reference count");
 	}
@@ -541,7 +699,7 @@ static void ValidateSourceScopedSecretBindings(ClientContext &context, const vec
 		}
 		uint8_t capabilities = 0;
 		for (auto &use : binding.uses) {
-			auto selection = SelectScopedSecretForURI(context, use.uri);
+			auto selection = SelectScopedSecretForUse(context, use);
 			if (!selection || !ScopedSecretSelectionMatchesBinding(*selection, binding)) {
 				throw InvalidInputException(
 				    "Scoped secret reference '%s' is stale because DuckDB now selects a different secret for its scope",
@@ -551,6 +709,13 @@ static void ValidateSourceScopedSecretBindings(ClientContext &context, const vec
 		}
 		if (capabilities != reference->capabilities) {
 			throw InternalException("Source scoped secret binding capabilities do not match the reference");
+		}
+	}
+	for (auto &use : unmatched_uses) {
+		if (SelectScopedSecretForUse(context, use)) {
+			throw InvalidInputException(
+			    "Scoped secret discovery is stale because DuckDB now selects a secret for a previously unmatched "
+			    "object-storage resource");
 		}
 	}
 }
@@ -660,6 +825,7 @@ struct PyLogicalPlan {
 	vector<ScopedSecretRef> scoped_secret_refs_;
 	// Source secret names, storage identities, and URIs never cross pickle.
 	vector<ScopedSecretBinding> source_scoped_secret_bindings_;
+	vector<ScopedSecretUse> source_unmatched_scoped_secret_uses_;
 
 	PyLogicalPlan() = default;
 
@@ -1730,6 +1896,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	plan.serialized_logical_plan_ = std::move(serialized_capture.serialized_plan);
 	plan.scoped_secret_refs_ = std::move(serialized_capture.scoped_secrets.references);
 	plan.source_scoped_secret_bindings_ = std::move(serialized_capture.scoped_secrets.source_bindings);
+	plan.source_unmatched_scoped_secret_uses_ = std::move(serialized_capture.scoped_secrets.source_unmatched_uses);
 
 	if (!plan.source_connection_.is_none()) {
 		auto &conn_wrapper = plan.source_connection_.cast<DuckDBPyConnection &>();

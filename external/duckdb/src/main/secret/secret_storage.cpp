@@ -86,6 +86,24 @@ vector<SecretEntry> CatalogSetSecretStorage::AllSecrets(optional_ptr<CatalogTran
 	return ret_value;
 }
 
+bool CatalogSetSecretStorage::ScanSecretMetadata(const secret_metadata_callback_t &callback,
+                                                 optional_ptr<CatalogTransaction> transaction) {
+	bool completed = true;
+	secrets->ScanWithReturn(GetTransactionOrDefault(transaction), [&](CatalogEntry &entry) {
+		auto &catalog_entry = entry.Cast<SecretCatalogEntry>();
+		auto &secret_entry = *catalog_entry.secret;
+		auto &secret = *secret_entry.secret;
+		SecretMetadata metadata {secret_entry.persist_type, secret_entry.storage_mode, secret.GetName(),
+		                         secret.GetType(),          secret.GetProvider(),      secret.GetScope()};
+		if (!callback(metadata)) {
+			completed = false;
+			return false;
+		}
+		return true;
+	});
+	return completed;
+}
+
 void CatalogSetSecretStorage::DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
                                                optional_ptr<CatalogTransaction> transaction) {
 	auto entry = secrets->GetEntry(GetTransactionOrDefault(transaction), name);

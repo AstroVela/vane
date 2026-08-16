@@ -52,7 +52,14 @@ def _restore_logical_plan(ray_cxx, state):
     return restored
 
 
-def _capture_write_relation(monkeypatch, connection, target):
+def _capture_write_relation(
+    monkeypatch,
+    connection,
+    target,
+    *,
+    query="SELECT 1 AS value",
+    **write_options,
+):
     captured = []
 
     class FakeRayRunner:
@@ -65,7 +72,7 @@ def _capture_write_relation(monkeypatch, connection, target):
     monkeypatch.setitem(sys.modules, "vane.runners", runners)
     monkeypatch.setenv("VANE_RUNNER", "ray")
 
-    connection.sql("SELECT 1 AS value").write_parquet(target)
+    connection.sql(query).write_parquet(target, **write_options)
     assert len(captured) == 1
     return captured[0]
 
@@ -210,6 +217,36 @@ def test_selected_http_secret_for_object_store_uri_is_rejected_before_ray():
     assert uri_sentinel not in str(exc_info.value)
 
 
+def test_s3_secret_precedes_a_matching_http_secret_when_merge_is_enabled():
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "s3_precedes_http_secret",
+        "s3://s3-http-precedence/",
+        value_sentinel="s3-precedence-value",
+    )
+    connection.execute(
+        """
+        CREATE SECRET lower_priority_http_secret (
+            TYPE HTTP,
+            EXTRA_HTTP_HEADERS MAP {'X-Secret-Sentinel': 'lower-priority'},
+            SCOPE 's3://s3-http-precedence/'
+        )
+        """
+    )
+    connection.execute("SET merge_http_secret_into_s3_request = true")
+
+    plan = _logical_plan_with_uses(
+        connection,
+        "s3-http-secret-precedence",
+        source_uris=("s3://s3-http-precedence/input.parquet",),
+    )
+
+    assert len(plan.scoped_secret_refs()) == 1
+    assert plan.scoped_secret_refs()[0]["type"] == "s3"
+
+
 def test_disabled_http_secret_merge_does_not_create_an_unused_reference():
     connection = vane.connect()
     connection.execute("LOAD httpfs")
@@ -231,6 +268,302 @@ def test_disabled_http_secret_merge_does_not_create_an_unused_reference():
     )
 
     assert plan.scoped_secret_refs() == []
+
+
+def test_previously_unmatched_use_rejects_a_new_secret_before_transport():
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    uri_sentinel = "unmatched-uri-sentinel-must-not-reach-errors"
+    plan = _logical_plan_with_uses(
+        connection,
+        "unmatched-use-becomes-secret-backed",
+        source_uris=(f"s3://new-secret-after-capture/input.parquet?token={uri_sentinel}",),
+    )
+    assert plan.scoped_secret_refs() == []
+
+    _create_s3_secret(
+        connection,
+        "created_after_plan_capture",
+        "s3://new-secret-after-capture/",
+        value_sentinel="new-secret-value-must-not-reach-errors",
+    )
+
+    with pytest.raises(Exception, match="previously unmatched") as pickle_error:
+        pickle.dumps(plan)
+    assert uri_sentinel not in str(pickle_error.value)
+
+    with pytest.raises(Exception, match="previously unmatched") as physical_error:
+        plan.to_physical_plan(vane.connect())
+    assert uri_sentinel not in str(physical_error.value)
+
+
+def test_unchanged_unmatched_use_can_cross_the_transport_boundary():
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    unmatched_uri = "s3://still-unmatched/source-only-uri-sentinel.parquet"
+    plan = _logical_plan_with_uses(
+        connection,
+        "unchanged-unmatched-use",
+        source_uris=(unmatched_uri,),
+    )
+
+    payload = pickle.dumps(plan)
+    restored = pickle.loads(payload)
+
+    assert unmatched_uri.encode() not in payload
+    assert restored.scoped_secret_refs() == []
+
+
+@pytest.mark.parametrize(
+    ("query", "write_options", "nested_suffix"),
+    [
+        pytest.param("SELECT 1 AS value", {}, "reserved/", id="single-file"),
+        pytest.param(
+            "SELECT 1 AS value",
+            {"per_thread_output": True},
+            "reserved/",
+            id="per-thread",
+        ),
+        pytest.param(
+            "SELECT i AS value FROM range(4) tbl(i)",
+            {"file_size_bytes": 1024},
+            "reserved/",
+            id="rotation",
+        ),
+        pytest.param(
+            "SELECT 'US' AS country, 1 AS value",
+            {"partition_by": ["country"]},
+            "country=US/",
+            id="partitioned",
+        ),
+    ],
+)
+def test_generated_copy_modes_reject_a_nested_secret_selection_before_ray(
+    monkeypatch,
+    query,
+    write_options,
+    nested_suffix,
+):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "generated_copy_broad_secret",
+        "s3://generated-copy/",
+        value_sentinel="generated-copy-broad-value",
+    )
+    nested_name = "generated_copy_nested_secret_sentinel"
+    nested_value = "generated-copy-nested-value-sentinel"
+    _create_s3_secret(
+        connection,
+        nested_name,
+        f"s3://generated-copy/output/{nested_suffix}",
+        value_sentinel=nested_value,
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://generated-copy/output",
+        query=query,
+        **write_options,
+    )
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets") as exc_info:
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "nested-copy-secret-selection")
+    assert nested_name not in str(exc_info.value)
+    assert nested_value not in str(exc_info.value)
+
+
+def test_generated_copy_rejects_a_secret_missing_from_the_commit_namespace(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "data_namespace_only_secret",
+        "s3://copy-sidecar/output/",
+        value_sentinel="data-namespace-only-value",
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://copy-sidecar/output",
+    )
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets"):
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "copy-commit-namespace-mismatch")
+
+
+def test_generated_copy_rejects_an_unmatched_base_with_a_nested_secret(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "nested_without_base_secret",
+        "s3://copy-unmatched-base/output/country=US/",
+        value_sentinel="nested-without-base-value",
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://copy-unmatched-base/output",
+        query="SELECT 'US' AS country, 1 AS value",
+        partition_by=["country"],
+    )
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets"):
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "copy-unmatched-base")
+
+
+def test_generated_copy_rejects_excessive_secret_scope_boundaries(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "copy_boundary_limit_broad_secret",
+        "s3://copy-boundary-limit/",
+        value_sentinel="copy-boundary-limit-broad-value",
+    )
+    scope_name_sentinel = "copy_boundary_limit_nested_secret"
+    scope_value_sentinel = "copy-boundary-limit-nested-value"
+    nested_scopes = ", ".join(
+        f"'s3://copy-boundary-limit/output/boundary={boundary_idx}/'" for boundary_idx in range(4097)
+    )
+    connection.execute(
+        f"""
+        CREATE SECRET {scope_name_sentinel} (
+            TYPE S3,
+            PROVIDER CONFIG,
+            KEY_ID 'key-{scope_name_sentinel}',
+            SECRET '{scope_value_sentinel}',
+            SCOPE [{nested_scopes}]
+        )
+        """
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://copy-boundary-limit/output",
+    )
+
+    with pytest.raises(Exception, match="secret metadata validation limit") as exc_info:
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "copy-secret-boundary-limit")
+    assert scope_name_sentinel not in str(exc_info.value)
+    assert scope_value_sentinel not in str(exc_info.value)
+
+
+def test_generated_copy_canonicalization_ignores_siblings_and_lower_priority_secrets(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "canonical_copy_s3_secret",
+        "s3://copy-canonical/",
+        value_sentinel="canonical-copy-s3-value",
+    )
+    _create_s3_secret(
+        connection,
+        "sibling_copy_s3_secret",
+        "s3://copy-canonical/output2/",
+        value_sentinel="sibling-copy-value",
+    )
+    connection.execute(
+        """
+        CREATE SECRET nested_lower_priority_r2_secret (
+            TYPE R2,
+            PROVIDER CONFIG,
+            KEY_ID 'r2-key',
+            SECRET 'lower-priority-r2-value',
+            ACCOUNT_ID 'account-id',
+            SCOPE 's3://copy-canonical/output/reserved/'
+        )
+        """
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://copy-canonical/output///",
+    )
+
+    plan = ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "canonical-copy-scope")
+
+    assert len(plan.scoped_secret_refs()) == 1
+    assert plan.scoped_secret_refs()[0]["type"] == "s3"
+    assert plan.scoped_secret_refs()[0]["scope"] == "s3://copy-canonical/"
+
+
+def test_generated_copy_namespace_rejects_a_new_nested_secret_before_transport(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "generated_copy_stable_secret",
+        "s3://generated-copy-stale/",
+        value_sentinel="generated-copy-stable-value",
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://generated-copy-stale/output",
+        query="SELECT 'US' AS country, 1 AS value",
+        partition_by=["country"],
+    )
+    plan = ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "stale-generated-copy-namespace")
+    assert len(plan.scoped_secret_refs()) == 1
+
+    nested_name = "generated_copy_created_after_capture"
+    nested_value = "generated-copy-new-nested-value"
+    _create_s3_secret(
+        connection,
+        nested_name,
+        "s3://generated-copy-stale/output/country=US/",
+        value_sentinel=nested_value,
+    )
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets") as pickle_error:
+        pickle.dumps(plan)
+    assert nested_name not in str(pickle_error.value)
+    assert nested_value not in str(pickle_error.value)
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets") as physical_error:
+        plan.to_physical_plan(vane.connect())
+    assert nested_name not in str(physical_error.value)
+    assert nested_value not in str(physical_error.value)
+
+
+def test_generated_copy_commit_namespace_rejects_a_new_secret_before_transport(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "commit_freshness_broad_secret",
+        "s3://copy-commit-freshness/",
+        value_sentinel="commit-freshness-broad-value",
+    )
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://copy-commit-freshness/output",
+    )
+    plan = ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "stale-copy-commit-namespace")
+
+    _create_s3_secret(
+        connection,
+        "commit_freshness_nested_secret",
+        "s3://copy-commit-freshness/output.duckdb_commit/",
+        value_sentinel="commit-freshness-nested-value",
+    )
+
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets"):
+        pickle.dumps(plan)
+    with pytest.raises(Exception, match="generated output paths can select different scoped secrets"):
+        plan.to_physical_plan(vane.connect())
 
 
 def test_secret_values_and_names_are_absent_from_logical_and_physical_pickles():

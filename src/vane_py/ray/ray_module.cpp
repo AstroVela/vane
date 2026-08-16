@@ -1124,7 +1124,8 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_attach_scoped_secret_uses_for_test",
 	    [](PyLogicalPlan &plan, py::iterable source_uris, py::iterable sink_uris) {
-		    if (!plan.scoped_secret_refs_.empty() || !plan.source_scoped_secret_bindings_.empty()) {
+		    if (!plan.scoped_secret_refs_.empty() || !plan.source_scoped_secret_bindings_.empty() ||
+		        !plan.source_unmatched_scoped_secret_uses_.empty()) {
 			    throw duckdb::InvalidInputException("test logical plan already contains scoped secret references");
 		    }
 		    if (plan.source_connection_.is_none()) {
@@ -1151,6 +1152,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    });
 		    plan.scoped_secret_refs_ = std::move(discovery.references);
 		    plan.source_scoped_secret_bindings_ = std::move(discovery.source_bindings);
+		    plan.source_unmatched_scoped_secret_uses_ = std::move(discovery.source_unmatched_uses);
 	    },
 	    py::arg("plan"), py::arg("source_uris"), py::arg("sink_uris"),
 	    "Attach explicit remote URI uses for scoped-secret contract tests.");
@@ -1197,15 +1199,17 @@ void register_ray_bindings(py::module_ &mod) {
 		        (void)DecodeLogicalPlanEnvelope(p.serialized_logical_plan_);
 		        auto session_id = VaneSessionIdFromSnapshot(p.connection_snapshot_);
 		        ValidateScopedSecretRefs(p.scoped_secret_refs_, p.query_id_, session_id, "logical plan pickle");
-		        if (!p.source_scoped_secret_bindings_.empty()) {
+		        if (!p.source_scoped_secret_bindings_.empty() || !p.source_unmatched_scoped_secret_uses_.empty()) {
 			        if (p.source_connection_.is_none()) {
-				        throw duckdb::InternalException("Source scoped secret bindings require the source connection");
+				        throw duckdb::InternalException(
+				            "Source scoped secret validation requires the source connection");
 			        }
 			        auto &source_wrapper = ExtractPyConnectionWrapper(p.source_connection_);
 			        auto source_context = source_wrapper.con.GetConnection().context;
 			        source_context->RunFunctionInTransaction([&]() {
 				        ValidateSourceScopedSecretBindings(*source_context, p.scoped_secret_refs_,
-				                                           p.source_scoped_secret_bindings_);
+				                                           p.source_scoped_secret_bindings_,
+				                                           p.source_unmatched_scoped_secret_uses_);
 			        });
 		        }
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,

@@ -1090,14 +1090,15 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 		scoped_secret_session_id = VaneSessionIdFromSnapshot(connection_snapshot_);
 	}
 	ValidateScopedSecretRefs(scoped_secret_refs_, query_id_, scoped_secret_session_id, "logical to physical planning");
-	if (!source_scoped_secret_bindings_.empty()) {
+	if (!source_scoped_secret_bindings_.empty() || !source_unmatched_scoped_secret_uses_.empty()) {
 		if (source_connection_.is_none()) {
-			throw duckdb::InternalException("Source scoped secret bindings require the source connection");
+			throw duckdb::InternalException("Source scoped secret validation requires the source connection");
 		}
 		auto &source_wrapper = ExtractPyConnectionWrapper(source_connection_);
 		auto source_context = source_wrapper.con.GetConnection().context;
 		source_context->RunFunctionInTransaction([&]() {
-			ValidateSourceScopedSecretBindings(*source_context, scoped_secret_refs_, source_scoped_secret_bindings_);
+			ValidateSourceScopedSecretBindings(*source_context, scoped_secret_refs_, source_scoped_secret_bindings_,
+			                                   source_unmatched_scoped_secret_uses_);
 		});
 	}
 	auto logical_payload = DecodeLogicalPlanEnvelope(serialized_logical_plan_);

@@ -43,6 +43,21 @@ struct DemoSecretType {
 	}
 };
 
+class CloneCountingSecret : public BaseSecret {
+public:
+	CloneCountingSecret(const vector<string> &scope, const string &name, shared_ptr<idx_t> clone_count_p)
+	    : BaseSecret(scope, "s3", "config", name), clone_count(std::move(clone_count_p)) {
+	}
+
+	unique_ptr<const BaseSecret> Clone() const override {
+		(*clone_count)++;
+		return make_uniq<CloneCountingSecret>(*this);
+	}
+
+private:
+	shared_ptr<idx_t> clone_count;
+};
+
 // Demo pluggable secret storage
 class TestSecretStorage : public CatalogSetSecretStorage {
 public:
@@ -176,6 +191,39 @@ TEST_CASE("Test adding a custom secret storage", "[secret][.]") {
 	REQUIRE(log.write_secret_requests[2] == "s1_test_type");
 	REQUIRE(log.remove_secret_requests[0] == "s2");
 	REQUIRE(log.remove_secret_requests[1] == "s1");
+}
+
+TEST_CASE("Scan secret metadata without cloning credential-bearing entries", "[secret][.]") {
+	DuckDB db(nullptr);
+
+	if (!db.ExtensionIsLoaded("httpfs")) {
+		return;
+	}
+
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
+	auto clone_count = make_shared<idx_t>(0);
+	auto secret =
+	    make_uniq<CloneCountingSecret>(vector<string> {"s3://metadata-scan/"}, "metadata_scan_secret", clone_count);
+	auto registered = secret_manager.RegisterSecret(transaction, std::move(secret), OnCreateConflict::ERROR_ON_CONFLICT,
+	                                                SecretPersistType::TEMPORARY);
+	REQUIRE(registered);
+	auto clones_before_scan = *clone_count;
+
+	idx_t visited_count = 0;
+	auto completed = secret_manager.ScanSecretMetadata(transaction, [&](const SecretMetadata &metadata) {
+		visited_count++;
+		REQUIRE(metadata.storage_mode == SecretManager::TEMPORARY_STORAGE_NAME);
+		REQUIRE(metadata.name == "metadata_scan_secret");
+		REQUIRE(metadata.type == "s3");
+		REQUIRE(metadata.provider == "config");
+		REQUIRE(metadata.scope == vector<string> {"s3://metadata-scan/"});
+		return false;
+	});
+
+	REQUIRE(!completed);
+	REQUIRE(visited_count == 1);
+	REQUIRE(*clone_count == clones_before_scan);
 }
 
 TEST_CASE("Test tie-break behaviour for custom secret storage", "[secret][.]") {

@@ -10,7 +10,7 @@ target_include_directories(
   python_ray
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/yyjson/include
-          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/mbedtls/include)
+          ${DUCKDB_SOURCE_PATH}/third_party/mbedtls/include)
 
 target_link_libraries(python_ray PRIVATE vane_python_dependencies)
 
