@@ -1021,6 +1021,8 @@ void register_ray_bindings(py::module_ &mod) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
 			                                                     false);
+		                } catch (const py::type_error &) {
+			                throw;
 		                } catch (const py::error_already_set &) {
 			                throw;
 		                } catch (const std::exception &ex) {
@@ -1032,6 +1034,8 @@ void register_ray_bindings(py::module_ &mod) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
 			                                                     true);
+		                } catch (const py::type_error &) {
+			                throw;
 		                } catch (const py::error_already_set &) {
 			                throw;
 		                } catch (const std::exception &ex) {
