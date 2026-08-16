@@ -38,7 +38,7 @@ RayTaskResult = require_ray_cxx_attr(
 )
 
 from vane.event_loop import set_event_loop
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import (
     FteTaskAttemptId,
     FteTaskState,
@@ -293,6 +293,16 @@ def _raise_copy_outcome_unknown(
     operation_id: str,
     operation_error: BaseException,
 ) -> NoReturn:
+    committed_error = next(
+        (
+            candidate
+            for candidate in _runtime_error_candidates(operation_error)
+            if isinstance(candidate, CopyResultUnavailableError)
+        ),
+        None,
+    )
+    if committed_error is not None:
+        raise committed_error
     unknown_error = next(
         (
             candidate
@@ -7212,7 +7222,22 @@ class RayQueryDriverActor:
             # terminal result so a concurrent failure cannot escape as an
             # unobserved asyncio task exception.
             committed_result: Mapping[str, Any] | None = None
-            unknown_outcome_error = primary_error if isinstance(primary_error, CopyOutcomeUnknownError) else None
+            committed_result_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(primary_error)
+                    if isinstance(candidate, CopyResultUnavailableError)
+                ),
+                None,
+            )
+            unknown_outcome_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(primary_error)
+                    if isinstance(candidate, CopyOutcomeUnknownError)
+                ),
+                None,
+            )
             if plan_execution is not None:
                 try:
                     await self._await_copy_operation(plan_execution)
@@ -7220,8 +7245,25 @@ class RayQueryDriverActor:
                     pass
                 try:
                     observed_result = plan_execution.result()
-                except BaseException:
-                    pass
+                except BaseException as observed_error:
+                    if committed_result_error is None:
+                        committed_result_error = next(
+                            (
+                                candidate
+                                for candidate in _runtime_error_candidates(observed_error)
+                                if isinstance(candidate, CopyResultUnavailableError)
+                            ),
+                            None,
+                        )
+                    if unknown_outcome_error is None:
+                        unknown_outcome_error = next(
+                            (
+                                candidate
+                                for candidate in _runtime_error_candidates(observed_error)
+                                if isinstance(candidate, CopyOutcomeUnknownError)
+                            ),
+                            None,
+                        )
                 else:
                     if isinstance(observed_result, Mapping):
                         if observed_result.get("copy_output_outcome_unknown") is True:
@@ -7264,6 +7306,23 @@ class RayQueryDriverActor:
                     cleanup_state=cleanup_state,
                     cleanup_warnings=cleanup_warnings,
                 )
+            if committed_result_error is not None:
+                if committed_result_error is not primary_error:
+                    committed_result_error.add_cleanup_warnings(
+                        self._copy_cleanup_warning(
+                            "COPY committed-result execution finalization",
+                            primary_error,
+                        )
+                    )
+                if teardown_error is not None:
+                    committed_result_error.add_cleanup_warnings(
+                        self._copy_cleanup_warning("COPY committed-result teardown", teardown_error)
+                    )
+                if committed_result_error is primary_error:
+                    if primary_error is execution_error:
+                        raise
+                    raise primary_error from execution_error
+                raise committed_result_error from primary_error
             if unknown_outcome_error is not None:
                 if unknown_outcome_error is not primary_error:
                     unknown_outcome_error.add_cleanup_warnings(
@@ -8402,6 +8461,16 @@ class RayQueryDriverClient:
                 )
             return outcome.result
         except Exception as e:
+            committed_result_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(e)
+                    if isinstance(candidate, CopyResultUnavailableError)
+                ),
+                None,
+            )
+            if committed_result_error is not None:
+                raise committed_result_error
             unknown_outcome = next(
                 (
                     candidate

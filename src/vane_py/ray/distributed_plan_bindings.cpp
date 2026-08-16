@@ -2742,6 +2742,7 @@ struct PyPhysicalPlanWrapperRunner {
 		std::string staging_root;
 	};
 	std::unordered_map<string, std::shared_ptr<StoredCopyContext>> streaming_results_;
+	std::atomic<bool> fail_next_extension_result_marshalling_for_test_ {false};
 
 	PyPhysicalPlanWrapperRunner()
 	    : ray_worker_manager_(
@@ -2806,6 +2807,10 @@ struct PyPhysicalPlanWrapperRunner {
 		if (result.is_err()) {
 			throw std::runtime_error(result.error().what());
 		}
+	}
+
+	void fail_next_extension_result_marshalling_for_test() {
+		fail_next_extension_result_marshalling_for_test_.store(true, std::memory_order_relaxed);
 	}
 
 	void close_session(const string &session_id) {
@@ -2977,6 +2982,14 @@ struct PyPhysicalPlanWrapperRunner {
 		bool body_succeeded = false;
 		bool query_owner_registered = false;
 		std::exception_ptr cleanup_error;
+		enum class ExtensionWriteTerminalState : uint8_t { NONE, COMMITTED, OUTCOME_UNKNOWN };
+		ExtensionWriteTerminalState extension_terminal_state = ExtensionWriteTerminalState::NONE;
+		string extension_terminal_detail;
+		string extension_terminal_base_path;
+		string extension_terminal_run_id;
+		string extension_terminal_manifest_path;
+		string extension_terminal_committed_marker_path;
+		vector<string> post_commit_warnings;
 		auto exception_message = [](const std::exception_ptr &error) {
 			try {
 				std::rethrow_exception(error);
@@ -3001,6 +3014,38 @@ struct PyPhysicalPlanWrapperRunner {
 				cleanup_error = std::current_exception();
 			}
 			cleanup_ms = elapsed_ms(cleanup_started);
+		};
+		auto raise_extension_terminal_error = [&](const std::exception_ptr &execution_error) -> void {
+			vector<string> cleanup_warnings(post_commit_warnings.begin(), post_commit_warnings.end());
+			if (cleanup_error) {
+				cleanup_warnings.push_back("native COPY runner cleanup failed: " + exception_message(cleanup_error));
+			}
+			py::tuple cleanup_warnings_py(cleanup_warnings.size());
+			for (idx_t index = 0; index < cleanup_warnings.size(); index++) {
+				cleanup_warnings_py[index] = py::str(cleanup_warnings[index]);
+			}
+
+			auto result_error = exception_message(execution_error);
+			py::object error_type;
+			py::object error_value;
+			if (extension_terminal_state == ExtensionWriteTerminalState::COMMITTED) {
+				error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
+				error_value = error_type(
+				    plan.idx(), "extension write result handling failed after the catalog commit: " + result_error,
+				    cleanup_warnings_py);
+			} else {
+				auto detail = extension_terminal_detail;
+				if (!detail.empty()) {
+					detail += "; ";
+				}
+				detail += "extension write result handling failed after finalization: " + result_error;
+				error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyOutcomeUnknownError");
+				error_value = error_type(plan.idx(), extension_terminal_base_path, extension_terminal_run_id,
+				                         extension_terminal_manifest_path, extension_terminal_committed_marker_path,
+				                         detail, cleanup_warnings_py);
+			}
+			PyErr_SetObject(error_type.ptr(), error_value.ptr());
+			throw py::error_already_set();
 		};
 
 		try {
@@ -3089,6 +3134,19 @@ struct PyPhysicalPlanWrapperRunner {
 						} else if (!extension_result.outcome_unknown && !extension_result.catalog_committed) {
 							extension_result.catalog_committed = true;
 						}
+						if (extension_result.catalog_committed) {
+							extension_terminal_state = ExtensionWriteTerminalState::COMMITTED;
+						} else if (extension_result.outcome_unknown) {
+							extension_terminal_state = ExtensionWriteTerminalState::OUTCOME_UNKNOWN;
+						}
+						extension_terminal_detail = extension_result.outcome_error;
+						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+							extension_terminal_base_path = extension_result.file_result.output_base_path;
+							extension_terminal_run_id = extension_result.file_result.output_run_id;
+							extension_terminal_manifest_path = extension_result.file_result.output_manifest_path;
+							extension_terminal_committed_marker_path =
+							    extension_result.file_result.output_committed_marker_path;
+						}
 						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
 							res = DuckDBResult<DistributedCopyResult>::ok(extension_result.file_result);
 						} else {
@@ -3106,6 +3164,10 @@ struct PyPhysicalPlanWrapperRunner {
 				}
 				run_plan_ms = elapsed_ms(run_plan_started);
 			}
+			if (extension_terminal_state != ExtensionWriteTerminalState::NONE &&
+			    fail_next_extension_result_marshalling_for_test_.exchange(false, std::memory_order_relaxed)) {
+				throw std::runtime_error("planned extension result marshalling failure");
+			}
 
 			if (!res.is_ok()) {
 				rethrow_submission_error(plan.idx(), res.error().what());
@@ -3122,7 +3184,6 @@ struct PyPhysicalPlanWrapperRunner {
 				rethrow_submission_error(plan.idx());
 				throw py::value_error("distributed COPY completed without a committed output marker");
 			}
-			vector<string> post_commit_warnings;
 			try {
 				rethrow_submission_error(plan.idx());
 			} catch (...) {
@@ -3193,6 +3254,10 @@ struct PyPhysicalPlanWrapperRunner {
 			return out;
 		} catch (...) {
 			auto execution_error = std::current_exception();
+			if (extension_terminal_state != ExtensionWriteTerminalState::NONE) {
+				cleanup();
+				raise_extension_terminal_error(execution_error);
+			}
 			if (body_succeeded) {
 				std::rethrow_exception(execution_error);
 			}

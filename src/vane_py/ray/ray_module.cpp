@@ -155,11 +155,65 @@ protected:
 	}
 };
 
+class CoordinatorOnlyWriteGlobalStateForTest final : public DistributedWriteGlobalState {};
+
+class CoordinatorOnlyWriteLocalStateForTest final : public DistributedWriteLocalState {};
+
+static unique_ptr<DistributedWriteGlobalState>
+CoordinatorOnlyWriteInitializeGlobalForTest(ClientContext &, const DistributedExtensionWriteInfo &,
+                                            const DistributedWriteTaskContext &) {
+	return make_uniq<CoordinatorOnlyWriteGlobalStateForTest>();
+}
+
+static unique_ptr<DistributedWriteLocalState>
+CoordinatorOnlyWriteInitializeLocalForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                           const DistributedWriteTaskContext &, DistributedWriteGlobalState &) {
+	return make_uniq<CoordinatorOnlyWriteLocalStateForTest>();
+}
+
+static void CoordinatorOnlyWriteSinkForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                            const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                                            DistributedWriteLocalState &, DataChunk &) {
+}
+
+static void CoordinatorOnlyWriteCombineForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                               const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                                               DistributedWriteLocalState &) {
+}
+
+static vector<DistributedWriteFragment> CoordinatorOnlyWriteFinalizeForTest(ClientContext &,
+                                                                            const DistributedExtensionWriteInfo &,
+                                                                            const DistributedWriteTaskContext &,
+                                                                            DistributedWriteGlobalState &) {
+	return {};
+}
+
+static void RegisterCoordinatorOnlyExtensionWriteForTest(ClientContext &context) {
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "vane_test";
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, "coordinator_only_write", 1});
+
+	DistributedWriteOperatorExtension write_operator;
+	write_operator.name = "coordinator_only_write";
+	write_operator.protocol_version = 1;
+	write_operator.mode = DistributedWriteMode::CALLBACK;
+	write_operator.fragment_codec = {"vane_test.coordinator_only_write", 1};
+	write_operator.callbacks.initialize_global = CoordinatorOnlyWriteInitializeGlobalForTest;
+	write_operator.callbacks.initialize_local = CoordinatorOnlyWriteInitializeLocalForTest;
+	write_operator.callbacks.sink = CoordinatorOnlyWriteSinkForTest;
+	write_operator.callbacks.combine = CoordinatorOnlyWriteCombineForTest;
+	write_operator.callbacks.finalize = CoordinatorOnlyWriteFinalizeForTest;
+
+	DistributedExtensionManager::Get(context).RegisterExtension(
+	    manifest, {make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(write_operator))});
+}
+
 class PhysicalCoordinatorOnlyExtensionWriteForTest final : public PhysicalOperator,
                                                            public distributed::ExtensionWriteTaskProvider {
 public:
-	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan)
-	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1) {
+	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan, bool fail_finalize_p = false)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1),
+	      fail_finalize(fail_finalize_p) {
 		plan.extension_name = "vane_test";
 		plan.operator_name = "coordinator_only_write";
 	}
@@ -176,6 +230,9 @@ public:
 	}
 
 	idx_t FinalizeDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
+		if (fail_finalize) {
+			throw IOException("planned coordinator-only extension finalization failure");
+		}
 		idx_t rows = 0;
 		for (const auto &result : results) {
 			rows += result.RowCount();
@@ -193,6 +250,7 @@ protected:
 
 private:
 	distributed::DistributedExtensionWritePlan plan;
+	bool fail_finalize;
 };
 
 class CountingResultCollectorForTest {
@@ -936,14 +994,14 @@ void register_ray_bindings(py::module_ &mod) {
 
 	m.def(
 	    "_make_coordinator_only_extension_write_plan_for_test",
-	    [](const string &query_id) {
+	    [](const string &query_id, bool fail_finalize, py::object conn_obj) {
 		    if (query_id.empty()) {
 			    throw duckdb::InternalException("test extension write plan requires a non-empty query_id");
 		    }
 		    auto physical_plan = std::make_shared<duckdb::PhysicalPlan>(duckdb::Allocator::DefaultAllocator());
 		    vector<LogicalType> child_types {LogicalType::BIGINT};
 		    auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
-		    auto &root = physical_plan->Make<PhysicalCoordinatorOnlyExtensionWriteForTest>();
+		    auto &root = physical_plan->Make<PhysicalCoordinatorOnlyExtensionWriteForTest>(fail_finalize);
 		    root.children.push_back(child);
 		    physical_plan->SetRoot(root);
 		    uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
@@ -951,9 +1009,33 @@ void register_ray_bindings(py::module_ &mod) {
 		        duckdb::distributed::DuckDBExecutionConfig::from_env());
 		    auto distributed_plan = std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(
 		        idx, query_id, std::move(physical_plan), std::move(config));
-		    return PyPhysicalPlanWrapper(std::move(distributed_plan));
+		    PyPhysicalPlanWrapper result(std::move(distributed_plan));
+		    if (!conn_obj.is_none()) {
+			    if (py::hasattr(conn_obj, "c")) {
+				    conn_obj = conn_obj.attr("c");
+			    }
+			    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
+			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn);
+		    }
+		    return result;
 	    },
-	    py::arg("query_id"), "Create a coordinator-only extension write plan for submission-boundary tests.");
+	    py::arg("query_id"), py::arg("fail_finalize") = false, py::arg("conn") = py::none(),
+	    "Create a coordinator-only extension write plan for submission-boundary tests.");
+
+	m.def(
+	    "_register_coordinator_only_extension_write_for_test",
+	    [](py::object conn_obj) {
+		    if (py::hasattr(conn_obj, "c")) {
+			    conn_obj = conn_obj.attr("c");
+		    }
+		    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
+		    auto &db_conn = py_conn.con.GetConnection();
+		    if (!db_conn.context) {
+			    throw py::value_error("test extension write registration requires an open DuckDB connection");
+		    }
+		    RegisterCoordinatorOnlyExtensionWriteForTest(*db_conn.context);
+	    },
+	    py::arg("conn"), "Register the coordinator-only callback write contract for native tests.");
 
 	m.def(
 	    "_make_worker_task_for_test",
@@ -1091,6 +1173,8 @@ void register_ray_bindings(py::module_ &mod) {
 	py::class_<PyPhysicalPlanWrapperRunner>(m, "DistributedPhysicalPlanRunner")
 	    .def(py::init<>())
 	    .def(py::init<py::object>(), py::arg("backend"))
+	    .def("_fail_next_extension_result_marshalling_for_test",
+	         &PyPhysicalPlanWrapperRunner::fail_next_extension_result_marshalling_for_test)
 	    .def(
 	        "run_plan",
 	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj) -> py::object {

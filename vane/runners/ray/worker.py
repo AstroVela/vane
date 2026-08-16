@@ -271,7 +271,13 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     def replaces_s3_identity(self, other: WorkerSnapshotDatabaseIdentity) -> bool:
         if not self.s3_session_id or self == other:
             return False
-        return self._replace(effective_s3_config_identity="") == other._replace(effective_s3_config_identity="")
+        return self._replace(
+            effective_s3_config_identity="",
+            use_session_credentials=False,
+        ) == other._replace(
+            effective_s3_config_identity="",
+            use_session_credentials=False,
+        )
 
 
 def _snapshot_nonempty_string(entry: Mapping[str, Any], field: str, description: str) -> str:
@@ -316,6 +322,7 @@ def _worker_snapshot_database_identity(
     if not isinstance(raw_settings, list):
         raise TypeError("query connection snapshot settings must be a list")
     settings: list[tuple[str, str, str]] = []
+    explicit_s3_credentials: list[tuple[str, str, str]] = []
     setting_names: set[str] = set()
     for raw_setting in raw_settings:
         if not isinstance(raw_setting, Mapping):
@@ -333,8 +340,13 @@ def _worker_snapshot_database_identity(
         setting_names.add(normalized_name)
         if normalized_name in _CONNECTION_SNAPSHOT_SECURITY_SETTINGS:
             continue
-        settings.append((normalized_name, value, input_type.upper()))
+        normalized_setting = (normalized_name, value, input_type.upper())
+        if normalized_name in _CONNECTION_SNAPSHOT_S3_CREDENTIAL_SETTINGS:
+            explicit_s3_credentials.append(normalized_setting)
+            continue
+        settings.append(normalized_setting)
     settings.sort()
+    explicit_s3_credentials.sort()
 
     duckdb_source_id = snapshot.get("duckdb_source_id")
     if not isinstance(duckdb_source_id, str) or not duckdb_source_id:
@@ -376,11 +388,17 @@ def _worker_snapshot_database_identity(
         s3_session_id = str(session_id).strip()
         if not s3_session_id:
             raise ValueError("worker snapshot httpfs database identity requires a Vane session_id")
-        s3_config = tuple(
-            (key, str(effective_s3_config[key]))
-            for key in _DUCKDB_S3_SESSION_KEYS
-            if str(effective_s3_config.get(key, "")).strip()
-        )
+        if use_session_credentials:
+            s3_config: tuple[Any, ...] = (
+                "session",
+                tuple(
+                    (key, str(effective_s3_config[key]))
+                    for key in _DUCKDB_S3_SESSION_KEYS
+                    if str(effective_s3_config.get(key, "")).strip()
+                ),
+            )
+        else:
+            s3_config = ("explicit", tuple(explicit_s3_credentials))
         s3_config_identity = hashlib.sha256(
             json.dumps(s3_config, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()

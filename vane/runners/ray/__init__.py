@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.ray.committed_copy import (
     force_abort_copy_direct_write_run,
     inspect_copy_direct_write_run,
@@ -19,6 +19,7 @@ from vane.runners.runner import Runner
 
 __all__ = [
     "CopyOutcomeUnknownError",
+    "CopyResultUnavailableError",
     "RayRunner",
     "cleanup_copy_direct_write_lifecycle_once",
     "force_abort_copy_direct_write_run",

@@ -142,30 +142,61 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
     assert actor._active_snapshot_cursors == set()
 
 
-def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(monkeypatch):
+@pytest.mark.parametrize(
+    ("old_credential_source", "new_credential_source"),
+    (
+        ("session", "session"),
+        ("explicit", "explicit"),
+        ("session", "explicit"),
+    ),
+    ids=("session-to-session", "explicit-to-explicit", "session-to-explicit"),
+)
+def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(
+    monkeypatch,
+    old_credential_source,
+    new_credential_source,
+):
     actor_class, actor = _worker_actor()
-    snapshot = {
+    base_snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [{"name": "httpfs", "version": "test-version"}],
         "distributed_extension_contracts": [],
         "settings": [],
     }
-    old_identity = _snapshot_database_identity(
-        snapshot,
-        session_id="session-a",
-        effective_s3_config={
-            "AWS_ACCESS_KEY_ID": "old-key",
-            "AWS_SECRET_ACCESS_KEY": "old-secret",
-        },
-    )
-    new_identity = _snapshot_database_identity(
-        snapshot,
-        session_id="session-a",
-        effective_s3_config={
-            "AWS_ACCESS_KEY_ID": "new-key",
-            "AWS_SECRET_ACCESS_KEY": "new-secret",
-        },
-    )
+
+    def identity(credential_source, access_key, secret_key):
+        snapshot = base_snapshot
+        effective_s3_config = {
+            "AWS_ACCESS_KEY_ID": access_key,
+            "AWS_SECRET_ACCESS_KEY": secret_key,
+        }
+        use_session_credentials = credential_source == "session"
+        if not use_session_credentials:
+            snapshot = {
+                **base_snapshot,
+                "settings": [
+                    {"name": "s3_access_key_id", "value": access_key, "input_type": "VARCHAR"},
+                    {"name": "s3_secret_access_key", "value": secret_key, "input_type": "VARCHAR"},
+                    {"name": "s3_session_token", "value": "", "input_type": "VARCHAR"},
+                ],
+            }
+            effective_s3_config = {}
+        return _snapshot_database_identity(
+            snapshot,
+            session_id="session-a",
+            effective_s3_config=effective_s3_config,
+            use_session_credentials=use_session_credentials,
+        )
+
+    old_identity = identity(old_credential_source, "old-key", "old-secret")
+    new_identity = identity(new_credential_source, "new-key", "new-secret")
+    assert old_identity != new_identity
+    assert old_identity.replaces_s3_identity(new_identity) is True
+    assert new_identity.replaces_s3_identity(old_identity) is True
+    assert "old-key" not in repr(old_identity)
+    assert "old-secret" not in repr(old_identity)
+    assert "new-key" not in repr(new_identity)
+    assert "new-secret" not in repr(new_identity)
     connections = []
 
     class Cursor:
@@ -498,6 +529,32 @@ def test_worker_snapshot_database_identity_isolates_effective_s3_configuration()
     assert first != second
     assert first != explicit_snapshot_credentials
     assert first == first_with_different_refresh_deadline
+    assert "key-a" not in repr(first)
+    assert "secret-a" not in repr(first)
+
+
+def test_worker_snapshot_database_identity_hashes_explicit_s3_credentials():
+    def identity(access_key, secret_key):
+        return _snapshot_database_identity(
+            {
+                "duckdb_source_id": "test-source-id",
+                "extensions": [{"name": "httpfs", "version": "test-version"}],
+                "distributed_extension_contracts": [],
+                "settings": [
+                    {"name": "s3_access_key_id", "value": access_key, "input_type": "VARCHAR"},
+                    {"name": "s3_secret_access_key", "value": secret_key, "input_type": "VARCHAR"},
+                    {"name": "s3_session_token", "value": "", "input_type": "VARCHAR"},
+                ],
+            },
+            use_session_credentials=False,
+        )
+
+    first = identity("key-a", "secret-a")
+    second = identity("key-b", "secret-b")
+
+    assert first != second
+    assert first.settings == second.settings == ()
+    assert first.effective_s3_config_identity != second.effective_s3_config_identity
     assert "key-a" not in repr(first)
     assert "secret-a" not in repr(first)
 

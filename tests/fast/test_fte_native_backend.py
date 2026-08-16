@@ -3911,6 +3911,105 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     assert not dst.exists()
 
 
+@pytest.mark.parametrize(
+    ("fail_finalize", "expected_error_name", "expected_write_state"),
+    (
+        (False, "CopyResultUnavailableError", "committed"),
+        (True, "CopyOutcomeUnknownError", None),
+    ),
+    ids=("committed", "outcome-unknown"),
+)
+def test_native_cxx_extension_write_preserves_terminal_state_when_result_marshalling_fails(
+    fail_finalize,
+    expected_error_name,
+    expected_write_state,
+):
+    from vane.runners import copy_outcome
+
+    class NoOutputHandle:
+        def __init__(self, task, partition_id):
+            query_id = task.context()["query_id"]
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0)
+            self.worker_id = "extension-write-worker"
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
+
+        def release_result_payload(self):
+            return None
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+            self.drop_calls = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "extension-write-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [NoOutputHandle(task, len(self.handles) + index) for index, task in enumerate(tasks)]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(handle.task_id) for handle in self.handles],
+            }
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(query_id)
+
+        def shutdown(self):
+            return None
+
+    con = vane.connect()
+    query_id = f"extension-result-marshalling-{uuid.uuid4()}"
+    vane.ray_cxx._register_coordinator_only_extension_write_for_test(con)
+    plan = vane.ray_cxx._make_coordinator_only_extension_write_plan_for_test(
+        query_id,
+        fail_finalize=fail_finalize,
+        conn=con,
+    )
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._fail_next_extension_result_marshalling_for_test()
+    expected_error = getattr(copy_outcome, expected_error_name)
+
+    try:
+        with pytest.raises(expected_error) as error:
+            runner.run_copy_plan(plan, con)
+
+        assert error.value.operation_id == query_id
+        assert error.value.safe_to_retry is False
+        assert "planned extension result marshalling failure" in str(error.value)
+        if expected_write_state is not None:
+            assert error.value.write_state == expected_write_state
+        else:
+            assert "planned coordinator-only extension finalization failure" in str(error.value)
+        assert backend.drop_calls == [query_id]
+    finally:
+        con.close()
+
+
 def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 

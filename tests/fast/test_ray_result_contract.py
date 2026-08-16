@@ -1630,6 +1630,60 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert plan_calls == 1
 
 
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-result-unavailable"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
+            nonlocal plan_calls
+            plan_calls += 1
+            on_execution_started()
+            raise driver.CopyResultUnavailableError(
+                plan_id,
+                "planned result marshalling failure",
+            )
+
+    def _teardown(_self, actual_plan_id):
+        assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert drop_fragments is True
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    for operation in (
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+    ):
+        with pytest.raises(driver.CopyResultUnavailableError) as error:
+            asyncio.run(operation())
+        assert error.value.operation_id == plan_id
+        assert error.value.write_state == "committed"
+        assert error.value.safe_to_retry is False
+        assert "planned result marshalling failure" in str(error.value)
+
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
+
+    assert recovered.outcome is None
+    assert isinstance(recovered.error, driver.CopyResultUnavailableError)
+    assert recovered.error.write_state == "committed"
+    assert plan_calls == 1
+
+
 def test_query_driver_evicted_copy_outcome_refuses_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     first_plan_id = "copy-evicted-terminal-first"
@@ -1798,10 +1852,29 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert str(restored) == str(error)
 
 
+def test_copy_result_unavailable_error_preserves_terminal_state_across_serialization():
+    error = driver.CopyResultUnavailableError(
+        "committed-copy-operation",
+        "result marshalling failed",
+        ("teardown warning",),
+    )
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is driver.CopyResultUnavailableError
+    assert restored.operation_id == error.operation_id
+    assert restored.detail == error.detail
+    assert restored.cleanup_warnings == error.cleanup_warnings
+    assert restored.write_state == "committed"
+    assert restored.safe_to_retry is False
+    assert str(restored) == str(error)
+
+
 def test_copy_outcome_unknown_error_is_exported_from_ray_runner_package():
-    from vane.runners.ray import CopyOutcomeUnknownError
+    from vane.runners.ray import CopyOutcomeUnknownError, CopyResultUnavailableError
 
     assert CopyOutcomeUnknownError is driver.CopyOutcomeUnknownError
+    assert CopyResultUnavailableError is driver.CopyResultUnavailableError
 
 
 def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypatch):
