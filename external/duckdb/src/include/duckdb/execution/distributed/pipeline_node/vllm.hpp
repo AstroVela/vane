@@ -46,6 +46,10 @@ inline std::string BuildPoolName(const PipelineNodeContext &ctx, NodeID node_id)
 		query_id = std::to_string(ctx.query_idx());
 	}
 	auto safe_query = BuildUniquePoolComponent(query_id);
+	if (!ctx.session_id().empty()) {
+		auto safe_session = BuildUniquePoolComponent(ctx.session_id());
+		return "duckdb_vllm_" + safe_session + "_" + safe_query + "_" + std::to_string(node_id);
+	}
 	return "duckdb_vllm_" + safe_query + "_" + std::to_string(node_id);
 }
 

@@ -62,8 +62,10 @@ class PipelineNodeContext {
 public:
 	PipelineNodeContext() = default;
 
-	PipelineNodeContext(uint16_t query_idx, std::string query_id, NodeID node_id, NodeName node_name)
-	    : query_idx_(query_idx), query_id_(std::move(query_id)), node_id_(node_id), node_name_(std::move(node_name)) {
+	PipelineNodeContext(uint16_t query_idx, std::string query_id, NodeID node_id, NodeName node_name,
+	                    std::string session_id = "")
+	    : query_idx_(query_idx), query_id_(std::move(query_id)), node_id_(node_id), node_name_(std::move(node_name)),
+	      session_id_(std::move(session_id)) {
 	}
 
 	uint16_t query_idx() const {
@@ -77,6 +79,9 @@ public:
 	}
 	const NodeName &node_name() const {
 		return node_name_;
+	}
+	const std::string &session_id() const {
+		return session_id_;
 	}
 
 	std::unordered_map<std::string, std::string> to_hashmap() const {
@@ -94,6 +99,7 @@ private:
 	std::string query_id_ = "";
 	NodeID node_id_ = 0;
 	NodeName node_name_ = "";
+	std::string session_id_ = "";
 };
 
 class DistributedPipelineNode;
@@ -619,8 +625,8 @@ private:
 };
 
 inline PipelineNodeContext MakePipelineNodeContext(uint16_t query_idx, std::string query_id, NodeID node_id,
-                                                   NodeName node_name) {
-	return PipelineNodeContext(query_idx, std::move(query_id), node_id, std::move(node_name));
+                                                   NodeName node_name, std::string session_id = "") {
+	return PipelineNodeContext(query_idx, std::move(query_id), node_id, std::move(node_name), std::move(session_id));
 }
 
 template <typename T>
@@ -630,7 +636,7 @@ inline PipelineNodeContext InheritPipelineNodeContext(const std::shared_ptr<T> &
 		return PipelineNodeContext(0, "", node_id, std::move(node_name));
 	}
 	return PipelineNodeContext(child->context().query_idx(), child->context().query_id(), node_id,
-	                           std::move(node_name));
+	                           std::move(node_name), child->context().session_id());
 }
 
 // ---------------------------------------------------------------------------

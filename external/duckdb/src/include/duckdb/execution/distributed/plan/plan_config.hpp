@@ -20,6 +20,7 @@ struct PlanConfig {
 	shared_ptr<DatabaseInstance> db;
 	size_t num_partitions = 1;
 	size_t max_concurrent_tasks = 0;
+	std::string session_id;
 
 	PlanConfig() = default;
 	PlanConfig(uint16_t idx, std::string qid, DuckDBExecutionConfigRef cfg, size_t partitions = 1)

@@ -160,7 +160,8 @@ struct PyPhysicalPlanWrapper {
 		}
 
 		plan_ =
-		    std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, effective_query_id, physical_plan, cfg);
+		    std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, effective_query_id, physical_plan, cfg,
+		                                                      VaneSessionIdFromSnapshot(connection_snapshot_));
 		if (physical_plan && physical_plan->HasRoot()) {
 			AssignDataSourceQueryOwner(physical_plan->Root(), resource_query_id_);
 		}
