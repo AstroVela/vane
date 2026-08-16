@@ -34,7 +34,7 @@ Vane unifies multimodal data, intelligence, and continuous learning with Python 
 > [!NOTE]
 > **Project status**
 >
-> - **Vane Data** — Supports most of the capabilities described below and is under active development, but is **not yet production-ready**. Its interfaces and internals may continue to evolve as the codebase is reviewed and hardened.
+> - **Vane Data** — Supports most of the capabilities described below and is under active development. Its interfaces and internals may continue to evolve as the codebase is reviewed and hardened.
 > - **Vane RL** and **Vane Agent** — In the early stages of design and implementation. Their source code will be released in future updates.
   - **Vibe Coding and Agentic Engineering** — Some parts of our system were initially built through Vibe Coding. We are now continuously analyzing, understanding, and improving the codebase, applying an Agentic Engineering approach to drive iterative optimization and enhance the quality, maintainability, and efficiency of the system.
 
