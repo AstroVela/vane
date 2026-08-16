@@ -23,7 +23,7 @@ static constexpr auto REFRESH_INTERVAL = std::chrono::seconds(5);
 
 RayWorkerManager::RayWorkerManager(QueryCleanup query_cleanup)
     : manager_instance_id_(duckdb::UUID::ToString(duckdb::UUID::GenerateRandomUUID())),
-      query_cleanup_(std::move(query_cleanup)) {
+      query_cleanup_(std::move(query_cleanup)), query_lifecycles_("Ray worker manager") {
 }
 
 static std::vector<std::string> AbortWorkers(const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers) {
@@ -56,6 +56,16 @@ static bool IsUnselectedFteHandle(const RayWorkerRuntime::TaskResultHandleType &
 	       finished_status->selected_attempt_task_ids.end();
 }
 
+static std::string ExceptionMessage(const std::exception_ptr &error) {
+	try {
+		std::rethrow_exception(error);
+	} catch (const std::exception &ex) {
+		return ex.what();
+	} catch (...) {
+		return "unknown exception";
+	}
+}
+
 bool RayWorkerManager::BeginOperation() const {
 	lock_guard<mutex> guard(mutex_);
 	if (state_.shutdown_started) {
@@ -74,60 +84,13 @@ void RayWorkerManager::EndOperation() const {
 	shutdown_cv_.notify_all();
 }
 
-std::optional<std::string> RayWorkerManager::BeginQueryOperation(const string &query_id,
-                                                                 const string &requested_owner_query_id) {
-	if (query_id.empty()) {
-		throw std::invalid_argument("FTE query operation requires non-empty query_id");
-	}
-	lock_guard<mutex> guard(mutex_);
-	if (state_.shutdown_started) {
-		return std::nullopt;
-	}
-	auto existing_owner = state_.query_owner_by_query.find(query_id);
-	if (existing_owner == state_.query_owner_by_query.end() && requested_owner_query_id.empty()) {
-		return std::nullopt;
-	}
-	const auto owner_query_id = requested_owner_query_id.empty() ? existing_owner->second : requested_owner_query_id;
-	if (owner_query_id.empty()) {
-		throw std::invalid_argument("FTE query operation requires non-empty resource_query_id");
-	}
-	if (existing_owner != state_.query_owner_by_query.end() && existing_owner->second != owner_query_id) {
-		throw std::runtime_error("FTE query owner changed while active: query=" + query_id +
-		                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
-	}
-	auto owner_entry = state_.query_owner_by_query.find(owner_query_id);
-	if (owner_entry != state_.query_owner_by_query.end() && owner_entry->second != owner_query_id) {
-		throw std::runtime_error("FTE resource query is already owned by another query: " + owner_query_id);
-	}
-	if (state_.closed_query_owners.find(owner_query_id) != state_.closed_query_owners.end() ||
-	    state_.quiescing_query_owners.find(owner_query_id) != state_.quiescing_query_owners.end()) {
-		return std::nullopt;
-	}
-	state_.query_owner_by_query[owner_query_id] = owner_query_id;
-	state_.query_owner_by_query[query_id] = owner_query_id;
-	state_.active_query_operations_by_owner[owner_query_id]++;
-	return owner_query_id;
+std::optional<QueryLifecycleCoordinator::Operation>
+RayWorkerManager::BeginQueryOperation(const string &query_id, const string &requested_owner_query_id) {
+	return query_lifecycles_.BeginOperation(query_id, requested_owner_query_id, !requested_owner_query_id.empty());
 }
 
-void RayWorkerManager::EndQueryOperation(const string &owner_query_id) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto active = state_.active_query_operations_by_owner.find(owner_query_id);
-		D_ASSERT(active != state_.active_query_operations_by_owner.end());
-		D_ASSERT(active->second > 0);
-		if (--active->second == 0) {
-			state_.active_query_operations_by_owner.erase(active);
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-void RayWorkerManager::CloseQueryOwnerIngress(const string &owner_query_id) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		state_.closed_query_owners.insert(owner_query_id);
-	}
-	shutdown_cv_.notify_all();
+void RayWorkerManager::EndQueryOperation(const QueryLifecycleCoordinator::Operation &operation) {
+	query_lifecycles_.EndOperation(operation);
 }
 
 void RayWorkerManager::register_query_owner(const string &query_id, const string &owner_query_id) {
@@ -135,27 +98,16 @@ void RayWorkerManager::register_query_owner(const string &query_id, const string
 	if (!operation) {
 		throw std::runtime_error("cannot register FTE query ownership after Ray worker manager shutdown");
 	}
-	QueryOperationGuard query_operation(*this, query_id, owner_query_id);
-	if (!query_operation) {
-		throw std::runtime_error("cannot register closing FTE query lifecycle: " + query_id);
-	}
+	query_lifecycles_.RegisterImmediate(query_id, owner_query_id);
 }
 
-void RayWorkerManager::WaitForQueryOperationsWithoutGIL(const string &owner_query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	shutdown_cv_.wait(guard, [&]() {
-		return state_.active_query_operations_by_owner.find(owner_query_id) ==
-		       state_.active_query_operations_by_owner.end();
-	});
-}
-
-void RayWorkerManager::WaitForQueryOperations(const string &owner_query_id) {
+void RayWorkerManager::WaitForQueryOperations(const QueryLifecycleCoordinator::LifecycleRef &lifecycle) {
 	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 		py::gil_scoped_release release;
-		WaitForQueryOperationsWithoutGIL(owner_query_id);
+		query_lifecycles_.WaitForOperations(lifecycle);
 		return;
 	}
-	WaitForQueryOperationsWithoutGIL(owner_query_id);
+	query_lifecycles_.WaitForOperations(lifecycle);
 }
 
 void RayWorkerManager::RecordQueryWorkers(const string &owner_query_id,
@@ -169,66 +121,34 @@ void RayWorkerManager::RecordQueryWorkers(const string &owner_query_id,
 		owned_workers.push_back(worker);
 	}
 }
+std::optional<QueryLifecycleCoordinator::Abort> RayWorkerManager::BeginQueryAbort(const string &query_id) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginAbort(query_id);
+	}
+	return query_lifecycles_.BeginAbort(query_id);
+}
 
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbortWithoutGIL(const string &query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	auto mapped_owner = state_.query_owner_by_query.find(query_id);
-	if (mapped_owner == state_.query_owner_by_query.end()) {
-		return std::nullopt;
+std::optional<QueryLifecycleCoordinator::Abort>
+RayWorkerManager::BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginAbort(teardown);
 	}
-	const auto owner_query_id = mapped_owner->second;
-	while (true) {
-		auto active_abort = state_.quiescing_query_owners.find(owner_query_id);
-		if (active_abort == state_.quiescing_query_owners.end()) {
-			break;
-		}
-		const auto active_token = active_abort->second;
-		state_.quiesce_waiters_by_owner[owner_query_id]++;
-		shutdown_cv_.wait(guard, [&]() {
-			auto current = state_.quiescing_query_owners.find(owner_query_id);
-			return current == state_.quiescing_query_owners.end() || current->second != active_token;
-		});
-		auto waiter = state_.quiesce_waiters_by_owner.find(owner_query_id);
-		D_ASSERT(waiter != state_.quiesce_waiters_by_owner.end());
-		D_ASSERT(waiter->second > 0);
-		if (--waiter->second == 0) {
-			state_.quiesce_waiters_by_owner.erase(waiter);
-		}
-		shutdown_cv_.notify_all();
-		if (state_.quiesced_query_owners.find(owner_query_id) != state_.quiesced_query_owners.end()) {
-			return std::nullopt;
-		}
-	}
-	if (state_.quiesced_query_owners.find(owner_query_id) != state_.quiesced_query_owners.end()) {
-		return std::nullopt;
-	}
-	if (state_.shutdown_started) {
-		throw std::runtime_error("cannot abort FTE query while Ray worker manager is shutting down: " + query_id);
-	}
-	state_.closed_query_owners.insert(owner_query_id);
-	const auto token = state_.next_query_quiesce_token++;
-	if (state_.next_query_quiesce_token == 0) {
-		state_.next_query_quiesce_token = 1;
-	}
-	state_.quiescing_query_owners[owner_query_id] = token;
-	const bool had_active_operations =
-	    state_.active_query_operations_by_owner.find(owner_query_id) != state_.active_query_operations_by_owner.end();
+	return query_lifecycles_.BeginAbort(teardown);
+}
 
-	std::unordered_set<string> query_ids {owner_query_id};
-	for (const auto &entry : state_.query_owner_by_query) {
-		if (entry.second == owner_query_id) {
-			query_ids.insert(entry.first);
-		}
+std::optional<QueryLifecycleCoordinator::Teardown> RayWorkerManager::BeginQueryTeardown(const string &query_id) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginTeardown(query_id);
 	}
-	std::vector<string> ordered_query_ids(query_ids.begin(), query_ids.end());
-	std::sort(ordered_query_ids.begin(), ordered_query_ids.end(), [&](const string &lhs, const string &rhs) {
-		if ((lhs == owner_query_id) != (rhs == owner_query_id)) {
-			return lhs != owner_query_id;
-		}
-		return lhs < rhs;
-	});
+	return query_lifecycles_.BeginTeardown(query_id);
+}
 
+std::vector<std::shared_ptr<RayWorkerRuntime>> RayWorkerManager::QueryWorkers(const string &owner_query_id) const {
 	std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
+	lock_guard<mutex> guard(mutex_);
 	auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
 		if (worker && std::find(workers.begin(), workers.end(), worker) == workers.end()) {
 			workers.push_back(worker);
@@ -243,145 +163,7 @@ std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbortWit
 	for (const auto &entry : state_.ray_workers) {
 		add_worker(entry.second);
 	}
-	return QueryAbort {owner_query_id, std::move(ordered_query_ids), std::move(workers), token, had_active_operations};
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbort(const string &query_id) {
-	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
-		py::gil_scoped_release release;
-		return BeginQueryAbortWithoutGIL(query_id);
-	}
-	return BeginQueryAbortWithoutGIL(query_id);
-}
-
-void RayWorkerManager::EndQueryAbort(const string &owner_query_id, uint64_t token, bool succeeded) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto current = state_.quiescing_query_owners.find(owner_query_id);
-		if (current != state_.quiescing_query_owners.end() && current->second == token) {
-			state_.quiescing_query_owners.erase(current);
-			if (succeeded) {
-				state_.quiesced_query_owners.insert(owner_query_id);
-			}
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryDropWithoutGIL(const string &query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	while (true) {
-		auto mapped_owner = state_.query_owner_by_query.find(query_id);
-		if (mapped_owner == state_.query_owner_by_query.end()) {
-			return std::nullopt;
-		}
-		const auto owner_query_id = mapped_owner->second;
-		shutdown_cv_.wait(guard, [&]() {
-			return state_.quiesce_waiters_by_owner.find(owner_query_id) == state_.quiesce_waiters_by_owner.end();
-		});
-		auto active_drop = state_.dropping_query_owners.find(owner_query_id);
-		if (active_drop != state_.dropping_query_owners.end()) {
-			const auto active_token = active_drop->second;
-			shutdown_cv_.wait(guard, [&]() {
-				auto current = state_.dropping_query_owners.find(owner_query_id);
-				return current == state_.dropping_query_owners.end() || current->second != active_token;
-			});
-			continue;
-		}
-		if (state_.shutdown_started) {
-			throw std::runtime_error("cannot drop FTE query while Ray worker manager is shutting down: " + query_id);
-		}
-		if (state_.quiesced_query_owners.find(owner_query_id) == state_.quiesced_query_owners.end()) {
-			throw std::runtime_error("cannot drop FTE query before its abort barrier: " + query_id);
-		}
-		const auto token = state_.next_query_drop_token++;
-		if (state_.next_query_drop_token == 0) {
-			state_.next_query_drop_token = 1;
-		}
-		state_.dropping_query_owners[owner_query_id] = token;
-
-		std::unordered_set<string> query_ids {owner_query_id};
-		for (const auto &entry : state_.query_owner_by_query) {
-			if (entry.second == owner_query_id) {
-				query_ids.insert(entry.first);
-			}
-		}
-		std::vector<string> ordered_query_ids(query_ids.begin(), query_ids.end());
-		std::sort(ordered_query_ids.begin(), ordered_query_ids.end(), [&](const string &lhs, const string &rhs) {
-			if ((lhs == owner_query_id) != (rhs == owner_query_id)) {
-				return lhs != owner_query_id;
-			}
-			return lhs < rhs;
-		});
-
-		std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
-		auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
-			if (worker && std::find(workers.begin(), workers.end(), worker) == workers.end()) {
-				workers.push_back(worker);
-			}
-		};
-		auto owned_workers = state_.workers_by_query_owner.find(owner_query_id);
-		if (owned_workers != state_.workers_by_query_owner.end()) {
-			for (const auto &worker : owned_workers->second) {
-				add_worker(worker);
-			}
-		}
-		for (const auto &entry : state_.ray_workers) {
-			add_worker(entry.second);
-		}
-		return QueryAbort {owner_query_id, std::move(ordered_query_ids), std::move(workers), token, false};
-	}
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryDrop(const string &query_id) {
-	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
-		py::gil_scoped_release release;
-		return BeginQueryDropWithoutGIL(query_id);
-	}
-	return BeginQueryDropWithoutGIL(query_id);
-}
-
-void RayWorkerManager::EndQueryDrop(const string &owner_query_id, uint64_t token) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto current = state_.dropping_query_owners.find(owner_query_id);
-		if (current != state_.dropping_query_owners.end() && current->second == token) {
-			state_.dropping_query_owners.erase(current);
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-void RayWorkerManager::FinishQueryLifecycle(const string &owner_query_id, uint64_t drop_token) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto active_drop = state_.dropping_query_owners.find(owner_query_id);
-		if (active_drop == state_.dropping_query_owners.end() || active_drop->second != drop_token) {
-			throw std::runtime_error("cannot finish stale FTE query drop: " + owner_query_id);
-		}
-		if (state_.active_query_operations_by_owner.find(owner_query_id) !=
-		    state_.active_query_operations_by_owner.end()) {
-			throw std::runtime_error("cannot finish active FTE query lifecycle: " + owner_query_id);
-		}
-		if (state_.quiesced_query_owners.find(owner_query_id) == state_.quiesced_query_owners.end()) {
-			throw std::runtime_error("cannot finish FTE query lifecycle before quiescence: " + owner_query_id);
-		}
-		if (state_.quiesce_waiters_by_owner.find(owner_query_id) != state_.quiesce_waiters_by_owner.end()) {
-			throw std::runtime_error("cannot finish FTE query lifecycle with active abort waiters: " + owner_query_id);
-		}
-		for (auto entry = state_.query_owner_by_query.begin(); entry != state_.query_owner_by_query.end();) {
-			if (entry->second == owner_query_id) {
-				entry = state_.query_owner_by_query.erase(entry);
-			} else {
-				++entry;
-			}
-		}
-		state_.workers_by_query_owner.erase(owner_query_id);
-		state_.closed_query_owners.erase(owner_query_id);
-		state_.quiesced_query_owners.erase(owner_query_id);
-		state_.dropping_query_owners.erase(active_drop);
-	}
-	shutdown_cv_.notify_all();
+	return workers;
 }
 
 bool RayWorkerManager::ShutdownStarted() const {
@@ -792,7 +574,7 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 		}
 		try {
 			auto fail_submission = [&](const DuckDBError &error) {
-				CloseQueryOwnerIngress(query_operation.owner_query_id());
+				query_lifecycles_.Close(query_operation.lifecycle());
 				return DuckDBResult<void>::err(error);
 			};
 			auto collect_workers = [&]() {
@@ -837,12 +619,12 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 		} catch (const py::error_already_set &e) {
 			// Publish the Python exception before the query operation is allowed
 			// to quiesce or shutdown to discard its owner state.
-			CloseQueryOwnerIngress(query_operation.owner_query_id());
+			query_lifecycles_.Close(query_operation.lifecycle());
 			submission_errors_.Store(query_operation.owner_query_id(), e);
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python error during submit_fte_task_events: ") + e.what()));
 		} catch (const std::exception &e) {
-			CloseQueryOwnerIngress(query_operation.owner_query_id());
+			query_lifecycles_.Close(query_operation.lifecycle());
 			return DuckDBResult<void>::err(DuckDBError(string("submit_fte_task_events failed: ") + e.what()));
 		}
 	} catch (const py::error_already_set &e) {
@@ -853,14 +635,7 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 }
 
 void RayWorkerManager::rethrow_submission_error(const string &query_id, const string &details) {
-	string owner_query_id = query_id;
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto owner = state_.query_owner_by_query.find(query_id);
-		if (owner != state_.query_owner_by_query.end()) {
-			owner_query_id = owner->second;
-		}
-	}
+	const auto owner_query_id = query_lifecycles_.OwnerForQuery(query_id);
 	auto message = string("distributed worker task submission failed for query_id=") + query_id;
 	if (!details.empty()) {
 		message += "; execution error: " + details;
@@ -1131,6 +906,15 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 			return DuckDBResult<void>::ok();
 		}
 		state_.shutdown_started = true;
+	}
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		query_lifecycles_.BeginShutdown();
+	} else {
+		query_lifecycles_.BeginShutdown();
+	}
+	{
+		lock_guard<mutex> guard(mutex_);
 		workers.reserve(state_.ray_workers.size());
 		for (auto &kv : state_.ray_workers) {
 			workers.push_back(kv.second);
@@ -1178,26 +962,22 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 	decltype(state_.fte_result_handles_by_query) result_handles;
 	decltype(state_.retained_fte_result_handles_by_query) retained_result_handles;
 	decltype(state_.workers_by_query_owner) query_workers;
-	std::unordered_set<string> owner_query_ids;
 	{
 		std::unique_lock<mutex> guard(mutex_);
 		shutdown_cv_.wait(guard, [&]() { return state_.active_operations == 0; });
-		for (const auto &entry : state_.query_owner_by_query) {
-			owner_query_ids.insert(entry.second);
-		}
 		state_.ray_workers.clear();
 		result_handles = std::move(state_.fte_result_handles_by_query);
 		retained_result_handles = std::move(state_.retained_fte_result_handles_by_query);
 		query_workers = std::move(state_.workers_by_query_owner);
-		state_.query_owner_by_query.clear();
-		state_.active_query_operations_by_owner.clear();
-		state_.closed_query_owners.clear();
-		state_.quiesced_query_owners.clear();
-		state_.quiescing_query_owners.clear();
-		state_.quiesce_waiters_by_owner.clear();
-		state_.dropping_query_owners.clear();
 		state_.last_refresh = {};
 	}
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		query_lifecycles_.WaitForAllOperations();
+	} else {
+		query_lifecycles_.WaitForAllOperations();
+	}
+	const auto owner_query_ids = query_lifecycles_.OwnerQueryIds();
 	result_handles.clear();
 	retained_result_handles.clear();
 	query_workers.clear();
@@ -1212,6 +992,27 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 			}
 		}
 		submission_errors_.Discard(owner_query_id);
+	}
+	try {
+		query_lifecycles_.FinishShutdown(true);
+	} catch (const std::exception &ex) {
+		errors.push_back(string("query lifecycle shutdown: ") + ex.what());
+		try {
+			query_lifecycles_.FinishShutdown(false);
+		} catch (const std::exception &finish_ex) {
+			errors.push_back(string("query lifecycle shutdown recovery: ") + finish_ex.what());
+		} catch (...) {
+			errors.push_back("query lifecycle shutdown recovery: unknown error");
+		}
+	} catch (...) {
+		errors.push_back("query lifecycle shutdown: unknown error");
+		try {
+			query_lifecycles_.FinishShutdown(false);
+		} catch (const std::exception &finish_ex) {
+			errors.push_back(string("query lifecycle shutdown recovery: ") + finish_ex.what());
+		} catch (...) {
+			errors.push_back("query lifecycle shutdown recovery: unknown error");
+		}
 	}
 	std::string error_message;
 	if (!errors.empty()) {
@@ -1269,6 +1070,68 @@ DuckDBResult<void> RayWorkerManager::close_session(const string &session_id) {
 	return DuckDBResult<void>::ok();
 }
 
+DuckDBResult<void> RayWorkerManager::ExecuteQueryAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort) {
+	if (!active_abort) {
+		return DuckDBResult<void>::ok();
+	}
+
+	std::optional<string> failure;
+	try {
+		std::vector<string> errors;
+		auto prepare_workers = [&]() {
+			const auto workers = QueryWorkers(active_abort->lifecycle.owner_query_id);
+			for (const auto &execution_query_id : active_abort->execution_query_ids) {
+				for (const auto &worker : workers) {
+					const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
+					try {
+						worker->PrepareDropQuery(execution_query_id);
+					} catch (const std::exception &ex) {
+						errors.push_back(execution_query_id + "@" + worker_id + ": " + ex.what());
+					} catch (...) {
+						errors.push_back(execution_query_id + "@" + worker_id + ": unknown abort error");
+					}
+				}
+			}
+		};
+		prepare_workers();
+		if (errors.empty()) {
+			WaitForQueryOperations(active_abort->lifecycle);
+			if (active_abort->had_active_operations) {
+				prepare_workers();
+			}
+		}
+		if (!errors.empty()) {
+			failure = "resource query abort barrier failed with " + std::to_string(errors.size()) + " error(s)";
+			for (const auto &error : errors) {
+				*failure += "; " + error;
+			}
+		}
+	} catch (const std::exception &ex) {
+		failure = string("resource query abort orchestration failed: ") + ex.what();
+	} catch (...) {
+		failure = "resource query abort orchestration failed: unknown error";
+	}
+	try {
+		query_lifecycles_.CompleteAbort(*active_abort, failure);
+	} catch (const std::exception &ex) {
+		if (failure) {
+			*failure += "; lifecycle completion: " + string(ex.what());
+		} else {
+			failure = string("resource query abort lifecycle completion failed: ") + ex.what();
+		}
+	} catch (...) {
+		if (failure) {
+			*failure += "; lifecycle completion: unknown error";
+		} else {
+			failure = "resource query abort lifecycle completion failed: unknown error";
+		}
+	}
+	if (failure) {
+		return DuckDBResult<void>::err(DuckDBError::external_error(std::move(*failure)));
+	}
+	return DuckDBResult<void>::ok();
+}
+
 DuckDBResult<void> RayWorkerManager::abort_and_quiesce_query(const string &query_id) {
 	if (query_id.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("FTE query abort requires non-empty query_id"));
@@ -1277,84 +1140,13 @@ DuckDBResult<void> RayWorkerManager::abort_and_quiesce_query(const string &query
 	if (!operation) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 	}
-	std::optional<QueryAbort> active_abort;
 	try {
-		active_abort = BeginQueryAbort(query_id);
+		return ExecuteQueryAbort(BeginQueryAbort(query_id));
 	} catch (const std::exception &ex) {
 		return DuckDBResult<void>::err(DuckDBError::external_error(ex.what()));
 	} catch (...) {
 		return DuckDBResult<void>::err(
 		    DuckDBError::external_error("unknown error while starting resource query abort"));
-	}
-	if (!active_abort) {
-		return DuckDBResult<void>::ok();
-	}
-
-	try {
-		std::vector<string> errors;
-		auto prepare_workers = [&]() {
-			try {
-				for (const auto &execution_query_id : active_abort->execution_query_ids) {
-					for (const auto &worker : active_abort->workers) {
-						const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
-						try {
-							worker->PrepareDropQuery(execution_query_id);
-						} catch (const std::exception &ex) {
-							errors.push_back(execution_query_id + "@" + worker_id + ": " + ex.what());
-						} catch (...) {
-							errors.push_back(execution_query_id + "@" + worker_id + ": unknown abort error");
-						}
-					}
-				}
-			} catch (const std::exception &ex) {
-				errors.push_back(string("abort orchestration: ") + ex.what());
-			} catch (...) {
-				errors.push_back("abort orchestration: unknown error");
-			}
-		};
-		prepare_workers();
-		if (errors.empty()) {
-			WaitForQueryOperations(active_abort->owner_query_id);
-			if (active_abort->had_active_operations) {
-				{
-					lock_guard<mutex> guard(mutex_);
-					auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
-						if (worker && std::find(active_abort->workers.begin(), active_abort->workers.end(), worker) ==
-						                  active_abort->workers.end()) {
-							active_abort->workers.push_back(worker);
-						}
-					};
-					auto owned_workers = state_.workers_by_query_owner.find(active_abort->owner_query_id);
-					if (owned_workers != state_.workers_by_query_owner.end()) {
-						for (const auto &worker : owned_workers->second) {
-							add_worker(worker);
-						}
-					}
-					for (const auto &entry : state_.ray_workers) {
-						add_worker(entry.second);
-					}
-				}
-				prepare_workers();
-			}
-		}
-		const bool succeeded = errors.empty();
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, succeeded);
-		if (!succeeded) {
-			string message = "resource query abort barrier failed with " + std::to_string(errors.size()) + " error(s)";
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			return DuckDBResult<void>::err(DuckDBError::external_error(std::move(message)));
-		}
-		return DuckDBResult<void>::ok();
-	} catch (const std::exception &ex) {
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, false);
-		return DuckDBResult<void>::err(
-		    DuckDBError::external_error(string("resource query abort orchestration failed: ") + ex.what()));
-	} catch (...) {
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, false);
-		return DuckDBResult<void>::err(
-		    DuckDBError::external_error("resource query abort orchestration failed: unknown error"));
 	}
 }
 
@@ -1366,18 +1158,20 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	if (!operation) {
 		throw std::runtime_error("Ray worker manager is shut down");
 	}
-	auto abort_res = abort_and_quiesce_query(query_id);
-	if (abort_res.is_err()) {
-		throw std::runtime_error(abort_res.error().what());
-	}
-	auto active_drop = BeginQueryDrop(query_id);
-	if (!active_drop) {
+	auto teardown = BeginQueryTeardown(query_id);
+	if (!teardown) {
 		return;
 	}
 	try {
+		auto abort_res = ExecuteQueryAbort(BeginQueryAbort(*teardown));
+		if (abort_res.is_err()) {
+			throw std::runtime_error(abort_res.error().what());
+		}
+		query_lifecycles_.MarkDropping(*teardown);
+		const auto workers = QueryWorkers(teardown->lifecycle.owner_query_id);
 		std::vector<string> errors;
-		for (const auto &execution_query_id : active_drop->execution_query_ids) {
-			for (const auto &worker : active_drop->workers) {
+		for (const auto &execution_query_id : teardown->execution_query_ids) {
+			for (const auto &worker : workers) {
 				const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
 				try {
 					worker->CleanupQuery(execution_query_id);
@@ -1397,7 +1191,7 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 			throw std::runtime_error(std::move(message));
 		}
 
-		for (const auto &execution_query_id : active_drop->execution_query_ids) {
+		for (const auto &execution_query_id : teardown->execution_query_ids) {
 			try {
 				ClearFteResultHandles(execution_query_id);
 			} catch (const std::exception &ex) {
@@ -1414,13 +1208,24 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 			throw std::runtime_error(std::move(message));
 		}
 		if (query_cleanup_) {
-			query_cleanup_(active_drop->owner_query_id);
+			query_cleanup_(teardown->lifecycle.owner_query_id);
 		}
-		submission_errors_.Discard(active_drop->owner_query_id);
-		FinishQueryLifecycle(active_drop->owner_query_id, active_drop->token);
+		submission_errors_.Discard(teardown->lifecycle.owner_query_id);
+		{
+			lock_guard<mutex> guard(mutex_);
+			state_.workers_by_query_owner.erase(teardown->lifecycle.owner_query_id);
+		}
+		query_lifecycles_.CompleteTeardown(*teardown, std::nullopt);
 	} catch (...) {
-		EndQueryDrop(active_drop->owner_query_id, active_drop->token);
-		throw;
+		auto failure = ExceptionMessage(std::current_exception());
+		try {
+			query_lifecycles_.CompleteTeardown(*teardown, failure);
+		} catch (const std::exception &ex) {
+			failure += "; lifecycle completion: " + string(ex.what());
+		} catch (...) {
+			failure += "; lifecycle completion: unknown error";
+		}
+		throw std::runtime_error(std::move(failure));
 	}
 }
 
