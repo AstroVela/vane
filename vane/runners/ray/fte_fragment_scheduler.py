@@ -1236,7 +1236,7 @@ def _fte_partition_attempt_identity(
     fragment_execution_id: int,
     fragment_id: str,
     partition_id: int,
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     fragment_execution = _FTE_FRAGMENT_EXECUTIONS.get((str(query_id), str(fragment_id)))
     if fragment_execution is None:
         raise KeyError(f"FTE fragment execution {query_id}/{fragment_id} is not registered")
@@ -1248,8 +1248,9 @@ def _fte_partition_attempt_identity(
     partition = fragment_execution.partitions.get(int(partition_id))
     if partition is None:
         raise KeyError(f"FTE partition {query_id}/{fragment_id}/{partition_id} is not registered")
-    attempt = FteTaskAttemptId(partition.task_id, partition.next_attempt_number())
-    return str(partition.task_id), str(attempt)
+    attempt_number = partition.next_attempt_number()
+    attempt = FteTaskAttemptId(partition.task_id, attempt_number)
+    return str(partition.task_id), str(attempt), attempt_number > 0
 
 
 def _set_fte_pending_reservation_blocked_reason(
@@ -1301,7 +1302,7 @@ def _acquire_fte_partition_task_lease(
             memory_requirement_bytes=0,
             blocked_reason=blocked_reason,
         )
-    task_id, attempt_id = _fte_partition_attempt_identity(
+    task_id, attempt_id, recovery = _fte_partition_attempt_identity(
         query_id,
         fragment_execution_id,
         fragment_id,
@@ -1320,7 +1321,10 @@ def _acquire_fte_partition_task_lease(
         # it against persistent driver waiters, but a denial leaves ownership
         # with the FTE descriptor queue instead of creating one QRM waiter per
         # logical partition.
-        grant = manager.try_acquire_task_descriptor(request)
+        grant = manager.try_acquire_task_descriptor(
+            request,
+            recovery=recovery,
+        )
     except BaseException:
         release_fte_partition_submission(
             query_id,

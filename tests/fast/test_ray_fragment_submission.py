@@ -8325,7 +8325,8 @@ def test_fte_aggregate_soft_denial_does_not_retry_a_different_worker(monkeypatch
     manager = get_query_resource_manager(query_id)
     requests = []
 
-    def try_descriptor(request):
+    def try_descriptor(request, *, recovery=False):
+        assert recovery is False
         requests.append(request)
         return TaskGrant(
             False,
@@ -8373,7 +8374,9 @@ def test_fte_worker_selection_error_does_not_create_a_qrm_probe(monkeypatch):
     monkeypatch.setattr(
         manager,
         "try_acquire_task_descriptor",
-        lambda _request: (_ for _ in ()).throw(AssertionError("QRM must not be consulted before a worker is selected")),
+        lambda _request, *, recovery=False: (_ for _ in ()).throw(
+            AssertionError("QRM must not be consulted before a worker is selected")
+        ),
     )
 
     class _Coordinator:

@@ -2058,6 +2058,289 @@ def test_task_liveness_cannot_move_back_upstream():
     assert upstream_request.blocked_reason == "liveness_task_active"
 
 
+def test_recovery_descriptor_can_restart_root_behind_live_downstream_lease():
+    root = _unit(
+        "resource:f:retry-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:retry-downstream",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    unrelated = _unit(
+        "resource:f:unrelated-live-task",
+        target=0,
+        blocks=0,
+        backend="ray_worker",
+    )
+    manager = _manager(
+        root,
+        downstream,
+        unrelated,
+        terminals=(downstream.resource_unit_id, unrelated.resource_unit_id),
+        resources=_r(store=100),
+    )
+    _ready(
+        manager,
+        root.resource_unit_id,
+        downstream.resource_unit_id,
+        unrelated.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    unrelated_task = manager.try_acquire_task(
+        _task(
+            unrelated.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-c",
+        )
+    )
+    assert downstream_task.granted and not downstream_task.liveness
+    assert unrelated_task.granted and not unrelated_task.liveness
+    manager.update_allocation(
+        _allocation(_r(store=20), generation=2),
+        admission_open=True,
+    )
+    retry = _task(
+        root.resource_unit_id,
+        0,
+        attempt="1",
+        retained=0,
+        node_id="node-a",
+    )
+
+    ordinary = manager.try_acquire_task_descriptor(retry)
+    recovery = manager.try_acquire_task_descriptor(retry, recovery=True)
+
+    assert not ordinary.granted
+    assert ordinary.blocked_reason == "liveness_task_active"
+    assert recovery.granted and recovery.liveness
+
+
+def test_recovery_descriptor_cannot_open_an_unrelated_root():
+    required_root = _unit(
+        "resource:f:required-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:active-downstream",
+        inputs=(required_root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    unrelated_root = _unit(
+        "resource:f:unrelated-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(
+        required_root,
+        downstream,
+        unrelated_root,
+        terminals=(downstream.resource_unit_id, unrelated_root.resource_unit_id),
+        resources=_r(),
+    )
+    _ready(
+        manager,
+        required_root.resource_unit_id,
+        downstream.resource_unit_id,
+        unrelated_root.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            unrelated_root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
+
+
+def test_recovery_descriptor_cannot_move_a_non_root_back_upstream():
+    root = _unit(
+        "resource:f:root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    middle = _unit(
+        "resource:f:middle",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:downstream",
+        inputs=(middle.resource_unit_id,),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(root, middle, downstream, resources=_r())
+    _ready(
+        manager,
+        root.resource_unit_id,
+        middle.resource_unit_id,
+        downstream.resource_unit_id,
+    )
+
+    downstream_task = manager.try_acquire_task(_task(downstream.resource_unit_id, 0, retained=0, node_id="node-b"))
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            middle.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
+
+
+def test_recovery_descriptor_can_extend_an_active_liveness_chain_back_to_root():
+    root = _unit(
+        "resource:f:retry-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    downstream = _unit(
+        "resource:f:active-downstream",
+        inputs=(root.resource_unit_id,),
+        target=10,
+        blocks=2,
+        backend="ray_worker",
+    )
+    manager = _manager(root, downstream, resources=_r())
+    _ready(manager, root.resource_unit_id, downstream.resource_unit_id)
+
+    downstream_task = manager.try_acquire_task(
+        _task(
+            downstream.resource_unit_id,
+            0,
+            retained=0,
+            node_id="node-b",
+        )
+    )
+    assert downstream_task.granted and downstream_task.liveness
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-a",
+        ),
+        recovery=True,
+    )
+
+    assert recovery.granted and recovery.liveness
+    active = manager.snapshot()["liveness"]["active_task_lease_ids_by_unit"]
+    assert active == {
+        downstream.resource_unit_id: downstream_task.lease.lease_id,
+        root.resource_unit_id: recovery.lease.lease_id,
+    }
+
+
+def test_recovery_descriptor_keeps_retiring_liveness_tokens_in_the_chain():
+    left_root = _unit(
+        "resource:f:left-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    right_root = _unit(
+        "resource:f:right-root",
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    join = _unit(
+        "resource:f:join",
+        inputs=(left_root.resource_unit_id, right_root.resource_unit_id),
+        target=10,
+        blocks=1,
+        backend="ray_worker",
+    )
+    manager = _manager(left_root, right_root, join, resources=_r())
+    _ready(
+        manager,
+        left_root.resource_unit_id,
+        right_root.resource_unit_id,
+        join.resource_unit_id,
+    )
+
+    left_task = manager.try_acquire_task(_task(left_root.resource_unit_id, 0, retained=0, node_id="node-a"))
+    join_task = manager.try_acquire_task(_task(join.resource_unit_id, 0, retained=0, node_id="node-b"))
+    assert left_task.granted and left_task.liveness
+    assert join_task.granted and join_task.liveness
+
+    manager.update_unit_state(
+        left_root.resource_unit_id,
+        runnable=False,
+        completed=True,
+    )
+    manager.update_allocation(
+        _allocation(_r(), generation=2),
+        admission_open=True,
+    )
+    assert left_root.resource_unit_id not in manager.current_eligible_resource_unit_ids()
+
+    recovery = manager.try_acquire_task_descriptor(
+        _task(
+            right_root.resource_unit_id,
+            0,
+            attempt="1",
+            retained=0,
+            node_id="node-c",
+        ),
+        recovery=True,
+    )
+
+    assert not recovery.granted
+    assert recovery.blocked_reason == "liveness_task_active"
+
+
 def test_task_liveness_can_cross_a_diamond_only_after_convergence():
     source = _unit("resource:f:diamond-source", target=0, blocks=0)
     left = _unit(

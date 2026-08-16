@@ -71,7 +71,46 @@ from vane.runners.ray.query_resource_runtime import (
 )
 
 
-def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monkeypatch):
+@pytest.mark.parametrize(("attempt_number", "recovery"), [(0, False), (1, True)])
+def test_fte_partition_attempt_identity_marks_only_retries_as_recovery(
+    monkeypatch,
+    attempt_number,
+    recovery,
+):
+    query_id = "query-attempt-identity"
+    fragment_id = "fragment-attempt-identity"
+    task_id = FteTaskId(query_id, 7, 0)
+    fragment_execution = SimpleNamespace(
+        fragment_execution_id=7,
+        partitions={
+            0: SimpleNamespace(
+                task_id=task_id,
+                next_attempt_number=lambda: attempt_number,
+            )
+        },
+    )
+    monkeypatch.setitem(
+        _FTE_FRAGMENT_EXECUTIONS,
+        (query_id, fragment_id),
+        fragment_execution,
+    )
+
+    identity = fte_fragment_scheduler._fte_partition_attempt_identity(
+        query_id,
+        7,
+        fragment_id,
+        0,
+    )
+
+    assert identity == (
+        str(task_id),
+        str(FteTaskAttemptId(task_id, attempt_number)),
+        recovery,
+    )
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monkeypatch, recovery):
     lease = object()
     descriptor_requests = []
     submission_events = []
@@ -85,14 +124,14 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
             self.lease = lease
 
     class _Manager:
-        def try_acquire_task_descriptor(self, request):
-            descriptor_requests.append(request)
+        def try_acquire_task_descriptor(self, request, *, recovery=False):
+            descriptor_requests.append((request, recovery))
             return _Grant()
 
     monkeypatch.setattr(
         fte_fragment_scheduler,
         "_fte_partition_attempt_identity",
-        lambda *_args: ("task:0", "task:0/attempt:0"),
+        lambda *_args: ("task:0", f"task:0/attempt:{int(recovery)}", recovery),
     )
     monkeypatch.setattr(
         fte_fragment_scheduler,
@@ -127,6 +166,7 @@ def test_fte_partition_admission_uses_non_persistent_descriptor_arbitration(monk
 
     assert result is lease
     assert len(descriptor_requests) == 1
+    assert descriptor_requests[0][1] is recovery
     assert [event[0] for event in submission_events] == ["admit", "resolve"]
     assert submission_events[-1][2]["granted"] is True
 
