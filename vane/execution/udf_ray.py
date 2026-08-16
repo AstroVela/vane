@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -18,6 +18,10 @@ from vane.execution._common import callable_cache_enabled as _callable_cache_ena
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
 from vane.execution.ray_stream_adapter import TaskLeaseObjectRefGenerator
+from vane.execution.udf_arrow_parquet_sink import (
+    terminal_arrow_parquet_sink_enabled,
+    write_terminal_arrow_parquet_output,
+)
 from vane.execution.udf_ray_actor_pool import (
     UDFActorPoolBase as _UDFActorPoolBase,
 )
@@ -807,45 +811,51 @@ def _iter_materialized_task_outputs(
             output_index += 1
             yield block, metadata
 
+    def execute_outputs() -> Iterator[pa.Table]:
+        call_mode = str(stream_payload.get("call_mode") or "")
+        if call_mode == "map":
+            for raw_table in tables:
+                yield _execute_scalar_map_layout(
+                    stream_payload,
+                    _ensure_table(raw_table),
+                    executor,
+                )
+            executor.finished_submitting()
+            return
+        if call_mode == "map_batches_rows":
+            for raw_table in tables:
+                yield _execute_row_preserving_batch_layout(
+                    stream_payload,
+                    _ensure_table(raw_table),
+                    executor,
+                )
+            executor.finished_submitting()
+            return
+        for raw_table in tables:
+            yield from executor.iter_submit(_ensure_table(raw_table))
+        executor.finished_submitting()
+        yield from executor.drain_outputs()
+
     # close() must run on every exit — errors and abandoned generators
     # included: with callable caching the AI wrapper outlives this executor,
     # and a skipped close would strand its provider client on a dead loop.
     try:
-        if str(stream_payload.get("call_mode") or "") == "map":
-            for raw_table in tables:
-                for block, metadata in emit(
-                    _execute_scalar_map_layout(
-                        stream_payload,
-                        _ensure_table(raw_table),
-                        executor,
-                    )
-                ):
-                    yield block
-                    yield metadata
-            executor.finished_submitting()
-            return
-
-        if str(stream_payload.get("call_mode") or "") == "map_batches_rows":
-            for raw_table in tables:
-                for block, metadata in emit(
-                    _execute_row_preserving_batch_layout(
-                        stream_payload,
-                        _ensure_table(raw_table),
-                        executor,
-                    )
-                ):
-                    yield block
-                    yield metadata
-            executor.finished_submitting()
-            return
-
-        for raw_table in tables:
-            for output in executor.iter_submit(_ensure_table(raw_table)):
-                for block, metadata in emit(output):
-                    yield block
-                    yield metadata
-        executor.finished_submitting()
-        for output in executor.drain_outputs():
+        outputs: Iterable[pa.Table]
+        if terminal_arrow_parquet_sink_enabled(stream_payload) and not any(
+            _ensure_table(table).num_rows for table in tables
+        ):
+            outputs = ()
+        else:
+            outputs = execute_outputs()
+        if terminal_arrow_parquet_sink_enabled(stream_payload):
+            outputs = (
+                write_terminal_arrow_parquet_output(
+                    stream_payload,
+                    outputs,
+                    invocation_id=str(stream_payload.get("task_lease_id") or ""),
+                ),
+            )
+        for output in outputs:
             for block, metadata in emit(output):
                 yield block
                 yield metadata
@@ -990,12 +1000,24 @@ def _iter_ref_bundle_task_outputs(
         # executor, and a skipped close would strand its provider client on
         # a dead loop.
         try:
-            for output in executor.iter_submit(table):
-                for block, output_metadata in emit_output(output):
-                    yield block
-                    yield output_metadata
-            executor.finished_submitting()
-            for output in executor.drain_outputs():
+
+            def execute_outputs() -> Iterator[pa.Table]:
+                if table.num_rows == 0 and terminal_arrow_parquet_sink_enabled(stream_payload):
+                    return
+                yield from executor.iter_submit(table)
+                executor.finished_submitting()
+                yield from executor.drain_outputs()
+
+            outputs: Iterable[pa.Table] = execute_outputs()
+            if terminal_arrow_parquet_sink_enabled(stream_payload):
+                outputs = (
+                    write_terminal_arrow_parquet_output(
+                        stream_payload,
+                        outputs,
+                        invocation_id=str(stream_payload.get("task_lease_id") or ""),
+                    ),
+                )
+            for output in outputs:
                 for block, output_metadata in emit_output(output):
                     yield block
                     yield output_metadata
@@ -1013,6 +1035,16 @@ def _iter_ref_bundle_task_outputs(
         return
 
     if call_mode == "map_batches_rows":
+        if table.num_rows == 0 and terminal_arrow_parquet_sink_enabled(payload):
+            statistics = write_terminal_arrow_parquet_output(
+                payload,
+                (),
+                invocation_id=str(payload.get("task_lease_id") or ""),
+            )
+            for output_index, block in enumerate(iter_bounded_stream_blocks(statistics, payload)):
+                yield block
+                yield make_stream_block_metadata(block, payload, output_index=output_index)
+            return
         executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
         configure_loaded_torch_threads()
         try:
@@ -1020,6 +1052,12 @@ def _iter_ref_bundle_task_outputs(
             executor.finished_submitting()
         finally:
             executor.close()
+        if terminal_arrow_parquet_sink_enabled(payload):
+            fused = write_terminal_arrow_parquet_output(
+                payload,
+                (fused,),
+                invocation_id=str(payload.get("task_lease_id") or ""),
+            )
         for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
             yield block
             yield make_stream_block_metadata(block, payload, output_index=output_index)
@@ -1028,12 +1066,29 @@ def _iter_ref_bundle_task_outputs(
     if call_mode != "map":
         raise RuntimeError("ray_task ref bundle input requires call_mode=map, map_batches, or flat_map")
 
+    if table.num_rows == 0 and terminal_arrow_parquet_sink_enabled(payload):
+        statistics = write_terminal_arrow_parquet_output(
+            payload,
+            (),
+            invocation_id=str(payload.get("task_lease_id") or ""),
+        )
+        for output_index, block in enumerate(iter_bounded_stream_blocks(statistics, payload)):
+            yield block
+            yield make_stream_block_metadata(block, payload, output_index=output_index)
+        return
+
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
     try:
         fused = _execute_scalar_map_layout(payload, table, executor)
     finally:
         executor.close()
+    if terminal_arrow_parquet_sink_enabled(payload):
+        fused = write_terminal_arrow_parquet_output(
+            payload,
+            (fused,),
+            invocation_id=str(payload.get("task_lease_id") or ""),
+        )
     for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
         yield block
         yield make_stream_block_metadata(block, payload, output_index=output_index)

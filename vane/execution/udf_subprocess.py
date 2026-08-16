@@ -60,6 +60,7 @@ from vane.execution.udf_admission import (
     LocalExecutionSlotPool,
     LocalSlotAdmissionAuthority,
 )
+from vane.execution.udf_arrow_parquet_sink import terminal_arrow_parquet_sink_payload
 from vane.execution.udf_lifecycle import (
     ExecutionCancellationScope,
     ExecutionCancelledError,
@@ -86,6 +87,8 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+
+_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY = "_vane_terminal_arrow_parquet_payload"
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -336,6 +339,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._wakeup: Callable[[], None] | None = None
         self._wakeup_error: BaseException | None = None
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
+        self._terminal_arrow_parquet_payload = terminal_arrow_parquet_sink_payload(payload)
         self._worker_env = dict(worker_env or {})
         self._session_config = (
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
@@ -742,9 +746,18 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if self._broken_error is None:
             self._broken_error = f"UDF subprocess wakeup callback failed: {exc}"
 
-    def _submit_table(self, args: pa.Table) -> Any | None:
+    def _submit_table(
+        self,
+        args: pa.Table,
+        terminal_arrow_parquet_payload: dict[str, Any] | None = None,
+    ) -> Any | None:
         args = _ensure_table(args)
-        if args.num_rows == 0:
+        terminal_payload = (
+            terminal_arrow_parquet_payload
+            if terminal_arrow_parquet_payload is not None
+            else self._terminal_arrow_parquet_payload
+        )
+        if args.num_rows == 0 and terminal_payload is None:
             return None
 
         scope = self._current_execution_scope()
@@ -763,10 +776,12 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 names,
                 submit_id=None,
                 name="udf-materialized-input",
-                reserve_output_credit=self._ref_bundle_output,
+                reserve_output_credit=self._ref_bundle_output and terminal_payload is None,
             )
             if worker_payload is None:
                 raise RuntimeError("local_shm descriptor creation failed for subprocess submit")
+            if terminal_payload is not None:
+                worker_payload[_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY] = terminal_payload
             return self._submit_ref_bundle_direct(worker_payload)
         except BaseException as submit_error:
             cleanup_error: BaseException | None = None
@@ -949,7 +964,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _submit_ref_bundle_direct(self, payload: dict[str, Any]) -> Any | None:
         lease_id_raw = payload.get("input_lease_id")
-        if payload.get("estimated_num_rows") == 0:
+        if payload.get("estimated_num_rows") == 0 and payload.get(_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY) is None:
             # The worker will never receive this bundle and therefore cannot
             # acknowledge its lease. Cancel rather than consume it so an empty
             # result does not leave behind unused output credit.
@@ -2576,7 +2591,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         self._pending_lock = threading.Lock()
         self._pending_batches = 0
         self._ref_bundle_output = payload_requests_local_ref_bundle_output(payload)
-        self._output_row_budget_bytes = _payload_output_row_budget_bytes(payload)
+        self._terminal_arrow_parquet_payload = terminal_arrow_parquet_sink_payload(payload)
+        self._output_row_budget_bytes = (
+            0 if self._terminal_arrow_parquet_payload is not None else _payload_output_row_budget_bytes(payload)
+        )
         self._learned_output_budget_bytes = 0
         self._last_output_budget_estimate_bytes = 0
         self._output_budget_lock = threading.Lock()
@@ -3007,7 +3025,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission = self._take_task_admission()
         self._submit_async(
             None,
-            lambda worker: worker._submit_table(table),
+            lambda worker: worker._submit_table(table, self._terminal_arrow_parquet_payload),
             admission,
         )
 
@@ -3016,7 +3034,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
         admission = self._take_task_admission()
         self._submit_async(
             int(submit_id),
-            lambda worker: worker._submit_table(table),
+            lambda worker: worker._submit_table(table, self._terminal_arrow_parquet_payload),
             admission,
         )
 
@@ -3035,10 +3053,12 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             names,
             submit_id=int(submit_id),
             name=f"udf-input-{int(submit_id)}",
-            reserve_output_credit=self._ref_bundle_output,
+            reserve_output_credit=self._ref_bundle_output and self._terminal_arrow_parquet_payload is None,
         )
         if worker_payload is not None:
             assert lease_id is not None
+            if self._terminal_arrow_parquet_payload is not None:
+                worker_payload[_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY] = self._terminal_arrow_parquet_payload
             self._track_input_lease(lease_id)
 
             def submit_worker(

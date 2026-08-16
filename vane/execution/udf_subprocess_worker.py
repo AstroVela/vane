@@ -10,6 +10,7 @@ import os
 import socket
 import struct
 import sys
+from collections.abc import Iterable
 from traceback import TracebackException
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,10 @@ from vane.execution.ref_bundle import (
     materialize_ref_bundle,
     payload_requests_local_ref_bundle_output,
     release_local_shm_ref_bundle_descriptor,
+)
+from vane.execution.udf_arrow_parquet_sink import (
+    terminal_arrow_parquet_sink_enabled,
+    write_terminal_arrow_parquet_output,
 )
 from vane.execution.udf_row_preserving import (
     fuse_row_preserving_output,
@@ -51,6 +56,8 @@ _MSG_OUTPUT_GRANT_GRANTED = 0x0D
 _MSG_OUTPUT_GRANT_CANCELLED = 0x0E
 _MSG_OUTPUT_GRANT_RELEASE = 0x0F
 _MSG_TASK_CANCELLED = 0x10
+
+_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY = "_vane_terminal_arrow_parquet_payload"
 
 _HEADER = struct.Struct("=BI")
 _IPC_HEADER = struct.Struct("<Q")
@@ -362,10 +369,11 @@ def _execute_submit(
     submit_count: int,
     input_lease_id: int | None = None,
     finish_before_drain: bool = False,
+    execution_payload: dict[str, Any] | None = None,
 ) -> tuple[shared_memory.SharedMemory, int, bytes]:
-    if input_table.num_rows == 0:
+    payload = execution_payload or getattr(executor, "_payload", {}) or {}
+    if input_table.num_rows == 0 and not terminal_arrow_parquet_sink_enabled(payload):
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
-    payload = getattr(executor, "_payload", {}) or {}
     call_mode = str(payload.get("call_mode") or "")
     row_preserving = call_mode == "map_batches_rows" or (
         call_mode == "map" and payload.get("scalar_arg_count") is not None
@@ -373,18 +381,49 @@ def _execute_submit(
     passthrough_table = None
     if row_preserving:
         input_table, passthrough_table = split_row_preserving_input(payload, input_table)
-    executor.submit(input_table)
-    if finish_before_drain:
-        executor.finished_submitting()
-    output_tables = _drain_executor_outputs(executor)
-    if row_preserving:
+    output_tables: Iterable[pa.Table]
+    if input_table.num_rows == 0:
+        output_tables = []
+    elif terminal_arrow_parquet_sink_enabled(payload) and not row_preserving:
+
+        def iter_terminal_outputs() -> Iterable[pa.Table]:
+            emitted = False
+            for output in executor.iter_submit(input_table):
+                emitted = True
+                yield output
+            if finish_before_drain:
+                executor.finished_submitting()
+            for output in executor.drain_outputs():
+                emitted = True
+                yield output
+            if not emitted:
+                raise RuntimeError("UDF returned no result")
+
+        output_tables = iter_terminal_outputs()
+    else:
+        executor.submit(input_table)
+        if finish_before_drain:
+            executor.finished_submitting()
+        output_tables = _drain_executor_outputs(executor)
+    if row_preserving and input_table.num_rows > 0:
+        output_tables = list(output_tables)
         if len(output_tables) != 1:
             raise RuntimeError(
                 "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
             )
         output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
+    if terminal_arrow_parquet_sink_enabled(payload):
+        result_tables = [
+            write_terminal_arrow_parquet_output(
+                payload,
+                output_tables,
+                invocation_id=f"subprocess:{os.getpid()}:{submit_count}",
+            )
+        ]
+    else:
+        result_tables = list(output_tables)
     if produce_ref_bundle_output:
-        required = sum(_ipc_response_size(output_table) for output_table in output_tables)
+        required = sum(_ipc_response_size(output_table) for output_table in result_tables)
         grant_id = _request_output_grant(
             sock,
             submit_count=submit_count,
@@ -393,7 +432,7 @@ def _execute_submit(
         )
         descriptor = None
         try:
-            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(output_tables, grant_id=grant_id)
+            descriptor = _make_local_shm_ref_bundle_descriptor_for_tables(result_tables, grant_id=grant_id)
             result_payload = vane_pickle.dumps(descriptor)
         except Exception:
             if descriptor is not None:
@@ -407,7 +446,7 @@ def _execute_submit(
                 pass
             raise
         return data_shm, _MSG_REF_BUNDLE_RESULT, result_payload
-    output_table = _concat_executor_outputs(output_tables)
+    output_table = _concat_executor_outputs(result_tables)
     output_ipc = _arrow_table_to_ipc_bytes(output_table)
     required = _IPC_HEADER.size + len(output_ipc)
     data_shm = _resize_shm(data_shm, required)
@@ -425,7 +464,7 @@ def _execute_task_submit(
     sock: socket.socket,
     input_lease_id: int | None = None,
 ) -> tuple[shared_memory.SharedMemory, int, bytes]:
-    if input_table.num_rows == 0:
+    if input_table.num_rows == 0 and not terminal_arrow_parquet_sink_enabled(payload):
         return data_shm, _MSG_OK, struct.pack("<Q", 0)
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
@@ -512,6 +551,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
 
             try:
                 input_lease_id = None
+                terminal_arrow_parquet_payload = None
                 if msg_type == _MSG_SUBMIT:
                     input_size = struct.unpack("<Q", payload_data)[0]
                     if input_size > len(_require_shm_buffer(data_shm)):
@@ -522,6 +562,11 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     input_table = _arrow_table_from_ipc_bytes(input_ipc)
                 else:
                     ref_bundle = vane_pickle.loads(payload_data)
+                    terminal_arrow_parquet_payload = ref_bundle.pop(_TERMINAL_ARROW_PARQUET_PAYLOAD_KEY, None)
+                    if terminal_arrow_parquet_payload is not None and not isinstance(
+                        terminal_arrow_parquet_payload, dict
+                    ):
+                        raise TypeError("terminal Arrow Parquet submit payload must be a dict")
                     lease_id_raw = ref_bundle.get("input_lease_id")
                     input_lease_id = int(lease_id_raw) if lease_id_raw is not None else None
                     try:
@@ -535,6 +580,10 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         _send_input_consume_failed(sock, ref_bundle, exc)
                         raise
                     _send_input_consumed(sock, ref_bundle, input_table)
+                execution_payload = payload
+                if terminal_arrow_parquet_payload is not None:
+                    execution_payload = dict(payload)
+                    execution_payload.update(terminal_arrow_parquet_payload)
                 submit_count += 1
                 log_submit = _should_log_submit(submit_count)
                 if log_submit:
@@ -548,7 +597,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                     )
                 if subprocess_mode == "task":
                     data_shm, result_msg_type, result_payload = _execute_task_submit(
-                        payload,
+                        execution_payload,
                         input_table,
                         data_shm,
                         produce_ref_bundle_output,
@@ -568,6 +617,7 @@ def worker_main(sock_fd: int, payload_shm_name: str, payload_size: int, data_shm
                         sock=sock,
                         submit_count=submit_count,
                         input_lease_id=input_lease_id,
+                        execution_payload=execution_payload,
                     )
                 if log_submit:
                     _worker_thread_log(

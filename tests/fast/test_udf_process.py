@@ -1724,6 +1724,9 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
         from vane.execution.ref_bundle import make_local_shm_ref_bundle_result
 
         both_tracked = threading.Event()
+        bad_handoff_entered = threading.Event()
+        allow_bad_handoff_failure = threading.Event()
+        bad_query_finished = threading.Event()
         good_handoff = threading.Event()
 
 
@@ -1796,6 +1799,9 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
 
             def handoff_output_block_lease(self, request_id, _lease_id):
                 if str(request_id) == "output-request:bad":
+                    bad_handoff_entered.set()
+                    if not allow_bad_handoff_failure.wait(timeout=10):
+                        raise RuntimeError("timed out waiting to release bad output lease handoff")
                     raise RuntimeError("planned output lease handoff failure")
                 good_handoff.set()
                 return True
@@ -1891,6 +1897,8 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
                 bad_relation.fetchall()
             except BaseException as exc:
                 bad_errors.append(exc)
+            finally:
+                bad_query_finished.set()
 
 
         def run_good():
@@ -1906,9 +1914,14 @@ def test_output_lease_callback_failure_isolated_to_owning_ray_slot():
         bad_thread.start()
         good_thread.start()
         barrier.wait()
+        handoff_started = bad_handoff_entered.wait(timeout=10)
+        query_finished_before_handoff = bad_query_finished.wait(timeout=0.25)
+        allow_bad_handoff_failure.set()
         bad_thread.join(timeout=10)
         good_thread.join(timeout=10)
         try:
+            assert handoff_started, "failing output lease handoff did not start"
+            assert not query_finished_before_handoff, "bad query finished before its output lease handoff"
             assert not bad_thread.is_alive(), "failing Ray slot did not terminate"
             assert not good_thread.is_alive(), "healthy Ray slot did not terminate"
             assert bad_errors, (bad_errors, good_errors, good_results)

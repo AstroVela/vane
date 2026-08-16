@@ -435,6 +435,68 @@ def test_materialized_task_publishes_unsplittable_row_for_soft_liveness():
     assert outputs[1]["block_id"] == "block:lease-oversized:0"
 
 
+def test_materialized_ray_task_writes_terminal_udf_output_with_arrow(tmp_path):
+    import pyarrow.parquet as pq
+
+    import vane.execution.udf_ray as fur
+    from vane import pickle as vane_pickle
+
+    def identity(table):
+        return table
+
+    output_directory = tmp_path / "ray-task-terminal-output"
+    payload = _distributed_payload(
+        function_pickle=vane_pickle.dumps(identity),
+        null_handling=1,
+        task_lease_id="lease-terminal-task",
+        attempt_id="attempt-terminal-task",
+        terminal_arrow_parquet_sink=True,
+        terminal_arrow_parquet_output_directory=str(output_directory),
+        terminal_arrow_parquet_file_extension="parquet",
+        terminal_arrow_parquet_writer_options={
+            "compression": "zstd",
+            "data_page_version": "1.0",
+            "dictionary_pagesize_limit": 1 << 20,
+            "row_group_size": 2,
+            "version": "1.0",
+        },
+        terminal_arrow_parquet_expected_names=["value"],
+        terminal_arrow_parquet_expected_types=["BIGINT"],
+        terminal_arrow_parquet_write_empty_file=True,
+    )
+
+    outputs = list(fur._iter_materialized_task_outputs(payload, [pa.table({"value": [1, 2, 3]})]))
+
+    assert len(outputs) == 2
+    statistics = outputs[0]
+    assert statistics.column("count").to_pylist() == [3]
+    output_path = statistics.column("filename")[0].as_py()
+    assert pq.read_table(output_path).to_pydict() == {"value": [1, 2, 3]}
+    assert "parquet-cpp-arrow" in str(pq.ParquetFile(output_path).metadata.created_by).lower()
+    assert outputs[1]["names"] == [
+        "filename",
+        "count",
+        "file_size_bytes",
+        "footer_size_bytes",
+        "column_statistics",
+        "partition_keys",
+    ]
+
+    empty_output_directory = tmp_path / "ray-task-terminal-empty-output"
+    empty_payload = dict(payload)
+    empty_payload["task_lease_id"] = "lease-terminal-task-empty"
+    empty_payload["terminal_arrow_parquet_output_directory"] = str(empty_output_directory)
+    empty_outputs = list(
+        fur._iter_materialized_task_outputs(
+            empty_payload,
+            [pa.table({"value": pa.array([], type=pa.int64())})],
+        )
+    )
+    assert len(empty_outputs) == 2
+    assert empty_outputs[0].column("count").to_pylist() == [0]
+    assert pq.read_table(empty_outputs[0].column("filename")[0].as_py()).schema == pa.schema([("value", pa.int64())])
+
+
 def test_actor_pool_requests_logical_memory_and_initializes_eagerly(monkeypatch):
     from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
     from vane.runners.ray.query_runtime_protocol import RAY_ACTOR_INDEX_ENV

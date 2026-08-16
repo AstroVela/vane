@@ -228,6 +228,68 @@ def test_actor_rows_mode_reuses_executor_across_calls(fake_ray):
     assert second[0].to_pydict() == {"keep": ["b"], "y": [6]}
 
 
+def test_precreated_actor_uses_task_terminal_arrow_parquet_payload(fake_ray, tmp_path):
+    import pyarrow.parquet as pq
+
+    actor = _make_actor(_rows_payload(_AddOne))
+    output_directory = tmp_path / "ray-actor-terminal-output"
+    task_payload = {
+        "terminal_arrow_parquet_sink": True,
+        "terminal_arrow_parquet_output_directory": str(output_directory),
+        "terminal_arrow_parquet_file_extension": "parquet",
+        "terminal_arrow_parquet_writer_options": {
+            "compression": "zstd",
+            "data_page_version": "1.0",
+            "dictionary_pagesize_limit": 1 << 20,
+            "row_group_size": 2,
+            "version": "1.0",
+        },
+        "terminal_arrow_parquet_expected_names": ["keep", "y"],
+        "terminal_arrow_parquet_expected_types": ["VARCHAR", "INTEGER"],
+        "terminal_arrow_parquet_write_empty_file": True,
+    }
+
+    blocks = _data_blocks(
+        list(
+            actor.run_block_stream(
+                pa.table({"x": [1, 2, 3], "keep": ["a", "b", "c"]}),
+                payload=task_payload,
+            )
+        )
+    )
+
+    assert len(blocks) == 1
+    statistics = blocks[0]
+    assert statistics.column("count").to_pylist() == [3]
+    output_path = statistics.column("filename")[0].as_py()
+    assert str(output_path).startswith(str(output_directory))
+    assert pq.read_table(output_path).to_pydict() == {
+        "keep": ["a", "b", "c"],
+        "y": [2, 3, 4],
+    }
+
+    empty_output_directory = tmp_path / "ray-actor-terminal-empty-output"
+    empty_payload = dict(task_payload)
+    empty_payload["terminal_arrow_parquet_output_directory"] = str(empty_output_directory)
+    empty_blocks = _data_blocks(
+        list(
+            actor.run_block_stream(
+                pa.table(
+                    {
+                        "x": pa.array([], type=pa.int64()),
+                        "keep": pa.array([], type=pa.string()),
+                    }
+                ),
+                payload=empty_payload,
+            )
+        )
+    )
+    assert len(empty_blocks) == 1
+    assert empty_blocks[0].column("count").to_pylist() == [0]
+    empty_output_path = empty_blocks[0].column("filename")[0].as_py()
+    assert pq.read_table(empty_output_path).schema == pa.schema([("keep", pa.string()), ("y", pa.int32())])
+
+
 def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):
     from vane.runners.ray.query_runtime_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,

@@ -13,6 +13,10 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane.execution._common import ensure_table as _ensure_table
 from vane.execution._udf_runtime import UDFExecutor as RuntimeUDFExecutor
+from vane.execution.udf_arrow_parquet_sink import (
+    terminal_arrow_parquet_sink_enabled,
+    write_terminal_arrow_parquet_output,
+)
 from vane.execution.udf_ray_config import (
     eager_actor_warm_up_enabled as _eager_actor_warm_up_enabled,
 )
@@ -325,38 +329,37 @@ def _actor_class(
                     )
                     output_count += 1
 
-            if str(effective_payload.get("call_mode") or "") == "map":
-                table = execute_scalar_map_layout(effective_payload, args, executor)
-                yield from emit(table)
-                _actor_debug_log(
-                    "run_block_stream_submit_done",
+            def execute_outputs() -> Iterator[pa.Table]:
+                call_mode = str(effective_payload.get("call_mode") or "")
+                if call_mode == "map":
+                    yield execute_scalar_map_layout(effective_payload, args, executor)
+                    return
+                if call_mode == "map_batches_rows":
+                    yield self._run_row_preserving_batch(args, effective_payload)
+                    return
+                for result in executor.iter_submit(args):
+                    table = _ensure_table(result)
+                    _actor_debug_log(
+                        "run_block_stream_output",
+                        effective_payload,
+                        output_index=output_count,
+                        rows=table.num_rows,
+                        columns=table.num_columns,
+                    )
+                    yield table
+
+            if terminal_arrow_parquet_sink_enabled(effective_payload):
+                statistics = write_terminal_arrow_parquet_output(
                     effective_payload,
-                    rows=args.num_rows,
-                    outputs=1,
+                    () if args.num_rows == 0 else execute_outputs(),
+                    invocation_id=str(effective_payload.get("task_lease_id") or ""),
                 )
-                return
-            if str(effective_payload.get("call_mode") or "") == "map_batches_rows":
-                yield from emit(self._run_row_preserving_batch(args, effective_payload))
-                _actor_debug_log(
-                    "run_block_stream_submit_done",
-                    effective_payload,
-                    rows=args.num_rows,
-                    outputs=1,
-                )
-                return
-            for result in executor.iter_submit(args):
-                table = _ensure_table(result)
-                _actor_debug_log(
-                    "run_block_stream_output",
-                    effective_payload,
-                    output_index=output_count,
-                    rows=table.num_rows,
-                    columns=table.num_columns,
-                )
-                yield from emit(table)
-            if output_count == 0:
-                table = _empty_output_table_from_payload(effective_payload)
-                yield from emit(table)
+                yield from emit(statistics)
+            else:
+                for table in execute_outputs():
+                    yield from emit(table)
+                if output_count == 0:
+                    yield from emit(_empty_output_table_from_payload(effective_payload))
             _actor_debug_log(
                 "run_block_stream_submit_done",
                 effective_payload,

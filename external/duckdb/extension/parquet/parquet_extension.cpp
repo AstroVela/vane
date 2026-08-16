@@ -90,6 +90,8 @@ struct ParquetWriteBindData : public TableFunctionData {
 	bool enable_bloom_filters = true;
 	//! What false positive rate are we willing to accept for bloom filters
 	double bloom_filter_false_positive_ratio = 0.01;
+	bool write_bloom_filter_option_set = false;
+	bool bloom_filter_false_positive_ratio_option_set = false;
 
 	//! After how many row groups to rotate to a new file
 	optional_idx row_groups_per_file;
@@ -104,6 +106,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	//! Which geo-parquet version to use when writing
 	GeoParquetVersion geoparquet_version = GeoParquetVersion::V1;
+	bool geoparquet_version_option_set = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<ParquetWriteBindData>();
@@ -118,12 +121,15 @@ struct ParquetWriteBindData : public TableFunctionData {
 		result->string_dictionary_page_size_limit = string_dictionary_page_size_limit;
 		result->enable_bloom_filters = enable_bloom_filters;
 		result->bloom_filter_false_positive_ratio = bloom_filter_false_positive_ratio;
+		result->write_bloom_filter_option_set = write_bloom_filter_option_set;
+		result->bloom_filter_false_positive_ratio_option_set = bloom_filter_false_positive_ratio_option_set;
 		result->row_groups_per_file = row_groups_per_file;
 		result->field_ids = field_ids.Copy();
 		result->shredding_types = shredding_types.Copy();
 		result->compression_level = compression_level;
 		result->parquet_version = parquet_version;
 		result->geoparquet_version = geoparquet_version;
+		result->geoparquet_version_option_set = geoparquet_version_option_set;
 		return unique_ptr<FunctionData>(std::move(result));
 	}
 };
@@ -319,12 +325,14 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 			bind_data->string_dictionary_page_size_limit = val;
 		} else if (loption == "write_bloom_filter") {
 			bind_data->enable_bloom_filters = BooleanValue::Get(option.second[0].DefaultCastAs(LogicalType::BOOLEAN));
+			bind_data->write_bloom_filter_option_set = true;
 		} else if (loption == "bloom_filter_false_positive_ratio") {
 			auto val = option.second[0].GetValue<double>();
 			if (val <= 0) {
 				throw BinderException("bloom_filter_false_positive_ratio must be greater than 0");
 			}
 			bind_data->bloom_filter_false_positive_ratio = val;
+			bind_data->bloom_filter_false_positive_ratio_option_set = true;
 		} else if (loption == "compression_level") {
 			const auto val = option.second[0].GetValue<int64_t>();
 			if (val < ZStdFileSystem::MinimumCompressionLevel() || val > ZStdFileSystem::MaximumCompressionLevel()) {
@@ -344,6 +352,7 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 				throw BinderException("Expected parquet_version 'V1' or 'V2'");
 			}
 		} else if (loption == "geoparquet_version") {
+			bind_data->geoparquet_version_option_set = true;
 			const auto roption = StringUtil::Upper(option.second[0].ToString());
 			if (roption == "NONE") {
 				bind_data->geoparquet_version = GeoParquetVersion::NONE;
@@ -396,6 +405,77 @@ static void ParquetWriteGetWrittenStatistics(ClientContext &context, FunctionDat
                                              GlobalFunctionData &gstate, CopyFunctionFileStatistics &statistics) {
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	global_state.writer->SetWrittenStatistics(statistics);
+}
+
+static Value ParquetArrowWriteOptions(const FunctionData &bind_data_p) {
+	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
+	if (!bind_data.kv_metadata.empty()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support KV_METADATA");
+	}
+	if (bind_data.encryption_config) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support ENCRYPTION_CONFIG");
+	}
+	if (bind_data.field_ids.ids && !bind_data.field_ids.ids->empty()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support FIELD_IDS");
+	}
+	if (bind_data.shredding_types.set) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support SHREDDING");
+	}
+	if (bind_data.row_group_size_bytes != NumericLimits<idx_t>::Maximum()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support ROW_GROUP_SIZE_BYTES");
+	}
+	if (bind_data.row_groups_per_file.IsValid()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support ROW_GROUPS_PER_FILE");
+	}
+	if (bind_data.dictionary_size_limit.IsValid()) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support DICTIONARY_SIZE_LIMIT");
+	}
+	if (bind_data.write_bloom_filter_option_set) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support WRITE_BLOOM_FILTER");
+	}
+	if (bind_data.bloom_filter_false_positive_ratio_option_set) {
+		throw NotImplementedException(
+		    "terminal UDF Arrow Parquet output does not support BLOOM_FILTER_FALSE_POSITIVE_RATIO");
+	}
+	if (bind_data.geoparquet_version_option_set) {
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support GEOPARQUET_VERSION");
+	}
+
+	string compression;
+	switch (bind_data.codec) {
+	case duckdb_parquet::CompressionCodec::UNCOMPRESSED:
+		compression = "none";
+		break;
+	case duckdb_parquet::CompressionCodec::SNAPPY:
+		compression = "snappy";
+		break;
+	case duckdb_parquet::CompressionCodec::GZIP:
+		compression = "gzip";
+		break;
+	case duckdb_parquet::CompressionCodec::ZSTD:
+		compression = "zstd";
+		break;
+	case duckdb_parquet::CompressionCodec::BROTLI:
+		compression = "brotli";
+		break;
+	case duckdb_parquet::CompressionCodec::LZ4_RAW:
+		compression = "lz4";
+		break;
+	default:
+		throw NotImplementedException("terminal UDF Arrow Parquet output does not support compression codec %d",
+		                              static_cast<int>(bind_data.codec));
+	}
+
+	child_list_t<Value> options;
+	options.emplace_back("compression", Value(compression));
+	options.emplace_back("row_group_size", Value::UBIGINT(bind_data.row_group_size));
+	options.emplace_back("dictionary_pagesize_limit", Value::UBIGINT(bind_data.string_dictionary_page_size_limit));
+	options.emplace_back("version", Value(bind_data.parquet_version == ParquetVersion::V2 ? "2.6" : "1.0"));
+	options.emplace_back("data_page_version", Value("1.0"));
+	if (bind_data.codec == duckdb_parquet::CompressionCodec::ZSTD) {
+		options.emplace_back("compression_level", Value::BIGINT(bind_data.compression_level));
+	}
+	return Value::STRUCT(std::move(options));
 }
 
 static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
@@ -645,6 +725,12 @@ static void ParquetCopySerialize(Serializer &serializer, const FunctionData &bin
 	                                    default_value.geoparquet_version);
 	serializer.WritePropertyWithDefault<ShreddingType>(117, "shredding_types", bind_data.shredding_types,
 	                                                   default_value.shredding_types);
+	serializer.WritePropertyWithDefault(118, "write_bloom_filter_option_set", bind_data.write_bloom_filter_option_set,
+	                                    false);
+	serializer.WritePropertyWithDefault(119, "bloom_filter_false_positive_ratio_option_set",
+	                                    bind_data.bloom_filter_false_positive_ratio_option_set, false);
+	serializer.WritePropertyWithDefault(120, "geoparquet_version_option_set", bind_data.geoparquet_version_option_set,
+	                                    false);
 }
 
 static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserializer, CopyFunction &function) {
@@ -680,6 +766,12 @@ static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserialize
 	    deserializer.ReadPropertyWithExplicitDefault(116, "geoparquet_version", default_value.geoparquet_version);
 	data->shredding_types =
 	    deserializer.ReadPropertyWithExplicitDefault<ShreddingType>(117, "shredding_types", ShreddingType());
+	data->write_bloom_filter_option_set =
+	    deserializer.ReadPropertyWithExplicitDefault<bool>(118, "write_bloom_filter_option_set", false);
+	data->bloom_filter_false_positive_ratio_option_set =
+	    deserializer.ReadPropertyWithExplicitDefault<bool>(119, "bloom_filter_false_positive_ratio_option_set", false);
+	data->geoparquet_version_option_set =
+	    deserializer.ReadPropertyWithExplicitDefault<bool>(120, "geoparquet_version_option_set", false);
 
 	return std::move(data);
 }
@@ -919,6 +1011,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.copy_to_initialize_global = ParquetWriteInitializeGlobal;
 	function.copy_to_initialize_local = ParquetWriteInitializeLocal;
 	function.copy_to_get_written_statistics = ParquetWriteGetWrittenStatistics;
+	function.copy_to_get_arrow_write_options = ParquetArrowWriteOptions;
 	function.copy_to_sink = ParquetWriteSink;
 	function.copy_to_combine = ParquetWriteCombine;
 	function.copy_to_finalize = ParquetWriteFinalize;

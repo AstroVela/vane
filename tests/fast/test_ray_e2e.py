@@ -2684,6 +2684,70 @@ def test_ray_python_udf_map_batches_arrow(ray_runner, duckdb_conn, parquet_path)
     _assert_results_match(duckdb_conn, sql, parts, label)
 
 
+@pytest.mark.parametrize("execution_backend", ["ray_task", "ray_actor"])
+def test_ray_terminal_udf_writes_parquet_with_arrow(
+    ray_runner,
+    duckdb_conn,
+    tmp_path,
+    execution_backend,
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    if ray is None:
+        pytest.skip("ray not installed")
+
+    input_path = tmp_path / f"terminal_udf_{execution_backend}_input.parquet"
+    output_path = tmp_path / f"terminal_udf_{execution_backend}_output.parquet"
+    duckdb_conn.execute(f"COPY (SELECT i::BIGINT AS x FROM range(17) t(i)) TO '{input_path!s}' (FORMAT PARQUET)")
+
+    def transform(table):
+        import pyarrow as worker_pa
+        import pyarrow.compute as pc
+
+        return worker_pa.table(
+            {
+                "x": table.column("x"),
+                "doubled": pc.multiply(table.column("x"), 2),
+            }
+        )
+
+    class Transform:
+        def __call__(self, table):
+            return transform(table)
+
+    udf = Transform if execution_backend == "ray_actor" else transform
+    backend_options = {"actor_number": 1} if execution_backend == "ray_actor" else {}
+    relation = (
+        duckdb_conn.read_parquet(str(input_path))
+        .repartition(2)
+        .map_batches(
+            udf,
+            schema={"x": vane.sqltypes.BIGINT, "doubled": vane.sqltypes.BIGINT},
+            execution_backend=execution_backend,
+            batch_size=4,
+            **backend_options,
+        )
+    )
+
+    relation.write_parquet(str(output_path), compression="zstd", row_group_size=3)
+
+    rows = duckdb_conn.sql(
+        f"SELECT count(*), sum(x)::BIGINT, sum(doubled)::BIGINT FROM read_parquet('{output_path!s}')"
+    ).fetchone()
+    parquet_files = [output_path] if output_path.is_file() else sorted(output_path.rglob("*.parquet"))
+    metadata = [pq.ParquetFile(path).metadata for path in parquet_files]
+    assert rows == (17, 136, 272)
+    assert parquet_files
+    assert all("parquet-cpp-arrow" in str(item.created_by).lower() for item in metadata)
+    assert all(0 < item.row_group(index).num_rows <= 3 for item in metadata for index in range(item.num_row_groups))
+    assert all(
+        item.row_group(index).column(0).compression == "ZSTD"
+        for item in metadata
+        for index in range(item.num_row_groups)
+    )
+    assert pa.concat_tables([pq.read_table(path) for path in parquet_files]).num_rows == 17
+
+
 def test_ray_task_credit_admission_runs_multiple_batches_concurrently(
     ray_runner,
     duckdb_conn,
