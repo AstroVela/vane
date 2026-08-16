@@ -45,17 +45,18 @@ struct DemoSecretType {
 
 class CloneCountingSecret : public BaseSecret {
 public:
-	CloneCountingSecret(const vector<string> &scope, const string &name, shared_ptr<idx_t> clone_count_p)
+	CloneCountingSecret(const duckdb::vector<string> &scope, const string &name,
+	                    duckdb::shared_ptr<idx_t> clone_count_p)
 	    : BaseSecret(scope, "s3", "config", name), clone_count(std::move(clone_count_p)) {
 	}
 
-	unique_ptr<const BaseSecret> Clone() const override {
+	duckdb::unique_ptr<const BaseSecret> Clone() const override {
 		(*clone_count)++;
 		return make_uniq<CloneCountingSecret>(*this);
 	}
 
 private:
-	shared_ptr<idx_t> clone_count;
+	duckdb::shared_ptr<idx_t> clone_count;
 };
 
 // Demo pluggable secret storage
@@ -254,9 +255,9 @@ TEST_CASE("Scan secret metadata without cloning credential-bearing entries", "[s
 
 	auto &secret_manager = SecretManager::Get(*db.instance);
 	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
-	auto clone_count = make_shared<idx_t>(0);
-	auto secret =
-	    make_uniq<CloneCountingSecret>(vector<string> {"s3://metadata-scan/"}, "metadata_scan_secret", clone_count);
+	auto clone_count = duckdb::make_shared_ptr<idx_t>(0);
+	auto secret = make_uniq<CloneCountingSecret>(duckdb::vector<string> {"s3://metadata-scan/"}, "metadata_scan_secret",
+	                                             clone_count);
 	auto registered = secret_manager.RegisterSecret(transaction, std::move(secret), OnCreateConflict::ERROR_ON_CONFLICT,
 	                                                SecretPersistType::TEMPORARY);
 	REQUIRE(registered);
@@ -280,7 +281,7 @@ TEST_CASE("Scan secret metadata without cloning credential-bearing entries", "[s
 		    REQUIRE(metadata.name == "metadata_scan_secret");
 		    REQUIRE(metadata.type == "s3");
 		    REQUIRE(metadata.provider == "config");
-		    REQUIRE(metadata.scope == vector<string> {"s3://metadata-scan/"});
+		    REQUIRE(metadata.scope == duckdb::vector<string> {"s3://metadata-scan/"});
 		    REQUIRE(!metadata.uses_standard_prefix_matching);
 		    return false;
 	    });
