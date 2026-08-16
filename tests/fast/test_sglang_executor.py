@@ -105,6 +105,44 @@ def test_sglang_prompt_expression_end_to_end(monkeypatch):
         conn.close()
 
 
+def test_sglang_driver_precreation_dispatches_by_engine(monkeypatch):
+    import vane.execution.vllm as vllm
+
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    envelope = _build_native_vllm_options_argument({})
+    envelope["engine"] = "sglang"
+    envelope.update(use_ray=True, ray_worker_only=True, ray_actor_pool_name="sglang-pool")
+
+    class Plan:
+        def collect_vllm_nodes(self, conn=None):
+            return [{"model": "test-model", "pool_name": "sglang-pool", "options": envelope}]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("VANE_WORKER", raising=False)
+
+    captured = {}
+    actors = object()
+
+    def get_or_create_named(_cls, **kwargs):
+        captured.update(kwargs)
+        return actors
+
+    monkeypatch.setattr(vllm.LLMActors, "get_or_create_named", classmethod(get_or_create_named))
+
+    created, _leases = vllm.ensure_named_vllm_pools_for_plan(Plan(), session_config={})
+
+    from vane.execution.sglang import SGLangRayLocalExecutor
+
+    assert created == [actors]
+    assert captured["actor_cls"] is SGLangRayLocalExecutor
+    assert captured["name_prefix"] == "sglang-pool"
+    assert captured["engine_args"] == {}
+    assert captured["generate_args"] == {}
+
+
 def test_sglang_ray_local_executor_hierarchy():
     import inspect
 

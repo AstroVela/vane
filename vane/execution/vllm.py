@@ -1503,6 +1503,7 @@ class LLMActors:
         name_prefix: str,
         engine_init_timeout_s: float | None = None,
         session_config: Mapping[str, Any] | None = None,
+        actor_cls: type = RayLocalVLLMExecutor,
     ) -> LLMActors:
         import ray
 
@@ -1552,6 +1553,7 @@ class LLMActors:
             name_prefix=name_prefix,
             engine_init_timeout_s=engine_init_timeout_s,
             session_config=session_config,
+            actor_cls=actor_cls,
         )
 
     @classmethod
@@ -1810,17 +1812,31 @@ def ensure_named_vllm_pools_for_plan(
             pool_name = str(node["pool_name"])
             model = str(node.get("model", ""))
 
-            # Parse options through normalize_options to get clean defaults.
+            # Parse options through the matching backend's normalize_options.
             raw_opts = node.get("options")
-            opts = _restore_native_vllm_secrets(normalize_options(raw_opts))
+            engine = "vllm"
+            if isinstance(raw_opts, dict):
+                engine = str(raw_opts.get("engine") or "vllm")
 
-            engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
-            generate_args = dict(opts.get("generate_args") or {})
+            if engine == "sglang":
+                from vane.execution.sglang import SGLangRayLocalExecutor, normalize_options as normalize_sglang_options
+
+                opts = normalize_sglang_options(raw_opts)
+                actor_cls = SGLangRayLocalExecutor
+                engine_args = dict(opts.get("engine_args") or {})
+                generate_args = dict(opts.get("generate_args") or {})
+                engine_init_timeout_s = opts.get("engine_init_timeout_s")
+            else:
+                opts = _restore_native_vllm_secrets(normalize_options(raw_opts))
+                actor_cls = RayLocalVLLMExecutor
+                engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
+                generate_args = dict(opts.get("generate_args") or {})
+                engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
+
             on_error = str(opts.get("on_error", "raise"))
             gpus_per_actor = opts["gpus_per_actor"]
             concurrency = max(1, int(opts.get("concurrency", 1)))
             load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
-            engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
 
             actors_obj = LLMActors.get_or_create_named(
                 model=model,
@@ -1833,6 +1849,7 @@ def ensure_named_vllm_pools_for_plan(
                 name_prefix=pool_name,
                 engine_init_timeout_s=engine_init_timeout_s,
                 session_config=normalized_session_config,
+                actor_cls=actor_cls,
             )
             created.append(actors_obj)
     except BaseException as execution_error:
