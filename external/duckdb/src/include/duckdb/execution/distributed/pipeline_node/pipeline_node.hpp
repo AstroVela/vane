@@ -635,8 +635,8 @@ inline PipelineNodeContext InheritPipelineNodeContext(const std::shared_ptr<T> &
 	if (!child) {
 		return PipelineNodeContext(0, "", node_id, std::move(node_name));
 	}
-	return PipelineNodeContext(child->context().query_idx(), child->context().query_id(), node_id,
-	                           std::move(node_name), child->context().session_id());
+	return PipelineNodeContext(child->context().query_idx(), child->context().query_id(), node_id, std::move(node_name),
+	                           child->context().session_id());
 }
 
 // ---------------------------------------------------------------------------

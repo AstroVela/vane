@@ -52,9 +52,7 @@ def test_sglang_local_executor_roundtrip(monkeypatch):
     monkeypatch.setitem(sys.modules, "sglang", _fake_sglang())
     from vane.execution.sglang import SGLangLocalExecutor
 
-    executor = SGLangLocalExecutor(
-        "test-model", {}, {"sampling_params": {"max_new_tokens": 8}}
-    )
+    executor = SGLangLocalExecutor("test-model", {}, {"sampling_params": {"max_new_tokens": 8}})
     try:
         rows = pa.table({"prompt": ["hello"]})
         executor.submit(None, ["hello"], rows)

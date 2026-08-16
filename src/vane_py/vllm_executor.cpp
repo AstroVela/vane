@@ -332,8 +332,8 @@ private:
 };
 
 static unique_ptr<VLLMExecutor> CreatePythonEngineExecutor(const string &module_name, ClientContext &context,
-                                                           const string &model,
-                                                         const Value &options, VLLMConfig &config) {
+                                                           const string &model, const Value &options,
+                                                           VLLMConfig &config) {
 	PythonGILWrapper gil;
 	py::object options_obj;
 	if (options.IsNull()) {

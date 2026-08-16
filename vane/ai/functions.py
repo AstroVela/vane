@@ -1807,7 +1807,9 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeInferen
             messages_expr,
         )
 
-    options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options(), engine=descriptor.get_engine())
+    options_argument = _build_native_vllm_options_argument(
+        descriptor.build_physical_vllm_options(), engine=descriptor.get_engine()
+    )
 
     return vane.FunctionExpression(
         "vllm",

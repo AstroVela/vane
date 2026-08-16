@@ -264,7 +264,9 @@ class LocalEngineExecutor(LLMExecutor):
         try:
             self._create_engine()
         except Exception as exc:
-            error_message = str(_safe_provider_execution_error(self._engine_name, self.model, "engine initialization", exc))
+            error_message = str(
+                _safe_provider_execution_error(self._engine_name, self.model, "engine initialization", exc)
+            )
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
@@ -277,7 +279,9 @@ class LocalEngineExecutor(LLMExecutor):
         try:
             self._create_engine()
         except Exception as exc:
-            error_message = str(_safe_provider_execution_error(self._engine_name, self.model, "engine initialization", exc))
+            error_message = str(
+                _safe_provider_execution_error(self._engine_name, self.model, "engine initialization", exc)
+            )
             if self.on_error == "raise":
                 with self.error_lock:
                     if self.error_message is None:
@@ -369,7 +373,9 @@ class LocalEngineExecutor(LLMExecutor):
         reservation_id: str | None = None,
     ) -> None:
         rows = _ensure_table(rows)
-        self._log_null_substitution(_SafeProviderError(f"{self._engine_name} engine init failed: {self.engine_error_message}"))
+        self._log_null_substitution(
+            _SafeProviderError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
+        )
         for i in range(rows.num_rows):
             row = rows.slice(i, 1)
             if executor_id:
