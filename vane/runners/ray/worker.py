@@ -881,18 +881,18 @@ def _configure_duckdb_s3(
 
     if region:
         conn.execute(f"SET s3_region='{_q(region)}'")
+    # Explicit connection credentials are owned by connection-snapshot replay.
+    # Never clear or overwrite them here: cursors with one exact snapshot
+    # identity share database-global httpfs settings and execute concurrently.
     if use_session_credentials:
         if access_key:
             conn.execute(f"SET s3_access_key_id='{_q(access_key)}'")
         if secret_key:
             conn.execute(f"SET s3_secret_access_key='{_q(secret_key)}'")
-    else:
-        conn.execute("SET s3_access_key_id=''")
-        conn.execute("SET s3_secret_access_key=''")
-    # Task cursors inherit settings from the long-lived session connection.
-    # Always overwrite the token so a refresh from temporary credentials to
-    # credentials without a token cannot retain the previous value.
-    conn.execute(f"SET s3_session_token='{_q(session_token)}'")
+        # Task cursors inherit settings from the long-lived session connection.
+        # Always overwrite the token so a refresh from temporary credentials to
+        # credentials without a token cannot retain the previous value.
+        conn.execute(f"SET s3_session_token='{_q(session_token)}'")
     if endpoint_url:
         parse_target = endpoint_url
         if "://" not in parse_target and not parse_target.startswith("//"):

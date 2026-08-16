@@ -14459,7 +14459,7 @@ def test_nonexpiring_session_credential_chain_is_resolved_once(monkeypatch):
     assert resolver_calls == [config]
 
 
-def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_profile_credentials(monkeypatch):
+def test_explicit_duckdb_credentials_skip_profile_resolution_without_mutating_snapshot_credentials(monkeypatch):
     resolver_calls = []
     monkeypatch.setattr(
         worker_mod,
@@ -14497,9 +14497,11 @@ def test_explicit_duckdb_credentials_skip_profile_resolution_and_discard_cached_
 
     assert effective == {"AWS_ENDPOINT_URL": "https://s3.example.test"}
     assert configured == effective
-    assert "SET s3_access_key_id=''" in statements
-    assert "SET s3_secret_access_key=''" in statements
-    assert "SET s3_session_token=''" in statements
+    assert not any(statement.startswith("SET s3_access_key_id=") for statement in statements)
+    assert not any(statement.startswith("SET s3_secret_access_key=") for statement in statements)
+    assert not any(statement.startswith("SET s3_session_token=") for statement in statements)
+    assert "SET s3_endpoint='s3.example.test'" in statements
+    assert "SET http_retries=10" in statements
     assert resolver_calls == []
 
 

@@ -1585,6 +1585,10 @@ class RayQueryDriverActor:
         self._copy_operation_terminal = BoundedReplayMap[str, _CopyOperationTerminal](
             capacity=_COPY_OPERATION_REPLAY_CAPACITY
         )
+        # Pending cleanup retains real plan resources rather than replay-only
+        # history. Keep those outcomes outside the bounded terminal window
+        # until cleanup succeeds or the owning client is detached.
+        self._copy_cleanup_pending_terminals: dict[str, _CopyOperationTerminal] = {}
         # Outcome payloads are bounded, but an admitted identity must remain
         # known for the owner's lifetime. Evicting a payload may make recovery
         # impossible; it must never authorize the same write to run again.
@@ -6692,10 +6696,31 @@ class RayQueryDriverActor:
             self._copy_operations_inflight = {}
         if not isinstance(getattr(self, "_copy_operation_terminal", None), BoundedReplayMap):
             self._copy_operation_terminal = BoundedReplayMap(capacity=_COPY_OPERATION_REPLAY_CAPACITY)
+        if not isinstance(getattr(self, "_copy_cleanup_pending_terminals", None), dict):
+            self._copy_cleanup_pending_terminals = {}
         if not isinstance(getattr(self, "_copy_operation_identities", None), dict):
             self._copy_operation_identities = {}
         if not isinstance(getattr(self, "_copy_cleanup_tasks", None), dict):
             self._copy_cleanup_tasks = {}
+
+    def _copy_operation_terminal_record(self, operation_id: str) -> _CopyOperationTerminal | None:
+        pending = self._copy_cleanup_pending_terminals.get(operation_id)
+        if pending is not None:
+            return pending
+        return self._copy_operation_terminal.get(operation_id)
+
+    def _retain_copy_operation_terminal(
+        self,
+        operation_id: str,
+        terminal: _CopyOperationTerminal,
+    ) -> None:
+        outcome = terminal.outcome
+        if outcome is not None and outcome.cleanup_state == "pending":
+            self._copy_operation_terminal.pop(operation_id, None)
+            self._copy_cleanup_pending_terminals[operation_id] = terminal
+            return
+        self._copy_cleanup_pending_terminals.pop(operation_id, None)
+        self._copy_operation_terminal[operation_id] = terminal
 
     def _discard_copy_operation_state_for_owner(self, owner_id: str) -> None:
         self._ensure_copy_operation_state()
@@ -6706,6 +6731,7 @@ class RayQueryDriverActor:
         }
         for operation_id in operation_ids:
             self._copy_operation_identities.pop(operation_id, None)
+            self._copy_cleanup_pending_terminals.pop(operation_id, None)
         self._copy_operation_terminal.discard_where(
             lambda operation_id, record: operation_id in operation_ids and record.owner_id == owner_id
         )
@@ -6845,17 +6871,23 @@ class RayQueryDriverActor:
             finally:
                 self._end_session_operation(session)
         except BaseException as error:
-            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
-                owner_id=owner_id,
-                session_id=session_id,
-                error=error,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                _CopyOperationTerminal(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    error=error,
+                ),
             )
             raise
         else:
-            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
-                owner_id=owner_id,
-                session_id=session_id,
-                outcome=outcome,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                _CopyOperationTerminal(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    outcome=outcome,
+                ),
             )
             return outcome
         finally:
@@ -6876,7 +6908,7 @@ class RayQueryDriverActor:
         operation_id = self._copy_operation_id(plan)
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
-        terminal = self._copy_operation_terminal.get(operation_id)
+        terminal = self._copy_operation_terminal_record(operation_id)
         if terminal is not None:
             self._validate_copy_operation_identity(
                 terminal,
@@ -6949,7 +6981,7 @@ class RayQueryDriverActor:
             raise ValueError("Vane session_id must not be empty")
         if not operation_key:
             raise ValueError("COPY operation identity must not be empty")
-        terminal = self._copy_operation_terminal.get(operation_key)
+        terminal = self._copy_operation_terminal_record(operation_key)
         if terminal is not None:
             self._validate_copy_operation_identity(
                 terminal,
@@ -6974,7 +7006,7 @@ class RayQueryDriverActor:
                     timeout=wait_timeout_s,
                 )
                 if not done:
-                    terminal = self._copy_operation_terminal.get(operation_key)
+                    terminal = self._copy_operation_terminal_record(operation_key)
                     if terminal is not None:
                         self._validate_copy_operation_identity(
                             terminal,
@@ -6992,7 +7024,7 @@ class RayQueryDriverActor:
             except asyncio.CancelledError:
                 raise
             except BaseException as operation_error:
-                terminal = self._copy_operation_terminal.get(operation_key)
+                terminal = self._copy_operation_terminal_record(operation_key)
                 if terminal is not None:
                     self._validate_copy_operation_identity(
                         terminal,
@@ -7061,11 +7093,14 @@ class RayQueryDriverActor:
             cleanup_state=cleanup_state,
             cleanup_warnings=cleanup_warnings,
         )
-        current = self._copy_operation_terminal.get(operation_id)
+        current = self._copy_operation_terminal_record(operation_id)
         if current is terminal:
-            self._copy_operation_terminal[operation_id] = replace(
-                terminal,
-                outcome=updated,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                replace(
+                    terminal,
+                    outcome=updated,
+                ),
             )
         return updated
 
@@ -7088,7 +7123,7 @@ class RayQueryDriverActor:
         if outcome.cleanup_state == "complete":
             return outcome
         operation_key = str(operation_id).strip()
-        terminal = self._copy_operation_terminal.get(operation_key)
+        terminal = self._copy_operation_terminal_record(operation_key)
         if terminal is None or terminal.outcome is None:
             raise CopyOutcomeUnknownError(operation_key)
         cleanup_task = self._copy_cleanup_tasks.get(operation_key)

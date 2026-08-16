@@ -1518,6 +1518,115 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     assert teardown_calls == 2
 
 
+def test_query_driver_pending_copy_cleanup_survives_terminal_replay_eviction(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    pending_plan_id = "copy-cleanup-pending-retained"
+    completed_plan_id = "copy-cleanup-completed-later"
+    logical_plans = {
+        plan_id: _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+        for plan_id in (pending_plan_id, completed_plan_id)
+    }
+    plan_calls = {pending_plan_id: 0, completed_plan_id: 0}
+    teardown_calls = {pending_plan_id: 0, completed_plan_id: 0}
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(plan, _conn, on_execution_started):
+            plan_id = str(plan.idx())
+            plan_calls[plan_id] += 1
+            on_execution_started()
+            return _committed_copy_result(rows_copied=plan_calls[plan_id])
+
+    async def _register(
+        _self,
+        plan,
+        *,
+        query_connection,
+        expected_plan_id=None,
+    ):
+        del query_connection
+        plan_id = str(plan.idx())
+        assert expected_plan_id == plan_id
+        return SimpleNamespace(query_id=plan_id, units=()), object()
+
+    def _teardown(_self, plan_id):
+        teardown_calls[plan_id] += 1
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
+        assert query_id == plan_id
+        assert drop_fragments is True
+        if plan_id == pending_plan_id and teardown_calls[plan_id] == 1:
+            raise RuntimeError("planned retained cleanup failure")
+        _release_test_plan_session_state(cls, runner, plan_id)
+
+    runner._copy_operation_terminal = driver.BoundedReplayMap(capacity=1)
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _register)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    pending = asyncio.run(_run_actor_copy_plan(runner, logical_plans[pending_plan_id]))
+    completed = asyncio.run(_run_actor_copy_plan(runner, logical_plans[completed_plan_id]))
+    assert runner._copy_cleanup_pending_terminals[pending_plan_id].outcome == pending
+    assert runner._copy_operation_terminal.get(pending_plan_id) is None
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            pending_plan_id,
+        )
+    )
+    cleaned = asyncio.run(
+        cls.retry_copy_cleanup(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            pending_plan_id,
+        )
+    )
+    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plans[pending_plan_id]))
+
+    assert pending.cleanup_state == "pending"
+    assert completed.cleanup_state == "complete"
+    assert recovered.outcome == pending
+    assert cleaned.cleanup_state == "complete"
+    assert pending_plan_id not in runner._copy_cleanup_pending_terminals
+    assert replayed == cleaned
+    assert plan_calls == {pending_plan_id: 1, completed_plan_id: 1}
+    assert teardown_calls == {pending_plan_id: 2, completed_plan_id: 1}
+
+
+def test_query_driver_owner_discard_releases_pending_copy_cleanup_terminal():
+    cls, runner = _make_local_query_driver_actor()
+    operation_id = "copy-cleanup-pending-owner-detach"
+    cls._ensure_copy_operation_state(runner)
+    runner._copy_operation_identities[operation_id] = (
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+    )
+    cls._retain_copy_operation_terminal(
+        runner,
+        operation_id,
+        driver._CopyOperationTerminal(
+            owner_id=_TEST_RUNTIME_OWNER_ID,
+            session_id=_TEST_SESSION_ID,
+            outcome=driver.CopyPlanOutcome(
+                result={},
+                final_progress_snapshot=None,
+                operation_id=operation_id,
+                cleanup_state="pending",
+            ),
+        ),
+    )
+
+    cls._discard_copy_operation_state_for_owner(runner, _TEST_RUNTIME_OWNER_ID)
+
+    assert operation_id not in runner._copy_operation_identities
+    assert operation_id not in runner._copy_cleanup_pending_terminals
+    assert cls._copy_operation_terminal_record(runner, operation_id) is None
+
+
 def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
