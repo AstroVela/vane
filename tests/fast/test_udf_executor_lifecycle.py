@@ -709,6 +709,68 @@ def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
     assert ready.wait_calls == [pytest.approx(0.125)]
 
 
+def test_local_vllm_result_wait_uses_query_deadline(monkeypatch):
+    import vane.execution.vllm as vllm
+
+    class FakeCondition:
+        def __init__(self):
+            self.timeout = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def wait_for(self, predicate, timeout=None):
+            assert predicate() is False
+            self.timeout = timeout
+            return False
+
+    condition = FakeCondition()
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._result_cv = condition
+    executor._wait_for_result_state = lambda _executor_id: (False, False)
+    monkeypatch.setattr(vllm.time, "time", lambda: 100.0)
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "101.0")
+
+    with pytest.raises(TimeoutError, match="query deadline expired while waiting for vLLM result"):
+        executor.wait_for_result()
+
+    assert condition.timeout == pytest.approx(1.0)
+
+
+def test_local_vllm_result_wait_returns_buffered_result_without_rechecking_deadline(monkeypatch):
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._result_cv = threading.Condition()
+    executor._wait_for_result_state = lambda _executor_id: (True, False)
+    monkeypatch.setattr(vllm.time, "time", lambda: 100.0)
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "99.0")
+
+    assert executor.wait_for_result() is True
+
+
+def test_local_vllm_result_wait_treats_shutdown_as_terminal():
+    import vane.execution.vllm as vllm
+
+    executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor.completed_tasks = deque()
+    executor.error_message = None
+    executor._finished_submitting = True
+    executor._shutdown_called = True
+    executor.running_task_count = 1
+    executor._per_executor_deques = {}
+    executor._per_executor_running_task_count = {"executor": 1}
+    executor._per_executor_finished = set()
+    executor._per_executor_errors = {}
+    executor._per_executor_aborted = set()
+
+    assert executor._wait_for_result_state(None) == (False, True)
+    assert executor._wait_for_result_state("executor") == (False, True)
+
+
 def test_vllm_remote_submit_failure_rolls_back_inflight(monkeypatch):
     import vane.execution.vllm as vllm
 

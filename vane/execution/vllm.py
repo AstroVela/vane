@@ -819,7 +819,13 @@ class LocalVLLMExecutor(VLLMExecutor):
 
     def _wait_for_result_blocking(self, executor_id: str | None = None) -> bool:
         with self._result_cv:
-            self._result_cv.wait_for(lambda: any(self._wait_for_result_state(executor_id)))
+            state = self._wait_for_result_state(executor_id)
+            if any(state):
+                return state[0]
+            timeout_s = _query_deadline_remaining_s()
+            ready = self._result_cv.wait_for(lambda: any(self._wait_for_result_state(executor_id)), timeout=timeout_s)
+            if not ready:
+                raise TimeoutError("query deadline expired while waiting for vLLM result")
             return self._wait_for_result_state(executor_id)[0]
 
     def _wait_for_result_state(self, executor_id: str | None) -> tuple[bool, bool]:
@@ -827,6 +833,8 @@ class LocalVLLMExecutor(VLLMExecutor):
             self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
         )
         has_result = bool(source_deque)
+        if self._shutdown_called:
+            return has_result, True
         if executor_id:
             terminal = (
                 executor_id in self._per_executor_errors
