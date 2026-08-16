@@ -28,6 +28,7 @@ from vane.ai.provider import (
     _SafeProviderError,
     _translate_missing_provider_dependency,
 )
+from vane.execution._llm_executor import LLMExecutor
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -139,83 +140,13 @@ def _attach_vllm_cleanup_failure(
         pass
 
 
-class VLLMExecutor(ABC):
-    """Common execution contract shared by local and Ray-backed vLLM executors.
+class VLLMExecutor(LLMExecutor):
+    """Base class for vLLM-backed executors.
 
-    Besides the submit/result lifecycle, the base class owns a one-shot wakeup
-    protocol used by DuckDB's native scheduler.  A scheduler callback is armed
-    only while no result or terminal state is ready, then consumed by the next
-    relevant state change so a blocked pipeline task can be scheduled again.
+    The engine-agnostic submit/result contract and one-shot wakeup protocol
+    live in :class:`LLMExecutor`. This class is the vLLM backend seam: the
+    concrete local, Ray-local, and remote vLLM executors subclass it.
     """
-
-    def _ensure_wakeup_state(self) -> None:
-        """Lazily initialize callback state for subclasses and test doubles."""
-        if not hasattr(self, "_wakeup_lock"):
-            self._wakeup_lock = threading.Lock()
-        if not hasattr(self, "_wakeup_callbacks"):
-            self._wakeup_callbacks: list[Callable[[], None]] = []
-
-    def _wakeup_ready(self) -> bool:
-        """Return whether the native scheduler should resume without arming."""
-        return False
-
-    def register_wakeup_callback(self, callback: Callable[[], None]) -> bool:
-        """Arm a one-shot native wakeup unless work is already actionable.
-
-        True means the callback is stored and the scheduler may safely block;
-        False means it must immediately recheck results or terminal state.
-        """
-        if not callable(callback):
-            raise TypeError("vllm wakeup callback must be callable")
-        self._ensure_wakeup_state()
-        with self._wakeup_lock:
-            if self._wakeup_ready():
-                return False
-            self._wakeup_callbacks.append(callback)
-            return True
-
-    def _notify_state_change(self, *, force: bool = False) -> None:
-        """Wake condition waiters and consume actionable native callbacks.
-
-        Condition waiters are always notified.  Native callbacks are one-shot
-        and run only when `_wakeup_ready()` is true, unless `force` requests an
-        unconditional scheduler recheck after a state transition.
-        """
-        self._ensure_wakeup_state()
-        callbacks: list[Callable[[], None]] = []
-        with self._wakeup_lock:
-            if force or self._wakeup_ready():
-                callbacks = self._wakeup_callbacks
-                self._wakeup_callbacks = []
-        result_cv = getattr(self, "_result_cv", None)
-        if result_cv is not None:
-            with result_cv:
-                result_cv.notify_all()
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                pass
-
-    @abstractmethod
-    def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
-        pass
-
-    @abstractmethod
-    def take_ready_result(self) -> tuple[list[str | None], pa.Table] | None:
-        pass
-
-    @abstractmethod
-    def finished_submitting(self) -> None:
-        pass
-
-    @abstractmethod
-    def all_tasks_finished(self) -> bool:
-        pass
-
-    @abstractmethod
-    def shutdown(self) -> None:
-        pass
 
 
 def _ensure_table(rows: Any) -> pa.Table:
@@ -2576,7 +2507,7 @@ def _apply_engine_defaults(engine_args: dict[str, Any]) -> dict[str, Any]:
     return engine_args
 
 
-def build_executor(model: str, options: Any | None) -> VLLMExecutor:
+def build_executor(model: str, options: Any | None) -> LLMExecutor:
     opts = normalize_options(options)
     pool_name = opts.get("ray_actor_pool_name")
     require_ray_worker = opts.get("require_ray_worker", False) or opts.get("ray_worker_only", False)
