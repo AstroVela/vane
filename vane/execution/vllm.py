@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import json
 import math
 import os
@@ -12,19 +10,16 @@ import threading
 import time
 import uuid
 import warnings
-from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 from decimal import Decimal
 from numbers import Integral, Real
-from typing import Any, Callable, overload
+from typing import Any, Callable
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
-from vane.ai.functions import _log_substituted_failure
 from vane.ai.provider import (
-    _safe_provider_execution_error,
     _SafeProviderError,
     _translate_missing_provider_dependency,
 )
@@ -223,7 +218,7 @@ class LocalVLLMExecutor(VLLMExecutor, LocalEngineExecutor):
         return final_output.outputs[0].text
 
 
-class RayLocalVLLMExecutor(RayActorExecutorMixin, LocalVLLMExecutor):
+class RayLocalVLLMExecutor(RayActorExecutorMixin, LocalVLLMExecutor):  # type: ignore[misc]
     def __init__(
         self,
         model: str,
@@ -1819,10 +1814,11 @@ def ensure_named_vllm_pools_for_plan(
                 engine = str(raw_opts.get("engine") or "vllm")
 
             if engine == "sglang":
-                from vane.execution.sglang import SGLangRayLocalExecutor, normalize_options as normalize_sglang_options
+                from vane.execution.sglang import SGLangRayLocalExecutor
+                from vane.execution.sglang import normalize_options as normalize_sglang_options
 
                 opts = normalize_sglang_options(raw_opts)
-                actor_cls = SGLangRayLocalExecutor
+                actor_cls: type = SGLangRayLocalExecutor
                 engine_args = dict(opts.get("engine_args") or {})
                 generate_args = dict(opts.get("generate_args") or {})
                 engine_init_timeout_s = opts.get("engine_init_timeout_s")

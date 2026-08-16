@@ -576,8 +576,8 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
-    import vane.execution.vllm as vllm
     import vane.execution._llm_executor as llm_executor
+    import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
     executor.llm = None

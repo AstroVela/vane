@@ -98,7 +98,16 @@ class NativeInferencePlan(NativePrompterPlan):
     field selects which executor factory runs at execution time.
     """
 
+    model_name: str
+    system_message: str | None
+    on_error: str
+
     @abstractmethod
     def get_engine(self) -> str:
         """Return the inference engine name ("vllm" | "sglang")."""
+        ...
+
+    @abstractmethod
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build options for the native PhysicalVLLM operator."""
         ...

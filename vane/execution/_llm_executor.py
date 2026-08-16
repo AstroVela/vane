@@ -25,7 +25,6 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
-from collections.abc import Mapping
 from typing import Any, Callable
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -740,6 +739,15 @@ class RayActorExecutorMixin:
     Concrete Ray executors mix this in ahead of their engine executor class.
     """
 
+    # Host contract supplied by LocalEngineExecutor when this mixin is placed
+    # ahead of it in a concrete executor's MRO. The data attributes are
+    # type-only annotations; the method references resolve through the
+    # cooperative self / super() at runtime.
+    _engine_name: str
+    task_count_lock: threading.Lock
+    _per_executor_waiters: dict[str, int]
+    _per_executor_wait_tokens_observed: dict[str, str]
+
     def _ensure_async_waiter_state(self) -> None:
         if not hasattr(self, "_async_waiter_lock"):
             self._async_waiter_lock = threading.Lock()
@@ -747,7 +755,7 @@ class RayActorExecutorMixin:
             self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
 
     def _notify_state_change(self, *, force: bool = False) -> None:
-        super()._notify_state_change(force=force)
+        super()._notify_state_change(force=force)  # type: ignore[misc]
         self._ensure_async_waiter_state()
         with self._async_waiter_lock:
             waiters = [waiter for executor_waiters in self._async_waiters.values() for waiter in executor_waiters]
@@ -766,7 +774,7 @@ class RayActorExecutorMixin:
         if executor_id is None:
             if wait_token is not None:
                 raise ValueError(f"{self._engine_name} global wait does not accept a wait_token")
-            return await asyncio.to_thread(self._wait_for_result_blocking, None)
+            return await asyncio.to_thread(self._wait_for_result_blocking, None)  # type: ignore[attr-defined]
         if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
             raise ValueError(f"{self._engine_name} wait_token must be a non-empty string")
         self._ensure_async_waiter_state()
@@ -779,12 +787,12 @@ class RayActorExecutorMixin:
             self._per_executor_waiters[executor_id] = self._per_executor_waiters.get(executor_id, 0) + 1
         try:
             while True:
-                has_result, terminal = self._wait_for_result_state(executor_id)
+                has_result, terminal = self._wait_for_result_state(executor_id)  # type: ignore[attr-defined]
                 if has_result or terminal:
-                    self._raise_if_task_failed(executor_id)
+                    self._raise_if_task_failed(executor_id)  # type: ignore[attr-defined]
                     return has_result
                 state_changed.clear()
-                has_result, terminal = self._wait_for_result_state(executor_id)
+                has_result, terminal = self._wait_for_result_state(executor_id)  # type: ignore[attr-defined]
                 if has_result or terminal:
                     continue
                 await state_changed.wait()

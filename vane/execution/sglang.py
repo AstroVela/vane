@@ -18,8 +18,8 @@ from typing import Any
 
 from vane.ai.provider import _SafeProviderError
 from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor, RayActorExecutorMixin
-from vane.runners.ray.ray_env import install_explicit_session_runtime_env
 from vane.execution._vllm_options_protocol import _unpack_native_options_envelope
+from vane.runners.ray.ray_env import install_explicit_session_runtime_env
 
 
 class SGLangExecutor(LLMExecutor):
@@ -76,7 +76,7 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
         return str(getattr(output, "text"))
 
 
-class SGLangRayLocalExecutor(RayActorExecutorMixin, SGLangLocalExecutor):
+class SGLangRayLocalExecutor(RayActorExecutorMixin, SGLangLocalExecutor):  # type: ignore[misc]
     """SGLang backend executor for Ray actor pools.
 
     Reuses the engine hooks from :class:`SGLangLocalExecutor` and the async
@@ -156,7 +156,7 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
     return merged
 
 
-def build_executor(model: str, options: Any | None) -> SGLangExecutor:
+def build_executor(model: str, options: Any | None) -> LLMExecutor:
     opts = normalize_options(options)
     if opts.get("use_ray"):
         import ray

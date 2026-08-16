@@ -12,7 +12,6 @@ pa = pytest.importorskip("pyarrow")
 
 def test_unknown_engine_reports_clear_error():
     import vane
-
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     envelope = _build_native_vllm_options_argument({})

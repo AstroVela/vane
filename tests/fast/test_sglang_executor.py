@@ -68,7 +68,6 @@ def test_sglang_local_executor_roundtrip(monkeypatch):
 def test_sglang_engine_dispatch_via_sql(monkeypatch):
     monkeypatch.setitem(sys.modules, "sglang", _fake_sglang())
     import vane
-
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     envelope = _build_native_vllm_options_argument({})
@@ -105,7 +104,6 @@ def test_sglang_prompt_expression_end_to_end(monkeypatch):
 
 def test_sglang_driver_precreation_dispatches_by_engine(monkeypatch):
     import vane.execution.vllm as vllm
-
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     envelope = _build_native_vllm_options_argument({})
