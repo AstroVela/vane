@@ -36,9 +36,20 @@ struct SecretMetadata {
 	const string &type;
 	const string &provider;
 	const vector<string> &scope;
+	bool uses_standard_prefix_matching;
+};
+
+//! Non-sensitive view emitted once for every registered storage, including
+//! empty and lookup-excluded storages, before any of that storage's secret
+//! entries. The referenced name remains valid only for the callback duration.
+struct SecretStorageMetadata {
+	const string &name;
+	bool included_in_lookups;
+	bool uses_standard_secret_lookup;
 };
 
 using secret_metadata_callback_t = std::function<bool(const SecretMetadata &)>;
+using secret_storage_metadata_callback_t = std::function<bool(const SecretStorageMetadata &)>;
 
 //! Base class for SecretStorage API
 class SecretStorage {
@@ -67,7 +78,9 @@ public:
 	//! Get all secrets
 	virtual vector<SecretEntry> AllSecrets(optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
 	//! Scan non-sensitive secret metadata without cloning credential values.
-	//! Returns false when the callback requests early termination.
+	//! The callback is synchronous and may execute while storage/catalog locks are
+	//! held. It must not retain metadata references, block, or call secret/catalog
+	//! APIs. Returns false when the callback requests early termination.
 	virtual bool ScanSecretMetadata(const secret_metadata_callback_t &callback,
 	                                optional_ptr<CatalogTransaction> transaction = nullptr) = 0;
 	//! Drop secret by name
@@ -83,6 +96,13 @@ public:
 	//! Returns include_in_lookups, used to create secret storage
 	virtual bool IncludeInLookups() {
 		return true;
+	}
+	//! Whether lookup participation and the entry-selection snapshot stay stable
+	//! for the supplied transaction, LookupSecret uses SelectBestMatch, and
+	//! ScanSecretMetadata completely enumerates that snapshot. Custom storage
+	//! classes must explicitly certify this complete contract.
+	virtual bool UsesStandardSecretLookup() const {
+		return false;
 	}
 
 	virtual bool Persistent() const {
@@ -124,16 +144,19 @@ public:
 	string &GetName() override {
 		return storage_name;
 	};
+	bool UsesStandardSecretLookup() const override {
+		return typeid(CatalogSetSecretStorage) == typeid(*this);
+	}
 
 	unique_ptr<SecretEntry> StoreSecret(unique_ptr<const BaseSecret> secret, OnCreateConflict on_conflict,
 	                                    optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	vector<SecretEntry> AllSecrets(optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	bool ScanSecretMetadata(const secret_metadata_callback_t &callback,
-	                        optional_ptr<CatalogTransaction> transaction = nullptr) override;
+	                        optional_ptr<CatalogTransaction> transaction = nullptr) final;
 	void DropSecretByName(const string &name, OnEntryNotFound on_entry_not_found,
 	                      optional_ptr<CatalogTransaction> transaction = nullptr) override;
 	SecretMatch LookupSecret(const string &path, const string &type,
-	                         optional_ptr<CatalogTransaction> transaction = nullptr) override;
+	                         optional_ptr<CatalogTransaction> transaction = nullptr) final;
 	unique_ptr<SecretEntry> GetSecretByName(const string &name,
 	                                        optional_ptr<CatalogTransaction> transaction = nullptr) override;
 
@@ -150,21 +173,27 @@ protected:
 	DatabaseInstance &db;
 };
 
-class TemporarySecretStorage : public CatalogSetSecretStorage {
+class TemporarySecretStorage final : public CatalogSetSecretStorage {
 public:
 	TemporarySecretStorage(const string &name_p, DatabaseInstance &db_p)
 	    : CatalogSetSecretStorage(db_p, name_p, TEMPORARY_STORAGE_OFFSET) {
 		secrets = make_uniq<CatalogSet>(Catalog::GetSystemCatalog(db));
 		persistent = false;
 	}
+	bool UsesStandardSecretLookup() const final {
+		return true;
+	}
 
 protected:
 };
 
-class LocalFileSecretStorage : public CatalogSetSecretStorage {
+class LocalFileSecretStorage final : public CatalogSetSecretStorage {
 public:
 	LocalFileSecretStorage(SecretManager &manager, DatabaseInstance &db, const string &name_p,
 	                       const string &secret_path);
+	bool UsesStandardSecretLookup() const final {
+		return true;
+	}
 
 protected:
 	//! Implements the writes to disk

@@ -1132,12 +1132,10 @@ void register_ray_bindings(py::module_ &mod) {
 			    throw duckdb::InternalException("test scoped secret discovery requires the source connection");
 		    }
 		    vector<ScopedSecretUse> uses;
+		    idx_t total_use_bytes = 0;
 		    auto append_uris = [&](py::iterable values, uint8_t capability) {
 			    for (auto value : values) {
-				    if (!py::isinstance<py::str>(value)) {
-					    throw py::type_error("test scoped secret URIs must be strings");
-				    }
-				    AddScopedSecretUse(uses, py::reinterpret_borrow<py::str>(value).cast<string>(), capability);
+				    AddScopedSecretUse(uses, total_use_bytes, ScopedSecretUseURIFromPython(value), capability);
 			    }
 		    };
 		    append_uris(source_uris, SCOPED_SECRET_CAPABILITY_READ);
@@ -1156,6 +1154,30 @@ void register_ray_bindings(py::module_ &mod) {
 	    },
 	    py::arg("plan"), py::arg("source_uris"), py::arg("sink_uris"),
 	    "Attach explicit remote URI uses for scoped-secret contract tests.");
+
+	m.def(
+	    "_register_non_prefix_scoped_secret_for_test",
+	    [](py::object connection, const string &secret_name) {
+		    auto &wrapper = ExtractPyConnectionWrapper(connection);
+		    auto context = wrapper.con.GetConnection().context;
+		    context->RunFunctionInTransaction([&]() {
+			    auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
+			    unique_ptr<const BaseSecret> secret = make_uniq<NonPrefixScopedSecretForTest>(secret_name);
+			    SecretManager::Get(*context).RegisterSecret(
+			        transaction, std::move(secret), OnCreateConflict::ERROR_ON_CONFLICT, SecretPersistType::TEMPORARY);
+		    });
+	    },
+	    py::arg("connection"), py::arg("secret_name"),
+	    "Register a non-prefix scoped secret for hard-cut contract tests.");
+
+	m.def(
+	    "_register_nonstandard_empty_secret_storage_for_test",
+	    [](py::object connection) {
+		    auto &wrapper = ExtractPyConnectionWrapper(connection);
+		    auto context = wrapper.con.GetConnection().context;
+		    SecretManager::Get(*context).LoadSecretStorage(make_uniq<NonStandardEmptySecretStorageForTest>());
+	    },
+	    py::arg("connection"), "Register an empty nonstandard lookup storage for hard-cut contract tests.");
 
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",

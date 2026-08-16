@@ -193,12 +193,64 @@ TEST_CASE("Test adding a custom secret storage", "[secret][.]") {
 	REQUIRE(log.remove_secret_requests[1] == "s1");
 }
 
+TEST_CASE("Secret storage generation changes when a storage is loaded", "[secret][.]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET allow_persistent_secrets=false"));
+
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
+	auto generation_before = secret_manager.GetSecretStorageGeneration(transaction);
+
+	TestSecretLog log;
+	secret_manager.LoadSecretStorage(make_uniq<TestSecretStorage>("generation_test", *db.instance, log, 30));
+	auto generation_after = secret_manager.GetSecretStorageGeneration(transaction);
+
+	REQUIRE(generation_after == generation_before + 1);
+}
+
+TEST_CASE("Secret metadata scan reports lookup-excluded storages", "[secret][.]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET allow_persistent_secrets=false"));
+
+	auto &secret_manager = SecretManager::Get(*db.instance);
+	TestSecretLog log;
+	auto storage = make_uniq<TestSecretStorage>("excluded_metadata_test", *db.instance, log, 30);
+	storage->include_in_lookups = false;
+	secret_manager.LoadSecretStorage(std::move(storage));
+	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
+
+	bool saw_excluded_storage = false;
+	idx_t visited_entries = 0;
+	auto completed = secret_manager.ScanSecretMetadata(
+	    transaction,
+	    [&](const SecretStorageMetadata &metadata) {
+		    if (metadata.name == "excluded_metadata_test") {
+			    REQUIRE(!metadata.included_in_lookups);
+			    REQUIRE(!metadata.uses_standard_secret_lookup);
+			    saw_excluded_storage = true;
+		    }
+		    return true;
+	    },
+	    [&](const SecretMetadata &) {
+		    visited_entries++;
+		    return true;
+	    });
+
+	REQUIRE(completed);
+	REQUIRE(saw_excluded_storage);
+	REQUIRE(visited_entries == 0);
+}
+
 TEST_CASE("Scan secret metadata without cloning credential-bearing entries", "[secret][.]") {
 	DuckDB db(nullptr);
+	Connection con(db);
 
 	if (!db.ExtensionIsLoaded("httpfs")) {
 		return;
 	}
+	REQUIRE_NO_FAIL(con.Query("SET allow_persistent_secrets=false"));
 
 	auto &secret_manager = SecretManager::Get(*db.instance);
 	auto transaction = CatalogTransaction::GetSystemTransaction(*db.instance);
@@ -210,18 +262,31 @@ TEST_CASE("Scan secret metadata without cloning credential-bearing entries", "[s
 	REQUIRE(registered);
 	auto clones_before_scan = *clone_count;
 
+	bool saw_memory_storage = false;
 	idx_t visited_count = 0;
-	auto completed = secret_manager.ScanSecretMetadata(transaction, [&](const SecretMetadata &metadata) {
-		visited_count++;
-		REQUIRE(metadata.storage_mode == SecretManager::TEMPORARY_STORAGE_NAME);
-		REQUIRE(metadata.name == "metadata_scan_secret");
-		REQUIRE(metadata.type == "s3");
-		REQUIRE(metadata.provider == "config");
-		REQUIRE(metadata.scope == vector<string> {"s3://metadata-scan/"});
-		return false;
-	});
+	auto completed = secret_manager.ScanSecretMetadata(
+	    transaction,
+	    [&](const SecretStorageMetadata &metadata) {
+		    REQUIRE(metadata.uses_standard_secret_lookup);
+		    if (metadata.name == SecretManager::TEMPORARY_STORAGE_NAME) {
+			    REQUIRE(metadata.included_in_lookups);
+			    saw_memory_storage = true;
+		    }
+		    return true;
+	    },
+	    [&](const SecretMetadata &metadata) {
+		    visited_count++;
+		    REQUIRE(metadata.storage_mode == SecretManager::TEMPORARY_STORAGE_NAME);
+		    REQUIRE(metadata.name == "metadata_scan_secret");
+		    REQUIRE(metadata.type == "s3");
+		    REQUIRE(metadata.provider == "config");
+		    REQUIRE(metadata.scope == vector<string> {"s3://metadata-scan/"});
+		    REQUIRE(!metadata.uses_standard_prefix_matching);
+		    return false;
+	    });
 
 	REQUIRE(!completed);
+	REQUIRE(saw_memory_storage);
 	REQUIRE(visited_count == 1);
 	REQUIRE(*clone_count == clones_before_scan);
 }

@@ -15,15 +15,19 @@ static constexpr uint8_t SCOPED_SECRET_CAPABILITY_READ = 1 << 0;
 static constexpr uint8_t SCOPED_SECRET_CAPABILITY_WRITE = 1 << 1;
 static constexpr uint8_t SCOPED_SECRET_CAPABILITY_MASK = SCOPED_SECRET_CAPABILITY_READ | SCOPED_SECRET_CAPABILITY_WRITE;
 static constexpr idx_t SCOPED_SECRET_MAX_REFERENCES = 4096;
+static constexpr idx_t SCOPED_SECRET_MAX_REFERENCE_BYTES = 16 * 1024 * 1024;
 static constexpr idx_t SCOPED_SECRET_MAX_USES = 100000;
+static constexpr idx_t SCOPED_SECRET_MAX_USE_BYTES = 16 * 1024 * 1024;
 static constexpr idx_t SCOPED_SECRET_MAX_IDENTITY_SIZE = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_SCOPE_SIZE = 65536;
+static constexpr idx_t SCOPED_SECRET_MAX_METADATA_STORAGES = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_METADATA_ENTRIES = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_METADATA_SCOPES = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_METADATA_BYTES = 16 * 1024 * 1024;
 static constexpr idx_t SCOPED_SECRET_MAX_GENERATED_BOUNDARIES = 4096;
 static constexpr idx_t SCOPED_SECRET_MAX_GENERATED_BOUNDARY_BYTES = 16 * 1024 * 1024;
 static constexpr char SCOPED_SECRET_GENERATED_PROBE_SUFFIX[] = "__vane_generated_copy_scope_probe__";
+static constexpr char SCOPED_SECRET_COPY_COMMIT_SUFFIX[] = ".duckdb_commit";
 
 struct ScopedSecretRef {
 	uint32_t version = SCOPED_SECRET_REF_VERSION;
@@ -72,12 +76,91 @@ struct ScopedSecretSelection {
 	string normalized_scope;
 };
 
+class NonPrefixScopedSecretForTest : public BaseSecret {
+public:
+	explicit NonPrefixScopedSecretForTest(const string &name)
+	    : BaseSecret({"s3://non-prefix-test-scope/"}, "s3", "config", name) {
+	}
+
+	int64_t MatchScore(const string &path) const override {
+		if (!StringUtil::EndsWith(path, ".parquet")) {
+			return NumericLimits<int64_t>::Minimum();
+		}
+		return NumericCast<int64_t>(path.size());
+	}
+
+	unique_ptr<const BaseSecret> Clone() const override {
+		return make_uniq<NonPrefixScopedSecretForTest>(*this);
+	}
+};
+
+class NonStandardEmptySecretStorageForTest : public SecretStorage {
+public:
+	NonStandardEmptySecretStorageForTest() : SecretStorage("vane_nonstandard_empty_test", 1000) {
+		unique_ptr<const BaseSecret> secret =
+		    make_uniq<KeyValueSecret>(vector<string> {"s3://nonstandard-empty-storage-scope/"}, "s3", "config",
+		                              "nonstandard_empty_storage_secret");
+		synthetic_entry = make_uniq<SecretEntry>(std::move(secret));
+		synthetic_entry->persist_type = SecretPersistType::TEMPORARY;
+		synthetic_entry->storage_mode = GetName();
+	}
+
+	unique_ptr<SecretEntry> StoreSecret(unique_ptr<const BaseSecret>, OnCreateConflict,
+	                                    optional_ptr<CatalogTransaction>) override {
+		throw NotImplementedException("Test-only synthetic secret storage does not support writes");
+	}
+
+	vector<SecretEntry> AllSecrets(optional_ptr<CatalogTransaction>) override {
+		return {};
+	}
+
+	bool ScanSecretMetadata(const secret_metadata_callback_t &, optional_ptr<CatalogTransaction>) override {
+		return true;
+	}
+
+	void DropSecretByName(const string &, OnEntryNotFound, optional_ptr<CatalogTransaction>) override {
+		throw NotImplementedException("Test-only synthetic secret storage does not support drops");
+	}
+
+	SecretMatch LookupSecret(const string &path, const string &type, optional_ptr<CatalogTransaction>) override {
+		if (StringUtil::CIEquals(type, "s3") && StringUtil::EndsWith(path, ".parquet")) {
+			return SecretMatch(*synthetic_entry, NumericLimits<int64_t>::Maximum() / 2);
+		}
+		return SecretMatch();
+	}
+
+	unique_ptr<SecretEntry> GetSecretByName(const string &, optional_ptr<CatalogTransaction>) override {
+		return nullptr;
+	}
+
+private:
+	unique_ptr<SecretEntry> synthetic_entry;
+};
+
 static void AppendScopedSecretIdentityField(string &identity_material, const string &value) {
 	auto value_size = static_cast<uint64_t>(value.size());
 	for (idx_t byte_idx = 0; byte_idx < sizeof(value_size); byte_idx++) {
 		identity_material.push_back(static_cast<char>((value_size >> (byte_idx * 8)) & 0xff));
 	}
 	identity_material.append(value);
+}
+
+static string CreateScopedSecretSelectionKey(const ScopedSecretSelection &selection) {
+	string key;
+	AppendScopedSecretIdentityField(key, selection.storage_name);
+	AppendScopedSecretIdentityField(key, selection.secret_name);
+	AppendScopedSecretIdentityField(key, selection.secret_type);
+	AppendScopedSecretIdentityField(key, selection.provider);
+	AppendScopedSecretIdentityField(key, selection.normalized_scope);
+	return key;
+}
+
+static string CreateScopedSecretScopeKey(const ScopedSecretSelection &selection) {
+	string key;
+	AppendScopedSecretIdentityField(key, selection.secret_type);
+	AppendScopedSecretIdentityField(key, selection.provider);
+	AppendScopedSecretIdentityField(key, selection.normalized_scope);
+	return key;
 }
 
 static string CreateScopedSecretReferenceId(const ScopedSecretSelection &selection, const string &owner_query_id,
@@ -150,6 +233,45 @@ static void ValidateScopedSecretIdentityField(const string &value, const char *f
 	}
 }
 
+static void ConsumeScopedSecretReferenceBytes(idx_t size, idx_t &total_bytes, const char *boundary) {
+	if (total_bytes > SCOPED_SECRET_MAX_REFERENCE_BYTES || size > SCOPED_SECRET_MAX_REFERENCE_BYTES - total_bytes) {
+		throw InvalidInputException("Scoped secret reference state at %s exceeds the maximum serialized byte size",
+		                            boundary);
+	}
+	total_bytes += size;
+}
+
+static void ConsumeScopedSecretReferenceBytes(const ScopedSecretRef &reference, idx_t &total_bytes,
+                                              const char *boundary) {
+	ConsumeScopedSecretReferenceBytes(reference.reference_id.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(reference.owner_query_id.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(reference.owner_session_id.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(reference.secret_type.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(reference.provider.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(reference.normalized_scope.size(), total_bytes, boundary);
+}
+
+static void ValidateScopedSecretSelection(const ScopedSecretSelection &selection) {
+	ValidateScopedSecretIdentityField(selection.storage_name, "selected storage name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+	ValidateScopedSecretIdentityField(selection.secret_name, "selected secret name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+	ValidateScopedSecretIdentityField(selection.secret_type, "selected secret type", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+	ValidateScopedSecretIdentityField(selection.provider, "selected provider", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+	ValidateScopedSecretIdentityField(selection.normalized_scope, "selected normalized scope",
+	                                  SCOPED_SECRET_MAX_SCOPE_SIZE, true);
+}
+
+static idx_t PreflightScopedSecretReferenceBytes(const ScopedSecretSelection &selection, const string &owner_query_id,
+                                                 const string &owner_session_id, idx_t total_bytes,
+                                                 const char *boundary) {
+	ConsumeScopedSecretReferenceBytes(BaseUUID::STRING_SIZE, total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(owner_query_id.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(owner_session_id.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(selection.secret_type.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(selection.provider.size(), total_bytes, boundary);
+	ConsumeScopedSecretReferenceBytes(selection.normalized_scope.size(), total_bytes, boundary);
+	return total_bytes;
+}
+
 static void ValidateScopedSecretRefs(const vector<ScopedSecretRef> &references, const string &expected_owner_query_id,
                                      const string &expected_session_id, const char *boundary) {
 	if (references.size() > SCOPED_SECRET_MAX_REFERENCES) {
@@ -164,6 +286,7 @@ static void ValidateScopedSecretRefs(const vector<ScopedSecretRef> &references, 
 	ValidateScopedSecretIdentityField(expected_session_id, "expected session ID", SCOPED_SECRET_MAX_IDENTITY_SIZE);
 
 	std::unordered_set<string> reference_ids;
+	idx_t total_reference_bytes = 0;
 	for (idx_t ref_idx = 0; ref_idx < references.size(); ref_idx++) {
 		auto &reference = references[ref_idx];
 		if (reference.version != SCOPED_SECRET_REF_VERSION) {
@@ -204,21 +327,21 @@ static void ValidateScopedSecretRefs(const vector<ScopedSecretRef> &references, 
 		}
 		ValidateScopedSecretIdentityField(reference.normalized_scope, "normalized scope", SCOPED_SECRET_MAX_SCOPE_SIZE,
 		                                  true);
+		ConsumeScopedSecretReferenceBytes(reference, total_reference_bytes, boundary);
 		if (reference.capabilities == 0 || (reference.capabilities & ~SCOPED_SECRET_CAPABILITY_MASK) != 0) {
 			throw InvalidInputException("Scoped secret reference '%s' has invalid capabilities at %s",
 			                            reference.reference_id, boundary);
 		}
 
-		if (ref_idx > 0 && !ScopedSecretRefLess(references[ref_idx - 1], reference)) {
-			throw InvalidInputException("Scoped secret reference state at %s is not in canonical order", boundary);
-		}
-		for (idx_t prior_idx = 0; prior_idx < ref_idx; prior_idx++) {
-			auto &prior = references[prior_idx];
+		if (ref_idx > 0) {
+			auto &prior = references[ref_idx - 1];
+			if (!ScopedSecretRefLess(prior, reference)) {
+				throw InvalidInputException("Scoped secret reference state at %s is not in canonical order", boundary);
+			}
 			if (prior.secret_type == reference.secret_type && prior.provider == reference.provider &&
 			    prior.normalized_scope == reference.normalized_scope) {
-				throw InvalidInputException(
-				    "Scoped secret reference state at %s is ambiguous for type/provider/scope '%s/%s/%s'", boundary,
-				    reference.secret_type, reference.provider, reference.normalized_scope);
+				throw InvalidInputException("Scoped secret reference state at %s is ambiguous for type/provider/scope",
+				                            boundary);
 			}
 		}
 	}
@@ -259,11 +382,27 @@ static py::list DescribeScopedSecretRefs(const vector<ScopedSecretRef> &referenc
 	return result;
 }
 
-static string ScopedSecretRefTupleString(const py::tuple &reference, idx_t field_idx, const char *field_name) {
+static string ScopedSecretRefTupleString(const py::tuple &reference, idx_t field_idx, const char *field_name,
+                                         idx_t max_size, bool allow_empty, idx_t &total_reference_bytes,
+                                         const char *boundary) {
 	if (!py::isinstance<py::str>(reference[field_idx])) {
 		throw InvalidInputException("Scoped secret reference %s must be a string", field_name);
 	}
-	return reference[field_idx].cast<string>();
+	auto value = py::reinterpret_borrow<py::str>(reference[field_idx]);
+	if (py::len(value) > max_size) {
+		throw InvalidInputException("Scoped secret reference contains an invalid %s", field_name);
+	}
+	Py_ssize_t utf8_size = 0;
+	auto utf8_data = PyUnicode_AsUTF8AndSize(value.ptr(), &utf8_size);
+	if (!utf8_data) {
+		throw py::error_already_set();
+	}
+	auto size = NumericCast<idx_t>(utf8_size);
+	if ((!allow_empty && size == 0) || size > max_size || memchr(utf8_data, '\0', size)) {
+		throw InvalidInputException("Scoped secret reference contains an invalid %s", field_name);
+	}
+	ConsumeScopedSecretReferenceBytes(size, total_reference_bytes, boundary);
+	return string(utf8_data, size);
 }
 
 static vector<ScopedSecretRef> ScopedSecretRefsFromPython(py::handle state, const string &expected_owner_query_id,
@@ -278,6 +417,7 @@ static vector<ScopedSecretRef> ScopedSecretRefsFromPython(py::handle state, cons
 	}
 	vector<ScopedSecretRef> references;
 	references.reserve(state_tuple.size());
+	idx_t total_reference_bytes = 0;
 	for (auto item : state_tuple) {
 		if (!py::isinstance<py::tuple>(item)) {
 			throw InvalidInputException("Scoped secret reference entry at %s must be a tuple", boundary);
@@ -302,12 +442,21 @@ static vector<ScopedSecretRef> ScopedSecretRefsFromPython(py::handle state, cons
 		}
 		ScopedSecretRef reference;
 		reference.version = static_cast<uint32_t>(version);
-		reference.reference_id = ScopedSecretRefTupleString(reference_tuple, 1, "opaque ID");
-		reference.owner_query_id = ScopedSecretRefTupleString(reference_tuple, 2, "owner query ID");
-		reference.owner_session_id = ScopedSecretRefTupleString(reference_tuple, 3, "owner session ID");
-		reference.secret_type = ScopedSecretRefTupleString(reference_tuple, 4, "secret type");
-		reference.provider = ScopedSecretRefTupleString(reference_tuple, 5, "provider");
-		reference.normalized_scope = ScopedSecretRefTupleString(reference_tuple, 6, "normalized scope");
+		reference.reference_id = ScopedSecretRefTupleString(reference_tuple, 1, "opaque ID", BaseUUID::STRING_SIZE,
+		                                                    false, total_reference_bytes, boundary);
+		reference.owner_query_id =
+		    ScopedSecretRefTupleString(reference_tuple, 2, "owner query ID", SCOPED_SECRET_MAX_IDENTITY_SIZE, false,
+		                               total_reference_bytes, boundary);
+		reference.owner_session_id =
+		    ScopedSecretRefTupleString(reference_tuple, 3, "owner session ID", SCOPED_SECRET_MAX_IDENTITY_SIZE, false,
+		                               total_reference_bytes, boundary);
+		reference.secret_type = ScopedSecretRefTupleString(
+		    reference_tuple, 4, "secret type", SCOPED_SECRET_MAX_IDENTITY_SIZE, false, total_reference_bytes, boundary);
+		reference.provider = ScopedSecretRefTupleString(reference_tuple, 5, "provider", SCOPED_SECRET_MAX_IDENTITY_SIZE,
+		                                                false, total_reference_bytes, boundary);
+		reference.normalized_scope =
+		    ScopedSecretRefTupleString(reference_tuple, 6, "normalized scope", SCOPED_SECRET_MAX_SCOPE_SIZE, true,
+		                               total_reference_bytes, boundary);
 		reference.capabilities = static_cast<uint8_t>(capabilities);
 		references.push_back(std::move(reference));
 	}
@@ -316,14 +465,36 @@ static vector<ScopedSecretRef> ScopedSecretRefsFromPython(py::handle state, cons
 }
 
 static bool IsSupportedObjectStorageURI(const string &uri) {
-	auto lower_uri = StringUtil::Lower(uri);
 	static constexpr const char *SUPPORTED_PREFIXES[] = {"s3://", "s3a://", "s3n://", "r2://", "gcs://", "gs://"};
 	for (auto prefix : SUPPORTED_PREFIXES) {
-		if (StringUtil::StartsWith(lower_uri, prefix)) {
+		if (StringUtil::CIStartsWith(uri, prefix)) {
 			return true;
 		}
 	}
 	return false;
+}
+
+static string ScopedSecretUseURIFromPython(py::handle value) {
+	if (!py::isinstance<py::str>(value)) {
+		throw py::type_error("test scoped secret URIs must be strings");
+	}
+	auto string_value = py::reinterpret_borrow<py::str>(value);
+	if (py::len(string_value) > SCOPED_SECRET_MAX_SCOPE_SIZE) {
+		throw InvalidInputException("Distributed object-storage URI exceeds the scoped secret use size limit");
+	}
+	Py_ssize_t utf8_size = 0;
+	auto utf8_data = PyUnicode_AsUTF8AndSize(string_value.ptr(), &utf8_size);
+	if (!utf8_data) {
+		throw py::error_already_set();
+	}
+	auto size = NumericCast<idx_t>(utf8_size);
+	if (size > SCOPED_SECRET_MAX_SCOPE_SIZE) {
+		throw InvalidInputException("Distributed object-storage URI exceeds the scoped secret use size limit");
+	}
+	if (memchr(utf8_data, '\0', size)) {
+		throw InvalidInputException("Distributed object-storage URI contains an invalid NUL byte");
+	}
+	return string(utf8_data, size);
 }
 
 static string NormalizedMatchedSecretScope(const BaseSecret &secret, const string &uri) {
@@ -357,10 +528,18 @@ static bool MergeHTTPSecretIntoS3Request(ClientContext &context) {
 	       !merge_http_secret.IsNull() && merge_http_secret.GetValue<bool>();
 }
 
+static void ValidateSecretStorageGeneration(SecretManager &secret_manager, CatalogTransaction transaction,
+                                            uint64_t expected_generation) {
+	if (secret_manager.GetSecretStorageGeneration(transaction) != expected_generation) {
+		throw InvalidInputException("DuckDB secret storage registry changed during scoped secret discovery");
+	}
+}
+
 static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientContext &context, const string &uri) {
 	static constexpr const char *SECRET_TYPE_PRECEDENCE[] = {"s3", "r2", "gcs", "aws"};
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto &secret_manager = SecretManager::Get(context);
+	auto storage_generation = secret_manager.GetSecretStorageGeneration(transaction);
 	for (auto secret_type : SECRET_TYPE_PRECEDENCE) {
 		auto match = secret_manager.LookupSecret(transaction, uri, secret_type);
 		if (!match.HasMatch()) {
@@ -368,6 +547,11 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientConte
 		}
 		auto &entry = *match.secret_entry;
 		auto &secret = *entry.secret;
+		ValidateScopedSecretIdentityField(entry.storage_mode, "source storage name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		ValidateScopedSecretIdentityField(secret.GetName(), "source secret name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		ValidateScopedSecretIdentityField(secret.GetType(), "source secret type", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+		ValidateScopedSecretIdentityField(secret.GetProvider(), "source secret provider",
+		                                  SCOPED_SECRET_MAX_IDENTITY_SIZE);
 		auto selected_type = StringUtil::Lower(secret.GetType());
 		auto provider = StringUtil::Lower(secret.GetProvider());
 		if (selected_type != secret_type || secret.GetType() != selected_type || secret.GetProvider() != provider) {
@@ -376,19 +560,16 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientConte
 		}
 		if (!IsSupportedScopedSecretProvider(selected_type, provider)) {
 			throw InvalidInputException(
-			    "Distributed scoped secrets do not support type/provider '%s/%s'; supported object-storage providers "
-			    "are config and credential_chain",
-			    selected_type, provider);
+			    "Distributed scoped secrets support only config and credential_chain providers for canonical "
+			    "object-storage secret types");
 		}
-		ValidateScopedSecretIdentityField(entry.storage_mode, "source storage name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
-		ValidateScopedSecretIdentityField(secret.GetName(), "source secret name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
-
 		ScopedSecretSelection selection;
 		selection.storage_name = entry.storage_mode;
 		selection.secret_name = secret.GetName();
 		selection.secret_type = std::move(selected_type);
 		selection.provider = std::move(provider);
 		selection.normalized_scope = NormalizedMatchedSecretScope(secret, uri);
+		ValidateSecretStorageGeneration(secret_manager, transaction, storage_generation);
 		return selection;
 	}
 
@@ -400,12 +581,19 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForURI(ClientConte
 	if (MergeHTTPSecretIntoS3Request(context)) {
 		auto http_match = secret_manager.LookupSecret(transaction, uri, "http");
 		if (http_match.HasMatch()) {
-			auto &secret = *http_match.secret_entry->secret;
+			auto &entry = *http_match.secret_entry;
+			auto &secret = *entry.secret;
+			ValidateScopedSecretIdentityField(entry.storage_mode, "source storage name",
+			                                  SCOPED_SECRET_MAX_IDENTITY_SIZE);
+			ValidateScopedSecretIdentityField(secret.GetName(), "source secret name", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+			ValidateScopedSecretIdentityField(secret.GetType(), "source secret type", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+			ValidateScopedSecretIdentityField(secret.GetProvider(), "source secret provider",
+			                                  SCOPED_SECRET_MAX_IDENTITY_SIZE);
 			throw InvalidInputException(
-			    "Distributed scoped secrets do not support type/provider '%s/%s' selected for an object-storage URI",
-			    secret.GetType(), secret.GetProvider());
+			    "Distributed scoped secrets do not support HTTP secret selections for object-storage URIs");
 		}
 	}
+	ValidateSecretStorageGeneration(secret_manager, transaction, storage_generation);
 	return std::nullopt;
 }
 
@@ -434,6 +622,9 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientConte
 	if (!use.covers_generated_copy_namespace) {
 		return SelectScopedSecretForURI(context, use.uri);
 	}
+	if (use.uri.size() > SCOPED_SECRET_MAX_SCOPE_SIZE) {
+		throw InvalidInputException("Distributed COPY output namespace exceeds the scoped secret path size limit");
+	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto canonical_root = distributed::CanonicalDistributedCopyBasePath(fs, use.uri);
@@ -445,6 +636,12 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientConte
 	if (separator.empty()) {
 		throw InvalidInputException("Distributed COPY secret discovery requires a non-empty path separator");
 	}
+	const auto commit_suffix_size = sizeof(SCOPED_SECRET_COPY_COMMIT_SUFFIX) - 1;
+	if (separator.size() > SCOPED_SECRET_MAX_SCOPE_SIZE ||
+	    commit_suffix_size > SCOPED_SECRET_MAX_SCOPE_SIZE - separator.size() ||
+	    canonical_base.size() > SCOPED_SECRET_MAX_SCOPE_SIZE - separator.size() - commit_suffix_size) {
+		throw InvalidInputException("Distributed COPY output namespace exceeds the scoped secret path size limit");
+	}
 	auto with_trailing_separator = [&](string path) {
 		if (!StringUtil::EndsWith(path, separator)) {
 			path += separator;
@@ -452,7 +649,10 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientConte
 		return path;
 	};
 	auto data_namespace_prefix = with_trailing_separator(canonical_base);
-	auto commit_namespace_prefix = with_trailing_separator(canonical_base + ".duckdb_commit");
+	auto commit_namespace_prefix = with_trailing_separator(canonical_base + SCOPED_SECRET_COPY_COMMIT_SUFFIX);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto &secret_manager = SecretManager::Get(context);
+	auto storage_generation = secret_manager.GetSecretStorageGeneration(transaction);
 
 	// Selecting at the common child prefix includes a secret scoped exactly to
 	// the output directory without inventing a filename that could accidentally
@@ -466,72 +666,94 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientConte
 		    "secret identity for the complete output namespace");
 	}
 
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto &secret_manager = SecretManager::Get(context);
 	vector<string> boundary_probes;
 	std::unordered_set<string> unique_boundaries;
+	idx_t metadata_storage_count = 0;
 	idx_t metadata_entry_count = 0;
 	idx_t metadata_scope_count = 0;
 	idx_t total_metadata_bytes = 0;
 	idx_t total_boundary_bytes = 0;
 	bool metadata_limit_exceeded = false;
+	bool unsupported_storage_lookup = false;
+	bool unsupported_prefix_matching = false;
 	const bool include_http_boundaries = MergeHTTPSecretIntoS3Request(context);
-	auto metadata_scan_completed = secret_manager.ScanSecretMetadata(transaction, [&](const SecretMetadata &metadata) {
-		if (metadata_entry_count >= SCOPED_SECRET_MAX_METADATA_ENTRIES ||
-		    metadata.scope.size() > SCOPED_SECRET_MAX_METADATA_SCOPES - metadata_scope_count) {
+	auto consume_metadata_bytes = [&](idx_t size) {
+		if (size > SCOPED_SECRET_MAX_METADATA_BYTES - total_metadata_bytes) {
 			metadata_limit_exceeded = true;
 			return false;
 		}
-		metadata_entry_count++;
-		metadata_scope_count += metadata.scope.size();
-		auto consume_metadata_bytes = [&](idx_t size) {
-			if (size > SCOPED_SECRET_MAX_METADATA_BYTES - total_metadata_bytes) {
-				metadata_limit_exceeded = true;
-				return false;
-			}
-			total_metadata_bytes += size;
-			return true;
-		};
-		if (!consume_metadata_bytes(metadata.storage_mode.size()) || !consume_metadata_bytes(metadata.name.size()) ||
-		    !consume_metadata_bytes(metadata.type.size()) || !consume_metadata_bytes(metadata.provider.size())) {
-			return false;
-		}
-
-		const bool affects_selection = IsScopedSecretSelectionType(metadata.type, include_http_boundaries);
-		for (auto &scope : metadata.scope) {
-			if (!consume_metadata_bytes(scope.size())) {
-				return false;
-			}
-			if (!affects_selection) {
-				continue;
-			}
-			bool is_nested_boundary = false;
-			for (auto namespace_prefix : {data_namespace_prefix, commit_namespace_prefix}) {
-				if (scope.size() > namespace_prefix.size() && StringUtil::StartsWith(scope, namespace_prefix)) {
-					is_nested_boundary = true;
-					break;
-				}
-			}
-			if (!is_nested_boundary) {
-				continue;
-			}
-			ValidateScopedSecretIdentityField(scope, "generated COPY scope", SCOPED_SECRET_MAX_SCOPE_SIZE);
-			if (unique_boundaries.find(scope) != unique_boundaries.end()) {
-				continue;
-			}
-			auto boundary_bytes = scope.size() + sizeof(SCOPED_SECRET_GENERATED_PROBE_SUFFIX) - 1;
-			if (unique_boundaries.size() >= SCOPED_SECRET_MAX_GENERATED_BOUNDARIES ||
-			    boundary_bytes > SCOPED_SECRET_MAX_GENERATED_BOUNDARY_BYTES - total_boundary_bytes) {
-				metadata_limit_exceeded = true;
-				return false;
-			}
-			unique_boundaries.insert(scope);
-			total_boundary_bytes += boundary_bytes;
-			boundary_probes.push_back(scope + SCOPED_SECRET_GENERATED_PROBE_SUFFIX);
-		}
+		total_metadata_bytes += size;
 		return true;
-	});
+	};
+	auto metadata_scan_completed = secret_manager.ScanSecretMetadata(
+	    transaction,
+	    [&](const SecretStorageMetadata &metadata) {
+		    if (metadata_storage_count >= SCOPED_SECRET_MAX_METADATA_STORAGES ||
+		        !consume_metadata_bytes(metadata.name.size())) {
+			    metadata_limit_exceeded = true;
+			    return false;
+		    }
+		    metadata_storage_count++;
+		    if (!metadata.uses_standard_secret_lookup) {
+			    unsupported_storage_lookup = true;
+			    return false;
+		    }
+		    return true;
+	    },
+	    [&](const SecretMetadata &metadata) {
+		    if (metadata_entry_count >= SCOPED_SECRET_MAX_METADATA_ENTRIES ||
+		        metadata.scope.size() > SCOPED_SECRET_MAX_METADATA_SCOPES - metadata_scope_count) {
+			    metadata_limit_exceeded = true;
+			    return false;
+		    }
+		    metadata_entry_count++;
+		    metadata_scope_count += metadata.scope.size();
+		    if (!consume_metadata_bytes(metadata.storage_mode.size()) ||
+		        !consume_metadata_bytes(metadata.name.size()) || !consume_metadata_bytes(metadata.type.size()) ||
+		        !consume_metadata_bytes(metadata.provider.size())) {
+			    return false;
+		    }
+
+		    const bool affects_selection = IsScopedSecretSelectionType(metadata.type, include_http_boundaries);
+		    if (affects_selection && !metadata.uses_standard_prefix_matching) {
+			    unsupported_prefix_matching = true;
+			    return false;
+		    }
+		    for (auto &scope : metadata.scope) {
+			    if (!consume_metadata_bytes(scope.size())) {
+				    return false;
+			    }
+			    if (!affects_selection) {
+				    continue;
+			    }
+			    const bool is_nested_boundary = (scope.size() > data_namespace_prefix.size() &&
+			                                     StringUtil::StartsWith(scope, data_namespace_prefix)) ||
+			                                    (scope.size() > commit_namespace_prefix.size() &&
+			                                     StringUtil::StartsWith(scope, commit_namespace_prefix));
+			    if (!is_nested_boundary) {
+				    continue;
+			    }
+			    ValidateScopedSecretIdentityField(scope, "generated COPY scope", SCOPED_SECRET_MAX_SCOPE_SIZE);
+			    if (unique_boundaries.find(scope) != unique_boundaries.end()) {
+				    continue;
+			    }
+			    auto boundary_bytes = scope.size() + sizeof(SCOPED_SECRET_GENERATED_PROBE_SUFFIX) - 1;
+			    if (unique_boundaries.size() >= SCOPED_SECRET_MAX_GENERATED_BOUNDARIES ||
+			        boundary_bytes > SCOPED_SECRET_MAX_GENERATED_BOUNDARY_BYTES - total_boundary_bytes) {
+				    metadata_limit_exceeded = true;
+				    return false;
+			    }
+			    unique_boundaries.insert(scope);
+			    total_boundary_bytes += boundary_bytes;
+			    boundary_probes.push_back(scope + SCOPED_SECRET_GENERATED_PROBE_SUFFIX);
+		    }
+		    return true;
+	    });
 	if (!metadata_scan_completed) {
+		if (unsupported_storage_lookup || unsupported_prefix_matching) {
+			throw InvalidInputException(
+			    "Distributed COPY scoped secret discovery requires standard longest-prefix matching semantics");
+		}
 		if (!metadata_limit_exceeded) {
 			throw InternalException("DuckDB secret metadata scan stopped unexpectedly");
 		}
@@ -547,21 +769,36 @@ static std::optional<ScopedSecretSelection> SelectScopedSecretForUse(ClientConte
 			    "secret identity for the complete output namespace");
 		}
 	}
+	ValidateSecretStorageGeneration(secret_manager, transaction, storage_generation);
 	return baseline;
 }
 
-static void AddScopedSecretUse(vector<ScopedSecretUse> &uses, const string &uri, uint8_t capability,
-                               bool covers_generated_copy_namespace = false) {
+static void AddScopedSecretUse(vector<ScopedSecretUse> &uses, idx_t &total_use_bytes, const string &uri,
+                               uint8_t capability, bool covers_generated_copy_namespace = false) {
 	if (!IsSupportedObjectStorageURI(uri)) {
 		return;
+	}
+	if (ContainsNul(uri)) {
+		throw InvalidInputException("Distributed object-storage URI contains an invalid NUL byte");
+	}
+	if (uri.size() > SCOPED_SECRET_MAX_SCOPE_SIZE) {
+		if (!covers_generated_copy_namespace) {
+			throw InvalidInputException("Distributed object-storage URI exceeds the scoped secret use size limit");
+		}
+		throw InvalidInputException("Distributed COPY output namespace exceeds the scoped secret path size limit");
 	}
 	if (uses.size() >= SCOPED_SECRET_MAX_USES) {
 		throw InvalidInputException("Distributed plan exceeds the maximum supported remote object-storage URI count");
 	}
+	if (total_use_bytes > SCOPED_SECRET_MAX_USE_BYTES || uri.size() > SCOPED_SECRET_MAX_USE_BYTES - total_use_bytes) {
+		throw InvalidInputException("Distributed plan exceeds the maximum scoped secret URI byte size");
+	}
+	total_use_bytes += uri.size();
 	uses.push_back({uri, capability, covers_generated_copy_namespace});
 }
 
-static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector<ScopedSecretUse> &uses) {
+static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector<ScopedSecretUse> &uses,
+                                               idx_t &total_use_bytes) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		if (get.function.get_bind_info) {
@@ -580,7 +817,8 @@ static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector
 							throw InvalidInputException(
 							    "Distributed external scan file_path discovery contains a non-VARCHAR URI");
 						}
-						AddScopedSecretUse(uses, path.GetValue<string>(), SCOPED_SECRET_CAPABILITY_READ);
+						AddScopedSecretUse(uses, total_use_bytes, StringValue::Get(path),
+						                   SCOPED_SECRET_CAPABILITY_READ);
 					}
 				}
 			}
@@ -591,15 +829,15 @@ static void CollectLogicalPlanScopedSecretUses(const LogicalOperator &op, vector
 		auto multi_file_bind = dynamic_cast<const MultiFileBindData *>(get.bind_data.get());
 		if (multi_file_bind && multi_file_bind->file_list) {
 			for (auto &file : multi_file_bind->file_list->Files()) {
-				AddScopedSecretUse(uses, file.path, SCOPED_SECRET_CAPABILITY_READ);
+				AddScopedSecretUse(uses, total_use_bytes, file.path, SCOPED_SECRET_CAPABILITY_READ);
 			}
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_COPY_TO_FILE) {
 		auto &copy = op.Cast<LogicalCopyToFile>();
-		AddScopedSecretUse(uses, copy.file_path, SCOPED_SECRET_CAPABILITY_WRITE, true);
+		AddScopedSecretUse(uses, total_use_bytes, copy.file_path, SCOPED_SECRET_CAPABILITY_WRITE, true);
 	}
 	for (auto &child : op.children) {
-		CollectLogicalPlanScopedSecretUses(*child, uses);
+		CollectLogicalPlanScopedSecretUses(*child, uses, total_use_bytes);
 	}
 }
 
@@ -610,6 +848,7 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 		       std::tie(right.uri, right.covers_generated_copy_namespace, right.capabilities);
 	});
 	vector<ScopedSecretUse> canonical_uses;
+	canonical_uses.reserve(uses.size());
 	for (auto &use : uses) {
 		if (!canonical_uses.empty() && canonical_uses.back().uri == use.uri &&
 		    canonical_uses.back().covers_generated_copy_namespace == use.covers_generated_copy_namespace) {
@@ -620,42 +859,46 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 	}
 
 	ScopedSecretDiscovery discovery;
+	std::unordered_map<string, idx_t> selection_indices;
+	std::unordered_set<string> selected_scope_keys;
+	selection_indices.reserve(MinValue<idx_t>(canonical_uses.size(), SCOPED_SECRET_MAX_REFERENCES));
+	selected_scope_keys.reserve(MinValue<idx_t>(canonical_uses.size(), SCOPED_SECRET_MAX_REFERENCES));
+	idx_t total_reference_bytes = 0;
+	bool owner_identity_validated = false;
 	for (auto &use : canonical_uses) {
 		auto selection = SelectScopedSecretForUse(context, use);
 		if (!selection) {
-			discovery.source_unmatched_uses.push_back(use);
+			discovery.source_unmatched_uses.push_back(std::move(use));
 			continue;
 		}
 		if (owner_query_id.empty() || owner_session_id.empty()) {
 			throw InvalidInputException(
 			    "Distributed object-storage secrets require non-empty query and Vane session ownership");
 		}
-
-		optional_idx existing_ref_idx;
-		for (idx_t ref_idx = 0; ref_idx < discovery.references.size(); ref_idx++) {
-			auto &reference = discovery.references[ref_idx];
-			auto &binding = discovery.source_bindings[ref_idx];
-			if (ScopedSecretSelectionMatchesBinding(*selection, binding)) {
-				existing_ref_idx = ref_idx;
-				break;
-			}
-			if (reference.secret_type == selection->secret_type && reference.provider == selection->provider &&
-			    reference.normalized_scope == selection->normalized_scope) {
-				throw InvalidInputException(
-				    "Distributed scoped secret selection is ambiguous for type/provider/scope '%s/%s/%s'",
-				    selection->secret_type, selection->provider, selection->normalized_scope);
-			}
+		if (!owner_identity_validated) {
+			ValidateScopedSecretIdentityField(owner_query_id, "owner query ID", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+			ValidateScopedSecretIdentityField(owner_session_id, "owner session ID", SCOPED_SECRET_MAX_IDENTITY_SIZE);
+			owner_identity_validated = true;
 		}
+		ValidateScopedSecretSelection(*selection);
 
-		if (existing_ref_idx.IsValid()) {
-			auto ref_idx = existing_ref_idx.GetIndex();
+		auto selection_key = CreateScopedSecretSelectionKey(*selection);
+		auto existing_ref = selection_indices.find(selection_key);
+		if (existing_ref != selection_indices.end()) {
+			auto ref_idx = existing_ref->second;
 			discovery.references[ref_idx].capabilities |= use.capabilities;
-			discovery.source_bindings[ref_idx].uses.push_back(use);
+			discovery.source_bindings[ref_idx].uses.push_back(std::move(use));
 			continue;
+		}
+		auto scope_key = CreateScopedSecretScopeKey(*selection);
+		if (selected_scope_keys.find(scope_key) != selected_scope_keys.end()) {
+			throw InvalidInputException("Distributed scoped secret selection is ambiguous for one type/provider/scope");
 		}
 		if (discovery.references.size() >= SCOPED_SECRET_MAX_REFERENCES) {
 			throw InvalidInputException("Distributed plan exceeds the maximum scoped secret reference count");
 		}
+		auto next_total_reference_bytes = PreflightScopedSecretReferenceBytes(
+		    *selection, owner_query_id, owner_session_id, total_reference_bytes, "logical plan capture");
 
 		ScopedSecretRef reference;
 		reference.reference_id = CreateScopedSecretReferenceId(*selection, owner_query_id, owner_session_id);
@@ -665,6 +908,7 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 		reference.provider = selection->provider;
 		reference.normalized_scope = selection->normalized_scope;
 		reference.capabilities = use.capabilities;
+		total_reference_bytes = next_total_reference_bytes;
 
 		ScopedSecretBinding binding;
 		binding.reference_id = reference.reference_id;
@@ -673,10 +917,13 @@ static ScopedSecretDiscovery DiscoverScopedSecretRefs(ClientContext &context, ve
 		binding.secret_type = selection->secret_type;
 		binding.provider = selection->provider;
 		binding.normalized_scope = selection->normalized_scope;
-		binding.uses.push_back(use);
+		binding.uses.push_back(std::move(use));
 
+		auto ref_idx = discovery.references.size();
 		discovery.references.push_back(std::move(reference));
 		discovery.source_bindings.push_back(std::move(binding));
+		selection_indices.emplace(std::move(selection_key), ref_idx);
+		selected_scope_keys.insert(std::move(scope_key));
 	}
 
 	std::sort(discovery.references.begin(), discovery.references.end(), ScopedSecretRefLess);
@@ -864,7 +1111,8 @@ static SerializedLogicalPlanCapture SerializeLogicalPlanFromRelation(const duckd
 		auto logical_plan = std::move(planner.plan);
 
 		vector<ScopedSecretUse> scoped_secret_uses;
-		CollectLogicalPlanScopedSecretUses(*logical_plan, scoped_secret_uses);
+		idx_t total_scoped_secret_use_bytes = 0;
+		CollectLogicalPlanScopedSecretUses(*logical_plan, scoped_secret_uses, total_scoped_secret_use_bytes);
 		capture.scoped_secrets =
 		    DiscoverScopedSecretRefs(*client_context, std::move(scoped_secret_uses), owner_query_id, owner_session_id);
 

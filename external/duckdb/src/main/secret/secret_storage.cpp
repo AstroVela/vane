@@ -93,8 +93,13 @@ bool CatalogSetSecretStorage::ScanSecretMetadata(const secret_metadata_callback_
 		auto &catalog_entry = entry.Cast<SecretCatalogEntry>();
 		auto &secret_entry = *catalog_entry.secret;
 		auto &secret = *secret_entry.secret;
-		SecretMetadata metadata {secret_entry.persist_type, secret_entry.storage_mode, secret.GetName(),
-		                         secret.GetType(),          secret.GetProvider(),      secret.GetScope()};
+		SecretMetadata metadata {secret_entry.persist_type,
+		                         secret_entry.storage_mode,
+		                         secret.GetName(),
+		                         secret.GetType(),
+		                         secret.GetProvider(),
+		                         secret.GetScope(),
+		                         secret.UsesStandardPrefixMatching()};
 		if (!callback(metadata)) {
 			completed = false;
 			return false;

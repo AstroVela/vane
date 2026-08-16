@@ -208,7 +208,7 @@ def test_selected_http_secret_for_object_store_uri_is_rejected_before_ray():
     )
 
     uri_sentinel = "uri-secret-value-must-not-reach-errors"
-    with pytest.raises(Exception, match="do not support type/provider 'http/config'") as exc_info:
+    with pytest.raises(Exception, match="do not support HTTP secret selections") as exc_info:
         _logical_plan_with_uses(
             connection,
             "unsupported-http-scoped-secret",
@@ -314,6 +314,43 @@ def test_unchanged_unmatched_use_can_cross_the_transport_boundary():
     assert restored.scoped_secret_refs() == []
 
 
+def test_scoped_secret_uses_reject_oversized_and_nul_uris_without_echoing_them():
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+
+    oversized_sentinel = "oversized-read-uri-sentinel"
+    oversized_uri = f"s3://oversized-read/{'x' * 65536}/{oversized_sentinel}"
+    with pytest.raises(Exception, match="scoped secret use size limit") as oversized_error:
+        _logical_plan_with_uses(
+            connection,
+            "oversized-read-secret-use",
+            source_uris=(oversized_uri,),
+        )
+    assert oversized_sentinel not in str(oversized_error.value)
+
+    nul_sentinel = "nul-read-uri-sentinel"
+    with pytest.raises(Exception, match="invalid NUL byte") as nul_error:
+        _logical_plan_with_uses(
+            connection,
+            "nul-read-secret-use",
+            source_uris=(f"s3://nul-read/input\0{nul_sentinel}.parquet",),
+        )
+    assert nul_sentinel not in str(nul_error.value)
+
+
+def test_scoped_secret_uses_bound_aggregate_uri_bytes():
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    source_uris = tuple(f"s3://aggregate-use-budget/{'y' * 65400}/{uri_idx:04d}.parquet" for uri_idx in range(257))
+
+    with pytest.raises(Exception, match="maximum scoped secret URI byte size"):
+        _logical_plan_with_uses(
+            connection,
+            "aggregate-scoped-secret-use-budget",
+            source_uris=source_uris,
+        )
+
+
 @pytest.mark.parametrize(
     ("query", "write_options", "nested_suffix"),
     [
@@ -417,6 +454,50 @@ def test_generated_copy_rejects_an_unmatched_base_with_a_nested_secret(monkeypat
         ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "copy-unmatched-base")
 
 
+def test_generated_copy_rejects_non_prefix_secret_matching_semantics(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "non_prefix_copy_broad_secret",
+        "s3://non-prefix-copy/",
+        value_sentinel="non-prefix-copy-broad-value",
+    )
+    custom_name = "non_prefix_matching_secret_sentinel"
+    ray_cxx._register_non_prefix_scoped_secret_for_test(connection, custom_name)
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://non-prefix-copy/output",
+    )
+
+    with pytest.raises(Exception, match="standard longest-prefix matching semantics") as exc_info:
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "non-prefix-copy-secret")
+    assert custom_name not in str(exc_info.value)
+
+
+def test_generated_copy_rejects_an_empty_nonstandard_lookup_storage(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "nonstandard_storage_copy_broad_secret",
+        "s3://nonstandard-storage-copy/",
+        value_sentinel="nonstandard-storage-copy-broad-value",
+    )
+    ray_cxx._register_nonstandard_empty_secret_storage_for_test(connection)
+    relation = _capture_write_relation(
+        monkeypatch,
+        connection,
+        "s3://nonstandard-storage-copy/output",
+    )
+
+    with pytest.raises(Exception, match="standard longest-prefix matching semantics"):
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "nonstandard-empty-secret-storage")
+
+
 def test_generated_copy_rejects_excessive_secret_scope_boundaries(monkeypatch):
     ray_cxx = _require_ray_cxx()
     connection = vane.connect()
@@ -453,6 +534,19 @@ def test_generated_copy_rejects_excessive_secret_scope_boundaries(monkeypatch):
         ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "copy-secret-boundary-limit")
     assert scope_name_sentinel not in str(exc_info.value)
     assert scope_value_sentinel not in str(exc_info.value)
+
+
+def test_generated_copy_rejects_an_oversized_namespace_without_echoing_it(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    path_sentinel = "oversized-copy-path-sentinel"
+    target = f"s3://oversized-copy/{'x' * 65536}/{path_sentinel}"
+    relation = _capture_write_relation(monkeypatch, connection, target)
+
+    with pytest.raises(Exception, match="scoped secret path size limit") as exc_info:
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(relation, "oversized-copy-namespace")
+    assert path_sentinel not in str(exc_info.value)
 
 
 def test_generated_copy_canonicalization_ignores_siblings_and_lower_priority_secrets(monkeypatch):
@@ -691,6 +785,47 @@ def test_logical_pickle_rejects_ambiguous_and_noncanonical_references():
     ambiguous_state[4] = tuple(ambiguous_references)
     with pytest.raises(Exception, match="is ambiguous"):
         _restore_logical_plan(ray_cxx, ambiguous_state)
+
+
+def test_logical_pickle_bounds_reference_bytes_with_long_common_prefixes():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("LOAD httpfs")
+    _create_s3_secret(
+        connection,
+        "reference_byte_budget_secret",
+        "s3://reference-byte-budget/",
+        value_sentinel="reference-byte-budget-value",
+    )
+    plan = _logical_plan_with_uses(
+        connection,
+        "reference-byte-budget",
+        source_uris=("s3://reference-byte-budget/input.parquet",),
+    )
+    base_state = list(plan.__getstate__())
+    reference_template = list(base_state[4][0])
+
+    def state_with_scopes(scopes):
+        references = []
+        for scope in scopes:
+            reference = list(reference_template)
+            reference[1] = _new_uuid8()
+            reference[6] = scope
+            references.append(tuple(reference))
+        references.sort(key=lambda ref: (ref[4], ref[5], ref[6], ref[1], ref[7]))
+        state = list(base_state)
+        state[4] = tuple(references)
+        return state
+
+    common_prefix = f"s3://reference-byte-budget/{'x' * 32768}"
+    accepted_state = state_with_scopes(f"{common_prefix}/{scope_idx:04d}/" for scope_idx in range(128))
+    restored = _restore_logical_plan(ray_cxx, accepted_state)
+    assert len(restored.scoped_secret_refs()) == 128
+
+    oversized_prefix = f"s3://reference-byte-budget/{'y' * 65400}"
+    oversized_state = state_with_scopes(f"{oversized_prefix}/{scope_idx:04d}/" for scope_idx in range(257))
+    with pytest.raises(Exception, match="maximum serialized byte size"):
+        _restore_logical_plan(ray_cxx, oversized_state)
 
 
 def test_refs_survive_physical_clone_query_replay_and_worker_task():

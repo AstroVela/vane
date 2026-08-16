@@ -106,6 +106,8 @@ public:
 	DUCKDB_API void Initialize(DatabaseInstance &db);
 	//! Load a secret storage
 	DUCKDB_API void LoadSecretStorage(unique_ptr<SecretStorage> storage);
+	//! Return a monotonic token for the initialized secret-storage registry.
+	DUCKDB_API uint64_t GetSecretStorageGeneration(CatalogTransaction transaction);
 
 	//! Deserialize a secret by automatically selecting the correct deserializer, secret_path can be set to improve
 	//! error hints
@@ -137,8 +139,13 @@ public:
 	//! List all secrets from all secret storages
 	DUCKDB_API vector<SecretEntry> AllSecrets(CatalogTransaction transaction);
 	//! Visit non-sensitive metadata for secrets that participate in lookups without cloning credential values.
-	//! Returns false when the callback requests early termination.
-	DUCKDB_API bool ScanSecretMetadata(CatalogTransaction transaction, const secret_metadata_callback_t &callback);
+	//! Each registered storage callback runs before that storage's entry callbacks, including for empty or
+	//! lookup-excluded storages. Entry callbacks are emitted only for lookup-participating storages. Both callbacks
+	//! follow SecretStorage::ScanSecretMetadata's synchronous, non-reentrant locking contract. Returns false when
+	//! either callback requests early termination.
+	DUCKDB_API bool ScanSecretMetadata(CatalogTransaction transaction,
+	                                   const secret_storage_metadata_callback_t &storage_callback,
+	                                   const secret_metadata_callback_t &secret_callback);
 
 	//! List all secret types
 	DUCKDB_API vector<SecretType> AllSecretTypes();
@@ -205,6 +212,8 @@ private:
 	case_insensitive_map_t<SecretType> secret_types;
 	//! Map of all registered SecretStorages
 	case_insensitive_map_t<unique_ptr<SecretStorage>> secret_storages;
+	//! Monotonic registry token, protected by manager_lock
+	uint64_t secret_storage_generation = 0;
 	//! While false, secret manager settings can still be changed
 	atomic<bool> initialized {false};
 	//! Configuration for secret manager
