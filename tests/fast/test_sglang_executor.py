@@ -103,3 +103,14 @@ def test_sglang_prompt_expression_end_to_end(monkeypatch):
         assert rows == [(1, "generated:Alpha"), (2, "generated:Beta")]
     finally:
         conn.close()
+
+
+def test_sglang_ray_local_executor_hierarchy():
+    import inspect
+
+    from vane.execution._llm_executor import RayActorExecutorMixin
+    from vane.execution.sglang import SGLangLocalExecutor, SGLangRayLocalExecutor
+
+    assert issubclass(SGLangRayLocalExecutor, SGLangLocalExecutor)
+    assert issubclass(SGLangRayLocalExecutor, RayActorExecutorMixin)
+    assert inspect.iscoroutinefunction(SGLangRayLocalExecutor.wait_for_result)

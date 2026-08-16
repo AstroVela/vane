@@ -17,7 +17,8 @@ import json
 from typing import Any
 
 from vane.ai.provider import _SafeProviderError
-from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor
+from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor, RayActorExecutorMixin
+from vane.runners.ray.ray_env import install_explicit_session_runtime_env
 from vane.execution._vllm_options_protocol import _unpack_native_options_envelope
 
 
@@ -75,6 +76,38 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
         return str(getattr(output, "text"))
 
 
+class SGLangRayLocalExecutor(RayActorExecutorMixin, SGLangLocalExecutor):
+    """SGLang backend executor for Ray actor pools.
+
+    Reuses the engine hooks from :class:`SGLangLocalExecutor` and the async
+    Ray-actor machinery from :class:`RayActorExecutorMixin`.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        engine_args: dict[str, Any],
+        generate_args: dict[str, Any],
+        on_error: str = "raise",
+        use_threading: bool = True,
+        engine_init_timeout_s: float | None = None,
+        force_background_thread: bool = False,
+        *,
+        _install_session_runtime_env: bool = False,
+    ):
+        if _install_session_runtime_env:
+            install_explicit_session_runtime_env()
+        super().__init__(
+            model,
+            engine_args,
+            generate_args,
+            on_error=on_error,
+            use_threading=use_threading,
+            engine_init_timeout_s=engine_init_timeout_s,
+            force_background_thread=force_background_thread,
+        )
+
+
 class _NormalizedSGLangOptions(dict[str, Any]):
     """Marker subclass so :func:`normalize_options` is idempotent."""
 
@@ -126,7 +159,32 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
 def build_executor(model: str, options: Any | None) -> SGLangExecutor:
     opts = normalize_options(options)
     if opts.get("use_ray"):
-        raise NotImplementedError("SGLang distributed (Ray) execution is not yet implemented")
+        import ray
+
+        if not ray.is_initialized():
+            raise RuntimeError("Ray SGLang execution requires an initialized RayRunner runtime")
+        pool_name = opts.get("ray_actor_pool_name")
+        if pool_name:
+            from vane.execution.vllm import LLMActors
+
+            llm_actors = LLMActors.lookup_named(concurrency=opts["concurrency"], name_prefix=pool_name)
+        else:
+            from vane.execution.vllm import LLMActors
+
+            llm_actors = LLMActors(
+                model=model,
+                engine_args=opts["engine_args"],
+                generate_args=opts["generate_args"],
+                on_error=opts["on_error"],
+                gpus_per_actor=opts["gpus_per_actor"],
+                concurrency=opts["concurrency"],
+                load_balance_threshold=opts["load_balance_threshold"],
+                engine_init_timeout_s=opts.get("engine_init_timeout_s"),
+                actor_cls=SGLangRayLocalExecutor,
+            )
+        from vane.execution.vllm import RemoteVLLMExecutor
+
+        return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
     return SGLangLocalExecutor(
         model,
         opts["engine_args"],

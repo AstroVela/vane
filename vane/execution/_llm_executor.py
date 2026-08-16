@@ -724,3 +724,79 @@ class LocalEngineExecutor(LLMExecutor):
         loop = getattr(self, "loop", None)
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
+
+
+class RayActorExecutorMixin:
+    """Async Ray-actor machinery shared by Ray-backed executors.
+
+    Ray actor methods are awaitable, so a Ray actor exposes an async
+    ``wait_for_result`` and wakes any in-flight async waiters on state change.
+    Concrete Ray executors mix this in ahead of their engine executor class.
+    """
+
+    def _ensure_async_waiter_state(self) -> None:
+        if not hasattr(self, "_async_waiter_lock"):
+            self._async_waiter_lock = threading.Lock()
+        if not hasattr(self, "_async_waiters"):
+            self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
+
+    def _notify_state_change(self, *, force: bool = False) -> None:
+        super()._notify_state_change(force=force)
+        self._ensure_async_waiter_state()
+        with self._async_waiter_lock:
+            waiters = [waiter for executor_waiters in self._async_waiters.values() for waiter in executor_waiters]
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # The waiter removes itself during normal loop shutdown.
+                continue
+
+    async def wait_for_result(  # type: ignore[override]
+        self,
+        executor_id: str | None = None,
+        wait_token: str | None = None,
+    ) -> bool:
+        if executor_id is None:
+            if wait_token is not None:
+                raise ValueError(f"{self._engine_name} global wait does not accept a wait_token")
+            return await asyncio.to_thread(self._wait_for_result_blocking, None)
+        if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
+            raise ValueError(f"{self._engine_name} wait_token must be a non-empty string")
+        self._ensure_async_waiter_state()
+        loop = asyncio.get_running_loop()
+        state_changed = asyncio.Event()
+        waiter = (loop, state_changed)
+        with self._async_waiter_lock:
+            self._async_waiters.setdefault(executor_id, []).append(waiter)
+        with self.task_count_lock:
+            self._per_executor_waiters[executor_id] = self._per_executor_waiters.get(executor_id, 0) + 1
+        try:
+            while True:
+                has_result, terminal = self._wait_for_result_state(executor_id)
+                if has_result or terminal:
+                    self._raise_if_task_failed(executor_id)
+                    return has_result
+                state_changed.clear()
+                has_result, terminal = self._wait_for_result_state(executor_id)
+                if has_result or terminal:
+                    continue
+                await state_changed.wait()
+        finally:
+            with self._async_waiter_lock:
+                executor_waiters = self._async_waiters.get(executor_id, [])
+                try:
+                    executor_waiters.remove(waiter)
+                except ValueError:
+                    pass
+                if not executor_waiters:
+                    self._async_waiters.pop(executor_id, None)
+            with self.task_count_lock:
+                remaining = self._per_executor_waiters.get(executor_id, 0) - 1
+                if remaining > 0:
+                    self._per_executor_waiters[executor_id] = remaining
+                else:
+                    self._per_executor_waiters.pop(executor_id, None)
+                if wait_token is not None:
+                    self._per_executor_wait_tokens_observed[executor_id] = wait_token
+            self._notify_state_change(force=True)
