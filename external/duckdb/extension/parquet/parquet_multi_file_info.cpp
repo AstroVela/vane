@@ -347,7 +347,6 @@ static void VerifyParquetSchemaParameter(const Value &schema) {
 static void ParquetScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                  const TableFunction &function) {
 	auto &bind_data = bind_data_p->Cast<MultiFileBindData>();
-	auto &parquet_data = bind_data.bind_data->Cast<ParquetReadBindData>();
 
 	vector<string> files;
 	for (auto &file : bind_data.file_list->GetAllFiles()) {
@@ -356,14 +355,17 @@ static void ParquetScanSerialize(Serializer &serializer, const optional_ptr<Func
 	serializer.WriteProperty(100, "files", files);
 	serializer.WriteProperty(101, "types", bind_data.types);
 	serializer.WriteProperty(102, "names", bind_data.names);
-	ParquetOptionsSerialization serialization(parquet_data.GetParquetOptions(), bind_data.file_options);
+	idx_t initial_file_row_groups;
+	idx_t initial_file_cardinality;
+	auto serialization =
+	    ParquetMultiFileInfo::SerializeBindData(bind_data, initial_file_row_groups, initial_file_cardinality);
 	serializer.WriteProperty(103, "parquet_options", serialization);
 	if (serializer.ShouldSerialize(3)) {
 		serializer.WriteProperty(104, "table_columns", bind_data.table_columns);
 	}
-	serializer.WritePropertyWithDefault<idx_t>(105, "initial_file_row_groups", parquet_data.initial_file_row_groups,
+	serializer.WritePropertyWithDefault<idx_t>(105, "initial_file_row_groups", initial_file_row_groups,
 	                                           static_cast<idx_t>(0));
-	serializer.WritePropertyWithDefault<idx_t>(106, "initial_file_cardinality", parquet_data.initial_file_cardinality,
+	serializer.WritePropertyWithDefault<idx_t>(106, "initial_file_cardinality", initial_file_cardinality,
 	                                           static_cast<idx_t>(0));
 	serializer.WriteProperty<MultiFileReaderBindData>(107, "reader_bind", bind_data.reader_bind);
 }
@@ -393,7 +395,6 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 		open_files.emplace_back(path);
 	}
 	shared_ptr<MultiFileList> file_list(new SimpleMultiFileList(std::move(open_files)));
-	auto parquet_options = make_uniq<ParquetFileReaderOptions>(std::move(serialization.parquet_options));
 	auto interface = make_uniq<ParquetMultiFileInfo>();
 	interface->InitializeInterface(context, *multi_file_reader, *file_list);
 
@@ -401,17 +402,15 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 	auto result = make_uniq<MultiFileBindData>();
 	result->multi_file_reader = std::move(multi_file_reader);
 	result->file_list = std::move(file_list);
-	result->file_options = std::move(serialization.file_options);
 	result->interface = std::move(interface);
-	result->bind_data = result->interface->InitializeBindData(*result, std::move(parquet_options));
+	ParquetMultiFileInfo::DeserializeBindData(*result, std::move(serialization), initial_file_row_groups,
+	                                          initial_file_cardinality);
 	result->types = std::move(types);
 	result->names = std::move(names);
 	result->table_columns = std::move(table_columns);
 	result->reader_bind = std::move(reader_bind);
 
 	auto &parquet_bind = result->bind_data->Cast<ParquetReadBindData>();
-	parquet_bind.initial_file_row_groups = initial_file_row_groups;
-	parquet_bind.initial_file_cardinality = initial_file_cardinality;
 	auto &options = parquet_bind.GetParquetOptions();
 	if (!options.schema.empty()) {
 		bool match_by_field_id = false;
@@ -439,6 +438,25 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 	result->virtual_columns = std::move(virtual_columns);
 	result->interface->FinalizeBindData(*result);
 	return std::move(result);
+}
+
+ParquetOptionsSerialization ParquetMultiFileInfo::SerializeBindData(const MultiFileBindData &bind_data,
+                                                                    idx_t &initial_file_row_groups,
+                                                                    idx_t &initial_file_cardinality) {
+	auto &parquet_data = bind_data.bind_data->Cast<ParquetReadBindData>();
+	initial_file_row_groups = parquet_data.initial_file_row_groups;
+	initial_file_cardinality = parquet_data.initial_file_cardinality;
+	return ParquetOptionsSerialization(parquet_data.GetParquetOptions(), bind_data.file_options);
+}
+
+void ParquetMultiFileInfo::DeserializeBindData(MultiFileBindData &bind_data, ParquetOptionsSerialization serialization,
+                                               idx_t initial_file_row_groups, idx_t initial_file_cardinality) {
+	bind_data.file_options = std::move(serialization.file_options);
+	auto parquet_options = make_uniq<ParquetFileReaderOptions>(std::move(serialization.parquet_options));
+	bind_data.bind_data = bind_data.interface->InitializeBindData(bind_data, std::move(parquet_options));
+	auto &parquet_bind = bind_data.bind_data->Cast<ParquetReadBindData>();
+	parquet_bind.initial_file_row_groups = initial_file_row_groups;
+	parquet_bind.initial_file_cardinality = initial_file_cardinality;
 }
 
 static vector<column_t> ParquetGetRowIdColumns(ClientContext &context, optional_ptr<FunctionData> bind_data) {
