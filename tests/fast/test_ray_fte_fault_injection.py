@@ -154,6 +154,9 @@ class _FteControlFaultActor:
         self.statuses.clear()
         return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
 
+    def prepare_shutdown(self):
+        """Acknowledge the production worker quiescence handshake."""
+
     def created_requests(self):
         return [
             {
@@ -458,25 +461,6 @@ def _build_native_scan_task(
     )
 
 
-def _wait_for_result_handles(
-    handle: RayWorkerActorHandle,
-    query_id: str,
-    expected_count: int,
-    *,
-    timeout_s: float = 10.0,
-) -> list:
-    deadline = time.monotonic() + timeout_s
-    handles = []
-    while time.monotonic() < deadline:
-        handles.extend(handle.pop_fte_result_handles(query_id))
-        if len(handles) >= expected_count:
-            return handles
-        time.sleep(0.05)
-    raise AssertionError(
-        f"expected {expected_count} result handles for {query_id}, got {[str(h.task_id) for h in handles]}"
-    )
-
-
 def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
     monkeypatch.setenv("VANE_FTE_STATUS_WAIT_TIMEOUT_S", "5")
     monkeypatch.setenv("VANE_FTE_CONTROL_RPC_INITIAL_BACKOFF_S", "0")
@@ -507,7 +491,10 @@ def test_real_ray_actor_kill_replays_fte_task_on_replacement(monkeypatch):
         ray.kill(actor0, no_restart=True)
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle0, "query-real-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle0.pop_fte_result_handles("query-real-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
         result = asyncio.run(asyncio.wait_for(retry_handle.get_result(), timeout=10.0))
         retry_requests = ray.get(actor1.created_requests.remote())
 
@@ -554,6 +541,7 @@ def test_real_ray_actor_kill_without_replacement_fails_fte_fragment_execution(mo
         ray.kill(actor0, no_restart=True)
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
 
         assert "worker-solo" not in worker_handle_mod._FTE_WORKER_HANDLES
         assert (
@@ -634,7 +622,10 @@ def test_real_ray_actor_kill_replays_native_dynamic_scan_on_replacement(monkeypa
 
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle1, "query-native-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles("query-native-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
 
         retry_info = ray.get(actor1.fte_get_task_info.remote(retry_handle.task_id.to_dict()))
         if retry_info["status"].get("state") == "RUNNING":
@@ -732,7 +723,10 @@ def test_real_ray_full_query_worker_loss_uses_retry_output(monkeypatch, tmp_path
 
         with pytest.raises(Exception):
             asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handle = _wait_for_result_handles(handle1, "query-full-kill", 1)[0]
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles("query-full-kill")
+        assert len(retry_handles) == 1
+        retry_handle = retry_handles[0]
 
         retry_info = ray.get(actor1.fte_get_task_info.remote(retry_handle.task_id.to_dict()))
         if retry_info["status"].get("state") == "RUNNING":
@@ -845,7 +839,9 @@ def test_real_ray_host_loss_replays_all_owned_full_query_outputs(monkeypatch, tm
         for task_handle in task_handles:
             with pytest.raises(Exception):
                 asyncio.run(asyncio.wait_for(task_handle.get_result(), timeout=10.0))
-        retry_handles = _wait_for_result_handles(handle1, query_id, 2)
+        handle0.wait_fte_worker_failure_reconciliation(timeout_s=10.0)
+        retry_handles = handle1.pop_fte_result_handles(query_id)
+        assert len(retry_handles) == 2
 
         handle1.task_input_stream_exhausted([source_a, source_b])
         results = [

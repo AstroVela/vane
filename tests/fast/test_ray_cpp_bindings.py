@@ -3444,7 +3444,7 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             manager_instance_id=failed_handle.manager_instance_id,
             error=RuntimeError("planned worker failure during query close"),
         )
-        assert worker_failures.mark_fte_worker_failed_for_event(closing_event) == []
+        assert failed_handle._handles_for_worker_failed_event(closing_event) == []
         assert actors[0].killed
         assert ray_worker_handle._FTE_WORKER_HANDLES.get(failed_worker_id) is None
 
@@ -3462,7 +3462,7 @@ def test_ray_worker_failure_retirement_survives_query_close_and_stale_event(monk
             manager_instance_id=failed_handle.manager_instance_id,
             error=closing_event.error,
         )
-        assert worker_failures.mark_fte_worker_failed_for_event(delayed_event) == []
+        assert failed_handle._handles_for_worker_failed_event(delayed_event) == []
         assert ray_worker_handle._FTE_WORKER_HANDLES[failed_worker_id] is replacement
         assert replacement._fte_healthy is True
         assert actors[1].killed is False

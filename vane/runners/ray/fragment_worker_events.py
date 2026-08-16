@@ -11,7 +11,7 @@ from vane.runners.fte import (
     FteWorkerReservationUnavailable,
 )
 from vane.runners.fte.fte_events import WorkerFailed
-from vane.runners.fte.fte_scheduler import FteEventHandlers
+from vane.runners.fte.fte_scheduler import FteEventHandlers, FteRetryDelayResult
 from vane.runners.ray.fragment_registry import (
     _FTE_CLOSING_QUERIES,
     _FTE_FRAGMENT_EXECUTIONS,
@@ -23,7 +23,7 @@ from vane.runners.ray.fragment_registry import (
 )
 from vane.runners.ray.fragment_worker_exchange import apply_exchange_selector_update
 from vane.runners.ray.fragment_worker_failures import (
-    mark_fte_worker_failed_for_event,
+    begin_fte_worker_failure_reconciliation,
 )
 from vane.runners.ray.fragment_worker_ordering import fragment_execution_key_for_fte_attempt
 from vane.runners.ray.fragment_worker_reservations import (
@@ -34,12 +34,15 @@ from vane.runners.ray.fte_fragment_scheduler import (
     FteWorkerPlacementManager,
     _sync_write_sink_unit_for_fragment,
     request_fte_pending_task_drain,
+    request_fte_pending_task_drain_with_completion,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from concurrent.futures import Future
 
     from vane.runners.fte.fte_events import ExchangeSelectorUpdated, TaskStatusChanged, WorkerReservationCompleted
+    from vane.runners.fte.fte_scheduler import FteQueryScheduler
 
 
 class FteWorkerEventHandlingMixin:
@@ -63,7 +66,7 @@ class FteWorkerEventHandlingMixin:
         """Fence a failed worker before queued work can observe it as live."""
 
         try:
-            return self._handles_for_worker_failed_event(
+            return self._handles_for_worker_failed_scheduler_event(
                 WorkerFailed(
                     query_id=failure.attempt_id.task_id.query_id,
                     worker_id=failure.worker_id,
@@ -101,14 +104,51 @@ class FteWorkerEventHandlingMixin:
             )
         return handles
 
-    def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
+    def _start_worker_failed_event(self, event: WorkerFailed) -> tuple[list[Any], Future[None] | None]:
+        reconciliation = begin_fte_worker_failure_reconciliation(event)
+        if reconciliation is None:
+            return [], None
+        if not reconciliation.owns_runner:
+            return [], reconciliation.completion
         handles: list[Any] = []
         try:
-            scheduled_by_fragment = mark_fte_worker_failed_for_event(event)
-            if scheduled_by_fragment:
-                handles.extend(self._handles_for_marked_fte_worker_failed(scheduled_by_fragment))
-        finally:
-            handles.extend(request_fte_pending_task_drain())
+            while True:
+                reconciled_schedulers: list[FteQueryScheduler] = []
+                retry_delay_completions: list[Future[None]] = []
+                try:
+                    while True:
+                        result = reconciliation.reconcile()
+                        if result is None:
+                            break
+                        reconciled_schedulers.extend(result.schedulers)
+                        retry_delay_completions.extend(result.retry_delay_completions)
+                        if result.scheduled_by_fragment:
+                            handles.extend(
+                                self._handles_for_marked_fte_worker_failed(list(result.scheduled_by_fragment))
+                            )
+                finally:
+                    drain_handles, pending_drain_completion = request_fte_pending_task_drain_with_completion()
+                    handles.extend(drain_handles)
+                reconciliation.complete_after_pending_drain(
+                    tuple(reconciled_schedulers),
+                    pending_drain_completion,
+                    tuple(retry_delay_completions),
+                )
+                if not reconciliation.release_runner():
+                    break
+        except BaseException as exc:
+            reconciliation.fail(exc)
+            raise
+        return handles, reconciliation.completion
+
+    def _handles_for_worker_failed_event(self, event: WorkerFailed) -> list[Any]:
+        handles, completion = self._start_worker_failed_event(event)
+        if completion is not None:
+            completion.result()
+        return handles
+
+    def _handles_for_worker_failed_scheduler_event(self, event: WorkerFailed) -> list[Any]:
+        handles, _completion = self._start_worker_failed_event(event)
         return handles
 
     def _handles_for_worker_reservation_completed_event(self, event: WorkerReservationCompleted) -> list[Any]:
@@ -338,13 +378,17 @@ class FteWorkerEventHandlingMixin:
                 query_id_filter=scheduler.query_id,
             )
 
+        def on_retry_delay_expired(_event: Any) -> FteRetryDelayResult:
+            handles, completion = request_fte_pending_task_drain_with_completion()
+            return FteRetryDelayResult(tuple(handles), completion)
+
         scheduler.bind_manager_instance(
             self.manager_instance_id,
             handlers=FteEventHandlers(
                 on_split_events=self._submit_fte_pending_tasks,
                 on_source_input_exhausted=on_source_input_exhausted,
                 on_task_status_changed=self._handles_for_task_status_changed_event,
-                on_worker_failed=self._handles_for_worker_failed_event,
+                on_worker_failed=self._handles_for_worker_failed_scheduler_event,
                 on_memory_pressure_detected=lambda event: self._revoke_fte_speculative_tasks_for_memory_pressure_direct(
                     max_count_per_worker=event.max_count_per_worker,
                     query_id_filter=event.query_id,
@@ -355,7 +399,7 @@ class FteWorkerEventHandlingMixin:
                     execution_class_filter=event.execution_class,
                 ),
                 on_worker_reservation_completed=self._handles_for_worker_reservation_completed_event,
-                on_retry_delay_expired=lambda _event: request_fte_pending_task_drain(),
+                on_retry_delay_expired=on_retry_delay_expired,
                 on_exchange_selector_updated=self._handles_for_exchange_selector_updated_event,
             ),
         )
