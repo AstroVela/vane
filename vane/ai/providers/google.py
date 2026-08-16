@@ -34,7 +34,12 @@ from vane.ai.options import (
     validate_embed_options as validate_closed_embed_options,
 )
 from vane.ai.protocols import PrompterDescriptor, TextEmbedderDescriptor
-from vane.ai.provider import Provider, ProviderCapabilityError, _ProviderResultError
+from vane.ai.provider import (
+    Provider,
+    ProviderCapabilityError,
+    _ProviderResultError,
+    _translate_missing_provider_dependency,
+)
 from vane.ai.providers._mime import ImageMimePolicy
 from vane.ai.typing import UDFOptions
 
@@ -442,8 +447,9 @@ class GoogleTextEmbedder:
         dimensions: int | None = None,
         provider_name: str = "google",
     ):
-        from google import genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
-        from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("google", "google.genai"):
+            import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
@@ -467,7 +473,8 @@ class GoogleTextEmbedder:
         batch can never produce a single oversized API call. The result
         always contains exactly one embedding per input.
         """
-        from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("google", "google.genai"):
+            from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         config = dict(self._options)
         if self._dimensions is not None:
@@ -586,8 +593,9 @@ class GooglePrompter:
         return_raw_response: bool = False,
         provider_name: str = "google",
     ) -> None:
-        from google import genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
-        from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("google", "google.genai"):
+            import google.genai as genai  # type: ignore[import-not-found, import-untyped, unused-ignore]
+            from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         options = unwrap_sensitive_options(options)
         http_options = types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1))
@@ -617,7 +625,8 @@ class GooglePrompter:
     # --- Multimodal message processing -----------------------------------
 
     def _process_message(self, msg: Any) -> Any:
-        from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("google", "google.genai"):
+            from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         if isinstance(msg, str):
             return types.Part.from_text(text=msg)
@@ -629,7 +638,8 @@ class GooglePrompter:
     # --- API call --------------------------------------------------------
 
     async def prompt(self, messages: tuple[Any, ...]) -> str | None:
-        from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
+        with _translate_missing_provider_dependency("google", "google.genai"):
+            from google.genai import types  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         contents = [types.Content(role="user", parts=[self._process_message(message) for message in messages])]
         config_kwargs: dict[str, Any] = {}

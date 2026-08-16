@@ -14,10 +14,11 @@ Supported providers are loaded lazily so optional dependencies (e.g.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
 
     from vane.ai.protocols import (
         NativePrompterPlan,
@@ -30,10 +31,35 @@ class ProviderImportError(ImportError):
     """Raised when an optional provider dependency is not installed."""
 
     def __init__(self, extra: str, *, function: str | None = None):
+        self.extra = extra
+        self.function = function
         fn_msg = f" to use the {function} function" if function else ""
         super().__init__(f"Please `pip install 'vane-ai[{extra}]'`{fn_msg} with this provider.")
 
+    def __reduce__(self) -> tuple[Any, tuple[str, str | None]]:
+        return _restore_provider_import_error, (self.extra, self.function)
 
+
+def _restore_provider_import_error(extra: str, function: str | None) -> ProviderImportError:
+    return ProviderImportError(extra, function=function)
+
+
+@contextmanager
+def _translate_missing_provider_dependency(extra: str, expected_module: str) -> Iterator[None]:
+    """Translate only a missing optional module or one of its namespaces."""
+    try:
+        yield
+    except ModuleNotFoundError as exc:
+        missing_module = exc.name
+        if missing_module is not None and (
+            missing_module == expected_module or expected_module.startswith(f"{missing_module}.")
+        ):
+            raise ProviderImportError(extra) from exc
+        raise
+
+
+_SAFE_PROVIDER_IMPORT_EXTRAS = frozenset({"anthropic", "google", "openai", "transformers", "vllm"})
+_SAFE_PROVIDER_IMPORT_FUNCTIONS = frozenset({"Embed", "Prompt"})
 _MAX_ERROR_TYPE_CHARS = 128
 _SAFE_ERROR_DETAIL_NAMES = ("status_code", "status", "code")
 
@@ -81,8 +107,17 @@ def _safe_provider_execution_error(
     model: str,
     operation: str,
     original_error: Exception,
-) -> RuntimeError:
+) -> ProviderImportError | RuntimeError:
     """Return a public-safe final error after provider retry handling."""
+    if type(original_error) is ProviderImportError:
+        extra = original_error.extra
+        function = original_error.function
+        if (
+            type(extra) is str
+            and extra in _SAFE_PROVIDER_IMPORT_EXTRAS
+            and (function is None or (type(function) is str and function in _SAFE_PROVIDER_IMPORT_FUNCTIONS))
+        ):
+            return ProviderImportError(extra, function=function)
     summary = _safe_original_error_summary(original_error)
     return RuntimeError(f"Provider {provider!r} model {model!r} failed during {operation}; upstream error: {summary}")
 
@@ -164,48 +199,33 @@ class _ProviderResultError(TypeError):
 
 
 def _load_transformers(name: str | None = None) -> Provider:
-    try:
-        from vane.ai.providers.transformers import TransformersProvider
+    from vane.ai.providers.transformers import TransformersProvider
 
-        return TransformersProvider(name)
-    except ImportError as e:
-        raise ProviderImportError("transformers") from e
+    return TransformersProvider(name)
 
 
 def _load_openai(name: str | None = None) -> Provider:
-    try:
-        from vane.ai.providers.openai import OpenAIProvider
+    from vane.ai.providers.openai import OpenAIProvider
 
-        return OpenAIProvider(name)
-    except ImportError as e:
-        raise ProviderImportError("openai") from e
+    return OpenAIProvider(name)
 
 
 def _load_vllm(name: str | None = None) -> Provider:
-    try:
-        from vane.ai.providers.vllm import VLLMProvider
+    from vane.ai.providers.vllm import VLLMProvider
 
-        return VLLMProvider(name)
-    except ImportError as e:
-        raise ProviderImportError("vllm") from e
+    return VLLMProvider(name)
 
 
 def _load_anthropic(name: str | None = None) -> Provider:
-    try:
-        from vane.ai.providers.anthropic import AnthropicProvider
+    from vane.ai.providers.anthropic import AnthropicProvider
 
-        return AnthropicProvider(name)
-    except ImportError as e:
-        raise ProviderImportError("anthropic") from e
+    return AnthropicProvider(name)
 
 
 def _load_google(name: str | None = None) -> Provider:
-    try:
-        from vane.ai.providers.google import GoogleProvider
+    from vane.ai.providers.google import GoogleProvider
 
-        return GoogleProvider(name)
-    except ImportError as e:
-        raise ProviderImportError("google") from e
+    return GoogleProvider(name)
 
 
 PROVIDERS: dict[str, Callable[..., Provider]] = {
@@ -225,7 +245,6 @@ def load_provider(provider: str, name: str | None = None) -> Provider:
         name: Optional display name override.
     Raises:
         ValueError: If the provider name is not registered.
-        ProviderImportError: If the provider's dependencies are missing.
     """
     factory = PROVIDERS.get(provider)
     if factory is None:
