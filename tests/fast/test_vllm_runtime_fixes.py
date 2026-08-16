@@ -408,6 +408,30 @@ def test_ray_actor_releases_only_terminal_per_executor_state():
     assert executor.release_executor("aborted") is True
 
 
+def test_ray_actor_wait_raises_stored_executor_error():
+    from vane.execution.vllm import RayLocalVLLMExecutor
+
+    executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
+    executor.on_error = "raise"
+    executor.task_count_lock = threading.Lock()
+    executor._per_executor_deques = {"executor": deque()}
+    executor._per_executor_running_task_count = {"executor": 0}
+    executor._per_executor_finished = set()
+    executor._per_executor_errors = {"executor": "sentinel request failure"}
+    executor._per_executor_aborted = set()
+    executor._per_executor_waiters = {}
+    executor._per_executor_wait_tokens_observed = {}
+    executor._async_waiter_lock = threading.Lock()
+    executor._async_waiters = {}
+    executor._notify_state_change = lambda **_kwargs: None
+
+    with pytest.raises(RuntimeError, match="vllm task failed: sentinel request failure"):
+        asyncio.run(executor.wait_for_result("executor", "error-wait"))
+
+    assert executor._per_executor_waiters == {}
+    assert executor._per_executor_wait_tokens_observed == {"executor": "error-wait"}
+
+
 def test_ray_actor_batches_ready_results_to_standard_vector_size():
     import vane.execution.vllm as vllm
 
@@ -452,6 +476,7 @@ def test_ray_actor_abort_waiter_does_not_depend_on_default_thread_pool_capacity(
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
+    executor.on_error = "raise"
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
@@ -509,6 +534,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
     executor = RayLocalVLLMExecutor.__new__(RayLocalVLLMExecutor)
     executor.llm = None
+    executor.on_error = "raise"
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
