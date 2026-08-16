@@ -28,6 +28,7 @@ endif()
 
 # Source files for the distributed module
 set(DISTRIBUTED_SOURCES_COMMON
+    extension_write.cpp
     plan/distributed_physical_plan.cpp
     plan/exchange_sink_instance_task.cpp
     plan/exchange_source_task.cpp
@@ -40,6 +41,7 @@ set(DISTRIBUTED_SOURCES_COMMON
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
     pipeline_node/expression_scan.cpp
+    pipeline_node/extension_write_sink.cpp
     pipeline_node/grouping_set_expand.cpp
     pipeline_node/join/broadcast_join.cpp
     pipeline_node/join/delim_join.cpp

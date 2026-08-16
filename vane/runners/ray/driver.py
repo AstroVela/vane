@@ -38,7 +38,7 @@ RayTaskResult = require_ray_cxx_attr(
 )
 
 from vane.event_loop import set_event_loop
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.fte import (
     FteTaskAttemptId,
     FteTaskState,
@@ -293,6 +293,16 @@ def _raise_copy_outcome_unknown(
     operation_id: str,
     operation_error: BaseException,
 ) -> NoReturn:
+    committed_error = next(
+        (
+            candidate
+            for candidate in _runtime_error_candidates(operation_error)
+            if isinstance(candidate, CopyResultUnavailableError)
+        ),
+        None,
+    )
+    if committed_error is not None:
+        raise committed_error
     unknown_error = next(
         (
             candidate
@@ -1575,6 +1585,10 @@ class RayQueryDriverActor:
         self._copy_operation_terminal = BoundedReplayMap[str, _CopyOperationTerminal](
             capacity=_COPY_OPERATION_REPLAY_CAPACITY
         )
+        # Pending cleanup retains real plan resources rather than replay-only
+        # history. Keep those outcomes outside the bounded terminal window
+        # until cleanup succeeds or the owning client is detached.
+        self._copy_cleanup_pending_terminals: dict[str, _CopyOperationTerminal] = {}
         # Outcome payloads are bounded, but an admitted identity must remain
         # known for the owner's lifetime. Evicting a payload may make recovery
         # impossible; it must never authorize the same write to run again.
@@ -2028,7 +2042,7 @@ class RayQueryDriverActor:
         import vane
         from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 
-        self._duckdb_conn = vane.connect()
+        self._duckdb_conn = vane.connect(config={"allow_persistent_secrets": False})
         _apply_duckdb_thread_setting(self._duckdb_conn)
         apply_duckdb_memory_limit(self._duckdb_conn, self._driver_duckdb_memory_bytes)
         return self._duckdb_conn
@@ -6568,10 +6582,7 @@ class RayQueryDriverActor:
                 finally:
                     raise
 
-            from vane.runners.ray.worker import (
-                _configure_duckdb_s3,
-                _refresh_effective_duckdb_s3_config,
-            )
+            from vane.runners.ray.worker import _refresh_effective_duckdb_s3_config
 
             use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
             refreshed_s3_config = _refresh_effective_duckdb_s3_config(
@@ -6579,11 +6590,7 @@ class RayQueryDriverActor:
                 session.s3_config,
                 use_session_credentials=use_session_credentials,
             )
-            session.s3_config = _configure_duckdb_s3(
-                query_connection,
-                refreshed_s3_config,
-                use_session_credentials=use_session_credentials,
-            )
+            session.s3_config = refreshed_s3_config
             physical_plan = logical_plan.to_physical_plan(
                 query_connection,
                 session.s3_config,
@@ -6689,10 +6696,31 @@ class RayQueryDriverActor:
             self._copy_operations_inflight = {}
         if not isinstance(getattr(self, "_copy_operation_terminal", None), BoundedReplayMap):
             self._copy_operation_terminal = BoundedReplayMap(capacity=_COPY_OPERATION_REPLAY_CAPACITY)
+        if not isinstance(getattr(self, "_copy_cleanup_pending_terminals", None), dict):
+            self._copy_cleanup_pending_terminals = {}
         if not isinstance(getattr(self, "_copy_operation_identities", None), dict):
             self._copy_operation_identities = {}
         if not isinstance(getattr(self, "_copy_cleanup_tasks", None), dict):
             self._copy_cleanup_tasks = {}
+
+    def _copy_operation_terminal_record(self, operation_id: str) -> _CopyOperationTerminal | None:
+        pending = self._copy_cleanup_pending_terminals.get(operation_id)
+        if pending is not None:
+            return pending
+        return self._copy_operation_terminal.get(operation_id)
+
+    def _retain_copy_operation_terminal(
+        self,
+        operation_id: str,
+        terminal: _CopyOperationTerminal,
+    ) -> None:
+        outcome = terminal.outcome
+        if outcome is not None and outcome.cleanup_state == "pending":
+            self._copy_operation_terminal.pop(operation_id, None)
+            self._copy_cleanup_pending_terminals[operation_id] = terminal
+            return
+        self._copy_cleanup_pending_terminals.pop(operation_id, None)
+        self._copy_operation_terminal[operation_id] = terminal
 
     def _discard_copy_operation_state_for_owner(self, owner_id: str) -> None:
         self._ensure_copy_operation_state()
@@ -6703,6 +6731,7 @@ class RayQueryDriverActor:
         }
         for operation_id in operation_ids:
             self._copy_operation_identities.pop(operation_id, None)
+            self._copy_cleanup_pending_terminals.pop(operation_id, None)
         self._copy_operation_terminal.discard_where(
             lambda operation_id, record: operation_id in operation_ids and record.owner_id == owner_id
         )
@@ -6842,17 +6871,23 @@ class RayQueryDriverActor:
             finally:
                 self._end_session_operation(session)
         except BaseException as error:
-            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
-                owner_id=owner_id,
-                session_id=session_id,
-                error=error,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                _CopyOperationTerminal(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    error=error,
+                ),
             )
             raise
         else:
-            self._copy_operation_terminal[operation_id] = _CopyOperationTerminal(
-                owner_id=owner_id,
-                session_id=session_id,
-                outcome=outcome,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                _CopyOperationTerminal(
+                    owner_id=owner_id,
+                    session_id=session_id,
+                    outcome=outcome,
+                ),
             )
             return outcome
         finally:
@@ -6873,7 +6908,7 @@ class RayQueryDriverActor:
         operation_id = self._copy_operation_id(plan)
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
-        terminal = self._copy_operation_terminal.get(operation_id)
+        terminal = self._copy_operation_terminal_record(operation_id)
         if terminal is not None:
             self._validate_copy_operation_identity(
                 terminal,
@@ -6946,7 +6981,7 @@ class RayQueryDriverActor:
             raise ValueError("Vane session_id must not be empty")
         if not operation_key:
             raise ValueError("COPY operation identity must not be empty")
-        terminal = self._copy_operation_terminal.get(operation_key)
+        terminal = self._copy_operation_terminal_record(operation_key)
         if terminal is not None:
             self._validate_copy_operation_identity(
                 terminal,
@@ -6971,7 +7006,7 @@ class RayQueryDriverActor:
                     timeout=wait_timeout_s,
                 )
                 if not done:
-                    terminal = self._copy_operation_terminal.get(operation_key)
+                    terminal = self._copy_operation_terminal_record(operation_key)
                     if terminal is not None:
                         self._validate_copy_operation_identity(
                             terminal,
@@ -6989,7 +7024,7 @@ class RayQueryDriverActor:
             except asyncio.CancelledError:
                 raise
             except BaseException as operation_error:
-                terminal = self._copy_operation_terminal.get(operation_key)
+                terminal = self._copy_operation_terminal_record(operation_key)
                 if terminal is not None:
                     self._validate_copy_operation_identity(
                         terminal,
@@ -7058,11 +7093,14 @@ class RayQueryDriverActor:
             cleanup_state=cleanup_state,
             cleanup_warnings=cleanup_warnings,
         )
-        current = self._copy_operation_terminal.get(operation_id)
+        current = self._copy_operation_terminal_record(operation_id)
         if current is terminal:
-            self._copy_operation_terminal[operation_id] = replace(
-                terminal,
-                outcome=updated,
+            self._retain_copy_operation_terminal(
+                operation_id,
+                replace(
+                    terminal,
+                    outcome=updated,
+                ),
             )
         return updated
 
@@ -7085,7 +7123,7 @@ class RayQueryDriverActor:
         if outcome.cleanup_state == "complete":
             return outcome
         operation_key = str(operation_id).strip()
-        terminal = self._copy_operation_terminal.get(operation_key)
+        terminal = self._copy_operation_terminal_record(operation_key)
         if terminal is None or terminal.outcome is None:
             raise CopyOutcomeUnknownError(operation_key)
         cleanup_task = self._copy_cleanup_tasks.get(operation_key)
@@ -7219,7 +7257,22 @@ class RayQueryDriverActor:
             # terminal result so a concurrent failure cannot escape as an
             # unobserved asyncio task exception.
             committed_result: Mapping[str, Any] | None = None
-            unknown_outcome_error = primary_error if isinstance(primary_error, CopyOutcomeUnknownError) else None
+            committed_result_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(primary_error)
+                    if isinstance(candidate, CopyResultUnavailableError)
+                ),
+                None,
+            )
+            unknown_outcome_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(primary_error)
+                    if isinstance(candidate, CopyOutcomeUnknownError)
+                ),
+                None,
+            )
             if plan_execution is not None:
                 try:
                     await self._await_copy_operation(plan_execution)
@@ -7227,8 +7280,25 @@ class RayQueryDriverActor:
                     pass
                 try:
                     observed_result = plan_execution.result()
-                except BaseException:
-                    pass
+                except BaseException as observed_error:
+                    if committed_result_error is None:
+                        committed_result_error = next(
+                            (
+                                candidate
+                                for candidate in _runtime_error_candidates(observed_error)
+                                if isinstance(candidate, CopyResultUnavailableError)
+                            ),
+                            None,
+                        )
+                    if unknown_outcome_error is None:
+                        unknown_outcome_error = next(
+                            (
+                                candidate
+                                for candidate in _runtime_error_candidates(observed_error)
+                                if isinstance(candidate, CopyOutcomeUnknownError)
+                            ),
+                            None,
+                        )
                 else:
                     if isinstance(observed_result, Mapping):
                         if observed_result.get("copy_output_outcome_unknown") is True:
@@ -7271,6 +7341,23 @@ class RayQueryDriverActor:
                     cleanup_state=cleanup_state,
                     cleanup_warnings=cleanup_warnings,
                 )
+            if committed_result_error is not None:
+                if committed_result_error is not primary_error:
+                    committed_result_error.add_cleanup_warnings(
+                        self._copy_cleanup_warning(
+                            "COPY committed-result execution finalization",
+                            primary_error,
+                        )
+                    )
+                if teardown_error is not None:
+                    committed_result_error.add_cleanup_warnings(
+                        self._copy_cleanup_warning("COPY committed-result teardown", teardown_error)
+                    )
+                if committed_result_error is primary_error:
+                    if primary_error is execution_error:
+                        raise
+                    raise primary_error from execution_error
+                raise committed_result_error from primary_error
             if unknown_outcome_error is not None:
                 if unknown_outcome_error is not primary_error:
                     unknown_outcome_error.add_cleanup_warnings(
@@ -7376,10 +7463,7 @@ class RayQueryDriverActor:
                     query_connection.close()
                 finally:
                     raise
-            from vane.runners.ray.worker import (
-                _configure_duckdb_s3,
-                _refresh_effective_duckdb_s3_config,
-            )
+            from vane.runners.ray.worker import _refresh_effective_duckdb_s3_config
 
             use_session_credentials = not bool(logical_plan.has_explicit_s3_credentials())
             refreshed_s3_config = _refresh_effective_duckdb_s3_config(
@@ -7387,11 +7471,7 @@ class RayQueryDriverActor:
                 session.s3_config,
                 use_session_credentials=use_session_credentials,
             )
-            session.s3_config = _configure_duckdb_s3(
-                query_connection,
-                refreshed_s3_config,
-                use_session_credentials=use_session_credentials,
-            )
+            session.s3_config = refreshed_s3_config
             plan = logical_plan.to_physical_plan(
                 query_connection,
                 session.s3_config,
@@ -8416,6 +8496,16 @@ class RayQueryDriverClient:
                 )
             return outcome.result
         except Exception as e:
+            committed_result_error = next(
+                (
+                    candidate
+                    for candidate in _runtime_error_candidates(e)
+                    if isinstance(candidate, CopyResultUnavailableError)
+                ),
+                None,
+            )
+            if committed_result_error is not None:
+                raise committed_result_error
             unknown_outcome = next(
                 (
                     candidate

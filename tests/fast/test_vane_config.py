@@ -119,7 +119,7 @@ assert runners.get_or_infer_runner_type() == {expected!r}
 
 
 def test_runner_entry_points_use_shared_invalid_value_error(monkeypatch):
-    expected = "Invalid runner type 'invalid-runner'. Please use 'local' or 'ray'."
+    expected = "Invalid runner type 'invalid-runner'. Please use 'local-fast', 'local', or 'ray'."
     script = f"""
 import os
 import vane.runners as runners

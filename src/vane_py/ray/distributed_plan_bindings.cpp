@@ -83,7 +83,20 @@ struct PyPhysicalPlanWrapper {
 		if (connection_snapshot_.is_none()) {
 			return;
 		}
-		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, apply_session_config);
+		ConnectionSnapshotApplyOptions options;
+		options.apply_session_config = apply_session_config;
+		ApplyConnectionSnapshot(conn_obj, connection_snapshot_, options);
+	}
+
+	py::object resolve_execution_connection(py::object conn_obj) const {
+		if (!worker_connection_.is_none()) {
+			auto &worker_connection = ExtractPyConnectionWrapper(worker_connection_);
+			if (worker_connection.con.ConnectionIsClosed()) {
+				throw py::value_error("DistributedPhysicalPlan binding connection is closed");
+			}
+			return worker_connection_;
+		}
+		return ResolveConnectionForSnapshot(conn_obj, connection_snapshot_);
 	}
 
 	void apply_udf_actor_handles() {
@@ -214,17 +227,52 @@ struct PyPhysicalPlanWrapper {
 		if (!physical_plan || !physical_plan->HasRoot()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root to clone");
 		}
+		return serialize_operator_root(physical_plan->Root());
+	}
+
+	void validate_serializable_for_submission() const {
+		if (!has_root()) {
+			(void)serialize_root_for_clone();
+			return;
+		}
+
+		auto physical_plan = plan_->physical_plan();
+		if (!physical_plan || !physical_plan->HasRoot()) {
+			throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root to submit");
+		}
+		auto &root = physical_plan->Root();
+		if (!root.GetExtensionWriteTaskProvider()) {
+			(void)serialize_operator_root(root);
+			return;
+		}
+		if (root.type != duckdb::PhysicalOperatorType::EXTENSION) {
+			throw duckdb::InvalidInputException(
+			    "Distributed extension write provider must be exposed by an EXTENSION physical root");
+		}
+		if (root.children.size() != 1) {
+			throw duckdb::InvalidInputException(
+			    "Distributed extension write requires exactly one worker-executable child");
+		}
+
+		// The extension root owns coordinator-only catalog state and never crosses
+		// the worker boundary. Validate exactly the subtree that task production
+		// can submit; requiring the extension root itself to serialize would make
+		// the generic protocol depend on an irrelevant extension capability.
+		(void)serialize_operator_root(root.children[0].get());
+	}
+
+	static string serialize_operator_root(const duckdb::PhysicalOperator &root) {
 		duckdb::MemoryStream stream;
 		duckdb::SerializationOptions options;
 		options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
 		options.serialize_default_values = true;
 		duckdb::BinarySerializer serializer(stream, options);
 		serializer.Begin();
-		physical_plan->Serialize(serializer);
+		root.Serialize(serializer);
 		serializer.End();
 		auto data_size = stream.GetPosition();
 		if (data_size == 0) {
-			throw duckdb::InternalException("DistributedPhysicalPlan serialized a non-empty root to an empty payload");
+			throw duckdb::InternalException("DistributedPhysicalPlan serialized a physical root to an empty payload");
 		}
 		auto data_ptr = stream.GetData();
 		return string(reinterpret_cast<const char *>(data_ptr), data_size);
@@ -773,9 +821,16 @@ struct PyPhysicalPlanWrapper {
 					max_id = id;
 				}
 			}
-			idx_t next_id = max_id + 1;
-			std::unordered_map<idx_t, idx_t> base_for_group;
-			std::unordered_map<idx_t, idx_t> dup_to_base;
+			idx_t last_id = max_id;
+			unordered_map<idx_t, idx_t> base_node_for_group;
+			unordered_map<idx_t, idx_t> group_for_node;
+			unordered_map<idx_t, idx_t> alias_to_parent;
+			auto allocate_node_id = [&]() {
+				if (last_id == NumericLimits<idx_t>::Maximum()) {
+					throw InvalidInputException("cannot allocate a unique distributed scan node identity");
+				}
+				return ++last_id;
+			};
 			std::function<void(PhysicalOperator &)> normalize = [&](PhysicalOperator &op) -> void {
 				if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 					auto &scan = op.Cast<PhysicalTableScan>();
@@ -783,24 +838,36 @@ struct PyPhysicalPlanWrapper {
 						if (scan.extra_info.scan_node_id.IsValid()) {
 							scan.extra_info.scan_group_id = scan.extra_info.scan_node_id;
 						} else {
-							scan.extra_info.scan_group_id = optional_idx(next_id++);
+							scan.extra_info.scan_group_id = optional_idx(allocate_node_id());
 						}
 					}
 					if (!scan.extra_info.scan_node_id.IsValid()) {
-						scan.extra_info.scan_node_id = optional_idx(next_id++);
+						scan.extra_info.scan_node_id = optional_idx(allocate_node_id());
 					}
 					const auto group_id = scan.extra_info.scan_group_id.GetIndex();
 					auto node_id = scan.extra_info.scan_node_id.GetIndex();
-					auto it = base_for_group.find(group_id);
-					if (it == base_for_group.end()) {
-						base_for_group[group_id] = node_id;
-					} else {
-						auto base_id = it->second;
-						if (node_id == base_id) {
-							node_id = next_id++;
-							scan.extra_info.scan_node_id = optional_idx(node_id);
+					const auto original_node_id = node_id;
+					auto existing_node = group_for_node.find(node_id);
+					if (existing_node != group_for_node.end()) {
+						if (existing_node->second != group_id) {
+							throw InvalidInputException(
+							    "distributed scan node identity %llu is reused by scan groups %llu and %llu",
+							    static_cast<unsigned long long>(node_id),
+							    static_cast<unsigned long long>(existing_node->second),
+							    static_cast<unsigned long long>(group_id));
 						}
-						dup_to_base[node_id] = base_id;
+						node_id = allocate_node_id();
+						scan.extra_info.scan_node_id = optional_idx(node_id);
+						group_for_node.emplace(node_id, group_id);
+						alias_to_parent.emplace(node_id, original_node_id);
+					} else {
+						group_for_node.emplace(node_id, group_id);
+						auto group_entry = base_node_for_group.find(group_id);
+						if (group_entry == base_node_for_group.end()) {
+							base_node_for_group.emplace(group_id, node_id);
+						} else if (node_id != group_entry->second) {
+							alias_to_parent.emplace(node_id, group_entry->second);
+						}
 					}
 				}
 				for (auto &child : op.children) {
@@ -809,16 +876,27 @@ struct PyPhysicalPlanWrapper {
 			};
 			normalize(plan_->physical_plan()->Root());
 
-			idx_t copied = 0;
-			for (const auto &kv : dup_to_base) {
+			for (const auto &kv : alias_to_parent) {
 				auto dup_key = py::str(std::to_string(kv.first));
 				if (out.contains(dup_key)) {
 					continue;
 				}
-				auto base_key = py::str(std::to_string(kv.second));
-				if (out.contains(base_key)) {
-					out[dup_key] = out[base_key];
-					copied++;
+				set<idx_t> visited;
+				auto assignment_id = kv.first;
+				while (!out.contains(py::str(std::to_string(assignment_id)))) {
+					if (!visited.insert(assignment_id).second) {
+						throw InternalException("distributed scan node alias cycle detected at node %llu",
+						                        static_cast<unsigned long long>(assignment_id));
+					}
+					auto alias = alias_to_parent.find(assignment_id);
+					if (alias == alias_to_parent.end()) {
+						break;
+					}
+					assignment_id = alias->second;
+				}
+				auto assignment_key = py::str(std::to_string(assignment_id));
+				if (out.contains(assignment_key)) {
+					out[dup_key] = out[assignment_key];
 				}
 			}
 		}
@@ -999,13 +1077,23 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 
 	py::object planning_conn = ResolvePlanningConnectionForSnapshot(conn_obj, source_connection_, connection_snapshot_);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(planning_conn);
-	// Resolved environment/profile credentials are the session baseline. Replay
-	// the source connection last so an explicit SET on that connection keeps
-	// DuckDB's normal explicit-config-over-environment precedence.
-	ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
 	const bool shares_source_database = ConnectionsShareDatabaseInstance(planning_conn, source_connection_);
-	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, effective_session_config.is_none(),
-	                        !shares_source_database);
+	ConnectionSnapshotApplyOptions snapshot_options;
+	snapshot_options.apply_session_config = effective_session_config.is_none();
+	snapshot_options.enforce_extension_security = !shares_source_database;
+	snapshot_options.apply_attached_databases = !shares_source_database;
+	// Validate and load the exact static extension set before refreshed AWS
+	// settings are allowed to execute LOAD httpfs. A snapshot that does not
+	// declare httpfs must leave the planning DatabaseInstance uncontaminated.
+	ValidateConnectionSnapshotExtensions(planning_conn, connection_snapshot_,
+	                                     snapshot_options.enforce_extension_security);
+	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot_, "httpfs")) {
+		// Resolved environment/profile credentials are the session baseline.
+		// Replay the source connection below so explicit source SET values retain
+		// DuckDB's normal precedence.
+		ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
+	}
+	ApplyConnectionSnapshot(planning_conn, connection_snapshot_, snapshot_options);
 	if (!udf_registrations_.is_none()) {
 		conn_wrapper.ApplyDistributedPythonUDFRegistrations(udf_registrations_);
 	}
@@ -1045,7 +1133,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.worker_connection_ = planning_conn;
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
-	plan_wrapper.connection_snapshot_ = connection_snapshot_;
+	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
 	validate_serialization(py::cast(plan_wrapper));
@@ -2654,6 +2742,7 @@ struct PyPhysicalPlanWrapperRunner {
 		std::string staging_root;
 	};
 	std::unordered_map<string, std::shared_ptr<StoredCopyContext>> streaming_results_;
+	std::atomic<bool> fail_next_extension_result_marshalling_for_test_ {false};
 
 	PyPhysicalPlanWrapperRunner()
 	    : ray_worker_manager_(
@@ -2718,6 +2807,10 @@ struct PyPhysicalPlanWrapperRunner {
 		if (result.is_err()) {
 			throw std::runtime_error(result.error().what());
 		}
+	}
+
+	void fail_next_extension_result_marshalling_for_test() {
+		fail_next_extension_result_marshalling_for_test_.store(true, std::memory_order_relaxed);
 	}
 
 	void close_session(const string &session_id) {
@@ -2889,6 +2982,14 @@ struct PyPhysicalPlanWrapperRunner {
 		bool body_succeeded = false;
 		bool query_owner_registered = false;
 		std::exception_ptr cleanup_error;
+		enum class ExtensionWriteTerminalState : uint8_t { NONE, COMMITTED, OUTCOME_UNKNOWN };
+		ExtensionWriteTerminalState extension_terminal_state = ExtensionWriteTerminalState::NONE;
+		string extension_terminal_detail;
+		string extension_terminal_base_path;
+		string extension_terminal_run_id;
+		string extension_terminal_manifest_path;
+		string extension_terminal_committed_marker_path;
+		vector<string> post_commit_warnings;
 		auto exception_message = [](const std::exception_ptr &error) {
 			try {
 				std::rethrow_exception(error);
@@ -2914,6 +3015,38 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 			cleanup_ms = elapsed_ms(cleanup_started);
 		};
+		auto raise_extension_terminal_error = [&](const std::exception_ptr &execution_error) -> void {
+			vector<string> cleanup_warnings(post_commit_warnings.begin(), post_commit_warnings.end());
+			if (cleanup_error) {
+				cleanup_warnings.push_back("native COPY runner cleanup failed: " + exception_message(cleanup_error));
+			}
+			py::tuple cleanup_warnings_py(cleanup_warnings.size());
+			for (idx_t index = 0; index < cleanup_warnings.size(); index++) {
+				cleanup_warnings_py[index] = py::str(cleanup_warnings[index]);
+			}
+
+			auto result_error = exception_message(execution_error);
+			py::object error_type;
+			py::object error_value;
+			if (extension_terminal_state == ExtensionWriteTerminalState::COMMITTED) {
+				error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyResultUnavailableError");
+				error_value = error_type(
+				    plan.idx(), "extension write result handling failed after the catalog commit: " + result_error,
+				    cleanup_warnings_py);
+			} else {
+				auto detail = extension_terminal_detail;
+				if (!detail.empty()) {
+					detail += "; ";
+				}
+				detail += "extension write result handling failed after finalization: " + result_error;
+				error_type = py::module_::import("vane.runners.copy_outcome").attr("CopyOutcomeUnknownError");
+				error_value = error_type(plan.idx(), extension_terminal_base_path, extension_terminal_run_id,
+				                         extension_terminal_manifest_path, extension_terminal_committed_marker_path,
+				                         detail, cleanup_warnings_py);
+			}
+			PyErr_SetObject(error_type.ptr(), error_value.ptr());
+			throw py::error_already_set();
+		};
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
@@ -2938,6 +3071,8 @@ struct PyPhysicalPlanWrapperRunner {
 			auto runner = std::make_shared<duckdb::distributed::PlanRunner>(worker_manager_, client_context);
 
 			DuckDBResult<DistributedCopyResult> res;
+			bool extension_write = false;
+			DistributedExtensionWriteResult extension_result;
 			idx_t run_plan_ms = 0;
 			{
 				auto run_plan_started = std::chrono::steady_clock::now();
@@ -2950,11 +3085,32 @@ struct PyPhysicalPlanWrapperRunner {
 					py::gil_scoped_acquire acquire;
 					on_execution_started.get()();
 				};
+				std::exception_ptr extension_catalog_commit_error;
 				if (!client_context) {
 					plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started);
 				} else {
-					client_context->RunFunctionInTransaction(
-					    [&]() { plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started); });
+					class PlanResultRollbackException final : public std::exception {};
+					try {
+						client_context->RunFunctionInTransaction([&]() {
+							plan_res = runner->run_plan(plan.plan_, {}, publish_execution_started);
+							if (plan_res.is_err() ||
+							    (plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE &&
+							     plan_res.value().extension_write_result.outcome_unknown)) {
+								throw PlanResultRollbackException();
+							}
+						});
+					} catch (const PlanResultRollbackException &) {
+					} catch (...) {
+						if (plan_res.is_ok() &&
+						    plan_res.value().tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE) {
+							// Provider finalization returned, but the coordinator transaction
+							// did not report a definitive outcome. The extension catalog may
+							// already reference the selected artifacts.
+							extension_catalog_commit_error = std::current_exception();
+						} else {
+							throw;
+						}
+					}
 				}
 				if (!plan_res.is_ok()) {
 					res = DuckDBResult<DistributedCopyResult>::err(plan_res.error());
@@ -2962,12 +3118,55 @@ struct PyPhysicalPlanWrapperRunner {
 					auto &plan_result = plan_res.value();
 					if (plan_result.tag == duckdb::distributed::PlanRunner::PlanResult::COPY) {
 						res = DuckDBResult<DistributedCopyResult>::ok(std::move(plan_result.copy_result));
+					} else if (plan_result.tag == duckdb::distributed::PlanRunner::PlanResult::EXTENSION_WRITE) {
+						extension_write = true;
+						extension_result = std::move(plan_result.extension_write_result);
+						if (extension_catalog_commit_error) {
+							extension_result.catalog_committed = false;
+							extension_result.outcome_unknown = true;
+							extension_result.outcome_error =
+							    "extension catalog commit outcome is unknown; selected artifacts were retained: " +
+							    exception_message(extension_catalog_commit_error);
+							if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+								extension_result.file_result.output_outcome_unknown = true;
+								extension_result.file_result.output_outcome_error = extension_result.outcome_error;
+							}
+						} else if (!extension_result.outcome_unknown && !extension_result.catalog_committed) {
+							extension_result.catalog_committed = true;
+						}
+						if (extension_result.catalog_committed) {
+							extension_terminal_state = ExtensionWriteTerminalState::COMMITTED;
+						} else if (extension_result.outcome_unknown) {
+							extension_terminal_state = ExtensionWriteTerminalState::OUTCOME_UNKNOWN;
+						}
+						extension_terminal_detail = extension_result.outcome_error;
+						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+							extension_terminal_base_path = extension_result.file_result.output_base_path;
+							extension_terminal_run_id = extension_result.file_result.output_run_id;
+							extension_terminal_manifest_path = extension_result.file_result.output_manifest_path;
+							extension_terminal_committed_marker_path =
+							    extension_result.file_result.output_committed_marker_path;
+						}
+						if (extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) {
+							res = DuckDBResult<DistributedCopyResult>::ok(extension_result.file_result);
+						} else {
+							DistributedCopyResult callback_result;
+							callback_result.rows_copied = extension_result.rows_written;
+							callback_result.output_committed = extension_result.catalog_committed;
+							callback_result.output_outcome_unknown = extension_result.outcome_unknown;
+							callback_result.output_outcome_error = extension_result.outcome_error;
+							res = DuckDBResult<DistributedCopyResult>::ok(std::move(callback_result));
+						}
 					} else {
 						res = DuckDBResult<DistributedCopyResult>::err(
-						    DuckDBError("run_plan returned stream instead of copy result for a COPY plan"));
+						    DuckDBError("run_plan returned stream instead of a write result for a write plan"));
 					}
 				}
 				run_plan_ms = elapsed_ms(run_plan_started);
+			}
+			if (extension_terminal_state != ExtensionWriteTerminalState::NONE &&
+			    fail_next_extension_result_marshalling_for_test_.exchange(false, std::memory_order_relaxed)) {
+				throw std::runtime_error("planned extension result marshalling failure");
 			}
 
 			if (!res.is_ok()) {
@@ -2976,11 +3175,15 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 
 			auto result = std::move(res).value();
-			if (!result.output_committed && !result.output_outcome_unknown) {
+			if (extension_write && !extension_result.catalog_committed && !extension_result.outcome_unknown) {
+				rethrow_submission_error(plan.idx());
+				throw py::value_error("distributed extension write completed without a confirmed catalog commit");
+			}
+			if ((!extension_write || extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT) &&
+			    !result.output_committed && !result.output_outcome_unknown) {
 				rethrow_submission_error(plan.idx());
 				throw py::value_error("distributed COPY completed without a committed output marker");
 			}
-			std::vector<string> post_commit_warnings;
 			try {
 				rethrow_submission_error(plan.idx());
 			} catch (...) {
@@ -3010,6 +3213,28 @@ struct PyPhysicalPlanWrapperRunner {
 			out["rows_copied"] = result.rows_copied;
 			out["files"] = files;
 			AppendDistributedCopyResultMetadata(out, result);
+			out["extension_write"] = py::bool_(extension_write);
+			out["extension_write_name"] = py::str(extension_write ? extension_result.info.Name() : string());
+			out["extension_catalog_committed"] = py::bool_(extension_write && extension_result.catalog_committed);
+			out["extension_write_mode"] =
+			    py::str(!extension_write                                                    ? string()
+			            : extension_result.info.mode == DistributedWriteMode::FILE_ARTIFACT ? "file_artifact"
+			                                                                                : "callback");
+			idx_t extension_fragment_count = 0;
+			idx_t extension_artifact_count = 0;
+			if (extension_write) {
+				for (const auto &task_result : extension_result.selected_task_results) {
+					extension_fragment_count += task_result.fragments.size();
+					for (const auto &fragment : task_result.fragments) {
+						extension_artifact_count += fragment.artifacts.size();
+					}
+				}
+			}
+			out["extension_task_result_count"] =
+			    py::int_(extension_write ? extension_result.selected_task_results.size() : 0);
+			out["extension_fragment_count"] = py::int_(extension_fragment_count);
+			out["extension_artifact_count"] = py::int_(extension_artifact_count);
+			out["extension_bytes_written"] = py::int_(extension_write ? extension_result.bytes_written : 0);
 			body_succeeded = true;
 			cleanup();
 			out["copy_total_ms"] = py::int_(elapsed_ms(copy_started));
@@ -3029,6 +3254,10 @@ struct PyPhysicalPlanWrapperRunner {
 			return out;
 		} catch (...) {
 			auto execution_error = std::current_exception();
+			if (extension_terminal_state != ExtensionWriteTerminalState::NONE) {
+				cleanup();
+				raise_extension_terminal_error(execution_error);
+			}
 			if (body_succeeded) {
 				std::rethrow_exception(execution_error);
 			}
@@ -3055,7 +3284,7 @@ struct PyPhysicalPlanWrapperRunner {
 		streaming_results_.erase(it);
 
 		// Convert Python file info dicts to C++ DistributedCopyFileInfo
-		std::vector<DistributedCopyFileInfo> files;
+		vector<DistributedCopyFileInfo> files;
 		for (auto item : file_infos_py) {
 			auto d = item.cast<py::dict>();
 			DistributedCopyFileInfo info;
@@ -3151,11 +3380,86 @@ struct PyPhysicalPlanWrapperRunner {
 
 		// Get ClientContext from connection
 		auto &context = *conn_wrapper.con.GetConnection().context;
-		(void)runtime_context_obj;
 
 		// Validate that we have a physical plan with a root
 		if (!physical_plan || !physical_plan->HasRoot()) {
 			throw py::value_error("Physical plan is missing or has no root operator");
+		}
+		string distributed_write_task_attempt_id;
+		if (!runtime_context_obj.is_none() && !py::isinstance<py::dict>(runtime_context_obj)) {
+			throw py::value_error("runtime_context must be a dict");
+		}
+		if (!runtime_context_obj.is_none()) {
+			auto runtime_context = runtime_context_obj.cast<py::dict>();
+			if (runtime_context.contains("task_id") && !runtime_context["task_id"].is_none()) {
+				if (!py::isinstance<py::str>(runtime_context["task_id"])) {
+					throw py::value_error("runtime_context task_id must be a string");
+				}
+				distributed_write_task_attempt_id = runtime_context["task_id"].cast<string>();
+				if (distributed_write_task_attempt_id.empty()) {
+					throw py::value_error("runtime_context task_id must not be empty");
+				}
+			}
+		}
+		duckdb::DistributedWriteTaskContext distributed_write_task_context;
+		distributed_write_task_context.query_id = plan_id;
+		distributed_write_task_context.task_attempt_id = distributed_write_task_attempt_id;
+		duckdb::ValidateDistributedWriteTaskContextAssignment(*physical_plan, distributed_write_task_context);
+		const bool worker_task_execution = !distributed_write_task_attempt_id.empty() || scan_task_map != nullptr ||
+		                                   exchange_source_task_map != nullptr ||
+		                                   exchange_sink_instance_task != nullptr ||
+		                                   fte_scan_source_queue_map != nullptr ||
+		                                   fte_exchange_source_queue_map != nullptr || copy_output_info != nullptr;
+		if (scan_task_map && fte_scan_source_queue_map) {
+			for (const auto &entry : *scan_task_map) {
+				if (fte_scan_source_queue_map->find(entry.first) != fte_scan_source_queue_map->end()) {
+					throw py::value_error("scan node_id=" + std::to_string(entry.first) +
+					                      " has both a static task descriptor and an FTE split queue");
+				}
+			}
+		}
+		if (exchange_source_task_map && fte_exchange_source_queue_map) {
+			for (const auto &entry : *exchange_source_task_map) {
+				if (fte_exchange_source_queue_map->find(entry.first) != fte_exchange_source_queue_map->end()) {
+					throw py::value_error("exchange source node_id=" + std::to_string(entry.first) +
+					                      " has both a static task descriptor and an FTE split queue");
+				}
+			}
+		}
+		set<idx_t> exchange_source_assignment_node_ids;
+		if (exchange_source_task_map) {
+			for (const auto &entry : *exchange_source_task_map) {
+				exchange_source_assignment_node_ids.insert(entry.first);
+			}
+		}
+		if (fte_exchange_source_queue_map) {
+			for (const auto &entry : *fte_exchange_source_queue_map) {
+				exchange_source_assignment_node_ids.insert(entry.first);
+			}
+		}
+		set<idx_t> scan_assignment_node_ids;
+		if (scan_task_map) {
+			for (const auto &entry : *scan_task_map) {
+				scan_assignment_node_ids.insert(entry.first);
+			}
+		}
+		if (fte_scan_source_queue_map) {
+			for (const auto &entry : *fte_scan_source_queue_map) {
+				scan_assignment_node_ids.insert(entry.first);
+			}
+		}
+		if (worker_task_execution || duckdb::distributed::HasDistributedScanTaskTargets(*physical_plan)) {
+			string error;
+			if (!duckdb::distributed::ValidateScanTaskAssignments(*physical_plan, scan_assignment_node_ids, &error)) {
+				throw py::value_error("Scan task assignment validation failed: " + error);
+			}
+		}
+		{
+			string error;
+			if (!duckdb::distributed::ValidateExchangeSourceAssignments(*physical_plan,
+			                                                            exchange_source_assignment_node_ids, &error)) {
+				throw py::value_error("Exchange source assignment validation failed: " + error);
+			}
 		}
 		AssignDataSourceQueryOwner(physical_plan->Root(), resource_query_id);
 
@@ -3170,16 +3474,21 @@ struct PyPhysicalPlanWrapperRunner {
 			string error;
 			bool applied;
 			{
-				// ExtensionFileListProvider scans materialize the dynamic file list
-				// here and can wait until no_more_splits. The control thread that
-				// seals the queue must be able to acquire the GIL while that wait is
-				// in progress.
+				// Extension callbacks materialize opaque task envelopes here and may
+				// wait until no_more_splits. The control thread that seals the queue
+				// must be able to acquire the GIL while that wait is in progress.
 				py::gil_scoped_release release;
 				applied = duckdb::distributed::ApplyFteScanSourceQueuesToPlan(*physical_plan,
 				                                                              *fte_scan_source_queue_map, &error);
 			}
 			if (!applied) {
 				throw py::value_error("Failed to apply FTE scan source queues to plan: " + error);
+			}
+		}
+		if (worker_task_execution || duckdb::distributed::HasDistributedScanTaskTargets(*physical_plan)) {
+			string error;
+			if (!duckdb::distributed::ValidateDistributedScanTasksApplied(*physical_plan, &error)) {
+				throw py::value_error("Distributed scan task validation failed: " + error);
 			}
 		}
 
@@ -3210,6 +3519,8 @@ struct PyPhysicalPlanWrapperRunner {
 		ApplyDynamicFilterDomainsToPlan(*physical_plan, dynamic_filter_domains_obj);
 
 		ApplyTaskLocalCopyOutput(*physical_plan, copy_output_info, &context);
+
+		duckdb::ApplyDistributedWriteTaskContext(*physical_plan, distributed_write_task_context);
 
 		auto &root_op = physical_plan->Root();
 		auto task_flight_manager = FindFlightExchangeSinkManager(root_op);
@@ -3589,6 +3900,12 @@ struct PyPhysicalPlanWrapperRunner {
 				}
 				return build_executed_result(std::move(task_stats));
 			}
+			if (root_op.type == PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE &&
+			    (collection.Types().size() != 1 || collection.Types()[0].id() != LogicalTypeId::BLOB ||
+			     collection.Count() != 1)) {
+				throw py::value_error(
+				    "Execution failed: distributed extension write must produce exactly one BLOB task envelope");
+			}
 
 			auto table = CollectionToArrowTable(collection, context);
 			const auto payload_bytes = static_cast<idx_t>(GetPyPayloadSizeBytes(table));
@@ -3710,7 +4027,7 @@ struct PyPhysicalPlanWrapperRunner {
 	py::object execute_native(py::object conn_obj, const PyPhysicalPlanWrapper &plan) {
 		try {
 			auto &mutable_plan = const_cast<PyPhysicalPlanWrapper &>(plan);
-			py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+			py::object exec_conn = plan.resolve_execution_connection(conn_obj);
 			mutable_plan.ensure_connection_snapshot(exec_conn);
 			mutable_plan.apply_udf_actor_handles();
 
@@ -3751,5 +4068,20 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 
 	auto &conn_wrapper = ExtractPyConnectionWrapper(exec_conn);
 	auto &context = *conn_wrapper.con.GetConnection().context;
-	return BuildNativeProgressTopology(context, topology_plan.plan_->physical_plan());
+	py::dict topology;
+	try {
+		context.RunFunctionInTransaction([&]() {
+			topology = BuildNativeProgressTopology(context, topology_plan.plan_->physical_plan());
+			// Some extension scan states finish asynchronous metadata work from
+			// their destructors. Release the topology clone before committing so
+			// those destructors retain a valid catalog transaction.
+			topology_plan.plan_.reset();
+		});
+	} catch (...) {
+		if (topology_plan.plan_) {
+			context.RunFunctionInTransaction([&]() { topology_plan.plan_.reset(); }, false);
+		}
+		throw;
+	}
+	return topology;
 }

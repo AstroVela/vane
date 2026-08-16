@@ -6,7 +6,6 @@
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/types/blob.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -15,7 +14,7 @@
 
 namespace duckdb {
 
-static const string DATASOURCE_PREFIX = "datasource://";
+static const string DATASOURCE_TASK_CODEC = "vane.datasource-task.python-pickle";
 
 // Global produce_stream callback — set once from Python module init,
 // used to restore the callback on workers after deserialization.
@@ -33,31 +32,51 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 	return callback;
 }
 
-vector<string> DataSourceScanBindData::GetFileList() const {
-	vector<string> files;
-	files.reserve(pickled_tasks.size());
-	for (auto &task : pickled_tasks) {
-		// Encode pickled task bytes as base64 with a prefix
-		auto encoded = Blob::ToBase64(string_t(task.data(), task.size()));
-		files.push_back(DATASOURCE_PREFIX + encoded);
+static vector<DistributedScanTask> DataSourcePlanDistributedScan(const TableFunctionDistributedScanInput &input) {
+	auto &bind_data = input.bind_data.Cast<DataSourceScanBindData>();
+	vector<DistributedScanTask> tasks;
+	tasks.reserve(bind_data.pickled_tasks.size());
+	for (idx_t task_index = 0; task_index < bind_data.pickled_tasks.size(); task_index++) {
+		DistributedScanTask task;
+		task.task_id = std::to_string(task_index);
+		task.payload = bind_data.pickled_tasks[task_index];
+		tasks.push_back(std::move(task));
 	}
-	return files;
+	return tasks;
 }
 
-void DataSourceScanBindData::SetFileList(const vector<string> &files) {
-	pickled_tasks.clear();
-	pickled_tasks.reserve(files.size());
-	for (auto &f : files) {
-		// Strip the prefix and decode base64 back to pickled task bytes
-		if (f.substr(0, DATASOURCE_PREFIX.size()) == DATASOURCE_PREFIX) {
-			auto base64_str = f.substr(DATASOURCE_PREFIX.size());
-			auto decoded = Blob::FromBase64(string_t(base64_str.data(), base64_str.size()));
-			pickled_tasks.push_back(std::move(decoded));
-		} else {
-			throw InvalidInputException("Expected datasource scan task descriptor to start with '%s'",
-			                            DATASOURCE_PREFIX);
+static unique_ptr<FunctionData> DataSourceCreateDistributedWorkerBind(const TableFunctionDistributedScanInput &input) {
+	auto &source_bind = input.bind_data.Cast<DataSourceScanBindData>();
+	auto worker_bind = make_uniq<DataSourceScanBindData>();
+	worker_bind->pickled_source = source_bind.pickled_source;
+	worker_bind->query_id = source_bind.query_id;
+	worker_bind->produce_stream = nullptr;
+	return std::move(worker_bind);
+}
+
+static bool IsCanonicalDataSourceTaskId(const string &task_id) {
+	if (task_id.empty() || (task_id.size() > 1 && task_id[0] == '0')) {
+		return false;
+	}
+	for (auto character : task_id) {
+		if (character < '0' || character > '9') {
+			return false;
 		}
 	}
+	return true;
+}
+
+static void DataSourceApplyDistributedTasks(FunctionData &worker_bind_data, const vector<DistributedScanTask> &tasks) {
+	auto &bind_data = worker_bind_data.Cast<DataSourceScanBindData>();
+	vector<string> validated_tasks;
+	validated_tasks.reserve(tasks.size());
+	for (const auto &task : tasks) {
+		if (!IsCanonicalDataSourceTaskId(task.task_id) || task.payload.empty()) {
+			throw InvalidInputException("invalid distributed DataSource task '%s'", task.task_id);
+		}
+		validated_tasks.push_back(task.payload);
+	}
+	bind_data.pickled_tasks = std::move(validated_tasks);
 }
 
 // ── Bind ───────────────────────────────────────────────────────────
@@ -281,6 +300,14 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	    DataSourceScanGetData, DataSourceScanBind, DataSourceScanInitGlobal, DataSourceScanInitLocal);
 	func.serialize = DataSourceScanSerialize;
 	func.deserialize = DataSourceScanDeserialize;
+	TableFunctionDistributedScanCallbacks distributed_scan;
+	distributed_scan.protocol_version = 1;
+	distributed_scan.task_codec = {DATASOURCE_TASK_CODEC, 1};
+	distributed_scan.plan = DataSourcePlanDistributedScan;
+	distributed_scan.create_worker_bind = DataSourceCreateDistributedWorkerBind;
+	distributed_scan.apply_tasks = DataSourceApplyDistributedTasks;
+	func.SetDistributedScanCallbacks(std::move(distributed_scan));
+	func.BindDistributedScanCapability("vane_core");
 	func.projection_pushdown = false;
 	return func;
 }

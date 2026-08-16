@@ -382,7 +382,7 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
     assert captured, "expected local write relation to be captured"
 
     query_id = str(uuid.uuid4())
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         query_id,
     ).to_physical_plan(con)
@@ -3911,6 +3911,105 @@ def test_native_cxx_run_copy_plan_preserves_worker_plan_exception_cause(tmp_path
     assert not dst.exists()
 
 
+@pytest.mark.parametrize(
+    ("fail_finalize", "expected_error_name", "expected_write_state"),
+    (
+        (False, "CopyResultUnavailableError", "committed"),
+        (True, "CopyOutcomeUnknownError", None),
+    ),
+    ids=("committed", "outcome-unknown"),
+)
+def test_native_cxx_extension_write_preserves_terminal_state_when_result_marshalling_fails(
+    fail_finalize,
+    expected_error_name,
+    expected_write_state,
+):
+    from vane.runners import copy_outcome
+
+    class NoOutputHandle:
+        def __init__(self, task, partition_id):
+            query_id = task.context()["query_id"]
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0)
+            self.worker_id = "extension-write-worker"
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
+
+        def release_result_payload(self):
+            return None
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+            self.drop_calls = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "extension-write-worker",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = [NoOutputHandle(task, len(self.handles) + index) for index, task in enumerate(tasks)]
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(handle.task_id) for handle in self.handles],
+            }
+
+        def drop_query(self, query_id):
+            self.drop_calls.append(query_id)
+
+        def shutdown(self):
+            return None
+
+    con = vane.connect()
+    query_id = f"extension-result-marshalling-{uuid.uuid4()}"
+    vane.ray_cxx._register_coordinator_only_extension_write_for_test(con)
+    plan = vane.ray_cxx._make_coordinator_only_extension_write_plan_for_test(
+        query_id,
+        fail_finalize=fail_finalize,
+        conn=con,
+    )
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._fail_next_extension_result_marshalling_for_test()
+    expected_error = getattr(copy_outcome, expected_error_name)
+
+    try:
+        with pytest.raises(expected_error) as error:
+            runner.run_copy_plan(plan, con)
+
+        assert error.value.operation_id == query_id
+        assert error.value.safe_to_retry is False
+        assert "planned extension result marshalling failure" in str(error.value)
+        if expected_write_state is not None:
+            assert error.value.write_state == expected_write_state
+        else:
+            assert "planned coordinator-only extension finalization failure" in str(error.value)
+        assert backend.drop_calls == [query_id]
+    finally:
+        con.close()
+
+
 def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, monkeypatch):
     con, _dst, relation = _capture_native_copy_relation(tmp_path, monkeypatch, local_staging=True)
 
@@ -3921,7 +4020,7 @@ def test_native_cxx_committed_copy_returns_backend_cleanup_warning(tmp_path, mon
         max_running_tasks=2,
     )
     query_id = f"copy-cleanup-failure-{uuid.uuid4()}"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         relation,
         query_id,
     ).to_physical_plan(con)
@@ -3960,7 +4059,7 @@ def test_native_cxx_run_copy_plan_successive_local_staging_runs_use_distinct_pat
     try:
         runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
         for _ in range(2):
-            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
                 relation,
                 str(uuid.uuid4()),
             ).to_physical_plan(con)
@@ -4087,10 +4186,12 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     monkeypatch.setattr(local_runner, "require_ray_cxx_attr", fake_require)
 
     executor = local_runner._InProcessFragmentExecutor()
-    request = {"fragment_plan": FakePlan(), "context": {}}
+    requests = [
+        {"fragment_plan": FakePlan(), "context": {}, "task_id": _task_id(partition_id)} for partition_id in range(2)
+    ]
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(executor, request) for _ in range(2)]
+            futures = [pool.submit(executor, request) for request in requests]
             results = [future.result(timeout=5.0) for future in futures]
 
         assert {result["conn_id"] for result in results} == {0, 1}
@@ -4156,7 +4257,10 @@ def test_in_process_fragment_executor_close_does_not_release_live_resources(monk
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert execute_started.wait(timeout=1.0)
         try:
             with pytest.raises(RuntimeError, match="did not drain.*active_executions=1"):
@@ -4222,7 +4326,10 @@ def test_in_process_fragment_executor_unregisters_cursor_before_close(monkeypatc
     monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        execution = pool.submit(executor, {"fragment_plan": object(), "context": {}})
+        execution = pool.submit(
+            executor,
+            {"fragment_plan": object(), "context": {}, "task_id": _task_id(0)},
+        )
         assert close_started.wait(timeout=1.0)
         try:
             executor.request_shutdown()
@@ -4407,7 +4514,7 @@ def test_in_process_fragment_executor_registration_failure_releases_execution_ow
     monkeypatch.setattr(executor, "_register_cursor", fail_register)
 
     with pytest.raises(RuntimeError, match="cursor registration failed"):
-        executor({"fragment_plan": object(), "context": {}})
+        executor({"fragment_plan": object(), "context": {}, "task_id": _task_id(0)})
 
     assert executor._in_flight == 0
     assert conn.cursor_instance.closed is True

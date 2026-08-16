@@ -4,8 +4,6 @@
 #pragma once
 
 #include <memory>
-#include <vector>
-
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
 #include "duckdb/execution/distributed/plan/scan_task.hpp"
@@ -20,7 +18,7 @@ namespace distributed {
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan);
 
 struct TableScanTaskSet {
-	std::vector<ScanTaskDescriptor> tasks;
+	vector<ScanTaskDescriptor> tasks;
 	bool known_empty;
 };
 

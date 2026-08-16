@@ -32,9 +32,11 @@
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+#include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
 #include "duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
+#include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
@@ -127,11 +129,31 @@ unique_ptr<FunctionData> TestInOutDeserialize(Deserializer &deserializer, TableF
 	return std::move(data);
 }
 
+unique_ptr<FunctionData> TestContextSettingDeserialize(Deserializer &deserializer, TableFunction &) {
+	auto marker = deserializer.ReadProperty<idx_t>(100, "marker");
+	auto &context = deserializer.Get<ClientContext &>();
+	Value threads;
+	if (!context.TryGetCurrentSetting("threads", threads) || threads.GetValue<idx_t>() != 3) {
+		marker = 0;
+	}
+	auto data = make_uniq<TestInOutBindData>();
+	data->marker = marker;
+	return std::move(data);
+}
+
 TableFunction MakeTestInOutFunction() {
 	TableFunction func("test_inout_serialization", {LogicalType::TABLE}, nullptr, TestInOutBind);
 	func.in_out_function = TestInOutFunction;
 	func.serialize = TestInOutSerialize;
 	func.deserialize = TestInOutDeserialize;
+	return func;
+}
+
+TableFunction MakeContextSettingTestInOutFunction() {
+	TableFunction func("test_inout_context_setting", {LogicalType::TABLE}, nullptr, TestInOutBind);
+	func.in_out_function = TestInOutFunction;
+	func.serialize = TestInOutSerialize;
+	func.deserialize = TestContextSettingDeserialize;
 	return func;
 }
 
@@ -1644,6 +1666,44 @@ TEST_CASE("PhysicalTableInOutFunction serialization roundtrip", "[serialization]
 	conn.Rollback();
 }
 
+TEST_CASE("Distributed physical plan clone exposes client settings to native bind deserialization",
+          "[serialization][physical_plan][distributed]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto set_result = conn.Query("SET threads=3");
+	REQUIRE(!set_result->HasError());
+
+	conn.BeginTransaction();
+	auto &context = *conn.context;
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	auto func = MakeContextSettingTestInOutFunction();
+	CreateTableFunctionInfo info(func);
+	catalog.CreateTableFunction(context, info);
+	conn.Commit();
+
+	conn.BeginTransaction();
+	auto &entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA,
+	                                                           "test_inout_context_setting");
+	auto table_func = entry.functions.GetFunctionByArguments(context, {LogicalType::TABLE});
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<ColumnIndex> column_ids;
+	column_ids.emplace_back(0);
+	auto bind_data = make_uniq<TestInOutBindData>();
+	bind_data->marker = 123;
+	vector<column_t> projected_input;
+	auto &inout =
+	    plan->Make<PhysicalTableInOutFunction>(types, table_func, std::move(bind_data), column_ids, 1, projected_input);
+	plan->SetRoot(inout);
+
+	auto cloned = distributed::ClonePhysicalPlanOrThrow(plan, "client_settings_test", conn.context.get());
+	auto &cloned_inout = cloned->Root().Cast<PhysicalTableInOutFunction>();
+	auto cloned_bind_data = cloned_inout.GetBindData();
+	REQUIRE(cloned_bind_data);
+	REQUIRE(cloned_bind_data->Cast<TestInOutBindData>().marker == 123);
+	conn.Rollback();
+}
+
 TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance metadata",
           "[serialization][physical_plan][exchange]") {
 	Allocator allocator;
@@ -1922,6 +1982,10 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 
 	auto &source = plan.Make<PhysicalRemoteExchangeSource>(types, 456, "exchange", partition_indices, source_handles,
 	                                                       exchange_mgr, source_nodes);
+	plan.SetRoot(source);
+	string assignment_error;
+	REQUIRE(distributed::ValidateExchangeSourceAssignments(plan, set<idx_t> {}, &assignment_error));
+	REQUIRE(assignment_error.empty());
 
 	MemoryStream stream(allocator);
 	SerializationOptions options;
@@ -2089,6 +2153,8 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves an explicit empt
 
 TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle attempt ids",
           "[serialization][physical_plan][exchange]") {
+	REQUIRE_THROWS_WITH(distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(""),
+	                    Catch::Matchers::Contains("empty exchange source task descriptor"));
 	distributed::ExchangeSourceTaskDescriptor descriptor;
 	descriptor.partition_indices = {0, 1};
 	descriptor.source_partition_count = 2;
@@ -2183,8 +2249,19 @@ TEST_CASE("ApplyExchangeSourceTasksToPlan patches runtime-bound exchange source"
 
 	std::unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> tasks;
 	tasks.emplace(42, descriptor);
+	set<idx_t> assigned_node_ids {42};
+	REQUIRE(distributed::ValidateExchangeSourceAssignments(plan, assigned_node_ids));
+	REQUIRE_FALSE(distributed::ValidateExchangeSourceAssignments(plan, set<idx_t> {}));
+	REQUIRE_FALSE(distributed::ValidateExchangeSourceAssignments(plan, set<idx_t> {42, 999}));
 
 	string error;
+	auto tasks_with_unknown_node = tasks;
+	tasks_with_unknown_node.emplace(999, descriptor);
+	REQUIRE_FALSE(distributed::ApplyExchangeSourceTasksToPlan(plan, tasks_with_unknown_node, &error));
+	REQUIRE(StringUtil::Contains(error, "node_id=999 is not present in the worker plan"));
+	REQUIRE(source.PartitionIndices().empty());
+	REQUIRE(source.SourceHandles().empty());
+	error.clear();
 	REQUIRE(distributed::ApplyExchangeSourceTasksToPlan(plan, tasks, &error));
 	REQUIRE(error.empty());
 	REQUIRE(source.PartitionIndices() == descriptor.partition_indices);
@@ -2201,6 +2278,58 @@ TEST_CASE("ApplyExchangeSourceTasksToPlan patches runtime-bound exchange source"
 	REQUIRE(source.SourceHandles()[1].files.size() == 1);
 	REQUIRE(source.SourceHandles()[1].files[0].path == "exchange__sink_1__attempt_0");
 	REQUIRE(source.SourceHandles()[1].files[0].file_size == 17);
+}
+
+TEST_CASE("Static and FTE exchange assignments apply as validated disjoint subsets",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> types = {LogicalType::INTEGER};
+	vector<string> source_nodes = {"node-1"};
+
+	distributed::FlightExchangeConfig flight_config;
+	flight_config.node_id = "node-1";
+	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
+	distributed::ExchangeSourceHandle embedded_handle;
+	embedded_handle.partition_id = 0;
+	embedded_handle.node_id = "node-1";
+	auto &embedded_source =
+	    plan.Make<PhysicalRemoteExchangeSource>(types, 1, "embedded-exchange", vector<idx_t> {0},
+	                                            vector<distributed::ExchangeSourceHandle> {embedded_handle},
+	                                            exchange_mgr, source_nodes)
+	        .Cast<PhysicalRemoteExchangeSource>();
+	auto &static_source = plan.Make<PhysicalRemoteExchangeSource>(types, 1, "static-exchange", vector<idx_t>(),
+	                                                              vector<distributed::ExchangeSourceHandle>(),
+	                                                              exchange_mgr, source_nodes, optional_idx(42))
+	                          .Cast<PhysicalRemoteExchangeSource>();
+	auto &fte_source = plan.Make<PhysicalRemoteExchangeSource>(types, 1, "fte-exchange", vector<idx_t>(),
+	                                                           vector<distributed::ExchangeSourceHandle>(),
+	                                                           exchange_mgr, source_nodes, optional_idx(43))
+	                       .Cast<PhysicalRemoteExchangeSource>();
+	fte_source.children.push_back(embedded_source);
+	static_source.children.push_back(fte_source);
+	plan.SetRoot(static_source);
+
+	distributed::ExchangeSourceTaskDescriptor descriptor;
+	descriptor.partition_indices = {0};
+	distributed::ExchangeSourceHandle handle;
+	handle.partition_id = 0;
+	handle.node_id = "node-1";
+	descriptor.source_handles.push_back(handle);
+	unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> static_tasks {{42, descriptor}};
+	auto queue = std::make_shared<distributed::FteSplitQueue>();
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> fte_queues {{43, queue}};
+
+	string error;
+	REQUIRE(distributed::ValidateExchangeSourceAssignments(plan, set<idx_t> {42, 43}, &error));
+	REQUIRE(error.empty());
+	REQUIRE(distributed::ApplyExchangeSourceTasksToPlan(plan, static_tasks, &error));
+	REQUIRE(error.empty());
+	REQUIRE(distributed::ApplyFteExchangeSourceQueuesToPlan(plan, fte_queues, &error));
+	REQUIRE(error.empty());
+	REQUIRE(static_source.SourceHandles().size() == 1);
+	REQUIRE(fte_source.SourceHandles().empty());
+	REQUIRE(embedded_source.SourceHandles().size() == 1);
 }
 
 TEST_CASE("Empty PhysicalPlan", "[serialization][physical_plan]") {

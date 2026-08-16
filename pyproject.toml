@@ -189,6 +189,7 @@ include = [
     "/CONTRIBUTING.md",
     "/CODE_OF_CONDUCT.md",
     "/DEVELOPMENT.md",
+    "/DISTRIBUTED_EXTENSIONS.md",
     "/GOVERNANCE.md",
     "/MAINTAINERS.md",
     "/RELEASE.md",

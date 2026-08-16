@@ -52,6 +52,31 @@ def test_logical_plan_pickle_uses_a_versioned_envelope():
     assert restored.to_physical_plan(connection) is not None
 
 
+def test_distributed_write_plan_rejects_source_explicit_transaction():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(Exception, match="cannot participate in an explicit transaction"):
+            ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+                connection.sql("SELECT 42 AS value"),
+                "explicit-transaction-write",
+            )
+    finally:
+        connection.execute("ROLLBACK")
+
+
+def test_distributed_write_plan_rejects_read_relation():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="requires a write relation"):
+        ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+            connection.sql("SELECT 42 AS value"),
+            "read-passed-to-write-path",
+        )
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

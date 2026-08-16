@@ -66,6 +66,12 @@ The build uses two parallel compile jobs by default to stay within standard CI
 runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
 machine has more capacity.
 
+Statically linked DuckDB extensions participate in Ray execution through the
+explicit scan callback and write provider contracts described in
+[DISTRIBUTED_EXTENSIONS.md](DISTRIBUTED_EXTENSIONS.md). Add engine-level
+protocol tests and extension-specific normal and fault-tolerant tests when
+implementing either contract.
+
 ## Python tests
 
 The required release gate covers the supported base installation and does not

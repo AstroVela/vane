@@ -37,6 +37,7 @@
 #include "duckdb/main/database_file_path_manager.hpp"
 #include "duckdb/main/result_set_manager.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/main/distributed_extension_manager.hpp"
 
 #ifndef DUCKDB_NO_THREADS
 #include "duckdb/common/thread.hpp"
@@ -340,6 +341,11 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	config.buffer_pool->SetObjectCache(object_cache.get());
 	connection_manager = make_uniq<ConnectionManager>();
 	extension_manager = make_uniq<ExtensionManager>(*this);
+	distributed_extension_manager = make_uniq<DistributedExtensionManager>(*this);
+	DistributedExtensionManifest core_manifest;
+	core_manifest.extension_name = "vane_core";
+	core_manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "datasource_scan", 1});
+	distributed_extension_manager->RegisterExtension(core_manifest);
 
 	// initialize the secret manager
 	config.secret_manager->Initialize(*this);
@@ -473,6 +479,10 @@ ConnectionManager &DatabaseInstance::GetConnectionManager() {
 
 ExtensionManager &DatabaseInstance::GetExtensionManager() {
 	return *extension_manager;
+}
+
+DistributedExtensionManager &DatabaseInstance::GetDistributedExtensionManager() {
+	return *distributed_extension_manager;
 }
 
 FileSystem &DuckDB::GetFileSystem() {

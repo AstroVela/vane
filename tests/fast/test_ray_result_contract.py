@@ -1518,6 +1518,115 @@ def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(m
     assert teardown_calls == 2
 
 
+def test_query_driver_pending_copy_cleanup_survives_terminal_replay_eviction(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    pending_plan_id = "copy-cleanup-pending-retained"
+    completed_plan_id = "copy-cleanup-completed-later"
+    logical_plans = {
+        plan_id: _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+        for plan_id in (pending_plan_id, completed_plan_id)
+    }
+    plan_calls = {pending_plan_id: 0, completed_plan_id: 0}
+    teardown_calls = {pending_plan_id: 0, completed_plan_id: 0}
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(plan, _conn, on_execution_started):
+            plan_id = str(plan.idx())
+            plan_calls[plan_id] += 1
+            on_execution_started()
+            return _committed_copy_result(rows_copied=plan_calls[plan_id])
+
+    async def _register(
+        _self,
+        plan,
+        *,
+        query_connection,
+        expected_plan_id=None,
+    ):
+        del query_connection
+        plan_id = str(plan.idx())
+        assert expected_plan_id == plan_id
+        return SimpleNamespace(query_id=plan_id, units=()), object()
+
+    def _teardown(_self, plan_id):
+        teardown_calls[plan_id] += 1
+        _, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, plan_id)
+        assert query_id == plan_id
+        assert drop_fragments is True
+        if plan_id == pending_plan_id and teardown_calls[plan_id] == 1:
+            raise RuntimeError("planned retained cleanup failure")
+        _release_test_plan_session_state(cls, runner, plan_id)
+
+    runner._copy_operation_terminal = driver.BoundedReplayMap(capacity=1)
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _register)
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    pending = asyncio.run(_run_actor_copy_plan(runner, logical_plans[pending_plan_id]))
+    completed = asyncio.run(_run_actor_copy_plan(runner, logical_plans[completed_plan_id]))
+    assert runner._copy_cleanup_pending_terminals[pending_plan_id].outcome == pending
+    assert runner._copy_operation_terminal.get(pending_plan_id) is None
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            pending_plan_id,
+        )
+    )
+    cleaned = asyncio.run(
+        cls.retry_copy_cleanup(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            pending_plan_id,
+        )
+    )
+    replayed = asyncio.run(_run_actor_copy_plan(runner, logical_plans[pending_plan_id]))
+
+    assert pending.cleanup_state == "pending"
+    assert completed.cleanup_state == "complete"
+    assert recovered.outcome == pending
+    assert cleaned.cleanup_state == "complete"
+    assert pending_plan_id not in runner._copy_cleanup_pending_terminals
+    assert replayed == cleaned
+    assert plan_calls == {pending_plan_id: 1, completed_plan_id: 1}
+    assert teardown_calls == {pending_plan_id: 2, completed_plan_id: 1}
+
+
+def test_query_driver_owner_discard_releases_pending_copy_cleanup_terminal():
+    cls, runner = _make_local_query_driver_actor()
+    operation_id = "copy-cleanup-pending-owner-detach"
+    cls._ensure_copy_operation_state(runner)
+    runner._copy_operation_identities[operation_id] = (
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+    )
+    cls._retain_copy_operation_terminal(
+        runner,
+        operation_id,
+        driver._CopyOperationTerminal(
+            owner_id=_TEST_RUNTIME_OWNER_ID,
+            session_id=_TEST_SESSION_ID,
+            outcome=driver.CopyPlanOutcome(
+                result={},
+                final_progress_snapshot=None,
+                operation_id=operation_id,
+                cleanup_state="pending",
+            ),
+        ),
+    )
+
+    cls._discard_copy_operation_state_for_owner(runner, _TEST_RUNTIME_OWNER_ID)
+
+    assert operation_id not in runner._copy_operation_identities
+    assert operation_id not in runner._copy_cleanup_pending_terminals
+    assert cls._copy_operation_terminal_record(runner, operation_id) is None
+
+
 def test_query_driver_copy_failure_is_replayed_without_reexecution(monkeypatch):
     cls, runner = _make_local_query_driver_actor()
     plan_id = "copy-failed-before-commit"
@@ -1627,6 +1736,60 @@ def test_query_driver_unknown_native_copy_outcome_is_structured_and_never_reexec
     assert recovered.outcome is None
     assert isinstance(recovered.error, driver.CopyOutcomeUnknownError)
     assert recovered.error.run_id == "run-unknown"
+    assert plan_calls == 1
+
+
+def test_query_driver_committed_result_failure_is_structured_and_never_reexecuted(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-result-unavailable"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    plan_calls = 0
+
+    class _PlanRunner:
+        def run_copy_plan(self, _plan, _conn, on_execution_started):
+            nonlocal plan_calls
+            plan_calls += 1
+            on_execution_started()
+            raise driver.CopyResultUnavailableError(
+                plan_id,
+                "planned result marshalling failure",
+            )
+
+    def _teardown(_self, actual_plan_id):
+        assert actual_plan_id == plan_id
+        _, _query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert drop_fragments is True
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    for operation in (
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+        lambda: _run_actor_copy_plan(runner, logical_plan),
+    ):
+        with pytest.raises(driver.CopyResultUnavailableError) as error:
+            asyncio.run(operation())
+        assert error.value.operation_id == plan_id
+        assert error.value.write_state == "committed"
+        assert error.value.safe_to_retry is False
+        assert "planned result marshalling failure" in str(error.value)
+
+    recovered = asyncio.run(
+        cls.recover_copy_plan(
+            runner,
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            plan_id,
+        )
+    )
+
+    assert recovered.outcome is None
+    assert isinstance(recovered.error, driver.CopyResultUnavailableError)
+    assert recovered.error.write_state == "committed"
     assert plan_calls == 1
 
 
@@ -1798,10 +1961,29 @@ def test_copy_outcome_unknown_error_preserves_operation_id_across_serialization(
     assert str(restored) == str(error)
 
 
+def test_copy_result_unavailable_error_preserves_terminal_state_across_serialization():
+    error = driver.CopyResultUnavailableError(
+        "committed-copy-operation",
+        "result marshalling failed",
+        ("teardown warning",),
+    )
+
+    restored = pickle.loads(pickle.dumps(error))
+
+    assert type(restored) is driver.CopyResultUnavailableError
+    assert restored.operation_id == error.operation_id
+    assert restored.detail == error.detail
+    assert restored.cleanup_warnings == error.cleanup_warnings
+    assert restored.write_state == "committed"
+    assert restored.safe_to_retry is False
+    assert str(restored) == str(error)
+
+
 def test_copy_outcome_unknown_error_is_exported_from_ray_runner_package():
-    from vane.runners.ray import CopyOutcomeUnknownError
+    from vane.runners.ray import CopyOutcomeUnknownError, CopyResultUnavailableError
 
     assert CopyOutcomeUnknownError is driver.CopyOutcomeUnknownError
+    assert CopyResultUnavailableError is driver.CopyResultUnavailableError
 
 
 def test_query_driver_copy_progress_cancellation_waits_before_teardown(monkeypatch):
@@ -4219,7 +4401,7 @@ def test_teardown_fails_closed_for_orphaned_actor_pool():
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
-def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
+def test_driver_forwards_session_s3_config_without_mutating_query_cursor(copy_plan):
     cls, runner = _make_local_query_driver_actor()
     session = runner._sessions[_TEST_SESSION_ID]
     session.config = {
@@ -4241,9 +4423,9 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
         @staticmethod
         def to_physical_plan(_connection, effective_session_config):
             assert effective_session_config == session.s3_config
-            raise RuntimeError("planned stop after query cursor configuration")
+            raise RuntimeError("planned stop after session config forwarding")
 
-    with pytest.raises(RuntimeError, match="planned stop after query cursor configuration"):
+    with pytest.raises(RuntimeError, match="planned stop after session config forwarding"):
         _run_test_plan_preparation(
             cls,
             runner,
@@ -4254,14 +4436,12 @@ def test_driver_applies_session_s3_config_to_query_cursor(copy_plan):
         )
 
     query_connection = session.connection.cursors[-1]
-    assert "SET s3_access_key_id='session-key'" in query_connection.statements
-    assert "SET s3_secret_access_key='session-secret'" in query_connection.statements
-    assert "SET s3_region='us-east-2'" in query_connection.statements
+    assert query_connection.statements == []
     assert query_connection.closed is True
 
 
 @pytest.mark.parametrize("copy_plan", [False, True])
-def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkeypatch, copy_plan):
+def test_driver_explicit_s3_settings_bypass_without_mutating_query_cursor(monkeypatch, copy_plan):
     from vane.runners.ray import worker as worker_module
 
     cls, runner = _make_local_query_driver_actor()
@@ -4293,9 +4473,9 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
         @staticmethod
         def to_physical_plan(_connection, effective_session_config):
             assert effective_session_config == {}
-            raise RuntimeError("planned stop after explicit S3 baseline reset")
+            raise RuntimeError("planned stop after explicit S3 bypass")
 
-    with pytest.raises(RuntimeError, match="planned stop after explicit S3 baseline reset"):
+    with pytest.raises(RuntimeError, match="planned stop after explicit S3 bypass"):
         _run_test_plan_preparation(
             cls,
             runner,
@@ -4306,9 +4486,7 @@ def test_driver_explicit_s3_settings_bypass_and_clear_session_credentials(monkey
         )
 
     query_connection = session.connection.cursors[-1]
-    assert "SET s3_access_key_id=''" in query_connection.statements
-    assert "SET s3_secret_access_key=''" in query_connection.statements
-    assert "SET s3_session_token=''" in query_connection.statements
+    assert query_connection.statements == []
     assert query_connection.closed is True
 
 
@@ -6744,6 +6922,17 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
             topology = vane.ray_cxx.describe_native_progress(con.cursor(), task_plan)
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
+                task_inputs = task.Inputs()
+                scan_task = {
+                    str(node_id): entry["data"]
+                    for node_id, entry in task_inputs.items()
+                    if entry["kind"] == "scan_task"
+                }
+                exchange_source_task = {
+                    str(node_id): entry["data"]
+                    for node_id, entry in task_inputs.items()
+                    if entry["kind"] == "exchange_source_task"
+                }
                 native_sink_instance = task.exchange_sink_instance()
                 sink_instance = ExchangeSinkInstanceHandle(
                     ExchangeSinkHandle(
@@ -6762,6 +6951,8 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
                     runner.execute_native(
                         con.cursor(),
                         task_plan,
+                        scan_task=scan_task or None,
+                        exchange_source_task=exchange_source_task or None,
                         exchange_sink_instance=sink_instance,
                     )
                 )
@@ -7000,7 +7191,7 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7066,7 +7257,7 @@ def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path,
     con.sql(f"select * from read_parquet('{src}')").write_parquet(raw_dst)
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7118,7 +7309,7 @@ def test_run_copy_plan_existing_file_uses_final_lifecycle_namespace(tmp_path, mo
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7179,7 +7370,7 @@ def test_run_copy_plan_leaves_stale_direct_write_cleanup_to_explicit_api(tmp_pat
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7240,7 +7431,7 @@ def test_run_copy_plan_local_staging_env_preserves_rename_path(tmp_path, monkeyp
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7284,7 +7475,7 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7328,7 +7519,7 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
 
     assert captured, "expected write relation to be captured"
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7502,7 +7693,7 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -7641,7 +7832,7 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
     con.sql(f"select * from read_parquet('{src}')").write_parquet(str(dst))
     assert captured, "expected write relation to be captured"
 
-    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
@@ -9251,6 +9442,28 @@ def test_ray_runner_retries_pending_copy_cleanup_by_operation_id():
 
     assert result is expected
     assert calls == ["copy-cleanup-runner-retry"]
+
+
+def test_ray_runner_uses_write_specific_logical_plan_factory(monkeypatch):
+    from vane.runners.ray import runner as runner_module
+
+    relation = object()
+
+    class _LogicalPlan:
+        @staticmethod
+        def from_duckdb_write_relation(actual_relation, _query_id):
+            assert actual_relation is relation
+            raise RuntimeError("write transaction validation reached")
+
+    ray_runner = object.__new__(runner_module.RayRunner)
+    monkeypatch.setattr(
+        runner_module,
+        "require_ray_cxx_attr",
+        lambda name, *, hint: _LogicalPlan,
+    )
+
+    with pytest.raises(RuntimeError, match="write transaction validation reached"):
+        ray_runner.run_write(relation)
 
 
 def test_connection_close_notification_reenters_runner_registry_lock(monkeypatch):

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from vane import _native
-from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.copy_outcome import CopyOutcomeUnknownError, CopyResultUnavailableError
 from vane.runners.local import set_runner_local
 from vane.runners.ray import set_runner_ray
 from vane.runners.runner import Runner
@@ -15,6 +15,7 @@ from vane.runners.runner import Runner
 
 __all__ = [
     "CopyOutcomeUnknownError",
+    "CopyResultUnavailableError",
     "get_or_create_runner",
     "get_or_infer_runner_type",
     "set_runner_local",

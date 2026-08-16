@@ -22,6 +22,7 @@
 #include <duckdb/execution/distributed/common_types.hpp>
 #include <duckdb/execution/distributed/copy_to_file.hpp>
 #include <duckdb/execution/distributed/copy_finalize.hpp>
+#include <duckdb/execution/distributed/extension_write_task_provider.hpp>
 #include <duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp>
 #include <duckdb/execution/distributed/plan/exchange_source_task.hpp>
 #include <duckdb/execution/distributed/plan/fte_split_queue.hpp>
@@ -36,13 +37,16 @@
 #include <duckdb/execution/distributed/utils/channel.hpp>
 #include <duckdb/planner/planner.hpp>
 #include <duckdb/common/file_system.hpp>
+#include <duckdb/common/limits.hpp>
 #include <duckdb/common/local_file_system.hpp>
+#include <duckdb/common/map.hpp>
+#include <duckdb/common/set.hpp>
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
 
 #include <exception>
 #include <optional>
-#include <set>
+#include <tuple>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);
@@ -71,6 +75,11 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/main/client_data.hpp>
 #include <duckdb/main/config.hpp>
 #include <duckdb/main/database.hpp>
+#include <duckdb/main/database_manager.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/distributed_extension_manager.hpp>
+#include <duckdb/main/extension_helper.hpp>
+#include <duckdb/parser/keyword_helper.hpp>
 #include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
@@ -84,7 +93,9 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp>
 #include <duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp>
 #include <duckdb/execution/operator/persistent/physical_copy_to_file.hpp>
+#include <duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp>
 #include <duckdb/execution/operator/scan/physical_column_data_scan.hpp>
+#include <duckdb/execution/operator/scan/physical_dummy_scan.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
@@ -144,6 +155,104 @@ protected:
 	}
 };
 
+class CoordinatorOnlyWriteGlobalStateForTest final : public DistributedWriteGlobalState {};
+
+class CoordinatorOnlyWriteLocalStateForTest final : public DistributedWriteLocalState {};
+
+static unique_ptr<DistributedWriteGlobalState>
+CoordinatorOnlyWriteInitializeGlobalForTest(ClientContext &, const DistributedExtensionWriteInfo &,
+                                            const DistributedWriteTaskContext &) {
+	return make_uniq<CoordinatorOnlyWriteGlobalStateForTest>();
+}
+
+static unique_ptr<DistributedWriteLocalState>
+CoordinatorOnlyWriteInitializeLocalForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                           const DistributedWriteTaskContext &, DistributedWriteGlobalState &) {
+	return make_uniq<CoordinatorOnlyWriteLocalStateForTest>();
+}
+
+static void CoordinatorOnlyWriteSinkForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                            const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                                            DistributedWriteLocalState &, DataChunk &) {
+}
+
+static void CoordinatorOnlyWriteCombineForTest(ExecutionContext &, const DistributedExtensionWriteInfo &,
+                                               const DistributedWriteTaskContext &, DistributedWriteGlobalState &,
+                                               DistributedWriteLocalState &) {
+}
+
+static vector<DistributedWriteFragment> CoordinatorOnlyWriteFinalizeForTest(ClientContext &,
+                                                                            const DistributedExtensionWriteInfo &,
+                                                                            const DistributedWriteTaskContext &,
+                                                                            DistributedWriteGlobalState &) {
+	return {};
+}
+
+static void RegisterCoordinatorOnlyExtensionWriteForTest(ClientContext &context) {
+	DistributedExtensionManifest manifest;
+	manifest.extension_name = "vane_test";
+	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, "coordinator_only_write", 1});
+
+	DistributedWriteOperatorExtension write_operator;
+	write_operator.name = "coordinator_only_write";
+	write_operator.protocol_version = 1;
+	write_operator.mode = DistributedWriteMode::CALLBACK;
+	write_operator.fragment_codec = {"vane_test.coordinator_only_write", 1};
+	write_operator.callbacks.initialize_global = CoordinatorOnlyWriteInitializeGlobalForTest;
+	write_operator.callbacks.initialize_local = CoordinatorOnlyWriteInitializeLocalForTest;
+	write_operator.callbacks.sink = CoordinatorOnlyWriteSinkForTest;
+	write_operator.callbacks.combine = CoordinatorOnlyWriteCombineForTest;
+	write_operator.callbacks.finalize = CoordinatorOnlyWriteFinalizeForTest;
+
+	DistributedExtensionManager::Get(context).RegisterExtension(
+	    manifest, {make_shared_ptr<const DistributedWriteOperatorExtension>(std::move(write_operator))});
+}
+
+class PhysicalCoordinatorOnlyExtensionWriteForTest final : public PhysicalOperator,
+                                                           public distributed::ExtensionWriteTaskProvider {
+public:
+	explicit PhysicalCoordinatorOnlyExtensionWriteForTest(PhysicalPlan &physical_plan, bool fail_finalize_p = false)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1),
+	      fail_finalize(fail_finalize_p) {
+		plan.extension_name = "vane_test";
+		plan.operator_name = "coordinator_only_write";
+	}
+
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
+		return this;
+	}
+
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override {
+		return plan;
+	}
+
+	void ValidateDistributedWrite(ClientContext &) const override {
+	}
+
+	idx_t FinalizeDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &results) const override {
+		if (fail_finalize) {
+			throw IOException("planned coordinator-only extension finalization failure");
+		}
+		idx_t rows = 0;
+		for (const auto &result : results) {
+			rows += result.RowCount();
+		}
+		return rows;
+	}
+
+	void AbortDistributedWrite(ClientContext &, const vector<DistributedWriteTaskResult> &) const override {
+	}
+
+protected:
+	void SerializeOperatorData(Serializer &) const override {
+		throw NotImplementedException("COORDINATOR_ONLY_EXTENSION_WRITE root cannot be serialized");
+	}
+
+private:
+	distributed::DistributedExtensionWritePlan plan;
+	bool fail_finalize;
+};
+
 class CountingResultCollectorForTest {
 public:
 	CountingResultCollectorForTest() : calls(make_shared_ptr<std::atomic<idx_t>>(0)) {
@@ -184,8 +293,15 @@ static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_conne
 	if (resolved_wrapper.con.ConnectionIsClosed()) {
 		throw std::runtime_error("resolved shuffle cleanup connection is closed");
 	}
-	ApplyEffectiveVaneSessionConfig(resolved_wrapper.con.GetConnection(), effective_session_config);
-	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, false, true, apply_snapshot_s3_credentials);
+	ConnectionSnapshotApplyOptions snapshot_options;
+	snapshot_options.apply_session_config = false;
+	snapshot_options.apply_s3_credentials = apply_snapshot_s3_credentials;
+	ValidateConnectionSnapshotExtensions(resolved_connection, connection_snapshot,
+	                                     snapshot_options.enforce_extension_security);
+	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot, "httpfs")) {
+		ApplyEffectiveVaneSessionConfig(resolved_wrapper, effective_session_config);
+	}
+	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, snapshot_options);
 	return resolved_connection;
 }
 
@@ -584,11 +700,30 @@ void register_ray_bindings(py::module_ &mod) {
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
 
 	m.def(
+	    "_resolve_query_snapshot_connection",
+	    [](py::object, const string &query_id) {
+		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
+		    if (snapshot.is_none()) {
+			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
+		    }
+		    // Ray workers cache this connection by the snapshot's exact engine,
+		    // extension, and replay-setting identity. Always create its
+		    // DatabaseInstance independently from the session bootstrap so
+		    // database-global state from one query cannot contaminate another.
+		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true, true);
+	    },
+	    py::arg("connection"), py::arg("query_id"));
+
+	m.def(
 	    "_register_query_python_replay_state",
-	    [](const string &query_id, const PyPhysicalPlanWrapper &plan) {
+	    [](const string &query_id, PyPhysicalPlanWrapper &plan) {
 		    if (query_id.empty()) {
 			    throw duckdb::InternalException("Query Python replay registration requires a non-empty query_id");
 		    }
+		    // Worker resource settings are owned by the Ray actor allocation, not
+		    // by the source connection. Remove them from every worker-side replay
+		    // before the snapshot is registered or used to resolve a database.
+		    plan.connection_snapshot_ = PrepareWorkerConnectionSnapshot(plan.connection_snapshot_);
 		    // The resource query owns this lifecycle. A retried FTE task can carry a
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
@@ -684,14 +819,14 @@ void register_ray_bindings(py::module_ &mod) {
 					    resolved_cleanup_connection = ResolveFlightShuffleCleanupConnection(
 					        cleanup_connection, snapshot, effective_session_config, apply_snapshot_s3_credentials);
 				    } else {
-					    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+					    ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
 				    }
 				    // Concurrent idempotent teardown can retire replay state after
 				    // this cleanup cursor was configured. Continue with its
 				    // sanitized session baseline: remaining storage failures stay
 				    // visible and retryable in the registry.
 			    } else {
-				    ApplyEffectiveVaneSessionConfig(conn_wrapper.con.GetConnection(), effective_session_config);
+				    ApplyEffectiveVaneSessionConfig(conn_wrapper, effective_session_config);
 			    }
 			    auto &resolved_wrapper = ExtractPyConnectionWrapper(resolved_cleanup_connection);
 			    auto &context = *resolved_wrapper.con.GetConnection().context;
@@ -781,8 +916,8 @@ void register_ray_bindings(py::module_ &mod) {
 	         py::arg("conn") = py::none())
 	    .def(
 	        "_validate_serializable_for_submission",
-	        [](const PyPhysicalPlanWrapper &p) { (void)p.serialize_root_for_clone(); },
-	        "Validate the physical root before distributed query registration.")
+	        [](const PyPhysicalPlanWrapper &p) { p.validate_serializable_for_submission(); },
+	        "Validate worker-executable physical roots before distributed query registration.")
 	    .def(py::pickle(
 	        // __getstate__: serialize the plan
 	        [](const PyPhysicalPlanWrapper &p) {
@@ -858,6 +993,51 @@ void register_ray_bindings(py::module_ &mod) {
 	    py::arg("query_id"), "Create an intentionally non-serializable physical plan for native tests.");
 
 	m.def(
+	    "_make_coordinator_only_extension_write_plan_for_test",
+	    [](const string &query_id, bool fail_finalize, py::object conn_obj) {
+		    if (query_id.empty()) {
+			    throw duckdb::InternalException("test extension write plan requires a non-empty query_id");
+		    }
+		    auto physical_plan = std::make_shared<duckdb::PhysicalPlan>(duckdb::Allocator::DefaultAllocator());
+		    vector<LogicalType> child_types {LogicalType::BIGINT};
+		    auto &child = physical_plan->Make<PhysicalDummyScan>(std::move(child_types), 1);
+		    auto &root = physical_plan->Make<PhysicalCoordinatorOnlyExtensionWriteForTest>(fail_finalize);
+		    root.children.push_back(child);
+		    physical_plan->SetRoot(root);
+		    uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
+		    auto config = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
+		        duckdb::distributed::DuckDBExecutionConfig::from_env());
+		    auto distributed_plan = std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(
+		        idx, query_id, std::move(physical_plan), std::move(config));
+		    PyPhysicalPlanWrapper result(std::move(distributed_plan));
+		    if (!conn_obj.is_none()) {
+			    if (py::hasattr(conn_obj, "c")) {
+				    conn_obj = conn_obj.attr("c");
+			    }
+			    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
+			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn);
+		    }
+		    return result;
+	    },
+	    py::arg("query_id"), py::arg("fail_finalize") = false, py::arg("conn") = py::none(),
+	    "Create a coordinator-only extension write plan for submission-boundary tests.");
+
+	m.def(
+	    "_register_coordinator_only_extension_write_for_test",
+	    [](py::object conn_obj) {
+		    if (py::hasattr(conn_obj, "c")) {
+			    conn_obj = conn_obj.attr("c");
+		    }
+		    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
+		    auto &db_conn = py_conn.con.GetConnection();
+		    if (!db_conn.context) {
+			    throw py::value_error("test extension write registration requires an open DuckDB connection");
+		    }
+		    RegisterCoordinatorOnlyExtensionWriteForTest(*db_conn.context);
+	    },
+	    py::arg("conn"), "Register the coordinator-only callback write contract for native tests.");
+
+	m.def(
 	    "_make_worker_task_for_test",
 	    [](bool has_plan, py::object query_id_obj) {
 		    duckdb::distributed::DuckPhysicalPlanRef physical_plan;
@@ -920,28 +1100,24 @@ void register_ray_bindings(py::module_ &mod) {
 	py::class_<PyLogicalPlan>(m, "PyLogicalPlan")
 	    .def_static("from_duckdb_relation",
 	                [](py::object relation_obj, py::object query_id_obj) {
-		                if (!py::isinstance<duckdb::DuckDBPyRelation>(relation_obj)) {
-			                throw py::type_error("Expected a Vane DuckDBPyRelation object");
-		                }
 		                try {
-			                auto &pyrel = relation_obj.cast<duckdb::DuckDBPyRelation &>();
-			                auto rel = pyrel.GetRelation();
-			                string query_id = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
-			                PyLogicalPlan plan;
-			                plan.query_id_ = std::move(query_id);
-			                plan.serialized_logical_plan_ = SerializeLogicalPlanFromRelation(rel);
-			                auto connection_owner = pyrel.GetConnectionOwner();
-			                if (connection_owner && !connection_owner.is_none() &&
-			                    py::isinstance<DuckDBPyConnection>(connection_owner)) {
-				                auto &conn_wrapper = connection_owner.cast<DuckDBPyConnection &>();
-				                plan.source_connection_ = connection_owner;
-				                auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
-				                if (py::len(registrations) > 0) {
-					                plan.udf_registrations_ = std::move(registrations);
-				                }
-				                plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper);
-			                }
-			                return plan;
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     false);
+		                } catch (const py::type_error &) {
+			                throw;
+		                } catch (const py::error_already_set &) {
+			                throw;
+		                } catch (const std::exception &ex) {
+			                throw py::value_error(ex.what());
+		                }
+	                })
+	    .def_static("from_duckdb_write_relation",
+	                [](py::object relation_obj, py::object query_id_obj) {
+		                try {
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     true);
+		                } catch (const py::type_error &) {
+			                throw;
 		                } catch (const py::error_already_set &) {
 			                throw;
 		                } catch (const std::exception &ex) {
@@ -997,6 +1173,8 @@ void register_ray_bindings(py::module_ &mod) {
 	py::class_<PyPhysicalPlanWrapperRunner>(m, "DistributedPhysicalPlanRunner")
 	    .def(py::init<>())
 	    .def(py::init<py::object>(), py::arg("backend"))
+	    .def("_fail_next_extension_result_marshalling_for_test",
+	         &PyPhysicalPlanWrapperRunner::fail_next_extension_result_marshalling_for_test)
 	    .def(
 	        "run_plan",
 	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj) -> py::object {
@@ -1175,31 +1353,56 @@ void register_ray_bindings(py::module_ &mod) {
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
 	           py::object effective_session_config_obj) {
 		        string plan_type_name = py::str(py::type::of(plan_obj).attr("__name__")).cast<string>();
+		        auto parse_node_id = [](py::handle key, const char *map_name) -> idx_t {
+			        if (!py::isinstance<py::str>(key)) {
+				        throw py::value_error(string(map_name) + " node_id must be a decimal string");
+			        }
+			        auto key_str = py::str(key).cast<string>();
+			        if (key_str.empty()) {
+				        throw py::value_error(string(map_name) + " node_id must not be empty");
+			        }
+			        if (!std::all_of(key_str.begin(), key_str.end(),
+			                         [](char value) { return value >= '0' && value <= '9'; })) {
+				        throw py::value_error(string(map_name) + " node_id must contain only decimal digits");
+			        }
+			        if (key_str.size() > 1 && key_str.front() == '0') {
+				        throw py::value_error(string(map_name) + " node_id must use canonical decimal form");
+			        }
+			        try {
+				        auto value = std::stoull(key_str);
+				        if (value >= NumericLimits<idx_t>::Maximum()) {
+					        throw std::out_of_range("node_id exceeds the valid idx_t range");
+				        }
+				        return static_cast<idx_t>(value);
+			        } catch (const std::exception &ex) {
+				        throw py::value_error(string("Invalid ") + map_name + " node_id: " + ex.what());
+			        }
+		        };
 		        std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> scan_task_map;
 		        bool has_scan_task_map = false;
 		        if (!scan_task_obj.is_none()) {
 			        if (py::isinstance<py::dict>(scan_task_obj)) {
 				        auto dict_obj = scan_task_obj.cast<py::dict>();
 				        for (auto item : dict_obj) {
-					        auto key_str = py::str(item.first).cast<string>();
-					        if (key_str.empty()) {
-						        continue;
-					        }
+					        auto node_id = parse_node_id(item.first, "scan_task");
 					        // Values are raw bytes (py::bytes) from driver context
-					        string val_bytes;
 					        auto val_obj = py::reinterpret_borrow<py::object>(item.second);
-					        if (py::isinstance<py::bytes>(val_obj)) {
-						        val_bytes = val_obj.cast<string>();
-					        } else {
-						        val_bytes = py::str(val_obj).cast<string>();
+					        if (!py::isinstance<py::bytes>(val_obj)) {
+						        throw py::value_error("scan_task values must be raw bytes");
 					        }
+					        auto val_bytes = val_obj.cast<string>();
 					        if (val_bytes.empty()) {
-						        continue;
+						        throw py::value_error("scan_task descriptor must not be empty");
 					        }
 					        try {
-						        auto node_id = static_cast<idx_t>(std::stoll(key_str));
-						        scan_task_map.emplace(
-						            node_id, duckdb::distributed::ScanTaskDescriptor::DeserializeFromBytes(val_bytes));
+						        auto inserted =
+						            scan_task_map
+						                .emplace(node_id, duckdb::distributed::ScanTaskDescriptor::DeserializeFromBytes(
+						                                      val_bytes))
+						                .second;
+						        if (!inserted) {
+							        throw std::invalid_argument("duplicate normalized node_id");
+						        }
 					        } catch (const std::exception &ex) {
 						        throw py::value_error(string("Invalid scan task map entry: ") + ex.what());
 					        }
@@ -1218,25 +1421,26 @@ void register_ray_bindings(py::module_ &mod) {
 			        if (py::isinstance<py::dict>(exchange_source_task_obj)) {
 				        auto dict_obj = exchange_source_task_obj.cast<py::dict>();
 				        for (auto item : dict_obj) {
-					        auto key_str = py::str(item.first).cast<string>();
-					        if (key_str.empty()) {
-						        continue;
-					        }
-					        string val_bytes;
+					        auto node_id = parse_node_id(item.first, "exchange_source_task");
 					        auto val_obj = py::reinterpret_borrow<py::object>(item.second);
-					        if (py::isinstance<py::bytes>(val_obj)) {
-						        val_bytes = val_obj.cast<string>();
-					        } else {
-						        val_bytes = py::str(val_obj).cast<string>();
+					        if (!py::isinstance<py::bytes>(val_obj)) {
+						        throw py::value_error("exchange_source_task values must be raw bytes");
 					        }
+					        auto val_bytes = val_obj.cast<string>();
 					        if (val_bytes.empty()) {
-						        continue;
+						        throw py::value_error("exchange_source_task descriptor must not be empty");
 					        }
 					        try {
-						        auto node_id = static_cast<idx_t>(std::stoll(key_str));
-						        exchange_source_task_map.emplace(
-						            node_id,
-						            duckdb::distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(val_bytes));
+						        auto inserted =
+						            exchange_source_task_map
+						                .emplace(
+						                    node_id,
+						                    duckdb::distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(
+						                        val_bytes))
+						                .second;
+						        if (!inserted) {
+							        throw std::invalid_argument("duplicate normalized node_id");
+						        }
 					        } catch (const std::exception &ex) {
 						        throw py::value_error(string("Invalid exchange source task map entry: ") + ex.what());
 					        }
@@ -1258,18 +1462,16 @@ void register_ray_bindings(py::module_ &mod) {
 			        }
 			        auto dict_obj = fte_scan_source_queues_obj.cast<py::dict>();
 			        for (auto item : dict_obj) {
-				        auto key_str = py::str(item.first).cast<string>();
-				        if (key_str.empty()) {
-					        continue;
-				        }
+				        auto node_id = parse_node_id(item.first, "fte_scan_source_queues");
 				        auto value_obj = py::reinterpret_borrow<py::object>(item.second);
 				        if (!py::isinstance<duckdb::distributed::FteSplitQueue>(value_obj)) {
 					        throw py::value_error("fte_scan_source_queues values must be FteSplitQueue instances");
 				        }
 				        try {
-					        auto node_id = static_cast<idx_t>(std::stoll(key_str));
 					        auto queue = value_obj.cast<std::shared_ptr<duckdb::distributed::FteSplitQueue>>();
-					        fte_scan_source_queue_map.emplace(node_id, std::move(queue));
+					        if (!fte_scan_source_queue_map.emplace(node_id, std::move(queue)).second) {
+						        throw std::invalid_argument("duplicate normalized node_id");
+					        }
 				        } catch (const std::exception &ex) {
 					        throw py::value_error(string("Invalid FTE scan source queue map entry: ") + ex.what());
 				        }
@@ -1290,18 +1492,16 @@ void register_ray_bindings(py::module_ &mod) {
 			        }
 			        auto dict_obj = fte_exchange_source_queues_obj.cast<py::dict>();
 			        for (auto item : dict_obj) {
-				        auto key_str = py::str(item.first).cast<string>();
-				        if (key_str.empty()) {
-					        continue;
-				        }
+				        auto node_id = parse_node_id(item.first, "fte_exchange_source_queues");
 				        auto value_obj = py::reinterpret_borrow<py::object>(item.second);
 				        if (!py::isinstance<duckdb::distributed::FteSplitQueue>(value_obj)) {
 					        throw py::value_error("fte_exchange_source_queues values must be FteSplitQueue instances");
 				        }
 				        try {
-					        auto node_id = static_cast<idx_t>(std::stoll(key_str));
 					        auto queue = value_obj.cast<std::shared_ptr<duckdb::distributed::FteSplitQueue>>();
-					        fte_exchange_source_queue_map.emplace(node_id, std::move(queue));
+					        if (!fte_exchange_source_queue_map.emplace(node_id, std::move(queue)).second) {
+						        throw std::invalid_argument("duplicate normalized node_id");
+					        }
 				        } catch (const std::exception &ex) {
 					        throw py::value_error(string("Invalid FTE exchange source queue map entry: ") + ex.what());
 				        }
@@ -1427,12 +1627,23 @@ void register_ray_bindings(py::module_ &mod) {
 			        PyPhysicalPlanWrapper deferred_exec_plan;
 
 			        try {
-				        py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
-				        // Install refreshed session credentials as a baseline
-				        // before replaying explicit source-connection settings.
-				        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn).con.GetConnection(),
-				                                        effective_session_config_obj);
+				        // A materialized physical plan owns objects bound to the
+				        // DatabaseInstance retained by worker_connection_. Replacing that
+				        // connection here can destroy the bound instance while operators
+				        // still reference it. Deferred worker plans have no retained
+				        // connection and are materialized against conn_obj below.
+				        py::object exec_conn = plan.resolve_execution_connection(conn_obj);
 				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
+				        // Establish the exact extension set before refreshed AWS
+				        // settings can load httpfs into this DatabaseInstance. Replay the
+				        // full snapshot only after the environment/profile baseline so
+				        // explicit source-connection settings retain normal precedence.
+				        ValidateConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_, true);
+				        if (ConnectionSnapshotDeclaresStaticExtension(plan.connection_snapshot_, "httpfs")) {
+					        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
+					                                        effective_session_config_obj);
+				        }
+				        plan.ensure_connection_snapshot(exec_conn, apply_snapshot_session_config);
 				        // Handle deferred deserialization (from pickle round-trip)
 				        if (!plan.has_root() && !plan.serialized_root_.empty()) {
 					        // Materialize into a temporary wrapper so any physical-plan
@@ -1481,9 +1692,9 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
 	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
 
-	// Merge multiple raw-bytes ScanTaskDescriptors into one.
-	// Each descriptor may contain multiple files; the merged result is a single
-	// ScanTaskDescriptor whose file list is the concatenation of all inputs.
+	// Merge multiple raw-bytes ScanTaskDescriptors into one. File descriptors
+	// concatenate files; extension descriptors concatenate opaque envelopes only
+	// when their capability and codec identities match exactly.
 	m.def(
 	    "merge_scan_task_descriptors",
 	    [](const py::list &bytes_list) -> py::bytes {
@@ -1491,29 +1702,26 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (py::len(bytes_list) == 0) {
 			    return py::bytes("");
 		    }
-		    if (py::len(bytes_list) == 1) {
-			    return bytes_list[0].cast<py::bytes>();
-		    }
 		    ScanTaskDescriptor merged;
+		    bool has_descriptor = false;
 		    for (auto item : bytes_list) {
 			    py::bytes b = item.cast<py::bytes>();
 			    string raw(b);
-			    if (raw.empty()) {
-				    continue;
-			    }
 			    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
-			    merged.estimated_cardinality =
-			        SaturatingAddIdx(merged.estimated_cardinality, desc.estimated_cardinality);
-			    merged.estimated_bytes = SaturatingAddIdx(merged.estimated_bytes, desc.estimated_bytes);
-			    merged.files.insert(merged.files.end(), std::make_move_iterator(desc.files.begin()),
-			                        std::make_move_iterator(desc.files.end()));
+			    if (!has_descriptor) {
+				    merged = std::move(desc);
+				    has_descriptor = true;
+			    } else {
+				    merged.Merge(std::move(desc));
+			    }
+		    }
+		    if (!has_descriptor) {
+			    return py::bytes("");
 		    }
 		    auto result = merged.SerializeToBytes();
 		    return py::bytes(result);
 	    },
-	    py::arg("bytes_list"),
-	    "Merge multiple raw-bytes ScanTaskDescriptors into a single descriptor "
-	    "by concatenating their file lists.");
+	    py::arg("bytes_list"), "Merge compatible raw-bytes ScanTaskDescriptors into a single descriptor.");
 
 	m.def(
 	    "scan_task_source_partition_id",
@@ -4170,7 +4378,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> files;
+		    vector<DistributedCopyFileInfo> files;
 		    DistributedCopyFileInfo first;
 		    first.staging_path = first_staged;
 		    first.row_count = 1;
@@ -4241,7 +4449,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_staged;
 			    first.row_count = 1;
@@ -4324,7 +4532,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> manifest_files;
+		    vector<DistributedCopyFileInfo> manifest_files;
 		    DistributedCopyFileInfo first_manifest;
 		    first_manifest.staging_path = first_staged;
 		    first_manifest.final_path = first_final;
@@ -4347,7 +4555,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    fs.MoveFile(first_staged, first_final);
 
 		    auto make_input_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_staged;
 			    first.row_count = 1;
@@ -4448,7 +4656,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_file;
 			    first.row_count = 1;
@@ -4551,7 +4759,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
 		    auto make_files = [&]() {
-			    std::vector<DistributedCopyFileInfo> files;
+			    vector<DistributedCopyFileInfo> files;
 			    DistributedCopyFileInfo first;
 			    first.staging_path = first_file;
 			    first.row_count = 1;
@@ -4670,7 +4878,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    spec.per_thread_output = true;
 		    spec.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
 
-		    std::vector<DistributedCopyFileInfo> files;
+		    vector<DistributedCopyFileInfo> files;
 		    DistributedCopyFileInfo info;
 		    info.staging_path = invisible_file;
 		    info.row_count = 4;
@@ -4739,7 +4947,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    selected_info.final_path = selected_file;
 		    selected_info.row_count = 7;
 		    selected_info.file_size_bytes = selected_body.size();
-		    std::vector<DistributedCopyFileInfo> selected_files;
+		    vector<DistributedCopyFileInfo> selected_files;
 		    selected_files.push_back(std::move(selected_info));
 
 		    auto commit_paths = BuildDistributedCopyFinalizeCommitPaths(fs, final_root, run_id);
@@ -4845,7 +5053,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (stale_lifecycle_res.is_err()) {
 			    throw std::runtime_error(stale_lifecycle_res.error().what());
 		    }
-		    std::vector<DistributedCopyFileInfo> stale_files;
+		    vector<DistributedCopyFileInfo> stale_files;
 		    stale_files.push_back(make_file_info(stale_file, 1, stale_body.size()));
 		    auto stale_manifest_res = WriteDistributedCopyFinalizeManifest(fs, stale_commit_paths, final_root,
 		                                                                   "direct:" + stale_run_id, stale_files);
@@ -4863,7 +5071,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    if (committed_lifecycle_res.is_err()) {
 			    throw std::runtime_error(committed_lifecycle_res.error().what());
 		    }
-		    std::vector<DistributedCopyFileInfo> committed_files;
+		    vector<DistributedCopyFileInfo> committed_files;
 		    committed_files.push_back(make_file_info(committed_file, 1, committed_body.size()));
 		    auto committed_manifest_res = WriteDistributedCopyFinalizeManifest(
 		        fs, committed_paths, final_root, "direct:" + committed_run_id, committed_files);

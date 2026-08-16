@@ -45,6 +45,7 @@
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
@@ -821,6 +822,20 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto task_index = deserializer.ReadProperty<idx_t>(105, "task_index");
 		return make_uniq<PhysicalDistributedReservoirSample>(physical_plan, std::move(types), std::move(options), stage,
 		                                                     task_index, estimated_cardinality);
+	}
+	case PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE: {
+		DistributedExtensionWriteInfo info;
+		deserializer.ReadObject(103, "distributed_write_info", [&](Deserializer &object) {
+			info = DistributedExtensionWriteInfo::Deserialize(object);
+		});
+		auto query_id = deserializer.ReadProperty<string>(104, "query_id");
+		auto task_attempt_id = deserializer.ReadProperty<string>(105, "task_attempt_id");
+		auto result =
+		    make_uniq<PhysicalDistributedExtensionWrite>(physical_plan, std::move(info), estimated_cardinality);
+		if (!query_id.empty() || !task_attempt_id.empty()) {
+			throw SerializationException("distributed extension write plan must not transport a runtime task context");
+		}
+		return std::move(result);
 	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");

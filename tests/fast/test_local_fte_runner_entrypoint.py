@@ -6,6 +6,8 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
 
 def test_set_runner_local_entrypoint_in_subprocess():
     script = """
@@ -78,7 +80,7 @@ os.environ["VANE_RUNNER"] = "native-fte"
 try:
     runners.get_or_create_runner()
 except vane.InvalidInputException as exc:
-    assert "Please use 'local' or 'ray'" in str(exc)
+    assert "Please use 'local-fast', 'local', or 'ray'" in str(exc)
 else:
     raise AssertionError("native-fte should no longer be a public runner")
 """
@@ -141,6 +143,71 @@ def test_local_runner_records_cleanup_failures_on_unknown_copy_outcome():
     )
     assert "backend join timed out" in str(error)
     assert error.safe_to_retry is False
+
+
+def test_local_runner_uses_write_specific_logical_plan_factory(monkeypatch):
+    from vane.runners.local import runner as runner_module
+
+    relation = object()
+
+    class FakeLogicalPlan:
+        @staticmethod
+        def from_duckdb_write_relation(actual_relation, _query_id):
+            assert actual_relation is relation
+            raise RuntimeError("write transaction validation reached")
+
+    monkeypatch.setattr(runner_module, "_preload_arrow_dataset_imports", lambda: None)
+    monkeypatch.setattr(
+        runner_module,
+        "require_ray_cxx_attr",
+        lambda name: FakeLogicalPlan if name == "PyLogicalPlan" else object,
+    )
+
+    with pytest.raises(RuntimeError, match="write transaction validation reached"):
+        runner_module.LocalRunner().run_write(relation)
+
+
+def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(monkeypatch):
+    from vane.runners.fte import FteTaskAttemptId, FteTaskId
+    from vane.runners.local import runner as runner_module
+
+    attempt_id = FteTaskAttemptId(FteTaskId("query-id", 7, 3), 2)
+    native_calls = []
+
+    class FakeCursor:
+        def close(self):
+            pass
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    class FakePlanRunner:
+        def execute_native(self, *args):
+            native_calls.append(args)
+            return "ok"
+
+    monkeypatch.setattr(
+        runner_module.NativeFteWorkerManagerBackend,
+        "materialize_task_context",
+        staticmethod(lambda _request, *, merge_scan_task_descriptors: {}),
+    )
+    monkeypatch.setattr(runner_module, "require_ray_cxx_attr", lambda _name: object())
+
+    executor = runner_module._InProcessFragmentExecutor()
+    monkeypatch.setattr(executor, "_get_conn", lambda: FakeConnection())
+    monkeypatch.setattr(executor, "_get_plan_runner", lambda: FakePlanRunner())
+
+    result = executor(
+        {
+            "task_id": attempt_id.to_dict(),
+            "fragment_plan": object(),
+        }
+    )
+
+    assert result == "ok"
+    assert len(native_calls) == 1
+    assert native_calls[0][10] == {"task_id": str(attempt_id)}
 
 
 def test_local_runner_rejects_invalid_num_workers():

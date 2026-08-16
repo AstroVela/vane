@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/physical_operator_visitor.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
@@ -49,6 +50,7 @@ class PhysicalWindow;
 
 namespace duckdb {
 class ClientContext;
+struct DistributedExtensionWriteInfo;
 namespace distributed {
 class ExchangeManager;
 
@@ -58,6 +60,8 @@ private:
 	PlanConfig plan_config_;
 	int pipeline_node_id_counter_ = 0;
 	DuckPhysicalPlanRef plan_;
+	ClientContext *client_context_;
+	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
 
 	int get_next_pipeline_node_id() {
@@ -65,16 +69,19 @@ private:
 	}
 
 public:
-	PhysicalPlanToPipelineNodeTranslator(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-	                                     ClientContext *client_context = nullptr);
+	//! resolved_extension_write_info is borrowed only during translation and
+	//! must be resolved for the physical extension root.
+	PhysicalPlanToPipelineNodeTranslator(
+	    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+	    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr);
 
 	// Static helper: convert a DuckDB PhysicalPlan into a DistributedPipelineNode.
 	// This mirrors the Rust helper `physical_plan_to_pipeline_node` but implemented
 	// as a C++ static method on the translator class. Implementation uses the
 	// PhysicalOperatorVisitor to traverse the operator tree in post-order.
-	static DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-	physical_plan_to_pipeline_node(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-	                               ClientContext *client_context = nullptr);
+	static DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline_node(
+	    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+	    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr);
 
 	// Override VisitOperator (post-order): children are visited first by calling
 	// the base traversal helper, then we peek/pop child results from node_stack_
@@ -232,11 +239,11 @@ private:
 
 // Backwards-compatible free function wrapper that delegates to the
 // translator static helper. Keeps existing call sites simple.
-inline DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
-physical_plan_to_pipeline_node(PlanConfig plan_config, DuckPhysicalPlanRef plan,
-                               ClientContext *client_context = nullptr) {
-	return PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(std::move(plan_config), std::move(plan),
-	                                                                            client_context);
+inline DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline_node(
+    PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
+    optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr) {
+	return PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
+	    std::move(plan_config), std::move(plan), client_context, resolved_extension_write_info);
 }
 } // namespace distributed
 } // namespace duckdb

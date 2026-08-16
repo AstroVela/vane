@@ -282,6 +282,103 @@ def test_actor_shutdown_joins_native_threads_before_closing_runtime(monkeypatch)
         actor_class._ensure_worker_runtime_running(actor)
 
 
+def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
+    from vane.runners.ray import worker as worker_module
+
+    cursor_closed = threading.Event()
+    cursor_interrupted = threading.Event()
+    database_closed = threading.Event()
+    shutdown_started = threading.Event()
+
+    class Cursor:
+        def interrupt(self):
+            cursor_interrupted.set()
+
+        def close(self):
+            cursor_closed.set()
+
+    class SnapshotConnection:
+        def close(self):
+            assert cursor_closed.is_set()
+            database_closed.set()
+
+    class TaskManager:
+        def shutdown(self):
+            shutdown_started.set()
+
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (("threads", "2"),),
+        (),
+        "test-source-id",
+        (),
+        (),
+        "",
+        "",
+        False,
+    )
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+
+    class DummyActor:
+        _close_retired_snapshot_databases_locked = actor_class._close_retired_snapshot_databases_locked
+        _shutdown_lock = threading.Lock()
+        _shared_conn_lock = threading.Lock()
+        _snapshot_connections_lock = threading.Lock()
+        _session_connections_lock = threading.RLock()
+        _native_execution_condition = threading.Condition()
+        _native_execution_count = 0
+        _native_execution_counts_by_query: dict[str, int] = {}
+        _native_execution_counts_by_task: dict[str, int] = {}
+        _native_task_query_ids: dict[str, str] = {}
+        _active_native_cursors: set[object] = set()
+        _native_cursor_query_ids: dict[object, str] = {}
+        _native_cursor_task_ids: dict[object, str] = {}
+        _closing_native_queries: set[str] = set()
+        _closing_native_tasks: set[str] = set()
+        _active_snapshot_execution_cursors = 1
+        _active_snapshot_cursors: set[object] = set()
+        _snapshot_connection_active_cursors = {database_identity: 1}
+        _snapshot_cursor_database_identities: dict[object, worker_module.WorkerSnapshotDatabaseIdentity] = {}
+        _retired_snapshot_database_identities: set[worker_module.WorkerSnapshotDatabaseIdentity] = set()
+        _retired_snapshot_session_ids: set[str] = set()
+        _shutdown_started = False
+        _shutdown_prepared = False
+        _shutdown_complete = False
+        _shared_conn = None
+        _snapshot_connections = {database_identity: SnapshotConnection()}
+        _session_connections: dict[str, tuple[dict[str, str], object]] = {}
+        _fte_task_manager = TaskManager()
+
+    actor = DummyActor()
+    cursor = Cursor()
+    actor._active_snapshot_cursors.add(cursor)
+    actor._snapshot_cursor_database_identities[cursor] = database_identity
+    shutdown_errors = []
+
+    def prepare_shutdown():
+        try:
+            actor_class._prepare_worker_runtime_shutdown(actor)
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    shutdown_thread = threading.Thread(target=prepare_shutdown)
+    shutdown_thread.start()
+    assert shutdown_started.wait(timeout=5)
+    assert actor._shutdown_started is True
+    assert database_closed.is_set() is False
+    assert cursor_interrupted.wait(timeout=5)
+
+    actor_class._close_snapshot_execution_cursor(actor, cursor)
+    shutdown_thread.join(timeout=5)
+
+    assert shutdown_thread.is_alive() is False
+    assert shutdown_errors == []
+    assert database_closed.is_set()
+    assert actor._snapshot_connections == {}
+    assert actor._shutdown_prepared is True
+
+
 def test_query_teardown_waits_for_pre_registration_native_admission():
     from vane.runners.ray import worker as worker_module
 

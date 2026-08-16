@@ -454,6 +454,11 @@ void PhysicalTableScan::GetMetrics(ClientContext &context, GlobalSourceState &gs
 
 void PhysicalTableScan::SerializeOperatorData(Serializer &serializer) const {
 	// TableScan-specific serialization
+	if (function.HasDistributedScanCallbacks() && !function.HasSerializationCallbacks()) {
+		throw SerializationException("Distributed physical table function '%s' requires complete serialize and "
+		                             "deserialize callbacks; worker rebind is not supported",
+		                             function.name);
+	}
 	FunctionSerializer::Serialize(serializer, function, bind_data.get());
 	serializer.WriteProperty(200, "returned_types", returned_types);
 	serializer.WriteProperty(201, "column_ids", column_ids);

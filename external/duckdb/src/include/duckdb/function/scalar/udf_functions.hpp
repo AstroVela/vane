@@ -68,7 +68,8 @@ inline string NormalizeRunnerType(string runner_type) {
 	std::transform(runner_type.begin(), runner_type.end(), runner_type.begin(),
 	               [](unsigned char c) { return std::tolower(c); });
 	if (!runner_type.empty() && runner_type != "local-fast" && runner_type != "local" && runner_type != "ray") {
-		throw InvalidInputException("Invalid runner type '%s'. Please use 'local' or 'ray'.", runner_type);
+		throw InvalidInputException("Invalid runner type '%s'. Please use 'local-fast', 'local', or 'ray'.",
+		                            runner_type);
 	}
 	return runner_type;
 }

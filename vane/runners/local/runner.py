@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._vane_session import ensure_vane_session_dir
 from vane.runners.copy_outcome import CopyOutcomeUnknownError
+from vane.runners.fte import FteTaskAttemptId
 from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 from vane.runners.fte.memory_config import apply_duckdb_memory_limit
 from vane.runners.progress import ProgressRenderer, build_progress_snapshot, progress_enabled
@@ -344,6 +345,7 @@ class _InProcessFragmentExecutor:
         cursor_registered = False
         try:
             request_payload = dict(request)
+            task_attempt_id = FteTaskAttemptId.coerce(request_payload.get("task_id"))
             context = NativeFteWorkerManagerBackend.materialize_task_context(
                 request_payload,
                 merge_scan_task_descriptors=require_ray_cxx_attr("merge_scan_task_descriptors"),
@@ -377,6 +379,7 @@ class _InProcessFragmentExecutor:
                 request_payload.get("fte_exchange_source_queues"),
                 request_payload.get("dynamic_filter_domains"),
                 request_payload.get("native_progress_callback"),
+                {"task_id": str(task_attempt_id)},
             )
         finally:
             try:
@@ -436,7 +439,7 @@ class LocalRunner(Runner):
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
         query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
         conn = vane.connect()
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(

@@ -85,6 +85,12 @@ def require_ray_cxx_attr(
 
 @overload
 def require_ray_cxx_attr(
+    name: Literal["_resolve_query_snapshot_connection"], *, hint: str | None = None
+) -> Callable[[object, str], object]: ...
+
+
+@overload
+def require_ray_cxx_attr(
     name: Literal[
         "_cleanup_query_python_replay_state",
         "begin_flight_shuffle_query_execution",

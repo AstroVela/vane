@@ -402,6 +402,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	    .def("insert", &DuckDBPyRelation::Insert, "Inserts the given values into the relation", py::arg("values"))
 	    .def("update", &DuckDBPyRelation::Update, "Update the given relation with the provided expressions",
 	         py::arg("set"), py::kw_only(), py::arg("condition") = py::none())
+	    .def("delete", &DuckDBPyRelation::Delete, "Delete rows from the given table relation", py::kw_only(),
+	         py::arg("condition") = py::none())
 
 	    // This should be deprecated in favor of a replacement scan
 	    .def("query", &DuckDBPyRelation::Query,
@@ -415,8 +417,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	         py::arg("column"))
 
 	    // Aren't these also technically consumers?
-	    .def("insert_into", &DuckDBPyRelation::InsertInto,
-	         "Inserts the relation object into an existing table named table_name", py::arg("table_name"));
+	    .def("insert_into", &DuckDBPyRelation::InsertInto, "Inserts the relation object into an existing table",
+	         py::arg("table_name"));
 
 	DefineMethod({"create", "to_table"}, relation_module, &DuckDBPyRelation::Create,
 	             "Creates a new table named table_name with the contents of the relation object",

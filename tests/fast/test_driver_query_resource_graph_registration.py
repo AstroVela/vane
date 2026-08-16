@@ -883,6 +883,28 @@ def test_driver_exposes_query_task_and_output_lease_api():
     assert required.issubset(dir(runner_cls))
 
 
+def test_driver_database_disables_persistent_secrets_at_connect(monkeypatch):
+    import vane
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    monkeypatch.delenv("VANE_DUCKDB_THREADS", raising=False)
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._duckdb_conn = None
+    runner._driver_duckdb_memory_bytes = None
+    connect_calls = []
+    connection = object()
+
+    def connect(*args, **kwargs):
+        connect_calls.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr(vane, "connect", connect)
+
+    assert runner_cls._ensure_duckdb_conn(runner) is connection
+    assert connect_calls == [((), {"config": {"allow_persistent_secrets": False}})]
+
+
 def test_driver_maintenance_refreshes_ray_capacity_usage_and_heartbeat_atomically():
     from vane.runners.ray.cluster_resource_coordinator import (
         ClusterQueryResourceCoordinator,

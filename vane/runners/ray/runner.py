@@ -166,15 +166,14 @@ class RayRunner(Runner):
             del relation
 
     def run_write(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
-        """Execute a distributed COPY/write plan and return file metadata."""
+        """Execute one distributed write query."""
         PyLogicalPlan = require_ray_cxx_attr(
             "PyLogicalPlan",
             hint="Ensure the C++ ray extension is built and importable in worker processes.",
         )
 
         query_id = str(uuid.uuid4())
-
-        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        logical_plan = PyLogicalPlan.from_duckdb_write_relation(relation, query_id)
         session_id = str(logical_plan.session_id())
 
         client = self._client_for_session(session_id)
