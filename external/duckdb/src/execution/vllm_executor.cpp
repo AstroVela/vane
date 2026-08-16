@@ -10,6 +10,7 @@
 
 #include "duckdb/execution/vllm_executor.hpp"
 
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
 
 #include <mutex>
@@ -35,9 +36,12 @@ vllm_executor_factory_t GetEngineExecutorFactory(const string &engine) {
 }
 
 string GetInferenceEngineName(const Value &options) {
-	// Envelopes produced before engine dispatch existed carry no engine field.
+	// The vllm() binder already guarantees options is a non-null STRUCT
+	// envelope, and every envelope builder writes the engine field. A missing
+	// or malformed engine field is therefore a bug, not a signal to silently
+	// fall back to vllm.
 	if (options.IsNull() || options.type().id() != LogicalTypeId::STRUCT) {
-		return "vllm";
+		throw InvalidInputException("native inference options must use the versioned STRUCT envelope");
 	}
 	const auto &children = StructValue::GetChildren(options);
 	const auto child_count = StructType::GetChildCount(options.type());
@@ -46,12 +50,16 @@ string GetInferenceEngineName(const Value &options) {
 			continue;
 		}
 		const auto &value = children[i];
-		if (!value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
-			return StringValue::Get(value);
+		if (value.IsNull() || value.type().id() != LogicalTypeId::VARCHAR) {
+			throw InvalidInputException("native inference options 'engine' field must be a non-null string");
 		}
-		break;
+		auto engine = StringValue::Get(value);
+		if (engine.empty()) {
+			throw InvalidInputException("native inference options 'engine' field must not be empty");
+		}
+		return engine;
 	}
-	return "vllm";
+	throw InvalidInputException("native inference options envelope is missing the 'engine' field");
 }
 
 } // namespace duckdb

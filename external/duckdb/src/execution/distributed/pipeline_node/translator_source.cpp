@@ -95,8 +95,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateCTESource(PhysicalOperator &op) {
 	auto schema = MakeSchemaFromTypes(op.GetTypes());
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
-	                                                  get_next_pipeline_node_id(), "ScanSource",
-	                                                  plan_config_.session_id),
+	                                                  get_next_pipeline_node_id(), "ScanSource"),
 	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
 }
 
@@ -107,8 +106,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateDummyScanSource(const PhysicalDum
 	auto schema = MakeSchemaFromTypes(op.GetTypes());
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
-	                                                  get_next_pipeline_node_id(), "ScanSource",
-	                                                  plan_config_.session_id),
+	                                                  get_next_pipeline_node_id(), "ScanSource"),
 	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
 }
 
@@ -133,9 +131,9 @@ PhysicalPlanToPipelineNodeTranslator::TranslateColumnDataScanSource(const Physic
 		scan_node_id = get_next_pipeline_node_id();
 	}
 
-	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id,
-	                                                  "ScanSource", plan_config_.session_id),
-	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
+	return MakeScanSourceNode(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"),
+	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
 }
 
 std::shared_ptr<DistributedPipelineNode>
@@ -176,9 +174,9 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	}
 
 	auto schema = MakeTableScanSchema(op, op.GetTypes());
-	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id,
-	                                                  "ScanSource", plan_config_.session_id),
-	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, require_scan_tasks);
+	return MakeScanSourceNode(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"),
+	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, require_scan_tasks);
 }
 
 } // namespace distributed

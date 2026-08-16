@@ -1448,7 +1448,6 @@ BuildDistributedPipelineNode(const std::shared_ptr<duckdb::distributed::Distribu
 		throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root");
 	}
 	PlanConfig cfg(plan->idx(), plan->query_id(), plan->execution_config());
-	cfg.session_id = plan->session_id();
 	if (client_context && client_context->db) {
 		cfg.db = client_context->db;
 	}

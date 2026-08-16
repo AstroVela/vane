@@ -671,8 +671,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    }
 		    auto cfg = std::make_shared<duckdb::distributed::DuckDBExecutionConfig>(
 		        duckdb::distributed::DuckDBExecutionConfig::from_env());
-		    auto distributed_plan = std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(
-		        idx, query_id, *plan_ptr, cfg, VaneSessionIdFromSnapshot(connection_snapshot_obj));
+		    auto distributed_plan =
+		        std::make_shared<duckdb::distributed::DistributedPhysicalPlan>(idx, query_id, *plan_ptr, cfg);
 		    auto result = PyPhysicalPlanWrapper(distributed_plan, resource_query_id);
 		    result.query_id_ = query_id;
 		    result.udf_registrations_ = udf_registrations_obj;

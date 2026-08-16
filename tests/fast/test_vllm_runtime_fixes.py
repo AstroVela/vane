@@ -29,6 +29,7 @@ def _native_vllm_envelope(public_options_json):
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": public_options_json,
         "__vane_vllm_secret_payload": b'{"payload_version":1,"values":[]}',
+        "engine": "vllm",
     }
 
 
@@ -291,6 +292,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": json.dumps(public_options),
         "__vane_vllm_secret_payload": secret_payload,
+        "engine": "vllm",
     }
 
     normalized = vllm.normalize_options(envelope)
@@ -607,7 +609,7 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
 
     monkeypatch.setenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", "10")
     monkeypatch.setattr(llm_executor, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
-    monkeypatch.setattr(vllm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(llm_executor.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="abort waiter timeout-wait did not acknowledge termination"):
         asyncio.run(executor.abort_executor("executor", "timeout-wait"))

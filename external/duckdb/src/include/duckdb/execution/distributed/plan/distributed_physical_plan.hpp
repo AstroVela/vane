@@ -38,14 +38,12 @@ private:
 	std::string query_id_;
 	std::shared_ptr<duckdb::PhysicalPlan> physical_plan_;
 	DuckDBExecutionConfigRef config_;
-	std::string session_id_;
 
 public:
 	DistributedPhysicalPlan(uint16_t query_idx, std::string query_id,
-	                        std::shared_ptr<duckdb::PhysicalPlan> physical_plan, DuckDBExecutionConfigRef config,
-	                        std::string session_id = "")
+	                        std::shared_ptr<duckdb::PhysicalPlan> physical_plan, DuckDBExecutionConfigRef config)
 	    : query_idx_(query_idx), query_id_(std::move(query_id)), physical_plan_(std::move(physical_plan)),
-	      config_(std::move(config)), session_id_(std::move(session_id)) {
+	      config_(std::move(config)) {
 	}
 
 	uint16_t idx() const {
@@ -54,10 +52,6 @@ public:
 
 	const std::string &query_id() const {
 		return query_id_;
-	}
-
-	const std::string &session_id() const {
-		return session_id_;
 	}
 
 	const std::shared_ptr<duckdb::PhysicalPlan> &physical_plan() const {

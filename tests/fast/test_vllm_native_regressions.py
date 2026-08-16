@@ -13,7 +13,8 @@ pa = pytest.importorskip("pyarrow")
 _EMPTY_NATIVE_VLLM_OPTIONS_SQL = """struct_pack(
     __vane_vllm_payload_version := 1,
     __vane_vllm_public_options_json := '{}',
-    __vane_vllm_secret_payload := encode('{"payload_version":1,"values":[]}')
+    __vane_vllm_secret_payload := encode('{"payload_version":1,"values":[]}'),
+    engine := 'vllm'
 )"""
 
 

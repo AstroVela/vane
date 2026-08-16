@@ -55,9 +55,9 @@ _NATIVE_OPTIONS_VERSION_KEY = "__vane_vllm_payload_version"
 _NATIVE_OPTIONS_PUBLIC_KEY = "__vane_vllm_public_options_json"
 _NATIVE_OPTIONS_SECRET_KEY = "__vane_vllm_secret_payload"
 
-# Top-level envelope field naming the inference engine ("vllm" | "sglang").
-# Absent on envelopes produced before engine dispatch existed, in which case
-# the C++ executor factory defaults to "vllm".
+# Required top-level envelope field naming the inference engine
+# ("vllm" | "sglang"). Every envelope builder writes it; the decoder and the
+# C++ executor factory reject envelopes that omit it instead of defaulting.
 _NATIVE_OPTIONS_ENGINE_KEY = "engine"
 
 # Required top-level fields that identify a value as an opaque options
@@ -181,8 +181,12 @@ def _unpack_native_options_envelope(options: dict[str, Any]) -> dict[str, Any]:
     if unexpected:
         raise ValueError(f"vllm native options envelope has unexpected fields: {', '.join(sorted(unexpected))}")
     engine = options.get(_NATIVE_OPTIONS_ENGINE_KEY)
-    if engine is not None and not isinstance(engine, str):
+    if engine is None:
+        raise ValueError("vllm native options envelope is missing the 'engine' field")
+    if not isinstance(engine, str):
         raise TypeError("vllm native options engine must be a string")
+    if not engine:
+        raise ValueError("vllm native options engine must not be empty")
 
     version = options[_NATIVE_OPTIONS_VERSION_KEY]
     if isinstance(version, bool) or not isinstance(version, int) or version != _NATIVE_OPTIONS_PAYLOAD_VERSION:

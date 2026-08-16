@@ -1809,9 +1809,9 @@ def ensure_named_vllm_pools_for_plan(
 
             # Parse options through the matching backend's normalize_options.
             raw_opts = node.get("options")
-            engine = "vllm"
-            if isinstance(raw_opts, dict):
-                engine = str(raw_opts.get("engine") or "vllm")
+            engine = raw_opts.get("engine") if isinstance(raw_opts, dict) else None
+            if engine not in ("vllm", "sglang"):
+                raise ValueError("distributed inference node options are missing a valid 'engine' field")
 
             if engine == "sglang":
                 from vane.execution.sglang import SGLangRayLocalExecutor
