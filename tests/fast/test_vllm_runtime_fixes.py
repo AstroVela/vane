@@ -577,6 +577,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
     import vane.execution.vllm as vllm
+    import vane.execution._llm_executor as llm_executor
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
     executor.llm = None
@@ -605,7 +606,7 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
         sleep_calls.append(delay)
 
     monkeypatch.setenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", "10")
-    monkeypatch.setattr(vllm, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(llm_executor, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
     monkeypatch.setattr(vllm.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="abort waiter timeout-wait did not acknowledge termination"):

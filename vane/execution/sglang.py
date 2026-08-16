@@ -4,22 +4,20 @@
 """SGLang inference backend executor.
 
 This module is the SGLang sibling of :mod:`vane.execution.vllm`. It implements
-the same engine-agnostic :class:`LLMExecutor` contract using SGLang's offline
-``Engine`` to run generations.
+the engine-agnostic :class:`LLMExecutor` contract using SGLang's offline
+``Engine`` to run generations. All submission/batching/wakeup/distributed
+machinery lives in :class:`LocalEngineExecutor`; this module supplies only the
+SGLang engine hooks.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import queue
-import threading
-from collections import deque
 from typing import Any
 
-import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
-
-from vane.ai.provider import _safe_provider_execution_error
-from vane.execution._llm_executor import LLMExecutor
+from vane.ai.provider import _SafeProviderError
+from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor
 from vane.execution._vllm_options_protocol import _unpack_native_options_envelope
 
 
@@ -31,179 +29,50 @@ class SGLangExecutor(LLMExecutor):
     """
 
 
-def _ensure_table(rows: Any) -> pa.Table:
-    if isinstance(rows, pa.Table):
-        return rows
-    if isinstance(rows, pa.RecordBatch):
-        return pa.Table.from_batches([rows])
-    if isinstance(rows, pa.RecordBatchReader):
-        return pa.Table.from_batches(list(rows))
-    raise TypeError("rows must be a pyarrow Table, RecordBatch, or RecordBatchReader")
+class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
+    """SGLang backend executor: local async engine.
 
+    Submission, batching, wakeup, and distributed routing live in
+    :class:`LocalEngineExecutor`; this class supplies only the SGLang engine
+    hooks.
+    """
 
-class SGLangLocalExecutor(SGLangExecutor):
-    """Local SGLang executor running the offline engine on a background thread."""
-
-    def __init__(
-        self,
-        model: str,
-        engine_args: dict[str, Any],
-        generate_args: dict[str, Any],
-        on_error: str = "raise",
-        use_threading: bool = True,
-        engine_init_timeout_s: float | None = None,
-        force_background_thread: bool = False,
-    ):
-        del use_threading, force_background_thread  # local SGLang always uses a thread
-        self.model = model
-        self.engine_args = dict(engine_args or {})
-        self.generate_args = dict(generate_args or {})
-        self.on_error = on_error
-        self.engine_init_timeout_s = engine_init_timeout_s
-
-        self.engine: Any = None
-        self.engine_error_message: str | None = None
-        self.error_message: str | None = None
-        self.error_lock = threading.Lock()
-        self.engine_ready = threading.Event()
-
-        self.sampling_params = self._materialize_sampling_params(self.generate_args)
-
-        self.counter = 0
-        self.counter_lock = threading.Lock()
-        self.running_task_count = 0
-        self.task_count_lock = threading.Lock()
-        self.completed_tasks: deque[tuple[str | None, pa.Table]] = deque()
-        self._finished_submitting = False
-        self._shutdown_called = False
-        self._result_cv = threading.Condition(threading.RLock())
-        self._ensure_wakeup_state()
-
-        self._submit_queue: queue.Queue[tuple[str, str, pa.Table] | None] = queue.Queue()
-        self._engine_thread = threading.Thread(target=self._engine_loop, daemon=True)
-        self._engine_thread.start()
+    _engine_name = "sglang"
 
     def _materialize_sampling_params(self, generate_args: dict[str, Any]) -> Any:
         from sglang import SamplingParams  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        sampling_params = generate_args.get("sampling_params", {})
+        sampling_params = generate_args.pop("sampling_params", None)
+        if sampling_params is None:
+            return SamplingParams()
+        if isinstance(sampling_params, SamplingParams):
+            return sampling_params
         if isinstance(sampling_params, str):
-            sampling_params = json.loads(sampling_params)
-        if not isinstance(sampling_params, dict):
-            raise TypeError("sglang sampling_params must be a dict or JSON string")
-        return SamplingParams(**sampling_params)
-
-    def _engine_loop(self) -> None:
-        try:
-            from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
-
-            self.engine = Engine(model_path=self.model, **self.engine_args)
-        except Exception as exc:
-            error_message = str(_safe_provider_execution_error("sglang", self.model, "engine initialization", exc))
-            if self.on_error == "raise":
-                with self.error_lock:
-                    if self.error_message is None:
-                        self.error_message = error_message
-            self.engine_error_message = error_message
-            self.engine_ready.set()
-            return
-        self.engine_ready.set()
-
-        while True:
-            item = self._submit_queue.get()
-            if item is None:
-                break
-            _request_id, prompt, row = item
             try:
-                output = self.engine.generate(prompt, self.sampling_params)
-                self.completed_tasks.append((self._extract_output_text(output), row))
-            except Exception as exc:
-                if self.on_error == "raise":
-                    error_message = str(_safe_provider_execution_error("sglang", self.model, "generation", exc))
-                    with self.error_lock:
-                        if self.error_message is None:
-                            self.error_message = error_message
-                    self._notify_state_change(force=True)
-                else:
-                    self.completed_tasks.append((None, row))
-            finally:
-                with self.task_count_lock:
-                    self.running_task_count -= 1
-                self._notify_state_change()
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("sglang sampling_params JSON could not be parsed") from exc
+        if isinstance(sampling_params, dict):
+            return SamplingParams(**sampling_params)
+        raise TypeError("sglang sampling_params must be a dict, JSON string, or SamplingParams instance")
 
-    def _extract_output_text(self, output: Any) -> str:
+    def _create_engine(self) -> None:
+        from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+        self.llm = Engine(model_path=self.model, **self.engine_args)
+
+    async def _run_generate(self, prompt: str, request_id: str) -> str:
+        del request_id  # SGLang's offline Engine is synchronous; no per-request id.
+        output = await asyncio.to_thread(self.llm.generate, prompt, self.sampling_params)
+        if output is None:
+            raise _SafeProviderError("sglang returned no outputs")
+        return self._extract_output_text(output)
+
+    @staticmethod
+    def _extract_output_text(output: Any) -> str:
         if isinstance(output, dict):
             return str(output["text"])
         return str(getattr(output, "text"))
-
-    def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
-        rows = _ensure_table(rows)
-        if len(prompts) != rows.num_rows:
-            raise ValueError("Number of prompts and rows must match")
-        if not self.engine_ready.is_set():
-            self._wait_for_engine_ready_blocking()
-        if self.engine_error_message is not None:
-            if self.on_error == "raise":
-                raise RuntimeError(f"sglang engine init failed: {self.engine_error_message}")
-            for i in range(rows.num_rows):
-                self.completed_tasks.append((None, rows.slice(i, 1)))
-            self._notify_state_change(force=True)
-            return
-        with self.task_count_lock:
-            self.running_task_count += len(prompts)
-        for i, prompt in enumerate(prompts):
-            with self.counter_lock:
-                request_id = str(self.counter)
-                self.counter += 1
-            self._submit_queue.put((request_id, prompt, rows.slice(i, 1)))
-        self._notify_state_change(force=True)
-
-    def take_ready_result(self) -> tuple[list[str | None], pa.Table] | None:
-        if self.error_message is not None:
-            raise RuntimeError(f"sglang task failed: {self.error_message}")
-        if not self.completed_tasks:
-            return None
-        output, row = self.completed_tasks.popleft()
-        self._notify_state_change()
-        return [output], row
-
-    def finished_submitting(self) -> None:
-        self._finished_submitting = True
-        self._notify_state_change(force=True)
-
-    def all_tasks_finished(self) -> bool:
-        with self.task_count_lock:
-            return self._finished_submitting and self.running_task_count == 0 and len(self.completed_tasks) == 0
-
-    def _wakeup_ready(self) -> bool:
-        if self._shutdown_called or self.error_message is not None:
-            return True
-        if self.completed_tasks:
-            return True
-        return self._finished_submitting and self.running_task_count == 0
-
-    def wait_for_result(self) -> bool:
-        with self._result_cv:
-            self._result_cv.wait_for(self._wakeup_ready)
-            return self._wakeup_ready()
-
-    def _wait_for_engine_ready_blocking(self) -> None:
-        if self.engine_ready.is_set():
-            return
-        timeout_s = self.engine_init_timeout_s
-        if timeout_s is None:
-            self.engine_ready.wait()
-            return
-        if not self.engine_ready.wait(timeout_s):
-            raise RuntimeError(f"sglang engine init did not finish before deadline ({timeout_s:.3f}s)")
-
-    def shutdown(self) -> None:
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        self._finished_submitting = True
-        self._notify_state_change(force=True)
-        self._submit_queue.put(None)
 
 
 class _NormalizedSGLangOptions(dict[str, Any]):
