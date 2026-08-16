@@ -25,6 +25,16 @@ public:
 
 struct ParquetMultiFileInfo : MultiFileReaderInterface {
 	static unique_ptr<MultiFileReaderInterface> CreateInterface(ClientContext &context);
+	//! Export and restore the Parquet-owned state transported by parquet_scan's ordinary
+	//! bind serde. Extensions that wrap parquet_scan use these helpers from their own
+	//! bind serde. Before deserializing, the caller must install the outer bind's file
+	//! list, reader, and initialized interface. DeserializeBindData sets only
+	//! file_options and bind_data.
+	DUCKDB_API static ParquetOptionsSerialization SerializeBindData(const MultiFileBindData &bind_data,
+	                                                                idx_t &initial_file_row_groups,
+	                                                                idx_t &initial_file_cardinality);
+	DUCKDB_API static void DeserializeBindData(MultiFileBindData &bind_data, ParquetOptionsSerialization serialization,
+	                                           idx_t initial_file_row_groups, idx_t initial_file_cardinality);
 
 	unique_ptr<BaseFileReaderOptions> InitializeOptions(ClientContext &context,
 	                                                    optional_ptr<TableFunctionInfo> info) override;

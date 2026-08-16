@@ -675,6 +675,53 @@ def test_execute_native_rejects_missing_distributed_scan_assignment(tmp_path):
         con.close()
 
 
+def test_parquet_bind_serde_preserves_worker_scan_options(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    partition_dir = tmp_path / "region=west"
+    partition_dir.mkdir()
+    source = partition_dir / "bind_state.parquet"
+    con = vane.connect()
+    try:
+        con.execute(f"COPY (SELECT 42::INTEGER AS value) TO '{source}' (FORMAT PARQUET)")
+        relation = con.sql(
+            f"""
+            SELECT value, region, filename, file_row_number
+            FROM read_parquet(
+                '{tmp_path}/*/*.parquet',
+                hive_partitioning = true,
+                filename = true,
+                file_row_number = true
+            )
+            """
+        )
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "parquet-wrapper-bind-serde",
+        ).to_physical_plan(con)
+        descriptor_map = plan.scan_task_descriptor_map()
+        assert len(descriptor_map) == 1
+        node_id, descriptors = next(iter(descriptor_map.items()))
+        assert len(descriptors) == 1
+
+        result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            con.cursor(),
+            plan,
+            scan_task={str(node_id): bytes(descriptors[0])},
+        )
+
+        assert result.completion_status == "ok"
+        assert len(result.partition_payloads) == 1
+        table = result.partition_payloads[0]
+        assert isinstance(table, pa.Table)
+        assert table.num_columns == 4
+        assert table.column(0).to_pylist() == [42]
+        assert table.column(1).to_pylist() == ["west"]
+        assert table.column(2).to_pylist() == [str(source)]
+        assert table.column(3).to_pylist() == [0]
+    finally:
+        con.close()
+
+
 def test_execute_native_rejects_static_and_fte_exchange_assignment_for_same_node():
     con = vane.connect()
     plan = _make_test_physical_plan(con)

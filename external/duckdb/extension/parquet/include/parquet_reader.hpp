@@ -130,8 +130,8 @@ struct ParquetOptionsSerialization {
 	MultiFileOptions file_options;
 
 public:
-	void Serialize(Serializer &serializer) const;
-	static ParquetOptionsSerialization Deserialize(Deserializer &deserializer);
+	DUCKDB_API void Serialize(Serializer &serializer) const;
+	DUCKDB_API static ParquetOptionsSerialization Deserialize(Deserializer &deserializer);
 };
 
 struct ParquetUnionData : public BaseUnionData {
