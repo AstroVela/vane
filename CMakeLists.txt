@@ -189,6 +189,7 @@ pybind11_add_module(
 # Add Vane's Python and engine dependencies.
 target_link_libraries(_native PRIVATE vane_python_dependencies)
 duckdb_link_extensions(_native)
+duckdb_stage_loadable_extensions()
 
 # ────────────────────────────────────────────
 # Controlling symbol export

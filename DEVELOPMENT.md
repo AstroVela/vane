@@ -44,6 +44,30 @@ Python-only changes do not require a native rebuild, but reinstall the
 non-editable package so the test environment receives them. Changes below
 `src/vane_py/` or `external/duckdb/src/` require an incremental native build.
 
+## Building a loadable extension artifact
+
+`VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
+`.duckdb_extension` artifacts without linking them into `vane._native`. The
+default is empty, so base Vane builds and wheels do not contain staged optional
+extensions. For example, build and exercise the in-tree `tpch` artifact:
+
+```bash
+export SKBUILD_BUILD_DIR="$PWD/build/python-release"
+export SKBUILD_CMAKE_BUILD_TYPE=Release
+uv pip install . --no-build-isolation \
+  -Ccmake.define.VANE_LOADABLE_EXTENSIONS=tpch
+cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
+VANE_TEST_LOADABLE_EXTENSION_PATH=\
+"$SKBUILD_BUILD_DIR/vane_extensions/tpch.duckdb_extension" \
+  scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py
+```
+
+Loadable artifacts require `EXTENSION_STATIC_BUILD=ON`. This keeps each
+artifact self-contained and preserves Vane's private `_native` symbol boundary.
+The staging directory is configurable with
+`VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`; packaging and trusted artifact
+metadata are intentionally handled separately.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test
