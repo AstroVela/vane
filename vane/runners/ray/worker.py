@@ -19,6 +19,7 @@ from typing import Any, NamedTuple, cast
 import ray
 
 from vane._ray_cxx import require_ray_cxx_attr
+from vane.extensions import _dynamic_extension_snapshot_cache_identity
 
 # Avoid importing C++ bindings at module import time (may not be registered yet).
 # Resolve `vane.ray_cxx` attributes lazily at use-time instead.
@@ -263,6 +264,7 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     s3_session_id: str
     effective_s3_config_identity: str
     use_session_credentials: bool
+    dynamic_extensions: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def has_static_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
@@ -370,6 +372,11 @@ def _worker_snapshot_database_identity(
         extensions.append((name, version))
     extensions.sort()
 
+    raw_dynamic_extensions = snapshot.get("dynamic_extensions")
+    if not isinstance(raw_dynamic_extensions, list):
+        raise TypeError("query connection snapshot dynamic_extensions must be a list")
+    dynamic_extensions = _dynamic_extension_snapshot_cache_identity(raw_dynamic_extensions)
+
     raw_distributed_contracts = snapshot.get("distributed_extension_contracts")
     if not isinstance(raw_distributed_contracts, list):
         raise TypeError("query connection snapshot distributed_extension_contracts must be a list")
@@ -418,6 +425,7 @@ def _worker_snapshot_database_identity(
         s3_session_id,
         s3_config_identity,
         identity_uses_session_credentials,
+        dynamic_extensions,
     )
 
 

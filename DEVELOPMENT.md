@@ -65,8 +65,55 @@ VANE_TEST_LOADABLE_EXTENSION_PATH=\
 Loadable artifacts require `EXTENSION_STATIC_BUILD=ON`. This keeps each
 artifact self-contained and preserves Vane's private `_native` symbol boundary.
 The staging directory is configurable with
-`VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`; packaging and trusted artifact
-metadata are intentionally handled separately.
+`VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`.
+
+## Building an optional extension wheel
+
+The base `vane-ai` wheel must stay free of optional `.duckdb_extension`
+artifacts. Package one already-staged, release-approved artifact into a
+separate platform wheel instead:
+
+```bash
+python scripts/build_extension_wheel.py \
+  --artifact "$SKBUILD_BUILD_DIR/vane_extensions/<extension>.duckdb_extension" \
+  --extension-name <extension> \
+  --platform-tag linux_x86_64 \
+  --trust-identity astrovela/vane \
+  --license-expression "Apache-2.0 AND MIT" \
+  --license-file LICENSE \
+  --license-file LICENSES/DuckDB-MIT.txt \
+  --output-directory dist/extensions
+```
+
+The generated wheel has an exact `vane-ai` dependency, embeds a versioned
+descriptor, and publishes a `vane.dynamic_extension_providers` entry point.
+The build command uses the installed Vane runtime to create that descriptor, so
+run it after installing Vane with the development build procedure above.
+Supply every license required by the selected artifact explicitly; the builder
+does not infer licenses or reuse the base wheel's metadata. Supply a valid,
+corresponding SPDX expression with `--license-expression` as well.
+Its platform tag must match the platform embedded in the extension artifact;
+the builder rejects a mismatched OS, architecture, or Linux libc-family tag.
+Pass that provider explicitly to `DynamicExtensionResolver`; neither installing
+a wheel nor using the resolver performs a network lookup. For Ray execution,
+the resolver records the exact loaded descriptor, artifact digest, and
+dependency order in the connection snapshot. A worker resolves only the named,
+preinstalled `vane.dynamic_extension_providers` entry points before it
+deserializes the plan. It never receives a coordinator-local artifact path,
+scans a directory, or downloads an extension; it also keeps unsigned loading,
+autoloading, and autoinstalling disabled. Validate a base and extension wheel
+together in a clean environment with:
+
+```bash
+python scripts/verify_extension_wheel.py \
+  --base-wheel dist/vane_ai-*.whl \
+  --extension-wheel dist/extensions/vane_extension_<extension>-*.whl \
+  --extension-name <extension> \
+  --trust-identity astrovela/vane
+```
+
+`tpch` remains an in-tree build/test artifact only: its source has additional
+redistribution terms and it must not be published as an extension wheel.
 
 ## Native C++ tests
 

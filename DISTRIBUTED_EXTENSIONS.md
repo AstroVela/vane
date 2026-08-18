@@ -105,12 +105,23 @@ method, matching DuckDB's `OperatorExtension`, `ParserExtension`,
 ## Build and loading
 
 The connection snapshot records the content-derived DuckDB `SourceID`, every
-loaded static extension name and exact extension version, and a sorted list of
-canonical distributed contract identities. A worker first validates its
-`SourceID`, invokes DuckDB's generated static loader, compares the loaded
-extension identities, and then compares the registered contracts before
-deserializing a plan. Dynamically
-installed extension binaries are not accepted by distributed execution.
+loaded static extension name and exact extension version, an ordered dynamic
+artifact list, and a sorted list of canonical distributed contract identities.
+Each dynamic entry contains the immutable descriptor, SHA-256 artifact digest,
+and declared dependency order. The coordinator records an entry only after
+`DynamicExtensionResolver` has verified and loaded it; a non-static extension
+loaded by another route is rejected while the snapshot is captured.
+
+A worker first validates its `SourceID`, resolves each dynamic entry from the
+matching preinstalled `vane.dynamic_extension_providers` entry point, verifies
+the descriptor and bytes, loads the dependency order, invokes DuckDB's
+generated static loader, compares loaded extension identities, and then
+compares registered contracts before deserializing a plan. The worker never
+receives a coordinator-local artifact path, scans a directory, or downloads an
+extension. It keeps unsigned loading, autoloading, and autoinstalling disabled;
+missing, altered, unsigned, platform-incompatible, or provider-disagreed
+artifacts fail deterministically. The exact dynamic descriptors and order are
+part of the worker DatabaseInstance cache identity.
 
 The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.

@@ -38,7 +38,7 @@ def _snapshot_database_identity(
     session_id="test-session",
 ):
     return worker_module._worker_snapshot_database_identity(
-        snapshot,
+        {"dynamic_extensions": [], **snapshot},
         session_id=session_id,
         effective_s3_config=effective_s3_config or {},
         use_session_credentials=use_session_credentials,
@@ -383,6 +383,48 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
     assert actor._active_snapshot_execution_cursors == 0
 
 
+def test_worker_snapshot_database_identity_includes_dynamic_artifact_identity():
+    base_snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "dynamic_extensions": [],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+
+    def dynamic_snapshot(digest):
+        return {
+            **base_snapshot,
+            "dynamic_extensions": [
+                {
+                    "descriptor": {
+                        "format_version": 1,
+                        "name": "dynamic_test",
+                        "extension_version": "test-version",
+                        "abi_type": "CPP",
+                        "duckdb_source_id": "a" * 40,
+                        "vane_version": "test-vane-version",
+                        "platform": "linux_amd64",
+                        "sha256": digest,
+                        "trust_identity": "test-provider",
+                        "dependencies": [],
+                    },
+                    "dependency_order": [],
+                }
+            ],
+        }
+
+    no_dynamic_identity = _snapshot_database_identity(base_snapshot)
+    first_dynamic_identity = _snapshot_database_identity(dynamic_snapshot("1" * 64))
+    same_dynamic_identity = _snapshot_database_identity(dynamic_snapshot("1" * 64))
+    altered_dynamic_identity = _snapshot_database_identity(dynamic_snapshot("2" * 64))
+
+    assert first_dynamic_identity == same_dynamic_identity
+    assert no_dynamic_identity != first_dynamic_identity
+    assert first_dynamic_identity != altered_dynamic_identity
+    assert first_dynamic_identity.dynamic_extensions
+
+
 def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch):
     actor_class, actor = _worker_actor()
     base_snapshot = {
@@ -611,6 +653,21 @@ def test_worker_snapshot_database_identity_omits_s3_state_without_httpfs():
 def test_worker_snapshot_database_identity_rejects_ambiguous_contract(snapshot, message):
     with pytest.raises((TypeError, ValueError), match=message):
         _snapshot_database_identity(snapshot)
+
+
+def test_worker_snapshot_database_identity_requires_dynamic_extension_snapshot():
+    with pytest.raises(TypeError, match="dynamic_extensions must be a list"):
+        worker_module._worker_snapshot_database_identity(
+            {
+                "duckdb_source_id": "test-source-id",
+                "extensions": [],
+                "distributed_extension_contracts": [],
+                "settings": [],
+            },
+            session_id="test-session",
+            effective_s3_config={},
+            use_session_credentials=True,
+        )
 
 
 def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(monkeypatch):

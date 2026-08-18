@@ -255,6 +255,13 @@ def test_wheel_rejects_every_import_or_distribution_root_not_owned_by_vane(membe
         check_release_artifacts._check_wheel(artifact, TEST_LAYOUT)
 
 
+def test_base_wheel_rejects_a_dynamic_extension_artifact():
+    artifact = _NamesOnlyArtifact(["vane/extensions/tpch.duckdb_extension"])
+
+    with pytest.raises(ValueError, match="must not contain optional extension artifacts"):
+        check_release_artifacts._check_wheel(artifact, TEST_LAYOUT)
+
+
 @pytest.mark.parametrize("required_path", REQUIRED_WHEEL_PATHS)
 def test_wheel_required_files_must_use_their_exact_install_paths(required_path):
     decoy = (

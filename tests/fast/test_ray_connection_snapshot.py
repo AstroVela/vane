@@ -8,6 +8,7 @@ import threading
 import pytest
 
 import vane
+import vane.extensions as extension_module
 
 
 def _require_ray_cxx():
@@ -25,6 +26,29 @@ def _table_from_native_result(result):
     if len(payloads) == 1:
         return payloads[0]
     return pa.concat_tables(payloads)
+
+
+def _dynamic_snapshot_entry(*, sha256="1" * 64, dependencies=(), dependency_order=()):
+    connection = vane.connect()
+    try:
+        platform = connection.execute("SELECT platform FROM pragma_platform()").fetchone()[0]
+    finally:
+        connection.close()
+    return {
+        "descriptor": {
+            "format_version": 1,
+            "name": "dynamic_test",
+            "extension_version": "test-version",
+            "abi_type": "CPP",
+            "duckdb_source_id": vane.__git_revision__,
+            "vane_version": vane.__version__,
+            "platform": platform,
+            "sha256": sha256,
+            "trust_identity": "test-provider",
+            "dependencies": list(dependencies),
+        },
+        "dependency_order": list(dependency_order),
+    }
 
 
 def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
@@ -786,6 +810,7 @@ def test_connection_snapshot_captures_exact_extension_contract():
     assert snapshot["duckdb_source_id"]
     assert isinstance(snapshot["extensions"], list)
     assert all(set(extension) >= {"name", "version"} for extension in snapshot["extensions"])
+    assert snapshot["dynamic_extensions"] == []
     assert snapshot["distributed_extension_contracts"] == [
         "vane_core{table_function:datasource_scan@1}",
     ]
@@ -901,6 +926,7 @@ def test_logical_snapshot_validates_manifest_before_applying_effective_s3_config
     [
         ("duckdb_source_id", "missing duckdb_source_id"),
         ("extensions", "extensions must be a list"),
+        ("dynamic_extensions", "dynamic_extensions must be a list"),
         ("distributed_extension_contracts", "distributed_extension_contracts must be a list"),
     ],
 )
@@ -1002,6 +1028,88 @@ def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_pa
     assert "sqlite_scanner" in message
     assert "Failed to download extension" not in message
     assert not extension_directory.exists()
+
+
+def test_snapshot_replay_rejects_missing_dynamic_provider_without_downloading(tmp_path, monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    monkeypatch.setattr(extension_module, "entry_points", lambda *, group: ())
+
+    source_conn = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-missing-dynamic-provider",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["dynamic_extensions"] = [_dynamic_snapshot_entry()]
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+
+    extension_directory = tmp_path / "extensions"
+    worker_connection = vane.connect(
+        config={
+            "allow_unsigned_extensions": "true",
+            "autoinstall_known_extensions": "true",
+            "autoload_known_extensions": "true",
+            "extension_directory": str(extension_directory),
+        }
+    )
+    worker_connection.execute("SET custom_extension_repository = 'http://127.0.0.1:9'")
+
+    with pytest.raises(Exception, match="VANE_DYNAMIC_EXTENSION_PROVIDER_NOT_FOUND"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(worker_connection.cursor(), replay_plan)
+
+    settings = dict(
+        worker_connection.execute(
+            """
+            SELECT name, value
+            FROM duckdb_settings()
+            WHERE name IN ('allow_unsigned_extensions', 'autoinstall_known_extensions', 'autoload_known_extensions')
+            """
+        ).fetchall()
+    )
+    assert settings == {
+        "allow_unsigned_extensions": "false",
+        "autoinstall_known_extensions": "false",
+        "autoload_known_extensions": "false",
+    }
+    assert not extension_directory.exists()
+
+
+def test_snapshot_replay_rejects_dynamic_dependency_order_before_provider_lookup(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: pytest.fail("invalid dynamic snapshot must not discover providers"),
+    )
+    dependency = {
+        "name": "dependency",
+        "extension_version": "test-version",
+        "sha256": "2" * 64,
+    }
+    source_conn = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_conn.sql("SELECT 1"),
+        "snapshot-invalid-dynamic-dependency-order",
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["dynamic_extensions"] = [
+        _dynamic_snapshot_entry(
+            dependencies=(dependency,),
+            dependency_order=("dependency@test-version#sha256:" + "2" * 64,),
+        )
+    ]
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+
+    with pytest.raises(Exception, match="VANE_DYNAMIC_EXTENSION_SNAPSHOT_DEPENDENCY_ORDER"):
+        ray_cxx.DistributedPhysicalPlanRunner().execute_native(vane.connect().cursor(), replay_plan)
 
 
 def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):
