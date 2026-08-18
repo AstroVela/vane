@@ -109,6 +109,83 @@ python scripts/verify_extension_wheel.py \
 `tpch` remains an in-tree build/test artifact only: its source has additional
 redistribution terms and it must not be published as an extension wheel.
 
+## Publishing a signed extension repository
+
+An independently distributed platform wheel is the release artifact. A signed
+repository is an optional transport and cache layer for those same wheel
+contents; it never adds extension binaries to the base `vane-ai` wheel. The
+publisher copies the wheel's exact `.duckdb_extension` and descriptor bytes,
+retains prior immutable entries, and signs the complete sorted index with an
+Ed25519 key. Rebuilding a name/version/runtime/platform coordinate with
+different bytes is rejected; publish a new extension version instead.
+
+Install the small repository-verification extra only in environments that
+publish from or install through a signed repository:
+
+```bash
+uv pip install "vane-ai[extensions]"
+```
+
+Publish one or more platform wheels with a release-controlled signing key. The
+key file may contain 32 raw Ed25519 private-key bytes, base64-encoded raw bytes,
+or an Ed25519 PEM key. Keep it outside the checkout and CI logs.
+
+```bash
+python scripts/publish_extension_repository.py \
+  --extension-wheel dist/extensions/vane_extension_<extension>-*.whl \
+  --output-directory dist/extension-repository \
+  --repository-id astrovela/vane \
+  --signer-identity astrovela/vane \
+  --signing-key-file /secure/path/vane-extension-signing-key
+```
+
+The command prints the corresponding base64 public key. Pin that key,
+repository ID, signer identity, and repository URL in deployment configuration;
+the client accepts only `https://` (or an explicit mounted/local `file://` URL),
+never an implicit DuckDB or Vane default repository. Materialize an extension
+into an explicit cache before loading it:
+
+```bash
+python scripts/install_extension_from_repository.py \
+  --repository-url https://extensions.example.invalid/vane/ \
+  --repository-id astrovela/vane \
+  --signer-identity astrovela/vane \
+  --public-key-file /secure/path/vane-extension-signing-public-key \
+  --cache-directory /var/cache/vane/extensions \
+  --extension-name <extension>
+```
+
+The installer verifies the signed index before trusting descriptor locations,
+downloads the complete exact dependency closure, and revalidates the cached
+descriptor, digest, runtime SourceID, Vane version, platform, and extension
+footer. A missing or invalid cache entry is redownloaded only from that same
+pinned repository. It never falls back to a generic URL or an unsigned
+artifact. In Python, use the resulting explicit provider with the existing
+resolver:
+
+```python
+import base64
+
+import vane
+
+repository = vane.SignedExtensionRepository(
+    repository_url="https://extensions.example.invalid/vane/",
+    repository_id="astrovela/vane",
+    signer_identity="astrovela/vane",
+    trusted_public_key=base64.b64decode("<pinned-base64-ed25519-public-key>"),
+    cache_directory="/var/cache/vane/extensions",
+)
+installed = repository.install("<extension>")
+
+connection = vane.connect(config={"allow_unsigned_extensions": "true"})
+installed.resolver().load(connection, installed.descriptor)
+```
+
+Ray workers must remain network-free. This repository client is only a
+coordinator/local-install transport layer; it does not itself make dynamically
+installed extensions available to distributed execution. Do not construct
+`SignedExtensionRepository` inside a Ray task or actor.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test

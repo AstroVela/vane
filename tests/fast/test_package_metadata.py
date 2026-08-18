@@ -316,6 +316,11 @@ def test_provider_extras_match_provider_import_errors():
     assert "vllm" in _requirements_for_extra("vllm")
 
 
+def test_signed_extension_repository_crypto_stays_in_an_explicit_extra():
+    assert _requirements_for_extra("extensions") == {"cryptography"}
+    assert "cryptography" not in _base_requirements()
+
+
 def test_structured_provider_extras_require_supported_sdk_versions():
     openai = _requirement_for_extra("openai", "openai")
     google = _requirement_for_extra("google", "google-genai")

@@ -469,6 +469,8 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "vane_packaging/extension_wheel.py",
         "vane_packaging/setuptools_scm_version.py",
         "scripts/build_extension_wheel.py",
+        "scripts/install_extension_from_repository.py",
+        "scripts/publish_extension_repository.py",
         "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
