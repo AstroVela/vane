@@ -83,6 +83,9 @@ video = [ # video data source; decord is gated to Vane's supported native platfo
     "psutil>=5.9",
     "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
+extensions = [ # signed optional DuckDB extension repository verification
+    "cryptography>=43.0.0",
+]
 all = [ # Cloud providers and dataframe/filesystem integrations; local model runtimes stay opt-in.
     "anthropic>=0.117.0",
     "google-genai>=1.22.0",
@@ -107,6 +110,7 @@ build-backend = "build_backend"
 backend-path = ["."]
 requires = [
     "scikit-build-core>=0.11.4",
+	"packaging>=24.2",
 	"pybind11[global]>=3.0.0",
     "setuptools-scm>=9.2.0",
 ]
@@ -208,6 +212,9 @@ include = [
     "/scripts/bootstrap_vcpkg.sh",
     "cmake/**",
     "/scripts/check_release_artifacts.py",
+    "/scripts/build_extension_wheel.py",
+    "/scripts/install_extension_from_repository.py",
+    "/scripts/publish_extension_repository.py",
     "/scripts/run_installed_pytest.sh",
     "/scripts/run_release_tests.sh",
     "/scripts/resolve_duckdb_fork_version.py",
@@ -215,6 +222,7 @@ include = [
     "/scripts/sync_vcpkg_licenses.py",
     "/scripts/verify_base_install.py",
     "/scripts/verify_duckdb_coexistence.py",
+    "/scripts/verify_extension_wheel.py",
 
     # Curated base-installation release gate. The larger inherited test tree
     # stays in the repository and is intentionally not part of the PyPI sdist.
@@ -426,6 +434,7 @@ test = [ # dependencies used for running the complete test suite
     "adbc-driver-manager>=1.10.0; python_version >= '3.10' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
     "adbc-driver-manager>=1.7.0; python_version < '3.10' and (sys_platform != 'win32' or platform_machine != 'ARM64')",
     "coverage",
+    "cryptography>=43.0.0",
     "gcovr",
     "gcsfs; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "polars",

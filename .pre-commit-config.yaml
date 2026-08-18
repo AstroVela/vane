@@ -78,7 +78,7 @@ repos:
           - "--no-warn-unused-ignores"
         # Keep NumPy stubs compatible with mypy's Python 3.10 target while
         # allowing the NumPy 2.3 wheels available to Python 3.14 hooks.
-        additional_dependencies: ["numpy<2.4", polars]
+        additional_dependencies: ["cryptography>=43.0.0", "numpy<2.4", polars]
 
   - repo: local
     hooks:

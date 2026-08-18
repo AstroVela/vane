@@ -466,12 +466,17 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "external/duckdb/LICENSE",
         "build_backend.py",
         "vane_packaging/__init__.py",
+        "vane_packaging/extension_wheel.py",
         "vane_packaging/setuptools_scm_version.py",
+        "scripts/build_extension_wheel.py",
+        "scripts/install_extension_from_repository.py",
+        "scripts/publish_extension_repository.py",
         "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
         "scripts/verify_duckdb_coexistence.py",
+        "scripts/verify_extension_wheel.py",
         "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
@@ -565,6 +570,12 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
         if root in {"vane", layout.dist_info_root, EXPECTED_LIBRARY_ROOT}:
             continue
         raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
+
+    optional_artifacts = [name for name in names if name.endswith(".duckdb_extension")]
+    if optional_artifacts:
+        raise ValueError(
+            f"{artifact.path}: base Vane wheel must not contain optional extension artifacts: {optional_artifacts}"
+        )
 
     native_extensions = [
         name
