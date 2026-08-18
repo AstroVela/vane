@@ -240,6 +240,14 @@ class LocalEngineExecutor(LLMExecutor):
         """Construct the backend engine and assign it to `self.llm`."""
         pass
 
+    def _shutdown_engine(self) -> None:
+        """Release backend-owned engine resources (subprocesses, GPU memory).
+
+        The default is a no-op for backends whose engine releases resources on
+        garbage collection. Backends with explicit process/GPU ownership (for
+        example SGLang's offline Engine) override this.
+        """
+
     @abstractmethod
     async def _run_generate(self, prompt: str, request_id: str) -> str:
         """Run one prompt and return the generated text."""
@@ -729,6 +737,7 @@ class LocalEngineExecutor(LLMExecutor):
         loop = getattr(self, "loop", None)
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
+        self._shutdown_engine()
 
 
 class RayActorExecutorMixin:

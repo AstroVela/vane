@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -45,7 +46,63 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
 
     def build_physical_vllm_options(self) -> dict[str, Any]:
         options = dict(self.sglang_options)
+
+        # PhysicalVLLM invokes the executor through a synchronous C++ bridge.
+        # Inside a generic Ray actor that bridge still needs a dedicated
+        # event-loop thread rather than Ray's async actor loop.
+        options["use_threading"] = True
+        options["_force_background_thread"] = True
         options["on_error"] = "null" if self.on_error == "ignore" else "raise"
+
+        # Lower accepted prompt controls into SGLang sampling params so they are
+        # not silently dropped. SGLang names the output-length field
+        # max_new_tokens; accept vLLM's max_tokens as an alias (max_new_tokens
+        # wins when both are supplied).
+        sampling_overrides: dict[str, Any] = {}
+        max_tokens = options.pop("max_tokens", None)
+        if max_tokens is not None:
+            sampling_overrides["max_new_tokens"] = max_tokens
+        for name in ("max_new_tokens", "temperature"):
+            value = options.pop(name, None)
+            if value is not None:
+                sampling_overrides[name] = value
+
+        generate_args = options.get("generate_args")
+        has_sampling_params = isinstance(generate_args, Mapping) and generate_args.get("sampling_params") is not None
+        if self.return_format is None and not sampling_overrides and not has_sampling_params:
+            return options
+
+        if generate_args is None:
+            generate_args = {}
+        elif isinstance(generate_args, Mapping):
+            generate_args = dict(generate_args)
+        else:
+            raise TypeError("SGLang generate_args must be a mapping when sampling parameters are configured")
+        options["generate_args"] = generate_args
+
+        sampling_params = generate_args.get("sampling_params")
+        if sampling_params is None:
+            sampling_params = {}
+        elif isinstance(sampling_params, str):
+            try:
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("SGLang sampling_params JSON could not be parsed") from exc
+            if not isinstance(sampling_params, dict):
+                raise TypeError("SGLang sampling_params JSON must decode to an object")
+        elif isinstance(sampling_params, Mapping):
+            sampling_params = dict(sampling_params)
+        else:
+            raise TypeError("SGLang sampling_params must be a mapping or JSON string")
+        generate_args["sampling_params"] = sampling_params
+
+        for name, value in sampling_overrides.items():
+            sampling_params.setdefault(name, value)
+        if self.return_format is not None:
+            # SGLang's SamplingParams carries JSON-mode decoding via json_schema
+            # (a JSON-schema string), unlike vLLM's structured_outputs object.
+            sampling_params["json_schema"] = json.dumps(self.return_format)
+
         return options
 
 

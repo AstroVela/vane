@@ -22,14 +22,33 @@ class _FakeEngine:
     def __init__(self, model_path=None, **kwargs):
         self.model_path = model_path
         self.kwargs = kwargs
+        self.shutdown_called = False
+        self.generate_calls: list[tuple[str, dict[str, object]]] = []
 
-    def generate(self, prompt, sampling_params):
+    def generate(self, prompt, sampling_params, **generate_args):
         del sampling_params
+        self.generate_calls.append((prompt, dict(generate_args)))
         return {"text": f"generated:{prompt}"}
 
+    def shutdown(self):
+        self.shutdown_called = True
 
-def _fake_sglang():
-    return types.SimpleNamespace(Engine=_FakeEngine, SamplingParams=_FakeSamplingParams)
+
+def _install_fake_sglang(monkeypatch):
+    """Register a fake SGLang package with the documented import path."""
+    sampling_params_module = types.ModuleType("sglang.srt.sampling.sampling_params")
+    sampling_params_module.SamplingParams = _FakeSamplingParams
+    sampling_module = types.ModuleType("sglang.srt.sampling")
+    sampling_module.sampling_params = sampling_params_module
+    srt_module = types.ModuleType("sglang.srt")
+    srt_module.sampling = sampling_module
+    sglang_module = types.ModuleType("sglang")
+    sglang_module.Engine = _FakeEngine
+    sglang_module.srt = srt_module
+    monkeypatch.setitem(sys.modules, "sglang", sglang_module)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_module)
+    monkeypatch.setitem(sys.modules, "sglang.srt.sampling", sampling_module)
+    monkeypatch.setitem(sys.modules, "sglang.srt.sampling.sampling_params", sampling_params_module)
 
 
 def test_sglang_hierarchy_and_normalize():
@@ -49,7 +68,7 @@ def test_sglang_hierarchy_and_normalize():
 
 
 def test_sglang_local_executor_roundtrip(monkeypatch):
-    monkeypatch.setitem(sys.modules, "sglang", _fake_sglang())
+    _install_fake_sglang(monkeypatch)
     from vane.execution.sglang import SGLangLocalExecutor
 
     executor = SGLangLocalExecutor("test-model", {}, {"sampling_params": {"max_new_tokens": 8}})
@@ -65,8 +84,43 @@ def test_sglang_local_executor_roundtrip(monkeypatch):
         executor.shutdown()
 
 
+def test_sglang_local_executor_shutdown_releases_engine(monkeypatch):
+    _install_fake_sglang(monkeypatch)
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor("test-model", {}, {})
+    try:
+        assert executor.llm is not None
+        assert executor.llm.shutdown_called is False
+        executor.shutdown()
+        assert executor.llm.shutdown_called is True
+    finally:
+        executor.shutdown()
+
+
+def test_sglang_generate_forwards_generate_args(monkeypatch):
+    _install_fake_sglang(monkeypatch)
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor(
+        "test-model",
+        {},
+        {"sampling_params": {"max_new_tokens": 8}, "return_logprob": True},
+    )
+    try:
+        rows = pa.table({"prompt": ["hello"]})
+        executor.submit(None, ["hello"], rows)
+        executor.finished_submitting()
+        assert executor.wait_for_result()
+        outputs, _out_rows = executor.take_ready_result()
+        assert outputs == ["generated:hello"]
+        assert executor.llm.generate_calls[0][1] == {"return_logprob": True}
+    finally:
+        executor.shutdown()
+
+
 def test_sglang_engine_dispatch_via_sql(monkeypatch):
-    monkeypatch.setitem(sys.modules, "sglang", _fake_sglang())
+    _install_fake_sglang(monkeypatch)
     import vane
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
@@ -85,7 +139,7 @@ def test_sglang_engine_dispatch_via_sql(monkeypatch):
 
 
 def test_sglang_prompt_expression_end_to_end(monkeypatch):
-    monkeypatch.setitem(sys.modules, "sglang", _fake_sglang())
+    _install_fake_sglang(monkeypatch)
     import vane
 
     conn = vane.connect()
@@ -148,3 +202,23 @@ def test_sglang_ray_local_executor_hierarchy():
     assert issubclass(SGLangRayLocalExecutor, SGLangLocalExecutor)
     assert issubclass(SGLangRayLocalExecutor, RayActorExecutorMixin)
     assert inspect.iscoroutinefunction(SGLangRayLocalExecutor.wait_for_result)
+
+
+def test_sglang_plan_lowers_prompt_controls_into_sampling_params():
+    from vane.ai.providers.sglang import NativeSGLangPromptPlan
+
+    plan = NativeSGLangPromptPlan(
+        sglang_options={"max_tokens": 32, "max_new_tokens": 40, "temperature": 0.7},
+        return_format={"type": "object"},
+        on_error="ignore",
+    )
+    options = plan.build_physical_vllm_options()
+
+    assert options["use_threading"] is True
+    assert options["_force_background_thread"] is True
+    assert options["on_error"] == "null"
+
+    sampling = options["generate_args"]["sampling_params"]
+    assert sampling["max_new_tokens"] == 40  # max_new_tokens wins over max_tokens
+    assert sampling["temperature"] == 0.7
+    assert sampling["json_schema"] == '{"type": "object"}'
