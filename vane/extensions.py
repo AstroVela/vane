@@ -12,8 +12,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
+import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, NoReturn, Protocol
 
@@ -27,6 +30,8 @@ _HEX_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9_]+$")
 _TRUST_IDENTITY_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP = "vane.dynamic_extension_providers"
+_DYNAMIC_EXTENSION_SNAPSHOT_ENTRY_KEYS = frozenset({"descriptor", "dependency_order"})
 
 
 class DynamicExtensionError(RuntimeError):
@@ -357,6 +362,355 @@ class _ExtensionConnection(Protocol):
     def load_extension(self, extension: str) -> None: ...
 
 
+@dataclass(frozen=True)
+class _DynamicExtensionSnapshotEntry:
+    """One ordered dynamic artifact entry retained for distributed replay."""
+
+    descriptor: DynamicExtensionDescriptor
+    dependency_order: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "descriptor": self.descriptor.to_dict(),
+            "dependency_order": list(self.dependency_order),
+        }
+
+
+# Vane's native connections retain these entries in their Vane session so
+# cursors share the exact same state. Protocol-only connections use weak state
+# solely so resolver unit doubles can exercise the same invariant without
+# retaining a closed connection.
+_protocol_snapshot_entries_lock = threading.Lock()
+_protocol_snapshot_entries_by_connection: dict[
+    int,
+    tuple[weakref.ReferenceType[object], list[str]],
+] = {}
+
+
+def _discard_protocol_snapshot_entries(connection_id: int, reference: weakref.ReferenceType[object]) -> None:
+    with _protocol_snapshot_entries_lock:
+        cached = _protocol_snapshot_entries_by_connection.get(connection_id)
+        if cached is not None and cached[0] is reference:
+            _protocol_snapshot_entries_by_connection.pop(connection_id, None)
+
+
+def _protocol_snapshot_entries(connection: _ExtensionConnection, *, create: bool) -> list[str]:
+    connection_id = id(connection)
+    with _protocol_snapshot_entries_lock:
+        cached = _protocol_snapshot_entries_by_connection.get(connection_id)
+        if cached is not None and cached[0]() is connection:
+            return cached[1]
+        if not create:
+            return []
+        try:
+            reference = weakref.ref(
+                connection,
+                lambda reference: _discard_protocol_snapshot_entries(connection_id, reference),
+            )
+        except TypeError as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_UNAVAILABLE",
+                "dynamic extension snapshots require a weak-referenceable protocol connection",
+            ) from exception
+        entries: list[str] = []
+        _protocol_snapshot_entries_by_connection[connection_id] = (reference, entries)
+        return entries
+
+
+def _dynamic_extension_snapshot_entry(candidate: ResolvedDynamicExtension) -> _DynamicExtensionSnapshotEntry:
+    return _DynamicExtensionSnapshotEntry(
+        descriptor=candidate.descriptor,
+        dependency_order=tuple(dependency.identity for dependency in candidate.descriptor.dependencies),
+    )
+
+
+def _canonical_snapshot_entry(entry: _DynamicExtensionSnapshotEntry) -> str:
+    return json.dumps(entry.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def _parse_dynamic_extension_snapshot(snapshot: object) -> tuple[_DynamicExtensionSnapshotEntry, ...]:
+    """Validate an ordered dynamic-extension snapshot without loading anything."""
+    if not isinstance(snapshot, list):
+        _fail("SNAPSHOT_INVALID", "dynamic_extensions must be a list")
+
+    parsed: list[_DynamicExtensionSnapshotEntry] = []
+    seen_identities: set[str] = set()
+    seen_names: set[str] = set()
+    available_dependencies: set[str] = set()
+    for entry_index, raw_entry in enumerate(snapshot):
+        if not isinstance(raw_entry, Mapping):
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions[{entry_index}] must be an object")
+        if set(raw_entry) != _DYNAMIC_EXTENSION_SNAPSHOT_ENTRY_KEYS:
+            _fail(
+                "SNAPSHOT_INVALID",
+                f"dynamic_extensions[{entry_index}] must contain only descriptor and dependency_order",
+            )
+        raw_descriptor = raw_entry["descriptor"]
+        if not isinstance(raw_descriptor, Mapping):
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions[{entry_index}].descriptor must be an object")
+        descriptor = DynamicExtensionDescriptor.from_dict(raw_descriptor)
+
+        raw_dependency_order = raw_entry["dependency_order"]
+        if not isinstance(raw_dependency_order, list) or any(
+            not isinstance(identity, str) for identity in raw_dependency_order
+        ):
+            _fail(
+                "SNAPSHOT_INVALID",
+                f"dynamic_extensions[{entry_index}].dependency_order must be a list of strings",
+            )
+        dependency_order = tuple(raw_dependency_order)
+        expected_dependency_order = tuple(dependency.identity for dependency in descriptor.dependencies)
+        if dependency_order != expected_dependency_order:
+            _fail(
+                "SNAPSHOT_DEPENDENCY_ORDER",
+                f"dynamic_extensions[{entry_index}] dependency_order does not match its descriptor",
+            )
+        missing_dependencies = [identity for identity in dependency_order if identity not in available_dependencies]
+        if missing_dependencies:
+            _fail(
+                "SNAPSHOT_DEPENDENCY_ORDER",
+                f"dynamic_extensions[{entry_index}] declares dependencies before they are loaded: "
+                f"{', '.join(missing_dependencies)}",
+            )
+        if descriptor.identity in seen_identities:
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions contains duplicate {descriptor.identity}")
+        if descriptor.name in seen_names:
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions contains conflicting name {descriptor.name}")
+
+        parsed_entry = _DynamicExtensionSnapshotEntry(descriptor, dependency_order)
+        parsed.append(parsed_entry)
+        seen_identities.add(descriptor.identity)
+        seen_names.add(descriptor.name)
+        available_dependencies.add(descriptor.identity)
+    return tuple(parsed)
+
+
+def _normalize_dynamic_extension_snapshot(snapshot: object) -> list[dict[str, object]]:
+    """Return the canonical dynamic snapshot after strict structural validation."""
+    return [entry.to_dict() for entry in _parse_dynamic_extension_snapshot(snapshot)]
+
+
+def _dynamic_extension_snapshot_cache_identity(snapshot: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return an exact, hashable artifact identity for a worker DB cache key."""
+    return tuple(
+        (entry.descriptor.to_json(), entry.dependency_order) for entry in _parse_dynamic_extension_snapshot(snapshot)
+    )
+
+
+def _native_dynamic_extension_snapshot_entries(connection: _ExtensionConnection) -> list[object] | None:
+    export_entries = getattr(connection, "_export_dynamic_extension_snapshot_entries", None)
+    if not callable(export_entries):
+        return None
+    try:
+        serialized_entries = export_entries()
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "SNAPSHOT_UNAVAILABLE", "could not read the connection's dynamic extension snapshot"
+        ) from exception
+    if not isinstance(serialized_entries, list) or any(not isinstance(entry, str) for entry in serialized_entries):
+        _fail("SNAPSHOT_INVALID", "connection dynamic extension snapshot entries must be a list of JSON strings")
+    parsed_entries: list[object] = []
+    for entry_index, serialized_entry in enumerate(serialized_entries):
+        try:
+            parsed_entries.append(json.loads(serialized_entry))
+        except ValueError as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_INVALID",
+                f"connection dynamic extension snapshot entry {entry_index} is not valid JSON",
+            ) from exception
+    return parsed_entries
+
+
+def _capture_dynamic_extension_snapshot(connection: _ExtensionConnection) -> list[dict[str, object]]:
+    """Capture resolver-owned dynamic artifacts without serializing local paths."""
+    native_entries = _native_dynamic_extension_snapshot_entries(connection)
+    if native_entries is not None:
+        return _normalize_dynamic_extension_snapshot(native_entries)
+
+    serialized_entries = list(_protocol_snapshot_entries(connection, create=False))
+    parsed_entries: list[object] = []
+    for entry_index, serialized_entry in enumerate(serialized_entries):
+        try:
+            parsed_entries.append(json.loads(serialized_entry))
+        except ValueError as exception:  # pragma: no cover - entries are produced locally below.
+            raise DynamicExtensionError(
+                "SNAPSHOT_INVALID",
+                f"connection dynamic extension snapshot entry {entry_index} is not valid JSON",
+            ) from exception
+    return _normalize_dynamic_extension_snapshot(parsed_entries)
+
+
+def _assert_native_loaded_extensions_match_snapshot(connection: _ExtensionConnection) -> None:
+    """Ensure a Vane connection has no dynamic binary outside resolver state."""
+    if _native_dynamic_extension_snapshot_entries(connection) is None:
+        return
+    expected_names = sorted(
+        entry.descriptor.name
+        for entry in _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    )
+    try:
+        rows = connection.execute(
+            """
+            SELECT extension_name
+            FROM duckdb_extensions()
+            WHERE loaded AND install_mode <> 'STATICALLY_LINKED'
+            ORDER BY extension_name
+            """
+        ).fetchall()
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "RUNTIME_IDENTITY_UNAVAILABLE", "could not query loaded dynamic extensions"
+        ) from exception
+    loaded_names: list[str] = []
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) != 1 or not isinstance(row[0], str) or not row[0]:
+            _fail("RUNTIME_IDENTITY_UNAVAILABLE", "duckdb_extensions() returned an invalid extension name")
+        loaded_names.append(row[0])
+    if loaded_names != expected_names:
+        _fail(
+            "LOADED_STATE_MISMATCH",
+            "loaded dynamic extensions do not exactly match resolver-owned snapshot state: "
+            f"loaded={loaded_names}, recorded={expected_names}",
+        )
+
+
+def _assert_dynamic_extension_snapshot_can_record(
+    connection: _ExtensionConnection,
+    candidate: ResolvedDynamicExtension,
+) -> bool:
+    """Reject cross-resolver identity conflicts before DuckDB loads another binary."""
+    for existing in _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection)):
+        if existing.descriptor.identity == candidate.identity:
+            if existing.descriptor != candidate.descriptor:
+                _fail(
+                    "LOADED_IDENTITY_CONFLICT",
+                    f"{candidate.identity} has conflicting immutable descriptors on this connection",
+                )
+            return True
+        if existing.descriptor.name == candidate.descriptor.name:
+            _fail(
+                "LOADED_NAME_CONFLICT",
+                f"{candidate.descriptor.name} is already loaded as {existing.descriptor.identity}",
+            )
+    return False
+
+
+def _record_dynamic_extension_snapshot_entry(
+    connection: _ExtensionConnection, candidate: ResolvedDynamicExtension
+) -> None:
+    """Persist a verified loaded artifact for later distributed snapshot capture."""
+    entry = _dynamic_extension_snapshot_entry(candidate)
+    serialized_entry = _canonical_snapshot_entry(entry)
+    record_entry = getattr(connection, "_record_dynamic_extension_snapshot_entry", None)
+    if callable(record_entry):
+        try:
+            record_entry(serialized_entry)
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_UNAVAILABLE", "could not record the connection's dynamic extension snapshot"
+            ) from exception
+        return
+
+    cached_entries = _protocol_snapshot_entries(connection, create=True)
+    with _protocol_snapshot_entries_lock:
+        if serialized_entry not in cached_entries:
+            cached_entries.append(serialized_entry)
+
+
+def _load_installed_dynamic_extension_providers(
+    extension_names: Iterable[str],
+) -> tuple[LocalExtensionProvider, ...]:
+    """Load only the entry points for artifacts explicitly named by a snapshot."""
+    names = tuple(sorted({_validate_extension_name(name) for name in extension_names}))
+    if not names:
+        return ()
+    try:
+        available_entry_points = tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
+        ) from exception
+
+    providers: list[LocalExtensionProvider] = []
+    for name in names:
+        matches = [entry_point for entry_point in available_entry_points if entry_point.name == name]
+        if not matches:
+            _fail(
+                "PROVIDER_NOT_FOUND",
+                f"no installed local provider entry point exists for {name}",
+            )
+        if len(matches) != 1:
+            _fail(
+                "PROVIDER_AMBIGUOUS",
+                f"multiple installed local provider entry points exist for {name}",
+            )
+        try:
+            provider_factory = matches[0].load()
+            provider = provider_factory()
+        except DynamicExtensionError:
+            raise
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
+            ) from exception
+        if not isinstance(provider, LocalExtensionProvider):
+            _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+        if all(existing is not provider for existing in providers):
+            providers.append(provider)
+    return tuple(providers)
+
+
+def _replay_dynamic_extension_snapshot(
+    connection: _ExtensionConnection,
+    snapshot: object,
+    verify_native_loaded_state: bool = True,
+) -> None:
+    """Verify and load an immutable dynamic-extension snapshot from local wheels only."""
+    expected_entries = _parse_dynamic_extension_snapshot(snapshot)
+    if verify_native_loaded_state:
+        _assert_native_loaded_extensions_match_snapshot(connection)
+    if not expected_entries:
+        return
+
+    existing_entries = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    expected_prefix = expected_entries[: len(existing_entries)]
+    if existing_entries != expected_prefix:
+        _fail(
+            "WORKER_DISAGREEMENT",
+            "worker dynamic extension snapshot differs from the coordinator snapshot",
+        )
+
+    providers = _load_installed_dynamic_extension_providers(entry.descriptor.name for entry in expected_entries)
+    resolver = DynamicExtensionResolver(
+        trusted_identities={entry.descriptor.trust_identity for entry in expected_entries},
+        providers=providers,
+    )
+
+    # Verify every byte and every dependency before modifying the worker's
+    # DuckDB instance. The resolver is then primed with an interrupted replay's
+    # verified prefix so a retry is deterministic and does not reload it.
+    resolved_by_identity: dict[str, ResolvedDynamicExtension] = {}
+    for entry in expected_entries:
+        for candidate in resolver.resolve(connection, entry.descriptor):
+            resolved_by_identity[candidate.identity] = candidate
+    loaded = resolver._loaded_for_connection(connection)
+    for entry in existing_entries:
+        candidate = resolved_by_identity.get(entry.descriptor.identity)
+        if candidate is None:  # pragma: no cover - resolve above is exhaustive.
+            _fail("WORKER_DISAGREEMENT", f"worker cannot resolve {entry.descriptor.identity}")
+        loaded[candidate.descriptor.sha256] = candidate
+
+    for entry in expected_entries[len(existing_entries) :]:
+        resolver.load(connection, entry.descriptor)
+
+    replayed_entries = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    if replayed_entries != expected_entries:
+        _fail(
+            "WORKER_DISAGREEMENT",
+            "worker dynamic extension identities differ after local replay",
+        )
+
+
 class DynamicExtensionResolver:
     """Resolve and load only explicitly trusted local extension artifacts."""
 
@@ -397,7 +751,10 @@ class DynamicExtensionResolver:
             visiting.add(candidate.identity)
             try:
                 if candidate_path is None:
-                    candidate_path = self._provider_artifact(candidate.identity).path
+                    candidate_path = self._provider_artifact(
+                        candidate.identity,
+                        expected_descriptor=candidate,
+                    ).path
                 self._verify_artifact(
                     candidate,
                     candidate_path,
@@ -427,6 +784,7 @@ class DynamicExtensionResolver:
         artifact: str | Path | None = None,
     ) -> ResolvedDynamicExtension:
         """Resolve and load dependencies before the requested extension."""
+        _assert_native_loaded_extensions_match_snapshot(connection)
         resolved = self.resolve(connection, descriptor, artifact=artifact)
         loaded = self._loaded_for_connection(connection)
         for candidate in resolved:
@@ -444,6 +802,9 @@ class DynamicExtensionResolver:
                         "LOADED_NAME_CONFLICT",
                         f"{candidate.descriptor.name} is already loaded as {loaded_candidate.identity}",
                     )
+            if _assert_dynamic_extension_snapshot_can_record(connection, candidate):
+                loaded[candidate.descriptor.sha256] = candidate
+                continue
             try:
                 connection.load_extension(str(candidate.path))
             except Exception as exception:
@@ -452,6 +813,7 @@ class DynamicExtensionResolver:
                     f"failed to load {candidate.identity} from {candidate.path.name}: {exception}",
                 ) from exception
             loaded[candidate.descriptor.sha256] = candidate
+            _record_dynamic_extension_snapshot_entry(connection, candidate)
         return resolved[-1]
 
     def loaded_identities(self, connection: _ExtensionConnection) -> tuple[str, ...]:
@@ -470,13 +832,24 @@ class DynamicExtensionResolver:
         self._loaded_by_connection[connection_id] = (connection, loaded)
         return loaded
 
-    def _provider_artifact(self, identity: str) -> LocalExtensionArtifact:
+    def _provider_artifact(
+        self,
+        identity: str,
+        *,
+        expected_descriptor: DynamicExtensionDescriptor | None = None,
+    ) -> LocalExtensionArtifact:
         candidates = [artifact for provider in self._providers if (artifact := provider.find(identity)) is not None]
         if not candidates:
             _fail("DEPENDENCY_NOT_FOUND", f"no trusted local provider contains {identity}")
         if len(candidates) != 1:
             _fail("ARTIFACT_AMBIGUOUS", f"multiple local providers contain {identity}")
-        return candidates[0]
+        artifact = candidates[0]
+        if expected_descriptor is not None and artifact.descriptor != expected_descriptor:
+            _fail(
+                "PROVIDER_DESCRIPTOR_MISMATCH",
+                f"local provider descriptor does not exactly match {expected_descriptor.identity}",
+            )
+        return artifact
 
     def _verify_artifact(
         self,

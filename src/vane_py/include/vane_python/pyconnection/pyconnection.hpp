@@ -160,6 +160,7 @@ struct VaneSessionContext {
 
 	string id;
 	py::dict config;
+	vector<string> dynamic_extension_snapshot_entries;
 	mutex lock;
 	idx_t connection_count = 1;
 	bool ray_session_opened = false;
@@ -382,6 +383,8 @@ public:
 	const string &GetVaneSessionId() const;
 	py::dict ExportVaneSessionConfig() const;
 	void MarkVaneRaySessionOpened();
+	void RecordDynamicExtensionSnapshotEntry(const string &entry);
+	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();
 
 	static vector<Value> TransformPythonParamList(const py::handle &params);

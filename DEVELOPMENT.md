@@ -95,8 +95,14 @@ corresponding SPDX expression with `--license-expression` as well.
 Its platform tag must match the platform embedded in the extension artifact;
 the builder rejects a mismatched OS, architecture, or Linux libc-family tag.
 Pass that provider explicitly to `DynamicExtensionResolver`; neither installing
-a wheel nor using the resolver performs a network lookup. Validate a base and
-extension wheel together in a clean environment with:
+a wheel nor using the resolver performs a network lookup. For Ray execution,
+the resolver records the exact loaded descriptor, artifact digest, and
+dependency order in the connection snapshot. A worker resolves only the named,
+preinstalled `vane.dynamic_extension_providers` entry points before it
+deserializes the plan. It never receives a coordinator-local artifact path,
+scans a directory, or downloads an extension; it also keeps unsigned loading,
+autoloading, and autoinstalling disabled. Validate a base and extension wheel
+together in a clean environment with:
 
 ```bash
 python scripts/verify_extension_wheel.py \

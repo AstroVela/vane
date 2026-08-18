@@ -1015,7 +1015,7 @@ void register_ray_bindings(py::module_ &mod) {
 				    conn_obj = conn_obj.attr("c");
 			    }
 			    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
-			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn);
+			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn, conn_obj);
 		    }
 		    return result;
 	    },

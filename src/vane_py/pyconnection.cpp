@@ -807,6 +807,9 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("extension"), py::kw_only(), py::arg("force_install") = false, py::arg("repository") = py::none(),
 	      py::arg("repository_url") = py::none(), py::arg("version") = py::none());
 	m.def("load_extension", &DuckDBPyConnection::LoadExtension, "Load an installed extension", py::arg("extension"));
+	m.def("_record_dynamic_extension_snapshot_entry", &DuckDBPyConnection::RecordDynamicExtensionSnapshotEntry,
+	      py::arg("entry"));
+	m.def("_export_dynamic_extension_snapshot_entries", &DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries);
 	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation,
 	      "Get profiling information for a query", py::arg("format") = "json");
 	m.def("enable_profiling", &DuckDBPyConnection::EnableProfiling, "Enable profiling for subsequent queries");
@@ -2980,6 +2983,36 @@ void DuckDBPyConnection::MarkVaneRaySessionOpened() {
 	vane_session->ray_session_opened = true;
 }
 
+void DuckDBPyConnection::RecordDynamicExtensionSnapshotEntry(const string &entry) {
+	if (entry.empty()) {
+		throw InvalidInputException("Dynamic extension snapshot entry must not be empty");
+	}
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	for (const auto &existing : vane_session->dynamic_extension_snapshot_entries) {
+		if (existing == entry) {
+			return;
+		}
+	}
+	vane_session->dynamic_extension_snapshot_entries.push_back(entry);
+}
+
+vector<string> DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries() const {
+	if (!vane_session) {
+		throw InternalException("DuckDB connection is missing its Vane session identity");
+	}
+	lock_guard<mutex> guard(vane_session->lock);
+	if (!vane_session_attached || vane_session->connection_count == 0) {
+		throw InternalException("DuckDB connection Vane session is closed");
+	}
+	return vane_session->dynamic_extension_snapshot_entries;
+}
+
 void DuckDBPyConnection::ReleaseVaneSession() {
 	if (!vane_session_attached) {
 		return;
@@ -3002,6 +3035,7 @@ void DuckDBPyConnection::ReleaseVaneSession() {
 	}
 	vane_session->connection_count = 0;
 	vane_session->config = py::dict();
+	vane_session->dynamic_extension_snapshot_entries.clear();
 	vane_session_attached = false;
 }
 
