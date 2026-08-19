@@ -246,6 +246,7 @@ public:
 	shared_ptr<DuckDBPyType> ListType(const shared_ptr<DuckDBPyType> &type);
 	shared_ptr<DuckDBPyType> ArrayType(const shared_ptr<DuckDBPyType> &type, idx_t size);
 	shared_ptr<DuckDBPyType> TensorType(const shared_ptr<DuckDBPyType> &type, const py::object &shape);
+	shared_ptr<DuckDBPyType> ImageType(const string &mode = "RGB8");
 	shared_ptr<DuckDBPyType> UnionType(const py::object &members);
 	shared_ptr<DuckDBPyType> EnumType(const string &name, const shared_ptr<DuckDBPyType> &type,
 	                                  const py::list &values_p);

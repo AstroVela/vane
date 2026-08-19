@@ -47,6 +47,11 @@ shared_ptr<DuckDBPyType> DuckDBPyConnection::TensorType(const shared_ptr<DuckDBP
 	return make_shared_ptr<DuckDBPyType>(tensor_type);
 }
 
+shared_ptr<DuckDBPyType> DuckDBPyConnection::ImageType(const string &mode) {
+	auto image_type = duckdb::ImageType::Create(duckdb::ImageType::ParseMode(mode));
+	return make_shared_ptr<DuckDBPyType>(image_type);
+}
+
 static child_list_t<LogicalType> GetChildList(const py::object &container) {
 	child_list_t<LogicalType> types;
 	if (py::isinstance<py::list>(container)) {

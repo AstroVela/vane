@@ -32,6 +32,74 @@ class TestCanonicalExtensionTypes:
         assert duck_arrow.column("tensor_col").combine_chunks().to_numpy_ndarray().tolist() == tensor.tolist()
         assert duck_arrow.equals(arrow_table)
 
+    def test_image_roundtrip_preserves_mode_and_nested_identity(self, duckdb_cursor):
+        np = pytest.importorskip("numpy")
+
+        frames = np.arange(2 * 3 * 3, dtype=np.uint8).reshape((1, 2, 3, 3))
+        source = pa.table(
+            {
+                "frame": pa.FixedShapeTensorArray.from_numpy_ndarray(frames),
+                "bbox": pa.array([[-1.0, -1.0, 2.0, 2.0]], type=pa.list_(pa.float64())),
+            }
+        )
+        cropped = vane.image.crop(vane.col("frame"), vane.col("bbox"))
+        relation = duckdb_cursor.from_arrow(source).select(cropped.alias("image"))
+
+        arrow_table = relation.to_arrow_table()
+        image_field = arrow_table.schema.field("image")
+        assert image_field.type == pa.struct([("width", pa.uint32()), ("height", pa.uint32()), ("pixels", pa.binary())])
+        assert image_field.metadata == {
+            b"ARROW:extension:name": b"vane.image",
+            b"ARROW:extension:metadata": b'{"mode":"RGB8"}',
+        }
+
+        roundtrip = duckdb_cursor.from_arrow(arrow_table)
+        assert roundtrip.types == [vane.image_type()]
+        assert roundtrip.fetchall() == relation.fetchall()
+
+        nested_relation = duckdb_cursor.from_arrow(source).select(
+            vane.FunctionExpression("struct_pack", cropped.alias("image")).alias("payload")
+        )
+        nested_arrow = nested_relation.to_arrow_table()
+        nested_image_field = nested_arrow.schema.field("payload").type.field("image")
+        assert nested_image_field.metadata[b"ARROW:extension:name"] == b"vane.image"
+        nested_roundtrip = duckdb_cursor.from_arrow(nested_arrow)
+        assert str(nested_roundtrip.types[0]) == "STRUCT(image IMAGE(RGB8))"
+        assert nested_roundtrip.fetchall() == nested_relation.fetchall()
+
+    @pytest.mark.parametrize(
+        ("metadata", "storage_type", "message"),
+        [
+            (
+                b"not-json",
+                pa.struct([("width", pa.uint32()), ("height", pa.uint32()), ("pixels", pa.binary())]),
+                "Failed to parse vane.image metadata",
+            ),
+            (
+                b'{"mode":"RGB8"}',
+                pa.struct([("width", pa.int64()), ("height", pa.uint32()), ("pixels", pa.binary())]),
+                "vane.image storage must be STRUCT",
+            ),
+        ],
+    )
+    def test_image_extension_rejects_invalid_metadata_or_storage(self, duckdb_cursor, metadata, storage_type, message):
+        storage = pa.array(
+            [{"width": 1, "height": 1, "pixels": b"\x00\x01\x02"}],
+            type=storage_type,
+        )
+        field = pa.field(
+            "image",
+            storage_type,
+            metadata={
+                b"ARROW:extension:name": b"vane.image",
+                b"ARROW:extension:metadata": metadata,
+            },
+        )
+        table = pa.Table.from_arrays([storage], schema=pa.schema([field]))
+
+        with pytest.raises(vane.InvalidInputException, match=message):
+            duckdb_cursor.from_arrow(table).types
+
     def test_uuid(self):
         duckdb_cursor = vane.connect()
         duckdb_cursor.execute("SET arrow_lossless_conversion = true")

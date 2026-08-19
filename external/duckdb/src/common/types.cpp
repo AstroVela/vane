@@ -1958,6 +1958,56 @@ idx_t TensorType::GetFlattenedSize(const LogicalType &type) {
 	return flattened_size;
 }
 
+LogicalType ImageType::Create(ImageMode mode) {
+	child_list_t<LogicalType> children {
+	    {"width", LogicalType::UINTEGER}, {"height", LogicalType::UINTEGER}, {"pixels", LogicalType::BLOB}};
+	LogicalType image_type = LogicalType::STRUCT(std::move(children));
+	image_type.SetAlias(TYPE_NAME);
+
+	auto mode_name = ModeToString(mode);
+	auto extension_info = make_uniq<ExtensionTypeInfo>();
+	LogicalTypeModifier mode_modifier {Value(mode_name)};
+	mode_modifier.label = mode_name;
+	extension_info->modifiers.push_back(std::move(mode_modifier));
+	extension_info->properties["mode"] = Value(mode_name);
+	image_type.SetExtensionInfo(std::move(extension_info));
+	return image_type;
+}
+
+bool ImageType::IsImage(const LogicalType &type) {
+	return type.id() == LogicalTypeId::STRUCT && type.HasAlias() && StringUtil::CIEquals(type.GetAlias(), TYPE_NAME);
+}
+
+ImageMode ImageType::GetMode(const LogicalType &type) {
+	if (!IsImage(type)) {
+		throw InvalidInputException("Type %s is not an IMAGE", type.ToString());
+	}
+	auto extension_info = type.GetExtensionInfo();
+	if (!extension_info) {
+		throw InvalidInputException("IMAGE type %s is missing extension metadata", type.ToString());
+	}
+	auto entry = extension_info->properties.find("mode");
+	if (entry == extension_info->properties.end() || entry->second.IsNull()) {
+		throw InvalidInputException("IMAGE type %s is missing mode metadata", type.ToString());
+	}
+	return ParseMode(entry->second.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+}
+
+ImageMode ImageType::ParseMode(const string &mode) {
+	if (StringUtil::CIEquals(mode, "RGB8")) {
+		return ImageMode::RGB8;
+	}
+	throw InvalidInputException("Unsupported IMAGE mode '%s'; supported modes: RGB8", mode);
+}
+
+string ImageType::ModeToString(ImageMode mode) {
+	switch (mode) {
+	case ImageMode::RGB8:
+		return "RGB8";
+	}
+	throw InternalException("Unknown IMAGE mode");
+}
+
 //===--------------------------------------------------------------------===//
 // Any Type
 //===--------------------------------------------------------------------===//

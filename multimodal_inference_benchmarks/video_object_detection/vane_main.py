@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import io
 import os
 import time
 import uuid
@@ -11,15 +10,14 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-from PIL import Image
 from ultralytics import YOLO
 from video_kernels import (
-    crop_bbox_to_png,
     frames_to_torch_tensor,
     yolo_result_to_features,
 )
 
 import vane
+from vane import image
 from vane.datasource import read_datasource
 from vane.datasource.video_reader import VideoFrameSource
 
@@ -49,7 +47,6 @@ FEATURE_ARROW_TYPE = pa.struct(
 )
 FEATURE_LIST_ARROW_TYPE = pa.list_(FEATURE_ARROW_TYPE)
 FRAME_TYPE = vane.tensor_type(vane.sqltypes.UTINYINT, (FRAME_HEIGHT, FRAME_WIDTH, 3))
-FEATURE_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])")
 FEATURE_LIST_TYPE = vane.type("STRUCT(label BIGINT, confidence DOUBLE, bbox DOUBLE[])[]")
 
 if min(BATCH_SIZE, NUM_GPU_NODES, PARQUET_ROW_GROUP_SIZE) <= 0:
@@ -72,16 +69,11 @@ def _frame_batch(column) -> np.ndarray:
         column = column.combine_chunks()
     batch = column.to_numpy_ndarray()
     expected = (len(column), FRAME_HEIGHT, FRAME_WIDTH, 3)
-    if batch.shape != expected or batch.dtype != np.uint8:
-        raise ValueError(f"Unexpected frame batch: shape={batch.shape}, dtype={batch.dtype}")
+    if batch.shape != expected or batch.dtype != np.uint8 or not batch.flags.c_contiguous:
+        raise ValueError(
+            f"Unexpected frame batch: shape={batch.shape}, dtype={batch.dtype}, c_contiguous={batch.flags.c_contiguous}"
+        )
     return batch
-
-
-def _feature_field(feature, name: str):
-    for key, value in feature.items():
-        if str(key).strip('"') == name:
-            return value
-    raise KeyError(name)
 
 
 class YOLODetector:
@@ -103,40 +95,6 @@ class YOLODetector:
                 "features": pa.array(features, type=FEATURE_LIST_ARROW_TYPE),
             }
         )
-
-
-def _crop_objects(table):
-    frame_indices = table.column("frame_index").to_pylist()
-    features = table.column("features").to_pylist()
-    frames = _frame_batch(table.column("frame"))
-
-    output_indices = []
-    output_features = []
-    output_objects = []
-    png_buffer = io.BytesIO()
-    for index, frame_features in enumerate(features):
-        if not frame_features:
-            continue
-        image = Image.fromarray(frames[index])
-        for feature in frame_features:
-            output_indices.append(frame_indices[index])
-            output_features.append(feature)
-            output_objects.append(
-                crop_bbox_to_png(
-                    frames[index],
-                    _feature_field(feature, "bbox"),
-                    pil_image=image,
-                    png_buffer=png_buffer,
-                )
-            )
-
-    return pa.table(
-        {
-            "frame_index": pa.array(output_indices, type=pa.int64()),
-            "features": pa.array(output_features, type=FEATURE_ARROW_TYPE),
-            "object": pa.array(output_objects, type=pa.binary()),
-        }
-    )
 
 
 def main() -> None:
@@ -165,13 +123,17 @@ def main() -> None:
             actor_number=NUM_GPU_NODES,
             gpus=1.0,
         )
-        rel = rel.map_batches(
-            _crop_objects,
-            schema={
-                "frame_index": vane.sqltypes.BIGINT,
-                "features": FEATURE_TYPE,
-                "object": vane.sqltypes.BLOB,
-            },
+        rel = rel.select(
+            vane.col("frame_index"),
+            vane.col("frame"),
+            vane.FunctionExpression("unnest", vane.col("features")).alias("features"),
+        )
+        bbox = vane.FunctionExpression("struct_extract", vane.col("features"), vane.lit("bbox"))
+        cropped = image.crop(vane.col("frame"), bbox)
+        rel = rel.select(
+            vane.col("frame_index"),
+            vane.col("features"),
+            image.encode(cropped, format="png").alias("object"),
         )
         rel.write_parquet(
             str(OUTPUT_DIR),

@@ -546,6 +546,17 @@ struct TensorType {
 	DUCKDB_API static idx_t GetFlattenedSize(const LogicalType &type);
 };
 
+enum class ImageMode : uint8_t { RGB8 };
+
+struct ImageType {
+	static constexpr const char *TYPE_NAME = "IMAGE";
+	DUCKDB_API static LogicalType Create(ImageMode mode);
+	DUCKDB_API static bool IsImage(const LogicalType &type);
+	DUCKDB_API static ImageMode GetMode(const LogicalType &type);
+	DUCKDB_API static ImageMode ParseMode(const string &mode);
+	DUCKDB_API static string ModeToString(ImageMode mode);
+};
+
 struct AggregateStateType {
 	DUCKDB_API static const string GetTypeName(const LogicalType &type);
 	DUCKDB_API static const aggregate_state_t &GetStateType(const LogicalType &type);

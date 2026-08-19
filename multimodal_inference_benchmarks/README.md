@@ -225,6 +225,12 @@ insertion-order preservation for this write because DuckDB requires it when
 `ROW_GROUP_SIZE_BYTES` is set; output row order is not part of this
 benchmark's result contract.
 
+For valid benchmark detections, Vane composes its native `image.crop` and
+`image.encode(..., format="png")` scalar expressions. Together they reproduce
+Pillow 11.3.0's crop padding, PNG row filters, compression settings, IDAT
+chunking, and output bytes. The crop result is represented by Vane's native
+`IMAGE(RGB8)` type before it is encoded.
+
 ## Batch-size sweep
 
 Start with the batch size shown above and repeatedly double it. Keep the input data, model cache, GPU count, and all other settings unchanged. Stop when doubling no longer improves throughput or causes unacceptable GPU memory pressure. Run each setting at least three times and compare the median runtime.

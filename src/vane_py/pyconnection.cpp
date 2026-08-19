@@ -665,6 +665,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	m.def("tensor_type", &DuckDBPyConnection::TensorType,
 	      "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
 	      py::arg("shape").none(false));
+	m.def("image_type", &DuckDBPyConnection::ImageType, "Create a dynamic-size native image type",
+	      py::arg("mode") = "RGB8");
 	m.def("union_type", &DuckDBPyConnection::UnionType, "Create a union type object from 'members'",
 	      py::arg("members").none(false));
 	m.def("string_type", &DuckDBPyConnection::StringType, "Create a string type with an optional collation",

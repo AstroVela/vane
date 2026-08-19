@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/function/function.hpp"
+#include "duckdb/function/scalar/image_functions.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/hash.hpp"
@@ -101,6 +102,9 @@ string BaseScalarFunction::ToString() const {
 
 // add your initializer for new functions here
 void BuiltinFunctions::Initialize() {
+	AddFunction(ImageCropFunction::GetFunction());
+	AddFunction(ImageEncodeFunction::GetFunction());
+
 	RegisterTableScanFunctions();
 	RegisterSQLiteFunctions();
 	RegisterReadFunctions();

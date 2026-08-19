@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/catalog/default/default_types.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -450,6 +456,27 @@ LogicalType BindGeometryType(BindLogicalTypeInput &input) {
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+// IMAGE Type
+//----------------------------------------------------------------------------------------------------------------------
+LogicalType BindImageType(BindLogicalTypeInput &input) {
+	auto &arguments = input.modifiers;
+	if (arguments.empty()) {
+		return ImageType::Create(ImageMode::RGB8);
+	}
+	if (arguments.size() != 1) {
+		throw BinderException("IMAGE type takes a single optional mode modifier");
+	}
+	auto &mode_value = arguments[0].GetValue();
+	if (mode_value.IsNull()) {
+		throw BinderException("IMAGE type mode cannot be NULL");
+	}
+	if (mode_value.type() != LogicalTypeId::VARCHAR) {
+		throw BinderException("IMAGE type mode must be a string");
+	}
+	return ImageType::Create(ImageType::ParseMode(StringValue::Get(mode_value)));
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 // All Types
 //----------------------------------------------------------------------------------------------------------------------
 
@@ -459,7 +486,7 @@ struct DefaultType {
 	bind_logical_type_function_t bind_function;
 };
 
-using builtin_type_array = std::array<DefaultType, 81>;
+using builtin_type_array = std::array<DefaultType, 82>;
 
 const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, BindDecimalType},
                                            {"dec", LogicalTypeId::DECIMAL, BindDecimalType},
@@ -541,6 +568,7 @@ const builtin_type_array BUILTIN_TYPES = {{{"decimal", LogicalTypeId::DECIMAL, B
                                            {"double", LogicalTypeId::DOUBLE, nullptr},
                                            {"float8", LogicalTypeId::DOUBLE, nullptr},
                                            {"geometry", LogicalTypeId::GEOMETRY, BindGeometryType},
+                                           {"image", LogicalTypeId::STRUCT, BindImageType},
                                            {"type", LogicalTypeId::TYPE, nullptr}}};
 
 optional_ptr<const DefaultType> TryGetDefaultTypeEntry(const string &name) {

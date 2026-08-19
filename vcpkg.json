@@ -15,6 +15,7 @@
     "gflags",
     "glog",
     "grpc",
-    "openssl"
+    "openssl",
+    "zlib"
   ]
 }

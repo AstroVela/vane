@@ -18,6 +18,7 @@ add_subdirectory(struct)
 add_subdirectory(variant)
 add_subdirectory(system)
 add_subdirectory(geometry)
+add_subdirectory(image)
 add_library_unity(
   duckdb_func_scalar
   OBJECT
