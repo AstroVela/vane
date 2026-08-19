@@ -2629,6 +2629,66 @@ def test_udf_runtime_stream_output_default_uses_runtime_batch_size():
     assert executor.take_ready_result() is None
 
 
+@pytest.mark.parametrize(
+    ("extra", "match"),
+    [
+        ({"execution_backend": "subprocess_task", "gpus": 1.0}, "Ray execution backend"),
+        ({"execution_backend": "ray_task", "gpus": 0.0}, "positive 'gpus' value"),
+    ],
+)
+def test_udf_runtime_dynamic_batching_rejects_non_gpu_ray_contract(extra, match):
+    from vane.execution._udf_runtime import UDFExecutor
+
+    payload = _subprocess_map_payload(lambda table: table, dynamic_batching=True, **extra)
+
+    with pytest.raises(ValueError, match=match):
+        UDFExecutor(payload)
+
+
+def test_udf_runtime_ray_gpu_batch_rejects_static_fallback():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    payload = _subprocess_map_payload(
+        lambda table: table,
+        execution_backend="ray_task",
+        gpus=1.0,
+    )
+
+    with pytest.raises(ValueError, match="requires dynamic_batching=True"):
+        UDFExecutor(payload)
+
+
+def test_udf_runtime_dynamic_batching_treats_scheduler_envelope_as_one_compute_batch():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def identity(table):
+        return pa.table(
+            {
+                "result": table.column("x"),
+                "batch_rows": [table.num_rows] * table.num_rows,
+            }
+        )
+
+    payload = _subprocess_map_payload(
+        identity,
+        execution_backend="ray_task",
+        gpus=1.0,
+        batch_size=10,
+        prebatched_input=False,
+        stream_output=True,
+        dynamic_batching=True,
+    )
+    executor = UDFExecutor(payload)
+    executor.submit(pa.table({"x": list(range(25))}))
+
+    output = executor.take_ready_result()
+
+    assert output is not None
+    assert output.num_rows == 25
+    assert output.column("batch_rows").to_pylist() == [25] * 25
+    assert executor.take_ready_result() is None
+
+
 def test_udf_runtime_stream_output_default_ignores_submit_and_method_batch_size():
     from vane.execution._udf_runtime import UDFExecutor
 

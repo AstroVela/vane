@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
+#include "duckdb/execution/operator/projection/udf_dynamic_batching.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -30,6 +31,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -817,6 +820,19 @@ static void AppendUDFExecutionConfigParams(InsertionOrderPreservingMap<string> &
 	if (preserve_compute_batch_boundaries.first && preserve_compute_batch_boundaries.second) {
 		result["preserve_compute_batch_boundaries"] = "true";
 	}
+	auto dynamic_batching = GetStructBoolField(payload, "dynamic_batching");
+	if (dynamic_batching.first && dynamic_batching.second) {
+		result["dynamic_batching"] = "true";
+		for (const auto &name :
+		     {"dynamic_batch_size_min_rows", "dynamic_batch_size_max_rows", "dynamic_batch_size_initial_rows",
+		      "dynamic_batch_target_latency_ms", "dynamic_batch_latency_tolerance_ms", "dynamic_batch_step_size",
+		      "dynamic_batch_correction", "dynamic_batch_history_size"}) {
+			auto value = GetStructIntField(payload, name);
+			if (value.first && value.second > 0) {
+				result[name] = std::to_string(value.second);
+			}
+		}
+	}
 	auto target_max_batch_bytes = GetStructIntField(payload, "udf_target_max_batch_bytes");
 	if (target_max_batch_bytes.first && target_max_batch_bytes.second > 0) {
 		result["udf_target_max_batch_bytes"] = std::to_string(target_max_batch_bytes.second);
@@ -910,6 +926,7 @@ static InsertionOrderPreservingMap<string> UDFTableFunctionDynamicToString(Table
 
 struct StreamingUDFConfig {
 	idx_t compute_batch_rows = 0;
+	UDFDynamicBatchingConfig dynamic_batching;
 	// Soft lower bound matching Ray Data's min_rows_per_bundle: preserve
 	// complete upstream blocks and coalesce only undersized blocks until this
 	// row count is reached. EOS and byte pressure may still submit a short tail.
@@ -1066,6 +1083,7 @@ struct StreamingInflightBatch {
 	idx_t total_rows = 0;
 	idx_t bytes = 0;
 	idx_t emitted_rows = 0;
+	std::chrono::steady_clock::time_point submitted_at;
 };
 
 struct StreamingReadyOutput {
@@ -1092,6 +1110,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	    : original_payload(std::move(payload_p)), actor_handles(std::move(actor_handles_p)) {
 		payload = original_payload;
 		config = ResolveStreamingUDFConfig(original_payload);
+		dynamic_batch_sizer.Reset(config.dynamic_batching);
 		UDFWorkerSlotDebugLog(StringUtil::Format("streaming_ctor_unresolved udf_name=%s initial_config_width=1",
 		                                         UDFDebugNameFromPayload(original_payload).c_str()));
 	}
@@ -1149,6 +1168,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 		    operator_width_resolved ? "true" : "false", static_cast<unsigned long long>(resolved_task_operator_width)));
 		payload = ResolveUDFRuntimePayload(original_payload, task_operator_width);
 		config = ResolveStreamingUDFConfig(payload, task_operator_width);
+		dynamic_batch_sizer.Reset(config.dynamic_batching);
 		resolved_task_operator_width = task_operator_width;
 		runtime_resolved = true;
 		runtime_operator_width_resolved = operator_width_resolved;
@@ -1158,6 +1178,7 @@ struct StreamingUDFState : public StateWithBlockableTasks {
 	Value payload;
 	shared_ptr<void> actor_handles;
 	StreamingUDFConfig config;
+	UDFDynamicBatchSizer dynamic_batch_sizer;
 	idx_t resolved_task_operator_width = 0;
 	bool runtime_resolved = false;
 	bool runtime_operator_width_resolved = false;
@@ -1285,7 +1306,8 @@ static void StreamingUDFDebugState(StreamingUDFState &state, const char *where, 
 	    "result_callbacks=%llu notify_space=%llu source_calls=%llu sink_calls=%llu blocked_sources=%llu "
 	    "blocked_sinks=%llu source_have_more=%llu source_blocked_empty=%llu wake_one=%llu wake_all=%llu "
 	    "blocked_source_tasks=%llu blocked_control_tasks=%llu max_pending_rows=%llu max_ready_rows=%llu "
-	    "max_active_batches=%llu config_compute_batch_rows=%llu config_min_task_batch_rows=%llu "
+	    "max_active_batches=%llu dynamic_batching=%s current_compute_batch_rows=%llu "
+	    "config_min_task_batch_rows=%llu "
 	    "config_task_input_max_bytes=%llu "
 	    "config_output_target_bytes=%llu",
 	    static_cast<unsigned long long>(tick), UDFDebugNameFromPayload(state.original_payload).c_str(), where,
@@ -1326,7 +1348,10 @@ static void StreamingUDFDebugState(StreamingUDFState &state, const char *where, 
 	    static_cast<unsigned long long>(state.blocked_control_tasks.size()),
 	    static_cast<unsigned long long>(state.max_pending_rows), static_cast<unsigned long long>(state.max_ready_rows),
 	    static_cast<unsigned long long>(state.max_active_batches),
-	    static_cast<unsigned long long>(state.config.compute_batch_rows),
+	    state.dynamic_batch_sizer.Enabled() ? "true" : "false",
+	    static_cast<unsigned long long>(state.dynamic_batch_sizer.Enabled()
+	                                        ? state.dynamic_batch_sizer.CurrentBatchRows()
+	                                        : state.config.compute_batch_rows),
 	    static_cast<unsigned long long>(state.config.min_task_batch_rows),
 	    static_cast<unsigned long long>(state.config.task_input_max_bytes),
 	    static_cast<unsigned long long>(state.config.output_target_bytes)));
@@ -1377,6 +1402,89 @@ static idx_t StreamingOutputByteCapacity(const StreamingUDFState &state);
 static idx_t StreamingOutputItemByteCapacity(const StreamingUDFState &state);
 static idx_t StreamingOutputEventCapacity(const StreamingUDFState &state);
 
+static idx_t RequirePositiveDynamicBatchField(const Value &payload, const string &name) {
+	auto child = GetStructChild(payload, name);
+	if (!child) {
+		throw InvalidInputException("dynamic GPU UDF batching requires payload.%s", name);
+	}
+	int64_t value = 0;
+	switch (child->type().id()) {
+	case LogicalTypeId::INTEGER:
+		value = IntegerValue::Get(*child);
+		break;
+	case LogicalTypeId::BIGINT:
+		value = BigIntValue::Get(*child);
+		break;
+	default:
+		throw InvalidInputException("dynamic GPU UDF payload.%s must be an integer", name);
+	}
+	if (value <= 0) {
+		throw InvalidInputException("dynamic GPU UDF payload.%s must be positive", name);
+	}
+	return NumericCast<idx_t>(value);
+}
+
+static std::chrono::microseconds DynamicBatchMilliseconds(idx_t milliseconds, const string &name) {
+	if (milliseconds > NumericLimits<int64_t>::Maximum() / 1000) {
+		throw InvalidInputException("dynamic GPU UDF payload.%s is too large", name);
+	}
+	return std::chrono::microseconds(static_cast<int64_t>(milliseconds * 1000));
+}
+
+static void ValidateDynamicBatchingExecution(const Value &payload, const string &execution_backend) {
+	if (execution_backend != "ray_task" && execution_backend != "ray_actor") {
+		throw InvalidInputException("dynamic GPU UDF batching requires a Ray execution backend");
+	}
+	auto call_mode = GetStructStringField(payload, "call_mode");
+	if (!call_mode.first || (call_mode.second != "map_batches" && call_mode.second != "map_batches_rows")) {
+		throw InvalidInputException("dynamic GPU UDF batching requires a batch UDF");
+	}
+	auto gpus = GetStructChild(payload, "gpus");
+	if (!gpus) {
+		throw InvalidInputException("dynamic GPU UDF batching requires positive payload.gpus");
+	}
+	switch (gpus->type().id()) {
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		break;
+	default:
+		throw InvalidInputException("dynamic GPU UDF payload.gpus must be numeric");
+	}
+	const auto gpu_count = gpus->DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+	if (!std::isfinite(gpu_count) || gpu_count <= 0.0) {
+		throw InvalidInputException("dynamic GPU UDF batching requires positive payload.gpus");
+	}
+}
+
+static bool IsRayGPUBatchPayload(const Value &payload, const string &execution_backend) {
+	if (execution_backend != "ray_task" && execution_backend != "ray_actor") {
+		return false;
+	}
+	auto call_mode = GetStructStringField(payload, "call_mode");
+	if (!call_mode.first || (call_mode.second != "map_batches" && call_mode.second != "map_batches_rows")) {
+		return false;
+	}
+	auto gpus = GetStructChild(payload, "gpus");
+	if (!gpus) {
+		return false;
+	}
+	switch (gpus->type().id()) {
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		break;
+	default:
+		return false;
+	}
+	const auto gpu_count = gpus->DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+	return std::isfinite(gpu_count) && gpu_count > 0.0;
+}
+
 static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t task_operator_width) {
 	StreamingUDFConfig config;
 	auto async_mode = GetStructBoolField(payload, "async_mode");
@@ -1395,12 +1503,46 @@ static StreamingUDFConfig ResolveStreamingUDFConfig(const Value &payload, idx_t 
 	if (ClassifyUDFMode(payload) != UDFMode::SCALAR_MAP && !HasStructField(payload, "output_schema")) {
 		throw InvalidInputException("non-scalar streaming UDF execution requires payload.output_schema");
 	}
-	auto batch_size = GetStructIntField(payload, "batch_size");
-	if (batch_size.first && batch_size.second > 0) {
-		config.compute_batch_rows = batch_size.second;
+	auto dynamic_batching_child = GetStructChild(payload, "dynamic_batching");
+	if (dynamic_batching_child && dynamic_batching_child->type().id() != LogicalTypeId::BOOLEAN) {
+		throw InvalidInputException("dynamic GPU UDF payload.dynamic_batching must be boolean");
+	}
+	auto dynamic_batching = GetStructBoolField(payload, "dynamic_batching");
+	if (IsRayGPUBatchPayload(payload, execution_backend.second) &&
+	    (!dynamic_batching.first || !dynamic_batching.second)) {
+		throw InvalidInputException("Ray GPU batch UDF payload requires dynamic_batching=true");
+	}
+	if (dynamic_batching.first && dynamic_batching.second) {
+		ValidateDynamicBatchingExecution(payload, execution_backend.second);
+		config.dynamic_batching.enabled = true;
+		config.dynamic_batching.min_batch_rows =
+		    RequirePositiveDynamicBatchField(payload, "dynamic_batch_size_min_rows");
+		config.dynamic_batching.max_batch_rows =
+		    RequirePositiveDynamicBatchField(payload, "dynamic_batch_size_max_rows");
+		config.dynamic_batching.initial_batch_rows =
+		    RequirePositiveDynamicBatchField(payload, "dynamic_batch_size_initial_rows");
+		config.dynamic_batching.target_batch_latency =
+		    DynamicBatchMilliseconds(RequirePositiveDynamicBatchField(payload, "dynamic_batch_target_latency_ms"),
+		                             "dynamic_batch_target_latency_ms");
+		config.dynamic_batching.latency_tolerance =
+		    DynamicBatchMilliseconds(RequirePositiveDynamicBatchField(payload, "dynamic_batch_latency_tolerance_ms"),
+		                             "dynamic_batch_latency_tolerance_ms");
+		config.dynamic_batching.step_size_alpha = RequirePositiveDynamicBatchField(payload, "dynamic_batch_step_size");
+		config.dynamic_batching.correction_delta =
+		    RequirePositiveDynamicBatchField(payload, "dynamic_batch_correction");
+		config.dynamic_batching.history_size = RequirePositiveDynamicBatchField(payload, "dynamic_batch_history_size");
+		config.dynamic_batching.Validate();
+	} else {
+		auto batch_size = GetStructIntField(payload, "batch_size");
+		if (batch_size.first && batch_size.second > 0) {
+			config.compute_batch_rows = batch_size.second;
+		}
 	}
 	auto min_task_batch_size = GetStructIntField(payload, "min_task_batch_size");
 	if (min_task_batch_size.first && min_task_batch_size.second > 0) {
+		if (config.dynamic_batching.enabled) {
+			throw InvalidInputException("streaming UDF min_task_batch_size is not valid with dynamic batching");
+		}
 		if (config.compute_batch_rows == 0) {
 			throw InvalidInputException("streaming UDF min_task_batch_size requires batch_size");
 		}
@@ -1955,6 +2097,13 @@ static bool StreamingHasLazyInput(const StreamingUDFState &state) {
 	return state.planned_submit.IsLazy() || !state.pending_lazy_inputs.empty();
 }
 
+static idx_t StreamingComputeBatchRows(const StreamingUDFState &state) {
+	if (state.dynamic_batch_sizer.Enabled()) {
+		return state.dynamic_batch_sizer.CurrentBatchRows();
+	}
+	return state.config.compute_batch_rows;
+}
+
 static idx_t NextStreamingPlannedSubmitSequence(StreamingUDFState &state) {
 	auto sequence = state.next_planned_submit_sequence++;
 	if (state.next_planned_submit_sequence == 0) {
@@ -1985,6 +2134,15 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 	if (state.pending_rows == 0 || state.pending_lazy_inputs.empty()) {
 		return plan;
 	}
+	const auto compute_batch_rows = StreamingComputeBatchRows(state);
+	if (state.dynamic_batch_sizer.Enabled()) {
+		// Match Daft's Flexible(min, current_max) contract: the adaptive
+		// batch size is an upper bound, not a watermark that delays available
+		// GPU work until a full batch can be assembled.
+		plan.target_rows = MinValue<idx_t>(state.pending_rows, compute_batch_rows);
+		plan.allow_incomplete_compute_batch = true;
+		return plan;
+	}
 	idx_t rows_through_boundary = 0;
 	for (const auto &entry : state.pending_lazy_inputs) {
 		if (!entry.bundle || entry.rows == 0) {
@@ -2006,11 +2164,11 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 			continue;
 		}
 		rows_through_boundary = SaturatingAdd(rows_through_boundary, entry.rows);
-		if (state.config.compute_batch_rows == 0) {
+		if (compute_batch_rows == 0) {
 			plan.target_rows = rows_through_boundary;
 			return plan;
 		}
-		const auto aligned_rows = rows_through_boundary - (rows_through_boundary % state.config.compute_batch_rows);
+		const auto aligned_rows = rows_through_boundary - (rows_through_boundary % compute_batch_rows);
 		if (aligned_rows > 0) {
 			plan.target_rows = aligned_rows;
 			return plan;
@@ -2022,6 +2180,12 @@ static StreamingSubmitPlan PlanStreamingLazySubmit(const StreamingUDFState &stat
 static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFState &state, bool flush_tail) {
 	StreamingSubmitPlan plan;
 	if (state.pending_rows == 0 || state.pending_inputs.empty()) {
+		return plan;
+	}
+	const auto compute_batch_rows = StreamingComputeBatchRows(state);
+	if (state.dynamic_batch_sizer.Enabled()) {
+		plan.target_rows = MinValue<idx_t>(state.pending_rows, compute_batch_rows);
+		plan.allow_incomplete_compute_batch = true;
 		return plan;
 	}
 	idx_t rows_through_boundary = 0;
@@ -2038,11 +2202,11 @@ static StreamingSubmitPlan PlanStreamingMaterializedSubmit(const StreamingUDFSta
 			}
 			continue;
 		}
-		if (state.config.compute_batch_rows == 0) {
+		if (compute_batch_rows == 0) {
 			plan.target_rows = rows_through_boundary;
 			return plan;
 		}
-		const auto aligned_rows = rows_through_boundary - (rows_through_boundary % state.config.compute_batch_rows);
+		const auto aligned_rows = rows_through_boundary - (rows_through_boundary % compute_batch_rows);
 		if (aligned_rows > 0) {
 			plan.target_rows = aligned_rows;
 			return plan;
@@ -2318,6 +2482,11 @@ static bool CompleteStreamingSubmitLocked(StreamingUDFState &state, unique_lock<
 		                       static_cast<unsigned long long>(submit_id)));
 		return false;
 	}
+	if (state.dynamic_batch_sizer.Enabled()) {
+		const auto batch_latency = std::chrono::duration_cast<std::chrono::microseconds>(
+		    std::chrono::steady_clock::now() - inflight_ref.submitted_at);
+		state.dynamic_batch_sizer.Record(inflight_ref.total_rows, batch_latency);
+	}
 	AtomicAddStreamingCounter(state.completed_input_rows, inflight_ref.total_rows);
 	AtomicAddStreamingCounter(state.completed_input_bytes, inflight_ref.bytes);
 	state.completed_batches.fetch_add(1);
@@ -2355,7 +2524,7 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 		if (!plan) {
 			return false;
 		}
-		candidate = TakeStreamingLazyInputBatch(state, plan, state.config.compute_batch_rows,
+		candidate = TakeStreamingLazyInputBatch(state, plan, StreamingComputeBatchRows(state),
 		                                        state.config.task_input_max_bytes);
 		pending = &candidate;
 	}
@@ -2381,6 +2550,7 @@ static bool TrySubmitStreamingLazyInput(ExecutionContext &context, StreamingUDFS
 	inflight.submit_id = submit_id;
 	inflight.total_rows = submitted_rows;
 	inflight.bytes = submitted_bytes;
+	inflight.submitted_at = std::chrono::steady_clock::now();
 	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
 	if (!inserted.second) {
 		throw InternalException("streaming UDF duplicate lazy submit_id %llu",
@@ -2689,7 +2859,7 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 		if (!plan) {
 			return false;
 		}
-		candidate = TakeStreamingMaterializedEnvelope(context, state, plan, state.config.compute_batch_rows,
+		candidate = TakeStreamingMaterializedEnvelope(context, state, plan, StreamingComputeBatchRows(state),
 		                                              state.config.task_input_max_bytes);
 		envelope = &candidate;
 	}
@@ -2721,6 +2891,7 @@ static bool TrySubmitStreamingMaterializedInput(ExecutionContext &context, Strea
 	inflight.submit_id = submit_id;
 	inflight.total_rows = rows;
 	inflight.bytes = bytes;
+	inflight.submitted_at = std::chrono::steady_clock::now();
 	auto inserted = state.inflight_batches.emplace(submit_id, inflight);
 	if (!inserted.second) {
 		throw InternalException("streaming UDF duplicate submit_id %llu", static_cast<unsigned long long>(submit_id));

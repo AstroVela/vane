@@ -426,11 +426,44 @@ def test_vane_function_batch_gpu_zero_stays_streaming():
 
         assert "STREAMING_UDF" in plan
         assert "ray_block_stream_output:" in plan
+        assert "dynamic_batching:" not in plan
     finally:
         if old_runner is None:
             os.environ.pop("VANE_RUNNER", None)
         else:
             os.environ["VANE_RUNNER"] = old_runner
+
+
+def test_vane_function_batch_gpu_payload_uses_dynamic_batch_defaults(monkeypatch):
+    import uuid
+
+    import pyarrow as pa
+
+    import vane
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+
+    @vane.func.batch(return_dtype=pa.int32(), gpus=1)
+    def identity(values):
+        return values
+
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::INTEGER as x from range(3) t(i)").select(identity(vane.col("x")))
+        payload = (
+            vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, str(uuid.uuid4()))
+            .to_physical_plan(con)
+            .collect_udf_nodes(conn=con)[0]["payload"]
+        )
+    finally:
+        con.close()
+
+    assert payload["execution_backend"] == "ray_task"
+    assert payload["dynamic_batching"] is True
+    assert payload["dynamic_batch_size_min_rows"] == 1
+    assert payload["dynamic_batch_size_max_rows"] == 128 * 1024
+    assert payload["dynamic_batch_size_initial_rows"] == 256
+    assert "batch_size" not in payload
 
 
 def test_vane_function_batch_descriptor_binds_instance():

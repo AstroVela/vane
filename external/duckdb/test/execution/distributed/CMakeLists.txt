@@ -6,6 +6,7 @@ set(TEST_EXECUTION_DISTRIBUTED_SOURCES
     test_aggregate_node.cpp
     test_udf_per_thread.cpp
     test_udf_serialization.cpp
+    test_udf_dynamic_batching.cpp
     test_clustering_spec.cpp
     test_copy_finalize.cpp
     test_distributed_extension_manager.cpp
