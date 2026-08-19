@@ -310,7 +310,7 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	                    py::arg("filter_expr"));
 	relation_module.def(
 	    "map_batches",
-	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
+	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema, const string &batch_format,
 	       const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
 	       const Optional<py::object> &min_task_batch_size,
 	       const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
@@ -320,23 +320,28 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	       const Optional<py::object> &task_input_max_bytes, const Optional<py::object> &output_target_max_bytes,
 	       py::kwargs kwargs) {
 		    RejectMapBatchesUnsupportedKwargs(kwargs);
-		    return self.MapBatches(fun, schema, batch_size, output_batch_size, min_task_batch_size,
+		    return self.MapBatches(fun, schema, batch_format, batch_size, output_batch_size, min_task_batch_size,
 		                           preserve_compute_batch_boundaries, cpus, gpus, memory_bytes, execution_backend,
 		                           actor_number, ray_actor_thread_policy, target_max_batch_bytes, task_input_max_bytes,
 		                           output_target_max_bytes);
 	    },
-	    "Apply a Python function or callable class to batches of rows. Retrying Task and Actor backends may replay "
+	    "Apply a Python function or callable class to batches of rows. batch_format selects pyarrow.Table, "
+	    "dict[str, numpy.ndarray], pandas.DataFrame, or cudf.DataFrame input and output. Non-null fixed-shape tensor "
+	    "columns are N-D arrays in NumPy batches; nullable tensor columns are object arrays containing per-row "
+	    "ndarrays or None. pandas tensor columns use per-row ndarrays. Nullable ordinary NumPy columns use "
+	    "numpy.ma.MaskedArray. The UDF must return batches in the selected batch_format. Retrying Task and Actor "
+	    "backends may replay "
 	    "a call after failure; exactly-once execution is not provided, so external effects must be idempotent. "
 	    "Callable classes use Actor backends: "
 	    "actor_number creates independent ephemeral instances, work has no Actor affinity or global ordering, and "
 	    "failures may reconstruct an Actor and reset its local state.",
-	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_size") = py::none(),
-	    py::arg("output_batch_size") = py::none(), py::arg("min_task_batch_size") = py::none(),
-	    py::arg("preserve_compute_batch_boundaries") = py::none(), py::arg("cpus") = py::none(),
-	    py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(), py::arg("execution_backend") = py::none(),
-	    py::arg("actor_number") = py::none(), py::arg("ray_actor_thread_policy") = py::none(),
-	    py::arg("target_max_batch_bytes") = py::none(), py::arg("task_input_max_bytes") = py::none(),
-	    py::arg("output_target_max_bytes") = py::none());
+	    py::arg("function"), py::arg("schema") = py::none(), py::kw_only(), py::arg("batch_format") = "pyarrow",
+	    py::arg("batch_size") = py::none(), py::arg("output_batch_size") = py::none(),
+	    py::arg("min_task_batch_size") = py::none(), py::arg("preserve_compute_batch_boundaries") = py::none(),
+	    py::arg("cpus") = py::none(), py::arg("gpus") = py::none(), py::arg("memory_bytes") = py::none(),
+	    py::arg("execution_backend") = py::none(), py::arg("actor_number") = py::none(),
+	    py::arg("ray_actor_thread_policy") = py::none(), py::arg("target_max_batch_bytes") = py::none(),
+	    py::arg("task_input_max_bytes") = py::none(), py::arg("output_target_max_bytes") = py::none());
 	relation_module.def(
 	    "flat_map",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,

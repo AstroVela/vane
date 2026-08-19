@@ -222,8 +222,9 @@ public:
 	                                 const Optional<py::object> &gpus, const Optional<py::object> &execution_backend,
 	                                 const Optional<py::object> &actor_number);
 	unique_ptr<DuckDBPyRelation>
-	MapBatches(py::function fun, Optional<py::object> schema, const Optional<py::object> &batch_size,
-	           const Optional<py::object> &output_batch_size, const Optional<py::object> &min_task_batch_size,
+	MapBatches(py::function fun, Optional<py::object> schema, const string &batch_format,
+	           const Optional<py::object> &batch_size, const Optional<py::object> &output_batch_size,
+	           const Optional<py::object> &min_task_batch_size,
 	           const Optional<py::object> &preserve_compute_batch_boundaries, const Optional<py::object> &cpus,
 	           const Optional<py::object> &gpus, const Optional<py::object> &memory_bytes,
 	           const Optional<py::object> &execution_backend, const Optional<py::object> &actor_number,

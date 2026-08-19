@@ -56,7 +56,7 @@ def _arrow_type_from_name(type_name: str) -> pa.DataType:
     try:
         return _arrow_type_from_duckdb_type(type_name)
     except Exception as exc:
-        raise ValueError(f"unsupported UDF output type for empty output: {type_name!r}") from exc
+        raise ValueError(f"unsupported UDF output type: {type_name!r}") from exc
 
 
 def _arrow_type_from_duckdb_type(type_name: str) -> pa.DataType:
@@ -112,10 +112,10 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
             _arrow_type_from_duckdb_pytype(children["value"]),
         )
 
-    raise ValueError(f"unsupported DuckDB type id for empty UDF output: {type_id!r}")
+    raise ValueError(f"unsupported DuckDB type id for UDF output: {type_id!r}")
 
 
-def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
+def arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     kind = str(entry.get("kind") or "").strip().lower()
     if kind == "tensor":
         dtype = _arrow_type_from_name(str(entry.get("dtype") or ""))
@@ -129,15 +129,33 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
 
 
 def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
+    schema = arrow_schema_from_output_schema(output_schema)
+    return pa.Table.from_arrays([pa.array([], type=field.type) for field in schema], schema=schema)
+
+
+def arrow_schema_from_output_schema(output_schema: Any) -> pa.Schema:
+    fields = []
+    for name, entry in normalize_output_schema_entries(output_schema):
+        fields.append(pa.field(name, arrow_type_from_output_schema_entry(entry)))
+    return pa.schema(fields)
+
+
+def normalize_output_schema_entries(output_schema: Any) -> tuple[tuple[str, dict[str, Any]], ...]:
     if not output_schema:
-        raise ValueError("empty UDF output requires payload.output_schema")
-    arrays = {}
+        raise ValueError("UDF output conversion requires payload.output_schema")
+    normalized: list[tuple[str, dict[str, Any]]] = []
+    names = set()
     for entry in output_schema:
         if not isinstance(entry, dict):
             raise ValueError("payload.output_schema entries must be dicts")
         name = str(entry.get("name") or "")
-        arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
-    return pa.table(arrays)
+        if not name:
+            raise ValueError("payload.output_schema entries require non-empty names")
+        if name in names:
+            raise ValueError(f"payload.output_schema contains duplicate name {name!r}")
+        names.add(name)
+        normalized.append((name, entry))
+    return tuple(normalized)
 
 
 def empty_output_table_from_payload(payload: dict[str, Any] | None) -> pa.Table:
@@ -145,4 +163,10 @@ def empty_output_table_from_payload(payload: dict[str, Any] | None) -> pa.Table:
     return empty_output_table_from_schema(payload.get("output_schema"))
 
 
-__all__ = ["empty_output_table_from_payload", "empty_output_table_from_schema"]
+__all__ = [
+    "arrow_schema_from_output_schema",
+    "arrow_type_from_output_schema_entry",
+    "empty_output_table_from_payload",
+    "empty_output_table_from_schema",
+    "normalize_output_schema_entries",
+]
