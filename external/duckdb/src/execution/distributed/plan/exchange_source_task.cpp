@@ -88,7 +88,7 @@ void ExchangeSourceTaskDescriptor::Serialize(Serializer &serializer) const {
 				files.WriteObject([&](Serializer &file_obj) {
 					const auto &file = handle.files[file_idx];
 					file_obj.WriteProperty(1, "path", file.path);
-					file_obj.WriteProperty(2, "file_size", file.file_size);
+					file_obj.WriteProperty<uint64_t>(2, "file_size", static_cast<uint64_t>(file.file_size));
 					file_obj.WriteProperty(3, "rows", file.rows);
 				});
 			});
@@ -119,7 +119,7 @@ ExchangeSourceTaskDescriptor ExchangeSourceTaskDescriptor::Deserialize(Deseriali
 				ExchangeSourceFile file;
 				files.ReadObject([&](Deserializer &file_obj) {
 					file.path = file_obj.ReadProperty<string>(1, "path");
-					file.file_size = file_obj.ReadProperty<size_t>(2, "file_size");
+					file.file_size = static_cast<size_t>(file_obj.ReadProperty<uint64_t>(2, "file_size"));
 					file_obj.ReadPropertyWithDefault<idx_t>(3, "rows", file.rows);
 				});
 				handle.files.push_back(std::move(file));

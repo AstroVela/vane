@@ -576,11 +576,8 @@ function(_duckdb_create_interface_target target_name)
                 /utf-8 # treat source files as UTF-8 encoded
     )
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    target_compile_options(
-      ${target_name}
-      INTERFACE -stdlib=libc++ # for libc++ in favor of older libstdc++
-                -mmacosx-version-min=10.7 # minimum osx version compatibility
-    )
+    # Use libc++ on macOS; the deployment target is supplied by the toolchain.
+    target_compile_options(${target_name} INTERFACE -stdlib=libc++)
   endif()
 
   # Link to the DuckDB static library

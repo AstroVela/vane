@@ -159,7 +159,7 @@ private:
 	size_t num_rows_;
 	size_t size_bytes_;
 	mutable std::once_flag materialize_once_;
-	mutable std::atomic<std::shared_ptr<duckdb::ColumnDataCollection>> materialized_collection_;
+	mutable std::shared_ptr<duckdb::ColumnDataCollection> materialized_collection_;
 	mutable std::exception_ptr materialize_error_;
 };
 

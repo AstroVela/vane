@@ -381,7 +381,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::size_bytes()
 		return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->SizeInBytes() : 0);
 }
 
@@ -390,7 +390,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::num_rows() c
 		return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->Count() : 0);
 }
 
@@ -412,7 +412,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 			duckdb::PythonGILWrapper gil;
 			try {
 				auto object_ref = object_ref_.get();
-				materialized_collection_.store(MaterializePyPayloadToCollection(object_ref, nullptr));
+				std::atomic_store(&materialized_collection_, MaterializePyPayloadToCollection(object_ref, nullptr));
 			} catch (const py::error_already_set &ex) {
 				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
 			}
@@ -424,7 +424,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 	if (materialize_error_) {
 		std::rethrow_exception(materialize_error_);
 	}
-	return materialized_collection_.load();
+	return std::atomic_load(&materialized_collection_);
 }
 
 py::object duckdb::distributed::python::ray::ResultPartitionToPyObject(

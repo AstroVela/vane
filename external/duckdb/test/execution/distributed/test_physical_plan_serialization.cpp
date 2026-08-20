@@ -244,7 +244,7 @@ string SerializeSourceDescriptorWithoutFlightHost() {
 			obj.WriteList(4, "files", 1, [&](Serializer::List &files, idx_t) {
 				files.WriteObject([&](Serializer &file_obj) {
 					file_obj.WriteProperty(1, "path", string("pre-strict-source"));
-					file_obj.WriteProperty<size_t>(2, "file_size", 0);
+					file_obj.WriteProperty<uint64_t>(2, "file_size", 0);
 					file_obj.WriteProperty<idx_t>(3, "rows", 0);
 				});
 			});
@@ -2169,7 +2169,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.flight_host = "flight-node-1.internal";
 	handle0.flight_port = 5010;
 	handle0.flight_server_epoch = "epoch-1";
-	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_7", 0, 11));
+	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_7", 0, (uint64_t(1) << 40) + 123));
 	descriptor.source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -2201,7 +2201,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].flight_server_epoch == "epoch-1");
 	REQUIRE(roundtrip.source_handles[0].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "exchange__sink_0__attempt_7");
-	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
+	REQUIRE(roundtrip.source_handles[0].files[0].file_size == (uint64_t(1) << 40) + 123);
 	REQUIRE(roundtrip.source_handles[1].partition_id == 1);
 	REQUIRE(roundtrip.source_handles[1].source_task_partition_id == 22);
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
