@@ -51,9 +51,9 @@ TEST_CASE("ProjectionNode: construction and display", "[distributed]") {
 	// Create a dummy child scan source node with no scans
 	std::vector<DuckPhysicalPlanRef> plans;
 	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
-	std::vector<ScanTaskDescriptor> scan_tasks;
+	std::vector<ScanSplit> scan_splits;
 	auto child = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 0, "scan"), DuckPhysicalPlanRef(),
-	                                              scan_tasks, schema, DuckDBExecutionConfigRef(), false);
+	                                              scan_splits, schema, DuckDBExecutionConfigRef(), false);
 
 	// Build a simple projection expression: reference to column 0
 	ExpressionRef expr = ExpressionRef(new BoundReferenceExpression(LogicalType::INTEGER, 0));
@@ -71,9 +71,9 @@ TEST_CASE("ProjectionNode: construction and display", "[distributed]") {
 TEST_CASE("FilterNode: construction and display", "[distributed]") {
 	std::vector<DuckPhysicalPlanRef> plans;
 	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::INTEGER});
-	std::vector<ScanTaskDescriptor> scan_tasks;
+	std::vector<ScanSplit> scan_splits;
 	auto child = std::make_shared<ScanSourceNode>(PipelineNodeContext(0, "", 0, "scan"), DuckPhysicalPlanRef(),
-	                                              scan_tasks, schema, DuckDBExecutionConfigRef(), false);
+	                                              scan_splits, schema, DuckDBExecutionConfigRef(), false);
 
 	ExpressionRef pred = ExpressionRef(new BoundConstantExpression(Value::INTEGER(1)));
 	auto node = FilterNode(2, child, pred);
@@ -89,13 +89,13 @@ TEST_CASE("ScanSourceNode: display", "[distributed]") {
 	DuckPhysicalPlanRef p = duckdb::distributed::make_physical_plan_with_identity_projection({{1, 2, 3}});
 	std::vector<DuckPhysicalPlanRef> plans = {p};
 	SchemaRef schema = MakeSchemaRef(std::vector<LogicalType> {LogicalType::BIGINT});
-	std::vector<ScanTaskDescriptor> scan_tasks = {ScanTaskDescriptor {}};
-	auto node = ScanSourceNode(PipelineNodeContext(0, "", 3, "scan"), plans[0], scan_tasks, schema,
+	std::vector<ScanSplit> scan_splits = {ScanSplit::EmptyFile()};
+	auto node = ScanSourceNode(PipelineNodeContext(0, "", 3, "scan"), plans[0], scan_splits, schema,
 	                           DuckDBExecutionConfigRef(), false);
 	auto disp = node.multiline_display(false);
 	bool found = false;
 	for (auto &s : disp) {
-		if (s.find("Num Scan Tasks = 1") != std::string::npos) {
+		if (s.find("Num Scan Splits = 1") != std::string::npos) {
 			found = true;
 			break;
 		}

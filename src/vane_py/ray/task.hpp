@@ -258,7 +258,7 @@ public:
 	py::object Plan() const;
 
 	// Return task inputs keyed by source node id. Each value contains a
-	// typed payload such as scan-task bytes or exchange-source-task bytes.
+	// typed payload such as scan-split-batch bytes or exchange-source-task bytes.
 	py::dict Inputs() const;
 
 	// Return the task-local remote exchange sink instance, if the plan has one.

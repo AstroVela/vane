@@ -2796,8 +2796,6 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
     input_path = tmp_path / "row_preserving_udf_limit"
     shuffle_dir = tmp_path / "row_preserving_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2822,8 +2820,8 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert distributed_plan.num_partitions() == 4
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
@@ -2852,8 +2850,6 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
     input_path = tmp_path / "streaming_struct_udf_limit"
     shuffle_dir = tmp_path / "streaming_struct_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2886,8 +2882,8 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert distributed_plan.num_partitions() == 4
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
@@ -3050,7 +3046,7 @@ def test_ray_task_map_batches_worker_process(ray_runner, duckdb_conn, tmp_path):
     assert os.getpid() not in pids
 
 
-def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
+def test_ray_split_batches_worker_parquet_scan_filter_projection(
     ray_runner,
     duckdb_conn,
     partitioned_parquet_path,
@@ -3155,8 +3151,6 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     shuffle_dir = tmp_path / "reservoir_sample_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     monkeypatch.setenv("VANE_ORDER_BY_SOURCE_TASKS", "4")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
@@ -3226,8 +3220,6 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
     duckdb_conn.execute("SET threads = 4")
@@ -3342,14 +3334,12 @@ def test_ray_group_by_multi_partition_plan(ray_runner, duckdb_conn, parquet_path
     )
 
 
-def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: grouping sets span multiple scan tasks"
+def test_ray_grouping_sets_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: grouping sets span multiple scan splits"
     input_path = tmp_path / "grouping_sets_multi_task"
     shuffle_dir = tmp_path / "grouping_sets_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET perfect_ht_threshold=0")
     duckdb_conn.execute(f"""
@@ -3375,8 +3365,8 @@ def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     normalized_plan = plan_text.upper()
     assert plan_text and "GROUPINGSETEXPAND" in normalized_plan and "REPARTITION" in normalized_plan, (
@@ -3674,8 +3664,6 @@ def test_ray_join_auto_broadcast_keeps_preserved_side_as_receiver(ray_runner, du
     monkeypatch.delenv("VANE_DISTRIBUTED_JOIN_STRATEGY", raising=False)
     monkeypatch.delenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", raising=False)
     monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3875,8 +3863,6 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
     monkeypatch.setenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3908,8 +3894,8 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = sorted(len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values())
-    assert descriptor_counts == [2, 8], f"{label}: expected unequal scan task streams, got {descriptor_counts}"
+    split_counts = sorted(len(batches) for batches in distributed_plan.scan_split_batch_map().values())
+    assert split_counts == [2, 8], f"{label}: expected unequal scan split streams, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     assert "REPARTITION" in plan_text.upper(), f"{label}: expected repartitioned hash join, got:\n{plan_text}"
     assert "HASH JOIN" in plan_text.upper(), f"{label}: expected hash join, got:\n{plan_text}"
@@ -3939,9 +3925,6 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_c
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", shuffle_uri)
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "8")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1GB")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MAX_BYTES", "2GB")
 
     _configure_conn_for_s3(duckdb_conn, endpoint, access_key, secret_key, region)
     duckdb_conn.execute("SET perfect_ht_threshold=0")
@@ -4113,15 +4096,13 @@ def test_ray_window(ray_runner, duckdb_conn, parquet_path):
     )
 
 
-def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: windows span multiple scan tasks"
+def test_ray_windows_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: windows span multiple scan splits"
     window_path = tmp_path / "window_multi_task"
     shuffle_dir = tmp_path / "window_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -4148,8 +4129,8 @@ def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path,
         return logical_plan.to_physical_plan(duckdb_conn)
 
     global_plan = distributed_plan(global_sql, "global")
-    descriptor_counts = [len(descriptors) for descriptors in global_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in global_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert global_plan.num_partitions() == 1
     assert "REPARTITION" in global_plan.repr_ascii(False).upper()
 

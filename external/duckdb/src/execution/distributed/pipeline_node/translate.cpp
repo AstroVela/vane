@@ -44,7 +44,7 @@
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
-#include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
@@ -453,10 +453,10 @@ DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline
 	return result;
 }
 
-std::unordered_map<idx_t, std::vector<ScanTaskDescriptor>>
-physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionConfigRef config,
-                                    shared_ptr<DatabaseInstance> db) {
-	std::unordered_map<idx_t, std::vector<ScanTaskDescriptor>> out;
+std::unordered_map<idx_t, std::vector<ScanSplit>>
+physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionConfigRef config,
+                                     shared_ptr<DatabaseInstance> db) {
+	std::unordered_map<idx_t, std::vector<ScanSplit>> out;
 	if (!plan || !plan->HasRoot()) {
 		return out;
 	}
@@ -505,10 +505,8 @@ physical_plan_scan_task_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCon
 				scan.extra_info.scan_node_id = optional_idx(allocate_scan_node_id());
 			}
 
-			auto task_set = MakeTableScanTasks(scan, *exec_cfg, db);
-			if (!task_set.tasks.empty()) {
-				out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(task_set.tasks));
-			}
+			auto splits = MakeTableScanSplits(scan, *exec_cfg, db);
+			out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(splits));
 		}
 		for (auto &child : op.children) {
 			collect(child.get());

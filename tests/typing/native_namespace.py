@@ -116,8 +116,10 @@ assert_type(require_ray_cxx_attr("PyLogicalPlan"), type[ray_cxx.PyLogicalPlan])
 assert_type(require_ray_cxx_attr("RayTaskResult"), type[ray_cxx.RayTaskResult])
 cleanup_flight_shuffle = require_ray_cxx_attr("cleanup_flight_shuffle_for_query")
 assert_type(cleanup_flight_shuffle("typing-query"), dict[str, int | str])
-assert_type(ray_cxx.merge_scan_task_descriptors([b"descriptor"]), bytes)
-assert_type(ray_cxx.scan_task_source_partition_id(b"descriptor"), int)
+assert_type(ray_cxx.merge_scan_split_batches([b"batch"]), bytes)
+assert_type(ray_cxx.split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
+split_scan_split_batch = require_ray_cxx_attr("split_scan_split_batch")
+assert_type(split_scan_split_batch(b"batch"), list[tuple[str, bytes, int | None]])
 assert_type(
     ray_cxx.split_exchange_source_task_by_partition(b"descriptor"),
     list[tuple[int, bytes, int, int, bool]],

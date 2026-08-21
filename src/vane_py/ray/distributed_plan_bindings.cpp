@@ -767,7 +767,7 @@ struct PyPhysicalPlanWrapper {
 		auto level = simple ? duckdb::distributed::DisplayLevel::Compact : duckdb::distributed::DisplayLevel::Default;
 		return duckdb::distributed::viz_distributed_pipeline_mermaid(pipeline_node, level, bottom_up, "");
 	}
-	py::dict scan_task_descriptor_map() const {
+	py::dict scan_split_batch_map() const {
 		py::dict out;
 		if (!IsInitialized()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan is uninitialized");
@@ -782,17 +782,19 @@ struct PyPhysicalPlanWrapper {
 		if (!physical_plan->HasRoot()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan physical plan has no root");
 		}
-		std::unordered_map<idx_t, std::vector<duckdb::distributed::ScanTaskDescriptor>> task_map;
+		std::unordered_map<idx_t, std::vector<duckdb::distributed::ScanSplit>> split_map;
 		duckdb::shared_ptr<duckdb::DatabaseInstance> db;
 		if (client_context_) {
 			db = client_context_->db;
 		}
-		task_map = duckdb::distributed::physical_plan_scan_task_map_wrapper(physical_plan, plan_->execution_config(),
-		                                                                    std::move(db));
-		for (auto &kv : task_map) {
+		split_map = duckdb::distributed::physical_plan_scan_split_map_wrapper(physical_plan, plan_->execution_config(),
+		                                                                      std::move(db));
+		for (auto &kv : split_map) {
 			py::list lst;
-			for (auto &task : kv.second) {
-				lst.append(py::bytes(task.SerializeToBytes()));
+			for (auto &split : kv.second) {
+				duckdb::distributed::ScanSplitBatch batch;
+				batch.splits.push_back(std::move(split));
+				lst.append(py::bytes(batch.SerializeToBytes()));
 			}
 			out[py::str(std::to_string(kv.first))] = std::move(lst);
 		}
@@ -3355,7 +3357,7 @@ struct PyPhysicalPlanWrapperRunner {
 	py::object execute_native_impl(
 	    py::object conn_obj, std::shared_ptr<duckdb::PhysicalPlan> physical_plan, const string &plan_id,
 	    const string &resource_query_id,
-	    const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map,
+	    const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map,
 	    const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map =
 	        nullptr,
 	    const duckdb::distributed::ExchangeSinkInstanceTaskDescriptor *exchange_sink_instance_task = nullptr,
@@ -3405,16 +3407,16 @@ struct PyPhysicalPlanWrapperRunner {
 		distributed_write_task_context.query_id = plan_id;
 		distributed_write_task_context.task_attempt_id = distributed_write_task_attempt_id;
 		duckdb::ValidateDistributedWriteTaskContextAssignment(*physical_plan, distributed_write_task_context);
-		const bool worker_task_execution = !distributed_write_task_attempt_id.empty() || scan_task_map != nullptr ||
-		                                   exchange_source_task_map != nullptr ||
+		const bool worker_task_execution = !distributed_write_task_attempt_id.empty() ||
+		                                   scan_split_batch_map != nullptr || exchange_source_task_map != nullptr ||
 		                                   exchange_sink_instance_task != nullptr ||
 		                                   fte_scan_source_queue_map != nullptr ||
 		                                   fte_exchange_source_queue_map != nullptr || copy_output_info != nullptr;
-		if (scan_task_map && fte_scan_source_queue_map) {
-			for (const auto &entry : *scan_task_map) {
+		if (scan_split_batch_map && fte_scan_source_queue_map) {
+			for (const auto &entry : *scan_split_batch_map) {
 				if (fte_scan_source_queue_map->find(entry.first) != fte_scan_source_queue_map->end()) {
 					throw py::value_error("scan node_id=" + std::to_string(entry.first) +
-					                      " has both a static task descriptor and an FTE split queue");
+					                      " has both a static split batch and an FTE split queue");
 				}
 			}
 		}
@@ -3438,8 +3440,8 @@ struct PyPhysicalPlanWrapperRunner {
 			}
 		}
 		set<idx_t> scan_assignment_node_ids;
-		if (scan_task_map) {
-			for (const auto &entry : *scan_task_map) {
+		if (scan_split_batch_map) {
+			for (const auto &entry : *scan_split_batch_map) {
 				scan_assignment_node_ids.insert(entry.first);
 			}
 		}
@@ -3448,10 +3450,10 @@ struct PyPhysicalPlanWrapperRunner {
 				scan_assignment_node_ids.insert(entry.first);
 			}
 		}
-		if (worker_task_execution || duckdb::distributed::HasDistributedScanTaskTargets(*physical_plan)) {
+		if (worker_task_execution || duckdb::distributed::HasDistributedScanSplitTargets(*physical_plan)) {
 			string error;
-			if (!duckdb::distributed::ValidateScanTaskAssignments(*physical_plan, scan_assignment_node_ids, &error)) {
-				throw py::value_error("Scan task assignment validation failed: " + error);
+			if (!duckdb::distributed::ValidateScanSplitAssignments(*physical_plan, scan_assignment_node_ids, &error)) {
+				throw py::value_error("Scan split assignment validation failed: " + error);
 			}
 		}
 		{
@@ -3463,10 +3465,10 @@ struct PyPhysicalPlanWrapperRunner {
 		}
 		AssignDataSourceQueryOwner(physical_plan->Root(), resource_query_id);
 
-		if (scan_task_map && !scan_task_map->empty()) {
+		if (scan_split_batch_map && !scan_split_batch_map->empty()) {
 			string error;
-			if (!duckdb::distributed::ApplyScanTasksToPlan(*physical_plan, *scan_task_map, &error)) {
-				throw py::value_error("Failed to apply scan tasks to plan: " + error);
+			if (!duckdb::distributed::ApplyScanSplitBatchesToPlan(*physical_plan, *scan_split_batch_map, &error)) {
+				throw py::value_error("Failed to apply scan split batches to plan: " + error);
 			}
 		}
 
@@ -3474,7 +3476,7 @@ struct PyPhysicalPlanWrapperRunner {
 			string error;
 			bool applied;
 			{
-				// Extension callbacks materialize opaque task envelopes here and may
+				// Extension callbacks materialize opaque scan splits here and may
 				// wait until no_more_splits. The control thread that seals the queue
 				// must be able to acquire the GIL while that wait is in progress.
 				py::gil_scoped_release release;
@@ -3485,10 +3487,10 @@ struct PyPhysicalPlanWrapperRunner {
 				throw py::value_error("Failed to apply FTE scan source queues to plan: " + error);
 			}
 		}
-		if (worker_task_execution || duckdb::distributed::HasDistributedScanTaskTargets(*physical_plan)) {
+		if (worker_task_execution || duckdb::distributed::HasDistributedScanSplitTargets(*physical_plan)) {
 			string error;
-			if (!duckdb::distributed::ValidateDistributedScanTasksApplied(*physical_plan, &error)) {
-				throw py::value_error("Distributed scan task validation failed: " + error);
+			if (!duckdb::distributed::ValidateDistributedScanSplitsApplied(*physical_plan, &error)) {
+				throw py::value_error("Distributed scan split validation failed: " + error);
 			}
 		}
 
@@ -3680,7 +3682,7 @@ struct PyPhysicalPlanWrapperRunner {
 					}
 					py::gil_scoped_acquire acquire;
 					try {
-						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map,
+						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_split_batch_map,
 						                                      exchange_source_task_map, fte_scan_source_queue_map,
 						                                      fte_exchange_source_queue_map, terminal_exchange_sink);
 						native_progress_callback(stats);
@@ -3694,7 +3696,7 @@ struct PyPhysicalPlanWrapperRunner {
 				if (has_native_progress_callback) {
 					py::gil_scoped_acquire acquire;
 					try {
-						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map,
+						auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_split_batch_map,
 						                                      exchange_source_task_map, fte_scan_source_queue_map,
 						                                      fte_exchange_source_queue_map, terminal_exchange_sink);
 						native_progress_callback(stats);
@@ -3891,7 +3893,7 @@ struct PyPhysicalPlanWrapperRunner {
 			auto &collection = materialized.Collection();
 			if (terminal_exchange_sink) {
 				auto task_stats =
-				    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
+				    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_split_batch_map, exchange_source_task_map,
 				                             fte_scan_source_queue_map, fte_exchange_source_queue_map, true);
 				MarkTaskStatsCompleted(task_stats);
 				plan_guard.release();
@@ -3910,10 +3912,10 @@ struct PyPhysicalPlanWrapperRunner {
 			auto table = CollectionToArrowTable(collection, context);
 			const auto payload_bytes = static_cast<idx_t>(GetPyPayloadSizeBytes(table));
 			auto materialized_stats = BuildMaterializedInputTaskStats(
-			    root_op, scan_task_map, exchange_source_task_map, fte_scan_source_queue_map,
+			    root_op, scan_split_batch_map, exchange_source_task_map, fte_scan_source_queue_map,
 			    fte_exchange_source_queue_map, collection.Count(), payload_bytes, &materialized);
 			auto task_stats =
-			    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
+			    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_split_batch_map, exchange_source_task_map,
 			                             fte_scan_source_queue_map, fte_exchange_source_queue_map);
 			OverlayMaterializedProgressStats(task_stats, materialized_stats);
 			MarkTaskStatsCompleted(task_stats);
@@ -3962,9 +3964,9 @@ struct PyPhysicalPlanWrapperRunner {
 				}
 				py::gil_scoped_acquire acquire;
 				try {
-					auto stats =
-					    BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_task_map, exchange_source_task_map,
-					                             fte_scan_source_queue_map, fte_exchange_source_queue_map);
+					auto stats = BuildNativeTaskStatsDict(stable_pipeline_snapshots, scan_split_batch_map,
+					                                      exchange_source_task_map, fte_scan_source_queue_map,
+					                                      fte_exchange_source_queue_map);
 					native_progress_callback(stats);
 					last_native_progress = now;
 				} catch (const std::exception &ex) {
@@ -4000,7 +4002,7 @@ struct PyPhysicalPlanWrapperRunner {
 			final_pipeline_snapshots = std::move(stable_pipeline_snapshots);
 		}
 		py::object final_task_stats =
-		    BuildNativeTaskStatsDict(final_pipeline_snapshots, scan_task_map, exchange_source_task_map,
+		    BuildNativeTaskStatsDict(final_pipeline_snapshots, scan_split_batch_map, exchange_source_task_map,
 		                             fte_scan_source_queue_map, fte_exchange_source_queue_map);
 
 		if (executor.HasResultCollector()) {

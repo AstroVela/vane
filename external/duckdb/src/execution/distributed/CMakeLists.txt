@@ -33,7 +33,7 @@ set(DISTRIBUTED_SOURCES_COMMON
     plan/exchange_sink_instance_task.cpp
     plan/exchange_source_task.cpp
     plan/fte_split_queue.cpp
-    plan/scan_task.cpp
+    plan/scan_split.cpp
     ${DISTRIBUTED_SOURCES_EXCHANGE}
     # python-related sources are optional and appended below when enabled
 )

@@ -387,7 +387,7 @@ static unique_ptr<FunctionData> ParquetScanDeserialize(Deserializer &deserialize
 
 	auto multi_file_reader = MultiFileReader::Create(function);
 	// A distributed worker plan deliberately serializes the schema-bearing bind
-	// state without coordinator files. The explicit scan task assignment replaces
+	// state without coordinator files. The explicit scan split assignment replaces
 	// this empty list before executor initialization.
 	vector<OpenFileInfo> open_files;
 	open_files.reserve(files.size());

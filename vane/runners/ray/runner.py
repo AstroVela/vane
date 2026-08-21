@@ -51,7 +51,7 @@ def notify_connection_closed(session_id: str) -> None:
         ) from errors[0]
 
 
-def _configure_scan_task_backlog_env(max_task_backlog: int | None) -> None:
+def _configure_scan_split_backlog_env(max_task_backlog: int | None) -> None:
     if max_task_backlog is None:
         return
     if max_task_backlog <= 0:
@@ -85,7 +85,7 @@ class RayRunner(Runner):
         self.ray_address = address
         self.max_task_backlog = max_task_backlog
         ensure_vane_session_dir()
-        _configure_scan_task_backlog_env(max_task_backlog)
+        _configure_scan_split_backlog_env(max_task_backlog)
 
         if not ray.is_initialized():
             ray.init(

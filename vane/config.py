@@ -10,7 +10,7 @@ Instead of setting environment variables manually, users can call
 
     vane.configure(
         runner="ray",
-        ray_scan_task_size_grouping=False,
+        ray_scan_split_min_count=16,
     )
 
 Under the hood this writes to ``os.environ`` — env vars remain the
@@ -64,9 +64,7 @@ if TYPE_CHECKING:
         local_exchange_buffer: str = "32MB"
         ray_init_sql: str = ""
         ray_max_task_backlog: int = 0
-        ray_scan_task_min_partition_num: int = 0
-        ray_scan_task_open_cost_bytes: int = 4 * 1024 * 1024
-        ray_scan_task_size_grouping: bool = True
+        ray_scan_split_min_count: int = 0
         runner: str = "ray"
         udf_arrow_fastpath: bool = True
         udf_parallel: bool = False
@@ -83,7 +81,7 @@ def configure(**kw: Any) -> VaneConfig:
 
     Example::
 
-        cfg = vane.configure(runner="ray", ray_scan_task_size_grouping=False)
+        cfg = vane.configure(runner="ray", ray_scan_split_min_count=16)
         print(cfg.runner)  # "ray"
     """
     for key in kw:

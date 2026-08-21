@@ -516,7 +516,7 @@ public:
 	table_function_deserialize_t deserialize;
 	//! Optional extension-owned distributed scan protocol. Bind-state transport
 	//! continues to use serialize/deserialize; these callbacks only detach,
-	//! create, and apply opaque scan tasks.
+	//! create, and apply opaque scan splits.
 	shared_ptr<const TableFunctionDistributedScanCallbacks> distributed_scan;
 	bool verify_serialization = true;
 

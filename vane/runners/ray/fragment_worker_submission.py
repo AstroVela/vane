@@ -20,6 +20,7 @@ from vane.runners.fte import (
 from vane.runners.fte.dynamic_inputs import (
     split_exchange_source_task_by_partition as _split_exchange_source_task_by_partition,
 )
+from vane.runners.fte.dynamic_inputs import split_scan_split_batch as _split_scan_split_batch
 from vane.runners.fte.dynamic_inputs import (
     splits_from_pending_task,
 )
@@ -621,6 +622,7 @@ class FteWorkerSubmissionMixin:
             ) = splits_from_pending_task(
                 item,
                 next_split_sequence=self._next_fte_split_sequence,
+                split_scan_split_batch_fn=_split_scan_split_batch,
                 split_exchange_source_task_by_partition_fn=_split_exchange_source_task_by_partition,
             )
             item["context"] = _strip_fte_dynamic_context(

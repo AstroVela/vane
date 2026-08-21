@@ -15,15 +15,15 @@ namespace distributed {
 
 namespace {
 
-size_t ResolveScanTaskSubmissionBacklog(size_t scan_task_count, const DuckDBExecutionConfigRef &exec_cfg) {
-	if (scan_task_count == 0) {
+size_t ResolveScanSplitSubmissionBacklog(size_t scan_split_count, const DuckDBExecutionConfigRef &exec_cfg) {
+	if (scan_split_count == 0) {
 		return 1;
 	}
 	if (!exec_cfg) {
-		return scan_task_count;
+		return scan_split_count;
 	}
 
-	size_t backlog = exec_cfg->scan_task_backlog();
+	size_t backlog = exec_cfg->scan_split_backlog();
 	if (backlog == 0) {
 		backlog = exec_cfg->distributed_worker_slots();
 	}
@@ -31,15 +31,15 @@ size_t ResolveScanTaskSubmissionBacklog(size_t scan_task_count, const DuckDBExec
 		backlog = exec_cfg->distributed_node_count();
 	}
 	if (backlog == 0) {
-		backlog = scan_task_count;
+		backlog = scan_split_count;
 	}
-	return std::max<size_t>(1, std::min(backlog, scan_task_count));
+	return std::max<size_t>(1, std::min(backlog, scan_split_count));
 }
 
 } // namespace
 
 SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionContext &plan_context) {
-	const auto channel_capacity = ResolveScanTaskSubmissionBacklog(scan_tasks_.size(), config().execution_config());
+	const auto channel_capacity = ResolveScanSplitSubmissionBacklog(scan_splits_.size(), config().execution_config());
 
 	auto channel = create_channel<SubmittableTask<WorkerTask>>(channel_capacity);
 	auto rx = std::move(channel.second);
@@ -64,16 +64,16 @@ SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionCon
 		}
 
 		if (injected_input_ptr->has_value()) {
-			if ((*injected_input_ptr)->kind != TaskInput::Kind::ScanTask) {
+			if ((*injected_input_ptr)->kind != TaskInput::Kind::ScanSplitBatch) {
 				tx_ptr->state()->close();
-				return DuckDBResult<void>::err(DuckDBError("ScanSourceNode injected input must be a scan task"));
+				return DuckDBResult<void>::err(DuckDBError("ScanSourceNode injected input must be a scan split batch"));
 			}
 
 			TaskContext tctx =
 			    TaskContext::from_node_context(self->context().query_idx(), self->node_id(), task_id_counter.next());
 			WorkerTask task(tctx, self->scan_plan_, self->config().execution_config(), self->context().to_hashmap());
 			task.mutable_inputs()[static_cast<SourceNodeId>(self->node_id())] =
-			    TaskInput::make_scan_task((*injected_input_ptr)->scan_task_bytes);
+			    TaskInput::make_scan_split_batch((*injected_input_ptr)->scan_split_batch_bytes);
 			auto r = tx_ptr->send(SubmittableTask<WorkerTask>(std::move(task)));
 			if (r.is_err()) {
 				tx_ptr->state()->close();
@@ -83,10 +83,10 @@ SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionCon
 			return DuckDBResult<void>::ok();
 		}
 
-		if (self->scan_tasks_.empty()) {
-			if (self->require_scan_tasks_) {
+		if (self->scan_splits_.empty()) {
+			if (self->require_scan_splits_) {
 				tx_ptr->state()->close();
-				return DuckDBResult<void>::err(DuckDBError("ScanSourceNode missing scan task partition set"));
+				return DuckDBResult<void>::err(DuckDBError("ScanSourceNode missing scan splits"));
 			}
 
 			TaskContext tctx =
@@ -101,13 +101,15 @@ SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionCon
 			return DuckDBResult<void>::ok();
 		}
 
-		const size_t num_scan_tasks = self->scan_tasks_.size();
+		const size_t num_scan_splits = self->scan_splits_.size();
 
-		// Emit one task per descriptor produced by MakeTableScanTasks.
-		for (size_t task_idx = 0; task_idx < num_scan_tasks; task_idx++) {
-			const auto &descriptor = self->scan_tasks_[task_idx];
+		// Emit one scheduler input per logical source split. The FTE scheduler
+		// alone decides how many of these splits belong to one task attempt.
+		for (size_t split_idx = 0; split_idx < num_scan_splits; split_idx++) {
+			ScanSplitBatch batch;
+			batch.splits.push_back(self->scan_splits_[split_idx]);
 			auto t_serialized_start = std::chrono::steady_clock::now();
-			auto scan_bytes = descriptor.SerializeToBytes();
+			auto scan_bytes = batch.SerializeToBytes();
 			auto t_serialized = std::chrono::steady_clock::now();
 
 			TaskContext tctx =
@@ -115,8 +117,8 @@ SubmittableTaskStream<WorkerTask> ScanSourceNode::produce_tasks(PlanExecutionCon
 			auto context = self->context().to_hashmap();
 
 			WorkerTask task(tctx, self->scan_plan_, self->config().execution_config(), std::move(context));
-			// Populate inputs_ for SourceId-based routing (analogous to Vane's Input::ScanTask)
-			task.mutable_inputs()[static_cast<SourceNodeId>(self->node_id())] = TaskInput::make_scan_task(scan_bytes);
+			task.mutable_inputs()[static_cast<SourceNodeId>(self->node_id())] =
+			    TaskInput::make_scan_split_batch(scan_bytes);
 			auto t_pre_send = std::chrono::steady_clock::now();
 			auto r = tx_ptr->send(SubmittableTask<WorkerTask>(std::move(task)));
 			auto t_post_send = std::chrono::steady_clock::now();
