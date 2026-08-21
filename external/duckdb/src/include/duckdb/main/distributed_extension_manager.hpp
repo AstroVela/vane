@@ -24,6 +24,9 @@ struct DistributedExtensionCapability {
 	DistributedExtensionCapabilityKind kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	string name;
 	idx_t protocol_version = 0;
+	//! Canonical catalog overload signature. Required for table-function
+	//! capabilities and empty for capability kinds that are not overloaded.
+	string function_signature;
 
 	DUCKDB_API string CanonicalIdentity() const;
 	DUCKDB_API bool operator==(const DistributedExtensionCapability &other) const;

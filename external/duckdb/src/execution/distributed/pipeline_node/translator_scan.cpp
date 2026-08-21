@@ -10,6 +10,7 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/execution/physical_plan.hpp"
 #include "duckdb/main/database.hpp"
 
@@ -129,6 +130,21 @@ size_t ResolveScanTaskTargetCount(size_t source_count, const DuckDBExecutionConf
 	return target;
 }
 
+size_t ResolveExtensionScanPlanningTargetCount(const DuckDBExecutionConfig &exec_cfg) {
+	size_t target = exec_cfg.distributed_worker_slots();
+	if (target == 0) {
+		target = exec_cfg.distributed_node_count();
+	}
+	if (target == 0) {
+		target = 1;
+	}
+	auto min_partitions = exec_cfg.scan_task_min_partition_num();
+	if (min_partitions > 0) {
+		target = std::max(target, min_partitions);
+	}
+	return target;
+}
+
 vector<vector<idx_t>> GroupIndexesByCount(idx_t count, size_t max_tasks) {
 	vector<vector<idx_t>> groups;
 	if (count == 0) {
@@ -224,9 +240,9 @@ std::vector<uint64_t> GetFileSizesFromDB(const std::vector<OpenFileInfo> &files,
 	return sizes;
 }
 
-TableFunctionDistributedScanInput MakeDistributedScanInput(const PhysicalTableScan &scan) {
+TableFunctionDistributedScanInput MakeDistributedScanInput(const PhysicalTableScan &scan, idx_t target_task_count = 0) {
 	return TableFunctionDistributedScanInput(*scan.bind_data, scan.column_ids, scan.projection_ids,
-	                                         scan.table_filters.get(), scan.estimated_cardinality);
+	                                         scan.table_filters.get(), scan.estimated_cardinality, target_task_count);
 }
 
 vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
@@ -237,7 +253,7 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 		                             scan.function.name);
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-	callbacks.Validate(scan.function.name);
+	callbacks.Validate(scan.function);
 	const auto &capability = callbacks.GetCapability();
 	if (!db) {
 		throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
@@ -246,7 +262,8 @@ vector<ScanTaskDescriptor> MakeExtensionScanTasks(const PhysicalTableScan &scan,
 	}
 	DistributedExtensionManager::Get(*db).RequireCapability(capability);
 
-	auto planned_tasks = callbacks.plan(MakeDistributedScanInput(scan));
+	auto planned_tasks = callbacks.plan(
+	    MakeDistributedScanInput(scan, NumericCast<idx_t>(ResolveExtensionScanPlanningTargetCount(exec_cfg))));
 	if (planned_tasks.empty()) {
 		ScanTaskDescriptor empty_task;
 		empty_task.kind = ScanTaskKind::EXTENSION;
@@ -360,7 +377,7 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 			                             scan.function.name);
 		}
 		const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-		callbacks.Validate(scan.function.name);
+		callbacks.Validate(scan.function);
 		bind_data = callbacks.create_worker_bind(MakeDistributedScanInput(scan));
 		if (!bind_data) {
 			throw InvalidInputException("Distributed table function '%s' returned null from create_worker_bind",

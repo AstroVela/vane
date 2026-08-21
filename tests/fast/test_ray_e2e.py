@@ -443,6 +443,82 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    label = "test_ray_e2e: distributed range source"
+    sql = "SELECT i FROM range(0, 8193) AS t(i)"
+    relation = duckdb_conn.sql(sql)
+    _, num_parts = _get_distributed_plan_info(relation, label)
+    assert num_parts is not None and num_parts >= 4
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=30.0)
+    _assert_results_match(duckdb_conn, sql, parts, label)
+
+    cases = [
+        (
+            "SELECT i FROM generate_series(5, -5, -2) AS t(i)",
+            "test_ray_e2e: distributed negative generate_series",
+        ),
+        (
+            "SELECT ts FROM range(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-08', INTERVAL 1 DAY) AS t(ts)",
+            "test_ray_e2e: distributed fixed timestamp range",
+        ),
+        (
+            "SELECT ts FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-05-31', INTERVAL 1 MONTH) AS t(ts)",
+            "test_ray_e2e: distributed calendar timestamp generate_series",
+        ),
+        (
+            "SELECT source_i, generated_i FROM range(1, 5) AS source(source_i), "
+            "LATERAL range(source_i) AS generated(generated_i)",
+            "test_ray_e2e: distributed source with correlated lateral range",
+        ),
+    ]
+    for case_sql, case_label in cases:
+        try:
+            _run_query_case(duckdb_conn, ray_runner, case_sql, case_label, timeout_s=30.0)
+        except Exception as exc:
+            raise AssertionError(f"{case_label}: distributed execution failed") from exc
+
+
+def test_ray_icu_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
+    duckdb_conn.execute("LOAD icu")
+    duckdb_conn.execute("SET TimeZone='America/New_York'")
+
+    exact_sql = (
+        "SELECT ts FROM generate_series("
+        "TIMESTAMPTZ '2026-03-07 00:00:00 America/New_York', "
+        "TIMESTAMPTZ '2026-03-10 00:00:00 America/New_York', INTERVAL 6 HOUR) AS t(ts)"
+    )
+    exact_relation = duckdb_conn.sql(exact_sql)
+    _, num_parts = _get_distributed_plan_info(exact_relation, "test_ray_e2e: distributed ICU fixed interval")
+    assert num_parts is not None and num_parts >= 4
+    exact_parts = _run_iter_tables(
+        ray_runner,
+        exact_relation,
+        "test_ray_e2e: distributed ICU fixed interval",
+        timeout_s=30.0,
+    )
+    _assert_results_match(
+        duckdb_conn,
+        exact_sql,
+        exact_parts,
+        "test_ray_e2e: distributed ICU fixed interval",
+    )
+
+    sql = (
+        "SELECT ts FROM generate_series("
+        "TIMESTAMPTZ '2026-03-07 12:00:00 America/New_York', "
+        "TIMESTAMPTZ '2026-03-10 12:00:00 America/New_York', INTERVAL 1 DAY) AS t(ts)"
+    )
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: distributed ICU calendar generate_series",
+        timeout_s=30.0,
+    )
+
+
 @pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument

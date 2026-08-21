@@ -351,7 +351,7 @@ static bool ApplyExtensionScanTasks(PhysicalTableScan &scan, const ScanTaskDescr
 		return false;
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-	callbacks.Validate(scan.function.name);
+	callbacks.Validate(scan.function);
 	const auto &capability = callbacks.GetCapability();
 	if (descriptor.extension_capability != capability) {
 		SetApplyError(error, "distributed scan capability mismatch for table function '" + scan.function.name +

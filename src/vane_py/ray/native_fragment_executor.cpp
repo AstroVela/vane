@@ -852,7 +852,12 @@ static bool NativePlanNeedsResultCollector(const duckdb::PhysicalOperator &root_
 	if (root_op.type == PhysicalOperatorType::EXCHANGE_SINK) {
 		return false;
 	}
-	return !root_op.IsSink() || root_op.IsSource() || root_op.type == PhysicalOperatorType::CTE ||
+	// Delim joins and CTEs are pipeline wrappers: although their physical root is
+	// a sink, BuildPipelines routes a hidden child pipeline back to the caller.
+	// Execute them through the managed query path so those rows are collected and
+	// finalize events retain ClientContext::active_query.
+	return !root_op.IsSink() || root_op.IsSource() || root_op.type == PhysicalOperatorType::LEFT_DELIM_JOIN ||
+	       root_op.type == PhysicalOperatorType::RIGHT_DELIM_JOIN || root_op.type == PhysicalOperatorType::CTE ||
 	       root_op.type == PhysicalOperatorType::RECURSIVE_CTE;
 }
 

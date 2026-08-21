@@ -787,7 +787,17 @@ def test_connection_snapshot_captures_exact_extension_contract():
     assert isinstance(snapshot["extensions"], list)
     assert all(set(extension) >= {"name", "version"} for extension in snapshot["extensions"])
     assert snapshot["distributed_extension_contracts"] == [
-        "vane_core{table_function:datasource_scan@1}",
+        "icu{table_function:generate_series(TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, INTERVAL)@1,"
+        "table_function:range(TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, INTERVAL)@1}",
+        "vane_core{table_function:datasource_scan(POINTER, POINTER, BLOB, BLOB[])@1,"
+        "table_function:generate_series(BIGINT)@1,"
+        "table_function:generate_series(BIGINT, BIGINT)@1,"
+        "table_function:generate_series(BIGINT, BIGINT, BIGINT)@1,"
+        "table_function:generate_series(TIMESTAMP, TIMESTAMP, INTERVAL)@1,"
+        "table_function:range(BIGINT)@1,"
+        "table_function:range(BIGINT, BIGINT)@1,"
+        "table_function:range(BIGINT, BIGINT, BIGINT)@1,"
+        "table_function:range(TIMESTAMP, TIMESTAMP, INTERVAL)@1}",
     ]
 
 
@@ -847,7 +857,7 @@ def test_snapshot_replay_rejects_different_distributed_extension_contract():
     snapshot = dict(state[6])
     snapshot["distributed_extension_contracts"] = [
         *snapshot["distributed_extension_contracts"],
-        "missing_test_extension{table_function:scan@1}",
+        "missing_test_extension{table_function:scan(BIGINT)@1}",
     ]
     state[6] = snapshot
 

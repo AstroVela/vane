@@ -13,6 +13,7 @@
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
@@ -21,6 +22,13 @@ namespace duckdb {
 
 class FunctionData;
 class TableFilterSet;
+class TableFunction;
+
+//! Stable catalog identity for one table-function overload. This uses the
+//! declared argument and varargs types rather than bind-time concrete types.
+DUCKDB_API string GetDistributedTableFunctionSignature(const string &function_name,
+                                                       const vector<LogicalType> &arguments,
+                                                       const LogicalType &varargs = LogicalType::INVALID);
 
 //! One elementary, portable unit of work produced by an extension on the
 //! coordinator. Vane never interprets the payload bytes.
@@ -40,9 +48,11 @@ struct DistributedScanTask {
 struct TableFunctionDistributedScanInput {
 	TableFunctionDistributedScanInput(const FunctionData &bind_data_p, const vector<ColumnIndex> &column_ids_p,
 	                                  const vector<idx_t> &projection_ids_p,
-	                                  optional_ptr<const TableFilterSet> table_filters_p, idx_t estimated_cardinality_p)
+	                                  optional_ptr<const TableFilterSet> table_filters_p, idx_t estimated_cardinality_p,
+	                                  idx_t target_task_count_p = 0)
 	    : bind_data(bind_data_p), column_ids(column_ids_p), projection_ids(projection_ids_p),
-	      table_filters(table_filters_p), estimated_cardinality(estimated_cardinality_p) {
+	      table_filters(table_filters_p), estimated_cardinality(estimated_cardinality_p),
+	      target_task_count(target_task_count_p) {
 	}
 
 	const FunctionData &bind_data;
@@ -50,6 +60,9 @@ struct TableFunctionDistributedScanInput {
 	const vector<idx_t> &projection_ids;
 	optional_ptr<const TableFilterSet> table_filters;
 	idx_t estimated_cardinality;
+	//! Scheduler-selected task-count hint. It is non-zero for task planning and
+	//! zero when the same input shape is used to create a task-free worker bind.
+	idx_t target_task_count;
 };
 
 //! Plan extension-owned elementary tasks as opaque envelopes.
@@ -82,8 +95,8 @@ struct TableFunctionDistributedScanCallbacks {
 	table_function_apply_distributed_scan_tasks_t apply_tasks = nullptr;
 
 	DUCKDB_API void ValidateDefinition(const string &function_name) const;
-	DUCKDB_API void Validate(const string &function_name) const;
-	DUCKDB_API void BindCapability(const string &extension_name, const string &function_name);
+	DUCKDB_API void Validate(const TableFunction &function) const;
+	DUCKDB_API void BindCapability(const string &extension_name, const TableFunction &function);
 	DUCKDB_API const DistributedExtensionCapabilityReference &GetCapability() const;
 	DUCKDB_API bool operator==(const TableFunctionDistributedScanCallbacks &other) const;
 

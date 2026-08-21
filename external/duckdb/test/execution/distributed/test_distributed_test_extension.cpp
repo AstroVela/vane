@@ -43,6 +43,7 @@ static const string DISTRIBUTED_TEST_SCAN_CODEC = "distributed-test.scan-task";
 static const string DISTRIBUTED_TEST_WRITE_CODEC = "distributed-test.opaque-write-fragment";
 static const string DISTRIBUTED_TEST_WRITE_NAME = "distributed_test_opaque_write";
 static atomic<idx_t> distributed_test_create_worker_bind_calls {0};
+static atomic<idx_t> distributed_test_last_target_task_count {0};
 
 struct DistributedTestRuntimeTask {
 	idx_t task_id = 0;
@@ -152,6 +153,8 @@ static DistributedExtensionCapabilityReference DistributedTestCapability() {
 	reference.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	reference.capability.name = "distributed_test_scan";
 	reference.capability.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
+	reference.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_scan", {LogicalType::BIGINT}, LogicalType::INVALID);
 	return reference;
 }
 
@@ -362,6 +365,7 @@ static unique_ptr<FunctionData> DistributedTestCreateWorkerBind(const TableFunct
 }
 
 static vector<DistributedScanTask> DistributedTestPlanTasks(const TableFunctionDistributedScanInput &input) {
+	distributed_test_last_target_task_count = input.target_task_count;
 	auto &bind_data = input.bind_data.Cast<DistributedTestScanBindData>();
 	vector<DistributedScanTask> result;
 	result.reserve(bind_data.tasks.size());
@@ -516,11 +520,12 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
 
 	auto &coordinator_manager = DistributedExtensionManager::Get(*coordinator_db.instance);
-	REQUIRE(SyntheticExtensionHasContractIdentity(
-	    coordinator_manager,
-	    "distributed_test{table_function:distributed_test_scan@1,write_operator:distributed_test_opaque_write@1}"));
+	REQUIRE(SyntheticExtensionHasContractIdentity(coordinator_manager,
+	                                              "distributed_test{table_function:distributed_test_scan(BIGINT)@1,"
+	                                              "write_operator:distributed_test_opaque_write@1}"));
 
 	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(1)", 3);
+	REQUIRE(distributed_test_last_target_task_count.load() == 3);
 	REQUIRE(planned.tasks.size() == 1);
 	auto &detached_bind =
 	    planned.worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
@@ -825,6 +830,8 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	                       distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION};
 	auto invalid_info = info;
 	invalid_info.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	invalid_info.capability.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_file_write", {});
 	REQUIRE_THROWS_WITH(invalid_info.Validate(), Catch::Matchers::Contains("must be a write operator"));
 
 	distributed::DistributedCopyFileInfo file;
@@ -852,6 +859,8 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	auto roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
 	auto invalid_result = roundtrip;
 	invalid_result.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	invalid_result.capability.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_file_write", {});
 	REQUIRE_THROWS_WITH(invalid_result.Validate(), Catch::Matchers::Contains("not a write operator"));
 	auto decoded = distributed::DecodeDistributedFileWriteResults(info, {roundtrip});
 	REQUIRE(decoded.size() == 1);
