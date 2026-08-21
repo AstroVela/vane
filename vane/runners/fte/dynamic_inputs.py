@@ -157,8 +157,8 @@ def prepare_fte_dynamic_inputs(
             if not source_node_id:
                 continue
             dynamic_scan_sources.add(source_node_id)
-            split_fn = split_scan_split_batch_fn or split_scan_split_batch
-            for split_id, singleton_batch, estimated_bytes in split_fn(value):
+            scan_split_fn = split_scan_split_batch_fn or split_scan_split_batch
+            for split_id, singleton_batch, estimated_bytes in scan_split_fn(value):
                 splits.append(
                     FteSplit(
                         source_node_id=source_node_id,
@@ -176,8 +176,8 @@ def prepare_fte_dynamic_inputs(
         if not source_node_id:
             continue
         dynamic_exchange_sources.add(source_node_id)
-        split_fn = split_exchange_source_task_by_partition_fn or split_exchange_source_task_by_partition
-        split_items, source_partition_count, source_task_count, replicated = split_fn(value)
+        exchange_split_fn = split_exchange_source_task_by_partition_fn or split_exchange_source_task_by_partition
+        split_items, source_partition_count, source_task_count, replicated = exchange_split_fn(value)
         if replicated:
             replicated_exchange_sources.add(source_node_id)
         exchange_source_partition_count = max(exchange_source_partition_count, int(source_partition_count))
