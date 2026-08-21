@@ -42,6 +42,18 @@ def _task_id(partition_id: int, *, query_id: str = "q") -> dict[str, int | str]:
     }
 
 
+def _scan_split_batch(split_id: str, data: Any) -> dict[str, Any]:
+    return {
+        "splits": [
+            {
+                "split_id": split_id,
+                "estimated_bytes": len(data) if isinstance(data, bytes) else None,
+                "data": data,
+            }
+        ]
+    }
+
+
 class _FakeNativeWorkerTask:
     def __init__(
         self,
@@ -386,7 +398,7 @@ def _captured_native_copy_plan(tmp_path, monkeypatch, *, local_staging: bool):
         captured[0],
         query_id,
     ).to_physical_plan(con)
-    assert plan.scan_task_descriptor_map()
+    assert plan.scan_split_batch_map()
     return con, dst, query_id, plan
 
 
@@ -844,8 +856,9 @@ def test_native_worker_terminal_task_stats_merge_completed_split_queue_stats():
                     "scan": [
                         {
                             "sequence_id": 1,
-                            "kind": "scan_task",
-                            "data": b"not-a-real-scan-descriptor",
+                            "kind": "scan_split",
+                            "split_id": "scan-1",
+                            "data": b"not-a-real-scan-split-batch",
                         }
                     ]
                 },
@@ -1354,7 +1367,7 @@ def test_native_worker_manager_task_input_stream_exhausted_seals_fte_runtime_sou
                     "worker_runtime": "fte",
                     "source_node_ids": ["7"],
                     "initial_splits": {
-                        "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                        "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     },
                 }
             ]
@@ -1379,7 +1392,10 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
         context={"query_id": "query-dynamic", "node_id": "3"},
         task_context={"task_id": 9, "last_node_id": "3"},
         inputs={
-            "1": {"kind": "scan_task", "data": b"scan-descriptor"},
+            "1": {
+                "kind": "scan_split_batch",
+                "data": _scan_split_batch("scan-0", b"scan-split-payload"),
+            },
             "3": {
                 "kind": "exchange_source_task",
                 "data": {
@@ -1399,16 +1415,17 @@ def test_native_worker_task_request_converts_inputs_to_dynamic_splits():
     assert request["source_node_ids"] == ["1", "3"]
     assert request["dynamic_scan_source_node_ids"] == ["1"]
     assert request["dynamic_exchange_source_node_ids"] == ["3"]
-    assert "scan_task:1" not in request["context"]
+    assert "scan_split_batch:1" not in request["context"]
     assert "exchange_source_task:3" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert "exchange_source_task_nodes" not in request["context"]
 
     scan_splits = request["initial_splits"]["1"]
     assert len(scan_splits) == 1
-    assert scan_splits[0]["kind"] == "scan_task"
+    assert scan_splits[0]["kind"] == "scan_split"
     assert scan_splits[0]["sequence_id"] == 0
-    assert scan_splits[0]["data"] == b"scan-descriptor"
+    assert scan_splits[0]["split_id"] == "scan-0"
+    assert scan_splits[0]["data"] == _scan_split_batch("scan-0", b"scan-split-payload")
 
     exchange_splits = request["initial_splits"]["3"]
     assert [split["sequence_id"] for split in exchange_splits] == [0, 1]
@@ -1550,23 +1567,20 @@ def test_native_worker_task_request_derives_stable_plan_sink_identity_from_input
     assert first_order["exchange_sink_instance"]["output_location"] == (f"shuffle__sink_{first_identity}__attempt_0")
 
 
-def test_native_worker_task_request_distinguishes_identical_scan_occurrences():
-    def make_request(source_task_partition_id: int) -> dict[str, Any]:
+def test_native_worker_task_request_distinguishes_scan_splits_by_stable_id():
+    def make_request(split_id: str, event_task_id: int) -> dict[str, Any]:
         task = _FakeNativeWorkerTask(
             context={"query_id": "query-duplicate-scan", "node_id": "4"},
             task_context={
                 "query_idx": 0,
                 "last_node_id": 4,
-                "task_id": 99 - source_task_partition_id,
+                "task_id": event_task_id,
                 "node_ids": [3, 4],
             },
             inputs={
                 "3": {
-                    "kind": "scan_task",
-                    "data": {
-                        "source_task_partition_id": source_task_partition_id,
-                        "files": ["same.parquet"],
-                    },
+                    "kind": "scan_split_batch",
+                    "data": _scan_split_batch(split_id, b"same-file-payload"),
                 }
             },
             exchange_sink_instance={
@@ -1577,9 +1591,14 @@ def test_native_worker_task_request_distinguishes_identical_scan_occurrences():
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
 
-    first = make_request(0)
-    repeated_occurrence = make_request(1)
+    first = make_request("file-0", 99)
+    same_logical_split = make_request("file-0", 12)
+    repeated_occurrence = make_request("file-1", 98)
 
+    assert (
+        first["exchange_sink_instance"]["task_partition_id"]
+        == same_logical_split["exchange_sink_instance"]["task_partition_id"]
+    )
     assert (
         first["exchange_sink_instance"]["task_partition_id"]
         != repeated_occurrence["exchange_sink_instance"]["task_partition_id"]
@@ -1699,7 +1718,7 @@ def test_native_fte_runtime_starts_dynamic_source_and_removes_initial_splits_bef
                     "source_node_ids": ["7"],
                     "dynamic_scan_source_node_ids": ["7"],
                     "initial_splits": {
-                        "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"scan"}],
+                        "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"scan"}],
                     },
                 }
             ]
@@ -3040,8 +3059,6 @@ def test_cxx_backend_registers_order_by_internal_queries_under_resource_owner(tm
     from vane.runners.local.runner import _InProcessFragmentExecutor
 
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
-    monkeypatch.setenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES", "1")
-    monkeypatch.setenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES", "1")
 
     con = vane.connect()
     for partition_id in range(4):
@@ -4178,7 +4195,7 @@ def test_in_process_fragment_executor_uses_thread_local_duckdb_resources(monkeyp
     def fake_require(name: str, *args: Any, **kwargs: Any) -> Any:
         if name == "DistributedPhysicalPlanRunner":
             return FakePlanRunner
-        if name == "merge_scan_task_descriptors":
+        if name == "merge_scan_split_batches":
             return lambda values: values
         raise AssertionError(f"unexpected ray_cxx attr: {name}")
 

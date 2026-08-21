@@ -15,16 +15,16 @@ from vane import configure, current_config, env
 
 def test_configure_sets_registered_environment_variables(monkeypatch):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
-    monkeypatch.delenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", raising=False)
+    monkeypatch.delenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", raising=False)
 
-    cfg = configure(runner="ray", ray_scan_task_size_grouping=False)
+    cfg = configure(runner="ray", ray_scan_split_min_count=16)
 
     assert cfg.runner == "ray"
-    assert cfg.ray_scan_task_size_grouping is False
+    assert cfg.ray_scan_split_min_count == 16
     assert os.environ["VANE_RUNNER"] == "ray"
-    assert os.environ["VANE_RAY_SCAN_TASK_SIZE_GROUPING"] == "False"
+    assert os.environ["VANE_RAY_SCAN_SPLIT_MIN_COUNT"] == "16"
     assert current_config().runner == "ray"
-    assert env.ray_scan_task_size_grouping is False
+    assert env.ray_scan_split_min_count == 16
 
 
 def test_configure_accepts_local_runner(monkeypatch):
@@ -435,7 +435,7 @@ def test_config_registry_contains_stable_public_fields():
     fields = set(current_config().__dict__)
 
     assert "runner" in fields
-    assert "ray_scan_task_open_cost_bytes" in fields
+    assert "ray_scan_split_min_count" in fields
     assert "udf_parallel" in fields
 
 

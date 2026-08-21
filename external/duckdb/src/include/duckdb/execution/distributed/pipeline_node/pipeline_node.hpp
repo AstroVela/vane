@@ -21,7 +21,7 @@ namespace duckdb {
 class ClientContext;
 namespace distributed {
 
-struct ScanTaskDescriptor;
+struct ScanSplit;
 
 struct MaterializeResult;
 
@@ -520,8 +520,8 @@ public:
 
 	size_t num_partitions() const;
 
-	// If this node is a ScanSource with scan tasks, return them.
-	bool try_get_scan_tasks(std::vector<ScanTaskDescriptor> &out) const;
+	// If this node is a ScanSource with logical scan splits, return them.
+	bool try_get_scan_splits(std::vector<ScanSplit> &out) const;
 
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
 		auto result = op_->produce_tasks(plan_context);

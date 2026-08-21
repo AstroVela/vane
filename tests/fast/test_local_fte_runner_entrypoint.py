@@ -190,7 +190,7 @@ def test_local_fragment_executor_passes_authoritative_task_attempt_to_native(mon
     monkeypatch.setattr(
         runner_module.NativeFteWorkerManagerBackend,
         "materialize_task_context",
-        staticmethod(lambda _request, *, merge_scan_task_descriptors: {}),
+        staticmethod(lambda _request, *, merge_scan_split_batches: {}),
     )
     monkeypatch.setattr(runner_module, "require_ray_cxx_attr", lambda _name: object())
 

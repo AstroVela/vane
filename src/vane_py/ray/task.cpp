@@ -1339,11 +1339,11 @@ py::dict RayWorkerTask::Inputs() const {
 	py::dict result;
 	for (const auto &kv : task_.inputs()) {
 		py::dict entry;
-		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanTask) {
-			entry["kind"] = "scan_task";
-			// scan_task_bytes is raw binary data — use py::bytes, NOT py::str
+		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanSplitBatch) {
+			entry["kind"] = "scan_split_batch";
+			// scan_split_batch_bytes is raw binary data — use py::bytes, NOT py::str
 			// (py::str would trigger UTF-8 decode and fail on arbitrary bytes)
-			entry["data"] = py::bytes(kv.second.scan_task_bytes);
+			entry["data"] = py::bytes(kv.second.scan_split_batch_bytes);
 		} else if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ExchangeSourceTask) {
 			entry["kind"] = "exchange_source_task";
 			entry["data"] = py::bytes(kv.second.exchange_source_task_bytes);

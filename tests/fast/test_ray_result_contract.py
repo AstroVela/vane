@@ -6923,10 +6923,10 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
             operators = [operator for pipeline in topology["pipelines"] for operator in pipeline["operators"]]
             if "EXCHANGE_SINK" in operators:
                 task_inputs = task.Inputs()
-                scan_task = {
+                scan_split_batch = {
                     str(node_id): entry["data"]
                     for node_id, entry in task_inputs.items()
-                    if entry["kind"] == "scan_task"
+                    if entry["kind"] == "scan_split_batch"
                 }
                 exchange_source_task = {
                     str(node_id): entry["data"]
@@ -6951,7 +6951,7 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
                     runner.execute_native(
                         con.cursor(),
                         task_plan,
-                        scan_task=scan_task or None,
+                        scan_split_batch=scan_split_batch or None,
                         exchange_source_task=exchange_source_task or None,
                         exchange_sink_instance=sink_instance,
                     )
@@ -7122,8 +7122,8 @@ def test_run_plan_uses_distributed_worker_path(tmp_path):
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
@@ -7196,8 +7196,8 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     execution_started = threading.Event()
@@ -7480,8 +7480,8 @@ def test_run_copy_plan_with_fte_preserves_copy_sink_output_for_existing_dir(tmp_
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
@@ -7524,8 +7524,8 @@ def test_run_copy_plan_local_direct_write_committed_reader(tmp_path, monkeypatch
         str(uuid.uuid4()),
     ).to_physical_plan(con)
 
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con):
@@ -7697,8 +7697,8 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con, node_id="node-a"):
@@ -7836,8 +7836,8 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
         captured[0],
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = dict(plan.scan_task_descriptor_map())
-    assert scan_task_descriptors
+    scan_split_batches = dict(plan.scan_split_batch_map())
+    assert scan_split_batches
 
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
     with _registered_low_level_plan(plan, con, node_id="node-a"):

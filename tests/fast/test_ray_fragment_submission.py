@@ -482,6 +482,17 @@ def _patch_ray_worker_handle_test_state(monkeypatch):
     worker_handle_mod._FTE_CLOSING_QUERIES.clear()
     worker_handle_mod._FTE_ACTIVE_OPERATIONS_BY_QUERY.clear()
     worker_handle_mod._FTE_ACTIVE_TEARDOWN_OPERATIONS_BY_QUERY.clear()
+    monkeypatch.setattr(
+        fragment_submission_mod,
+        "_split_scan_split_batch",
+        lambda value: [
+            (
+                "test-" + (bytes(value).hex() if isinstance(value, (bytes, bytearray, memoryview)) else str(value)),
+                value,
+                len(value) if isinstance(value, (bytes, bytearray, memoryview)) else None,
+            )
+        ],
+    )
     monkeypatch.setenv("VANE_FTE_RETRY_INITIAL_DELAY_S", "0")
     monkeypatch.setattr(
         RayWorkerActorHandle,
@@ -622,7 +633,7 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
                 _FakeTask(
                     name=f"sample-input-{node_id}",
                     context={"query_id": query_id, "node_id": node_id},
-                    inputs={node_id: {"kind": "scan_task", "data": node_id.encode()}},
+                    inputs={node_id: {"kind": "scan_split_batch", "data": node_id.encode()}},
                     exchange_sink_instance={
                         "sink_handle": {"task_partition_id": 0, "partition_id": 0},
                         "task_partition_id": 0,
@@ -729,7 +740,7 @@ def test_submit_tasks_rejects_missing_query_id_before_registering_fragment():
     task = _FakeTask(
         name="scan-task-missing-query",
         context={"node_id": "17"},
-        inputs={"17": {"kind": "scan_task", "data": b"a"}},
+        inputs={"17": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan"},
     )
 
@@ -888,13 +899,13 @@ def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execut
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-merge", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-merge", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
     expected_fragment_id = fragment_id_for_task(task0.context(), task0.name())[1]
@@ -904,8 +915,8 @@ def test_submit_tasks_coalesces_same_fragment_scan_splits_in_fte_fragment_execut
     assert len(handles) == 1
     request = _create_requests(actor)[0]
     assert request["fragment_id"] == expected_fragment_id
-    assert "scan_task:7" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch:7" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
     assert [split["data"] for split in request["initial_splits"]["7"]] == [b"a", b"b"]
     assert actor.register_payloads == [
@@ -1089,7 +1100,7 @@ def test_fte_split_backpressure_remote_error_is_canceled_by_query_close():
         worker=_BackpressuredWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     try:
@@ -1147,7 +1158,9 @@ def test_fte_worker_command_dispatch_preserves_healthy_tail_and_new_outbox_comma
             worker=worker,
             attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, partition_id), 0),
             source_node_id="7",
-            splits=({"sequence_id": partition_id, "kind": "scan_task", "data": b"x"},),
+            splits=(
+                {"sequence_id": partition_id, "kind": "scan_split", "split_id": f"scan-{partition_id}", "data": b"x"},
+            ),
         )
 
     failed_first = add_command(failed_a, 0)
@@ -1298,7 +1311,7 @@ def test_fte_worker_command_dispatch_publishes_only_successful_healthy_creates(m
         worker=failed_after_create,
         attempt_id=scheduled_attempts[1].attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"x"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"x"},),
     )
     mutation_result = FragmentExecutionMutationResult.from_attempts(
         scheduled_attempts,
@@ -1379,7 +1392,7 @@ def test_fte_worker_command_dispatch_isolates_reused_worker_id_incarnations(monk
         worker=failed,
         attempt_id=FteTaskAttemptId(FteTaskId(query_id, 0, 0), 0),
         source_node_id="7",
-        splits=({"sequence_id": 0, "kind": "scan_task", "data": b"old"},),
+        splits=({"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"old"},),
     )
     partition = stage.add_partition(1)
     scheduled = partition.start_attempt(
@@ -1553,7 +1566,7 @@ def test_fte_split_backpressure_preserves_query_deadline():
         worker=_DeadlineWorker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     try:
@@ -1622,7 +1635,7 @@ def test_fte_split_backpressure_terminal_status_uses_task_status_path(monkeypatc
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
     no_more_command = FteNoMoreSplitsCommand(
         query_id=query_id,
@@ -1725,7 +1738,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         async def add_splits(task_id, source_node_id, splits):
             assert FteTaskAttemptId.coerce(task_id) == attempt_id
             assert source_node_id == "7"
-            assert splits == [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}]
+            assert splits == [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"}]
             execution.add_splits(source_node_id, splits)
             raise AssertionError("terminal add_splits must not return normally")
 
@@ -1798,7 +1811,7 @@ def test_fte_late_add_splits_terminal_status_uses_task_status_path(
         worker=handle,
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
     no_more_command = FteNoMoreSplitsCommand(
         query_id=query_id,
@@ -1882,7 +1895,7 @@ def test_fte_late_add_splits_unknown_attempt_remains_strict_error():
                 _WorkerEndpoint(),
                 task_id,
                 "7",
-                [{"sequence_id": 1, "kind": "scan_task", "data": b"a"}],
+                [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"}],
             )
         )
 
@@ -3473,7 +3486,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
             _FakeTask(
                 name="scan-drop",
                 context={"query_id": "query-drop", "node_id": "7"},
-                inputs={"7": {"kind": "scan_task", "data": b"drop"}},
+                inputs={"7": {"kind": "scan_split_batch", "data": b"drop"}},
                 plan={"plan": "drop-template"},
             )
         ]
@@ -3483,7 +3496,7 @@ def test_fte_drop_query_clears_fte_registry_and_worker_pressure(monkeypatch):
             _FakeTask(
                 name="scan-keep",
                 context={"query_id": "query-keep", "node_id": "8"},
-                inputs={"8": {"kind": "scan_task", "data": b"keep"}},
+                inputs={"8": {"kind": "scan_split_batch", "data": b"keep"}},
                 plan={"plan": "keep-template"},
             )
         ]
@@ -4731,9 +4744,9 @@ def test_fte_wait_task_status_async_restores_remote_timeout_error():
 
 def test_strip_fte_dynamic_context_removes_static_bindings_only():
     context = {
-        "scan_task:7": b"scan-dynamic",
-        "scan_task:8": b"scan-static",
-        "scan_task_nodes": "7,8",
+        "scan_split_batch:7": b"scan-dynamic",
+        "scan_split_batch:8": b"scan-static",
+        "scan_split_batch_nodes": "7,8",
         "exchange_source_task:3": b"exchange-dynamic",
         "exchange_source_task:4": b"exchange-static",
         "exchange_source_task_nodes": "3,4",
@@ -4746,14 +4759,14 @@ def test_strip_fte_dynamic_context_removes_static_bindings_only():
         {"3"},
     )
 
-    assert "scan_task:7" not in stripped
+    assert "scan_split_batch:7" not in stripped
     assert "exchange_source_task:3" not in stripped
-    assert stripped["scan_task:8"] == b"scan-static"
-    assert stripped["scan_task_nodes"] == "8"
+    assert stripped["scan_split_batch:8"] == b"scan-static"
+    assert stripped["scan_split_batch_nodes"] == "8"
     assert stripped["exchange_source_task:4"] == b"exchange-static"
     assert stripped["exchange_source_task_nodes"] == "4"
     assert stripped["query_id"] == "q"
-    assert context["scan_task_nodes"] == "7,8"
+    assert context["scan_split_batch_nodes"] == "7,8"
 
 
 def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
@@ -4767,13 +4780,13 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -4794,8 +4807,8 @@ def test_fte_submit_creates_task_then_sends_split_updates(monkeypatch):
         "existing": 0,
         "total": 1,
     }
-    assert "scan_task:7" not in request["context"]
-    assert "scan_task_nodes" not in request["context"]
+    assert "scan_split_batch:7" not in request["context"]
+    assert "scan_split_batch_nodes" not in request["context"]
     assert request["dynamic_scan_source_node_ids"] == ["7"]
     assert [split["data"] for split in request["initial_splits"]["7"]] == [b"a", b"b"]
     assert [split["sequence_id"] for split in request["initial_splits"]["7"]] == [0, 1]
@@ -4829,7 +4842,7 @@ def test_fte_event_driven_task_source_chunks_and_drains(monkeypatch):
         _FakeTask(
             name=f"scan-task-{idx}",
             context={"query_id": "query-fte-event-source", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": f"p{idx}".encode()}},
+            inputs={"7": {"kind": "scan_split_batch", "data": f"p{idx}".encode()}},
             plan={"plan": "scan-template"},
         )
         for idx in range(5)
@@ -4869,13 +4882,13 @@ def test_fte_partitions_are_distributed_to_worker_owners(monkeypatch):
     task0 = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-owner", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     task1 = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-owner", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -4992,7 +5005,7 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
     )
     request = scheduled.request
     request["initial_splits"] = {
-        "7": ({"sequence_id": 0, "kind": "scan_task", "data": b"base"},),
+        "7": ({"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"base"},),
     }
     handle.reserve_fte_partition(
         query_id,
@@ -5021,8 +5034,8 @@ def test_fte_split_ack_before_create_ack_is_merged_into_running_pressure(monkeyp
         attempt_id=scheduled.attempt_id,
         source_node_id="7",
         splits=(
-            {"sequence_id": 1, "kind": "scan_task", "data": b"a"},
-            {"sequence_id": 2, "kind": "scan_task", "data": b"bc"},
+            {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},
+            {"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2", "data": b"bc"},
         ),
     )
     create_rpc_completed = threading.Event()
@@ -5308,7 +5321,7 @@ def test_fte_add_splits_ack_after_task_finish_does_not_revive_pressure():
         worker=handle,
         attempt_id=finished_attempt.attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"late"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"late"},),
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -5407,7 +5420,7 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
         query_id,
         0,
         fragment_id=fragment_id,
-        context={"scan_task_nodes": "7,8"},
+        context={"scan_split_batch_nodes": "7,8"},
         task_memory_bytes=64,
     )
     first = stage.add_partition(0)
@@ -5870,7 +5883,7 @@ def test_fte_registry_stats_reports_query_fragment_partition_metrics(monkeypatch
     task = _FakeTask(
         name="scan-task-metrics",
         context={"query_id": "query-fte-metrics", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -6083,7 +6096,7 @@ def test_fte_create_promotes_reservation_to_running_atomically(monkeypatch):
                     _FakeTask(
                         name=f"scan-{query_id}",
                         context={"query_id": query_id, "node_id": node_id},
-                        inputs={node_id: {"kind": "scan_task", "data": query_id.encode()}},
+                        inputs={node_id: {"kind": "scan_split_batch", "data": query_id.encode()}},
                     )
                 ]
             )
@@ -8630,7 +8643,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "8",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"8": {"kind": "scan_task", "data": b"p0"}},
+                inputs={"8": {"kind": "scan_split_batch", "data": b"p0"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -8644,7 +8657,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "9",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"9": {"kind": "scan_task", "data": b"p1"}},
+                inputs={"9": {"kind": "scan_split_batch", "data": b"p1"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -8658,7 +8671,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "10",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"10": {"kind": "scan_task", "data": b"p2"}},
+                inputs={"10": {"kind": "scan_split_batch", "data": b"p2"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -8672,7 +8685,7 @@ def test_fte_worker_capacity_registers_every_ready_partition_with_credit_authori
                     "node_id": "11",
                     "task_execution_class": "STANDARD",
                 },
-                inputs={"11": {"kind": "scan_task", "data": b"p3"}},
+                inputs={"11": {"kind": "scan_split_batch", "data": b"p3"}},
                 plan={"plan": "exchange-template"},
             )
         ]
@@ -9597,7 +9610,7 @@ def test_fte_running_execution_class_transition_updates_pressure(monkeypatch):
                     "node_id": "7",
                     "task_execution_class": "EAGER_SPECULATIVE",
                 },
-                inputs={"7": {"kind": "scan_task", "data": b"a"}},
+                inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
                 plan={"plan": "scan-template"},
             )
         ]
@@ -9670,7 +9683,7 @@ def test_fte_worker_failure_retry_preserves_registered_heap(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-memory-retry", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     first = failed_worker.submit_tasks([task])
@@ -9817,7 +9830,7 @@ def test_fte_worker_failure_replays_descriptor_on_new_owner(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-worker-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -9877,7 +9890,7 @@ def test_manager_shutdown_defers_primary_actor_kill_until_finish(monkeypatch):
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-manager-shutdown",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     handle0.submit_tasks([task])
@@ -9918,7 +9931,7 @@ def test_fte_worker_failure_waits_for_worker_quiescence_before_retry(monkeypatch
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-1",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -9993,7 +10006,7 @@ def test_fte_worker_failure_without_confirmed_quiescence_fails_closed(monkeypatc
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-2",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -10065,7 +10078,7 @@ def test_fte_worker_failure_accepts_confirmed_actor_death_as_quiescence(monkeypa
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-3",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -10101,7 +10114,7 @@ def test_fte_worker_failure_event_uses_confirmed_actor_death_without_prepare(mon
             "copy_output_base": "s3://bucket/output",
             "copy_output_run_id": "run-4",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "copy-template"},
     )
     first = handle0.submit_tasks([task])
@@ -10151,7 +10164,7 @@ def test_fte_status_worker_failure_reconciles_all_queries_before_canceled_status
         _FakeTask(
             name=f"scan-task-{suffix}",
             context={"query_id": f"query-shared-worker-{suffix}", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": suffix.encode()}},
+            inputs={"7": {"kind": "scan_split_batch", "data": suffix.encode()}},
             plan={"plan": "scan-template"},
         )
         for suffix in ("a", "b")
@@ -10369,7 +10382,7 @@ def test_fte_worker_failure_retry_waits_for_scheduling_delayer(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-retry-delay", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -10438,13 +10451,13 @@ def test_fte_split_append_control_failure_replays_on_replacement(monkeypatch):
     first_task = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-append-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     append_task = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-append-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -10553,7 +10566,7 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
             _FakeTask(
                 name="scan-other",
                 context={"query_id": "query-control-other", "node_id": "6"},
-                inputs={"6": {"kind": "scan_task", "data": b"other"}},
+                inputs={"6": {"kind": "scan_split_batch", "data": b"other"}},
             )
         ]
     )
@@ -10561,12 +10574,12 @@ def test_fte_control_failure_preempts_queued_work_across_queries(monkeypatch):
         _FakeTask(
             name="scan-a",
             context={"query_id": "query-control-barrier", "node_id": "7"},
-            inputs={"7": {"kind": "scan_task", "data": b"a"}},
+            inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         ),
         _FakeTask(
             name="scan-b",
             context={"query_id": "query-control-barrier", "node_id": "8"},
-            inputs={"8": {"kind": "scan_task", "data": b"b"}},
+            inputs={"8": {"kind": "scan_split_batch", "data": b"b"}},
         ),
     ]
 
@@ -10642,13 +10655,13 @@ def test_fte_split_queue_full_recovers_without_replacing_worker(monkeypatch):
     first_task = _FakeTask(
         name="scan-task-0",
         context={"query_id": "query-fte-queue-full", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
     append_task = _FakeTask(
         name="scan-task-1",
         context={"query_id": "query-fte-queue-full", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"b"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"b"}},
         plan={"plan": "scan-template"},
     )
 
@@ -10683,10 +10696,10 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
     actor0 = _FakeActor()
     handle0 = RayWorkerActorHandle(actor0, memory_capacity_bytes=1 << 60, worker_id="worker-0")
 
-    scan_task = _FakeTask(
+    scan_source_task = _FakeTask(
         name="scan-stage",
         context={"query_id": "query-host-loss", "node_id": "scan"},
-        inputs={"7": {"kind": "scan_task", "data": b"scan-a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"scan-a"}},
         plan={"plan": "scan-template"},
     )
     downstream_descriptor = vane.ray_cxx.make_exchange_source_task_descriptor_for_test(
@@ -10719,7 +10732,7 @@ def test_fte_worker_failure_replays_all_owned_stage_partitions(monkeypatch):
         plan={"plan": "exchange-template"},
     )
 
-    first_handles = handle0.submit_tasks([scan_task, exchange_task])
+    first_handles = handle0.submit_tasks([scan_source_task, exchange_task])
     actor1 = _FakeActor()
     handle1 = RayWorkerActorHandle(actor1, memory_capacity_bytes=1 << 60, worker_id="worker-1")
 
@@ -10789,7 +10802,7 @@ def test_fte_worker_failure_without_replacement_fails_stage_without_retry(monkey
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-no-replacement", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -12020,7 +12033,7 @@ def test_fte_input_stream_exhausted_sends_no_more(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     handle.submit_tasks([task])
@@ -12053,7 +12066,7 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-watcher", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -12610,7 +12623,7 @@ def test_fragment_registration_ownership_lives_until_remote_actor_completion():
     task = _FakeTask(
         name="scan-task",
         context={"query_id": query_id, "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     handle.submit_tasks([task])
@@ -12710,7 +12723,7 @@ def test_bulk_submit_reuses_pending_fragment_registration_dependency():
     task = _FakeTask(
         name="scan-task",
         context={"query_id": query_id, "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
     _, fragment_id = fragment_id_for_task(task.context(), task.name())
     pending_ref = object()
@@ -12798,7 +12811,7 @@ def test_fte_attempt_handle_registered_before_status_watcher_start(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-watcher-order", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -12817,7 +12830,7 @@ def test_fte_task_status_event_marks_partition_finished(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-status", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -12852,7 +12865,7 @@ def test_fte_task_status_event_retries_failed_attempt(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-status-retry", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     first = handle.submit_tasks([task])[0]
@@ -12892,7 +12905,7 @@ def test_fte_task_status_event_oom_is_terminal_for_registered_heap(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-oom-status", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     first = handle.submit_tasks([task])[0]
@@ -12995,7 +13008,7 @@ def test_fte_wait_query_raises_on_failed_partition(monkeypatch):
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-wait-failed", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -13031,7 +13044,7 @@ def test_fte_input_stream_exhausted_seals_running_speculative_as_standard(monkey
             "node_id": "7",
             "task_execution_class": "SPECULATIVE",
         },
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
     )
 
     running = handle.submit_tasks([task])[0]
@@ -13102,7 +13115,7 @@ def test_fte_input_stream_exhausted_control_failure_replays_sealed_descriptor(mo
     task = _FakeTask(
         name="scan-task",
         context={"query_id": "query-fte-no-more-lost", "node_id": "7"},
-        inputs={"7": {"kind": "scan_task", "data": b"a"}},
+        inputs={"7": {"kind": "scan_split_batch", "data": b"a"}},
         plan={"plan": "scan-template"},
     )
 
@@ -14511,7 +14524,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
             self,
             cursor,
             plan,
-            scan_task_arg,
+            scan_split_batch_arg,
             exchange_source_task_arg,
             copy_output_info,
             exchange_sink_instance,
@@ -14527,7 +14540,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
                 (
                     cursor,
                     plan,
-                    scan_task_arg,
+                    scan_split_batch_arg,
                     exchange_source_task_arg,
                     copy_output_info,
                     exchange_sink_instance,
@@ -14662,7 +14675,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     (
         _,
         plan,
-        scan_task_arg,
+        scan_split_batch_arg,
         exchange_source_task_arg,
         copy_output_info,
         exchange_sink_instance,
@@ -14674,7 +14687,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         effective_session_config,
     ) = calls[0]
     assert plan is plan_object
-    assert scan_task_arg == {"1": b"scan"}
+    assert scan_split_batch_arg == {"1": b"scan"}
     assert exchange_source_task_arg == {"9": b"exchange-binding"}
     assert copy_output_info == {"base": "", "run_id": "run-native", "remote_base": "/tmp/out"}
     assert exchange_sink_instance == {
@@ -15116,7 +15129,7 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
             self,
             cursor,
             _plan,
-            _scan_task_arg,
+            _scan_split_batch_arg,
             _exchange_source_task_arg,
             _copy_output_info,
             _exchange_sink_instance,

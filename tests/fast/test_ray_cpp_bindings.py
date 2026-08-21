@@ -525,7 +525,7 @@ def test_distributed_physical_plan_inspectors():
     assert isinstance(plan.num_partitions(), int)
     assert isinstance(plan.repr_ascii(False), str)
     assert isinstance(plan.repr_mermaid(False, False), str)
-    assert isinstance(plan.scan_task_descriptor_map(), dict)
+    assert isinstance(plan.scan_split_batch_map(), dict)
 
 
 def test_distributed_physical_plan_runner_run_plan_accepts_none():
@@ -546,7 +546,7 @@ def test_fte_split_queue_basic_states():
 
     first = queue.try_get_next()
     second = queue.try_get_next()
-    assert first == {"state": "SPLIT", "kind": "scan_task", "data": b"scan-a"}
+    assert first == {"state": "SPLIT", "kind": "scan_split_batch", "data": b"scan-a"}
     assert second == {
         "state": "SPLIT",
         "kind": "exchange_source_task",
@@ -557,29 +557,30 @@ def test_fte_split_queue_basic_states():
     assert queue.try_get_next() == {"state": "FINISHED"}
 
 
-def test_merge_scan_task_descriptors_rejects_empty_payload():
-    assert vane.ray_cxx.merge_scan_task_descriptors([]) == b""
-    with pytest.raises(Exception, match="empty scan task descriptor"):
-        vane.ray_cxx.merge_scan_task_descriptors([b""])
+def test_merge_scan_split_batches_rejects_empty_payload():
+    with pytest.raises(ValueError, match="requires at least one batch"):
+        vane.ray_cxx.merge_scan_split_batches([])
+    with pytest.raises(Exception, match="empty scan split batch"):
+        vane.ray_cxx.merge_scan_split_batches([b""])
 
 
-@pytest.mark.parametrize("argument", ["scan_task", "exchange_source_task"])
-def test_execute_native_rejects_empty_distributed_task_descriptor(argument):
+@pytest.mark.parametrize("argument", ["scan_split_batch", "exchange_source_task"])
+def test_execute_native_rejects_empty_distributed_input_payload(argument):
     con = vane.connect()
     cursor = con.cursor()
     plan = _make_test_physical_plan(con)
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
 
     try:
-        with pytest.raises(ValueError, match="descriptor must not be empty"):
+        with pytest.raises(ValueError, match="must not be empty"):
             runner.execute_native(cursor, plan, **{argument: {"1": b""}})
     finally:
         cursor.close()
         con.close()
 
 
-@pytest.mark.parametrize("argument", ["scan_task", "exchange_source_task"])
-def test_execute_native_rejects_nonbinary_distributed_task_descriptor(argument):
+@pytest.mark.parametrize("argument", ["scan_split_batch", "exchange_source_task"])
+def test_execute_native_rejects_nonbinary_distributed_input_payload(argument):
     con = vane.connect()
     cursor = con.cursor()
     plan = _make_test_physical_plan(con)
@@ -602,7 +603,7 @@ def test_execute_native_rejects_noncanonical_distributed_task_node_id(node_id):
 
     try:
         with pytest.raises(ValueError, match="node_id"):
-            runner.execute_native(cursor, plan, scan_task={node_id: b"not-reached"})
+            runner.execute_native(cursor, plan, scan_split_batch={node_id: b"not-reached"})
     finally:
         cursor.close()
         con.close()
@@ -638,17 +639,17 @@ def test_execute_native_rejects_static_and_fte_scan_assignment_for_same_node(tmp
         con.sql(f"SELECT * FROM parquet_scan('{source}')"),
         "overlapping-scan-assignment",
     ).to_physical_plan(con)
-    descriptor_map = plan.scan_task_descriptor_map()
-    assert len(descriptor_map) == 1
-    node_id, descriptors = next(iter(descriptor_map.items()))
-    assert len(descriptors) == 1
+    batch_map = plan.scan_split_batch_map()
+    assert len(batch_map) == 1
+    node_id, batches = next(iter(batch_map.items()))
+    assert len(batches) == 1
 
     try:
-        with pytest.raises(ValueError, match="both a static task descriptor and an FTE split queue"):
+        with pytest.raises(ValueError, match="both a static split batch and an FTE split queue"):
             vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
                 con.cursor(),
                 plan,
-                scan_task={str(node_id): bytes(descriptors[0])},
+                scan_split_batch={str(node_id): bytes(batches[0])},
                 fte_scan_source_queues={str(node_id): vane.ray_cxx.FteSplitQueue()},
             )
     finally:
@@ -663,10 +664,10 @@ def test_execute_native_rejects_missing_distributed_scan_assignment(tmp_path):
         con.sql(f"SELECT * FROM parquet_scan('{source}')"),
         "missing-scan-assignment",
     ).to_physical_plan(con)
-    assert plan.scan_task_descriptor_map()
+    assert plan.scan_split_batch_map()
 
     try:
-        with pytest.raises(ValueError, match="no explicit worker task assignment"):
+        with pytest.raises(ValueError, match="no explicit worker split assignment"):
             vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
                 con.cursor(),
                 plan,
@@ -698,15 +699,15 @@ def test_parquet_bind_serde_preserves_worker_scan_options(tmp_path):
             relation,
             "parquet-wrapper-bind-serde",
         ).to_physical_plan(con)
-        descriptor_map = plan.scan_task_descriptor_map()
-        assert len(descriptor_map) == 1
-        node_id, descriptors = next(iter(descriptor_map.items()))
-        assert len(descriptors) == 1
+        batch_map = plan.scan_split_batch_map()
+        assert len(batch_map) == 1
+        node_id, batches = next(iter(batch_map.items()))
+        assert len(batches) == 1
 
         result = vane.ray_cxx.DistributedPhysicalPlanRunner().execute_native(
             con.cursor(),
             plan,
-            scan_task={str(node_id): bytes(descriptors[0])},
+            scan_split_batch={str(node_id): bytes(batches[0])},
         )
 
         assert result.completion_status == "ok"
@@ -2916,11 +2917,11 @@ def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = plan.scan_task_descriptor_map()
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 1
-    assert isinstance(descriptors[0], bytes)
+    scan_split_batches = plan.scan_split_batch_map()
+    assert len(scan_split_batches) == 1
+    node_id, batches = next(iter(scan_split_batches.items()))
+    assert len(batches) == 1
+    assert isinstance(batches[0], bytes)
 
     split_queue = vane.ray_cxx.FteSplitQueue()
     runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
@@ -2963,7 +2964,7 @@ def test_execute_native_fte_dynamic_scan_queue_reads_parquet_after_blocking(tmp_
             for item in progress
         )
 
-        split_queue.add_scan_split(bytes(descriptors[0]))
+        split_queue.add_scan_split(bytes(batches[0]))
         split_queue.no_more_splits()
         thread.join(timeout=5)
         assert not thread.is_alive()
@@ -3061,14 +3062,14 @@ def _make_two_file_dynamic_scan_plan(tmp_path):
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    scan_task_descriptors = plan.scan_task_descriptor_map()
-    assert len(scan_task_descriptors) == 1
-    node_id, descriptors = next(iter(scan_task_descriptors.items()))
-    assert len(descriptors) == 2
-    return con, plan, str(node_id), descriptors
+    scan_split_batches = plan.scan_split_batch_map()
+    assert len(scan_split_batches) == 1
+    node_id, batches = next(iter(scan_split_batches.items()))
+    assert len(batches) == 2
+    return con, plan, str(node_id), batches
 
 
-def test_scan_task_descriptors_have_stable_distinct_logical_partitions_for_duplicate_files(tmp_path):
+def test_scan_splits_have_stable_distinct_ids_for_duplicate_files(tmp_path):
     pytest.importorskip("pyarrow")
 
     con = vane.connect()
@@ -3079,19 +3080,21 @@ def test_scan_task_descriptors_have_stable_distinct_logical_partitions_for_dupli
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
-    descriptor_map = plan.scan_task_descriptor_map()
-    assert len(descriptor_map) == 1
-    descriptors = next(iter(descriptor_map.values()))
-    assert len(descriptors) == 2
+    batch_map = plan.scan_split_batch_map()
+    assert len(batch_map) == 1
+    batches = next(iter(batch_map.values()))
+    assert len(batches) == 2
 
-    assert [vane.ray_cxx.scan_task_source_partition_id(bytes(item)) for item in descriptors] == [0, 1]
-    assert bytes(descriptors[0]) != bytes(descriptors[1])
+    exploded = vane.ray_cxx.split_scan_split_batch(vane.ray_cxx.merge_scan_split_batches(batches))
+    assert [item[0] for item in exploded] == ["file-0", "file-1"]
+    assert [item[1] for item in exploded] == [bytes(item) for item in batches]
+    assert bytes(batches[0]) != bytes(batches[1])
 
 
 def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_path):
     pytest.importorskip("pyarrow")
 
-    con, plan, node_id, descriptors = _make_two_file_dynamic_scan_plan(tmp_path)
+    con, plan, node_id, batches = _make_two_file_dynamic_scan_plan(tmp_path)
     worker_con_a = vane.connect()
     worker_con_b = vane.connect()
     plan_a = plan.clone(worker_con_a)
@@ -3124,14 +3127,14 @@ def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_pa
         assert thread_b.is_alive()
         assert results.empty()
 
-        queue_b.add_scan_split(bytes(descriptors[1]))
+        queue_b.add_scan_split(bytes(batches[1]))
         queue_b.no_more_splits()
         thread_b.join(timeout=5)
         assert not thread_b.is_alive()
         assert thread_a.is_alive()
         assert results.get_nowait() == ("b", "ok", [33])
 
-        queue_a.add_scan_split(bytes(descriptors[0]))
+        queue_a.add_scan_split(bytes(batches[0]))
         queue_a.no_more_splits()
         thread_a.join(timeout=5)
         assert not thread_a.is_alive()
@@ -3154,7 +3157,7 @@ def test_distributed_physical_plan_clones_use_independent_fte_scan_queues(tmp_pa
 def test_distributed_physical_plan_clone_scan_queue_cancel_does_not_cancel_sibling(tmp_path):
     pytest.importorskip("pyarrow")
 
-    con, plan, node_id, descriptors = _make_two_file_dynamic_scan_plan(tmp_path)
+    con, plan, node_id, batches = _make_two_file_dynamic_scan_plan(tmp_path)
     worker_con_cancel = vane.connect()
     worker_con_ok = vane.connect()
     plan_cancel = plan.clone(worker_con_cancel)
@@ -3192,7 +3195,7 @@ def test_distributed_physical_plan_clone_scan_queue_cancel_does_not_cancel_sibli
         assert results.empty()
 
         queue_cancel.cancel()
-        queue_ok.add_scan_split(bytes(descriptors[1]))
+        queue_ok.add_scan_split(bytes(batches[1]))
         queue_ok.no_more_splits()
 
         thread_cancel.join(timeout=5)

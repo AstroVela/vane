@@ -16,7 +16,7 @@
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
-#include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
@@ -36,34 +36,35 @@ using namespace duckdb;
 namespace {
 
 static constexpr idx_t DISTRIBUTED_TEST_SCAN_PROTOCOL = 1;
-static constexpr idx_t DISTRIBUTED_TEST_TASK_CODEC_VERSION = 1;
+static constexpr idx_t DISTRIBUTED_TEST_SPLIT_CODEC_VERSION = 1;
 static constexpr idx_t DISTRIBUTED_TEST_WRITE_PROTOCOL = 1;
 static constexpr idx_t DISTRIBUTED_TEST_WRITE_CODEC_VERSION = 1;
-static const string DISTRIBUTED_TEST_SCAN_CODEC = "distributed-test.scan-task";
+static const string DISTRIBUTED_TEST_SCAN_SPLIT_CODEC = "distributed-test.scan-split";
 static const string DISTRIBUTED_TEST_WRITE_CODEC = "distributed-test.opaque-write-fragment";
 static const string DISTRIBUTED_TEST_WRITE_NAME = "distributed_test_opaque_write";
 static atomic<idx_t> distributed_test_create_worker_bind_calls {0};
+static atomic<idx_t> distributed_test_last_target_split_count {0};
 
-struct DistributedTestRuntimeTask {
-	idx_t task_id = 0;
+struct DistributedTestSourceUnit {
+	idx_t unit_id = 0;
 	string resource;
 	string artifact;
 };
 
 struct DistributedTestScanBindData : public TableFunctionData {
-	idx_t requested_task_count = 0;
-	vector<DistributedTestRuntimeTask> tasks;
+	idx_t requested_unit_count = 0;
+	vector<DistributedTestSourceUnit> units;
 
 	bool Equals(const FunctionData &other) const override {
 		auto other_data = dynamic_cast<const DistributedTestScanBindData *>(&other);
-		if (!other_data || requested_task_count != other_data->requested_task_count ||
-		    tasks.size() != other_data->tasks.size()) {
+		if (!other_data || requested_unit_count != other_data->requested_unit_count ||
+		    units.size() != other_data->units.size()) {
 			return false;
 		}
-		for (idx_t task_index = 0; task_index < tasks.size(); task_index++) {
-			const auto &left = tasks[task_index];
-			const auto &right = other_data->tasks[task_index];
-			if (left.task_id != right.task_id || left.resource != right.resource || left.artifact != right.artifact) {
+		for (idx_t unit_index = 0; unit_index < units.size(); unit_index++) {
+			const auto &left = units[unit_index];
+			const auto &right = other_data->units[unit_index];
+			if (left.unit_id != right.unit_id || left.resource != right.resource || left.artifact != right.artifact) {
 				return false;
 			}
 		}
@@ -72,42 +73,42 @@ struct DistributedTestScanBindData : public TableFunctionData {
 };
 
 struct DistributedTestScanGlobalState : public GlobalTableFunctionState {
-	idx_t task_index = 0;
+	idx_t unit_index = 0;
 };
 
 static atomic<idx_t> distributed_test_bind_calls {0};
 static atomic<idx_t> distributed_test_deserialize_calls {0};
 
-static string FileResource(idx_t task_id) {
-	return "synthetic-file://partition-" + std::to_string(task_id) + ".parquet";
+static string FileResource(idx_t unit_id) {
+	return "synthetic-file://partition-" + std::to_string(unit_id) + ".parquet";
 }
 
-static string FragmentPayload(idx_t task_id) {
+static string FragmentPayload(idx_t unit_id) {
 	string result;
 	result.push_back('\0');
-	result += "fragment:" + std::to_string(task_id);
+	result += "fragment:" + std::to_string(unit_id);
 	return result;
 }
 
-static string FragmentArtifact(idx_t task_id) {
+static string FragmentArtifact(idx_t unit_id) {
 	string result;
 	result.push_back(static_cast<char>(0x7f));
 	result.push_back('\0');
-	result += "delete-vector:" + std::to_string(task_id);
+	result += "delete-vector:" + std::to_string(unit_id);
 	return result;
 }
 
-static string FragmentTaskEnvelope(idx_t task_id) {
+static string FragmentSplitPayload(idx_t unit_id) {
 	MemoryStream stream(Allocator::DefaultAllocator());
 	BinarySerializer serializer(stream);
 	serializer.Begin();
-	serializer.WriteProperty(1, "fragment", FragmentPayload(task_id));
-	serializer.WriteProperty(2, "delete_vector", FragmentArtifact(task_id));
+	serializer.WriteProperty(1, "fragment", FragmentPayload(unit_id));
+	serializer.WriteProperty(2, "delete_vector", FragmentArtifact(unit_id));
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
 
-static pair<string, string> DecodeFragmentTaskEnvelope(const string &payload) {
+static pair<string, string> DecodeFragmentSplitPayload(const string &payload) {
 	if (payload.empty()) {
 		throw InvalidInputException("distributed test fragment envelope is empty");
 	}
@@ -121,25 +122,25 @@ static pair<string, string> DecodeFragmentTaskEnvelope(const string &payload) {
 	return {std::move(fragment), std::move(delete_vector)};
 }
 
-static idx_t ParseTaskId(const string &task_id, const string &prefix) {
-	if (!StringUtil::StartsWith(task_id, prefix)) {
-		throw InvalidInputException("distributed test task '%s' does not start with '%s'", task_id, prefix);
+static idx_t ParseSplitIndex(const string &split_id, const string &prefix) {
+	if (!StringUtil::StartsWith(split_id, prefix)) {
+		throw InvalidInputException("distributed test split '%s' does not start with '%s'", split_id, prefix);
 	}
-	auto suffix = task_id.substr(prefix.size());
+	auto suffix = split_id.substr(prefix.size());
 	if (suffix.empty()) {
-		throw InvalidInputException("distributed test task '%s' has no numeric identity", task_id);
+		throw InvalidInputException("distributed test split '%s' has no numeric identity", split_id);
 	}
 	if (suffix.size() > 1 && suffix[0] == '0') {
-		throw InvalidInputException("distributed test task '%s' has a non-canonical numeric identity", task_id);
+		throw InvalidInputException("distributed test split '%s' has a non-canonical numeric identity", split_id);
 	}
 	idx_t result = 0;
 	for (auto character : suffix) {
 		if (character < '0' || character > '9') {
-			throw InvalidInputException("distributed test task '%s' has an invalid numeric identity", task_id);
+			throw InvalidInputException("distributed test split '%s' has an invalid numeric identity", split_id);
 		}
 		const auto digit = NumericCast<idx_t>(character - '0');
 		if (result > (NumericLimits<idx_t>::Maximum() - digit) / 10) {
-			throw InvalidInputException("distributed test task '%s' numeric identity overflows idx_t", task_id);
+			throw InvalidInputException("distributed test split '%s' numeric identity overflows idx_t", split_id);
 		}
 		result = result * 10 + digit;
 	}
@@ -281,28 +282,28 @@ static unique_ptr<FunctionData> DistributedTestScanBind(ClientContext &, TableFu
                                                         vector<LogicalType> &return_types, vector<string> &names) {
 	distributed_test_bind_calls++;
 	if (input.inputs.size() != 1 || input.inputs[0].IsNull()) {
-		throw BinderException("distributed test scan requires a non-null task count");
+		throw BinderException("distributed test scan requires a non-null source unit count");
 	}
-	auto signed_task_count = input.inputs[0].GetValue<int64_t>();
-	if (signed_task_count < 0 || signed_task_count > 1024) {
-		throw BinderException("distributed test scan task count must be between 0 and 1024");
+	auto signed_unit_count = input.inputs[0].GetValue<int64_t>();
+	if (signed_unit_count < 0 || signed_unit_count > 1024) {
+		throw BinderException("distributed test scan source unit count must be between 0 and 1024");
 	}
 
 	return_types.emplace_back(LogicalType::UBIGINT);
-	names.emplace_back("task_id");
+	names.emplace_back("unit_id");
 	auto result = make_uniq<DistributedTestScanBindData>();
-	result->requested_task_count = NumericCast<idx_t>(signed_task_count);
-	result->tasks.reserve(result->requested_task_count);
-	for (idx_t task_id = 0; task_id < result->requested_task_count; task_id++) {
-		DistributedTestRuntimeTask task;
-		task.task_id = task_id;
-		if (task_id % 2 == 0) {
-			task.resource = FileResource(task_id);
+	result->requested_unit_count = NumericCast<idx_t>(signed_unit_count);
+	result->units.reserve(result->requested_unit_count);
+	for (idx_t unit_id = 0; unit_id < result->requested_unit_count; unit_id++) {
+		DistributedTestSourceUnit unit;
+		unit.unit_id = unit_id;
+		if (unit_id % 2 == 0) {
+			unit.resource = FileResource(unit_id);
 		} else {
-			task.resource = FragmentPayload(task_id);
-			task.artifact = FragmentArtifact(task_id);
+			unit.resource = FragmentPayload(unit_id);
+			unit.artifact = FragmentArtifact(unit_id);
 		}
-		result->tasks.push_back(std::move(task));
+		result->units.push_back(std::move(unit));
 	}
 	return std::move(result);
 }
@@ -315,9 +316,9 @@ static void DistributedTestScan(ClientContext &, TableFunctionInput &input, Data
 	auto &bind_data = input.bind_data->Cast<DistributedTestScanBindData>();
 	auto &global_state = input.global_state->Cast<DistributedTestScanGlobalState>();
 	idx_t output_index = 0;
-	while (global_state.task_index < bind_data.tasks.size() && output_index < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, output_index, Value::UBIGINT(bind_data.tasks[global_state.task_index].task_id));
-		global_state.task_index++;
+	while (global_state.unit_index < bind_data.units.size() && output_index < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, output_index, Value::UBIGINT(bind_data.units[global_state.unit_index].unit_id));
+		global_state.unit_index++;
 		output_index++;
 	}
 	output.SetCardinality(output_index);
@@ -326,13 +327,13 @@ static void DistributedTestScan(ClientContext &, TableFunctionInput &input, Data
 static void DistributedTestScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                          const TableFunction &) {
 	auto &bind_data = bind_data_p->Cast<DistributedTestScanBindData>();
-	serializer.WriteProperty(100, "requested_task_count", bind_data.requested_task_count);
-	serializer.WriteList(101, "tasks", bind_data.tasks.size(), [&](Serializer::List &tasks, idx_t task_index) {
-		const auto &task = bind_data.tasks[task_index];
-		tasks.WriteObject([&](Serializer &task_serializer) {
-			task_serializer.WriteProperty(1, "task_id", task.task_id);
-			task_serializer.WriteProperty(2, "resource", task.resource);
-			task_serializer.WriteProperty(3, "artifact", task.artifact);
+	serializer.WriteProperty(100, "requested_unit_count", bind_data.requested_unit_count);
+	serializer.WriteList(101, "units", bind_data.units.size(), [&](Serializer::List &units, idx_t unit_index) {
+		const auto &unit = bind_data.units[unit_index];
+		units.WriteObject([&](Serializer &unit_serializer) {
+			unit_serializer.WriteProperty(1, "unit_id", unit.unit_id);
+			unit_serializer.WriteProperty(2, "resource", unit.resource);
+			unit_serializer.WriteProperty(3, "artifact", unit.artifact);
 		});
 	});
 }
@@ -340,15 +341,15 @@ static void DistributedTestScanSerialize(Serializer &serializer, const optional_
 static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &deserializer, TableFunction &) {
 	distributed_test_deserialize_calls++;
 	auto result = make_uniq<DistributedTestScanBindData>();
-	result->requested_task_count = deserializer.ReadProperty<idx_t>(100, "requested_task_count");
-	deserializer.ReadList(101, "tasks", [&](Deserializer::List &tasks, idx_t) {
-		DistributedTestRuntimeTask task;
-		tasks.ReadObject([&](Deserializer &task_deserializer) {
-			task.task_id = task_deserializer.ReadProperty<idx_t>(1, "task_id");
-			task.resource = task_deserializer.ReadProperty<string>(2, "resource");
-			task.artifact = task_deserializer.ReadProperty<string>(3, "artifact");
+	result->requested_unit_count = deserializer.ReadProperty<idx_t>(100, "requested_unit_count");
+	deserializer.ReadList(101, "units", [&](Deserializer::List &units, idx_t) {
+		DistributedTestSourceUnit unit;
+		units.ReadObject([&](Deserializer &unit_deserializer) {
+			unit.unit_id = unit_deserializer.ReadProperty<idx_t>(1, "unit_id");
+			unit.resource = unit_deserializer.ReadProperty<string>(2, "resource");
+			unit.artifact = unit_deserializer.ReadProperty<string>(3, "artifact");
 		});
-		result->tasks.push_back(std::move(task));
+		result->units.push_back(std::move(unit));
 	});
 	return std::move(result);
 }
@@ -357,52 +358,53 @@ static unique_ptr<FunctionData> DistributedTestCreateWorkerBind(const TableFunct
 	distributed_test_create_worker_bind_calls++;
 	auto &source_bind = input.bind_data.Cast<DistributedTestScanBindData>();
 	auto worker_bind = make_uniq<DistributedTestScanBindData>();
-	worker_bind->requested_task_count = source_bind.requested_task_count;
+	worker_bind->requested_unit_count = source_bind.requested_unit_count;
 	return std::move(worker_bind);
 }
 
-static vector<DistributedScanTask> DistributedTestPlanTasks(const TableFunctionDistributedScanInput &input) {
+static vector<DistributedScanSplit> DistributedTestPlanSplits(const TableFunctionDistributedScanPlanningInput &input) {
+	distributed_test_last_target_split_count = input.target_split_count;
 	auto &bind_data = input.bind_data.Cast<DistributedTestScanBindData>();
-	vector<DistributedScanTask> result;
-	result.reserve(bind_data.tasks.size());
-	for (const auto &runtime_task : bind_data.tasks) {
-		DistributedScanTask task;
-		task.estimated_cardinality = optional_idx(1);
-		task.payload = runtime_task.resource;
-		if (runtime_task.artifact.empty()) {
-			task.task_id = "file-" + std::to_string(runtime_task.task_id);
-			task.estimated_bytes = optional_idx(1024 + runtime_task.task_id);
+	vector<DistributedScanSplit> result;
+	result.reserve(bind_data.units.size());
+	for (const auto &unit : bind_data.units) {
+		DistributedScanSplit split;
+		split.estimated_cardinality = optional_idx(1);
+		split.payload = unit.resource;
+		if (unit.artifact.empty()) {
+			split.split_id = "file-" + std::to_string(unit.unit_id);
+			split.estimated_bytes = optional_idx(1024 + unit.unit_id);
 		} else {
-			task.task_id = "fragment-" + std::to_string(runtime_task.task_id);
-			task.estimated_bytes = optional_idx(2048 + runtime_task.task_id);
-			task.payload = FragmentTaskEnvelope(runtime_task.task_id);
+			split.split_id = "fragment-" + std::to_string(unit.unit_id);
+			split.estimated_bytes = optional_idx(2048 + unit.unit_id);
+			split.payload = FragmentSplitPayload(unit.unit_id);
 		}
-		result.push_back(std::move(task));
+		result.push_back(std::move(split));
 	}
 	return result;
 }
 
-static void DistributedTestApplyTasks(FunctionData &worker_bind_data, const vector<DistributedScanTask> &tasks) {
+static void DistributedTestApplySplits(FunctionData &worker_bind_data, const vector<DistributedScanSplit> &splits) {
 	auto &bind_data = worker_bind_data.Cast<DistributedTestScanBindData>();
-	vector<DistributedTestRuntimeTask> validated_tasks;
-	validated_tasks.reserve(tasks.size());
-	for (const auto &task : tasks) {
-		if (StringUtil::StartsWith(task.task_id, "file-")) {
-			auto task_id = ParseTaskId(task.task_id, "file-");
-			if (task.payload != FileResource(task_id)) {
-				throw InvalidInputException("invalid distributed test file task '%s'", task.task_id);
+	vector<DistributedTestSourceUnit> assigned_units;
+	assigned_units.reserve(splits.size());
+	for (const auto &split : splits) {
+		if (StringUtil::StartsWith(split.split_id, "file-")) {
+			auto unit_id = ParseSplitIndex(split.split_id, "file-");
+			if (split.payload != FileResource(unit_id)) {
+				throw InvalidInputException("invalid distributed test file split '%s'", split.split_id);
 			}
-			validated_tasks.push_back({task_id, task.payload, string()});
+			assigned_units.push_back({unit_id, split.payload, string()});
 		} else {
-			auto task_id = ParseTaskId(task.task_id, "fragment-");
-			auto fragment = DecodeFragmentTaskEnvelope(task.payload);
-			if (fragment.first != FragmentPayload(task_id) || fragment.second != FragmentArtifact(task_id)) {
-				throw InvalidInputException("invalid distributed test opaque fragment task '%s'", task.task_id);
+			auto unit_id = ParseSplitIndex(split.split_id, "fragment-");
+			auto fragment = DecodeFragmentSplitPayload(split.payload);
+			if (fragment.first != FragmentPayload(unit_id) || fragment.second != FragmentArtifact(unit_id)) {
+				throw InvalidInputException("invalid distributed test opaque fragment split '%s'", split.split_id);
 			}
-			validated_tasks.push_back({task_id, std::move(fragment.first), std::move(fragment.second)});
+			assigned_units.push_back({unit_id, std::move(fragment.first), std::move(fragment.second)});
 		}
 	}
-	bind_data.tasks = std::move(validated_tasks);
+	bind_data.units = std::move(assigned_units);
 }
 
 static TableFunction DistributedTestScanFunction() {
@@ -412,10 +414,10 @@ static TableFunction DistributedTestScanFunction() {
 	function.deserialize = DistributedTestScanDeserialize;
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
-	callbacks.task_codec = {DISTRIBUTED_TEST_SCAN_CODEC, DISTRIBUTED_TEST_TASK_CODEC_VERSION};
-	callbacks.plan = DistributedTestPlanTasks;
+	callbacks.split_codec = {DISTRIBUTED_TEST_SCAN_SPLIT_CODEC, DISTRIBUTED_TEST_SPLIT_CODEC_VERSION};
+	callbacks.plan_splits = DistributedTestPlanSplits;
 	callbacks.create_worker_bind = DistributedTestCreateWorkerBind;
-	callbacks.apply_tasks = DistributedTestApplyTasks;
+	callbacks.apply_splits = DistributedTestApplySplits;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;
 }
@@ -438,8 +440,19 @@ public:
 
 struct PlannedDistributedTestScan {
 	distributed::DuckPhysicalPlanRef worker_plan;
-	vector<distributed::ScanTaskDescriptor> tasks;
+	vector<distributed::ScanSplit> splits;
 };
+
+static distributed::ScanSplitBatch MakeScanSplitBatch(vector<distributed::ScanSplit> splits) {
+	distributed::ScanSplitBatch batch;
+	batch.splits = std::move(splits);
+	batch.Validate();
+	return batch;
+}
+
+static distributed::ScanSplitBatch MakeScanSplitBatch(const distributed::ScanSplit &split) {
+	return MakeScanSplitBatch(vector<distributed::ScanSplit> {split});
+}
 
 static PlannedDistributedTestScan PlanDistributedTestScan(DuckDB &db, Connection &connection, const string &query,
                                                           idx_t worker_slots) {
@@ -454,7 +467,7 @@ static PlannedDistributedTestScan PlanDistributedTestScan(DuckDB &db, Connection
 	}
 	auto coordinator_plan = distributed::DuckPhysicalPlanRef(generated_plan.release());
 	auto &coordinator_scan = coordinator_plan->Root().Cast<PhysicalTableScan>();
-	auto coordinator_task_count = coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size();
+	auto coordinator_unit_count = coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().units.size();
 	distributed::DuckDBExecutionConfig config;
 	config.set_distributed_worker_slots(worker_slots);
 	PlannedDistributedTestScan result;
@@ -463,38 +476,36 @@ static PlannedDistributedTestScan PlanDistributedTestScan(DuckDB &db, Connection
 	result.worker_plan = distributed::MakeTableScanPlan(coordinator_scan);
 	REQUIRE(distributed_test_create_worker_bind_calls.load() == create_calls_before_plan + 1);
 	REQUIRE(distributed_test_deserialize_calls.load() == deserialize_calls_before_plan);
-	REQUIRE(coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == coordinator_task_count);
-	auto task_set = distributed::MakeTableScanTasks(coordinator_scan, config, db.instance);
-	REQUIRE_FALSE(task_set.known_empty);
-	result.tasks = std::move(task_set.tasks);
+	REQUIRE(coordinator_scan.bind_data->Cast<DistributedTestScanBindData>().units.size() == coordinator_unit_count);
+	result.splits = distributed::MakeTableScanSplits(coordinator_scan, config, db.instance);
 	return result;
 }
 
 static distributed::DuckPhysicalPlanRef CloneAndApply(Connection &worker,
                                                       const distributed::DuckPhysicalPlanRef &worker_plan,
-                                                      const distributed::ScanTaskDescriptor &task, idx_t scan_node_id) {
+                                                      const distributed::ScanSplitBatch &batch, idx_t scan_node_id) {
 	auto bind_calls_before_clone = distributed_test_bind_calls.load();
 	auto cloned =
 	    distributed::ClonePhysicalPlanOrThrow(worker_plan, "distributed_test_extension", worker.context.get());
 	REQUIRE(distributed_test_bind_calls.load() == bind_calls_before_clone);
 	auto &worker_scan = cloned->Root().Cast<PhysicalTableScan>();
-	REQUIRE(worker_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+	REQUIRE(worker_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 	worker_scan.extra_info.scan_node_id = optional_idx(scan_node_id);
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> assigned_tasks;
-	assigned_tasks.emplace(scan_node_id, task);
+	unordered_map<idx_t, distributed::ScanSplitBatch> assigned_batches;
+	assigned_batches.emplace(scan_node_id, batch);
 	string apply_error;
-	REQUIRE(distributed::ApplyScanTasksToPlan(*cloned, assigned_tasks, &apply_error));
+	REQUIRE(distributed::ApplyScanSplitBatchesToPlan(*cloned, assigned_batches, &apply_error));
 	return cloned;
 }
 
 } // namespace
 
-TEST_CASE("Distributed synthetic extension transports file tasks with an explicit worker bind",
+TEST_CASE("Distributed synthetic extension transports file splits with an explicit worker bind",
           "[distributed][extension][extension-scan]") {
-	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBytes(""),
-	                    Catch::Matchers::Contains("empty scan task descriptor"));
-	REQUIRE_THROWS_WITH(distributed::ScanTaskDescriptor::DeserializeFromBase64(""),
-	                    Catch::Matchers::Contains("empty base64 scan task descriptor"));
+	REQUIRE_THROWS_WITH(distributed::ScanSplitBatch::DeserializeFromBytes(""),
+	                    Catch::Matchers::Contains("empty scan split batch"));
+	REQUIRE_THROWS_WITH(distributed::ScanSplitBatch::DeserializeFromBase64(""),
+	                    Catch::Matchers::Contains("empty base64 scan split batch"));
 
 	auto invalid_function = DistributedTestScanFunction();
 	auto invalid_callbacks = invalid_function.GetDistributedScanCallbacks();
@@ -511,9 +522,21 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection coordinator(coordinator_db);
 
-	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY task_id");
+	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY unit_id");
 	REQUIRE_NO_FAIL(*native_result);
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
+
+	auto duplicate_logical_plan = coordinator.ExtractPlan("SELECT * FROM distributed_test_scan(2)");
+	REQUIRE(duplicate_logical_plan != nullptr);
+	PhysicalPlanGenerator duplicate_generator(*coordinator.context);
+	auto duplicate_physical_plan = duplicate_generator.Plan(std::move(duplicate_logical_plan));
+	REQUIRE(duplicate_physical_plan != nullptr);
+	auto &duplicate_scan = duplicate_physical_plan->Root().Cast<PhysicalTableScan>();
+	auto &duplicate_bind = duplicate_scan.bind_data->Cast<DistributedTestScanBindData>();
+	duplicate_bind.units[1] = duplicate_bind.units[0];
+	distributed::DuckDBExecutionConfig duplicate_config;
+	REQUIRE_THROWS_WITH(distributed::MakeTableScanSplits(duplicate_scan, duplicate_config, coordinator_db.instance),
+	                    Catch::Matchers::Contains("planned duplicate split_id 'file-0'"));
 
 	auto &coordinator_manager = DistributedExtensionManager::Get(*coordinator_db.instance);
 	REQUIRE(SyntheticExtensionHasContractIdentity(
@@ -521,24 +544,24 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	    "distributed_test{table_function:distributed_test_scan@1,write_operator:distributed_test_opaque_write@1}"));
 
 	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(1)", 3);
-	REQUIRE(planned.tasks.size() == 1);
+	REQUIRE(planned.splits.size() == 1);
+	REQUIRE(distributed_test_last_target_split_count.load() == 3);
 	auto &detached_bind =
 	    planned.worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(detached_bind.tasks.empty());
-	const auto &descriptor = planned.tasks[0];
-	REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
-	REQUIRE(descriptor.files.empty());
-	REQUIRE(descriptor.extension_capability == DistributedTestCapability());
-	REQUIRE(descriptor.task_codec.name == DISTRIBUTED_TEST_SCAN_CODEC);
-	REQUIRE(descriptor.task_codec.version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
-	REQUIRE(descriptor.extension_tasks.size() == 1);
-	REQUIRE(descriptor.extension_tasks[0].task_id == "file-0");
-	REQUIRE(descriptor.extension_tasks[0].payload == FileResource(0));
-	REQUIRE(descriptor.estimated_cardinality == 1);
-	REQUIRE(descriptor.estimated_bytes == 1024);
+	REQUIRE(detached_bind.units.empty());
+	const auto &split = planned.splits[0];
+	REQUIRE(split.kind == distributed::ScanSplitKind::EXTENSION);
+	REQUIRE(split.file.path.empty());
+	REQUIRE(split.extension_capability == DistributedTestCapability());
+	REQUIRE(split.split_codec.name == DISTRIBUTED_TEST_SCAN_SPLIT_CODEC);
+	REQUIRE(split.split_codec.version == DISTRIBUTED_TEST_SPLIT_CODEC_VERSION);
+	REQUIRE(split.split_id == "file-0");
+	REQUIRE(split.extension_payload == FileResource(0));
+	REQUIRE(split.estimated_cardinality == 1);
+	REQUIRE(split.estimated_bytes == 1024);
 
-	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(planned.tasks[0].SerializeToBytes());
-	REQUIRE(roundtrip.extension_tasks[0].payload == FileResource(0));
+	auto roundtrip = distributed::ScanSplitBatch::DeserializeFromBytes(MakeScanSplitBatch(split).SerializeToBytes());
+	REQUIRE(roundtrip.splits[0].extension_payload == FileResource(0));
 
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
@@ -547,67 +570,67 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	    planned.worker_plan, "distributed_test_extension_missing_assignment", worker.context.get());
 	string missing_assignment_error;
 	REQUIRE_FALSE(
-	    distributed::ValidateDistributedScanTasksApplied(*missing_assignment_plan, &missing_assignment_error));
+	    distributed::ValidateDistributedScanSplitsApplied(*missing_assignment_plan, &missing_assignment_error));
 	REQUIRE(StringUtil::Contains(missing_assignment_error, "no runtime scan node identity"));
 	auto &missing_assignment_scan = missing_assignment_plan->Root().Cast<PhysicalTableScan>();
 	missing_assignment_scan.extra_info.scan_node_id = optional_idx(6);
-	REQUIRE_FALSE(distributed::ValidateScanTaskAssignments(*missing_assignment_plan, set<idx_t> {}));
-	REQUIRE(distributed::ValidateScanTaskAssignments(*missing_assignment_plan, set<idx_t> {6}));
-	REQUIRE_FALSE(distributed::ValidateScanTaskAssignments(*missing_assignment_plan, set<idx_t> {6, 999}));
+	REQUIRE_FALSE(distributed::ValidateScanSplitAssignments(*missing_assignment_plan, set<idx_t> {}));
+	REQUIRE(distributed::ValidateScanSplitAssignments(*missing_assignment_plan, set<idx_t> {6}));
+	REQUIRE_FALSE(distributed::ValidateScanSplitAssignments(*missing_assignment_plan, set<idx_t> {6, 999}));
 	missing_assignment_error.clear();
 	REQUIRE_FALSE(
-	    distributed::ValidateDistributedScanTasksApplied(*missing_assignment_plan, &missing_assignment_error));
-	REQUIRE(StringUtil::Contains(missing_assignment_error, "no explicit worker task assignment"));
+	    distributed::ValidateDistributedScanSplitsApplied(*missing_assignment_plan, &missing_assignment_error));
+	REQUIRE(StringUtil::Contains(missing_assignment_error, "no explicit worker split assignment"));
 	auto worker_plan = CloneAndApply(worker, planned.worker_plan, roundtrip, 7);
 	string assigned_error;
-	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*worker_plan, &assigned_error));
+	REQUIRE(distributed::ValidateDistributedScanSplitsApplied(*worker_plan, &assigned_error));
 	auto &assigned_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(assigned_bind.tasks.size() == 1);
-	REQUIRE(assigned_bind.tasks[0].task_id == 0);
-	REQUIRE(assigned_bind.tasks[0].resource == FileResource(0));
+	REQUIRE(assigned_bind.units.size() == 1);
+	REQUIRE(assigned_bind.units[0].unit_id == 0);
+	REQUIRE(assigned_bind.units[0].resource == FileResource(0));
 
 	auto empty_planned =
 	    PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(0)", 3);
-	REQUIRE(empty_planned.tasks.size() == 1);
-	REQUIRE(empty_planned.tasks[0].kind == distributed::ScanTaskKind::EXTENSION);
-	REQUIRE(empty_planned.tasks[0].extension_tasks.empty());
-	REQUIRE(empty_planned.tasks[0].source_task_partition_id == 0);
-	auto empty_roundtrip =
-	    distributed::ScanTaskDescriptor::DeserializeFromBytes(empty_planned.tasks[0].SerializeToBytes());
+	REQUIRE(empty_planned.splits.size() == 1);
+	REQUIRE(empty_planned.splits[0].kind == distributed::ScanSplitKind::EXTENSION);
+	REQUIRE(empty_planned.splits[0].empty);
+	REQUIRE(empty_planned.splits[0].split_id == "empty");
+	auto empty_roundtrip = distributed::ScanSplitBatch::DeserializeFromBytes(
+	    MakeScanSplitBatch(empty_planned.splits[0]).SerializeToBytes());
 	auto empty_worker_plan = CloneAndApply(worker, empty_planned.worker_plan, empty_roundtrip, 8);
 	string empty_assignment_error;
-	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*empty_worker_plan, &empty_assignment_error));
+	REQUIRE(distributed::ValidateDistributedScanSplitsApplied(*empty_worker_plan, &empty_assignment_error));
 	auto &empty_bind =
 	    empty_worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(empty_bind.tasks.empty());
+	REQUIRE(empty_bind.units.empty());
 
-	auto missing_fte_descriptor_plan = distributed::ClonePhysicalPlanOrThrow(
-	    empty_planned.worker_plan, "distributed_test_extension_missing_fte_descriptor", worker.context.get());
-	auto &missing_fte_descriptor_scan = missing_fte_descriptor_plan->Root().Cast<PhysicalTableScan>();
-	missing_fte_descriptor_scan.extra_info.scan_node_id = optional_idx(9);
+	auto missing_fte_batch_plan = distributed::ClonePhysicalPlanOrThrow(
+	    empty_planned.worker_plan, "distributed_test_extension_missing_fte_batch", worker.context.get());
+	auto &missing_fte_batch_scan = missing_fte_batch_plan->Root().Cast<PhysicalTableScan>();
+	missing_fte_batch_scan.extra_info.scan_node_id = optional_idx(9);
 	auto empty_queue = std::make_shared<distributed::FteSplitQueue>();
 	empty_queue->NoMoreSplits();
-	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> missing_fte_descriptor_queues;
-	missing_fte_descriptor_queues.emplace(9, std::move(empty_queue));
-	string missing_fte_descriptor_error;
-	REQUIRE_FALSE(distributed::ApplyFteScanSourceQueuesToPlan(
-	    *missing_fte_descriptor_plan, missing_fte_descriptor_queues, &missing_fte_descriptor_error));
-	REQUIRE(StringUtil::Contains(missing_fte_descriptor_error, "without an explicit task descriptor"));
-	REQUIRE_FALSE(missing_fte_descriptor_scan.distributed_scan_tasks_applied);
+	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> missing_fte_batch_queues;
+	missing_fte_batch_queues.emplace(9, std::move(empty_queue));
+	string missing_fte_batch_error;
+	REQUIRE_FALSE(distributed::ApplyFteScanSourceQueuesToPlan(*missing_fte_batch_plan, missing_fte_batch_queues,
+	                                                          &missing_fte_batch_error));
+	REQUIRE(StringUtil::Contains(missing_fte_batch_error, "without an explicit split batch"));
+	REQUIRE_FALSE(missing_fte_batch_scan.distributed_scan_splits_applied);
 
 	auto empty_fte_plan = distributed::ClonePhysicalPlanOrThrow(
-	    empty_planned.worker_plan, "distributed_test_extension_empty_fte_descriptor", worker.context.get());
+	    empty_planned.worker_plan, "distributed_test_extension_empty_fte_batch", worker.context.get());
 	auto &empty_fte_scan = empty_fte_plan->Root().Cast<PhysicalTableScan>();
 	empty_fte_scan.extra_info.scan_node_id = optional_idx(10);
-	auto empty_descriptor_queue = std::make_shared<distributed::FteSplitQueue>();
-	empty_descriptor_queue->AddSplit(distributed::TaskInput::make_scan_task(empty_planned.tasks[0].SerializeToBytes()));
-	empty_descriptor_queue->NoMoreSplits();
+	auto empty_batch_queue = std::make_shared<distributed::FteSplitQueue>();
+	empty_batch_queue->AddSplit(distributed::TaskInput::make_scan_split_batch(empty_roundtrip.SerializeToBytes()));
+	empty_batch_queue->NoMoreSplits();
 	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> empty_fte_queues;
-	empty_fte_queues.emplace(10, std::move(empty_descriptor_queue));
+	empty_fte_queues.emplace(10, std::move(empty_batch_queue));
 	string empty_fte_error;
 	REQUIRE(distributed::ApplyFteScanSourceQueuesToPlan(*empty_fte_plan, empty_fte_queues, &empty_fte_error));
-	REQUIRE(empty_fte_scan.distributed_scan_tasks_applied);
-	REQUIRE(empty_fte_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+	REQUIRE(empty_fte_scan.distributed_scan_splits_applied);
+	REQUIRE(empty_fte_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 
 	auto duplicate_fte_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
 	auto &left_duplicate_scan = distributed::ClonePhysicalPlanRootIntoPlanOrThrow(
@@ -635,16 +658,17 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	auto &duplicate_union =
 	    duplicate_fte_plan->Make<PhysicalUnion>(left_duplicate_scan.GetTypes(), duplicate_children, 0, false);
 	duplicate_fte_plan->SetRoot(duplicate_union);
-	auto left_descriptor = planned.tasks[0];
-	auto right_descriptor = planned.tasks[0];
-	right_descriptor.extension_tasks[0].task_id = "file-1";
-	right_descriptor.extension_tasks[0].payload = FileResource(1);
-	right_descriptor.Validate();
+	auto left_batch = MakeScanSplitBatch(planned.splits[0]);
+	auto right_split = planned.splits[0];
+	right_split.split_id = "file-1";
+	right_split.extension_payload = FileResource(1);
+	right_split.Validate();
+	auto right_batch = MakeScanSplitBatch(std::move(right_split));
 	auto left_queue = std::make_shared<distributed::FteSplitQueue>();
-	left_queue->AddSplit(distributed::TaskInput::make_scan_task(left_descriptor.SerializeToBytes()));
+	left_queue->AddSplit(distributed::TaskInput::make_scan_split_batch(left_batch.SerializeToBytes()));
 	left_queue->NoMoreSplits();
 	auto right_queue = std::make_shared<distributed::FteSplitQueue>();
-	right_queue->AddSplit(distributed::TaskInput::make_scan_task(right_descriptor.SerializeToBytes()));
+	right_queue->AddSplit(distributed::TaskInput::make_scan_split_batch(right_batch.SerializeToBytes()));
 	right_queue->NoMoreSplits();
 	unordered_map<idx_t, std::shared_ptr<distributed::FteSplitQueue>> duplicate_fte_queues;
 	duplicate_fte_queues.emplace(11, std::move(left_queue));
@@ -652,19 +676,19 @@ TEST_CASE("Distributed synthetic extension transports file tasks with an explici
 	string duplicate_fte_error;
 	REQUIRE(
 	    distributed::ApplyFteScanSourceQueuesToPlan(*duplicate_fte_plan, duplicate_fte_queues, &duplicate_fte_error));
-	REQUIRE(left_duplicate_scan.distributed_scan_tasks_applied);
-	REQUIRE(right_duplicate_scan.distributed_scan_tasks_applied);
-	REQUIRE(third_duplicate_scan.distributed_scan_tasks_applied);
+	REQUIRE(left_duplicate_scan.distributed_scan_splits_applied);
+	REQUIRE(right_duplicate_scan.distributed_scan_splits_applied);
+	REQUIRE(third_duplicate_scan.distributed_scan_splits_applied);
 	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != right_duplicate_scan.extra_info.scan_node_id);
 	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != third_duplicate_scan.extra_info.scan_node_id);
 	REQUIRE(right_duplicate_scan.extra_info.scan_node_id != third_duplicate_scan.extra_info.scan_node_id);
-	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
-	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
-	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.size() == 1);
-	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(0));
-	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(1));
-	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().tasks[0].resource == FileResource(1));
-	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*duplicate_fte_plan));
+	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units.size() == 1);
+	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units.size() == 1);
+	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units.size() == 1);
+	REQUIRE(left_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units[0].resource == FileResource(0));
+	REQUIRE(right_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units[0].resource == FileResource(1));
+	REQUIRE(third_duplicate_scan.bind_data->Cast<DistributedTestScanBindData>().units[0].resource == FileResource(1));
+	REQUIRE(distributed::ValidateDistributedScanSplitsApplied(*duplicate_fte_plan));
 
 	auto no_serde_plan = planned.worker_plan;
 	no_serde_plan->Root().Cast<PhysicalTableScan>().function.serialize = nullptr;
@@ -686,131 +710,130 @@ TEST_CASE("Distributed extension scan constructs its worker bind without Functio
 	REQUIRE(generated_plan->Root().type == PhysicalOperatorType::TABLE_SCAN);
 	auto &coordinator_scan = generated_plan->Root().Cast<PhysicalTableScan>();
 	auto &coordinator_bind = coordinator_scan.bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(coordinator_bind.tasks.size() == 1);
+	REQUIRE(coordinator_bind.units.size() == 1);
 	REQUIRE_THROWS_WITH(coordinator_bind.Copy(), Catch::Matchers::Contains("Copy not supported"));
 
 	auto worker_plan = distributed::MakeTableScanPlan(coordinator_scan);
 	auto &worker_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(worker_bind.requested_task_count == coordinator_bind.requested_task_count);
-	REQUIRE(worker_bind.tasks.empty());
-	REQUIRE(coordinator_bind.tasks.size() == 1);
+	REQUIRE(worker_bind.requested_unit_count == coordinator_bind.requested_unit_count);
+	REQUIRE(worker_bind.units.empty());
+	REQUIRE(coordinator_bind.units.size() == 1);
 }
 
-TEST_CASE("Distributed synthetic extension mixes file tasks with opaque fat fragment payloads",
+TEST_CASE("Distributed synthetic extension mixes file splits with opaque fat fragment payloads",
           "[distributed][extension][extension-scan]") {
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection coordinator(coordinator_db);
 
-	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY task_id");
+	auto native_result = coordinator.Query("SELECT * FROM distributed_test_scan(3) ORDER BY unit_id");
 	REQUIRE_NO_FAIL(*native_result);
 	REQUIRE(CHECK_COLUMN(native_result, 0, {0, 1, 2}));
 
 	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(3)", 3);
-	REQUIRE(planned.tasks.size() == 3);
-	for (idx_t task_index = 0; task_index < planned.tasks.size(); task_index++) {
-		const auto &descriptor = planned.tasks[task_index];
-		REQUIRE(descriptor.kind == distributed::ScanTaskKind::EXTENSION);
-		REQUIRE(descriptor.files.empty());
-		REQUIRE(descriptor.task_codec.name == DISTRIBUTED_TEST_SCAN_CODEC);
-		REQUIRE(descriptor.task_codec.version == DISTRIBUTED_TEST_TASK_CODEC_VERSION);
-		REQUIRE(descriptor.extension_tasks.size() == 1);
-		const auto &task = descriptor.extension_tasks[0];
-		if (task_index % 2 == 0) {
-			REQUIRE(task.task_id == "file-" + std::to_string(task_index));
-			REQUIRE(task.payload == FileResource(task_index));
+	REQUIRE(planned.splits.size() == 3);
+	for (idx_t split_index = 0; split_index < planned.splits.size(); split_index++) {
+		const auto &split = planned.splits[split_index];
+		REQUIRE(split.kind == distributed::ScanSplitKind::EXTENSION);
+		REQUIRE(split.file.path.empty());
+		REQUIRE(split.split_codec.name == DISTRIBUTED_TEST_SCAN_SPLIT_CODEC);
+		REQUIRE(split.split_codec.version == DISTRIBUTED_TEST_SPLIT_CODEC_VERSION);
+		if (split_index % 2 == 0) {
+			REQUIRE(split.split_id == "file-" + std::to_string(split_index));
+			REQUIRE(split.extension_payload == FileResource(split_index));
 		} else {
-			REQUIRE(task.task_id == "fragment-" + std::to_string(task_index));
-			auto fragment = DecodeFragmentTaskEnvelope(task.payload);
-			REQUIRE(fragment.first == FragmentPayload(task_index));
+			REQUIRE(split.split_id == "fragment-" + std::to_string(split_index));
+			auto fragment = DecodeFragmentSplitPayload(split.extension_payload);
+			REQUIRE(fragment.first == FragmentPayload(split_index));
 			REQUIRE(fragment.first[0] == '\0');
-			REQUIRE(fragment.second == FragmentArtifact(task_index));
+			REQUIRE(fragment.second == FragmentArtifact(split_index));
 			REQUIRE(fragment.second[1] == '\0');
 		}
 	}
 
-	auto merged = planned.tasks[0];
-	merged.Merge(planned.tasks[1]);
-	REQUIRE(merged.extension_tasks.size() == 2);
-	REQUIRE(merged.source_task_partition_id == DConstants::INVALID_INDEX);
-	auto roundtrip = distributed::ScanTaskDescriptor::DeserializeFromBytes(merged.SerializeToBytes());
-	REQUIRE(roundtrip.extension_tasks.size() == 2);
-	REQUIRE(DecodeFragmentTaskEnvelope(roundtrip.extension_tasks[1].payload).second == FragmentArtifact(1));
+	auto merged = MakeScanSplitBatch(planned.splits[0]);
+	merged.Merge(MakeScanSplitBatch(planned.splits[1]));
+	REQUIRE(merged.splits.size() == 2);
+	auto roundtrip = distributed::ScanSplitBatch::DeserializeFromBytes(merged.SerializeToBytes());
+	REQUIRE(roundtrip.splits.size() == 2);
+	REQUIRE(DecodeFragmentSplitPayload(roundtrip.splits[1].extension_payload).second == FragmentArtifact(1));
 
 	DuckDB worker_db(nullptr);
 	worker_db.LoadStaticExtension<DistributedTestExtension>();
 	Connection worker(worker_db);
 	auto worker_plan = CloneAndApply(worker, planned.worker_plan, roundtrip, 11);
 	auto &assigned_bind = worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
-	REQUIRE(assigned_bind.tasks.size() == 2);
-	REQUIRE(assigned_bind.tasks[0].task_id == 0);
-	REQUIRE(assigned_bind.tasks[0].resource == FileResource(0));
-	REQUIRE(assigned_bind.tasks[0].artifact.empty());
-	REQUIRE(assigned_bind.tasks[1].task_id == 1);
-	REQUIRE(assigned_bind.tasks[1].artifact == FragmentArtifact(1));
+	REQUIRE(assigned_bind.units.size() == 2);
+	REQUIRE(assigned_bind.units[0].unit_id == 0);
+	REQUIRE(assigned_bind.units[0].resource == FileResource(0));
+	REQUIRE(assigned_bind.units[0].artifact.empty());
+	REQUIRE(assigned_bind.units[1].unit_id == 1);
+	REQUIRE(assigned_bind.units[1].artifact == FragmentArtifact(1));
 
-	auto mismatched = planned.tasks[2];
-	mismatched.task_codec = {"distributed-test.invalid-task", 1};
+	auto mismatched = MakeScanSplitBatch(planned.splits[2]);
+	mismatched.splits[0].split_codec = {"distributed-test.invalid-split", 1};
 	REQUIRE_THROWS_WITH(roundtrip.Merge(std::move(mismatched)),
 	                    Catch::Matchers::Contains("different protocol identities"));
-	auto duplicate_merge_target = planned.tasks[0];
-	auto duplicate_merge_source = planned.tasks[0];
+	auto duplicate_merge_target = MakeScanSplitBatch(planned.splits[0]);
+	auto duplicate_merge_source = MakeScanSplitBatch(planned.splits[0]);
 	REQUIRE_THROWS_WITH(duplicate_merge_target.Merge(std::move(duplicate_merge_source)),
-	                    Catch::Matchers::Contains("duplicate task_id"));
-	REQUIRE(duplicate_merge_target.extension_tasks.size() == 1);
-	REQUIRE(duplicate_merge_target.extension_tasks[0].task_id == "file-0");
+	                    Catch::Matchers::Contains("duplicate split_id"));
+	REQUIRE(duplicate_merge_target.splits.size() == 1);
+	REQUIRE(duplicate_merge_target.splits[0].split_id == "file-0");
 
 	auto mismatched_worker_plan = distributed::ClonePhysicalPlanOrThrow(
 	    planned.worker_plan, "distributed_test_extension_codec_mismatch", worker.context.get());
 	auto &mismatched_worker_scan = mismatched_worker_plan->Root().Cast<PhysicalTableScan>();
 	mismatched_worker_scan.extra_info.scan_node_id = optional_idx(12);
-	auto mismatched_assignment = planned.tasks[1];
-	mismatched_assignment.task_codec = {"distributed-test.invalid-task", 1};
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> mismatched_tasks;
-	mismatched_tasks.emplace(12, std::move(mismatched_assignment));
+	auto mismatched_assignment = MakeScanSplitBatch(planned.splits[1]);
+	mismatched_assignment.splits[0].split_codec = {"distributed-test.invalid-split", 1};
+	unordered_map<idx_t, distributed::ScanSplitBatch> mismatched_batches;
+	mismatched_batches.emplace(12, std::move(mismatched_assignment));
 	string mismatch_error;
-	REQUIRE_FALSE(distributed::ApplyScanTasksToPlan(*mismatched_worker_plan, mismatched_tasks, &mismatch_error));
-	REQUIRE(StringUtil::Contains(mismatch_error, "task codec mismatch"));
+	REQUIRE_FALSE(
+	    distributed::ApplyScanSplitBatchesToPlan(*mismatched_worker_plan, mismatched_batches, &mismatch_error));
+	REQUIRE(StringUtil::Contains(mismatch_error, "split codec mismatch"));
 
 	auto unknown_node_plan = distributed::ClonePhysicalPlanOrThrow(
 	    planned.worker_plan, "distributed_test_extension_unknown_node", worker.context.get());
 	auto &unknown_node_scan = unknown_node_plan->Root().Cast<PhysicalTableScan>();
 	unknown_node_scan.extra_info.scan_node_id = optional_idx(13);
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> unknown_node_tasks;
-	unknown_node_tasks.emplace(13, planned.tasks[0]);
-	unknown_node_tasks.emplace(999, planned.tasks[1]);
+	unordered_map<idx_t, distributed::ScanSplitBatch> unknown_node_batches;
+	unknown_node_batches.emplace(13, MakeScanSplitBatch(planned.splits[0]));
+	unknown_node_batches.emplace(999, MakeScanSplitBatch(planned.splits[1]));
 	string unknown_node_error;
-	REQUIRE_FALSE(distributed::ApplyScanTasksToPlan(*unknown_node_plan, unknown_node_tasks, &unknown_node_error));
+	REQUIRE_FALSE(
+	    distributed::ApplyScanSplitBatchesToPlan(*unknown_node_plan, unknown_node_batches, &unknown_node_error));
 	REQUIRE(StringUtil::Contains(unknown_node_error, "node_id=999 is not present in the worker plan"));
-	REQUIRE_FALSE(unknown_node_scan.distributed_scan_tasks_applied);
-	REQUIRE(unknown_node_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+	REQUIRE_FALSE(unknown_node_scan.distributed_scan_splits_applied);
+	REQUIRE(unknown_node_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 
 	auto invalid_opaque_plan = distributed::ClonePhysicalPlanOrThrow(
-	    planned.worker_plan, "distributed_test_extension_invalid_opaque_task", worker.context.get());
+	    planned.worker_plan, "distributed_test_extension_invalid_opaque_split", worker.context.get());
 	auto &invalid_opaque_scan = invalid_opaque_plan->Root().Cast<PhysicalTableScan>();
 	invalid_opaque_scan.extra_info.scan_node_id = optional_idx(14);
-	auto invalid_opaque_descriptor = planned.tasks[0];
-	invalid_opaque_descriptor.Merge(planned.tasks[1]);
-	invalid_opaque_descriptor.extension_tasks[1].task_id += "junk";
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> invalid_opaque_tasks;
-	invalid_opaque_tasks.emplace(14, std::move(invalid_opaque_descriptor));
-	REQUIRE_THROWS_WITH(distributed::ApplyScanTasksToPlan(*invalid_opaque_plan, invalid_opaque_tasks),
+	auto invalid_opaque_batch = MakeScanSplitBatch(planned.splits[0]);
+	invalid_opaque_batch.Merge(MakeScanSplitBatch(planned.splits[1]));
+	invalid_opaque_batch.splits[1].split_id += "junk";
+	unordered_map<idx_t, distributed::ScanSplitBatch> invalid_opaque_batches;
+	invalid_opaque_batches.emplace(14, std::move(invalid_opaque_batch));
+	REQUIRE_THROWS_WITH(distributed::ApplyScanSplitBatchesToPlan(*invalid_opaque_plan, invalid_opaque_batches),
 	                    Catch::Matchers::Contains("invalid numeric identity"));
-	REQUIRE_FALSE(invalid_opaque_scan.distributed_scan_tasks_applied);
-	REQUIRE(invalid_opaque_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+	REQUIRE_FALSE(invalid_opaque_scan.distributed_scan_splits_applied);
+	REQUIRE(invalid_opaque_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 
-	auto aliased_task_plan = distributed::ClonePhysicalPlanOrThrow(
-	    planned.worker_plan, "distributed_test_extension_aliased_task", worker.context.get());
-	auto &aliased_task_scan = aliased_task_plan->Root().Cast<PhysicalTableScan>();
-	aliased_task_scan.extra_info.scan_node_id = optional_idx(15);
-	auto aliased_task_descriptor = planned.tasks[1];
-	aliased_task_descriptor.extension_tasks[0].task_id = "fragment-01";
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> aliased_tasks;
-	aliased_tasks.emplace(15, std::move(aliased_task_descriptor));
-	REQUIRE_THROWS_WITH(distributed::ApplyScanTasksToPlan(*aliased_task_plan, aliased_tasks),
+	auto aliased_split_plan = distributed::ClonePhysicalPlanOrThrow(
+	    planned.worker_plan, "distributed_test_extension_aliased_split", worker.context.get());
+	auto &aliased_split_scan = aliased_split_plan->Root().Cast<PhysicalTableScan>();
+	aliased_split_scan.extra_info.scan_node_id = optional_idx(15);
+	auto aliased_split_batch = MakeScanSplitBatch(planned.splits[1]);
+	aliased_split_batch.splits[0].split_id = "fragment-01";
+	unordered_map<idx_t, distributed::ScanSplitBatch> aliased_batches;
+	aliased_batches.emplace(15, std::move(aliased_split_batch));
+	REQUIRE_THROWS_WITH(distributed::ApplyScanSplitBatchesToPlan(*aliased_split_plan, aliased_batches),
 	                    Catch::Matchers::Contains("non-canonical numeric identity"));
-	REQUIRE_FALSE(aliased_task_scan.distributed_scan_tasks_applied);
-	REQUIRE(aliased_task_scan.bind_data->Cast<DistributedTestScanBindData>().tasks.empty());
+	REQUIRE_FALSE(aliased_split_scan.distributed_scan_splits_applied);
+	REQUIRE(aliased_split_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 }
 
 TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
@@ -1104,8 +1127,8 @@ TEST_CASE("Distributed synthetic extension composes opaque scan and write callba
 	db.LoadStaticExtension<DistributedTestExtension>();
 	Connection connection(db);
 	auto planned = PlanDistributedTestScan(db, connection, "SELECT * FROM distributed_test_scan(3)", 1);
-	REQUIRE(planned.tasks.size() == 1);
-	REQUIRE(planned.tasks[0].extension_tasks.size() == 3);
+	REQUIRE(planned.splits.size() == 3);
+	REQUIRE(distributed_test_last_target_split_count.load() == 1);
 
 	auto execution_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
 	auto &scan = distributed::ClonePhysicalPlanRootIntoPlanOrThrow(
@@ -1120,13 +1143,13 @@ TEST_CASE("Distributed synthetic extension composes opaque scan and write callba
 	execution_plan->SetRoot(write);
 
 	set<idx_t> assigned_scan_node_ids {21};
-	REQUIRE(distributed::ValidateScanTaskAssignments(*execution_plan, assigned_scan_node_ids));
-	unordered_map<idx_t, distributed::ScanTaskDescriptor> assigned_tasks;
-	assigned_tasks.emplace(21, planned.tasks[0]);
+	REQUIRE(distributed::ValidateScanSplitAssignments(*execution_plan, assigned_scan_node_ids));
+	unordered_map<idx_t, distributed::ScanSplitBatch> assigned_batches;
+	assigned_batches.emplace(21, MakeScanSplitBatch(planned.splits));
 	string apply_error;
-	REQUIRE(distributed::ApplyScanTasksToPlan(*execution_plan, assigned_tasks, &apply_error));
+	REQUIRE(distributed::ApplyScanSplitBatchesToPlan(*execution_plan, assigned_batches, &apply_error));
 	REQUIRE(apply_error.empty());
-	REQUIRE(distributed::ValidateDistributedScanTasksApplied(*execution_plan));
+	REQUIRE(distributed::ValidateDistributedScanSplitsApplied(*execution_plan));
 
 	const DistributedWriteTaskContext task_context {"query-scan-write", "fragment-0.partition-0.attempt-0"};
 	REQUIRE(ValidateDistributedWriteTaskContextAssignment(*execution_plan, task_context) == 1);

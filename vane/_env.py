@@ -9,11 +9,11 @@ Usage::
 
     # Read (always live from os.environ)
     print(env.runner)  # "ray" or "local"
-    print(env.ray_scan_task_size_grouping)  # True
+    print(env.ray_scan_split_min_count)  # 0
 
     # Write (sets os.environ immediately)
     env.runner = "ray"
-    env.ray_scan_task_size_grouping = False
+    env.ray_scan_split_min_count = 16
 
     # Bulk snapshot
     d = env.as_dict()  # {"runner": "ray", ...}
@@ -129,30 +129,18 @@ class EnvRegistry:
 
     # -- Ray runner ---------------------------------------------------------
 
-    ray_scan_task_size_grouping = _Var(
-        "VANE_RAY_SCAN_TASK_SIZE_GROUPING",
-        bool,
-        True,
-        "Enable size-based scan task grouping (merges small files into 96-384MB tasks). "
-        "Set to false/0 to disable and get one task per file.",
-    )
     ray_max_task_backlog = _Var(
         "VANE_RAY_MAX_TASK_BACKLOG",
         int,
         0,
         "Max pending tasks before back-pressure. 0 = unlimited.",
     )
-    ray_scan_task_open_cost_bytes = _Var(
-        "VANE_RAY_SCAN_TASK_OPEN_COST_BYTES",
-        int,
-        4 * 1024 * 1024,
-        "Virtual per-file I/O cost (bytes) for Spark-style partition sizing. Default 4 MB.",
-    )
-    ray_scan_task_min_partition_num = _Var(
-        "VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM",
+    ray_scan_split_min_count = _Var(
+        "VANE_RAY_SCAN_SPLIT_MIN_COUNT",
         int,
         0,
-        "Minimum number of scan partitions. 0 = use worker_slots.",
+        "Minimum split-planning hint passed to distributed table functions. "
+        "0 = use the available worker slots. FTE remains responsible for grouping splits into tasks.",
     )
     ray_init_sql = _Var(
         "VANE_RAY_INIT_SQL",
@@ -203,7 +191,7 @@ class EnvRegistry:
 
         Example::
 
-            env.set(runner="ray", ray_scan_task_size_grouping=False)
+            env.set(runner="ray", ray_scan_split_min_count=16)
         """
         for key, value in kw.items():
             descriptor = getattr(type(self), key, None)

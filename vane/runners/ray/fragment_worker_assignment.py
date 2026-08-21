@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     from vane.runners.ray.fragment_registry import _FteFragmentState
 
 
+_DYNAMIC_SCAN_MIN_TARGET_PARTITION_SIZE_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_TASK_SPLIT_COUNT = 2048
+
+
 def _dynamic_scan_max_splits_per_partition() -> int | None:
     raw = os.getenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION")
     if raw is None or raw.strip() == "":
@@ -30,16 +34,39 @@ def _dynamic_scan_max_splits_per_partition() -> int | None:
     return value
 
 
+def _make_arbitrary_assigner(
+    fragment_state: _FteFragmentState,
+    *,
+    partitioned_sources: set[str],
+    replicated_sources: set[str] | None = None,
+) -> ArbitrarySplitAssigner:
+    max_splits_per_partition = _dynamic_scan_max_splits_per_partition()
+    min_target_partition_size_bytes = None
+    max_target_partition_size_bytes = None
+    if fragment_state.dynamic_scan_source_node_ids:
+        min_target_partition_size_bytes = _DYNAMIC_SCAN_MIN_TARGET_PARTITION_SIZE_BYTES
+        max_target_partition_size_bytes = (
+            max_splits_per_partition or _DEFAULT_MAX_TASK_SPLIT_COUNT
+        ) * _DYNAMIC_SCAN_MIN_TARGET_PARTITION_SIZE_BYTES
+    return ArbitrarySplitAssigner(
+        partitioned_sources=partitioned_sources,
+        replicated_sources=replicated_sources,
+        max_splits_per_partition=max_splits_per_partition,
+        min_target_partition_size_bytes=min_target_partition_size_bytes,
+        max_target_partition_size_bytes=max_target_partition_size_bytes,
+    )
+
+
 def make_fte_assigner(fragment_state: _FteFragmentState) -> SplitAssigner:
     if fragment_state.dynamic_exchange_source_node_ids:
         replicated_exchange_sources = set(fragment_state.replicated_exchange_source_node_ids)
         dynamic_exchange_sources = set(fragment_state.dynamic_exchange_source_node_ids)
         partitioned_exchange_sources = dynamic_exchange_sources - replicated_exchange_sources
         if not partitioned_exchange_sources:
-            return ArbitrarySplitAssigner(
+            return _make_arbitrary_assigner(
+                fragment_state,
                 partitioned_sources=set(fragment_state.source_node_ids) - replicated_exchange_sources,
                 replicated_sources=replicated_exchange_sources,
-                max_splits_per_partition=_dynamic_scan_max_splits_per_partition(),
             )
         source_partition_ids = sorted(fragment_state.exchange_source_partition_ids)
         source_partition_count = max(
@@ -56,9 +83,9 @@ def make_fte_assigner(fragment_state: _FteFragmentState) -> SplitAssigner:
             replicated_sources=set(fragment_state.dynamic_scan_source_node_ids) | replicated_exchange_sources,
             source_partition_to_task_partition=mapping,
         )
-    return ArbitrarySplitAssigner(
+    return _make_arbitrary_assigner(
+        fragment_state,
         partitioned_sources=set(fragment_state.source_node_ids),
-        max_splits_per_partition=_dynamic_scan_max_splits_per_partition(),
     )
 
 

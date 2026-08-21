@@ -24,23 +24,23 @@ PartitionStatistics::PartitionStatistics() : row_start(0), count(0), count_type(
 TableFunctionInfo::~TableFunctionInfo() {
 }
 
-void DistributedScanTask::Validate() const {
-	if (task_id.empty()) {
-		throw SerializationException("distributed extension scan task has an empty task_id");
+void DistributedScanSplit::Validate() const {
+	if (split_id.empty()) {
+		throw SerializationException("distributed extension scan split has an empty split_id");
 	}
 }
 
-void DistributedScanTask::Serialize(Serializer &serializer) const {
+void DistributedScanSplit::Serialize(Serializer &serializer) const {
 	Validate();
-	serializer.WriteProperty(1, "task_id", task_id);
+	serializer.WriteProperty(1, "split_id", split_id);
 	serializer.WriteProperty(2, "payload", payload);
 	serializer.WriteProperty(3, "estimated_cardinality", estimated_cardinality);
 	serializer.WriteProperty(4, "estimated_bytes", estimated_bytes);
 }
 
-DistributedScanTask DistributedScanTask::Deserialize(Deserializer &deserializer) {
-	DistributedScanTask result;
-	result.task_id = deserializer.ReadProperty<string>(1, "task_id");
+DistributedScanSplit DistributedScanSplit::Deserialize(Deserializer &deserializer) {
+	DistributedScanSplit result;
+	result.split_id = deserializer.ReadProperty<string>(1, "split_id");
 	result.payload = deserializer.ReadProperty<string>(2, "payload");
 	result.estimated_cardinality = deserializer.ReadProperty<optional_idx>(3, "estimated_cardinality");
 	result.estimated_bytes = deserializer.ReadProperty<optional_idx>(4, "estimated_bytes");
@@ -118,16 +118,16 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 }
 
 void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &function_name) const {
-	if (!plan || !create_worker_bind || !apply_tasks) {
-		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan, "
-		                            "create_worker_bind, and apply_tasks",
+	if (!plan_splits || !create_worker_bind || !apply_splits) {
+		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan_splits, "
+		                            "create_worker_bind, and apply_splits",
 		                            function_name);
 	}
 	if (protocol_version == 0) {
 		throw InvalidInputException(
 		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
-	task_codec.Validate("Distributed scan task codec for table function '" + function_name + "'");
+	split_codec.Validate("Distributed scan split codec for table function '" + function_name + "'");
 }
 
 void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
@@ -171,8 +171,8 @@ const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallb
 
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
 	return protocol_version == other.protocol_version && capability == other.capability &&
-	       task_codec == other.task_codec && plan == other.plan && create_worker_bind == other.create_worker_bind &&
-	       apply_tasks == other.apply_tasks;
+	       split_codec == other.split_codec && plan_splits == other.plan_splits &&
+	       create_worker_bind == other.create_worker_bind && apply_splits == other.apply_splits;
 }
 
 void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {

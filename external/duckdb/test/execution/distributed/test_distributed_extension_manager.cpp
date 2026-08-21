@@ -113,7 +113,7 @@ static void DistributedOverloadScan(ClientContext &, TableFunctionInput &, DataC
 	output.SetCardinality(0);
 }
 
-static vector<DistributedScanTask> DistributedOverloadPlan(const TableFunctionDistributedScanInput &) {
+static vector<DistributedScanSplit> DistributedOverloadPlan(const TableFunctionDistributedScanPlanningInput &) {
 	return {};
 }
 
@@ -122,7 +122,7 @@ static unique_ptr<FunctionData> DistributedOverloadCreateWorkerBind(const TableF
 	return make_uniq<DistributedOverloadBindData>();
 }
 
-static void DistributedOverloadApply(FunctionData &, const vector<DistributedScanTask> &) {
+static void DistributedOverloadApply(FunctionData &, const vector<DistributedScanSplit> &) {
 }
 
 static void DistributedOverloadSerialize(Serializer &serializer, const optional_ptr<FunctionData>,
@@ -143,10 +143,10 @@ static TableFunction DistributedOverloadFunction(const LogicalType &argument) {
 	function.deserialize = DistributedOverloadDeserialize;
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = 1;
-	callbacks.task_codec = {"distributed-overload.task", 1};
-	callbacks.plan = DistributedOverloadPlan;
+	callbacks.split_codec = {"distributed-overload.split", 1};
+	callbacks.plan_splits = DistributedOverloadPlan;
 	callbacks.create_worker_bind = DistributedOverloadCreateWorkerBind;
-	callbacks.apply_tasks = DistributedOverloadApply;
+	callbacks.apply_splits = DistributedOverloadApply;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;
 }

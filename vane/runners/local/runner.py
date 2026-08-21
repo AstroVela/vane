@@ -175,18 +175,18 @@ def _shutdown_local_write_resources(
 
 
 def _native_task_maps_from_context(context: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]]:
-    scan_task_map: dict[str, Any] = {}
+    scan_split_batch_map: dict[str, Any] = {}
     exchange_source_task_map: dict[str, Any] = {}
     for key, value in (context or {}).items():
-        if key.startswith("scan_task:"):
+        if key.startswith("scan_split_batch:"):
             node_id = key.split(":", 1)[1]
             if node_id:
-                scan_task_map[node_id] = value
+                scan_split_batch_map[node_id] = value
         elif key.startswith("exchange_source_task:"):
             node_id = key.split(":", 1)[1]
             if node_id:
                 exchange_source_task_map[node_id] = value
-    return scan_task_map, exchange_source_task_map
+    return scan_split_batch_map, exchange_source_task_map
 
 
 class _InProcessFragmentExecutor:
@@ -348,9 +348,9 @@ class _InProcessFragmentExecutor:
             task_attempt_id = FteTaskAttemptId.coerce(request_payload.get("task_id"))
             context = NativeFteWorkerManagerBackend.materialize_task_context(
                 request_payload,
-                merge_scan_task_descriptors=require_ray_cxx_attr("merge_scan_task_descriptors"),
+                merge_scan_split_batches=require_ray_cxx_attr("merge_scan_split_batches"),
             )
-            scan_task_map, exchange_source_task_map = _native_task_maps_from_context(context)
+            scan_split_batch_map, exchange_source_task_map = _native_task_maps_from_context(context)
             plan = request_payload.get("fragment_plan")
             if plan is None:
                 raise RuntimeError("local fragment execution requires fragment_plan")
@@ -371,7 +371,7 @@ class _InProcessFragmentExecutor:
             return self._get_plan_runner().execute_native(
                 cursor,
                 plan,
-                scan_task_map or None,
+                scan_split_batch_map or None,
                 exchange_source_task_map or None,
                 _copy_output_info_from_context(context),
                 request_payload.get("exchange_sink_instance"),

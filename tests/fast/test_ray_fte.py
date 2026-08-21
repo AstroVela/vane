@@ -20,6 +20,7 @@ from vane.runners.fte import (
     FteExchangeTracker,
     FteFragmentExecution,
     FtePartitionState,
+    FteSplit,
     FteTaskAttemptId,
     FteTaskExecution,
     FteTaskId,
@@ -42,6 +43,7 @@ from vane.runners.fte import (
     derive_exchange_sink_instance_for_attempt,
     materialize_task_inputs,
 )
+from vane.runners.fte.dynamic_inputs import prepare_fte_dynamic_inputs, split_scan_split_batch
 from vane.runners.fte.fte_attempts import RunningAttempt
 from vane.runners.fte.fte_config import FteWorkerAdmissionConfig
 from vane.runners.fte.fte_events import FteAddSplitsCommand
@@ -961,7 +963,7 @@ def test_fte_task_execution_terminal_status_refreshes_split_stats_with_fallback(
 @pytest.mark.parametrize(
     ("dynamic_source_field", "queue_attribute", "source_node_id", "split_kind"),
     [
-        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_task"),
+        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_split"),
         (
             "dynamic_exchange_source_node_ids",
             "dynamic_exchange_source_queues",
@@ -979,6 +981,12 @@ def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
     async def execute_fn(_request):
         return None
 
+    def split_payload(sequence_id, data):
+        payload = {"sequence_id": sequence_id, "kind": split_kind, "data": data}
+        if split_kind == "scan_split":
+            payload["split_id"] = f"scan-{sequence_id}"
+        return payload
+
     initial_payload = b"initial-payload" * 1024
     added_payload = b"added-payload" * 1024
     execution = FteTaskExecution(
@@ -986,13 +994,7 @@ def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
             "task_id": f"q-dynamic-payload.0.{source_node_id}.0",
             dynamic_source_field: [source_node_id],
             "initial_splits": {
-                source_node_id: [
-                    {
-                        "sequence_id": 0,
-                        "kind": split_kind,
-                        "data": initial_payload,
-                    }
-                ],
+                source_node_id: [split_payload(0, initial_payload)],
             },
         },
         execute_fn,
@@ -1007,7 +1009,7 @@ def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
 
     execution.add_splits(
         source_node_id,
-        [{"sequence_id": 1, "kind": split_kind, "data": added_payload}],
+        [split_payload(1, added_payload)],
     )
 
     assert execution.initial_splits == {}
@@ -1026,7 +1028,7 @@ def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
 
     duplicate_status = execution.add_splits(
         source_node_id,
-        [{"sequence_id": 1, "kind": split_kind, "data": b"duplicate"}],
+        [split_payload(1, b"duplicate")],
     )
     assert duplicate_status.duplicate_split_count == 1
     assert queue.try_get_next() == {"state": "BLOCKED"}
@@ -1036,7 +1038,7 @@ def test_fte_task_execution_dynamic_split_payloads_are_queue_owned(
 @pytest.mark.parametrize(
     ("dynamic_source_field", "queue_attribute", "source_node_id", "split_kind"),
     [
-        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_task"),
+        ("dynamic_scan_source_node_ids", "dynamic_scan_source_queues", "7", "scan_split"),
         (
             "dynamic_exchange_source_node_ids",
             "dynamic_exchange_source_queues",
@@ -1054,17 +1056,17 @@ def test_fte_task_execution_dynamic_source_update_transfers_and_releases_retaine
     async def execute_fn(_request):
         return None
 
+    def split_payload(sequence_id, data):
+        payload = {"sequence_id": sequence_id, "kind": split_kind, "data": data}
+        if split_kind == "scan_split":
+            payload["split_id"] = f"scan-{sequence_id}"
+        return payload
+
     execution = FteTaskExecution(
         {
             "task_id": "q-dynamic-update.0.0.0",
             "initial_splits": {
-                source_node_id: [
-                    {
-                        "sequence_id": 0,
-                        "kind": split_kind,
-                        "data": b"retained-before-update",
-                    }
-                ],
+                source_node_id: [split_payload(0, b"retained-before-update")],
             },
         },
         execute_fn,
@@ -1076,13 +1078,7 @@ def test_fte_task_execution_dynamic_source_update_transfers_and_releases_retaine
         {
             dynamic_source_field: [source_node_id],
             "initial_splits": {
-                source_node_id: [
-                    {
-                        "sequence_id": 1,
-                        "kind": split_kind,
-                        "data": b"added-with-update",
-                    }
-                ],
+                source_node_id: [split_payload(1, b"added-with-update")],
             },
         }
     )
@@ -1099,13 +1095,7 @@ def test_fte_task_execution_dynamic_source_update_transfers_and_releases_retaine
     duplicate_status = execution.update_task(
         {
             "initial_splits": {
-                source_node_id: [
-                    {
-                        "sequence_id": 1,
-                        "kind": split_kind,
-                        "data": b"duplicate",
-                    }
-                ],
+                source_node_id: [split_payload(1, b"duplicate")],
             },
         }
     )
@@ -1437,7 +1427,7 @@ def test_task_descriptor_storage_spills_and_reloads(tmp_path):
     desc_a = TaskDescriptor(
         task_a,
         "qspill:node:a",
-        initial_splits={"7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}]},
+        initial_splits={"7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}]},
     )
     desc_b = TaskDescriptor(task_b, "qspill:node:b")
 
@@ -1464,7 +1454,7 @@ def test_task_descriptor_builds_create_task_request():
         "q:node:scan",
         context={"query_id": "q"},
         initial_splits={
-            "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"scan"}],
+            "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"scan"}],
         },
         no_more_splits={"7"},
         resource_request={"cpus": 1},
@@ -1592,9 +1582,9 @@ def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
     added = descriptor.append_splits(
         "7",
         [
-            {"sequence_id": 0, "kind": "scan_task", "data": b"a"},
-            {"sequence_id": 0, "kind": "scan_task", "data": b"duplicate"},
-            {"sequence_id": 1, "kind": "scan_task", "data": b"b"},
+            {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"},
+            {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"duplicate"},
+            {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"},
         ],
     )
     assert [split.data for split in added] == [b"a", b"b"]
@@ -1611,7 +1601,7 @@ def test_task_descriptor_appends_splits_idempotently_and_replays_fte_fields():
     assert request["no_more_splits"] == ["7"]
 
     with pytest.raises(RuntimeError, match="already marked no_more_splits"):
-        descriptor.append_splits("7", [{"sequence_id": 2, "kind": "scan_task"}])
+        descriptor.append_splits("7", [{"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2"}])
 
 
 def test_task_descriptor_applies_task_update_request_subset():
@@ -1630,14 +1620,14 @@ def test_task_descriptor_applies_task_update_request_subset():
                 "resource_request": {"memory": 32},
                 "initial_splits": {
                     "7": [
-                        {"sequence_id": 0, "kind": "scan_task", "data": b"a"},
-                        {"sequence_id": 0, "kind": "scan_task", "data": b"duplicate"},
+                        {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"},
+                        {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"duplicate"},
                     ],
                 },
                 "split_assignments": [
                     {
                         "source_node_id": "8",
-                        "splits": [{"sequence_id": 0, "kind": "scan_task", "data": b"b"}],
+                        "splits": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"b"}],
                         "no_more_splits": True,
                     }
                 ],
@@ -2146,7 +2136,7 @@ def test_two_stage_query_dag_worker_loss_uses_selected_attempt_for_final_result(
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"input"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"input"}],
                     ready_for_scheduling=True,
                 ),
                 PartitionUpdate(0, "7", no_more_splits=True),
@@ -2620,7 +2610,7 @@ def test_fte_worker_command_executor_requires_split_queue_wait_protocol():
         worker=object(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(RuntimeError, match="fte_wait_split_queue_has_space"):
@@ -2647,7 +2637,7 @@ def test_fte_worker_command_executor_requires_single_ordered_enqueue_protocol():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(RuntimeError, match="enqueue_fte_add_splits"):
@@ -2684,7 +2674,7 @@ def test_fte_worker_command_executor_waits_for_slow_split_consumer():
         worker=worker,
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -2724,7 +2714,7 @@ def test_fte_worker_command_executor_split_wait_is_cancellable():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(FteSplitSubmissionCancelled, match="split submission canceled"):
@@ -2755,7 +2745,7 @@ def test_fte_worker_command_executor_close_wins_capacity_to_enqueue_race():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(FteSplitSubmissionCancelled, match="split submission canceled"):
@@ -2794,7 +2784,7 @@ def test_fte_worker_command_executor_cancels_ordered_add_after_capacity():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -2826,7 +2816,7 @@ def test_fte_worker_command_executor_preserves_query_deadline():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(QueryDeadlineExceeded, match="query deadline expired"):
@@ -2858,7 +2848,7 @@ def test_fte_worker_command_executor_reports_terminal_task_during_split_wait():
         worker=_Worker(),
         attempt_id=attempt_id,
         source_node_id="7",
-        splits=({"sequence_id": 1, "kind": "scan_task", "data": b"a"},),
+        splits=({"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"a"},),
     )
 
     with pytest.raises(FteSplitQueueTerminal, match="became terminal with state FAILED"):
@@ -2887,8 +2877,8 @@ def test_fte_add_splits_command_success_accounts_count_and_bytes_atomically():
         attempt_id=attempt_id,
         source_node_id="7",
         splits=(
-            {"sequence_id": 1, "kind": "scan_task", "size_bytes": 7},
-            {"sequence_id": 2, "kind": "scan_task", "size_bytes": 11},
+            {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "size_bytes": 7},
+            {"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2", "size_bytes": 11},
         ),
     )
     stage = _fte_fragment_execution("q", 0, fragment_id="q:node:scan")
@@ -2920,7 +2910,7 @@ def test_fte_fragment_execution_requires_fragment_registration_protocol():
                     PartitionUpdate(
                         0,
                         "7",
-                        [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                        [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                         ready_for_scheduling=True,
                     )
                 ],
@@ -2950,7 +2940,7 @@ def test_fte_fragment_execution_does_not_probe_a_sync_control_fallback():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -2963,7 +2953,7 @@ def test_fte_fragment_execution_does_not_probe_a_sync_control_fallback():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                    [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
                 )
             ]
         )
@@ -3013,7 +3003,7 @@ def test_fte_fragment_execution_assignment_creates_task_and_sends_later_updates(
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ]
@@ -3038,7 +3028,7 @@ def test_fte_fragment_execution_assignment_creates_task_and_sends_later_updates(
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                    [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
                     ready_for_scheduling=True,
                 )
             ]
@@ -3098,7 +3088,7 @@ def test_fte_fragment_execution_uses_worker_command_executor_for_create_and_upda
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3122,7 +3112,7 @@ def test_fte_fragment_execution_uses_worker_command_executor_for_create_and_upda
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                    [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
                     no_more_splits=True,
                 )
             ]
@@ -3161,7 +3151,7 @@ def test_fte_fragment_execution_task_update_before_create_is_replayed_in_create_
             "dynamic_filter_domains": {"df0": {"range": [1, 3]}},
             "context": {"trace_token": "abc"},
             "initial_splits": {
-                "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
             },
         },
     )
@@ -3200,7 +3190,7 @@ def test_fte_fragment_execution_task_update_running_attempt_uses_update_command(
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3214,7 +3204,7 @@ def test_fte_fragment_execution_task_update_running_attempt_uses_update_command(
             "output_buffers": {"version": 3, "buffers": ["out-1"]},
             "dynamic_filter_domains": {"df1": {"single_value": 9}},
             "initial_splits": {
-                "7": [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                "7": [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
             },
         },
     )
@@ -3248,7 +3238,7 @@ def test_fte_fragment_execution_ignores_stale_output_buffer_update_for_running_a
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3302,7 +3292,7 @@ def test_fte_fragment_execution_appends_descriptor_before_add_splits_command_fai
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3318,7 +3308,7 @@ def test_fte_fragment_execution_appends_descriptor_before_add_splits_command_fai
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                    [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
                 )
             ]
         )
@@ -3404,7 +3394,7 @@ def test_fte_fragment_execution_backpressures_until_split_queue_recovers():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3417,7 +3407,7 @@ def test_fte_fragment_execution_backpressures_until_split_queue_recovers():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 1, "kind": "scan_task", "data": b"b"}],
+                    [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"}],
                 )
             ]
         )
@@ -3453,7 +3443,7 @@ def test_fte_fragment_execution_revoke_unsealed_speculative_waits_for_seal():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3518,7 +3508,7 @@ def test_fte_fragment_execution_speculative_revoke_cancels_outside_state_lock():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3575,7 +3565,7 @@ def test_fte_fragment_execution_speculative_revoke_reports_partial_cancel_failur
                 PartitionUpdate(
                     partition_id,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": bytes([partition_id])}],
                     ready_for_scheduling=True,
                 )
                 for partition_id in (0, 1)
@@ -3628,7 +3618,7 @@ def test_fte_fragment_execution_speculative_revoke_clears_reservation_after_exch
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3673,7 +3663,7 @@ def test_fte_fragment_execution_revoke_exchange_failure_commits_no_partial_batch
                 PartitionUpdate(
                     partition_id,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": bytes([partition_id])}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": bytes([partition_id])}],
                     ready_for_scheduling=True,
                 )
                 for partition_id in (0, 1)
@@ -3714,7 +3704,7 @@ def test_fte_fragment_execution_seal_transitions_running_speculative_to_standard
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3871,7 +3861,7 @@ def test_fte_fragment_execution_execution_admission_defers_ready_until_released(
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"p0"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"p0"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3916,7 +3906,7 @@ def test_fte_fragment_execution_coalesces_and_chunks_split_updates(monkeypatch):
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -3931,8 +3921,8 @@ def test_fte_fragment_execution_coalesces_and_chunks_split_updates(monkeypatch):
                     0,
                     "7",
                     [
-                        {"sequence_id": 1, "kind": "scan_task", "data": b"b"},
-                        {"sequence_id": 2, "kind": "scan_task", "data": b"c"},
+                        {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"},
+                        {"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2", "data": b"c"},
                     ],
                     ready_for_scheduling=True,
                 ),
@@ -3940,8 +3930,8 @@ def test_fte_fragment_execution_coalesces_and_chunks_split_updates(monkeypatch):
                     0,
                     "7",
                     [
-                        {"sequence_id": 2, "kind": "scan_task", "data": b"dup"},
-                        {"sequence_id": 3, "kind": "scan_task", "data": b"d"},
+                        {"sequence_id": 2, "kind": "scan_split", "split_id": "scan-2", "data": b"dup"},
+                        {"sequence_id": 3, "kind": "scan_split", "split_id": "scan-3", "data": b"d"},
                     ],
                     ready_for_scheduling=True,
                 ),
@@ -3971,7 +3961,7 @@ def test_fte_fragment_execution_rejects_splits_after_no_more_in_same_batch():
                     PartitionUpdate(
                         0,
                         "7",
-                        [{"sequence_id": 0, "kind": "scan_task", "data": b"late"}],
+                        [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"late"}],
                         ready_for_scheduling=True,
                     ),
                 ]
@@ -3996,7 +3986,7 @@ def test_fte_fragment_execution_no_more_is_recorded_and_sent_once():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 )
             ],
@@ -4024,7 +4014,7 @@ def test_fte_fragment_execution_no_more_is_recorded_and_sent_once():
                     PartitionUpdate(
                         0,
                         "7",
-                        [{"sequence_id": 1, "kind": "scan_task", "data": b"late"}],
+                        [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"late"}],
                     )
                 ]
             )
@@ -4064,7 +4054,7 @@ def test_fte_fragment_execution_retry_replays_accumulated_descriptor():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 ),
                 PartitionUpdate(0, "7", no_more_splits=True),
@@ -4199,7 +4189,7 @@ def test_fte_fragment_execution_oom_is_terminal_for_fixed_heap():
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 ),
                 PartitionUpdate(0, "7", no_more_splits=True),
@@ -4993,7 +4983,7 @@ def test_fte_fragment_execution_handle_failed_status_retries_with_replayed_descr
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                     ready_for_scheduling=True,
                 ),
             ],
@@ -5204,7 +5194,7 @@ def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output
                 PartitionUpdate(
                     0,
                     "7",
-                    [{"sequence_id": 0, "kind": "scan_task", "data": b"old-worker"}],
+                    [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"old-worker"}],
                     ready_for_scheduling=True,
                 ),
                 PartitionUpdate(0, "7", no_more_splits=True),
@@ -5453,7 +5443,10 @@ def test_single_split_assigner_waits_for_all_sources_before_sealing():
 
     result = assigner.assign(
         "11",
-        [{"kind": "scan_task", "data": b"a"}, {"kind": "scan_task", "data": b"b"}],
+        [
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a"},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b"},
+        ],
         no_more_inputs=True,
     )
 
@@ -5479,6 +5472,70 @@ def test_single_split_assigner_waits_for_all_sources_before_sealing():
     assert result.partition_updates[0].no_more_splits is True
 
 
+def test_scan_split_requires_stable_identity():
+    with pytest.raises(ValueError, match="requires a stable split_id"):
+        FteSplit(source_node_id="7", sequence_id=0, kind="scan_split", data=b"payload")
+
+
+def test_scan_split_preserves_exact_opaque_identity():
+    split = FteSplit(
+        source_node_id="7",
+        sequence_id=0,
+        kind="scan_split",
+        split_id=" split with spaces ",
+        data=b"payload",
+    )
+
+    assert split.split_id == " split with spaces "
+    assert split.to_dict()["split_id"] == " split with spaces "
+    assert split_scan_split_batch({"splits": [{"split_id": " split with spaces "}]})[0][0] == (" split with spaces ")
+
+
+def test_prepare_fte_dynamic_inputs_explodes_scan_batch_into_stable_splits():
+    next_sequence = 0
+
+    def allocate_sequence(_query_id, _fragment_id, _source_node_id):
+        nonlocal next_sequence
+        result = next_sequence
+        next_sequence += 1
+        return result
+
+    batch = {
+        "batch_metadata": "preserved",
+        "splits": [
+            {"split_id": "range-0", "estimated_bytes": 7, "data": b"first"},
+            {"split_id": "range-1", "data": b"second"},
+        ],
+    }
+
+    prepared = prepare_fte_dynamic_inputs(
+        context={"scan_split_batch:7": batch},
+        query_id="query-scan-splits",
+        fragment_id="fragment-scan-splits",
+        next_split_sequence=allocate_sequence,
+    )
+
+    assert prepared.dynamic_scan_sources == {"7"}
+    assert prepared.dynamic_exchange_sources == set()
+    assert [split.split_id for split in prepared.splits] == ["range-0", "range-1"]
+    assert [split.sequence_id for split in prepared.splits] == [0, 1]
+    assert [split.size_bytes for split in prepared.splits] == [7, None]
+    assert [split.data["batch_metadata"] for split in prepared.splits] == ["preserved", "preserved"]
+    assert [split.data["splits"] for split in prepared.splits] == [[batch["splits"][0]], [batch["splits"][1]]]
+
+
+def test_split_scan_split_batch_rejects_duplicate_stable_ids():
+    with pytest.raises(ValueError, match="duplicate scan split_id"):
+        split_scan_split_batch(
+            {
+                "splits": [
+                    {"split_id": "duplicate", "data": b"first"},
+                    {"split_id": "duplicate", "data": b"second"},
+                ]
+            }
+        )
+
+
 def test_single_split_assigner_finish_creates_empty_partition():
     result = SingleSplitAssigner().finish()
 
@@ -5498,8 +5555,8 @@ def test_arbitrary_split_assigner_keeps_partition_open_until_full_or_finished():
     result = assigner.assign(
         "9",
         [
-            {"kind": "scan_task", "data": b"a", "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 100},
         ],
     )
 
@@ -5511,7 +5568,7 @@ def test_arbitrary_split_assigner_keeps_partition_open_until_full_or_finished():
 
     result = assigner.assign(
         "9",
-        [{"kind": "scan_task", "data": b"c", "size_bytes": 100}],
+        [{"kind": "scan_split", "split_id": "scan-c", "data": b"c", "size_bytes": 100}],
         no_more_inputs=True,
     )
 
@@ -5521,7 +5578,7 @@ def test_arbitrary_split_assigner_keeps_partition_open_until_full_or_finished():
     assert [update.no_more_splits for update in result.partition_updates].count(True) >= 2
 
     with pytest.raises(RuntimeError, match="after finish"):
-        assigner.assign("9", [{"kind": "scan_task", "data": b"d"}])
+        assigner.assign("9", [{"kind": "scan_split", "split_id": "scan-d", "data": b"d"}])
 
 
 def test_arbitrary_split_assigner_replays_replicated_splits_to_new_partitions():
@@ -5544,8 +5601,8 @@ def test_arbitrary_split_assigner_replays_replicated_splits_to_new_partitions():
     result = assigner.assign(
         "probe",
         [
-            {"kind": "scan_task", "data": b"a", "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 100},
         ],
         no_more_inputs=True,
     )
@@ -5572,8 +5629,8 @@ def test_arbitrary_split_assigner_waits_for_replicated_source_before_sealing_ful
     result = assigner.assign(
         "probe",
         [
-            {"kind": "scan_task", "data": b"a", "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 100},
         ],
     )
 
@@ -5614,8 +5671,20 @@ def test_arbitrary_split_assigner_groups_by_node_requirements():
     result = assigner.assign(
         "scan",
         [
-            {"kind": "scan_task", "data": b"a", "addresses": ["host-a"], "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "addresses": ["host-b"], "size_bytes": 100},
+            {
+                "kind": "scan_split",
+                "split_id": "scan-a",
+                "data": b"a",
+                "addresses": ["host-a"],
+                "size_bytes": 100,
+            },
+            {
+                "kind": "scan_split",
+                "split_id": "scan-b",
+                "data": b"b",
+                "addresses": ["host-b"],
+                "size_bytes": 100,
+            },
         ],
     )
 
@@ -5636,8 +5705,20 @@ def test_arbitrary_split_assigner_ranks_available_hosts():
     result = assigner.assign(
         "scan",
         [
-            {"kind": "scan_task", "data": b"a", "addresses": ["host-a"], "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "addresses": ["host-a", "host-b"], "size_bytes": 100},
+            {
+                "kind": "scan_split",
+                "split_id": "scan-a",
+                "data": b"a",
+                "addresses": ["host-a"],
+                "size_bytes": 100,
+            },
+            {
+                "kind": "scan_split",
+                "split_id": "scan-b",
+                "data": b"b",
+                "addresses": ["host-a", "host-b"],
+                "size_bytes": 100,
+            },
         ],
     )
 
@@ -5651,12 +5732,15 @@ def test_arbitrary_split_assigner_rejects_catalog_mismatch_and_non_remote_split_
     assigner = ArbitrarySplitAssigner(partitioned_sources={"scan"}, catalog_requirement="tpch")
 
     with pytest.raises(ValueError, match="unexpected split catalog requirement"):
-        assigner.assign("scan", [{"kind": "scan_task", "catalog": "hive"}])
+        assigner.assign("scan", [{"kind": "scan_split", "split_id": "scan-catalog", "catalog": "hive"}])
 
     assigner = ArbitrarySplitAssigner(partitioned_sources={"scan"})
 
     with pytest.raises(ValueError, match="not remotely accessible"):
-        assigner.assign("scan", [{"kind": "scan_task", "remotely_accessible": False}])
+        assigner.assign(
+            "scan",
+            [{"kind": "scan_split", "split_id": "scan-local", "remotely_accessible": False}],
+        )
 
 
 def test_arbitrary_split_assigner_adapts_target_size_after_growth_period():
@@ -5673,9 +5757,9 @@ def test_arbitrary_split_assigner_adapts_target_size_after_growth_period():
     result = assigner.assign(
         "scan",
         [
-            {"kind": "scan_task", "data": b"a", "size_bytes": 100},
-            {"kind": "scan_task", "data": b"b", "size_bytes": 100},
-            {"kind": "scan_task", "data": b"c", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 100},
+            {"kind": "scan_split", "split_id": "scan-c", "data": b"c", "size_bytes": 100},
         ],
         no_more_inputs=True,
     )
@@ -5850,7 +5934,7 @@ def test_fte_assigner_uses_arbitrary_distribution_for_replicated_exchange_only_f
 
     result = assigner.assign(
         "scan",
-        [{"kind": "scan_task", "data": b"scan", "size_bytes": 1024}],
+        [{"kind": "scan_split", "split_id": "scan-0", "data": b"scan", "size_bytes": 1024}],
         no_more_inputs=True,
     )
     assert [p.partition_id for p in result.partitions_added] == [0]
@@ -5871,13 +5955,71 @@ def test_fte_assigner_uses_dynamic_scan_max_splits_per_partition(monkeypatch):
     result = assigner.assign(
         "scan",
         [
-            {"kind": "scan_task", "data": b"a", "size_bytes": 1},
-            {"kind": "scan_task", "data": b"b", "size_bytes": 1},
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 1},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 1},
         ],
         no_more_inputs=True,
     )
     assert [partition.partition_id for partition in result.partitions_added] == [0, 1]
     assert result.sealed_partitions == [0, 1]
+
+
+def test_fte_assigner_batches_estimated_tiny_dynamic_scan_splits_by_default(monkeypatch):
+    monkeypatch.delenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", raising=False)
+    state = _FteFragmentState()
+    state.source_node_ids.add("scan")
+    state.dynamic_scan_source_node_ids.add("scan")
+
+    assigner = make_fte_assigner(state)
+
+    result = assigner.assign(
+        "scan",
+        [
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a", "size_bytes": 1},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b", "size_bytes": 1},
+        ],
+        no_more_inputs=True,
+    )
+
+    assert [partition.partition_id for partition in result.partitions_added] == [0]
+    assert result.sealed_partitions == [0]
+
+
+def test_fte_assigner_exposes_unknown_size_dynamic_scan_splits_by_default(monkeypatch):
+    monkeypatch.delenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", raising=False)
+    state = _FteFragmentState()
+    state.source_node_ids.add("scan")
+    state.dynamic_scan_source_node_ids.add("scan")
+
+    assigner = make_fte_assigner(state)
+
+    result = assigner.assign(
+        "scan",
+        [
+            {"kind": "scan_split", "split_id": "scan-a", "data": b"a"},
+            {"kind": "scan_split", "split_id": "scan-b", "data": b"b"},
+        ],
+        no_more_inputs=True,
+    )
+
+    assert [partition.partition_id for partition in result.partitions_added] == [0, 1]
+    assert result.sealed_partitions == [0, 1]
+
+
+def test_arbitrary_split_assigner_preserves_exchange_only_default_grouping():
+    assigner = ArbitrarySplitAssigner(partitioned_sources={"exchange"})
+
+    result = assigner.assign(
+        "exchange",
+        [
+            {"kind": "exchange_source_task", "data": b"a", "size_bytes": 1},
+            {"kind": "exchange_source_task", "data": b"b", "size_bytes": 1},
+        ],
+        no_more_inputs=True,
+    )
+
+    assert [partition.partition_id for partition in result.partitions_added] == [0]
+    assert result.sealed_partitions == [0]
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
@@ -5902,19 +6044,19 @@ def test_materialize_task_inputs_merges_context():
         {"query_id": "q"},
         {
             "1": [
-                {"sequence_id": 0, "kind": "scan_task", "data": b"a"},
-                {"sequence_id": 1, "kind": "scan_task", "data": b"b"},
+                {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"},
+                {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"},
             ],
             "2": [
                 {"sequence_id": 0, "kind": "exchange_source_task", "data": b"ex"},
             ],
         },
-        merge_scan_task_descriptors=merge_scan,
+        merge_scan_split_batches=merge_scan,
     )
 
     assert context["query_id"] == "q"
-    assert context["scan_task:1"] == b"ab"
-    assert context["scan_task_nodes"] == "1"
+    assert context["scan_split_batch:1"] == b"ab"
+    assert context["scan_split_batch_nodes"] == "1"
     assert context["exchange_source_task:2"] == b"ex"
     assert context["exchange_source_task_nodes"] == "2"
     assert merge_calls == [[b"a", b"b"]]
@@ -5937,7 +6079,7 @@ def test_fte_worker_task_manager_create_status_info_cancel_and_drop():
                 "task_id": task_id,
                 "fragment_id": "q:node:scan",
                 "initial_splits": {
-                    "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                 },
             }
         )
@@ -5948,8 +6090,8 @@ def test_fte_worker_task_manager_create_status_info_cancel_and_drop():
             task_id,
             "7",
             [
-                {"sequence_id": 0, "kind": "scan_task", "data": b"duplicate"},
-                {"sequence_id": 1, "kind": "scan_task", "data": b"b"},
+                {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"duplicate"},
+                {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"},
             ],
         )
         assert status["duplicate_split_count"] == 1
@@ -6027,7 +6169,7 @@ def test_fte_worker_task_manager_finalization_failure_is_terminal_and_releases_s
             "fragment_id": "q-finalize:node:scan",
             "dynamic_scan_source_node_ids": ["7"],
             "initial_splits": {
-                "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"finalization-input"}],
+                "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"finalization-input"}],
             },
         }
         if failure_point == "file_stat":
@@ -6213,7 +6355,7 @@ def test_fte_worker_task_manager_update_task_applies_task_update_subset():
                 "task_id": task_id,
                 "fragment_id": "q:node:scan",
                 "initial_splits": {
-                    "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"a"}],
+                    "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"a"}],
                 },
             }
         )
@@ -6226,8 +6368,8 @@ def test_fte_worker_task_manager_update_task_applies_task_update_subset():
                 "dynamic_filter_domains": {"df0": {"single_value": 11}},
                 "initial_splits": {
                     "7": [
-                        {"sequence_id": 0, "kind": "scan_task", "data": b"dup"},
-                        {"sequence_id": 1, "kind": "scan_task", "data": b"b"},
+                        {"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"dup"},
+                        {"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"b"},
                     ],
                 },
             },
@@ -6303,7 +6445,7 @@ def test_fte_worker_task_manager_fte_update_before_execution_updates_descriptor_
                 "output_buffers": {"version": 2, "buffers": ["out-1"]},
                 "dynamic_filter_domains": {"df1": {"range": [3, 5]}},
                 "initial_splits": {
-                    "7": [{"sequence_id": 0, "kind": "scan_task", "data": b"late"}],
+                    "7": [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"late"}],
                 },
                 "no_more_splits": ["7"],
             },
@@ -6383,7 +6525,7 @@ def test_fte_worker_task_manager_fte_runtime_waits_for_no_more_splits():
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 0, "kind": "scan_task", "data": b"late"}],
+            [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"late"}],
         )
         await asyncio.sleep(0)
         assert executed.is_set() is False
@@ -6618,11 +6760,11 @@ def test_fte_worker_task_manager_fte_runtime_uses_dynamic_scan_source_queue():
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 0, "kind": "scan_task", "data": b"scan-binding"}],
+            [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"scan-binding"}],
         )
         assert queue.try_get_next() == {
             "state": "SPLIT",
-            "kind": "scan_task",
+            "kind": "scan_split_batch",
             "data": b"scan-binding",
         }
 
@@ -6672,7 +6814,7 @@ def test_fte_worker_task_manager_dynamic_source_consumes_before_no_more_splits()
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 0, "kind": "scan_task", "data": b"first"}],
+            [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"first"}],
         )
         full = await manager.wait_split_queue_has_space(
             task_id,
@@ -6700,7 +6842,7 @@ def test_fte_worker_task_manager_dynamic_source_consumes_before_no_more_splits()
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 1, "kind": "scan_task", "data": b"second"}],
+            [{"sequence_id": 1, "kind": "scan_split", "split_id": "scan-1", "data": b"second"}],
         )
         sealed = await manager.no_more_splits(task_id, "7")
         status = await manager.wait_task_status(task_id, sealed["version"], timeout_s=1.0)
@@ -6738,7 +6880,7 @@ def test_fte_worker_task_manager_wait_split_queue_has_space_tracks_buffered_spli
         await manager.add_splits(
             task_id,
             "7",
-            [{"sequence_id": 0, "kind": "scan_task", "data": b"scan-binding"}],
+            [{"sequence_id": 0, "kind": "scan_split", "split_id": "scan-0", "data": b"scan-binding"}],
         )
         full = await manager.wait_split_queue_has_space(
             task_id,

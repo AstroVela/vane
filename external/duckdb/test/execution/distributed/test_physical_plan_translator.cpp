@@ -734,7 +734,7 @@ TEST_CASE("PhysicalPlanTranslator: unsupported table function bind data is a val
 	REQUIRE(msg.find("unsupported_table_scan") != std::string::npos);
 	REQUIRE(msg.find("Copy not supported for TableFunctionData") != std::string::npos);
 	DuckDBExecutionConfig config;
-	REQUIRE_THROWS_WITH(MakeTableScanTasks(scan.Cast<PhysicalTableScan>(), config, nullptr),
+	REQUIRE_THROWS_WITH(MakeTableScanSplits(scan.Cast<PhysicalTableScan>(), config, nullptr),
 	                    Catch::Matchers::Contains("does not provide a distributable file list"));
 }
 
@@ -1276,12 +1276,8 @@ TEST_CASE("PhysicalPlanTranslator: cte scan -> ScanSourceNode", "[distributed]")
 
 #if DUCKDB_EXTENSION_PARQUET_LINKED
 TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distributed]") {
-	const char *prev_min = std::getenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES");
-	const char *prev_max = std::getenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES");
 	const char *prev_rg_max = std::getenv("DUCKDB_RAY_PARQUET_SPLIT_ROW_GROUPS_MAX_FILES");
 
-	setenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES", "1", 1);
-	setenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES", "1", 1);
 	setenv("DUCKDB_RAY_PARQUET_SPLIT_ROW_GROUPS_MAX_FILES", "1", 1);
 
 	DuckDB db(nullptr);
@@ -1309,7 +1305,7 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	REQUIRE(res.value()->num_partitions() > 1);
 	auto scan_source = std::dynamic_pointer_cast<ScanSourceNode>(res.value()->inner());
 	REQUIRE(scan_source != nullptr);
-	REQUIRE_FALSE(scan_source->scan_tasks().empty());
+	REQUIRE_FALSE(scan_source->scan_splits().empty());
 
 	auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
 	PlanExecutionContext execution_context(task_executor, conn.context);
@@ -1323,34 +1319,60 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	auto &worker_bind = worker_scan.bind_data->Cast<MultiFileBindData>();
 	REQUIRE(worker_bind.file_list->GetAllFiles().empty());
 	string assignment_error;
-	REQUIRE_FALSE(ValidateDistributedScanTasksApplied(*worker_plan, &assignment_error));
-	REQUIRE(StringUtil::Contains(assignment_error, "no explicit worker task assignment"));
+	REQUIRE_FALSE(ValidateDistributedScanSplitsApplied(*worker_plan, &assignment_error));
+	REQUIRE(StringUtil::Contains(assignment_error, "no explicit worker split assignment"));
 
-	auto missing_fte_descriptor_plan =
-	    ClonePhysicalPlanOrThrow(worker_plan, "parquet_missing_fte_descriptor", conn.context.get());
-	auto &missing_fte_descriptor_scan = missing_fte_descriptor_plan->Root().Cast<PhysicalTableScan>();
-	auto missing_fte_descriptor_queue = std::make_shared<FteSplitQueue>();
-	missing_fte_descriptor_queue->NoMoreSplits();
-	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> missing_fte_descriptor_queues {
-	    {static_cast<idx_t>(scan_source->node_id()), std::move(missing_fte_descriptor_queue)}};
-	REQUIRE(
-	    ApplyFteScanSourceQueuesToPlan(*missing_fte_descriptor_plan, missing_fte_descriptor_queues, &assignment_error));
-	REQUIRE_THROWS_WITH(missing_fte_descriptor_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles(),
-	                    Catch::Matchers::Contains("without an explicit task descriptor"));
+	auto missing_fte_batch_plan =
+	    ClonePhysicalPlanOrThrow(worker_plan, "parquet_missing_fte_batch", conn.context.get());
+	auto &missing_fte_batch_scan = missing_fte_batch_plan->Root().Cast<PhysicalTableScan>();
+	auto missing_fte_batch_queue = std::make_shared<FteSplitQueue>();
+	missing_fte_batch_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> missing_fte_batch_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(missing_fte_batch_queue)}};
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*missing_fte_batch_plan, missing_fte_batch_queues, &assignment_error));
+	REQUIRE_THROWS_WITH(missing_fte_batch_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles(),
+	                    Catch::Matchers::Contains("without an explicit split batch"));
 
-	auto empty_fte_descriptor_plan =
-	    ClonePhysicalPlanOrThrow(worker_plan, "parquet_empty_fte_descriptor", conn.context.get());
-	auto &empty_fte_descriptor_scan = empty_fte_descriptor_plan->Root().Cast<PhysicalTableScan>();
-	auto empty_fte_descriptor_queue = std::make_shared<FteSplitQueue>();
-	ScanTaskDescriptor empty_descriptor;
-	empty_descriptor.source_task_partition_id = 0;
-	empty_fte_descriptor_queue->AddSplit(TaskInput::make_scan_task(empty_descriptor.SerializeToBytes()));
-	empty_fte_descriptor_queue->NoMoreSplits();
-	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> empty_fte_descriptor_queues {
-	    {static_cast<idx_t>(scan_source->node_id()), std::move(empty_fte_descriptor_queue)}};
+	auto empty_fte_batch_plan = ClonePhysicalPlanOrThrow(worker_plan, "parquet_empty_fte_batch", conn.context.get());
+	auto &empty_fte_batch_scan = empty_fte_batch_plan->Root().Cast<PhysicalTableScan>();
+	auto empty_fte_batch_queue = std::make_shared<FteSplitQueue>();
+	ScanSplitBatch empty_batch;
+	empty_batch.splits.push_back(ScanSplit::EmptyFile());
+	empty_fte_batch_queue->AddSplit(TaskInput::make_scan_split_batch(empty_batch.SerializeToBytes()));
+	empty_fte_batch_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> empty_fte_batch_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(empty_fte_batch_queue)}};
 	assignment_error.clear();
-	REQUIRE(ApplyFteScanSourceQueuesToPlan(*empty_fte_descriptor_plan, empty_fte_descriptor_queues, &assignment_error));
-	REQUIRE(empty_fte_descriptor_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*empty_fte_batch_plan, empty_fte_batch_queues, &assignment_error));
+	REQUIRE(empty_fte_batch_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
+
+	ScanSplitBatch nonempty_batch;
+	nonempty_batch.splits.push_back(scan_source->scan_splits()[0]);
+	auto repeated_split_plan = ClonePhysicalPlanOrThrow(worker_plan, "parquet_repeated_fte_split", conn.context.get());
+	auto &repeated_split_scan = repeated_split_plan->Root().Cast<PhysicalTableScan>();
+	auto repeated_split_queue = std::make_shared<FteSplitQueue>();
+	repeated_split_queue->AddSplit(TaskInput::make_scan_split_batch(nonempty_batch.SerializeToBytes()));
+	repeated_split_queue->AddSplit(TaskInput::make_scan_split_batch(nonempty_batch.SerializeToBytes()));
+	repeated_split_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> repeated_split_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(repeated_split_queue)}};
+	assignment_error.clear();
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*repeated_split_plan, repeated_split_queues, &assignment_error));
+	REQUIRE_THROWS_WITH(repeated_split_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles(),
+	                    Catch::Matchers::Contains("duplicate split_id"));
+
+	auto mixed_empty_plan = ClonePhysicalPlanOrThrow(worker_plan, "parquet_mixed_empty_fte_split", conn.context.get());
+	auto &mixed_empty_scan = mixed_empty_plan->Root().Cast<PhysicalTableScan>();
+	auto mixed_empty_queue = std::make_shared<FteSplitQueue>();
+	mixed_empty_queue->AddSplit(TaskInput::make_scan_split_batch(empty_batch.SerializeToBytes()));
+	mixed_empty_queue->AddSplit(TaskInput::make_scan_split_batch(nonempty_batch.SerializeToBytes()));
+	mixed_empty_queue->NoMoreSplits();
+	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> mixed_empty_queues {
+	    {static_cast<idx_t>(scan_source->node_id()), std::move(mixed_empty_queue)}};
+	assignment_error.clear();
+	REQUIRE(ApplyFteScanSourceQueuesToPlan(*mixed_empty_plan, mixed_empty_queues, &assignment_error));
+	REQUIRE_THROWS_WITH(mixed_empty_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles(),
+	                    Catch::Matchers::Contains("explicit empty scan split cannot be combined"));
 
 	auto duplicate_fte_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());
 	auto &left_duplicate_scan = ClonePhysicalPlanRootIntoPlanOrThrow(worker_plan, *duplicate_fte_plan,
@@ -1371,7 +1393,7 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	    duplicate_fte_plan->Make<PhysicalUnion>(left_duplicate_scan.GetTypes(), duplicate_children, 0, false);
 	duplicate_fte_plan->SetRoot(duplicate_union);
 	auto duplicate_fte_queue = std::make_shared<FteSplitQueue>();
-	duplicate_fte_queue->AddSplit(TaskInput::make_scan_task(empty_descriptor.SerializeToBytes()));
+	duplicate_fte_queue->AddSplit(TaskInput::make_scan_split_batch(empty_batch.SerializeToBytes()));
 	duplicate_fte_queue->NoMoreSplits();
 	unordered_map<idx_t, std::shared_ptr<FteSplitQueue>> duplicate_fte_queues {
 	    {duplicate_scan_node_id, std::move(duplicate_fte_queue)}};
@@ -1380,30 +1402,20 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	REQUIRE(left_duplicate_scan.extra_info.scan_node_id != right_duplicate_scan.extra_info.scan_node_id);
 	REQUIRE(left_duplicate_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
 	REQUIRE(right_duplicate_scan.bind_data->Cast<MultiFileBindData>().file_list->GetAllFiles().empty());
-	REQUIRE(ValidateDistributedScanTasksApplied(*duplicate_fte_plan, &assignment_error));
+	REQUIRE(ValidateDistributedScanSplitsApplied(*duplicate_fte_plan, &assignment_error));
 
 	REQUIRE(next_task.second.task()->inputs().size() == 1);
 	const auto &task_input = next_task.second.task()->inputs().begin()->second;
-	REQUIRE(task_input.kind == TaskInput::Kind::ScanTask);
-	unordered_map<idx_t, ScanTaskDescriptor> assignments;
+	REQUIRE(task_input.kind == TaskInput::Kind::ScanSplitBatch);
+	unordered_map<idx_t, ScanSplitBatch> assignments;
 	assignments.emplace(static_cast<idx_t>(scan_source->node_id()),
-	                    ScanTaskDescriptor::DeserializeFromBytes(task_input.scan_task_bytes));
+	                    ScanSplitBatch::DeserializeFromBytes(task_input.scan_split_batch_bytes));
 	assignment_error.clear();
-	REQUIRE(ApplyScanTasksToPlan(*worker_plan, assignments, &assignment_error));
+	REQUIRE(ApplyScanSplitBatchesToPlan(*worker_plan, assignments, &assignment_error));
 	REQUIRE(assignment_error.empty());
-	REQUIRE(ValidateDistributedScanTasksApplied(*worker_plan, &assignment_error));
+	REQUIRE(ValidateDistributedScanSplitsApplied(*worker_plan, &assignment_error));
 	REQUIRE_FALSE(worker_bind.file_list->GetAllFiles().empty());
 
-	if (prev_min) {
-		setenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES", prev_min, 1);
-	} else {
-		unsetenv("DUCKDB_RAY_SCAN_TASK_MIN_BYTES");
-	}
-	if (prev_max) {
-		setenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES", prev_max, 1);
-	} else {
-		unsetenv("DUCKDB_RAY_SCAN_TASK_MAX_BYTES");
-	}
 	if (prev_rg_max) {
 		setenv("DUCKDB_RAY_PARQUET_SPLIT_ROW_GROUPS_MAX_FILES", prev_rg_max, 1);
 	} else {
