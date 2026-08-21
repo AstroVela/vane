@@ -13,6 +13,7 @@
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
@@ -21,6 +22,13 @@ namespace duckdb {
 
 class FunctionData;
 class TableFilterSet;
+class TableFunction;
+
+//! Stable catalog identity for one table-function overload. This uses the
+//! declared argument and varargs types rather than bind-time concrete types.
+DUCKDB_API string GetDistributedTableFunctionSignature(const string &function_name,
+                                                       const vector<LogicalType> &arguments,
+                                                       const LogicalType &varargs = LogicalType::INVALID);
 
 //! One stable, independently assignable unit of scan work produced by an
 //! extension on the coordinator. Vane never interprets the payload bytes.
@@ -94,8 +102,8 @@ struct TableFunctionDistributedScanCallbacks {
 	table_function_apply_distributed_scan_splits_t apply_splits = nullptr;
 
 	DUCKDB_API void ValidateDefinition(const string &function_name) const;
-	DUCKDB_API void Validate(const string &function_name) const;
-	DUCKDB_API void BindCapability(const string &extension_name, const string &function_name);
+	DUCKDB_API void Validate(const TableFunction &function) const;
+	DUCKDB_API void BindCapability(const string &extension_name, const TableFunction &function);
 	DUCKDB_API const DistributedExtensionCapabilityReference &GetCapability() const;
 	DUCKDB_API bool operator==(const TableFunctionDistributedScanCallbacks &other) const;
 

@@ -66,12 +66,15 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
 }
 ```
 
-Each concrete capability owns a protocol version so scan and write contracts
-can evolve independently. Names and versions are stable wire identities, not
-display labels. The current registry accepts only implemented hook kinds:
-distributed table scans and distributed write operators. It has no public
-placeholder API for hypothetical aggregate, COPY, storage, or context
-protocols.
+Each table-function overload with callbacks owns a capability and protocol
+version, identified by its canonical catalog signature (for example,
+`range(BIGINT, BIGINT)`). Different overloads of one function may evolve
+independently, and distributed and native-only overloads may coexist. Write
+contracts remain identified by operator name. These signatures, names, and
+versions are stable wire identities, not display labels. The current registry
+accepts only implemented hook kinds: distributed table scans and distributed
+write operators. It has no public placeholder API for hypothetical aggregate,
+COPY, storage, or context protocols.
 
 Ordinary DuckDB registrations remain available on every statically linked
 worker:
@@ -88,12 +91,12 @@ worker:
 
 `ExtensionLoader` automatically stages a table-function capability when the
 normally registered `TableFunction` carries distributed scan callbacks. The
-extension name, function name, and capability kind are derived rather than
-repeated by the extension author. A write hook similarly receives its extension
-identity from the loader. The loader stages every concrete contract and
-publishes the manifest and write implementations atomically only when loading
-finalizes successfully. Duplicate identities, zero protocol versions, mixed
-distributed/native-only overloads, incomplete callbacks, and non-canonical
+extension name, canonical overload signature, and capability kind are derived
+rather than repeated by the extension author. A write hook similarly receives
+its extension identity from the loader. The loader stages every concrete
+overload contract and publishes the manifest and write implementations
+atomically only when loading finalizes successfully. Duplicate overload
+identities, zero protocol versions, incomplete callbacks, and non-canonical
 names are rejected.
 
 `DistributedWriteOperatorExtension` is a hook type, not another loadable
@@ -189,8 +192,9 @@ version, a split codec identity, and three operations:
 
 The ordinary `loader.RegisterFunction(...)` call binds the complete
 `DistributedExtensionCapabilityReference` from the loader's extension identity
-and the table function's catalog name. No second table-function registration is
-required, and native DuckDB continues to execute the original bind/init/scan
+and the table function overload's canonical catalog signature. No second
+table-function registration is required, native-only overloads remain
+unaffected, and native DuckDB continues to execute the original bind/init/scan
 callbacks.
 
 Each envelope contains a stable `split_id`, one opaque payload, and optional

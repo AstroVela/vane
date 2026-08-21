@@ -137,18 +137,32 @@ static unique_ptr<FunctionData> DistributedOverloadDeserialize(Deserializer &des
 	return make_uniq<DistributedOverloadBindData>();
 }
 
-static TableFunction DistributedOverloadFunction(const LogicalType &argument) {
+static TableFunction DistributedOverloadFunction(const LogicalType &argument, idx_t protocol_version = 1) {
 	TableFunction function({argument}, DistributedOverloadScan, DistributedOverloadBind);
 	function.serialize = DistributedOverloadSerialize;
 	function.deserialize = DistributedOverloadDeserialize;
 	TableFunctionDistributedScanCallbacks callbacks;
-	callbacks.protocol_version = 1;
-	callbacks.split_codec = {"distributed-overload.split", 1};
+	callbacks.protocol_version = protocol_version;
+	callbacks.split_codec = {"distributed-overload.split", protocol_version};
 	callbacks.plan_splits = DistributedOverloadPlan;
 	callbacks.create_worker_bind = DistributedOverloadCreateWorkerBind;
 	callbacks.apply_splits = DistributedOverloadApply;
 	function.SetDistributedScanCallbacks(std::move(callbacks));
 	return function;
+}
+
+static TableFunction NativeOverloadFunction(const LogicalType &argument) {
+	return TableFunction({argument}, DistributedOverloadScan, DistributedOverloadBind);
+}
+
+static DistributedExtensionCapability TableFunctionCapability(string name, vector<LogicalType> arguments,
+                                                              idx_t protocol_version = 1) {
+	DistributedExtensionCapability result;
+	result.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	result.name = std::move(name);
+	result.protocol_version = protocol_version;
+	result.function_signature = GetDistributedTableFunctionSignature(result.name, arguments, LogicalType::INVALID);
+	return result;
 }
 
 static bool ManagerHasContractIdentity(DistributedExtensionManager &manager, const string &identity) {
@@ -163,11 +177,22 @@ static bool ManagerHasContractIdentity(DistributedExtensionManager &manager, con
 class DistributedOverloadExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override {
+		TableFunctionSet ambiguous("ambiguous_overload_scan");
+		ambiguous.AddFunction(DistributedOverloadFunction(LogicalType::INTEGER));
+		ambiguous.AddFunction(NativeOverloadFunction(LogicalType::INTEGER));
+		REQUIRE_THROWS_WITH(loader.RegisterFunction(std::move(ambiguous)),
+		                    Catch::Matchers::Contains("declared more than once"));
+
 		TableFunctionSet initial("distributed_overload_scan");
 		initial.AddFunction(DistributedOverloadFunction(LogicalType::INTEGER));
+		initial.AddFunction(NativeOverloadFunction(LogicalType::VARCHAR));
 		loader.RegisterFunction(std::move(initial));
+		TableFunctionSet duplicate("distributed_overload_scan");
+		duplicate.AddFunction(NativeOverloadFunction(LogicalType::INTEGER));
+		REQUIRE_THROWS_WITH(loader.AddFunctionOverload(std::move(duplicate)),
+		                    Catch::Matchers::Contains("already registered"));
 		TableFunctionSet overloads("distributed_overload_scan");
-		overloads.AddFunction(DistributedOverloadFunction(LogicalType::BIGINT));
+		overloads.AddFunction(DistributedOverloadFunction(LogicalType::BIGINT, 2));
 		loader.AddFunctionOverload(std::move(overloads));
 	}
 
@@ -184,23 +209,23 @@ TEST_CASE("Distributed extension manifests are deterministic and exact", "[distr
 
 	DistributedExtensionManifest registered_manifest;
 	registered_manifest.extension_name = "test_manifest";
-	registered_manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1});
+	registered_manifest.capabilities.push_back(TableFunctionCapability("scan", {LogicalType::BIGINT}));
 	registered_manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, "write", 2});
 	manager.RegisterExtension(
 	    registered_manifest, {make_shared_ptr<const DistributedWriteOperatorExtension>(FileWriteOperator("write", 2))});
 
-	REQUIRE(ManagerHasContractIdentity(manager, "test_manifest{table_function:scan@1,write_operator:write@2}"));
+	REQUIRE(ManagerHasContractIdentity(manager, "test_manifest{table_function:scan(BIGINT)@1,write_operator:write@2}"));
 	auto identities = manager.GetContractIdentities();
 	REQUIRE_NOTHROW(manager.ValidateExact(identities));
 	DistributedExtensionCapabilityReference reference;
 	reference.extension_name = "test_manifest";
-	reference.capability = {DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1};
+	reference.capability = TableFunctionCapability("scan", {LogicalType::BIGINT});
 	REQUIRE_NOTHROW(manager.RequireCapability(reference));
 
 	auto mismatched = identities;
 	for (auto &identity : mismatched) {
 		if (StringUtil::StartsWith(identity, "test_manifest{")) {
-			identity = "test_manifest{table_function:scan@7,write_operator:write@2}";
+			identity = "test_manifest{table_function:scan(BIGINT)@7,write_operator:write@2}";
 		}
 	}
 	REQUIRE_THROWS_WITH(manager.ValidateExact(mismatched), Catch::Matchers::Contains("coordinator and worker"));
@@ -217,16 +242,24 @@ TEST_CASE("Distributed extension registration rejects ambiguous declarations", "
 	DistributedExtensionManifest empty_contract {"empty_contract", {}};
 	REQUIRE_THROWS_WITH(manager.RegisterExtension(empty_contract), Catch::Matchers::Contains("concrete capability"));
 	DistributedExtensionManifest zero_version {"zero_version",
-	                                           {{DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 0}}};
+	                                           {TableFunctionCapability("scan", {LogicalType::BIGINT}, 0)}};
 	REQUIRE_THROWS_WITH(manager.RegisterExtension(zero_version), Catch::Matchers::Contains("greater than zero"));
+	DistributedExtensionManifest missing_signature {"missing_signature",
+	                                                {{DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1}}};
+	REQUIRE_THROWS_WITH(manager.RegisterExtension(missing_signature), Catch::Matchers::Contains("overload signature"));
+	auto non_canonical_capability = TableFunctionCapability("scan", {LogicalType::BIGINT});
+	non_canonical_capability.function_signature = "other(BIGINT)";
+	DistributedExtensionManifest non_canonical_signature {"non_canonical_signature", {non_canonical_capability}};
+	REQUIRE_THROWS_WITH(manager.RegisterExtension(non_canonical_signature),
+	                    Catch::Matchers::Contains("non-canonical overload signature"));
 
 	DistributedExtensionManifest strict;
 	strict.extension_name = "strict";
-	strict.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1});
+	strict.capabilities.push_back(TableFunctionCapability("scan", {LogicalType::BIGINT}));
 	manager.RegisterExtension(strict);
 	REQUIRE_THROWS_WITH(manager.RegisterExtension(strict), Catch::Matchers::Contains("already registered"));
 	strict.extension_name = "duplicate_capability";
-	strict.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 2});
+	strict.capabilities.push_back(TableFunctionCapability("scan", {LogicalType::BIGINT}, 2));
 	REQUIRE_THROWS_WITH(manager.RegisterExtension(strict), Catch::Matchers::Contains("declared more than once"));
 
 	DistributedExtensionManifest missing_write {"missing_write",
@@ -267,7 +300,7 @@ TEST_CASE("Distributed write operators require an exact concrete capability", "[
 	auto &manager = DistributedExtensionManager::Get(*db.instance);
 	DistributedExtensionManifest manifest;
 	manifest.extension_name = "write_contract";
-	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1});
+	manifest.capabilities.push_back(TableFunctionCapability("scan", {LogicalType::BIGINT}));
 	manifest.capabilities.push_back({DistributedExtensionCapabilityKind::WRITE_OPERATOR, "write", 3});
 	manager.RegisterExtension(
 	    manifest, {make_shared_ptr<const DistributedWriteOperatorExtension>(FileWriteOperator("write", 3))});
@@ -280,7 +313,7 @@ TEST_CASE("Distributed write operators require an exact concrete capability", "[
 	REQUIRE(write_operator->mode == DistributedWriteMode::FILE_ARTIFACT);
 
 	auto scan = write;
-	scan.capability = {DistributedExtensionCapabilityKind::TABLE_FUNCTION, "scan", 1};
+	scan.capability = TableFunctionCapability("scan", {LogicalType::BIGINT});
 	REQUIRE_THROWS_WITH(manager.GetWriteOperator(scan), Catch::Matchers::Contains("write-operator capability"));
 }
 
@@ -293,17 +326,19 @@ TEST_CASE("ExtensionLoader distributed declaration validation has strong excepti
 	                                   "loader_retry{write_operator:scan@1}"));
 }
 
-TEST_CASE("ExtensionLoader derives one capability across separately registered table overloads",
-          "[distributed][extension]") {
+TEST_CASE("ExtensionLoader derives capabilities per distributed table overload", "[distributed][extension]") {
 	DuckDB db(nullptr);
 	REQUIRE_NOTHROW(db.LoadStaticExtension<DistributedOverloadExtension>());
 
 	REQUIRE(ManagerHasContractIdentity(DistributedExtensionManager::Get(*db.instance),
-	                                   "distributed_overload{table_function:distributed_overload_scan@1}"));
+	                                   "distributed_overload{table_function:distributed_overload_scan(BIGINT)@2,"
+	                                   "table_function:distributed_overload_scan(INTEGER)@1}"));
 
 	Connection connection(db);
 	auto integer_result = connection.Query("SELECT * FROM distributed_overload_scan(1::INTEGER)");
 	REQUIRE_NO_FAIL(*integer_result);
 	auto bigint_result = connection.Query("SELECT * FROM distributed_overload_scan(1::BIGINT)");
 	REQUIRE_NO_FAIL(*bigint_result);
+	auto native_result = connection.Query("SELECT * FROM distributed_overload_scan('native')");
+	REQUIRE_NO_FAIL(*native_result);
 }

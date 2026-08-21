@@ -62,18 +62,34 @@ static void ValidateExtensionRegistration(const string &extension_name) {
 	}
 }
 
-static void ValidateCapabilityRegistration(const string &extension_name, const string &capability_name,
-                                           idx_t protocol_version) {
+static void ValidateCapabilityRegistration(const string &extension_name,
+                                           const DistributedExtensionCapability &capability) {
 	ValidateExtensionRegistration(extension_name);
-	if (!IsValidCapabilityName(capability_name)) {
+	if (!IsValidCapabilityName(capability.name)) {
 		throw InvalidInputException("Distributed extension capability name must contain only lowercase ASCII letters, "
 		                            "digits, underscores, dots, and hyphens: '%s'",
-		                            capability_name);
+		                            capability.name);
 	}
-	if (protocol_version == 0) {
+	if (capability.protocol_version == 0) {
 		throw InvalidInputException(
 		    "Distributed extension capability '%s.%s' protocol version must be greater than zero", extension_name,
-		    capability_name);
+		    capability.name);
+	}
+	if (capability.kind == DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
+		if (capability.function_signature.empty()) {
+			throw InvalidInputException("Distributed table-function capability '%s.%s' requires an overload signature",
+			                            extension_name, capability.name);
+		}
+		if (!StringUtil::StartsWith(capability.function_signature, capability.name + "(") ||
+		    capability.function_signature.back() != ')') {
+			throw InvalidInputException(
+			    "Distributed table-function capability '%s.%s' has a non-canonical overload signature '%s'",
+			    extension_name, capability.name, capability.function_signature);
+		}
+	} else if (!capability.function_signature.empty()) {
+		throw InvalidInputException(
+		    "Distributed capability '%s.%s' must not define a table-function overload signature", extension_name,
+		    capability.name);
 	}
 }
 
@@ -95,12 +111,14 @@ static string DistributedExtensionCapabilityKindToString(DistributedExtensionCap
 }
 
 string DistributedExtensionCapability::CanonicalIdentity() const {
-	return StringUtil::Format("%s:%s@%llu", DistributedExtensionCapabilityKindToString(kind), name,
+	const auto &subject = kind == DistributedExtensionCapabilityKind::TABLE_FUNCTION ? function_signature : name;
+	return StringUtil::Format("%s:%s@%llu", DistributedExtensionCapabilityKindToString(kind), subject,
 	                          static_cast<unsigned long long>(protocol_version));
 }
 
 bool DistributedExtensionCapability::operator==(const DistributedExtensionCapability &other) const {
-	return kind == other.kind && name == other.name && protocol_version == other.protocol_version;
+	return kind == other.kind && name == other.name && protocol_version == other.protocol_version &&
+	       function_signature == other.function_signature;
 }
 
 bool DistributedExtensionCapability::operator<(const DistributedExtensionCapability &other) const {
@@ -110,12 +128,15 @@ bool DistributedExtensionCapability::operator<(const DistributedExtensionCapabil
 	if (name != other.name) {
 		return name < other.name;
 	}
+	if (function_signature != other.function_signature) {
+		return function_signature < other.function_signature;
+	}
 	return protocol_version < other.protocol_version;
 }
 
 void DistributedExtensionCapabilityReference::Validate() const {
 	ValidateCapabilityKind(capability.kind);
-	ValidateCapabilityRegistration(extension_name, capability.name, capability.protocol_version);
+	ValidateCapabilityRegistration(extension_name, capability);
 }
 
 void DistributedExtensionCapabilityReference::Serialize(Serializer &serializer) const {
@@ -124,6 +145,7 @@ void DistributedExtensionCapabilityReference::Serialize(Serializer &serializer) 
 	serializer.WriteProperty(2, "capability_kind", static_cast<uint8_t>(capability.kind));
 	serializer.WriteProperty(3, "capability_name", capability.name);
 	serializer.WriteProperty(4, "capability_protocol_version", capability.protocol_version);
+	serializer.WriteProperty(5, "table_function_signature", capability.function_signature);
 }
 
 DistributedExtensionCapabilityReference
@@ -134,6 +156,7 @@ DistributedExtensionCapabilityReference::Deserialize(Deserializer &deserializer)
 	    static_cast<DistributedExtensionCapabilityKind>(deserializer.ReadProperty<uint8_t>(2, "capability_kind"));
 	result.capability.name = deserializer.ReadProperty<string>(3, "capability_name");
 	result.capability.protocol_version = deserializer.ReadProperty<idx_t>(4, "capability_protocol_version");
+	result.capability.function_signature = deserializer.ReadProperty<string>(5, "table_function_signature");
 	result.Validate();
 	return result;
 }
@@ -202,14 +225,16 @@ void DistributedExtensionManager::ValidateManifest(const DistributedExtensionMan
 		throw InvalidInputException("Distributed extension '%s' must contain a concrete capability",
 		                            manifest.extension_name);
 	}
-	set<pair<DistributedExtensionCapabilityKind, string>> capability_identities;
+	set<string> capability_identities;
 	for (const auto &capability : manifest.capabilities) {
 		ValidateCapabilityKind(capability.kind);
-		ValidateCapabilityRegistration(manifest.extension_name, capability.name, capability.protocol_version);
-		auto identity = make_pair(capability.kind, capability.name);
+		ValidateCapabilityRegistration(manifest.extension_name, capability);
+		auto identity = StringUtil::Format("%u:%s:%s", static_cast<unsigned int>(capability.kind), capability.name,
+		                                   capability.function_signature);
 		if (!capability_identities.insert(identity).second) {
-			throw InvalidInputException("Distributed extension capability '%s.%s' is declared more than once",
-			                            manifest.extension_name, capability.name);
+			throw InvalidInputException("Distributed extension capability '%s.%s' with signature '%s' is declared more "
+			                            "than once",
+			                            manifest.extension_name, capability.name, capability.function_signature);
 		}
 	}
 }
@@ -287,7 +312,8 @@ void DistributedExtensionManager::RequireCapability(const DistributedExtensionCa
 		throw InvalidInputException("Distributed extension '%s' is not registered", capability.extension_name);
 	}
 	for (const auto &registered : extension->second.capabilities) {
-		if (registered.kind == capability.capability.kind && registered.name == capability.capability.name) {
+		if (registered.kind == capability.capability.kind && registered.name == capability.capability.name &&
+		    registered.function_signature == capability.capability.function_signature) {
 			if (registered.protocol_version != capability.capability.protocol_version) {
 				throw InvalidInputException(
 				    "Distributed extension capability '%s.%s' protocol mismatch: required %llu, registered %llu",
@@ -320,7 +346,8 @@ DistributedExtensionManager::GetWriteOperator(const DistributedExtensionCapabili
 
 shared_ptr<const DistributedWriteOperatorExtension>
 DistributedExtensionManager::GetWriteOperator(const string &extension_name, const string &operator_name) const {
-	ValidateCapabilityRegistration(extension_name, operator_name, 1);
+	DistributedExtensionCapability requested {DistributedExtensionCapabilityKind::WRITE_OPERATOR, operator_name, 1};
+	ValidateCapabilityRegistration(extension_name, requested);
 	lock_guard<mutex> guard(lock);
 	auto extension = extensions.find(extension_name);
 	if (extension == extensions.end()) {
