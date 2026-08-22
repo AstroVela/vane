@@ -45,6 +45,7 @@
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
+#include "duckdb/execution/operator/set/physical_union.hpp"
 #include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
@@ -263,6 +264,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	case PhysicalOperatorType::UNNEST: {
 		auto &pu = static_cast<PhysicalUnnest &>(op);
 		node_impl = TranslateUnnest(pu, children);
+		break;
+	}
+	case PhysicalOperatorType::UNION: {
+		auto &union_op = static_cast<PhysicalUnion &>(op);
+		node_impl = TranslateUnion(union_op, children);
 		break;
 	}
 	case PhysicalOperatorType::INOUT_FUNCTION: {

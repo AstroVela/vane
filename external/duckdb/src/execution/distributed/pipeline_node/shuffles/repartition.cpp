@@ -350,10 +350,10 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		auto repartition_spec = self_shared->repartition_spec_;
 		auto plan_builder = [self_shared, repartition_spec, num_partitions, exchange_id, exchange, exchange_mgr,
 		                     sink_task_counter](DuckPhysicalPlanRef plan) {
-			// Each task gets its own sink handle via the Exchange SPI
+			// The ordinal only distinguishes plan templates. FTE replaces it with
+			// a stable identity that is unique across every input fragment.
 			auto task_partition_id = sink_task_counter->fetch_add(1);
-			auto sink_handle_obj = exchange->AddSink(task_partition_id);
-			auto sink_instance = exchange->InstantiateSink(sink_handle_obj, /*attempt_id=*/0);
+			auto sink_instance = InstantiateFteDerivedExchangeSink(*exchange, task_partition_id);
 			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, exchange_id,
 			                                 sink_instance, exchange_mgr, self_shared->collect_mark_join_build_summary_,
 			                                 CopyExpressions(self_shared->mark_join_build_expressions_));

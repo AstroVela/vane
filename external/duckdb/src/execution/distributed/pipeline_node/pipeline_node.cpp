@@ -10,6 +10,13 @@
 namespace duckdb {
 namespace distributed {
 
+ExchangeSinkInstanceHandle InstantiateFteDerivedExchangeSink(Exchange &exchange, idx_t plan_task_partition_id) {
+	auto sink_handle = exchange.AddSink(plan_task_partition_id);
+	auto sink_instance = exchange.InstantiateSink(sink_handle, /*attempt_id=*/0);
+	sink_instance.fte_task_identity = true;
+	return sink_instance;
+}
+
 void RecordRemoteExchangeFinishedSinks(Exchange &exchange, const std::vector<MaterializedOutput> &outputs,
                                        const char *mismatch_context) {
 	for (idx_t i = 0; i < outputs.size(); i++) {

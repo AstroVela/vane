@@ -45,6 +45,7 @@ class PhysicalTableScan;
 class PhysicalTopN;
 class PhysicalUngroupedAggregate;
 class PhysicalUnnest;
+class PhysicalUnion;
 class PhysicalVLLM;
 class PhysicalWindow;
 } // namespace duckdb
@@ -219,6 +220,9 @@ private:
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateUnnest(const PhysicalUnnest &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateUnion(const PhysicalUnion &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateTableInOut(const PhysicalTableInOutFunction &op,

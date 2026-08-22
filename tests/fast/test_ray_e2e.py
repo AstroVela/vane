@@ -465,6 +465,83 @@ def test_ray_empty_result_plan_returns_no_partitions(ray_runner, duckdb_conn, sq
     assert arrow_result.num_rows == 0
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS x UNION ALL SELECT 2 AS x UNION ALL SELECT 3 AS x",
+        "SELECT * FROM (VALUES (1), (2), (2)) AS left_input(x) UNION SELECT * FROM (VALUES (2), (3)) AS right_input(x)",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE UNION ALL SELECT * FROM (VALUES (3), (4)) AS input(x)",
+    ],
+)
+def test_ray_union_value_branches(ray_runner, duckdb_conn, sql):
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: union value branches",
+        require_all=["UNION"],
+    )
+
+
+def test_ray_union_parquet_branches_preserve_independent_scan_splits(ray_runner, duckdb_conn, parquet_path):
+    sql = f"""
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a < 600
+        UNION ALL
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a >= 400
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, "test_ray_e2e: union parquet branches")
+    assert plan_text and "UNION" in plan_text.upper()
+    assert num_parts is not None and num_parts >= 2
+    parts = _run_iter_tables(ray_runner, relation, "test_ray_e2e: union parquet branches")
+    _assert_results_match(duckdb_conn, sql, parts, "test_ray_e2e: union parquet branches")
+
+
+def test_ray_union_branches_feed_distributed_order_by(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: union feeds distributed order by"
+    sql = """
+        SELECT x
+        FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x UNION ALL SELECT 2 AS x)
+        ORDER BY x
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "ORDERBY" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "ORDER_BY"],
+        ordered=True,
+    )
+
+
+def test_ray_union_branches_feed_broadcast_join(ray_runner, duckdb_conn, monkeypatch):
+    label = "test_ray_e2e: union feeds broadcast join"
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+    sql = """
+        SELECT probe.k, build.v
+        FROM range(1, 5) AS probe(k)
+        JOIN (
+            SELECT 1 AS k, 10 AS v
+            UNION ALL
+            SELECT 3 AS k, 30 AS v
+        ) AS build
+          ON probe.k = build.k
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "BROADCAST JOIN" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "HASH_JOIN"],
+    )
+
+
 def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
     monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
     label = "test_ray_e2e: distributed range source"

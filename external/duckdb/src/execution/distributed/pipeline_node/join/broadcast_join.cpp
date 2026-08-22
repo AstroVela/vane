@@ -343,8 +343,7 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		                     sink_task_counter](DuckPhysicalPlanRef plan) {
 			auto repartition_spec = RepartitionSpec::create_into_partitions(num_partitions);
 			auto task_partition_id = sink_task_counter->fetch_add(1);
-			auto sink_handle_obj = exchange->AddSink(task_partition_id);
-			auto sink_instance = exchange->InstantiateSink(sink_handle_obj, /*attempt_id=*/0);
+			auto sink_instance = InstantiateFteDerivedExchangeSink(*exchange, task_partition_id);
 			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, exchange_id,
 			                                 sink_instance, exchange_mgr);
 		};

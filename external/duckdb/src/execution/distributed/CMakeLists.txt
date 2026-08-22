@@ -57,11 +57,13 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/translator_order_limit.cpp
     pipeline_node/translator_scan.cpp
     pipeline_node/translator_source.cpp
+    pipeline_node/translator_union.cpp
     pipeline_node/translator_unary.cpp
     pipeline_node/scan_source.cpp
     pipeline_node/sample.cpp
     pipeline_node/pivot.cpp
     pipeline_node/unnest.cpp
+    pipeline_node/union.cpp
     pipeline_node/shuffles/repartition.cpp
     pipeline_node/sink.cpp
     pipeline_node/sort.cpp

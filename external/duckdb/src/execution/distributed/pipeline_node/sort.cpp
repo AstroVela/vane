@@ -649,8 +649,7 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			auto stage_plan_builder = [staging_exchange, exchange_mgr, staging_exchange_id, staging_sink_counter,
 			                           num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
 				auto task_partition_id = staging_sink_counter->fetch_add(1);
-				auto sink_handle = staging_exchange->AddSink(task_partition_id);
-				auto sink_instance = staging_exchange->InstantiateSink(sink_handle, /*attempt_id=*/0);
+				auto sink_instance = InstantiateFteDerivedExchangeSink(*staging_exchange, task_partition_id);
 				return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, staging_exchange_id,
 				                                 sink_instance, exchange_mgr);
 			};
