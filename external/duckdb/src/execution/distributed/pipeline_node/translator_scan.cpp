@@ -94,7 +94,8 @@ vector<ScanSplit> MakeExtensionScanSplits(const PhysicalTableScan &scan, const D
 	DistributedExtensionManager::Get(*db).RequireCapability(capability);
 
 	auto scan_input = MakeDistributedScanInput(scan);
-	TableFunctionDistributedScanPlanningInput planning_input(scan_input, ResolveScanSplitTargetCount(exec_cfg));
+	TableFunctionDistributedScanPlanningInput planning_input(scan_input, ResolveScanSplitTargetCount(exec_cfg),
+	                                                         FileSystem::GetFileSystem(*db));
 	auto planned_splits = callbacks.plan_splits(planning_input);
 	if (planned_splits.empty()) {
 		return {ScanSplit::EmptyExtension(capability, callbacks.split_codec)};

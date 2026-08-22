@@ -348,6 +348,8 @@ public:
 
 	//! Gets validation line information
 	ValidatorLine GetValidationLine();
+	//! Restrict row ownership after the scanner has synchronized to a valid record boundary.
+	void SetScanRangeEnd(idx_t buffer_idx, idx_t buffer_pos);
 
 	const idx_t scanner_idx;
 	//! We use the max of idx_t to signify this is a line finder scanner.
@@ -365,6 +367,9 @@ private:
 	void ProcessOverBufferValue();
 
 	void ProcessExtraRow();
+	bool has_scan_range_end = false;
+	idx_t scan_range_end_buffer_idx = 0;
+	idx_t scan_range_end_pos = 0;
 	//! Function used to move from one buffer to the other, if necessary
 	bool MoveToNextBuffer();
 

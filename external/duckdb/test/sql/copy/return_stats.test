@@ -251,11 +251,11 @@ COPY multi_partitioned_test TO '__TEST_DIR__/multi_partitioned_test' (FORMAT PAR
 statement ok
 COPY (FROM test_all_types()) TO '__TEST_DIR__/test_all_types.parquet' (RETURN_STATS);
 
-# unsupported format (CSV)
-statement error
+# CSV returns row count and file size without column statistics
+query IIIIII
 COPY integers TO '__TEST_DIR__/test_copy_to_file.csv' (RETURN_STATS);
 ----
-not supported
+<REGEX>:.*test_copy_to_file.csv	200000	<REGEX>:\d+	NULL	{}	NULL
 
 # 128-bit decimal stats are big-endian; unifying row-group bounds must decode
 # before comparing, otherwise the file-level min/max get swapped

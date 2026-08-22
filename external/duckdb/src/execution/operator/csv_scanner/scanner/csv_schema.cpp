@@ -125,6 +125,10 @@ bool CSVSchema::Empty() const {
 	return columns.empty();
 }
 
+bool CSVSchema::IsEmptyFile() const {
+	return empty;
+}
+
 bool CSVSchema::MatchColumns(const CSVSchema &other) const {
 	return other.columns.size() == columns.size() || empty || other.empty;
 }
