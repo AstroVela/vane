@@ -443,6 +443,28 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) LIMIT 0",
+    ],
+)
+def test_ray_empty_result_plan_returns_no_partitions(ray_runner, duckdb_conn, sql):
+    label = "test_ray_e2e: empty result"
+    explain_text = _explain_text(duckdb_conn, sql)
+    _assert_explain_contains(explain_text, require_all=["EMPTY_RESULT"], label=label)
+
+    relation = duckdb_conn.sql(sql)
+    assert relation.columns == ["x"]
+    parts = _run_iter_tables(ray_runner, relation, label)
+    assert parts == []
+
+    arrow_result = duckdb_conn.sql(sql).to_arrow_table()
+    assert arrow_result.schema.names == ["x"]
+    assert arrow_result.num_rows == 0
+
+
 def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
     monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
     label = "test_ray_e2e: distributed range source"

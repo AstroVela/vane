@@ -6,10 +6,12 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
@@ -30,6 +32,14 @@ DuckPhysicalPlanRef MakeDummyScanPlan(const duckdb::PhysicalDummyScan &scan) {
 	auto plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
 	auto &dummy = plan->Make<duckdb::PhysicalDummyScan>(scan.GetTypes(), scan.estimated_cardinality);
 	plan->SetRoot(dummy);
+	return plan;
+}
+
+DuckPhysicalPlanRef MakeEmptyResultPlan(const duckdb::PhysicalEmptyResult &empty_result) {
+	Allocator &alloc = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
+	auto &empty = plan->Make<duckdb::PhysicalEmptyResult>(empty_result.GetTypes(), empty_result.estimated_cardinality);
+	plan->SetRoot(empty);
 	return plan;
 }
 
@@ -108,6 +118,18 @@ PhysicalPlanToPipelineNodeTranslator::TranslateDummyScanSource(const PhysicalDum
 	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
 	                                                  get_next_pipeline_node_id(), "ScanSource"),
 	                          std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, false);
+}
+
+std::shared_ptr<DistributedPipelineNode>
+PhysicalPlanToPipelineNodeTranslator::TranslateEmptyResultSource(const PhysicalEmptyResult &op) {
+	auto empty_plan = MakeEmptyResultPlan(op);
+	auto schema = MakeSchemaFromTypes(op.GetTypes());
+	auto exec_cfg = ResolveExecutionConfig(plan_config_);
+	auto empty_result = std::make_shared<EmptyResultSourceNode>(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, get_next_pipeline_node_id(),
+	                            "EmptyResultSource"),
+	    std::move(empty_plan), std::move(schema), std::move(exec_cfg));
+	return std::make_shared<DistributedPipelineNode>(std::move(empty_result));
 }
 
 std::shared_ptr<DistributedPipelineNode>

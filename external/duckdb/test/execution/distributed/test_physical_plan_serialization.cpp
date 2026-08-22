@@ -28,6 +28,7 @@
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -350,6 +351,30 @@ TEST_CASE("PhysicalProjection serialization roundtrip", "[serialization][physica
 	REQUIRE(proj_ptr->select_list.size() == 2);
 
 	std::cerr << "[test] PhysicalProjection serialization roundtrip PASSED" << std::endl;
+}
+
+TEST_CASE("PhysicalEmptyResult serialization roundtrip", "[serialization][physical_plan]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+	PhysicalEmptyResult empty_result(plan, types, 0);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	empty_result.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	REQUIRE(deserialized_op->type == PhysicalOperatorType::EMPTY_RESULT);
+	REQUIRE(deserialized_op->GetTypes() == types);
+	REQUIRE(deserialized_op->estimated_cardinality == 0);
 }
 
 TEST_CASE("PhysicalFilter serialization roundtrip", "[serialization][physical_plan]") {

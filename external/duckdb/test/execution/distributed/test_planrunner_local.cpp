@@ -15,6 +15,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
@@ -392,6 +393,31 @@ TEST_CASE("PlanRunner instantiation", "[distributed][plan][local]") {
 	auto runner = std::make_shared<PlanRunner>(worker_mgr, con.context);
 
 	REQUIRE(runner != nullptr);
+}
+
+TEST_CASE("PlanRunner finishes an empty-result plan without submitting worker tasks", "[distributed][plan][local]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto logical_plan = con.ExtractPlan("SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*con.context);
+	auto generated_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(generated_plan != nullptr);
+	REQUIRE(generated_plan->Root().type == PhysicalOperatorType::EMPTY_RESULT);
+	auto physical_plan = DuckPhysicalPlanRef(generated_plan.release());
+
+	auto workers = setup_workers({{make_worker_id("empty-result-w1"), 1}});
+	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(17, "planrunner-empty-result", physical_plan,
+	                                                                  std::move(execution_config));
+
+	auto result = runner->run_plan(std::move(distributed_plan));
+	REQUIRE(result.is_ok());
+	REQUIRE(result.value().tag == PlanRunner::PlanResult::STREAMING);
+	REQUIRE_FALSE(result.value().stream.next().first);
 }
 
 TEST_CASE("PlanRunner rejects an unregistered extension write capability",

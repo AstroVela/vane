@@ -23,6 +23,7 @@ class PhysicalNestedLoopJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
 class PhysicalDummyScan;
+class PhysicalEmptyResult;
 class PhysicalExpressionScan;
 class PhysicalFilter;
 class PhysicalLimit;
@@ -155,6 +156,8 @@ private:
 	std::shared_ptr<DistributedPipelineNode> TranslateCTESource(PhysicalOperator &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateDummyScanSource(const PhysicalDummyScan &op);
+
+	std::shared_ptr<DistributedPipelineNode> TranslateEmptyResultSource(const PhysicalEmptyResult &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateColumnDataScanSource(const PhysicalColumnDataScan &op);
 
