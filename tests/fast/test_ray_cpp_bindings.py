@@ -4117,6 +4117,95 @@ def test_ray_worker_manager_snapshot_refresh_shutdown_has_no_deadlock(monkeypatc
     assert aborted == ["worker-racing-shutdown"]
 
 
+def test_ray_worker_manager_overlapping_drop_joins_failure_and_retry_generation(monkeypatch):
+    query_id = "query-overlapping-drop-failure"
+    thread_count = 6
+    caller_barrier = threading.Barrier(thread_count)
+    drop_condition = threading.Condition()
+    prepare_calls = []
+    cleanup_calls = []
+
+    class DummyRayWorkerHandle:
+        def fte_prepare_drop_query(self, actual_query_id):
+            with drop_condition:
+                prepare_calls.append(str(actual_query_id))
+                call_number = len(prepare_calls)
+                drop_condition.notify_all()
+                if call_number == 1:
+                    # A correct single-flight implementation admits only this
+                    # leader. Keep it open long enough for the other callers to
+                    # join; the predicate only completes early for the broken
+                    # implementation that calls every worker abort.
+                    drop_condition.wait_for(lambda: len(prepare_calls) == thread_count, timeout=0.5)
+            if call_number == 1:
+                raise RuntimeError("planned shared Ray teardown failure")
+            return {
+                "tasks_removed": 0,
+                "tasks_canceled": 0,
+                "fragments_removed": 0,
+            }
+
+        def fte_cleanup_query(self, actual_query_id):
+            cleanup_calls.append(str(actual_query_id))
+            return {}
+
+        def prepare_shutdown(self):
+            pass
+
+        def finish_shutdown(self):
+            pass
+
+        def abort_shutdown(self):
+            raise AssertionError("successful shutdown must not abort the worker")
+
+    def start_ray_workers(_existing_ids, _manager_instance_id):
+        return [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-overlapping-drop",
+                DummyRayWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ]
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(ray_worker_handle, "start_ray_workers", start_ray_workers)
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+    manager = vane.ray_cxx.RayWorkerManager()
+    assert len(manager.worker_snapshots()) == 1
+    manager.register_query_owner(query_id, query_id)
+    errors: list[BaseException] = []
+
+    def drop() -> None:
+        try:
+            caller_barrier.wait(timeout=5.0)
+            manager.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=drop) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert len(errors) == thread_count
+    assert len({str(error) for error in errors}) == 1
+    assert "planned shared Ray teardown failure" in str(errors[0])
+    assert prepare_calls == [query_id]
+    assert cleanup_calls == []
+
+    manager.drop_query_fragments(query_id)
+    manager.register_query_owner(query_id, query_id)
+    manager.drop_query_fragments(query_id)
+    assert prepare_calls == [query_id, query_id, query_id]
+    assert cleanup_calls == [query_id, query_id]
+    manager.shutdown()
+
+
 def test_ray_worker_manager_drop_is_best_effort_across_worker_failures(monkeypatch):
     calls = []
 

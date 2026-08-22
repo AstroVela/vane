@@ -18,6 +18,7 @@
 #include <string>
 
 #include "safe_pyobject.hpp"
+#include "query_lifecycle_coordinator.hpp"
 #include "worker.hpp"
 #include "task.hpp"
 #include "duckdb/execution/distributed/utils/channel.hpp"
@@ -82,27 +83,10 @@ private:
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    retained_fte_result_handles_by_query;
-		std::unordered_map<string, string> query_owner_by_query;
-		std::unordered_map<string, idx_t> active_query_operations_by_owner;
 		std::unordered_map<string, std::vector<std::shared_ptr<RayWorkerRuntime>>> workers_by_query_owner;
-		std::unordered_set<string> closed_query_owners;
-		std::unordered_set<string> quiesced_query_owners;
-		std::unordered_map<string, uint64_t> quiescing_query_owners;
-		std::unordered_map<string, idx_t> quiesce_waiters_by_owner;
-		std::unordered_map<string, uint64_t> dropping_query_owners;
-		uint64_t next_query_quiesce_token = 1;
-		uint64_t next_query_drop_token = 1;
 		idx_t active_operations = 0;
 		bool shutdown_started = false;
 		bool shutdown_finished = false;
-	};
-
-	struct QueryAbort {
-		string owner_query_id;
-		std::vector<string> execution_query_ids;
-		std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
-		uint64_t token;
-		bool had_active_operations;
 	};
 
 	class OperationGuard {
@@ -130,25 +114,28 @@ private:
 	public:
 		QueryOperationGuard(RayWorkerManager &manager, const string &query_id,
 		                    const string &requested_owner_query_id = string())
-		    : manager_(manager), owner_query_id_(manager_.BeginQueryOperation(query_id, requested_owner_query_id)) {
+		    : manager_(manager), operation_(manager_.BeginQueryOperation(query_id, requested_owner_query_id)) {
 		}
 		QueryOperationGuard(const QueryOperationGuard &) = delete;
 		QueryOperationGuard &operator=(const QueryOperationGuard &) = delete;
 		~QueryOperationGuard() {
-			if (owner_query_id_) {
-				manager_.EndQueryOperation(*owner_query_id_);
+			if (operation_) {
+				manager_.EndQueryOperation(*operation_);
 			}
 		}
 		explicit operator bool() const {
-			return owner_query_id_.has_value();
+			return operation_.has_value();
 		}
 		const string &owner_query_id() const {
-			return *owner_query_id_;
+			return operation_->lifecycle.owner_query_id;
+		}
+		const QueryLifecycleCoordinator::LifecycleRef &lifecycle() const {
+			return operation_->lifecycle;
 		}
 
 	private:
 		RayWorkerManager &manager_;
-		std::optional<string> owner_query_id_;
+		std::optional<QueryLifecycleCoordinator::Operation> operation_;
 	};
 
 	const string manager_instance_id_;
@@ -156,24 +143,23 @@ private:
 	mutable mutex mutex_;
 	mutable std::condition_variable shutdown_cv_;
 	mutable State state_;
+	QueryLifecycleCoordinator query_lifecycles_;
 	PythonExceptionStore submission_errors_;
 
 	bool BeginOperation() const;
 	void EndOperation() const;
-	std::optional<string> BeginQueryOperation(const string &query_id, const string &requested_owner_query_id);
-	void EndQueryOperation(const string &owner_query_id);
-	void CloseQueryOwnerIngress(const string &owner_query_id);
-	void WaitForQueryOperationsWithoutGIL(const string &owner_query_id);
-	void WaitForQueryOperations(const string &owner_query_id);
+	std::optional<QueryLifecycleCoordinator::Operation> BeginQueryOperation(const string &query_id,
+	                                                                        const string &requested_owner_query_id);
+	void EndQueryOperation(const QueryLifecycleCoordinator::Operation &operation);
+	void WaitForQueryOperations(const QueryLifecycleCoordinator::LifecycleRef &lifecycle);
 	void RecordQueryWorkers(const string &owner_query_id,
 	                        const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers);
-	std::optional<QueryAbort> BeginQueryAbortWithoutGIL(const string &query_id);
-	std::optional<QueryAbort> BeginQueryAbort(const string &query_id);
-	void EndQueryAbort(const string &owner_query_id, uint64_t token, bool succeeded);
-	std::optional<QueryAbort> BeginQueryDropWithoutGIL(const string &query_id);
-	std::optional<QueryAbort> BeginQueryDrop(const string &query_id);
-	void EndQueryDrop(const string &owner_query_id, uint64_t token);
-	void FinishQueryLifecycle(const string &owner_query_id, uint64_t drop_token);
+	std::optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const string &query_id);
+	std::optional<QueryLifecycleCoordinator::Abort>
+	BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown);
+	std::optional<QueryLifecycleCoordinator::Teardown> BeginQueryTeardown(const string &query_id);
+	std::vector<std::shared_ptr<RayWorkerRuntime>> QueryWorkers(const string &owner_query_id) const;
+	DuckDBResult<void> ExecuteQueryAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort);
 	bool ShutdownStarted() const;
 	bool RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
 	                            const std::shared_ptr<std::atomic<bool>> &retired) const;

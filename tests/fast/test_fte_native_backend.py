@@ -2993,6 +2993,60 @@ def test_cxx_backend_serializes_overlapping_drop_and_reuses_query_id():
     assert backend.drop_calls == [query_id, query_id]
 
 
+def test_cxx_backend_overlapping_drop_joins_failure_and_retry_generation():
+    thread_count = 6
+    caller_barrier = threading.Barrier(thread_count)
+    drop_condition = threading.Condition()
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.drop_calls = []
+
+        def drop_query(self, query_id):
+            with drop_condition:
+                self.drop_calls.append(str(query_id))
+                call_number = len(self.drop_calls)
+                drop_condition.notify_all()
+                if call_number == 1:
+                    # A correct single-flight implementation admits only this
+                    # leader. Keep it open long enough for the other callers to
+                    # join; the predicate only completes early for the broken
+                    # implementation that calls every backend drop.
+                    drop_condition.wait_for(lambda: len(self.drop_calls) == thread_count, timeout=0.5)
+            if call_number == 1:
+                raise RuntimeError("planned shared teardown failure")
+
+    query_id = f"backend-overlapping-drop-failure-{uuid.uuid4()}"
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    runner._register_query_owner_for_test(query_id, query_id)
+    errors: list[BaseException] = []
+
+    def drop() -> None:
+        try:
+            caller_barrier.wait(timeout=5.0)
+            runner.drop_query_fragments(query_id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=drop) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert [thread for thread in threads if thread.is_alive()] == []
+    assert len(errors) == thread_count
+    assert len({str(error) for error in errors}) == 1
+    assert "planned shared teardown failure" in str(errors[0])
+    assert backend.drop_calls == [query_id]
+
+    runner.drop_query_fragments(query_id)
+    runner._register_query_owner_for_test(query_id, query_id)
+    runner.drop_query_fragments(query_id)
+    assert backend.drop_calls == [query_id, query_id, query_id]
+
+
 def test_cxx_backend_routes_nested_execution_drop_to_registered_resource_owner():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):
@@ -3427,8 +3481,8 @@ def test_cxx_backend_drop_failure_preserves_replay_state_for_active_submit_until
         con.close()
 
 
-def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
-    """A drop joining shutdown must not report success before shutdown quiesces work."""
+def test_cxx_backend_drop_rejects_running_shutdown_without_waiting():
+    """A teardown must not wait on shutdown while its caller can block shutdown."""
     submit_started = threading.Event()
     allow_submit_return = threading.Event()
     shutdown_started = threading.Event()
@@ -3517,9 +3571,11 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
 
         drop_thread.start()
         assert drop_invoked.wait(timeout=5.0)
-        drop_thread.join(timeout=0.05)
-        assert drop_thread.is_alive()
+        drop_thread.join(timeout=5.0)
+        assert not drop_thread.is_alive()
         assert shutdown_thread.is_alive()
+        assert len(drop_errors) == 1
+        assert "cannot tear down FTE query while Python backend is shutting down" in str(drop_errors[0])
         assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
 
         allow_submit_return.set()
@@ -3531,7 +3587,7 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
         assert not shutdown_thread.is_alive()
         assert not drop_thread.is_alive()
         assert shutdown_errors == []
-        assert drop_errors == []
+        assert len(drop_errors) == 1
         assert len(run_errors) == 1
         assert "query is closing" in str(run_errors[0])
         assert backend.drop_calls == []
