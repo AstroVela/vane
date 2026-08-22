@@ -32,6 +32,7 @@
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
 #include "duckdb/execution/operator/projection/physical_pivot.hpp"
@@ -332,6 +333,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	case PhysicalOperatorType::DUMMY_SCAN: {
 		auto &dummy_scan = static_cast<PhysicalDummyScan &>(op);
 		node_stack_.push_back(TranslateDummyScanSource(dummy_scan));
+		return;
+	}
+	case PhysicalOperatorType::EMPTY_RESULT: {
+		auto &empty_result = static_cast<PhysicalEmptyResult &>(op);
+		node_stack_.push_back(TranslateEmptyResultSource(empty_result));
 		return;
 	}
 	case PhysicalOperatorType::COLUMN_DATA_SCAN:

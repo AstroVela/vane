@@ -434,6 +434,12 @@ public:
 	virtual bool is_materialization_barrier() const {
 		return false;
 	}
+	/// True when the node itself is a complete, statically empty query result.
+	/// A parent may still need to execute over that empty input (for example,
+	/// an ungrouped aggregate), so this property is intentionally not inherited.
+	virtual bool is_statically_empty_result() const {
+		return false;
+	}
 	/// Physical child nodes whose complete distributed output must be
 	/// materialized before this barrier is released. Barrier nodes must
 	/// explicitly identify at least one input; non-barrier nodes return none.
@@ -508,6 +514,10 @@ public:
 
 	bool is_materialization_barrier() const override {
 		return op_->is_materialization_barrier();
+	}
+
+	bool is_statically_empty_result() const override {
+		return op_->is_statically_empty_result();
 	}
 
 	std::vector<NodeID> materialized_input_node_ids() const override {

@@ -48,6 +48,7 @@
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -888,6 +889,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	}
 	case PhysicalOperatorType::DUMMY_SCAN: {
 		return make_uniq<PhysicalDummyScan>(physical_plan, std::move(types), estimated_cardinality);
+	}
+	case PhysicalOperatorType::EMPTY_RESULT: {
+		return make_uniq<PhysicalEmptyResult>(physical_plan, std::move(types), estimated_cardinality);
 	}
 	case PhysicalOperatorType::EXPRESSION_SCAN: {
 		auto expressions = deserializer.ReadProperty<vector<vector<unique_ptr<Expression>>>>(103, "expressions");

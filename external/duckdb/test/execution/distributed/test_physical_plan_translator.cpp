@@ -24,6 +24,7 @@
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
@@ -62,6 +63,7 @@
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 #include "duckdb/execution/distributed/pipeline_node/grouping_set_expand.hpp"
 #include "duckdb/execution/distributed/pipeline_node/limit.hpp"
+#include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/projection.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sample.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
@@ -1221,6 +1223,58 @@ TEST_CASE("PhysicalPlanTranslator: dummy scan -> ScanSourceNode", "[distributed]
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::ScanSourceNode>(inner) != nullptr);
+}
+
+TEST_CASE("PhysicalPlanTranslator: empty result -> EmptyResultSourceNode", "[distributed]") {
+	Allocator allocator;
+	auto plan_ptr = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+
+	auto &empty_result = plan_ptr->Make<PhysicalEmptyResult>(types, 0);
+	plan_ptr->SetRoot(empty_result);
+
+	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
+	REQUIRE(res.ok);
+	REQUIRE(res.value() != nullptr);
+	auto empty_source = std::dynamic_pointer_cast<duckdb::distributed::EmptyResultSourceNode>(res.value()->inner());
+	REQUIRE(empty_source != nullptr);
+	REQUIRE(GetSchemaTypes(empty_source->config().schema()) == types);
+	REQUIRE(empty_source->config().clustering_spec()->num_partitions() == 1);
+
+	PlanExecutionContext execution_context(nullptr);
+	auto task_stream = res.value()->produce_tasks(execution_context);
+	auto task = task_stream.poll_next();
+	REQUIRE(task.first);
+	REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::EMPTY_RESULT);
+	REQUIRE_FALSE(task_stream.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: ungrouped aggregate executes over an empty-result input", "[distributed]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto logical_plan =
+	    conn.ExtractPlan("SELECT count(*) FROM (SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE)");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*conn.context);
+	auto generated_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(generated_plan != nullptr);
+	REQUIRE(generated_plan->Root().type == PhysicalOperatorType::UNGROUPED_AGGREGATE);
+	REQUIRE(generated_plan->Root().children.size() == 1);
+	REQUIRE(generated_plan->Root().children[0].get().type == PhysicalOperatorType::EMPTY_RESULT);
+	auto physical_plan = DuckPhysicalPlanRef(generated_plan.release());
+
+	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, physical_plan,
+	                                                               conn.context.get());
+	REQUIRE(res.is_ok());
+	PlanExecutionContext execution_context(nullptr, conn.context);
+	auto task_stream = res.value()->produce_tasks(execution_context);
+	auto task = task_stream.poll_next();
+	REQUIRE(task.first);
+	REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::UNGROUPED_AGGREGATE);
+	REQUIRE(task.second.task()->plan()->Root().children.size() == 1);
+	REQUIRE(task.second.task()->plan()->Root().children[0].get().type == PhysicalOperatorType::EMPTY_RESULT);
+	REQUIRE_FALSE(task_stream.poll_next().first);
 }
 
 TEST_CASE("PhysicalPlanTranslator: column data scan -> ScanSourceNode", "[distributed]") {

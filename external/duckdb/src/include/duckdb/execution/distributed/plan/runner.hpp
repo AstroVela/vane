@@ -295,6 +295,9 @@ public:
 	DuckDBResult<void> execute_plan(std::shared_ptr<DistributedPipelineNode> pipeline_node,
 	                                std::shared_ptr<PlanTaskExecutor> task_executor,
 	                                UnboundedSender<MaterializedOutput> output_sender, TaskInputs initial_inputs = {}) {
+		if (pipeline_node->is_statically_empty_result()) {
+			return DuckDBResult<void>::ok();
+		}
 		auto fte_task_submitter = std::make_shared<WorkerManagerFteTaskSubmitter>(worker_manager_);
 		PlanExecutionContext ctx(task_executor, client_context_, std::move(initial_inputs), fte_task_submitter);
 		auto tasks_stream = pipeline_node->produce_tasks(ctx);
