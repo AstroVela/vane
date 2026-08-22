@@ -41,6 +41,7 @@
 #include "duckdb/function/distributed_table_function.hpp"
 #include "duckdb/function/table/datasource_scan.hpp"
 #include "duckdb/function/table/range.hpp"
+#include "duckdb/function/table/read_csv.hpp"
 
 #ifndef DUCKDB_NO_THREADS
 #include "duckdb/common/thread.hpp"
@@ -359,6 +360,9 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	};
 	add_core_table_function(DataSourceScanFunction::GetFunction());
 	for (const auto &function : RangeTableFunction::GetFunctions()) {
+		add_core_table_function(function);
+	}
+	for (const auto &function : ReadCSVTableFunction::GetFunctions()) {
 		add_core_table_function(function);
 	}
 	distributed_extension_manager->RegisterExtension(core_manifest);
