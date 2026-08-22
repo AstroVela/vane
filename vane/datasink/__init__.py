@@ -740,10 +740,13 @@ def _write_result_from_mapping(operation_id: str, payload: Mapping[str, Any]) ->
     warnings = payload.get("warnings", ())
     if isinstance(warnings, str) or not isinstance(warnings, (list, tuple)):
         raise TypeError("DataSink result warnings must be a list of strings")
+    rows_received = cast(int, _strict_uint64("rows_received", payload.get("rows_received")))
+    rows_affected = _strict_uint64("rows_affected", payload.get("rows_affected"), allow_none=True)
+    bytes_received = cast(int, _strict_uint64("bytes_received", payload.get("bytes_received")))
     return WriteResult(
-        rows_received=payload.get("rows_received"),
-        rows_affected=payload.get("rows_affected"),
-        bytes_received=payload.get("bytes_received"),
+        rows_received=rows_received,
+        rows_affected=rows_affected,
+        bytes_received=bytes_received,
         metadata=metadata,
         warnings=tuple(warnings),
         state=WriteState(str(payload.get("state") or "")),

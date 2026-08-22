@@ -635,13 +635,13 @@ class LocalRunner(Runner):
                             renderer.update(force=True)
                         except BaseException as progress_error:
                             progress_diagnostics.append(("DataSink progress update", progress_error))
-                    for stage, progress_error in progress_diagnostics:
-                        append_warning(stage, progress_error)
+                    for stage, diagnostic_error in progress_diagnostics:
+                        append_warning(stage, diagnostic_error)
             finally:
                 primary_error = sys.exc_info()[1]
                 if result is None and primary_error is not None and hasattr(primary_error, "add_note"):
-                    for stage, progress_error in progress_diagnostics:
-                        primary_error.add_note(format_warning(stage, progress_error))
+                    for stage, diagnostic_error in progress_diagnostics:
+                        primary_error.add_note(format_warning(stage, diagnostic_error))
                 finalization_error: BaseException | None = None
                 try:
                     write_executor.shutdown(wait=True)

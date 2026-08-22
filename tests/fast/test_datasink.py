@@ -345,7 +345,7 @@ def test_keyed_unique_input_is_applied(monkeypatch):
 
 
 def test_replayed_and_losing_attempts_converge_for_idempotent_writer():
-    from vane.datasink import _SinkBatchRuntime, _results_from_arrow
+    from vane.datasink import _results_from_arrow, _SinkBatchRuntime
 
     bound = _ReplayBound()
     context = WriteContext("replayed-operation")

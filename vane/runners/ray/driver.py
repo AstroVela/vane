@@ -800,6 +800,14 @@ def _safe_remote_error_message(exc: BaseException) -> str:
     return f"{type(exc).__name__} from remote Ray task"
 
 
+def _cleanup_warning(stage: str, error: BaseException) -> str:
+    try:
+        message = str(error)
+    except BaseException:
+        message = "<error message unavailable>"
+    return f"{stage} failed: {type(error).__name__}: {message}"
+
+
 def _ray_progress_snapshot_or_none(
     runner: Any,
     owner_id: str,
@@ -6855,11 +6863,7 @@ class RayQueryDriverActor:
 
     @staticmethod
     def _copy_cleanup_warning(stage: str, error: BaseException) -> str:
-        try:
-            message = str(error)
-        except BaseException:
-            message = "<error message unavailable>"
-        return f"{stage} failed: {type(error).__name__}: {message}"
+        return _cleanup_warning(stage, error)
 
     @staticmethod
     def _copy_native_cleanup_warnings(result: Mapping[str, Any]) -> tuple[str, ...]:
@@ -8695,9 +8699,7 @@ class RayQueryDriverClient:
                 progress.finish()
             except BaseException as progress_error:
                 if hasattr(execution_error, "add_note"):
-                    execution_error.add_note(
-                        self._copy_cleanup_warning("DataSink progress finalization", progress_error)
-                    )
+                    execution_error.add_note(_cleanup_warning("DataSink progress finalization", progress_error))
             if hasattr(execution_error, "traceback_str") or hasattr(execution_error, "cause"):
                 raise RuntimeError(_safe_remote_error_message(execution_error)) from None
             raise
@@ -8708,7 +8710,7 @@ class RayQueryDriverClient:
             warnings = [raw_warnings] if isinstance(raw_warnings, str) and raw_warnings else []
             if not isinstance(raw_warnings, str) and isinstance(raw_warnings, (list, tuple)):
                 warnings.extend(str(warning) for warning in raw_warnings)
-            warnings.append(self._copy_cleanup_warning("DataSink progress finalization", progress_error))
+            warnings.append(_cleanup_warning("DataSink progress finalization", progress_error))
             result["data_sink_cleanup_warnings"] = warnings
         return result
 
