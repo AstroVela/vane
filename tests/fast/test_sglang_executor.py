@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 
@@ -13,42 +14,38 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 
-class _FakeSamplingParams:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-
 class _FakeEngine:
     def __init__(self, model_path=None, **kwargs):
         self.model_path = model_path
         self.kwargs = kwargs
         self.shutdown_called = False
-        self.generate_calls: list[tuple[str, dict[str, object]]] = []
+        self.creation_loop = asyncio.get_running_loop()
+        self.generation_loops: list[asyncio.AbstractEventLoop] = []
+        self.generate_calls: list[tuple[str, dict[str, object], dict[str, object]]] = []
+        self.active_generations = 0
+        self.max_active_generations = 0
 
-    def generate(self, prompt, sampling_params, **generate_args):
-        del sampling_params
-        self.generate_calls.append((prompt, dict(generate_args)))
-        return {"text": f"generated:{prompt}"}
+    async def async_generate(self, prompt, sampling_params, **generate_args):
+        assert isinstance(sampling_params, dict)
+        self.generation_loops.append(asyncio.get_running_loop())
+        self.generate_calls.append((prompt, dict(sampling_params), dict(generate_args)))
+        self.active_generations += 1
+        self.max_active_generations = max(self.max_active_generations, self.active_generations)
+        try:
+            await asyncio.sleep(0)
+            return {"text": f"generated:{prompt}"}
+        finally:
+            self.active_generations -= 1
 
     def shutdown(self):
         self.shutdown_called = True
 
 
 def _install_fake_sglang(monkeypatch):
-    """Register a fake SGLang package with the documented import path."""
-    sampling_params_module = types.ModuleType("sglang.srt.sampling.sampling_params")
-    sampling_params_module.SamplingParams = _FakeSamplingParams
-    sampling_module = types.ModuleType("sglang.srt.sampling")
-    sampling_module.sampling_params = sampling_params_module
-    srt_module = types.ModuleType("sglang.srt")
-    srt_module.sampling = sampling_module
+    """Register a fake SGLang package exposing the public Engine API."""
     sglang_module = types.ModuleType("sglang")
     sglang_module.Engine = _FakeEngine
-    sglang_module.srt = srt_module
     monkeypatch.setitem(sys.modules, "sglang", sglang_module)
-    monkeypatch.setitem(sys.modules, "sglang.srt", srt_module)
-    monkeypatch.setitem(sys.modules, "sglang.srt.sampling", sampling_module)
-    monkeypatch.setitem(sys.modules, "sglang.srt.sampling.sampling_params", sampling_params_module)
 
 
 def test_sglang_hierarchy_and_normalize():
@@ -80,6 +77,8 @@ def test_sglang_local_executor_roundtrip(monkeypatch):
         outputs, out_rows = executor.take_ready_result()
         assert outputs == ["generated:hello"]
         assert out_rows.num_rows == 1
+        assert executor.sampling_params == {"max_new_tokens": 8}
+        assert executor.llm.generation_loops == [executor.llm.creation_loop]
     finally:
         executor.shutdown()
 
@@ -90,6 +89,7 @@ def test_sglang_local_executor_shutdown_releases_engine(monkeypatch):
 
     executor = SGLangLocalExecutor("test-model", {}, {})
     try:
+        executor._wait_for_engine_ready_blocking()
         assert executor.llm is not None
         assert executor.llm.shutdown_called is False
         executor.shutdown()
@@ -114,7 +114,33 @@ def test_sglang_generate_forwards_generate_args(monkeypatch):
         assert executor.wait_for_result()
         outputs, _out_rows = executor.take_ready_result()
         assert outputs == ["generated:hello"]
-        assert executor.llm.generate_calls[0][1] == {"return_logprob": True}
+        assert executor.llm.generate_calls[0][1] == {"max_new_tokens": 8}
+        assert executor.llm.generate_calls[0][2] == {"return_logprob": True}
+    finally:
+        executor.shutdown()
+
+
+def test_sglang_async_generation_can_overlap_on_engine_loop(monkeypatch):
+    _install_fake_sglang(monkeypatch)
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor("test-model", {}, {})
+    try:
+        rows = pa.table({"prompt": ["hello", "world"]})
+        executor.submit(None, ["hello", "world"], rows)
+        executor.finished_submitting()
+
+        outputs = []
+        while not executor.all_tasks_finished():
+            assert executor.wait_for_result()
+            result = executor.take_ready_result()
+            if result is not None:
+                ready_outputs, _out_rows = result
+                outputs.extend(ready_outputs)
+
+        assert sorted(outputs) == ["generated:hello", "generated:world"]
+        assert executor.llm.max_active_generations == 2
+        assert executor.llm.generation_loops == [executor.llm.creation_loop, executor.llm.creation_loop]
     finally:
         executor.shutdown()
 

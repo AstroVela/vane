@@ -12,9 +12,8 @@ SGLang engine hooks.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import threading
+from collections.abc import Mapping
 from typing import Any
 
 from vane.ai.provider import (
@@ -44,48 +43,35 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
 
     _engine_name = "sglang"
 
-    def _materialize_sampling_params(self, generate_args: dict[str, Any]) -> Any:
-        with _translate_missing_provider_dependency("sglang", "sglang"):
-            from sglang.srt.sampling.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                SamplingParams,
-            )
-
+    def _materialize_sampling_params(self, generate_args: dict[str, Any]) -> dict[str, Any]:
         sampling_params = generate_args.pop("sampling_params", None)
         if sampling_params is None:
-            return SamplingParams()
-        if isinstance(sampling_params, SamplingParams):
-            return sampling_params
+            return {}
         if isinstance(sampling_params, str):
             try:
                 sampling_params = json.loads(sampling_params)
             except json.JSONDecodeError as exc:
                 raise ValueError("sglang sampling_params JSON could not be parsed") from exc
-        if isinstance(sampling_params, dict):
-            return SamplingParams(**sampling_params)
-        raise TypeError("sglang sampling_params must be a dict, JSON string, or SamplingParams instance")
+        if isinstance(sampling_params, Mapping):
+            return dict(sampling_params)
+        raise TypeError("sglang sampling_params must be a mapping or JSON object")
 
     def _create_engine(self) -> None:
         with _translate_missing_provider_dependency("sglang", "sglang"):
             from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
         self.llm = Engine(model_path=self.model, **self.engine_args)
-        # SGLang's synchronous Engine drives a single internal event loop, so
-        # generation calls must be serialized across the executor's threads.
-        self._generate_lock = threading.Lock()
 
     async def _run_generate(self, prompt: str, request_id: str) -> str:
-        del request_id  # SGLang's offline Engine is synchronous; no per-request id.
-        output = await asyncio.to_thread(self._generate_sync, prompt)
+        del request_id  # SGLang's offline Engine does not require Vane's request id.
+        output = await self.llm.async_generate(
+            prompt=prompt,
+            sampling_params=self.sampling_params,
+            **self.generate_args,
+        )
         if output is None:
             raise _SafeProviderError("sglang returned no outputs")
         return self._extract_output_text(output)
-
-    def _generate_sync(self, prompt: str) -> Any:
-        # SGLang's sync Engine is not thread-safe: overlapping generate() calls
-        # on its internal event loop fail with an already-running loop. Serialize
-        # them and forward the remaining generate_args (return_logprob, etc.).
-        with self._generate_lock:
-            return self.llm.generate(prompt, self.sampling_params, **self.generate_args)
 
     def _shutdown_engine(self) -> None:
         # SGLang's offline Engine owns scheduler/detokenizer subprocesses and a
