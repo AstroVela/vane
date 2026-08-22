@@ -324,14 +324,18 @@ std::vector<std::string> QueryLifecycleCoordinator::OwnerQueryIds() const {
 	return owners;
 }
 
-bool QueryLifecycleCoordinator::WaitForShutdownLocked(std::unique_lock<std::mutex> &guard, const std::string &query_id,
-                                                      const char *operation) const {
+void QueryLifecycleCoordinator::EnsureTransitionAllowedLocked(const std::string &query_id,
+                                                              const char *operation) const {
 	if (!shutdown_started_) {
-		return true;
+		return;
 	}
-	condition_.wait(guard, [&]() { return !shutdown_running_; });
 	if (shutdown_finished_) {
-		return false;
+		throw std::runtime_error("cannot " + std::string(operation) + " FTE query after " + component_name_ +
+		                         " shutdown: " + query_id);
+	}
+	if (shutdown_running_) {
+		throw std::runtime_error("cannot " + std::string(operation) + " FTE query while " + component_name_ +
+		                         " is shutting down: " + query_id);
 	}
 	throw std::runtime_error("cannot " + std::string(operation) + " FTE query after " + component_name_ +
 	                         " shutdown failed: " + query_id);
@@ -396,9 +400,7 @@ std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::Begin
 	if (lifecycle->abort_attempt) {
 		return BeginAbortLocked(guard, lifecycle);
 	}
-	if (!WaitForShutdownLocked(guard, query_id, "abort")) {
-		return std::nullopt;
-	}
+	EnsureTransitionAllowedLocked(query_id, "abort");
 	return BeginAbortLocked(guard, lifecycle);
 }
 
@@ -445,9 +447,7 @@ QueryLifecycleCoordinator::BeginTeardown(const std::string &query_id) {
 		}
 		return std::nullopt;
 	}
-	if (!WaitForShutdownLocked(guard, query_id, "tear down")) {
-		return std::nullopt;
-	}
+	EnsureTransitionAllowedLocked(query_id, "tear down");
 	if (lifecycle->phase == Phase::OPEN) {
 		lifecycle->phase = Phase::CLOSING;
 	}

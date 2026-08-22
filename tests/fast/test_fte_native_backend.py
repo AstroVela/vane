@@ -3481,8 +3481,8 @@ def test_cxx_backend_drop_failure_preserves_replay_state_for_active_submit_until
         con.close()
 
 
-def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
-    """A drop joining shutdown must not report success before shutdown quiesces work."""
+def test_cxx_backend_drop_rejects_running_shutdown_without_waiting():
+    """A teardown must not wait on shutdown while its caller can block shutdown."""
     submit_started = threading.Event()
     allow_submit_return = threading.Event()
     shutdown_started = threading.Event()
@@ -3571,9 +3571,11 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
 
         drop_thread.start()
         assert drop_invoked.wait(timeout=5.0)
-        drop_thread.join(timeout=0.05)
-        assert drop_thread.is_alive()
+        drop_thread.join(timeout=5.0)
+        assert not drop_thread.is_alive()
         assert shutdown_thread.is_alive()
+        assert len(drop_errors) == 1
+        assert "cannot tear down FTE query while Python backend is shutting down" in str(drop_errors[0])
         assert vane.ray_cxx._lookup_query_connection_snapshot(query_id) is not None
 
         allow_submit_return.set()
@@ -3585,7 +3587,7 @@ def test_cxx_backend_drop_waits_for_shutdown_before_owner_state_cleanup():
         assert not shutdown_thread.is_alive()
         assert not drop_thread.is_alive()
         assert shutdown_errors == []
-        assert drop_errors == []
+        assert len(drop_errors) == 1
         assert len(run_errors) == 1
         assert "query is closing" in str(run_errors[0])
         assert backend.drop_calls == []

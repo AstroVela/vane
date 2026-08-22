@@ -134,8 +134,7 @@ private:
 	std::shared_ptr<LifecycleState> ResolveOwnerLocked(const std::string &owner_query_id) const;
 	std::shared_ptr<LifecycleState> CreateLifecycleLocked(const std::string &owner_query_id);
 	void BindQueryLocked(const std::shared_ptr<LifecycleState> &lifecycle, const std::string &query_id);
-	bool WaitForShutdownLocked(std::unique_lock<std::mutex> &guard, const std::string &query_id,
-	                           const char *operation) const;
+	void EnsureTransitionAllowedLocked(const std::string &query_id, const char *operation) const;
 	static void EnsureAttemptLeader(const Attempt &attempt, const std::string &operation,
 	                                const std::string &owner_query_id);
 	void WaitForAttemptLocked(std::unique_lock<std::mutex> &guard, const std::shared_ptr<Attempt> &attempt,
