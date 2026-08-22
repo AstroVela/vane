@@ -23,8 +23,7 @@
 #include "duckdb/main/relation/table_function_relation.hpp"
 #include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/main/relation/create_view_relation.hpp"
-#include "duckdb/main/relation/write_csv_relation.hpp"
-#include "duckdb/main/relation/write_parquet_relation.hpp"
+#include "duckdb/main/relation/write_file_relation.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -993,7 +992,7 @@ void Relation::Create(const string &catalog_name, const string &schema_name, con
 }
 
 shared_ptr<Relation> Relation::WriteCSVRel(const string &csv_file, case_insensitive_map_t<vector<Value>> options) {
-	return make_shared_ptr<duckdb::WriteCSVRelation>(shared_from_this(), csv_file, std::move(options));
+	return WriteFileRel(csv_file, "csv", std::move(options));
 }
 
 void Relation::WriteCSV(const string &csv_file, case_insensitive_map_t<vector<Value>> options) {
@@ -1007,9 +1006,7 @@ void Relation::WriteCSV(const string &csv_file, case_insensitive_map_t<vector<Va
 
 shared_ptr<Relation> Relation::WriteParquetRel(const string &parquet_file,
                                                case_insensitive_map_t<vector<Value>> options) {
-	auto write_parquet =
-	    make_shared_ptr<duckdb::WriteParquetRelation>(shared_from_this(), parquet_file, std::move(options));
-	return std::move(write_parquet);
+	return WriteFileRel(parquet_file, "parquet", std::move(options));
 }
 
 void Relation::WriteParquet(const string &parquet_file, case_insensitive_map_t<vector<Value>> options) {
@@ -1017,6 +1014,20 @@ void Relation::WriteParquet(const string &parquet_file, case_insensitive_map_t<v
 	auto res = write_parquet->Execute();
 	if (res->HasError()) {
 		const string prepended_message = "Failed to write '" + parquet_file + "': ";
+		res->ThrowError(prepended_message);
+	}
+}
+
+shared_ptr<Relation> Relation::WriteFileRel(const string &file_path, const string &format,
+                                            case_insensitive_map_t<vector<Value>> options) {
+	return make_shared_ptr<duckdb::WriteFileRelation>(shared_from_this(), file_path, format, std::move(options));
+}
+
+void Relation::WriteFile(const string &file_path, const string &format, case_insensitive_map_t<vector<Value>> options) {
+	auto write_file = WriteFileRel(file_path, format, std::move(options));
+	auto res = write_file->Execute();
+	if (res->HasError()) {
+		const string prepended_message = "Failed to write '" + file_path + "' as '" + format + "': ";
 		res->ThrowError(prepended_message);
 	}
 }

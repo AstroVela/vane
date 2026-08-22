@@ -1133,7 +1133,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	const bool is_write_relation =
 	    rel->type == RelationType::CREATE_TABLE_RELATION || rel->type == RelationType::INSERT_RELATION ||
 	    rel->type == RelationType::DELETE_RELATION || rel->type == RelationType::UPDATE_RELATION ||
-	    rel->type == RelationType::WRITE_CSV_RELATION || rel->type == RelationType::WRITE_PARQUET_RELATION;
+	    rel->type == RelationType::WRITE_FILE_RELATION;
 	if (require_auto_commit) {
 		if (!rel->context) {
 			throw duckdb::InternalException("Cannot validate distributed write transaction: relation has no context");

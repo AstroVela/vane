@@ -1523,3 +1523,22 @@ TEST_CASE("Distinct removes virtual columns from inherited relation bindings", "
 	REQUIRE_NOTHROW(result = named_rowid->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
 }
+
+TEST_CASE("Generic file relation uses a registered COPY format", "[relation_api][copy]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto output_path = TestCreatePath("generic_write_file_relation.csv");
+	auto source = con.RelationFromQuery("SELECT 1 AS value UNION ALL SELECT 2 AS value", "source");
+	case_insensitive_map_t<duckdb::vector<Value>> options;
+	options["header"] = {Value::BOOLEAN(true)};
+
+	auto write = source->WriteFileRel(output_path, "csv", std::move(options));
+	REQUIRE(write->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE(write->ToString(0).find("Write To CSV") != string::npos);
+	REQUIRE(source->WriteCSVRel(output_path + ".alias.csv")->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE(source->WriteParquetRel(output_path + ".alias.parquet")->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE_NO_FAIL(write->Execute());
+
+	auto result = con.Query("SELECT value FROM read_csv_auto('" + output_path + "') ORDER BY value");
+	REQUIRE(CHECK_COLUMN(result, 0, {1, 2}));
+}

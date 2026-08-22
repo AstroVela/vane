@@ -54,6 +54,10 @@ static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	    py::arg("per_thread_output") = py::none(), py::arg("use_tmp_file") = py::none(),
 	    py::arg("partition_by") = py::none(), py::arg("write_partition_columns") = py::none());
 
+	DefineMethod({"to_file", "write_file"}, m, &DuckDBPyRelation::ToFile,
+	             "Write the relation object with a registered DuckDB COPY format", py::arg("file_name"), py::kw_only(),
+	             py::arg("format"));
+
 	m.def("fetchone", &DuckDBPyRelation::FetchOne, "Execute and fetch a single row as a tuple")
 	    .def("fetchmany", &DuckDBPyRelation::FetchMany, "Execute and fetch the next set of rows as a list of tuples",
 	         py::arg("size") = 1)

@@ -36,6 +36,7 @@ add_library_unity(
   value_relation.cpp
   materialized_relation.cpp
   view_relation.cpp
+  write_file_relation.cpp
   write_parquet_relation.cpp
   write_csv_relation.cpp
   unnest_relation.cpp)
