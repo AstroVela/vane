@@ -32,6 +32,7 @@
 #include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/main/relation/unnest_relation.hpp"
 #include "duckdb/main/relation/update_relation.hpp"
+#include "duckdb/main/relation/data_sink_relation.hpp"
 #include "vane_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
@@ -305,6 +306,12 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &n
 		num_partitions = num_partitions_obj.cast<idx_t>();
 	}
 	return DeriveRelation(rel->LocalExchange(num_partitions));
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {
+	AssertRelation();
+	(void)rel->context->GetContext();
+	return DeriveRelation(make_shared_ptr<DataSinkRelation>(rel, operation_id));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {

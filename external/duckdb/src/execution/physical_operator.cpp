@@ -30,6 +30,7 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
 #include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -837,6 +838,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			throw SerializationException("distributed extension write plan must not transport a runtime task context");
 		}
 		return std::move(result);
+	}
+	case PhysicalOperatorType::DATA_SINK: {
+		auto operation_id = deserializer.ReadProperty<string>(103, "operation_id");
+		return make_uniq<PhysicalDataSink>(physical_plan, std::move(types), std::move(operation_id),
+		                                   estimated_cardinality);
 	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");

@@ -40,6 +40,7 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
@@ -414,6 +415,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 			auto &batch_op = static_cast<PhysicalBatchCopyToFile &>(op);
 			node_impl = TranslateBatchCopyToFile(batch_op, children);
 		}
+		break;
+	}
+	case PhysicalOperatorType::DATA_SINK: {
+		auto &data_sink = static_cast<PhysicalDataSink &>(op);
+		node_impl = TranslateDataSink(data_sink, children);
 		break;
 	}
 	case PhysicalOperatorType::EXTENSION: {

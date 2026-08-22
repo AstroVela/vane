@@ -35,6 +35,17 @@ static void InitializeReadOnlyProperties(py::class_<DuckDBPyRelation> &m) {
 static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	m.def("execute", &DuckDBPyRelation::Execute, "Transform the relation into a result set")
 	    .def("close", &DuckDBPyRelation::Close, "Closes the result");
+	m.def(
+	    "write_datasink",
+	    [](py::object self, py::object sink, py::object operation_id) {
+		    auto write_datasink = py::module_::import("vane.datasink").attr("write_datasink");
+		    if (operation_id.is_none()) {
+			    return write_datasink(self, sink);
+		    }
+		    return write_datasink(self, sink, py::arg("operation_id") = operation_id);
+	    },
+	    "Execute the relation into a Python DataSink and return its WriteSummary", py::arg("sink"), py::kw_only(),
+	    py::arg("operation_id") = py::none());
 
 	DefineMethod({"to_parquet", "write_parquet"}, m, &DuckDBPyRelation::ToParquet,
 	             "Write the relation object to a Parquet file in 'file_name'", py::arg("file_name"), py::kw_only(),
@@ -312,6 +323,7 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 
 	relation_module.def("filter", &DuckDBPyRelation::Filter, "Filter the relation object by the filter in filter_expr",
 	                    py::arg("filter_expr"));
+	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
 	relation_module.def(
 	    "map_batches",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,

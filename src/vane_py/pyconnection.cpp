@@ -32,6 +32,7 @@
 #include "duckdb/main/relation/read_json_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/view_relation.hpp"
+#include "duckdb/planner/operator/logical_data_sink.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
@@ -3124,6 +3125,7 @@ static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database
 	}
 
 	DBConfig config(read_only);
+	OperatorExtension::Register(config, make_shared_ptr<DataSinkOperatorExtension>());
 	config.AddExtensionOption("pandas_analyze_sample",
 	                          "The maximum number of rows to sample when analyzing a pandas object column.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(1000));

@@ -2825,6 +2825,155 @@ struct PyPhysicalPlanWrapperRunner {
 		}
 	}
 
+	py::dict run_datasink_plan(const PyPhysicalPlanWrapper &plan,
+	                           duckdb::shared_ptr<duckdb::ClientContext> client_context = nullptr,
+	                           duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
+	                               duckdb::distributed::python::ray::SafePyObject(),
+	                           duckdb::distributed::python::ray::SafePyObject on_execution_started =
+	                               duckdb::distributed::python::ray::SafePyObject()) {
+		using namespace duckdb::distributed;
+		(void)py_conn_keepalive;
+		bool query_owner_registered = false;
+		bool cleanup_done = false;
+		bool execution_started = false;
+		string operation_id;
+		std::exception_ptr cleanup_error;
+		auto exception_message = [](const std::exception_ptr &error) {
+			try {
+				std::rethrow_exception(error);
+			} catch (const std::exception &ex) {
+				return string(ex.what());
+			} catch (...) {
+				return string("unknown exception");
+			}
+		};
+		auto cleanup = [&]() {
+			if (cleanup_done) {
+				return;
+			}
+			cleanup_done = true;
+			if (!query_owner_registered) {
+				return;
+			}
+			try {
+				drop_query_fragments(plan.idx());
+			} catch (...) {
+				cleanup_error = std::current_exception();
+			}
+		};
+		auto unknown_result = [&](string error) {
+			py::dict out;
+			out["operation_id"] = py::str(operation_id);
+			out["write_results"] = py::list();
+			out["outcome_aborted"] = py::bool_(false);
+			out["outcome_unknown"] = py::bool_(true);
+			out["outcome_error"] = py::str(std::move(error));
+			py::list cleanup_warnings;
+			if (cleanup_error) {
+				cleanup_warnings.append("native DataSink fragment cleanup failed: " + exception_message(cleanup_error));
+			}
+			out["data_sink_cleanup_warnings"] = std::move(cleanup_warnings);
+			return out;
+		};
+
+		try {
+			const bool replay_state_created = RegisterQueryPythonReplayState(
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			try {
+				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
+			} catch (...) {
+				if (!query_owner_registered && replay_state_created) {
+					CleanupQueryPythonReplayState(plan.resource_query_id_);
+				}
+				throw;
+			}
+			query_owner_registered = true;
+			if (!plan.plan_ || !plan.plan_->physical_plan() || !plan.plan_->physical_plan()->HasRoot()) {
+				throw py::value_error("DistributedPhysicalPlan for DataSink has no physical root");
+			}
+			auto &physical_root = plan.plan_->physical_plan()->Root();
+			if (physical_root.type != PhysicalOperatorType::DATA_SINK) {
+				throw py::value_error("DistributedPhysicalPlan for DataSink must have a DATA_SINK root");
+			}
+			operation_id = physical_root.Cast<PhysicalDataSink>().operation_id;
+
+			auto runner = std::make_shared<PlanRunner>(worker_manager_, client_context);
+			DuckDBResult<PlanRunner::PlanResult> plan_result;
+			{
+				py::gil_scoped_release release;
+				auto publish_execution_started = [&]() {
+					execution_started = true;
+					if (!on_execution_started.has_value()) {
+						return;
+					}
+					py::gil_scoped_acquire acquire;
+					on_execution_started.get()();
+				};
+				plan_result = runner->run_plan(plan.plan_, {}, publish_execution_started);
+			}
+			if (plan_result.is_err()) {
+				rethrow_submission_error(plan.idx(), plan_result.error().what());
+				throw py::value_error(plan_result.error().what());
+			}
+			auto finalized = std::move(plan_result).value();
+			if (finalized.tag != PlanRunner::PlanResult::DATA_SINK) {
+				throw py::value_error("run_plan did not return a DataSink result for a DataSink plan");
+			}
+
+			vector<string> post_execution_warnings;
+			try {
+				rethrow_submission_error(plan.idx());
+			} catch (...) {
+				post_execution_warnings.push_back("native DataSink post-execution submission state failed: " +
+				                                  exception_message(std::current_exception()));
+			}
+			py::dict out;
+			out["operation_id"] = py::str(finalized.data_sink_result.operation_id);
+			out["outcome_aborted"] = py::bool_(finalized.data_sink_result.outcome_aborted);
+			out["outcome_unknown"] = py::bool_(finalized.data_sink_result.outcome_unknown);
+			out["outcome_error"] = py::str(finalized.data_sink_result.outcome_error);
+			py::list write_results;
+			auto json_loads = py::module_::import("json").attr("loads");
+			for (const auto &result : finalized.data_sink_result.write_results) {
+				py::dict item;
+				item["operation_id"] = py::str(result.operation_id);
+				item["state"] = py::str(result.state);
+				item["rows_received"] = py::int_(result.rows_received);
+				item["rows_affected"] = result.rows_affected.IsNull()
+				                            ? py::object(py::none())
+				                            : py::object(py::int_(result.rows_affected.GetValue<uint64_t>()));
+				item["bytes_received"] = py::int_(result.bytes_received);
+				item["metadata"] = json_loads(result.metadata_json);
+				item["warnings"] = json_loads(result.warnings_json);
+				write_results.append(std::move(item));
+			}
+			out["write_results"] = std::move(write_results);
+			cleanup();
+			py::list cleanup_warnings;
+			for (const auto &warning : post_execution_warnings) {
+				cleanup_warnings.append(warning);
+			}
+			if (cleanup_error) {
+				cleanup_warnings.append("native DataSink fragment cleanup failed: " + exception_message(cleanup_error));
+			}
+			out["data_sink_cleanup_warnings"] = std::move(cleanup_warnings);
+			return out;
+		} catch (...) {
+			auto execution_error = std::current_exception();
+			cleanup();
+			if (execution_started) {
+				return unknown_result("distributed DataSink result handling failed after execution started: " +
+				                      exception_message(execution_error));
+			}
+			if (cleanup_error) {
+				throw std::runtime_error(
+				    "distributed DataSink setup and teardown both failed: setup=" + exception_message(execution_error) +
+				    "; teardown=" + exception_message(cleanup_error));
+			}
+			std::rethrow_exception(execution_error);
+		}
+	}
+
 	py::object finalize_copy_impl(py::list file_infos_py, py::str copy_spec_key, py::str,
 	                              duckdb::shared_ptr<duckdb::ClientContext> client_context = nullptr) {
 		using namespace duckdb::distributed;

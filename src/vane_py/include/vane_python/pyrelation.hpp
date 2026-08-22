@@ -66,6 +66,7 @@ public:
 	unique_ptr<DuckDBPyRelation> Limit(int64_t n, int64_t offset = 0);
 	unique_ptr<DuckDBPyRelation> Repartition(const py::args &args, const py::kwargs &kwargs);
 	unique_ptr<DuckDBPyRelation> LocalExchange(const py::object &num_partitions);
+	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 

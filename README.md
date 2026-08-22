@@ -173,6 +173,7 @@ local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckD
 
 ### More Resources
 
+- [Python DataSink contract](DATASINKS.md)
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
 - [Production deployment](https://vane.astrovela.ai/docs/data/deploy/deployment)
 

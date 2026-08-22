@@ -47,6 +47,12 @@ class DistributedPhysicalPlanRunner:
         conn: object | None = ...,
         on_execution_started: Callable[[], None] | None = ...,
     ) -> dict[str, Any]: ...
+    def run_datasink_plan(
+        self,
+        plan: DistributedPhysicalPlan,
+        conn: object | None = ...,
+        on_execution_started: Callable[[], None] | None = ...,
+    ) -> dict[str, Any]: ...
     def finalize_copy(
         self,
         file_infos: list[Any],

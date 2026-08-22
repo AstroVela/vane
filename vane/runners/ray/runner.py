@@ -181,6 +181,19 @@ class RayRunner(Runner):
         # Send PyLogicalPlan to Driver — Driver will create physical plan
         return client.run_copy_plan(logical_plan)
 
+    def run_datasink(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
+        """Execute one distributed Python DataSink query."""
+
+        PyLogicalPlan = require_ray_cxx_attr(
+            "PyLogicalPlan",
+            hint="Ensure the C++ ray extension is built and importable in worker processes.",
+        )
+        query_id = str(uuid.uuid4())
+        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        session_id = str(logical_plan.session_id())
+        client = self._client_for_session(session_id)
+        return client.run_datasink_plan(logical_plan)
+
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
         """Retry cleanup for a committed write without executing the write again."""
         with self._session_lock:

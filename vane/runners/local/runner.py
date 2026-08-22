@@ -551,3 +551,147 @@ class LocalRunner(Runner):
             if write_succeeded and primary_error is None and cleanup_errors:
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
+
+    def run_datasink(self, relation: Any) -> dict[str, Any]:
+        """Execute one immediate, idempotent DataSink with the local FTE backend."""
+
+        import vane
+
+        _preload_arrow_dataset_imports()
+        PyLogicalPlan = require_ray_cxx_attr("PyLogicalPlan")
+        DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
+
+        query_id = str(uuid.uuid4())
+        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        conn = vane.connect()
+        fragment_executor = _InProcessFragmentExecutor()
+        backend = NativeFteWorkerManagerBackend(
+            execute_fn=fragment_executor,
+            num_workers=self.num_workers,
+            max_running_tasks=self.max_running_tasks,
+        )
+        udf_actor_pools: list[Any] = []
+        renderer = None
+        result: dict[str, Any] | None = None
+        progress_diagnostics: list[tuple[str, BaseException]] = []
+
+        def format_warning(stage: str, error: BaseException) -> str:
+            try:
+                message = str(error)
+            except BaseException:
+                message = "<error message unavailable>"
+            return f"{stage} failed: {type(error).__name__}: {message}"
+
+        def append_warning(stage: str, error: BaseException) -> None:
+            if result is None:
+                return
+            raw_warnings = result.get("data_sink_cleanup_warnings", ())
+            warnings = [raw_warnings] if isinstance(raw_warnings, str) and raw_warnings else []
+            if not isinstance(raw_warnings, str) and isinstance(raw_warnings, (list, tuple)):
+                warnings.extend(str(warning) for warning in raw_warnings)
+            warnings.append(format_warning(stage, error))
+            result["data_sink_cleanup_warnings"] = warnings
+
+        try:
+            physical_plan = logical_plan.to_physical_plan(conn)
+            from vane.execution.udf_subprocess import ensure_local_subprocess_actor_pools_for_plan
+
+            udf_actor_pools, _ = ensure_local_subprocess_actor_pools_for_plan(physical_plan, conn=conn)
+            fragment_executor.retain_resources(conn, *udf_actor_pools)
+            plan_runner = DistributedPhysicalPlanRunner(backend)
+            started_at = time.time()
+            if progress_enabled("local"):
+                renderer = ProgressRenderer(lambda: self._progress_snapshot(backend, query_id, started_at))
+
+            def execute_datasink() -> dict[str, Any]:
+                native_result = plan_runner.run_datasink_plan(physical_plan, conn)
+                if not isinstance(native_result, dict):
+                    raise TypeError("DistributedPhysicalPlanRunner.run_datasink_plan() must return a dict")
+                return native_result
+
+            write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vane-local-fte-datasink")
+            try:
+                future = write_executor.submit(execute_datasink)
+                if renderer is None:
+                    result = future.result()
+                else:
+                    progress_updates_enabled = True
+                    while True:
+                        try:
+                            result = future.result(timeout=renderer.interval_s)
+                            break
+                        except TimeoutError:
+                            if future.done():
+                                result = future.result()
+                                break
+                            if progress_updates_enabled:
+                                try:
+                                    renderer.update()
+                                except BaseException as progress_error:
+                                    progress_diagnostics.append(("DataSink progress update", progress_error))
+                                    progress_updates_enabled = False
+                    if progress_updates_enabled:
+                        try:
+                            renderer.update(force=True)
+                        except BaseException as progress_error:
+                            progress_diagnostics.append(("DataSink progress update", progress_error))
+                    for stage, progress_error in progress_diagnostics:
+                        append_warning(stage, progress_error)
+            finally:
+                primary_error = sys.exc_info()[1]
+                if result is None and primary_error is not None and hasattr(primary_error, "add_note"):
+                    for stage, progress_error in progress_diagnostics:
+                        primary_error.add_note(format_warning(stage, progress_error))
+                finalization_error: BaseException | None = None
+                try:
+                    write_executor.shutdown(wait=True)
+                except BaseException as shutdown_error:
+                    if result is not None:
+                        append_warning("DataSink executor shutdown", shutdown_error)
+                    elif primary_error is not None:
+                        if hasattr(primary_error, "add_note"):
+                            primary_error.add_note(format_warning("DataSink executor shutdown", shutdown_error))
+                    else:
+                        finalization_error = shutdown_error
+                if renderer is not None:
+                    try:
+                        renderer.finish(final_state="FINISHED" if result is not None else None)
+                    except BaseException as progress_error:
+                        if result is not None:
+                            append_warning("DataSink progress finalization", progress_error)
+                        elif primary_error is not None:
+                            if hasattr(primary_error, "add_note"):
+                                primary_error.add_note(format_warning("DataSink progress finalization", progress_error))
+                        elif finalization_error is None:
+                            finalization_error = progress_error
+                        elif hasattr(finalization_error, "add_note"):
+                            finalization_error.add_note(
+                                format_warning("DataSink progress finalization", progress_error)
+                            )
+                if finalization_error is not None:
+                    raise finalization_error
+        finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_errors = _shutdown_local_write_resources(
+                backend,
+                fragment_executor,
+                conn,
+                udf_actor_pools,
+                kill_actor_pools=result is None or result.get("outcome_unknown") is True,
+                timeout_s=fragment_executor.close_timeout_s,
+            )
+            if result is not None:
+                for cleanup_error in cleanup_errors:
+                    append_warning("DataSink local resource shutdown", cleanup_error)
+            elif primary_error is not None and hasattr(primary_error, "add_note"):
+                for cleanup_error in cleanup_errors:
+                    primary_error.add_note(format_warning("DataSink local resource shutdown", cleanup_error))
+            elif cleanup_errors:
+                details = "; ".join(
+                    format_warning("DataSink local resource shutdown", error) for error in cleanup_errors
+                )
+                raise RuntimeError(f"failed to shut down local DataSink resources: {details}") from cleanup_errors[0]
+
+        if result is None:
+            raise RuntimeError("local DataSink execution completed without a result")
+        return result
