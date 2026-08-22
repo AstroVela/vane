@@ -95,6 +95,20 @@ case_insensitive_map_t<CopyOption> Binder::GetFullCopyOptionsList(const CopyFunc
 
 BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &function, CopyToType copy_to_type) {
 	if (function.plan) {
+		auto &copy_info = *stmt.info;
+		if (copy_info.select_relation) {
+			// COPY plan rewrites operate on a parsed query tree. Only normalize a
+			// relation-backed source when that representation is faithful: silently
+			// converting a non-SQL relation could discard exchange or binding state.
+			copy_info.select_statement = copy_info.select_relation->TryGetSerializableQueryNode(*this);
+			if (!copy_info.select_statement) {
+				throw NotImplementedException(
+				    "COPY TO FORMAT \"%s\" uses a plan rewrite and cannot consume a relation source that has "
+				    "no faithful SQL query-node representation",
+				    copy_info.format);
+			}
+			copy_info.select_relation.reset();
+		}
 		// plan rewrite COPY TO
 		return function.plan(*this, stmt);
 	}

@@ -28,6 +28,7 @@ BoundStatement WriteFileRelation::Bind(Binder &binder) {
 	info->is_from = false;
 	info->file_path = file_path;
 	info->format = format;
+	info->is_format_auto_detected = false;
 	info->options = options;
 	copy.info = std::move(info);
 	return binder.Bind(copy.Cast<SQLStatement>());

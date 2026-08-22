@@ -110,6 +110,35 @@ def test_write_file_with_unset_runner_dispatches_generic_copy_relation(tmp_path,
     assert not target.exists()
 
 
+def test_write_file_json_with_unset_runner_builds_distributed_plan(tmp_path, monkeypatch):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    import vane
+
+    logical_plans = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            logical_plans.append(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+                    relation,
+                    "generic-json-copy-relation",
+                )
+            )
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    target = tmp_path / "distributed.json"
+    connection = vane.connect()
+    connection.sql("select 1 as id, 'alpha' as label").write_file(str(target), format="json")
+
+    assert len(logical_plans) == 1
+    assert logical_plans[0] is not None
+    assert not target.exists()
+
+
 @pytest.mark.parametrize("runner_value", [None, "", "ray"])
 def test_relation_mutations_dispatch_ray_without_local_execution(monkeypatch, runner_value):
     if runner_value is None:
@@ -403,6 +432,34 @@ def test_write_file_with_local_fast_runner(tmp_path, monkeypatch):
     conn.sql("select 1 as x union all select 2 as x").write_file(str(target), format="csv")
 
     assert conn.sql(f"select * from read_csv('{target}') order by 1").fetchall() == [(1,), (2,)]
+
+
+def test_write_file_json_with_local_fast_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    conn = vane.connect()
+    target = tmp_path / "out.json"
+    conn.sql("select 1 as id, 'alpha' as label union all select 2 as id, 'beta' as label").write_file(
+        str(target), format="json"
+    )
+
+    assert conn.sql(f"select id, label from read_json_auto('{target}') order by id").fetchall() == [
+        (1, "alpha"),
+        (2, "beta"),
+    ]
+
+
+def test_write_file_rejects_unknown_explicit_format_before_creating_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    conn = vane.connect()
+    target = tmp_path / "unknown.out"
+    with pytest.raises(Exception, match="(?i)copy function.*jsno"):
+        conn.sql("select 1 as value").write_file(str(target), format="jsno")
+
+    assert not target.exists()
 
 
 def test_invalid_runner_env_raises_clear_error(monkeypatch):

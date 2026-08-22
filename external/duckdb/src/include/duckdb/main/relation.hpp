@@ -308,6 +308,7 @@ protected:
 	}
 
 private:
+	friend class Binder;
 	friend class ClientContext;
 	friend class DuckDBPyRelation;
 	friend class RelationStatement;
