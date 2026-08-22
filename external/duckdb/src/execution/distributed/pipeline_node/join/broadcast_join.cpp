@@ -338,8 +338,7 @@ SubmittableTaskStream<WorkerTask> BroadcastJoinNode::produce_tasks(PlanExecution
 		// Build sink plan builder using AddRemoteExchangeSinkPlan (shared with repartition)
 		auto plan_builder = [num_partitions, exchange, exchange_mgr](DuckPhysicalPlanRef plan) {
 			auto repartition_spec = RepartitionSpec::create_into_partitions(num_partitions);
-			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, *exchange,
-			                                 ExchangeSinkIdentitySource::TASK, optional_idx(), exchange_mgr);
+			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, *exchange, exchange_mgr);
 		};
 		auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
 		auto first_with_sink =

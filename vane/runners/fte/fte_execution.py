@@ -151,6 +151,7 @@ class FteTaskPartition:
         *,
         max_attempts: int = 4,
         sink_handle: ExchangeSinkHandle | None = None,
+        exchange_sink_task_partition_id: int | None = None,
         node_requirements: NodeRequirements | None = None,
         memory_requirement_bytes: int | None = None,
         execution_class: FteTaskExecutionClass | str | None = None,
@@ -164,6 +165,17 @@ class FteTaskPartition:
         self.max_attempts = int(max_attempts)
         self.remaining_attempts = int(max_attempts)
         self.sink_handle = sink_handle
+        self.exchange_sink_task_partition_id = (
+            None
+            if exchange_sink_task_partition_id is None
+            else _check_non_negative("exchange_sink_task_partition_id", exchange_sink_task_partition_id)
+        )
+        if self.sink_handle is not None and self.exchange_sink_task_partition_id is not None:
+            raise ValueError(
+                "partition cannot use both a tracked exchange sink handle and a native exchange sink identity"
+            )
+        if (self.descriptor.exchange_sink_config is None) != (self.exchange_sink_task_partition_id is None):
+            raise ValueError("native exchange sink config and scheduler-owned task identity must be set together")
         self.node_requirements = node_requirements
         self.memory_requirement_bytes = (
             None if memory_requirement_bytes is None else max(0, int(memory_requirement_bytes))
@@ -624,6 +636,8 @@ class FteFragmentExecution:
         )
         if self.exchange is not None and self.exchange_sink_config is not None:
             raise ValueError("FteFragmentExecution cannot use both an exchange tracker and exchange_sink_config")
+        if self.exchange_sink_config is not None and self.logical_fragment_identity is None:
+            raise ValueError("exchange sink requires a stable logical fragment identity")
         explicit_execution_class = fte_task_execution_class_metadata_present(
             self.context,
             self.resource_request,
@@ -678,9 +692,21 @@ class FteFragmentExecution:
         task_id = FteTaskId(self.query_id, self.fragment_execution_id, partition_id)
         if self.exchange is None:
             sink_handle = None
+            exchange_sink_task_partition_id = None
+            if self.exchange_sink_config is not None:
+                logical_fragment_identity = self.logical_fragment_identity
+                if logical_fragment_identity is None:
+                    raise ValueError("exchange sink requires a stable logical fragment identity")
+                exchange_sink_task_partition_id, identity_key = _stable_fte_task_identity(
+                    logical_fragment_identity,
+                    partition_id,
+                )
+                if self.stable_task_identity_callback is not None:
+                    self.stable_task_identity_callback(exchange_sink_task_partition_id, identity_key)
         else:
             with self._exchange_lock:
                 sink_handle = self.exchange.add_sink(partition_id)
+            exchange_sink_task_partition_id = None
         descriptor = TaskDescriptor(
             task_id,
             self.fragment_id,
@@ -699,6 +725,7 @@ class FteFragmentExecution:
             descriptor,
             max_attempts=self.max_attempts,
             sink_handle=sink_handle,
+            exchange_sink_task_partition_id=exchange_sink_task_partition_id,
             node_requirements=node_requirements,
             memory_requirement_bytes=self.task_memory_bytes,
             execution_class=self.execution_class,
@@ -1896,24 +1923,16 @@ class FteFragmentExecution:
             raise RuntimeError("FTE attempt mutation requires the fragment state lock")
         if self.partitions.get(partition.task_id.partition_id) is not partition:
             raise ValueError(f"partition {partition.task_id} does not belong to this fragment execution")
-        sink_instance = None
+        sink_instance: Any = None
         if self.exchange is None and partition.descriptor.exchange_sink_config is not None:
             sink_config = normalize_exchange_sink_config(partition.descriptor.exchange_sink_config)
-            runtime_task_partition_id = None
-            if sink_config["identity_source"] == "task":
-                logical_fragment_identity = self.logical_fragment_identity
-                if logical_fragment_identity is None:
-                    raise ValueError("task-identity exchange sink requires a stable logical fragment identity")
-                runtime_task_partition_id, identity_key = _stable_fte_task_identity(
-                    logical_fragment_identity,
-                    partition.task_id.partition_id,
-                )
-                if self.stable_task_identity_callback is not None:
-                    self.stable_task_identity_callback(runtime_task_partition_id, identity_key)
+            scheduler_task_partition_id = partition.exchange_sink_task_partition_id
+            if scheduler_task_partition_id is None:
+                raise RuntimeError("exchange sink partition is missing its scheduler-owned task identity")
             sink_instance = bind_exchange_sink_instance(
                 sink_config,
                 attempt_id=partition.next_attempt_number(),
-                task_partition_id=runtime_task_partition_id,
+                task_partition_id=scheduler_task_partition_id,
             )
         worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:

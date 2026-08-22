@@ -6934,11 +6934,10 @@ def test_remote_exchange_sink_executes_bound_attempt_without_exposing_result_col
                     if entry["kind"] == "exchange_source_task"
                 }
                 sink_config = task.exchange_sink_config()
-                task_partition_id = len(sink_results) if sink_config["identity_source"] == "task" else None
                 sink_instance = bind_exchange_sink_instance(
                     sink_config,
                     attempt_id=0,
-                    task_partition_id=task_partition_id,
+                    task_partition_id=len(sink_results),
                 )
                 sink_topologies.append(topology)
                 sink_results.append(

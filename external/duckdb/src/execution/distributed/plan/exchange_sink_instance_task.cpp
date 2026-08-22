@@ -44,10 +44,6 @@ bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const Exc
 	if (runtime_handle.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
 		return SetValidationError(error, "runtime exchange sink received an invalid task identity");
 	}
-	if (sink.SinkIdentitySource() == ExchangeSinkIdentitySource::PLAN &&
-	    runtime_handle.sink_handle.task_partition_id != sink.PlanTaskPartitionId().GetIndex()) {
-		return SetValidationError(error, "runtime exchange sink task identity does not match the plan");
-	}
 	const auto expected_output_location = sink.SinkOutputLocationPrefix() + "__sink_" +
 	                                      std::to_string(runtime_handle.sink_handle.task_partition_id) + "__attempt_" +
 	                                      std::to_string(runtime_handle.attempt_id);
@@ -58,17 +54,13 @@ bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const Exc
 }
 
 bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSinkInstanceHandle &sink_instance,
-                                         ExchangeSinkIdentitySource identity_source, std::string *error) {
+                                         std::string *error) {
 	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
 		auto *sample = dynamic_cast<PhysicalDistributedReservoirSample *>(&op);
 		if (!sample) {
 			return SetValidationError(error, "DISTRIBUTED_RESERVOIR_SAMPLE operator has an unexpected implementation");
 		}
 		if (sample->stage == DistributedReservoirSampleStage::LOCAL) {
-			if (identity_source != ExchangeSinkIdentitySource::TASK) {
-				return SetValidationError(
-				    error, "local distributed reservoir sample requires a task-derived exchange sink identity");
-			}
 			if (sink_instance.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
 				return SetValidationError(error,
 				                          "local distributed reservoir sample received an invalid task identity");
@@ -76,7 +68,7 @@ bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSin
 		}
 	}
 	for (auto &child : op.children) {
-		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, identity_source, error)) {
+		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, error)) {
 			return false;
 		}
 	}
@@ -91,7 +83,7 @@ bool ValidateExchangeSinkInstanceForOperator(PhysicalOperator &op, const Exchang
 			return SetValidationError(error, "EXCHANGE_SINK operator is not a PhysicalRemoteExchangeSink");
 		}
 		if (!ValidateRuntimeSinkHandle(*sink, sink_instance, error) ||
-		    !ValidateRuntimeTaskIndexForOperator(*sink, sink_instance, sink->SinkIdentitySource(), error)) {
+		    !ValidateRuntimeTaskIndexForOperator(*sink, sink_instance, error)) {
 			return false;
 		}
 		validated++;

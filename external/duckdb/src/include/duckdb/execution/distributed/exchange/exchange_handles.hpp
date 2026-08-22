@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,14 +30,7 @@ struct ExchangeContext {
 
 // ─── Sink Handles ────────────────────────────────────────
 
-enum class ExchangeSinkIdentitySource : uint8_t {
-	/// The physical plan carries a fixed task partition id.
-	PLAN = 0,
-	/// The task runner supplies the task partition id when it binds an attempt.
-	TASK = 1,
-};
-
-/// Identifies the logical sink for one task partition.
+/// Identifies the logical sink for one scheduler-owned task partition.
 struct ExchangeSinkHandle {
 	idx_t task_partition_id = DConstants::INVALID_INDEX;
 };

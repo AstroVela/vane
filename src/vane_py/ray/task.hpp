@@ -261,7 +261,7 @@ public:
 	// typed payload such as scan-split-batch bytes or exchange-source-task bytes.
 	py::dict Inputs() const;
 
-	// Return the static remote exchange sink binding configuration, if present.
+	// Return the static remote exchange sink configuration, if present.
 	py::object ExchangeSinkConfig() const;
 
 private:

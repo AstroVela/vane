@@ -1361,17 +1361,6 @@ py::object RayWorkerTask::ExchangeSinkConfig() const {
 		return py::none();
 	}
 	py::dict result;
-	switch (sink->SinkIdentitySource()) {
-	case duckdb::distributed::ExchangeSinkIdentitySource::PLAN:
-		result["identity_source"] = "plan";
-		result["plan_task_partition_id"] = sink->PlanTaskPartitionId().GetIndex();
-		break;
-	case duckdb::distributed::ExchangeSinkIdentitySource::TASK:
-		result["identity_source"] = "task";
-		break;
-	default:
-		throw py::value_error("exchange_sink_config has an invalid identity source");
-	}
 	result["output_partition_count"] = sink->NumPartitions();
 	result["query_id"] = sink->SinkQueryId();
 	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();

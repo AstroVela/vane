@@ -1483,7 +1483,6 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
                 }
             },
             exchange_sink_config={
-                "identity_source": "task",
                 "query_id": "query-sink-identity",
                 "output_partition_count": 1,
                 "output_location_prefix": "materialized",
@@ -1510,9 +1509,9 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
         physical_suffix="second",
     )
 
-    stable_identity = first_order["exchange_sink_instance"]["task_partition_id"]
-    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == stable_identity
-    assert different_source["exchange_sink_instance"]["task_partition_id"] != stable_identity
+    stable_identity = first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
+    assert different_source["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != stable_identity
     assert stable_identity != (4 << 32) | 7
     assert reversed_order["exchange_sink_instance"]["attempt_id"] == 2
     assert reversed_order["exchange_sink_instance"]["output_location"] == (
@@ -1543,7 +1542,6 @@ def test_native_worker_task_request_derives_stable_task_sink_identity_from_input
                 }
             },
             exchange_sink_config={
-                "identity_source": "task",
                 "query_id": "query-plan-derived",
                 "output_partition_count": 1,
                 "output_location_prefix": "shuffle",
@@ -1555,9 +1553,9 @@ def test_native_worker_task_request_derives_stable_task_sink_identity_from_input
     reversed_order = make_request(99, 41)
     different_source = make_request(7, 42)
 
-    first_identity = first_order["exchange_sink_instance"]["task_partition_id"]
-    assert reversed_order["exchange_sink_instance"]["task_partition_id"] == first_identity
-    assert different_source["exchange_sink_instance"]["task_partition_id"] != first_identity
+    first_identity = first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == first_identity
+    assert different_source["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != first_identity
     assert first_order["exchange_sink_instance"]["output_location"] == (f"shuffle__sink_{first_identity}__attempt_0")
 
 
@@ -1578,7 +1576,6 @@ def test_native_worker_task_request_distinguishes_scan_splits_by_stable_id():
                 }
             },
             exchange_sink_config={
-                "identity_source": "task",
                 "query_id": "query-duplicate-scan",
                 "output_partition_count": 1,
                 "output_location_prefix": "shuffle",
@@ -1591,12 +1588,12 @@ def test_native_worker_task_request_distinguishes_scan_splits_by_stable_id():
     repeated_occurrence = make_request("file-1", 98)
 
     assert (
-        first["exchange_sink_instance"]["task_partition_id"]
-        == same_logical_split["exchange_sink_instance"]["task_partition_id"]
+        first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        == same_logical_split["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
-        first["exchange_sink_instance"]["task_partition_id"]
-        != repeated_occurrence["exchange_sink_instance"]["task_partition_id"]
+        first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != repeated_occurrence["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
 
 
@@ -1615,7 +1612,6 @@ def test_native_worker_task_request_uses_explicit_static_source_partition_identi
                 "node_ids": [3, 4],
             },
             exchange_sink_config={
-                "identity_source": "task",
                 "query_id": "query-static-source",
                 "output_partition_count": 1,
                 "output_location_prefix": "shuffle",
@@ -1627,40 +1623,43 @@ def test_native_worker_task_request_uses_explicit_static_source_partition_identi
     reversed_order = make_request(99)
 
     assert (
-        reversed_order["exchange_sink_instance"]["task_partition_id"]
-        == (first_order["exchange_sink_instance"]["task_partition_id"])
+        reversed_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        == (first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"])
     )
 
 
-def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
-    task = _FakeNativeWorkerTask(
-        context={
-            "query_id": "query-plan-sink-identity",
-            "node_id": "3",
-            "fragment_execution_id": 4,
-            "attempt_id": 2,
-        },
-        task_context={
-            "query_idx": 0,
-            "last_node_id": 3,
-            "task_id": 7,
-            "node_ids": [3],
-        },
-        exchange_sink_config={
-            "identity_source": "plan",
-            "plan_task_partition_id": 5,
-            "query_id": "query-plan-sink-identity",
-            "output_partition_count": 1,
-            "output_location_prefix": "range",
-        },
-    )
+def test_native_worker_task_request_uses_scheduler_identity_for_source_free_sink():
+    def make_request(task_id: int, attempt_id: int) -> dict[str, Any]:
+        task = _FakeNativeWorkerTask(
+            context={
+                "query_id": "query-source-free-sink",
+                "node_id": "3",
+                "fragment_execution_id": 4,
+                "attempt_id": attempt_id,
+            },
+            task_context={
+                "query_idx": 0,
+                "last_node_id": 3,
+                "task_id": task_id,
+                "node_ids": [3],
+            },
+            exchange_sink_config={
+                "query_id": "query-source-free-sink",
+                "output_partition_count": 1,
+                "output_location_prefix": "range",
+            },
+        )
+        return NativeFteWorkerManagerBackend._request_from_task(task)
 
-    request = NativeFteWorkerManagerBackend._request_from_task(task)
+    first = make_request(7, 0)
+    retry = make_request(7, 2)
+    other_task = make_request(8, 0)
 
-    assert request["exchange_sink_instance"]["attempt_id"] == 2
-    assert request["exchange_sink_instance"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["output_location"] == "range__sink_5__attempt_2"
+    stable_identity = first["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert retry["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
+    assert other_task["exchange_sink_instance"]["sink_handle"]["task_partition_id"] != stable_identity
+    assert retry["exchange_sink_instance"]["attempt_id"] == 2
+    assert retry["exchange_sink_instance"]["output_location"] == f"range__sink_{stable_identity}__attempt_2"
 
 
 def test_native_worker_manager_rejects_stable_task_identity_collisions():
@@ -1669,12 +1668,12 @@ def test_native_worker_manager_rejects_stable_task_identity_collisions():
     requests = [
         {
             "task_id": _task_id(1, query_id="query-collision"),
-            "exchange_sink_instance": {"task_partition_id": 123},
+            "exchange_sink_instance": {"sink_handle": {"task_partition_id": 123}},
             identity_key_field: "logical-task-a",
         },
         {
             "task_id": _task_id(2, query_id="query-collision"),
-            "exchange_sink_instance": {"task_partition_id": 123},
+            "exchange_sink_instance": {"sink_handle": {"task_partition_id": 123}},
             identity_key_field: "logical-task-b",
         },
     ]

@@ -635,7 +635,6 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
                     context={"query_id": query_id, "node_id": node_id},
                     inputs={node_id: {"kind": "scan_split_batch", "data": node_id.encode()}},
                     exchange_sink_config={
-                        "identity_source": "task",
                         "query_id": query_id,
                         "output_partition_count": 1,
                         "output_location_prefix": f"{query_id}_coordinator",
@@ -657,12 +656,12 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
 
     for node_id in node_ids:
         assert (
-            first_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+            first_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_node["7"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_node["42"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_node["7"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_node["42"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_node["7"]["task_id"]["fragment_execution_id"]
@@ -691,7 +690,6 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
                         "stable_task_partition_id": str(task_idx),
                     },
                     exchange_sink_config={
-                        "identity_source": "task",
                         "query_id": execution_query_id,
                         "output_partition_count": 1,
                         "output_location_prefix": f"{execution_query_id}_coordinator",
@@ -709,12 +707,12 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
 
     for task_idx in ("0", "1"):
         assert (
-            first_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
+            first_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_task["0"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_task["1"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_task["0"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_task["1"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_task["0"]["task_id"]["fragment_execution_id"]
@@ -807,7 +805,6 @@ def test_submit_tasks_rejects_invalid_exchange_sink_config_before_registering_fr
         context={"query_id": "query-invalid-sink-config", "node_id": "17"},
         plan={"plan": "scan"},
         exchange_sink_config={
-            "identity_source": "task",
             "query_id": "query-invalid-sink-config",
             "output_partition_count": 1,
             "output_location_prefix": "invalid-sink-config",
@@ -5437,8 +5434,6 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
     fragment_id = f"{query_id}:node:7"
     key = (query_id, fragment_id)
     exchange_sink_config = {
-        "identity_source": "plan",
-        "plan_task_partition_id": 2,
         "query_id": query_id,
         "output_partition_count": 1,
         "output_location_prefix": "merged-exchange",
@@ -5447,6 +5442,7 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
         query_id,
         0,
         fragment_id=fragment_id,
+        logical_fragment_identity=fragment_id,
         context={"scan_split_batch_nodes": "7,8"},
         exchange_sink_config=exchange_sink_config,
         task_memory_bytes=64,

@@ -5149,12 +5149,11 @@ def test_fte_fragment_execution_worker_lost_uses_retry_attempt_as_durable_output
     assert Path(retry.sink_instance.attempt_path).exists()
 
 
-def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
+def test_fte_fragment_execution_retries_scheduler_owned_remote_exchange_sink():
     worker0 = _FakeLiveWorker("worker-a")
     worker1 = _FakeLiveWorker("worker-b")
+    registered_identities = []
     sink_config = {
-        "identity_source": "plan",
-        "plan_task_partition_id": 0,
         "query_id": "q",
         "output_partition_count": 4,
         "output_location_prefix": "55f8c578-9c57-4b9d-bdc2-ef62d1dfc323",
@@ -5167,6 +5166,10 @@ def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
         "q",
         11,
         fragment_id="q:node:shuffle",
+        logical_fragment_identity="q:node:shuffle",
+        stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
+            (stable_task_identity, identity_key)
+        ),
         worker_selector=select_worker,
         max_attempts=2,
         exchange_sink_config=sink_config,
@@ -5188,10 +5191,13 @@ def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
 
     assert retry is not None
     retry_request = worker1.calls[0][1]
+    stable_identity = scheduled0.request["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+    assert len(registered_identities) == 1
+    assert registered_identities[0][0] == stable_identity
     assert scheduled0.request["exchange_sink_instance"]["attempt_id"] == 0
-    assert scheduled0.request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 0
+    assert scheduled0.request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
     assert retry.request["exchange_sink_instance"]["attempt_id"] == 1
-    assert retry.request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 0
+    assert retry.request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
     assert (
         scheduled0.request["exchange_sink_instance"]["output_location"]
         != retry.request["exchange_sink_instance"]["output_location"]
@@ -5207,8 +5213,6 @@ def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
     [
         (
             {
-                "identity_source": "plan",
-                "plan_task_partition_id": 0,
                 "query_id": "q",
                 "output_partition_count": 1,
                 "output_location_prefix": "exchange",
@@ -5218,8 +5222,6 @@ def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
         (
             None,
             {
-                "identity_source": "plan",
-                "plan_task_partition_id": 0,
                 "query_id": "q",
                 "output_partition_count": 1,
                 "output_location_prefix": "exchange",
@@ -5227,18 +5229,14 @@ def test_fte_fragment_execution_retries_plan_identity_remote_exchange_sink():
         ),
         (
             {
-                "identity_source": "plan",
-                "plan_task_partition_id": 0,
                 "query_id": "q",
                 "output_partition_count": 1,
                 "output_location_prefix": "exchange",
             },
             {
-                "identity_source": "plan",
-                "plan_task_partition_id": 1,
                 "query_id": "q",
                 "output_partition_count": 1,
-                "output_location_prefix": "exchange",
+                "output_location_prefix": "other-exchange",
             },
         ),
     ],
@@ -5248,6 +5246,7 @@ def test_fte_fragment_execution_rejects_changed_exchange_sink_config(registered_
         "q",
         11,
         fragment_id="q:node:shuffle",
+        logical_fragment_identity="q:node:shuffle",
         exchange_sink_config=registered_config,
     )
 
@@ -5260,10 +5259,9 @@ def test_fte_fragment_execution_rejects_changed_exchange_sink_config(registered_
         )
 
 
-def test_fte_fragment_execution_binds_task_identity_sink_partition():
+def test_fte_fragment_execution_binds_scheduler_owned_sink_partition():
     worker = _FakeLiveWorker("worker-a")
     sink_config = {
-        "identity_source": "task",
         "query_id": "q",
         "output_partition_count": 4,
         "output_location_prefix": "q_shuffle_3",
@@ -5284,16 +5282,48 @@ def test_fte_fragment_execution_binds_task_identity_sink_partition():
     _execute_stage_commands(stage, scheduled_result)
     sink_instance = scheduled.request["exchange_sink_instance"]
 
-    assert sink_instance["sink_handle"]["task_partition_id"] == sink_instance["task_partition_id"]
-    assert sink_instance["output_location"] == (f"q_shuffle_3__sink_{sink_instance['task_partition_id']}__attempt_0")
+    assert set(sink_instance) == {
+        "sink_handle",
+        "attempt_id",
+        "query_id",
+        "output_partition_count",
+        "output_location",
+    }
+    scheduler_task_partition_id = sink_instance["sink_handle"]["task_partition_id"]
+    assert sink_instance["output_location"] == f"q_shuffle_3__sink_{scheduler_task_partition_id}__attempt_0"
     assert worker.calls[0][1]["exchange_sink_instance"] == sink_instance
+
+
+def test_fte_fragment_execution_allocates_exchange_identity_when_partition_is_created():
+    registered_identities = []
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:shuffle",
+        logical_fragment_identity="q:logical:shuffle",
+        stable_task_identity_callback=lambda stable_task_identity, identity_key: registered_identities.append(
+            (stable_task_identity, identity_key)
+        ),
+        exchange_sink_config={
+            "query_id": "q",
+            "output_partition_count": 4,
+            "output_location_prefix": "q_shuffle_3",
+        },
+    )
+
+    partition = stage.add_partition(3)
+
+    assert len(registered_identities) == 1
+    assert partition.exchange_sink_task_partition_id == registered_identities[0][0]
+    assert registered_identities[0][1].endswith(",3]")
+    assert stage.add_partition(3) is partition
+    assert partition.running_attempts == {}
 
 
 def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_sink():
     worker = _FakeLiveWorker("worker-a")
     registered_identities = []
     sink_config = {
-        "identity_source": "task",
         "query_id": "q",
         "output_partition_count": 1,
         "output_location_prefix": "q_coordinator",
@@ -5321,37 +5351,22 @@ def test_fte_fragment_execution_uses_logical_fragment_identity_for_materialized_
 
     assert str(scheduled.attempt_id) == "q.12.3.0"
     assert identity_key.endswith(",3]")
-    assert sink_instance["task_partition_id"] == expected_sink_identity
     assert sink_instance["sink_handle"]["task_partition_id"] == expected_sink_identity
     assert sink_instance["output_location"] == f"q_coordinator__sink_{expected_sink_identity}__attempt_0"
 
 
 def test_fte_fragment_execution_rejects_materialized_sink_without_logical_fragment_identity():
-    worker = _FakeLiveWorker("worker-a")
-    selected_partitions = []
-
-    def select_worker(partition):
-        selected_partitions.append(partition)
-        return worker.worker_id, worker
-
-    stage = _fte_fragment_execution(
-        "q",
-        12,
-        fragment_id="q:node:sample",
-        worker_selector=select_worker,
-        exchange_sink_config={
-            "identity_source": "task",
-            "query_id": "q",
-            "output_partition_count": 1,
-            "output_location_prefix": "q_coordinator",
-        },
-    )
-
     with pytest.raises(ValueError, match="requires a stable logical fragment identity"):
-        stage.apply_assignment_result(AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3]))
-
-    assert selected_partitions == []
-    assert worker.calls == []
+        _fte_fragment_execution(
+            "q",
+            12,
+            fragment_id="q:node:sample",
+            exchange_sink_config={
+                "query_id": "q",
+                "output_partition_count": 1,
+                "output_location_prefix": "q_coordinator",
+            },
+        )
 
 
 def test_fte_fragment_execution_handle_task_status_accepts_task_id_string():

@@ -136,14 +136,12 @@ idx_t PhysicalRemoteExchangeSink::SelectPartitionRange(const string_t &sort_key,
 PhysicalRemoteExchangeSink::PhysicalRemoteExchangeSink(
     PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality, std::string exchange_id,
     idx_t num_partitions, RepartitionSpec::Type repartition_type, vector<unique_ptr<Expression>> partition_by,
-    distributed::ExchangeSinkIdentitySource sink_identity_source, optional_idx plan_task_partition_id,
     std::string sink_query_id, std::string sink_output_location_prefix,
     std::shared_ptr<distributed::ExchangeManager> exchange_mgr, vector<string> range_boundaries,
     vector<string> range_order_modifiers)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXCHANGE_SINK, std::move(types), estimated_cardinality),
       exchange_id_(std::move(exchange_id)), num_partitions_(num_partitions), repartition_type_(repartition_type),
-      partition_by_(std::move(partition_by)), sink_identity_source_(sink_identity_source),
-      plan_task_partition_id_(plan_task_partition_id), sink_query_id_(std::move(sink_query_id)),
+      partition_by_(std::move(partition_by)), sink_query_id_(std::move(sink_query_id)),
       sink_output_location_prefix_(std::move(sink_output_location_prefix)), exchange_mgr_(std::move(exchange_mgr)),
       range_boundaries_(std::move(range_boundaries)), range_order_modifiers_(std::move(range_order_modifiers)) {
 	if (num_partitions_ == 0) {
@@ -157,20 +155,6 @@ PhysicalRemoteExchangeSink::PhysicalRemoteExchangeSink(
 	}
 	if (sink_output_location_prefix_.empty()) {
 		throw InvalidInputException("remote exchange sink requires a non-empty output location prefix");
-	}
-	switch (sink_identity_source_) {
-	case distributed::ExchangeSinkIdentitySource::PLAN:
-		if (!plan_task_partition_id_.IsValid()) {
-			throw InvalidInputException("plan-identity remote exchange sink requires a task partition id");
-		}
-		break;
-	case distributed::ExchangeSinkIdentitySource::TASK:
-		if (plan_task_partition_id_.IsValid()) {
-			throw InvalidInputException("task-identity remote exchange sink cannot carry a plan task partition id");
-		}
-		break;
-	default:
-		throw InvalidInputException("remote exchange sink has an invalid identity source");
 	}
 	if (repartition_type_ == RepartitionSpec::Type::Range) {
 		if (partition_by_.empty()) {
@@ -365,8 +349,8 @@ InsertionOrderPreservingMap<string> PhysicalRemoteExchangeSink::ParamsToString()
 namespace duckdb {
 
 void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) const {
-	// Write the same field layout as PhysicalExchangeSink so the worker-side
-	// deserializer (EXCHANGE_SINK case) can reconstruct a working sink.
+	// Serialize immutable exchange metadata only. The scheduler-owned task
+	// identity and concrete attempt are carried by the worker task descriptor.
 	auto flight_manager = std::dynamic_pointer_cast<distributed::FlightExchangeManager>(exchange_mgr_);
 	if (!flight_manager) {
 		throw SerializationException("PhysicalRemoteExchangeSink requires a FlightExchangeManager");
@@ -379,16 +363,14 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	serializer.WriteProperty(106, "repartition_type", static_cast<uint8_t>(repartition_type_));
 	serializer.WriteProperty(107, "partition_by", partition_by_);
 	serializer.WriteProperty(108, "local_dirs", local_dirs);
-	serializer.WriteProperty(109, "sink_identity_source", static_cast<uint8_t>(sink_identity_source_));
-	serializer.WriteProperty(110, "plan_task_partition_id", plan_task_partition_id_);
-	serializer.WriteProperty(111, "sink_output_location_prefix", sink_output_location_prefix_);
-	serializer.WriteProperty(112, "range_boundaries", range_boundaries_);
-	serializer.WriteProperty(113, "range_order_modifiers", range_order_modifiers_);
-	serializer.WriteProperty(114, "sink_query_id", sink_query_id_);
-	serializer.WritePropertyWithDefault<bool>(115, "collect_mark_join_build_summary", collect_mark_join_build_summary_,
+	serializer.WriteProperty(109, "sink_output_location_prefix", sink_output_location_prefix_);
+	serializer.WriteProperty(110, "range_boundaries", range_boundaries_);
+	serializer.WriteProperty(111, "range_order_modifiers", range_order_modifiers_);
+	serializer.WriteProperty(112, "sink_query_id", sink_query_id_);
+	serializer.WritePropertyWithDefault<bool>(113, "collect_mark_join_build_summary", collect_mark_join_build_summary_,
 	                                          false);
 	if (collect_mark_join_build_summary_) {
-		serializer.WriteProperty(116, "mark_join_build_expressions", mark_join_build_expressions_);
+		serializer.WriteProperty(114, "mark_join_build_expressions", mark_join_build_expressions_);
 	}
 }
 

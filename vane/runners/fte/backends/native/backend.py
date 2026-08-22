@@ -2202,17 +2202,15 @@ class NativeFteWorkerManagerBackend:
         exchange_sink_config = task.exchange_sink_config()
         if exchange_sink_config is not None:
             exchange_sink_config = normalize_exchange_sink_config(exchange_sink_config)
-            runtime_task_partition_id = None
-            if exchange_sink_config["identity_source"] == "task":
-                runtime_task_partition_id, stable_task_identity_key = _stable_native_fte_task_identity(
-                    task_inputs,
-                    task_context_info,
-                    context,
-                )
+            scheduler_task_partition_id, stable_task_identity_key = _stable_native_fte_task_identity(
+                task_inputs,
+                task_context_info,
+                context,
+            )
             exchange_sink_instance = bind_exchange_sink_instance(
                 exchange_sink_config,
                 attempt_id=attempt_id,
-                task_partition_id=runtime_task_partition_id,
+                task_partition_id=scheduler_task_partition_id,
             )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")
@@ -2275,7 +2273,10 @@ class NativeFteWorkerManagerBackend:
             exchange_sink_instance = request.get("exchange_sink_instance")
             if not isinstance(exchange_sink_instance, Mapping):
                 raise ValueError("stable native FTE task identity requires an exchange sink instance")
-            stable_identity = exchange_sink_instance.get("task_partition_id")
+            sink_handle = exchange_sink_instance.get("sink_handle")
+            if not isinstance(sink_handle, Mapping):
+                raise ValueError("stable native FTE task identity requires an exchange sink handle")
+            stable_identity = sink_handle.get("task_partition_id")
             if stable_identity is None:
                 raise ValueError("stable native FTE task identity was not bound to the exchange sink")
             pending.append((query_id, int(stable_identity), str(identity_key)))

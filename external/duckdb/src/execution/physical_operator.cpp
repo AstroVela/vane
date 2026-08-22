@@ -1204,19 +1204,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(107, "partition_by");
 		auto local_dirs = deserializer.ReadProperty<vector<string>>(108, "local_dirs");
 		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
-		auto sink_identity_source_raw = deserializer.ReadProperty<uint8_t>(109, "sink_identity_source");
-		auto sink_identity_source = static_cast<distributed::ExchangeSinkIdentitySource>(sink_identity_source_raw);
-		auto plan_task_partition_id = deserializer.ReadProperty<optional_idx>(110, "plan_task_partition_id");
-		auto sink_output_location_prefix = deserializer.ReadProperty<string>(111, "sink_output_location_prefix");
-		auto range_boundaries =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(112, "range_boundaries", {});
-		auto range_order_modifiers =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(113, "range_order_modifiers", {});
-		auto sink_query_id = deserializer.ReadProperty<string>(114, "sink_query_id");
+		auto sink_output_location_prefix = deserializer.ReadProperty<string>(109, "sink_output_location_prefix");
+		auto range_boundaries = deserializer.ReadProperty<vector<string>>(110, "range_boundaries");
+		auto range_order_modifiers = deserializer.ReadProperty<vector<string>>(111, "range_order_modifiers");
+		auto sink_query_id = deserializer.ReadProperty<string>(112, "sink_query_id");
 		auto collect_mark_join_build_summary =
-		    deserializer.ReadPropertyWithDefault<bool>(115, "collect_mark_join_build_summary");
+		    deserializer.ReadPropertyWithDefault<bool>(113, "collect_mark_join_build_summary");
 		auto mark_join_build_expressions =
-		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(116, "mark_join_build_expressions");
+		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(114, "mark_join_build_expressions");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1224,9 +1219,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		auto result = make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
-		    repartition_type, std::move(partition_by), sink_identity_source, plan_task_partition_id,
-		    std::move(sink_query_id), std::move(sink_output_location_prefix), std::move(exchange_mgr),
-		    std::move(range_boundaries), std::move(range_order_modifiers));
+		    repartition_type, std::move(partition_by), std::move(sink_query_id), std::move(sink_output_location_prefix),
+		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers));
 		if (collect_mark_join_build_summary) {
 			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 		}

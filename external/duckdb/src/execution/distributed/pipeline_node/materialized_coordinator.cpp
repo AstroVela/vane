@@ -106,8 +106,7 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		if (local_plan_builder) {
 			plan = local_plan_builder(std::move(plan));
 		}
-		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, ExchangeSinkIdentitySource::TASK,
-		                                 optional_idx(), exchange_mgr);
+		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, exchange_mgr);
 	};
 
 	auto sink_stream = input_stream->pipeline_instruction(node, sink_plan_builder, client_context);

@@ -7,7 +7,7 @@
 // duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp
 //
 // Remote exchange sink that delegates to ExchangeManager SPI.
-// Serialized plans carry immutable binding metadata only. A task runner must
+// Serialized plans carry immutable exchange metadata only. A task runner must
 // apply one concrete ExchangeSinkInstanceHandle before execution.
 // Replaces PhysicalExchangeSink and PhysicalStreamingExchangeSink.
 //===----------------------------------------------------------------------===//
@@ -17,8 +17,6 @@
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_manager.hpp"
-#include "duckdb/common/optional_idx.hpp"
-
 #include <string>
 #include <vector>
 
@@ -31,9 +29,7 @@ public:
 public:
 	PhysicalRemoteExchangeSink(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
 	                           std::string exchange_id, idx_t num_partitions, RepartitionSpec::Type repartition_type,
-	                           vector<unique_ptr<Expression>> partition_by,
-	                           distributed::ExchangeSinkIdentitySource sink_identity_source,
-	                           optional_idx plan_task_partition_id, std::string sink_query_id,
+	                           vector<unique_ptr<Expression>> partition_by, std::string sink_query_id,
 	                           std::string sink_output_location_prefix,
 	                           std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
 	                           vector<string> range_boundaries = {}, vector<string> range_order_modifiers = {});
@@ -67,12 +63,6 @@ public:
 	}
 	idx_t NumPartitions() const {
 		return num_partitions_;
-	}
-	distributed::ExchangeSinkIdentitySource SinkIdentitySource() const {
-		return sink_identity_source_;
-	}
-	optional_idx PlanTaskPartitionId() const {
-		return plan_task_partition_id_;
 	}
 	const std::string &SinkQueryId() const {
 		return sink_query_id_;
@@ -123,8 +113,6 @@ private:
 	idx_t num_partitions_;
 	RepartitionSpec::Type repartition_type_;
 	vector<unique_ptr<Expression>> partition_by_;
-	distributed::ExchangeSinkIdentitySource sink_identity_source_;
-	optional_idx plan_task_partition_id_;
 	std::string sink_query_id_;
 	std::string sink_output_location_prefix_;
 	mutable distributed::ExchangeSinkInstanceHandle sink_handle_;

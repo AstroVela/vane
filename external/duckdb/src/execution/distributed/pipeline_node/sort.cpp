@@ -20,7 +20,6 @@
 #include "duckdb/execution/distributed/plan/runner.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -646,8 +645,7 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			                                              exchange_mgr, client_context);
 			auto stage_plan_builder = [staging_exchange,
 			                           exchange_mgr](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
-				return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *staging_exchange,
-				                                 ExchangeSinkIdentitySource::TASK, optional_idx(), exchange_mgr);
+				return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *staging_exchange, exchange_mgr);
 			};
 
 			auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
@@ -791,12 +789,9 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			auto range_exchange = CreateOrderByExchange(self_shared->context(), range_exchange_id, num_partitions,
 			                                            exchange_mgr, client_context);
 			const auto range_query_id = MakeOrderByInternalQueryId(self_shared->context(), "range_query");
-			auto range_sink_counter = std::make_shared<std::atomic<idx_t>>(0);
-			auto range_plan_builder = [self_shared, range_exchange, exchange_mgr, range_sink_counter,
+			auto range_plan_builder = [self_shared, range_exchange, exchange_mgr,
 			                           boundaries](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
-				auto task_partition_id = range_sink_counter->fetch_add(1);
 				return AddRemoteRangeExchangeSinkPlan(std::move(plan), self_shared->orders_, *range_exchange,
-				                                      ExchangeSinkIdentitySource::PLAN, optional_idx(task_partition_id),
 				                                      exchange_mgr, boundaries);
 			};
 

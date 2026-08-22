@@ -121,10 +121,10 @@ static MarkJoinBuildSummary ExecuteMarkJoinSummarySink(Connection &con, const ve
 	partition_by.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
 	auto exchange_manager = std::make_shared<MarkSummaryTestExchangeManager>();
 	auto &sink = physical_plan
-	                 ->Make<PhysicalRemoteExchangeSink>(
-	                     input_types, right_values.size(), "mark-summary-test", 2, RepartitionSpec::Type::Hash,
-	                     std::move(partition_by), distributed::ExchangeSinkIdentitySource::PLAN, optional_idx(0),
-	                     "mark-summary-query", "mark-summary-attempt", std::move(exchange_manager))
+	                 ->Make<PhysicalRemoteExchangeSink>(input_types, right_values.size(), "mark-summary-test", 2,
+	                                                    RepartitionSpec::Type::Hash, std::move(partition_by),
+	                                                    "mark-summary-query", "mark-summary-attempt",
+	                                                    std::move(exchange_manager))
 	                 .Cast<PhysicalRemoteExchangeSink>();
 	distributed::ExchangeSinkInstanceHandle sink_handle;
 	sink_handle.sink_handle.task_partition_id = 0;

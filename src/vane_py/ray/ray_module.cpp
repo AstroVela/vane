@@ -1532,12 +1532,12 @@ void register_ray_bindings(py::module_ &mod) {
 						        exchange_sink_instance_task.sink_instance.query_id =
 						            py::str(sink_handle["query_id"]).cast<string>();
 					        }
-					        if (sink_handle.contains("partition_id")) {
-						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
-						            py::int_(sink_handle["partition_id"]).cast<idx_t>();
-					        } else if (sink_handle.contains("task_partition_id")) {
+					        if (sink_handle.contains("task_partition_id")) {
 						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
 						            py::int_(sink_handle["task_partition_id"]).cast<idx_t>();
+					        } else if (sink_handle.contains("partition_id")) {
+						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
+						            py::int_(sink_handle["partition_id"]).cast<idx_t>();
 					        }
 				        } else if (d.contains("task_partition_id")) {
 					        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
