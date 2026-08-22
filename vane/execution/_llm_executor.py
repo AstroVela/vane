@@ -7,12 +7,13 @@
 SGLang, ...): the submit/result lifecycle plus the one-shot wakeup protocol
 used by DuckDB's native scheduler. ``LocalEngineExecutor`` extends it with
 all the engine-agnostic machinery (background event loop, task counting,
-per-executor routing, abort/release) so a backend only supplies four hooks:
+per-executor routing, abort/release) so a backend only supplies five hooks:
 
 * ``_engine_name`` — short backend name for error messages;
 * ``_materialize_sampling_params`` — build the backend's sampling params;
 * ``_create_engine`` — construct the backend engine object on ``self.llm``;
-* ``_run_generate`` — run one prompt and return its output text.
+* ``_run_generate`` — run one prompt and return its output text;
+* ``_shutdown_engine`` — release backend resources on the owning event loop.
 """
 
 from __future__ import annotations
@@ -181,6 +182,13 @@ class LocalEngineExecutor(LLMExecutor):
         self.engine_ready = threading.Event()
         self.engine_error_message: str | None = None
         self.engine_init_timeout_s = engine_init_timeout_s
+        self._engine_init_task: asyncio.Task[None] | None = None
+        self._engine_shutdown_lock = threading.Lock()
+        self._engine_shutdown_complete = False
+        self._lifecycle_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_called = False
+        self._shutdown_complete = False
 
         self.sampling_params = self._materialize_sampling_params(generate_args)
         self.generate_args = generate_args
@@ -214,7 +222,6 @@ class LocalEngineExecutor(LLMExecutor):
                 )
 
         self._finished_submitting = False
-        self._shutdown_called = False
         self._per_executor_deques: dict[str, deque[tuple[Any, ...]]] = {}
         self._per_executor_running_task_count: dict[str, int] = {}
         self._per_executor_finished: set[str] = set()
@@ -247,6 +254,14 @@ class LocalEngineExecutor(LLMExecutor):
         garbage collection. Backends with explicit process/GPU ownership (for
         example SGLang's offline Engine) override this.
         """
+
+    def _shutdown_engine_once(self) -> None:
+        """Run backend teardown at most once across normal and fallback paths."""
+        with self._engine_shutdown_lock:
+            if self._engine_shutdown_complete:
+                return
+            self._shutdown_engine()
+            self._engine_shutdown_complete = True
 
     @abstractmethod
     async def _run_generate(self, prompt: str, request_id: str) -> str:
@@ -300,7 +315,7 @@ class LocalEngineExecutor(LLMExecutor):
     def _run_event_loop(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.loop.create_task(self._init_engine())
+        self._engine_init_task = self.loop.create_task(self._init_engine())
         self.loop_ready.set()
         try:
             self.loop.run_forever()
@@ -310,8 +325,29 @@ class LocalEngineExecutor(LLMExecutor):
                 task.cancel()
             if pending:
                 self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            self.loop.close()
-            asyncio.set_event_loop(None)
+            try:
+                self._shutdown_engine_once()
+            finally:
+                self.loop.close()
+                asyncio.set_event_loop(None)
+
+    async def _shutdown_on_event_loop(self) -> None:
+        """Finish initialization, cancel generation, then release the engine."""
+        init_task = self._engine_init_task
+        if init_task is not None and init_task is not asyncio.current_task():
+            await asyncio.shield(init_task)
+
+        current_task = asyncio.current_task()
+        pending = [
+            task
+            for task in asyncio.all_tasks(self.loop)
+            if task is not current_task and task is not init_task and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._shutdown_engine_once()
 
     async def _generate(
         self,
@@ -394,6 +430,8 @@ class LocalEngineExecutor(LLMExecutor):
     # ---- native bridge lifecycle -------------------------------------------
 
     def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
+        if self._shutdown_called:
+            raise RuntimeError(f"{self._engine_name} executor is shutting down")
         rows = _ensure_table(rows)
         if len(prompts) != rows.num_rows:
             raise ValueError("Number of prompts and rows must match")
@@ -402,17 +440,20 @@ class LocalEngineExecutor(LLMExecutor):
             raise ValueError("Synchronous mode not supported when use_threading is False")
 
         self._wait_for_engine_ready_blocking()
-        if self.engine_error_message is not None:
-            if self.on_error == "raise":
-                raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
-            self._append_error_rows(rows)
-            return
-        with self.task_count_lock:
-            self.running_task_count += len(prompts)
+        with self._lifecycle_lock:
+            if self._shutdown_called:
+                raise RuntimeError(f"{self._engine_name} executor is shutting down")
+            if self.engine_error_message is not None:
+                if self.on_error == "raise":
+                    raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
+                self._append_error_rows(rows)
+                return
+            with self.task_count_lock:
+                self.running_task_count += len(prompts)
 
-        for i, prompt in enumerate(prompts):
-            row = rows.slice(i, 1)
-            asyncio.run_coroutine_threadsafe(self._generate(prompt, row), self.loop)
+            for i, prompt in enumerate(prompts):
+                row = rows.slice(i, 1)
+                asyncio.run_coroutine_threadsafe(self._generate(prompt, row), self.loop)
         self._notify_state_change(force=True)
 
     async def submit_async(
@@ -422,44 +463,18 @@ class LocalEngineExecutor(LLMExecutor):
         executor_id: str | None = None,
         reservation_id: str | None = None,
     ) -> None:
+        if self._shutdown_called:
+            raise RuntimeError(f"{self._engine_name} executor is shutting down")
         rows = _ensure_table(rows)
         if len(prompts) != rows.num_rows:
             raise ValueError("Number of prompts and rows must match")
 
-        if executor_id:
-            with self.task_count_lock:
-                if (
-                    executor_id in self._per_executor_finished
-                    or executor_id in self._per_executor_aborted
-                    or executor_id in self._per_executor_errors
-                ):
-                    raise RuntimeError(f"{self._engine_name} executor {executor_id} is already finished")
-                if executor_id not in self._per_executor_deques:
-                    self._per_executor_deques[executor_id] = deque()
-                    self._per_executor_request_ids[executor_id] = set()
-                    self._per_executor_tasks[executor_id] = set()
+        if not self._ray_actor_mode and not self.engine_ready.is_set():
+            await self._wait_for_engine_ready_async()
 
-        if self._ray_actor_mode:
-            if self.engine_error_message is not None:
-                if self.on_error == "raise":
-                    raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
-                self._append_error_rows(rows, executor_id, reservation_id)
-                return
-
-            with self.task_count_lock:
-                self.running_task_count += len(prompts)
-                if executor_id:
-                    self._per_executor_running_task_count[executor_id] = self._per_executor_running_task_count.get(
-                        executor_id, 0
-                    ) + len(prompts)
-
-            for i, prompt in enumerate(prompts):
-                row = rows.slice(i, 1)
-                asyncio_task = asyncio.create_task(self._generate(prompt, row, executor_id, reservation_id))
-                self._track_executor_task(executor_id, asyncio_task)
-        else:
-            if not self.engine_ready.is_set():
-                await self._wait_for_engine_ready_async()
+        with self._lifecycle_lock:
+            if self._shutdown_called:
+                raise RuntimeError(f"{self._engine_name} executor is shutting down")
             if executor_id:
                 with self.task_count_lock:
                     if (
@@ -468,6 +483,11 @@ class LocalEngineExecutor(LLMExecutor):
                         or executor_id in self._per_executor_errors
                     ):
                         raise RuntimeError(f"{self._engine_name} executor {executor_id} is already finished")
+                    if executor_id not in self._per_executor_deques:
+                        self._per_executor_deques[executor_id] = deque()
+                        self._per_executor_request_ids[executor_id] = set()
+                        self._per_executor_tasks[executor_id] = set()
+
             if self.engine_error_message is not None:
                 if self.on_error == "raise":
                     raise RuntimeError(f"{self._engine_name} engine init failed: {self.engine_error_message}")
@@ -483,10 +503,14 @@ class LocalEngineExecutor(LLMExecutor):
 
             for i, prompt in enumerate(prompts):
                 row = rows.slice(i, 1)
-                thread_future = asyncio.run_coroutine_threadsafe(
-                    self._generate(prompt, row, executor_id, reservation_id), self.loop
-                )
-                self._track_executor_task(executor_id, thread_future)
+                task: Any
+                if self._ray_actor_mode:
+                    task = asyncio.create_task(self._generate(prompt, row, executor_id, reservation_id))
+                else:
+                    task = asyncio.run_coroutine_threadsafe(
+                        self._generate(prompt, row, executor_id, reservation_id), self.loop
+                    )
+                self._track_executor_task(executor_id, task)
         self._notify_state_change(force=True)
 
     def _track_executor_task(self, executor_id: str | None, task: Any) -> None:
@@ -729,15 +753,37 @@ class LocalEngineExecutor(LLMExecutor):
         return self._wait_for_result_blocking(executor_id)
 
     def shutdown(self) -> None:
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        self._finished_submitting = True
-        self._notify_state_change(force=True)
-        loop = getattr(self, "loop", None)
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-        self._shutdown_engine()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            with self._lifecycle_lock:
+                self._shutdown_called = True
+            self._finished_submitting = True
+            self._notify_state_change(force=True)
+
+            loop = getattr(self, "loop", None)
+            loop_thread = getattr(self, "loop_thread", None)
+            try:
+                if loop is not None and loop_thread is not None and loop_thread.is_alive() and not loop.is_closed():
+                    if threading.current_thread() is loop_thread:
+                        self._shutdown_engine_once()
+                    else:
+                        shutdown_future = asyncio.run_coroutine_threadsafe(self._shutdown_on_event_loop(), loop)
+                        shutdown_future.result()
+                else:
+                    # Ray-actor mode constructs and tears down the engine on the
+                    # actor directly; use_threading=False has no loop thread.
+                    self._shutdown_engine_once()
+            finally:
+                if loop is not None and loop_thread is not None:
+                    if not loop.is_closed():
+                        try:
+                            loop.call_soon_threadsafe(loop.stop)
+                        except RuntimeError:
+                            pass
+                    if threading.current_thread() is not loop_thread:
+                        loop_thread.join()
+                self._shutdown_complete = True
 
 
 class RayActorExecutorMixin:

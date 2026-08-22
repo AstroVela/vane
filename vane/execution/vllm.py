@@ -209,6 +209,15 @@ class LocalVLLMExecutor(VLLMExecutor, LocalEngineExecutor):
         args = AsyncEngineArgs(model=self.model, **self.engine_args)
         self.llm = AsyncLLMEngine.from_engine_args(args)
 
+    def _shutdown_engine(self) -> None:
+        llm = self.llm
+        if llm is None:
+            return
+        try:
+            llm.shutdown()
+        finally:
+            self.llm = None
+
     async def _run_generate(self, prompt: str, request_id: str) -> str:
         final_output = None
         async for output in self.llm.generate(prompt, self.sampling_params, request_id, **self.generate_args):

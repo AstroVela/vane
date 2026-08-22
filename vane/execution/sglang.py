@@ -80,8 +80,11 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
         if llm is None:
             return
         shutdown = getattr(llm, "shutdown", None)
-        if shutdown is not None:
-            shutdown()
+        try:
+            if shutdown is not None:
+                shutdown()
+        finally:
+            self.llm = None
 
     @staticmethod
     def _extract_output_text(output: Any) -> str:

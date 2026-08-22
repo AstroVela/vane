@@ -372,6 +372,27 @@ def test_native_executor_materializes_structured_outputs_params(monkeypatch):
     assert executor.sampling_params.options == {"max_tokens": 8}
 
 
+def test_local_vllm_executor_explicitly_shuts_down_engine():
+    from vane.execution.vllm import LocalVLLMExecutor
+
+    class Engine:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    engine = Engine()
+    executor = LocalVLLMExecutor.__new__(LocalVLLMExecutor)
+    executor.llm = engine
+
+    executor._shutdown_engine()
+    executor._shutdown_engine()
+
+    assert engine.shutdown_calls == 1
+    assert executor.llm is None
+
+
 def test_ray_actor_releases_only_terminal_per_executor_state():
     from vane.execution.vllm import RayLocalVLLMExecutor
 
@@ -641,6 +662,7 @@ def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
+    executor._lifecycle_lock = threading.Lock()
     executor._finished_submitting = False
     executor.running_task_count = 0
     executor.task_count_lock = threading.Lock()

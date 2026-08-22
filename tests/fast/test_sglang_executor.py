@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import types
 
 import pytest
@@ -19,6 +20,8 @@ class _FakeEngine:
         self.model_path = model_path
         self.kwargs = kwargs
         self.shutdown_called = False
+        self.shutdown_calls = 0
+        self.shutdown_loop = None
         self.creation_loop = asyncio.get_running_loop()
         self.generation_loops: list[asyncio.AbstractEventLoop] = []
         self.generate_calls: list[tuple[str, dict[str, object], dict[str, object]]] = []
@@ -39,6 +42,8 @@ class _FakeEngine:
 
     def shutdown(self):
         self.shutdown_called = True
+        self.shutdown_calls += 1
+        self.shutdown_loop = asyncio.get_running_loop()
 
 
 def _install_fake_sglang(monkeypatch):
@@ -90,12 +95,98 @@ def test_sglang_local_executor_shutdown_releases_engine(monkeypatch):
     executor = SGLangLocalExecutor("test-model", {}, {})
     try:
         executor._wait_for_engine_ready_blocking()
-        assert executor.llm is not None
-        assert executor.llm.shutdown_called is False
+        engine = executor.llm
+        assert engine is not None
+        assert engine.shutdown_called is False
         executor.shutdown()
-        assert executor.llm.shutdown_called is True
+        assert engine.shutdown_called is True
+        assert engine.shutdown_calls == 1
+        assert engine.shutdown_loop is engine.creation_loop
+        assert executor.llm is None
+        assert executor.loop_thread.is_alive() is False
+        executor.shutdown()
+        assert engine.shutdown_calls == 1
     finally:
         executor.shutdown()
+
+
+def test_sglang_shutdown_waits_for_initialization_and_closes_late_engine(monkeypatch):
+    init_started = threading.Event()
+    allow_init = threading.Event()
+    instances = []
+
+    class SlowEngine(_FakeEngine):
+        def __init__(self, model_path=None, **kwargs):
+            init_started.set()
+            assert allow_init.wait(timeout=2)
+            super().__init__(model_path=model_path, **kwargs)
+            instances.append(self)
+
+    sglang_module = types.ModuleType("sglang")
+    sglang_module.Engine = SlowEngine
+    monkeypatch.setitem(sys.modules, "sglang", sglang_module)
+
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor("test-model", {}, {})
+    assert init_started.wait(timeout=2)
+
+    shutdown_thread = threading.Thread(target=executor.shutdown)
+    shutdown_thread.start()
+    shutdown_thread.join(timeout=0.05)
+    assert shutdown_thread.is_alive()
+
+    allow_init.set()
+    shutdown_thread.join(timeout=2)
+
+    assert shutdown_thread.is_alive() is False
+    assert len(instances) == 1
+    engine = instances[0]
+    assert engine.shutdown_calls == 1
+    assert engine.shutdown_loop is engine.creation_loop
+    assert executor.llm is None
+    assert executor.loop_thread.is_alive() is False
+
+    with pytest.raises(RuntimeError, match="executor is shutting down"):
+        executor.submit(None, ["late"], pa.table({"prompt": ["late"]}))
+    with pytest.raises(RuntimeError, match="executor is shutting down"):
+        asyncio.run(executor.submit_async(["late"], pa.table({"prompt": ["late"]})))
+
+
+def test_sglang_shutdown_cancels_generation_before_engine_teardown(monkeypatch):
+    generation_started = threading.Event()
+    generation_cancelled = threading.Event()
+
+    class BlockingEngine(_FakeEngine):
+        async def async_generate(self, prompt, sampling_params, **generate_args):
+            del prompt, sampling_params, generate_args
+            generation_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                generation_cancelled.set()
+
+        def shutdown(self):
+            assert generation_cancelled.is_set()
+            super().shutdown()
+
+    sglang_module = types.ModuleType("sglang")
+    sglang_module.Engine = BlockingEngine
+    monkeypatch.setitem(sys.modules, "sglang", sglang_module)
+
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor("test-model", {}, {})
+    executor.submit(None, ["blocked"], pa.table({"prompt": ["blocked"]}))
+    assert generation_started.wait(timeout=2)
+    engine = executor.llm
+
+    executor.shutdown()
+
+    assert generation_cancelled.is_set()
+    assert engine.shutdown_calls == 1
+    assert executor.running_task_count == 0
+    assert executor.loop_thread.is_alive() is False
 
 
 def test_sglang_generate_forwards_generate_args(monkeypatch):
