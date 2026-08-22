@@ -153,6 +153,8 @@ static DistributedExtensionCapabilityReference DistributedTestCapability() {
 	reference.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	reference.capability.name = "distributed_test_scan";
 	reference.capability.protocol_version = DISTRIBUTED_TEST_SCAN_PROTOCOL;
+	reference.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_scan", {LogicalType::BIGINT}, LogicalType::INVALID);
 	return reference;
 }
 
@@ -539,9 +541,9 @@ TEST_CASE("Distributed synthetic extension transports file splits with an explic
 	                    Catch::Matchers::Contains("planned duplicate split_id 'file-0'"));
 
 	auto &coordinator_manager = DistributedExtensionManager::Get(*coordinator_db.instance);
-	REQUIRE(SyntheticExtensionHasContractIdentity(
-	    coordinator_manager,
-	    "distributed_test{table_function:distributed_test_scan@1,write_operator:distributed_test_opaque_write@1}"));
+	REQUIRE(SyntheticExtensionHasContractIdentity(coordinator_manager,
+	                                              "distributed_test{table_function:distributed_test_scan(BIGINT)@1,"
+	                                              "write_operator:distributed_test_opaque_write@1}"));
 
 	auto planned = PlanDistributedTestScan(coordinator_db, coordinator, "SELECT * FROM distributed_test_scan(1)", 3);
 	REQUIRE(planned.splits.size() == 1);
@@ -848,6 +850,8 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	                       distributed::DISTRIBUTED_FILE_WRITE_FRAGMENT_CODEC_VERSION};
 	auto invalid_info = info;
 	invalid_info.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	invalid_info.capability.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_file_write", {});
 	REQUIRE_THROWS_WITH(invalid_info.Validate(), Catch::Matchers::Contains("must be a write operator"));
 
 	distributed::DistributedCopyFileInfo file;
@@ -875,6 +879,8 @@ TEST_CASE("Distributed extension file writes use the fixed artifact adapter",
 	auto roundtrip = DistributedWriteTaskResult::DeserializeFromBytes(encoded[0].SerializeToBytes());
 	auto invalid_result = roundtrip;
 	invalid_result.capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
+	invalid_result.capability.capability.function_signature =
+	    GetDistributedTableFunctionSignature("distributed_test_file_write", {});
 	REQUIRE_THROWS_WITH(invalid_result.Validate(), Catch::Matchers::Contains("not a write operator"));
 	auto decoded = distributed::DecodeDistributedFileWriteResults(info, {roundtrip});
 	REQUIRE(decoded.size() == 1);

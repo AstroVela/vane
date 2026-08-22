@@ -84,7 +84,7 @@ vector<ScanSplit> MakeExtensionScanSplits(const PhysicalTableScan &scan, const D
 		                             scan.function.name);
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-	callbacks.Validate(scan.function.name);
+	callbacks.Validate(scan.function);
 	const auto &capability = callbacks.GetCapability();
 	if (!db) {
 		throw InvalidInputException("Distributed extension scan '%s' requires a DatabaseInstance for capability "
@@ -134,7 +134,7 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 			                             scan.function.name);
 		}
 		const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-		callbacks.Validate(scan.function.name);
+		callbacks.Validate(scan.function);
 		bind_data = callbacks.create_worker_bind(MakeDistributedScanInput(scan));
 		if (!bind_data) {
 			throw InvalidInputException("Distributed table function '%s' returned null from create_worker_bind",

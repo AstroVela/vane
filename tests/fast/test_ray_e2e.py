@@ -443,6 +443,37 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    label = "test_ray_e2e: distributed range source"
+    sql = "SELECT i FROM range(0, 8193) AS t(i)"
+    relation = duckdb_conn.sql(sql)
+    _, num_parts = _get_distributed_plan_info(relation, label)
+    assert num_parts is not None and num_parts >= 4
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=30.0)
+    _assert_results_match(duckdb_conn, sql, parts, label)
+
+    cases = [
+        (
+            "SELECT i FROM generate_series(5, -5, -2) AS t(i)",
+            "test_ray_e2e: distributed negative generate_series",
+        ),
+        (
+            "SELECT ts FROM range(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-08', INTERVAL 1 DAY) AS t(ts)",
+            "test_ray_e2e: distributed fixed timestamp range",
+        ),
+        (
+            "SELECT ts FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-05-31', INTERVAL 1 MONTH) AS t(ts)",
+            "test_ray_e2e: distributed calendar timestamp generate_series",
+        ),
+    ]
+    for case_sql, case_label in cases:
+        try:
+            _run_query_case(duckdb_conn, ray_runner, case_sql, case_label, timeout_s=30.0)
+        except Exception as exc:
+            raise AssertionError(f"{case_label}: distributed execution failed") from exc
+
+
 @pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument

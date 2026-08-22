@@ -365,7 +365,7 @@ static bool ApplyExtensionScanSplits(PhysicalTableScan &scan, const ScanSplitBat
 		return false;
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
-	callbacks.Validate(scan.function.name);
+	callbacks.Validate(scan.function);
 	const auto &capability = callbacks.GetCapability();
 	const auto &first_split = batch.splits[0];
 	if (first_split.extension_capability != capability) {

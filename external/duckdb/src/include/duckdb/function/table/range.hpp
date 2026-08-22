@@ -22,6 +22,10 @@ struct GlobTableFunction {
 };
 
 struct RangeTableFunction {
+	//! Construct the complete overload set. The core distributed manifest uses
+	//! these same function objects so protocol identities cannot drift from
+	//! catalog registration.
+	static vector<TableFunction> GetFunctions();
 	static void RegisterFunction(BuiltinFunctions &set);
 };
 
