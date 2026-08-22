@@ -997,6 +997,14 @@ idx_t FlightExchange::GetNumPartitions() const {
 	return output_partition_count_;
 }
 
+const ExchangeContext &FlightExchange::GetContext() const {
+	return ctx_;
+}
+
+const std::string &FlightExchange::GetSinkOutputLocationPrefix() const {
+	return exchange_instance_id_;
+}
+
 void FlightExchange::Close() {
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (closed_) {

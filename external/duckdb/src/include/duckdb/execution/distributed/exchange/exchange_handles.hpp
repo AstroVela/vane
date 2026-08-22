@@ -31,19 +31,22 @@ struct ExchangeContext {
 
 // ─── Sink Handles ────────────────────────────────────────
 
-/// Identifies a logical sink within an Exchange (one per task partition).
-/// Identifies the logical sink for one task partition.
-struct ExchangeSinkHandle {
-	idx_t task_partition_id = 0;
+enum class ExchangeSinkIdentitySource : uint8_t {
+	/// The physical plan carries a fixed task partition id.
+	PLAN = 0,
+	/// The task runner supplies the task partition id when it binds an attempt.
+	TASK = 1,
 };
 
-/// Identifies a concrete sink instance (supports retries via attempt_id).
+/// Identifies the logical sink for one task partition.
+struct ExchangeSinkHandle {
+	idx_t task_partition_id = DConstants::INVALID_INDEX;
+};
+
 /// Identifies one concrete sink attempt for a logical sink.
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
-	/// Derive the concrete sink identity from the FTE fragment partition.
-	bool fte_task_identity = false;
 	/// Query that owns this concrete attempt.
 	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),

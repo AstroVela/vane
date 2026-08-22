@@ -134,20 +134,27 @@ TEST_CASE("Generic exchange builder preserves range partition metadata", "[distr
 	REQUIRE(clustering_by[0] != nullptr);
 	REQUIRE(clustering_by[1] != nullptr);
 
-	ExchangeSinkInstanceHandle sink_handle;
-	sink_handle.sink_handle.task_partition_id = 0;
-	sink_handle.output_partition_count = 3;
 	FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	auto exchange_mgr = std::make_shared<FlightExchangeManager>(std::move(flight_config));
+	ExchangeContext exchange_context {"query-1", "range-stage"};
+	auto mismatched_exchange = exchange_mgr->CreateExchange(exchange_context, 4);
 
-	REQUIRE_THROWS_WITH(AddRemoteExchangeSinkPlan(plan, spec, 4, "range-stage", sink_handle, exchange_mgr),
+	REQUIRE_THROWS_WITH(AddRemoteExchangeSinkPlan(plan, spec, *mismatched_exchange, ExchangeSinkIdentitySource::TASK,
+	                                              optional_idx(), exchange_mgr),
 	                    Catch::Matchers::Contains("does not match exchange partition count"));
-	auto result = AddRemoteExchangeSinkPlan(plan, spec, 3, "range-stage", sink_handle, std::move(exchange_mgr));
+	auto exchange = exchange_mgr->CreateExchange(exchange_context, 3);
+	auto result = AddRemoteExchangeSinkPlan(plan, spec, *exchange, ExchangeSinkIdentitySource::TASK, optional_idx(),
+	                                        std::move(exchange_mgr));
 	REQUIRE(result.get() == plan.get());
 	auto *sink = dynamic_cast<PhysicalRemoteExchangeSink *>(&result->Root());
 	REQUIRE(sink != nullptr);
 	REQUIRE(sink->RepartitionType() == RepartitionSpec::Type::Range);
+	REQUIRE(sink->SinkIdentitySource() == ExchangeSinkIdentitySource::TASK);
+	REQUIRE_FALSE(sink->PlanTaskPartitionId().IsValid());
+	REQUIRE(sink->SinkQueryId() == "query-1");
+	REQUIRE_FALSE(sink->SinkOutputLocationPrefix().empty());
+	REQUIRE_FALSE(sink->HasBoundSinkHandle());
 	REQUIRE(sink->PartitionBy().size() == 2);
 	REQUIRE(sink->PartitionBy()[0] != nullptr);
 	REQUIRE(sink->PartitionBy()[1] != nullptr);

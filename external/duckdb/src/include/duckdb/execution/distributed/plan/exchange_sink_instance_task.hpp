@@ -24,6 +24,7 @@ class Serializer;
 namespace distributed {
 
 struct ExchangeSinkInstanceTaskDescriptor {
+	/// Concrete logical-task attempt bound by the task runner.
 	ExchangeSinkInstanceHandle sink_instance;
 
 	void Serialize(Serializer &serializer) const;

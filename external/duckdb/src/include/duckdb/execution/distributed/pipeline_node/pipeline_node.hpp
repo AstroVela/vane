@@ -683,10 +683,5 @@ MergeTaskContext(const std::unordered_map<std::string, std::string> &base,
 void RecordRemoteExchangeFinishedSinks(Exchange &exchange, const std::vector<MaterializedOutput> &outputs,
                                        const char *mismatch_context);
 
-// Register a plan-local sink ordinal and mark its runtime identity for stable
-// derivation by FTE. This is required for task streams that can contain more
-// than one logical fragment, where fragment-local partition ids may overlap.
-ExchangeSinkInstanceHandle InstantiateFteDerivedExchangeSink(Exchange &exchange, idx_t plan_task_partition_id);
-
 } // namespace distributed
 } // namespace duckdb

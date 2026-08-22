@@ -30,49 +30,76 @@ bool SetValidationError(std::string *error, const std::string &message) {
 	return false;
 }
 
-bool ExtractSinkOutputLocationPrefix(const ExchangeSinkInstanceHandle &handle, std::string &prefix,
-                                     std::string *error) {
-	const auto sink_suffix = std::string("__sink_") + std::to_string(handle.sink_handle.task_partition_id) +
-	                         "__attempt_" + std::to_string(handle.attempt_id);
-	if (handle.output_location.size() < sink_suffix.size() ||
-	    handle.output_location.compare(handle.output_location.size() - sink_suffix.size(), sink_suffix.size(),
-	                                   sink_suffix) != 0) {
-		return SetValidationError(error, "remote exchange sink plan has an invalid sink output location");
-	}
-	prefix = handle.output_location.substr(0, handle.output_location.size() - sink_suffix.size());
-	if (prefix.empty()) {
-		return SetValidationError(error, "remote exchange sink plan is missing its exchange instance id");
-	}
-	return true;
-}
-
 bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const ExchangeSinkInstanceHandle &runtime_handle,
                                std::string *error) {
-	const auto &plan_handle = sink.SinkHandle();
-	if (plan_handle.query_id.empty()) {
+	if (sink.SinkQueryId().empty()) {
 		return SetValidationError(error, "remote exchange sink plan is missing query ownership");
 	}
-	if (runtime_handle.query_id.empty() || runtime_handle.query_id != plan_handle.query_id) {
+	if (runtime_handle.query_id.empty() || runtime_handle.query_id != sink.SinkQueryId()) {
 		return SetValidationError(error, "runtime exchange sink query does not match the plan");
-	}
-	if (plan_handle.output_partition_count != sink.NumPartitions()) {
-		return SetValidationError(error, "remote exchange sink plan has an inconsistent output partition count");
 	}
 	if (runtime_handle.output_partition_count == 0 || runtime_handle.output_partition_count != sink.NumPartitions()) {
 		return SetValidationError(error, "runtime exchange sink output partition count does not match the plan");
 	}
-	if (plan_handle.output_location.empty()) {
-		return SetValidationError(error, "remote exchange sink plan is missing its output location");
+	if (runtime_handle.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
+		return SetValidationError(error, "runtime exchange sink received an invalid task identity");
 	}
-	std::string exchange_instance_prefix;
-	if (!ExtractSinkOutputLocationPrefix(plan_handle, exchange_instance_prefix, error)) {
-		return false;
+	if (sink.SinkIdentitySource() == ExchangeSinkIdentitySource::PLAN &&
+	    runtime_handle.sink_handle.task_partition_id != sink.PlanTaskPartitionId().GetIndex()) {
+		return SetValidationError(error, "runtime exchange sink task identity does not match the plan");
 	}
-	const auto expected_output_location = exchange_instance_prefix + "__sink_" +
+	const auto expected_output_location = sink.SinkOutputLocationPrefix() + "__sink_" +
 	                                      std::to_string(runtime_handle.sink_handle.task_partition_id) + "__attempt_" +
 	                                      std::to_string(runtime_handle.attempt_id);
 	if (runtime_handle.output_location != expected_output_location) {
 		return SetValidationError(error, "runtime exchange sink output location does not match the plan");
+	}
+	return true;
+}
+
+bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSinkInstanceHandle &sink_instance,
+                                         ExchangeSinkIdentitySource identity_source, std::string *error) {
+	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
+		auto *sample = dynamic_cast<PhysicalDistributedReservoirSample *>(&op);
+		if (!sample) {
+			return SetValidationError(error, "DISTRIBUTED_RESERVOIR_SAMPLE operator has an unexpected implementation");
+		}
+		if (sample->stage == DistributedReservoirSampleStage::LOCAL) {
+			if (identity_source != ExchangeSinkIdentitySource::TASK) {
+				return SetValidationError(
+				    error, "local distributed reservoir sample requires a task-derived exchange sink identity");
+			}
+			if (sink_instance.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
+				return SetValidationError(error,
+				                          "local distributed reservoir sample received an invalid task identity");
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, identity_source, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ValidateExchangeSinkInstanceForOperator(PhysicalOperator &op, const ExchangeSinkInstanceHandle &sink_instance,
+                                             std::string *error, idx_t &validated) {
+	if (op.type == PhysicalOperatorType::EXCHANGE_SINK) {
+		auto *sink = dynamic_cast<PhysicalRemoteExchangeSink *>(&op);
+		if (!sink) {
+			return SetValidationError(error, "EXCHANGE_SINK operator is not a PhysicalRemoteExchangeSink");
+		}
+		if (!ValidateRuntimeSinkHandle(*sink, sink_instance, error) ||
+		    !ValidateRuntimeTaskIndexForOperator(*sink, sink_instance, sink->SinkIdentitySource(), error)) {
+			return false;
+		}
+		validated++;
+	}
+	for (auto &child : op.children) {
+		if (!ValidateExchangeSinkInstanceForOperator(child.get(), sink_instance, error, validated)) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -87,41 +114,11 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 			}
 			return false;
 		}
-		auto sink_handle = task.sink_instance;
-		if (!ValidateRuntimeSinkHandle(*sink, sink_handle, error)) {
-			return false;
-		}
-		sink->ApplyRuntimeSinkHandle(std::move(sink_handle));
+		sink->ApplyRuntimeSinkHandle(task.sink_instance);
 		applied++;
 	}
 	for (auto &child : op.children) {
 		if (!ApplyExchangeSinkInstanceToOperator(child.get(), task, error, applied)) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSinkInstanceHandle &sink_instance,
-                                         std::string *error) {
-	if (op.type == PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE) {
-		auto *sample = dynamic_cast<PhysicalDistributedReservoirSample *>(&op);
-		if (!sample) {
-			return SetValidationError(error, "DISTRIBUTED_RESERVOIR_SAMPLE operator has an unexpected implementation");
-		}
-		if (sample->stage == DistributedReservoirSampleStage::LOCAL) {
-			if (!sink_instance.fte_task_identity) {
-				return SetValidationError(
-				    error, "local distributed reservoir sample requires an FTE-derived exchange sink identity");
-			}
-			if (sink_instance.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
-				return SetValidationError(error,
-				                          "local distributed reservoir sample received an invalid task identity");
-			}
-		}
-	}
-	for (auto &child : op.children) {
-		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, error)) {
 			return false;
 		}
 	}
@@ -153,12 +150,11 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	serializer.WriteProperty(5, "flight_server_epoch", sink_instance.flight_server_epoch);
 	serializer.WriteProperty(6, "query_id", sink_instance.query_id);
 	serializer.WriteProperty(7, "flight_host", sink_instance.flight_host);
-	serializer.WriteProperty(8, "fte_task_identity", sink_instance.fte_task_identity);
-	serializer.WritePropertyWithDefault<bool>(9, "mark_join_build_summary_valid",
+	serializer.WritePropertyWithDefault<bool>(8, "mark_join_build_summary_valid",
 	                                          sink_instance.mark_join_build_summary.valid, false);
-	serializer.WritePropertyWithDefault<bool>(10, "mark_join_build_has_rows",
+	serializer.WritePropertyWithDefault<bool>(9, "mark_join_build_has_rows",
 	                                          sink_instance.mark_join_build_summary.has_rows, false);
-	serializer.WritePropertyWithDefault<bool>(11, "mark_join_build_has_null",
+	serializer.WritePropertyWithDefault<bool>(10, "mark_join_build_has_null",
 	                                          sink_instance.mark_join_build_summary.has_null, false);
 }
 
@@ -173,12 +169,11 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	result.sink_instance.flight_server_epoch = deserializer.ReadProperty<string>(5, "flight_server_epoch");
 	result.sink_instance.query_id = deserializer.ReadProperty<string>(6, "query_id");
 	result.sink_instance.flight_host = deserializer.ReadProperty<string>(7, "flight_host");
-	result.sink_instance.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(8, "fte_task_identity");
-	deserializer.ReadPropertyWithDefault<bool>(9, "mark_join_build_summary_valid",
+	deserializer.ReadPropertyWithDefault<bool>(8, "mark_join_build_summary_valid",
 	                                           result.sink_instance.mark_join_build_summary.valid);
-	deserializer.ReadPropertyWithDefault<bool>(10, "mark_join_build_has_rows",
+	deserializer.ReadPropertyWithDefault<bool>(9, "mark_join_build_has_rows",
 	                                           result.sink_instance.mark_join_build_summary.has_rows);
-	deserializer.ReadPropertyWithDefault<bool>(11, "mark_join_build_has_null",
+	deserializer.ReadPropertyWithDefault<bool>(10, "mark_join_build_has_null",
 	                                           result.sink_instance.mark_join_build_summary.has_null);
 	if (!result.sink_instance.mark_join_build_summary.IsConsistent()) {
 		throw SerializationException("invalid MARK join build summary in exchange sink task");
@@ -216,8 +211,12 @@ bool ApplyExchangeSinkInstanceToPlan(duckdb::PhysicalPlan &plan, const ExchangeS
 		}
 		return false;
 	}
-	if (!ValidateRuntimeTaskIndexForOperator(plan.Root(), task.sink_instance, error)) {
+	idx_t validated = 0;
+	if (!ValidateExchangeSinkInstanceForOperator(plan.Root(), task.sink_instance, error, validated)) {
 		return false;
+	}
+	if (validated == 0) {
+		return SetValidationError(error, "no remote exchange sink found in plan");
 	}
 	idx_t applied = 0;
 	if (!ApplyExchangeSinkInstanceToOperator(plan.Root(), task, error, applied)) {

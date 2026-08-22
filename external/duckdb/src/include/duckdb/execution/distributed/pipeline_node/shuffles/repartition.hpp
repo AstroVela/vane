@@ -6,6 +6,7 @@
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/common/optional_idx.hpp"
+#include "duckdb/execution/distributed/exchange/exchange.hpp"
 #include "duckdb/execution/distributed/exchange/exchange_handles.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 // Forward-declare PlanExecutionContext to avoid circular includes
@@ -87,18 +88,17 @@ private:
 
 DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan,
                                               const std::shared_ptr<::duckdb::RepartitionSpec> &spec,
-                                              idx_t num_partitions, const std::string &exchange_id,
-                                              const ExchangeSinkInstanceHandle &sink_handle,
+                                              const Exchange &exchange, ExchangeSinkIdentitySource sink_identity_source,
+                                              optional_idx plan_task_partition_id,
                                               std::shared_ptr<ExchangeManager> exchange_mgr,
                                               bool collect_mark_join_build_summary = false,
                                               vector<unique_ptr<Expression>> mark_join_build_expressions = {});
 
-DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan,
-                                                   const vector<::duckdb::BoundOrderByNode> &orders,
-                                                   idx_t num_partitions, const std::string &exchange_id,
-                                                   const ExchangeSinkInstanceHandle &sink_handle,
-                                                   std::shared_ptr<ExchangeManager> exchange_mgr,
-                                                   vector<string> boundary_keys);
+DuckPhysicalPlanRef
+AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan, const vector<::duckdb::BoundOrderByNode> &orders,
+                               const Exchange &exchange, ExchangeSinkIdentitySource sink_identity_source,
+                               optional_idx plan_task_partition_id, std::shared_ptr<ExchangeManager> exchange_mgr,
+                               vector<string> boundary_keys);
 
 DuckPhysicalPlanRef MakeRemoteExchangeSourcePlan(const vector<LogicalType> &types, idx_t estimated_cardinality,
                                                  const std::string &exchange_id, vector<idx_t> partition_indices,

@@ -120,9 +120,6 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("attempt_id")) {
 		out.attempt_id = py::int_(d["attempt_id"]).cast<duckdb::idx_t>();
 	}
-	if (d.contains("fte_task_identity")) {
-		out.fte_task_identity = py::bool_(d["fte_task_identity"]).cast<bool>();
-	}
 	if (d.contains("output_partition_count")) {
 		out.output_partition_count = py::int_(d["output_partition_count"]).cast<duckdb::idx_t>();
 	}
@@ -1353,7 +1350,7 @@ py::dict RayWorkerTask::Inputs() const {
 	return result;
 }
 
-py::object RayWorkerTask::ExchangeSinkInstance() const {
+py::object RayWorkerTask::ExchangeSinkConfig() const {
 	duckdb::PythonGILWrapper gil;
 	auto plan_ref = task_.plan();
 	if (!plan_ref || !plan_ref->HasRoot()) {
@@ -1363,38 +1360,20 @@ py::object RayWorkerTask::ExchangeSinkInstance() const {
 	if (!sink) {
 		return py::none();
 	}
-	const auto &instance = sink->SinkHandle();
-	if (!instance.mark_join_build_summary.IsConsistent()) {
-		throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
-	}
-	py::dict sink_handle;
-	sink_handle["task_partition_id"] = instance.sink_handle.task_partition_id;
-	sink_handle["partition_id"] = instance.sink_handle.task_partition_id;
-
 	py::dict result;
-	result["sink_handle"] = sink_handle;
-	result["task_partition_id"] = instance.sink_handle.task_partition_id;
-	result["partition_id"] = instance.sink_handle.task_partition_id;
-	result["attempt_id"] = instance.attempt_id;
-	result["output_partition_count"] = instance.output_partition_count;
-	result["query_id"] = instance.query_id;
-	if (instance.fte_task_identity) {
-		result["fte_task_identity"] = true;
+	switch (sink->SinkIdentitySource()) {
+	case duckdb::distributed::ExchangeSinkIdentitySource::PLAN:
+		result["identity_source"] = "plan";
+		result["plan_task_partition_id"] = sink->PlanTaskPartitionId().GetIndex();
+		break;
+	case duckdb::distributed::ExchangeSinkIdentitySource::TASK:
+		result["identity_source"] = "task";
+		break;
+	default:
+		throw py::value_error("exchange_sink_config has an invalid identity source");
 	}
-	if (!instance.flight_server_epoch.empty()) {
-		result["flight_server_epoch"] = instance.flight_server_epoch;
-	}
-	if (!instance.flight_host.empty()) {
-		result["flight_host"] = instance.flight_host;
-	}
-	if (!instance.output_location.empty()) {
-		result["output_location"] = instance.output_location;
-		result["attempt_path"] = instance.output_location;
-	}
-	if (instance.mark_join_build_summary.valid) {
-		result["mark_join_build_summary_valid"] = true;
-		result["mark_join_build_has_rows"] = instance.mark_join_build_summary.has_rows;
-		result["mark_join_build_has_null"] = instance.mark_join_build_summary.has_null;
-	}
+	result["output_partition_count"] = sink->NumPartitions();
+	result["query_id"] = sink->SinkQueryId();
+	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();
 	return result;
 }

@@ -63,14 +63,14 @@ class _FakeNativeWorkerTask:
         task_context: dict[str, Any] | None = None,
         inputs: dict[str, Any] | None = None,
         plan: Any = None,
-        exchange_sink_instance: Any = None,
+        exchange_sink_config: Any = None,
     ) -> None:
         self._name = name
         self._context = dict(context or {})
         self._task_context = dict(task_context or {})
         self._inputs = dict(inputs or {})
         self._plan = {"plan": "native"} if plan is None else plan
-        self._exchange_sink_instance = exchange_sink_instance
+        self._exchange_sink_config = exchange_sink_config
 
     def name(self):
         return self._name
@@ -87,8 +87,8 @@ class _FakeNativeWorkerTask:
     def plan(self):
         return self._plan
 
-    def exchange_sink_instance(self):
-        return self._exchange_sink_instance
+    def exchange_sink_config(self):
+        return self._exchange_sink_config
 
 
 class _QueryLifecycleBackend:
@@ -1469,7 +1469,6 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
                 "node_id": "3",
                 "fragment_execution_id": 4,
                 "attempt_id": attempt_id,
-                "preserve_plan_exchange_sink_instance": "1",
             },
             task_context={
                 "query_idx": 0,
@@ -1483,16 +1482,11 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
                     "data": exchange_source,
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {
-                    "query_id": "query-sink-identity",
-                    "exchange_id": "materialized",
-                    "task_partition_id": 0,
-                    "partition_id": 0,
-                },
-                "attempt_id": 0,
-                "output_location": "materialized__sink_0__attempt_0",
-                "fte_task_identity": True,
+            exchange_sink_config={
+                "identity_source": "task",
+                "query_id": "query-sink-identity",
+                "output_partition_count": 1,
+                "output_location_prefix": "materialized",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1525,10 +1519,9 @@ def test_native_worker_task_request_derives_fte_exchange_sink_identity():
         f"materialized__sink_{stable_identity}__attempt_2"
     )
     assert first_order["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == stable_identity
-    assert "preserve_plan_exchange_sink_instance" not in first_order["exchange_sink_instance"]
 
 
-def test_native_worker_task_request_derives_stable_plan_sink_identity_from_inputs():
+def test_native_worker_task_request_derives_stable_task_sink_identity_from_inputs():
     def make_request(event_task_id: int, source_task_partition_id: int) -> dict[str, Any]:
         task = _FakeNativeWorkerTask(
             context={"query_id": "query-plan-derived", "node_id": "4"},
@@ -1549,10 +1542,11 @@ def test_native_worker_task_request_derives_stable_plan_sink_identity_from_input
                     },
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "identity_source": "task",
+                "query_id": "query-plan-derived",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1583,10 +1577,11 @@ def test_native_worker_task_request_distinguishes_scan_splits_by_stable_id():
                     "data": _scan_split_batch(split_id, b"same-file-payload"),
                 }
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "identity_source": "task",
+                "query_id": "query-duplicate-scan",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1619,10 +1614,11 @@ def test_native_worker_task_request_uses_explicit_static_source_partition_identi
                 "task_id": event_task_id,
                 "node_ids": [3, 4],
             },
-            exchange_sink_instance={
-                "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                "attempt_id": 0,
-                "output_location": "shuffle__sink_0__attempt_0",
+            exchange_sink_config={
+                "identity_source": "task",
+                "query_id": "query-static-source",
+                "output_partition_count": 1,
+                "output_location_prefix": "shuffle",
             },
         )
         return NativeFteWorkerManagerBackend._request_from_task(task)
@@ -1643,7 +1639,6 @@ def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
             "node_id": "3",
             "fragment_execution_id": 4,
             "attempt_id": 2,
-            "preserve_plan_exchange_sink_instance": "1",
         },
         task_context={
             "query_idx": 0,
@@ -1651,17 +1646,12 @@ def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
             "task_id": 7,
             "node_ids": [3],
         },
-        exchange_sink_instance={
-            "sink_handle": {
-                "query_id": "query-plan-sink-identity",
-                "exchange_id": "range",
-                "task_partition_id": 5,
-                "partition_id": 5,
-            },
-            "task_partition_id": 5,
-            "partition_id": 5,
-            "attempt_id": 0,
-            "output_location": "range__sink_5__attempt_0",
+        exchange_sink_config={
+            "identity_source": "plan",
+            "plan_task_partition_id": 5,
+            "query_id": "query-plan-sink-identity",
+            "output_partition_count": 1,
+            "output_location_prefix": "range",
         },
     )
 
@@ -1669,11 +1659,8 @@ def test_native_worker_task_request_preserves_plan_exchange_sink_identity():
 
     assert request["exchange_sink_instance"]["attempt_id"] == 2
     assert request["exchange_sink_instance"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["partition_id"] == 5
     assert request["exchange_sink_instance"]["sink_handle"]["task_partition_id"] == 5
-    assert request["exchange_sink_instance"]["sink_handle"]["partition_id"] == 5
     assert request["exchange_sink_instance"]["output_location"] == "range__sink_5__attempt_2"
-    assert request["exchange_sink_instance"]["preserve_plan_exchange_sink_instance"] is True
 
 
 def test_native_worker_manager_rejects_stable_task_identity_collisions():

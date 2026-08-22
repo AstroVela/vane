@@ -26,10 +26,10 @@ namespace distributed {
 ///
 /// Lifecycle (coordinator side):
 ///   1. CreateExchange() via ExchangeManager
-///   2. AddSink() for each input task → get ExchangeSinkHandle
-///   3. InstantiateSink() for each handle → get SinkInstanceHandle (sent to worker)
+///   2. Copy immutable exchange metadata into each remote sink plan
+///   3. The task runner binds a logical task id and attempt id before execution
 ///   4. Workers write data via ExchangeSink::AddChunk()
-///   5. SinkFinished() called as each sink completes
+///   5. AddSink() and SinkFinished() register each completed logical task attempt
 ///   6. AllRequiredSinksFinished() when all sinks are done
 ///   7. GetSourceHandles() → produce handles for downstream tasks
 ///   8. Close()
@@ -38,12 +38,13 @@ public:
 	virtual ~Exchange() = default;
 
 	/// Register a new sink for the given task partition.
-	/// Called once per input task (coordinator side).
+	/// May be called before submission or when a bound attempt completes.
 	virtual ExchangeSinkHandle AddSink(idx_t task_partition_id) = 0;
 
 	/// Create a concrete sink instance for the given handle and attempt.
-	/// The returned SinkInstanceHandle is sent to the worker to create
-	/// the actual ExchangeSink.
+	/// Coordinator-owned execution paths can use this directly. Serialized
+	/// physical plans instead carry immutable binding metadata and are bound by
+	/// their task runner.
 	/// Multiple attempts for the same handle support fault tolerance.
 	virtual ExchangeSinkInstanceHandle InstantiateSink(const ExchangeSinkHandle &handle, idx_t attempt_id) = 0;
 
@@ -78,6 +79,12 @@ public:
 
 	/// Number of output partitions this exchange was created with.
 	virtual idx_t GetNumPartitions() const = 0;
+
+	/// Immutable ownership metadata copied into remote sink plans.
+	virtual const ExchangeContext &GetContext() const = 0;
+
+	/// Prefix used to construct a concrete sink attempt location.
+	virtual const std::string &GetSinkOutputLocationPrefix() const = 0;
 
 	/// Close the exchange and release all resources.
 	virtual void Close() = 0;

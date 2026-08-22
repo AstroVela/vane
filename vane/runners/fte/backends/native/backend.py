@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vane._native import ray_cxx
+from vane.runners.exchange_sink import bind_exchange_sink_instance, normalize_exchange_sink_config
 from vane.runners.fte.backend import TaskResultPoll, TaskResultState
 from vane.runners.fte.dynamic_inputs import (
     prepare_fte_dynamic_inputs,
@@ -28,7 +29,6 @@ from vane.runners.fte.dynamic_inputs import (
     strip_fte_dynamic_context,
 )
 from vane.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
-from vane.runners.fte.fte_exchange import derive_exchange_sink_instance_for_attempt
 from vane.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from vane.runners.fte.fte_state import FteTaskState
 from vane.runners.fte.fte_types import (
@@ -2199,48 +2199,21 @@ class NativeFteWorkerManagerBackend:
 
         exchange_sink_instance = None
         stable_task_identity_key = None
-        exchange_sink_instance_fn = getattr(task, "exchange_sink_instance", None)
-        if callable(exchange_sink_instance_fn):
-            exchange_sink_instance = exchange_sink_instance_fn()
-            if exchange_sink_instance is not None:
-                try:
-                    exchange_sink_instance = dict(exchange_sink_instance)
-                except (TypeError, ValueError):
-                    pass
-                preserve_plan_sink_partition = str(
-                    context.get("preserve_plan_exchange_sink_instance") or ""
-                ).strip().lower() not in ("", "0", "false", "no", "off")
-                if preserve_plan_sink_partition and isinstance(exchange_sink_instance, Mapping):
-                    exchange_sink_instance = dict(exchange_sink_instance)
-                    # The inherited context can describe an upstream plan sink.
-                    # An appended materialized-coordinator sink carries its own
-                    # explicit FTE-derived identity policy.
-                    if not bool(exchange_sink_instance.get("fte_task_identity")):
-                        exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
-                stable_task_identity = None
-                runtime_task_partition_id = partition_id
-                preserve_plan_sink_identity = isinstance(exchange_sink_instance, Mapping) and bool(
-                    exchange_sink_instance.get("preserve_plan_exchange_sink_instance")
+        exchange_sink_config = task.exchange_sink_config()
+        if exchange_sink_config is not None:
+            exchange_sink_config = normalize_exchange_sink_config(exchange_sink_config)
+            runtime_task_partition_id = None
+            if exchange_sink_config["identity_source"] == "task":
+                runtime_task_partition_id, stable_task_identity_key = _stable_native_fte_task_identity(
+                    task_inputs,
+                    task_context_info,
+                    context,
                 )
-                if isinstance(exchange_sink_instance, Mapping) and not preserve_plan_sink_identity:
-                    stable_task_identity, stable_task_identity_key = _stable_native_fte_task_identity(
-                        task_inputs,
-                        task_context_info,
-                        context,
-                    )
-                    runtime_task_partition_id = stable_task_identity
-                exchange_sink_instance = derive_exchange_sink_instance_for_attempt(
-                    exchange_sink_instance,
-                    attempt_id,
-                    task_partition_id=runtime_task_partition_id,
-                    fragment_execution_id=fragment_execution_id,
-                    stable_task_identity=(
-                        stable_task_identity
-                        if isinstance(exchange_sink_instance, Mapping)
-                        and bool(exchange_sink_instance.get("fte_task_identity"))
-                        else None
-                    ),
-                )
+            exchange_sink_instance = bind_exchange_sink_instance(
+                exchange_sink_config,
+                attempt_id=attempt_id,
+                task_partition_id=runtime_task_partition_id,
+            )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")
         node_id = str(context.get("node_id") or task_context_info.get("last_node_id") or partition_id)

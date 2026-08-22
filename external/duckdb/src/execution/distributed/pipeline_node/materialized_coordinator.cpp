@@ -95,20 +95,19 @@ DuckDBResult<void> RunMaterializedCoordinator(const std::shared_ptr<PipelineNode
 		    DuckDBError::internal_error("materialized coordinator failed to create exchange"));
 	}
 	auto exchange = std::shared_ptr<Exchange>(exchange_unique.release());
-	auto template_sink_instance = InstantiateFteDerivedExchangeSink(*exchange, 0);
 
 	MaterializedPlanBuilder local_plan_builder;
 	if (per_task_builder_factory) {
 		local_plan_builder = per_task_builder_factory(0);
 	}
 
-	auto sink_plan_builder = [local_plan_builder, exchange_mgr, exchange_id, template_sink_instance,
-	                          num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
+	auto sink_plan_builder = [local_plan_builder, exchange_mgr,
+	                          exchange](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
 		if (local_plan_builder) {
 			plan = local_plan_builder(std::move(plan));
 		}
-		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, exchange_id, template_sink_instance,
-		                                 exchange_mgr);
+		return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *exchange, ExchangeSinkIdentitySource::TASK,
+		                                 optional_idx(), exchange_mgr);
 	};
 
 	auto sink_stream = input_stream->pipeline_instruction(node, sink_plan_builder, client_context);

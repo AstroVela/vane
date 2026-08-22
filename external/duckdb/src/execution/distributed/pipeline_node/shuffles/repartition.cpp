@@ -126,14 +126,18 @@ idx_t ResolveExchangeSourceTaskCount(idx_t num_partitions, const DuckDBExecution
 // ─── RemoteExchange (SPI-based) plan builders ────────────────────────
 
 DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const std::shared_ptr<RepartitionSpec> &spec,
-                                              idx_t num_partitions, const std::string &exchange_id,
-                                              const distributed::ExchangeSinkInstanceHandle &sink_handle,
+                                              const distributed::Exchange &exchange,
+                                              distributed::ExchangeSinkIdentitySource sink_identity_source,
+                                              optional_idx plan_task_partition_id,
                                               std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
                                               bool collect_mark_join_build_summary,
                                               vector<unique_ptr<Expression>> mark_join_build_expressions) {
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
+	const auto num_partitions = exchange.GetNumPartitions();
+	const auto &exchange_context = exchange.GetContext();
+	const auto &exchange_id = exchange_context.exchange_id;
 	if (spec && spec->type() == RepartitionSpec::Type::Range) {
 		auto *range_spec = dynamic_cast<RangeRepartitionSpec *>(spec.get());
 		if (!range_spec) {
@@ -143,8 +147,8 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 		if (config.num_partitions() && config.num_partitions() != num_partitions) {
 			throw InvalidInputException("range repartition partition count does not match exchange partition count");
 		}
-		return AddRemoteRangeExchangeSinkPlan(std::move(plan), config.orders(), num_partitions, exchange_id,
-		                                      sink_handle, std::move(exchange_mgr), config.boundaries());
+		return AddRemoteRangeExchangeSinkPlan(std::move(plan), config.orders(), exchange, sink_identity_source,
+		                                      plan_task_partition_id, std::move(exchange_mgr), config.boundaries());
 	}
 	auto partition_exprs = CopyHashPartitionByExpressions(spec);
 	auto repartition_type = ResolveRepartitionType(spec);
@@ -152,7 +156,8 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 	auto estimated = old_root.estimated_cardinality;
 	auto &sink = static_cast<PhysicalRemoteExchangeSink &>(plan->Make<PhysicalRemoteExchangeSink>(
 	    old_root.GetTypes(), estimated, exchange_id, num_partitions, repartition_type, std::move(partition_exprs),
-	    sink_handle, std::move(exchange_mgr)));
+	    sink_identity_source, plan_task_partition_id, exchange_context.query_id, exchange.GetSinkOutputLocationPrefix(),
+	    std::move(exchange_mgr)));
 	if (collect_mark_join_build_summary) {
 		sink.EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 	}
@@ -162,13 +167,16 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 }
 
 DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan, const vector<BoundOrderByNode> &orders,
-                                                   idx_t num_partitions, const std::string &exchange_id,
-                                                   const distributed::ExchangeSinkInstanceHandle &sink_handle,
+                                                   const distributed::Exchange &exchange,
+                                                   distributed::ExchangeSinkIdentitySource sink_identity_source,
+                                                   optional_idx plan_task_partition_id,
                                                    std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
                                                    vector<string> boundary_keys) {
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
+	const auto num_partitions = exchange.GetNumPartitions();
+	const auto &exchange_context = exchange.GetContext();
 	RangeRepartitionConfig::Validate(orders, num_partitions, boundary_keys);
 	vector<unique_ptr<Expression>> partition_exprs;
 	vector<string> order_modifiers;
@@ -180,10 +188,11 @@ DuckPhysicalPlanRef AddRemoteRangeExchangeSinkPlan(DuckPhysicalPlanRef plan, con
 	}
 	auto &old_root = plan->Root();
 	auto estimated = old_root.estimated_cardinality;
-	auto &sink = plan->Make<PhysicalRemoteExchangeSink>(old_root.GetTypes(), estimated, exchange_id, num_partitions,
-	                                                    RepartitionSpec::Type::Range, std::move(partition_exprs),
-	                                                    sink_handle, std::move(exchange_mgr), std::move(boundary_keys),
-	                                                    std::move(order_modifiers));
+	auto &sink = plan->Make<PhysicalRemoteExchangeSink>(
+	    old_root.GetTypes(), estimated, exchange_context.exchange_id, num_partitions, RepartitionSpec::Type::Range,
+	    std::move(partition_exprs), sink_identity_source, plan_task_partition_id, exchange_context.query_id,
+	    exchange.GetSinkOutputLocationPrefix(), std::move(exchange_mgr), std::move(boundary_keys),
+	    std::move(order_modifiers));
 	sink.children.push_back(old_root);
 	plan->SetRoot(sink);
 	return plan;
@@ -343,19 +352,12 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		auto exchange = std::shared_ptr<distributed::Exchange>(
 		    exchange_mgr->CreateExchange(exchange_ctx, num_partitions).release());
 
-		// Atomic counter for generating unique task partition IDs for sink handles
-		auto sink_task_counter = std::make_shared<std::atomic<idx_t>>(0);
-
 		// Build sink plan builder: RemoteExchangeSink
 		auto repartition_spec = self_shared->repartition_spec_;
-		auto plan_builder = [self_shared, repartition_spec, num_partitions, exchange_id, exchange, exchange_mgr,
-		                     sink_task_counter](DuckPhysicalPlanRef plan) {
-			// The ordinal only distinguishes plan templates. FTE replaces it with
-			// a stable identity that is unique across every input fragment.
-			auto task_partition_id = sink_task_counter->fetch_add(1);
-			auto sink_instance = InstantiateFteDerivedExchangeSink(*exchange, task_partition_id);
-			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, num_partitions, exchange_id,
-			                                 sink_instance, exchange_mgr, self_shared->collect_mark_join_build_summary_,
+		auto plan_builder = [self_shared, repartition_spec, exchange, exchange_mgr](DuckPhysicalPlanRef plan) {
+			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, *exchange,
+			                                 ExchangeSinkIdentitySource::TASK, optional_idx(), exchange_mgr,
+			                                 self_shared->collect_mark_join_build_summary_,
 			                                 CopyExpressions(self_shared->mark_join_build_expressions_));
 		};
 		auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);

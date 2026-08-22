@@ -540,7 +540,6 @@ BuildExchangeSourceTasks(const PipelineNodeContext &context, const PipelineNodeC
 		task_context_map["fragment_id"] = effective_query_id + ":orderby:" + std::to_string(context.node_id()) + ":" +
 		                                  task_name + ":" + std::to_string(task_idx);
 		task_context_map["stable_task_partition_id"] = std::to_string(task_idx);
-		task_context_map["preserve_plan_exchange_sink_instance"] = "1";
 		WorkerTask task(task_context, plan, config.execution_config(), std::move(task_context_map), task_name);
 		tasks.push_back(std::move(task));
 	}
@@ -645,13 +644,10 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			const auto stage_query_id = MakeOrderByInternalQueryId(self_shared->context(), "stage_query");
 			auto staging_exchange = CreateOrderByExchange(self_shared->context(), staging_exchange_id, num_partitions,
 			                                              exchange_mgr, client_context);
-			auto staging_sink_counter = std::make_shared<std::atomic<idx_t>>(0);
-			auto stage_plan_builder = [staging_exchange, exchange_mgr, staging_exchange_id, staging_sink_counter,
-			                           num_partitions](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
-				auto task_partition_id = staging_sink_counter->fetch_add(1);
-				auto sink_instance = InstantiateFteDerivedExchangeSink(*staging_exchange, task_partition_id);
-				return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, num_partitions, staging_exchange_id,
-				                                 sink_instance, exchange_mgr);
+			auto stage_plan_builder = [staging_exchange,
+			                           exchange_mgr](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
+				return AddRemoteExchangeSinkPlan(std::move(plan), nullptr, *staging_exchange,
+				                                 ExchangeSinkIdentitySource::TASK, optional_idx(), exchange_mgr);
 			};
 
 			auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
@@ -796,13 +792,12 @@ SubmittableTaskStream<WorkerTask> OrderByNode::produce_tasks(PlanExecutionContex
 			                                            exchange_mgr, client_context);
 			const auto range_query_id = MakeOrderByInternalQueryId(self_shared->context(), "range_query");
 			auto range_sink_counter = std::make_shared<std::atomic<idx_t>>(0);
-			auto range_plan_builder = [self_shared, range_exchange, exchange_mgr, range_exchange_id, range_sink_counter,
-			                           num_partitions, boundaries](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
+			auto range_plan_builder = [self_shared, range_exchange, exchange_mgr, range_sink_counter,
+			                           boundaries](DuckPhysicalPlanRef plan) -> DuckPhysicalPlanRef {
 				auto task_partition_id = range_sink_counter->fetch_add(1);
-				auto sink_handle = range_exchange->AddSink(task_partition_id);
-				auto sink_instance = range_exchange->InstantiateSink(sink_handle, /*attempt_id=*/0);
-				return AddRemoteRangeExchangeSinkPlan(std::move(plan), self_shared->orders_, num_partitions,
-				                                      range_exchange_id, sink_instance, exchange_mgr, boundaries);
+				return AddRemoteRangeExchangeSinkPlan(std::move(plan), self_shared->orders_, *range_exchange,
+				                                      ExchangeSinkIdentitySource::PLAN, optional_idx(task_partition_id),
+				                                      exchange_mgr, boundaries);
 			};
 
 			auto range_tasks = BuildExchangeSourceTasks(

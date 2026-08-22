@@ -261,8 +261,8 @@ public:
 	// typed payload such as scan-split-batch bytes or exchange-source-task bytes.
 	py::dict Inputs() const;
 
-	// Return the task-local remote exchange sink instance, if the plan has one.
-	py::object ExchangeSinkInstance() const;
+	// Return the static remote exchange sink binding configuration, if present.
+	py::object ExchangeSinkConfig() const;
 
 private:
 	duckdb::distributed::WorkerTask task_;
