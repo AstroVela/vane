@@ -47,6 +47,14 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
     def build_physical_vllm_options(self) -> dict[str, Any]:
         options = dict(self.sglang_options)
 
+        actor_number = options.pop("actor_number", None)
+        if actor_number is not None:
+            options.setdefault("concurrency", actor_number)
+
+        max_retries = options.pop("max_retries", None)
+        if max_retries not in (None, 0):
+            raise ValueError("native SGLang prompting does not support max_retries")
+
         # PhysicalVLLM invokes the executor through a synchronous C++ bridge.
         # Inside a generic Ray actor that bridge still needs a dedicated
         # event-loop thread rather than Ray's async actor loop.

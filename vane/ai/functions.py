@@ -1706,9 +1706,9 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family == "vllm":
+    if family in {"vllm", "sglang"}:
         if return_raw_response:
-            raise ValueError("Provider 'vllm' does not support return_raw_response")
+            raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1
         prepared["batch_size"] = batch_size if batch_size is not None else 128
         prepared["max_retries"] = max_retries if max_retries is not None else 0

@@ -325,7 +325,14 @@ def test_sglang_plan_lowers_prompt_controls_into_sampling_params():
     from vane.ai.providers.sglang import NativeSGLangPromptPlan
 
     plan = NativeSGLangPromptPlan(
-        sglang_options={"max_tokens": 32, "max_new_tokens": 40, "temperature": 0.7},
+        sglang_options={
+            "actor_number": 3,
+            "batch_size": 7,
+            "max_retries": 0,
+            "max_tokens": 32,
+            "max_new_tokens": 40,
+            "temperature": 0.7,
+        },
         return_format={"type": "object"},
         on_error="ignore",
     )
@@ -334,8 +341,74 @@ def test_sglang_plan_lowers_prompt_controls_into_sampling_params():
     assert options["use_threading"] is True
     assert options["_force_background_thread"] is True
     assert options["on_error"] == "null"
+    assert options["concurrency"] == 3
+    assert options["batch_size"] == 7
+    assert "actor_number" not in options
+    assert "max_retries" not in options
 
     sampling = options["generate_args"]["sampling_params"]
     assert sampling["max_new_tokens"] == 40  # max_new_tokens wins over max_tokens
     assert sampling["temperature"] == 0.7
     assert sampling["json_schema"] == '{"type": "object"}'
+
+
+def test_sglang_builder_forwards_background_loop_controls(monkeypatch):
+    import vane.execution.sglang as sglang
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    captured = {}
+    executor = object()
+
+    def create_local_executor(model, engine_args, generate_args, **kwargs):
+        captured.update(model=model, engine_args=engine_args, generate_args=generate_args, kwargs=kwargs)
+        return executor
+
+    monkeypatch.setattr(sglang, "SGLangLocalExecutor", create_local_executor)
+    envelope = _build_native_vllm_options_argument(
+        {"use_threading": True, "_force_background_thread": True},
+        engine="sglang",
+    )
+
+    assert sglang.build_executor("test-model", envelope) is executor
+    assert captured["kwargs"]["use_threading"] is True
+    assert captured["kwargs"]["force_background_thread"] is True
+
+
+def test_sglang_secrets_restore_before_named_pool_creation(monkeypatch):
+    import vane.execution.vllm as vllm
+    from vane.ai._redaction import Secret
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    envelope = _build_native_vllm_options_argument(
+        {
+            "engine_args": {"hf_token": Secret("hf_SGLANG-ENGINE-TOKEN")},
+            "generate_args": {"api_key": Secret("sk-SGLANG-GENERATE-KEY")},
+        },
+        engine="sglang",
+    )
+    envelope.update(use_ray=True, ray_worker_only=True, ray_actor_pool_name="sglang-secret-pool")
+
+    class Plan:
+        def collect_vllm_nodes(self, conn=None):
+            return [{"model": "secret-model", "pool_name": "sglang-secret-pool", "options": envelope}]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("VANE_WORKER", raising=False)
+
+    captured = {}
+    actors = object()
+
+    def get_or_create_named(_cls, **kwargs):
+        captured.update(kwargs)
+        return actors
+
+    monkeypatch.setattr(vllm.LLMActors, "get_or_create_named", classmethod(get_or_create_named))
+
+    created, leases = vllm.ensure_named_vllm_pools_for_plan(Plan(), session_config={})
+
+    assert created == [actors]
+    assert leases == {}
+    assert captured["engine_args"]["hf_token"] == "hf_SGLANG-ENGINE-TOKEN"
+    assert captured["generate_args"]["api_key"] == "sk-SGLANG-GENERATE-KEY"

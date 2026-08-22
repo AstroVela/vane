@@ -1826,7 +1826,7 @@ def ensure_named_vllm_pools_for_plan(
                 from vane.execution.sglang import SGLangRayLocalExecutor
                 from vane.execution.sglang import normalize_options as normalize_sglang_options
 
-                opts = normalize_sglang_options(raw_opts)
+                opts = _restore_native_vllm_secrets(normalize_sglang_options(raw_opts))
                 actor_cls: type = SGLangRayLocalExecutor
                 engine_args = dict(opts.get("engine_args") or {})
                 generate_args = dict(opts.get("generate_args") or {})

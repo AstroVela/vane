@@ -142,6 +142,7 @@ _SGLANG_DEFAULTS: dict[str, Any] = {
     "engine_args": {},
     "generate_args": {},
     "use_ray": False,
+    "use_threading": True,
     "inflight_limit": 128,
     "engine_init_timeout_s": None,
 }
@@ -212,5 +213,7 @@ def build_executor(model: str, options: Any | None) -> LLMExecutor:
         opts["engine_args"],
         opts["generate_args"],
         on_error=opts["on_error"],
+        use_threading=opts["use_threading"],
         engine_init_timeout_s=opts.get("engine_init_timeout_s"),
+        force_background_thread=opts.get("_force_background_thread", False),
     )

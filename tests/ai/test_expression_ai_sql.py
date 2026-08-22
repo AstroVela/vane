@@ -911,6 +911,31 @@ def test_ai_sql_helper_builds_closed_native_vllm_spec():
     }
 
 
+def test_ai_sql_helper_preserves_native_sglang_execution_controls():
+    from vane.ai._sql import build_ai_prompt_sql_spec
+
+    spec = build_ai_prompt_sql_spec(
+        "sglang",
+        "model-a",
+        None,
+        "raise",
+        {
+            "actor_number": Decimal(3),
+            "batch_size": Decimal(7),
+            "max_retries": Decimal(0),
+        },
+    )
+    options_envelope = spec["options"]
+    native = json.loads(options_envelope["__vane_vllm_public_options_json"])
+
+    assert spec["execution_kind"] == "native_vllm"
+    assert options_envelope["engine"] == "sglang"
+    assert native["concurrency"] == 3
+    assert native["batch_size"] == 7
+    assert "actor_number" not in native
+    assert "max_retries" not in native
+
+
 def test_ai_embed_sql_fixed_dimensions_and_null_contract_are_preserved():
     conn = vane.connect()
     relation = conn.sql("""

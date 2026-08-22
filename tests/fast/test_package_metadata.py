@@ -314,6 +314,7 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("google") == {"google-genai"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
     assert "vllm" in _requirements_for_extra("vllm")
+    assert "sglang" in _requirements_for_extra("sglang")
 
 
 def test_structured_provider_extras_require_supported_sdk_versions():
@@ -324,10 +325,16 @@ def test_structured_provider_extras_require_supported_sdk_versions():
         "vllm",
         {"platform_system": "Linux", "platform_machine": "x86_64"},
     )
+    sglang = _requirement_for_extra(
+        "sglang",
+        "sglang",
+        {"platform_system": "Linux", "platform_machine": "x86_64"},
+    )
 
     assert openai.specifier == SpecifierSet(">=1.66.0")
     assert google.specifier == SpecifierSet(">=1.22.0")
     assert vllm.specifier == SpecifierSet(">=0.11.0")
+    assert sglang.specifier == SpecifierSet(">=0.5.17,<0.6")
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():
