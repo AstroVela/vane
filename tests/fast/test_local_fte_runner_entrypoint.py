@@ -346,7 +346,6 @@ def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
         FakeFragmentExecutor(),
         FakeConn(),
         [FakePool("first"), FakePool("second")],
-        kill_actor_pools=True,
         timeout_s=7.0,
     )
 
@@ -357,13 +356,13 @@ def test_local_runner_teardown_releases_actor_pools_after_execution_resources():
         "fragments-request",
         "backend-join",
         "fragments-close",
-        "pool:second:True",
-        "pool:first:True",
+        "pool:second:False",
+        "pool:first:False",
         "connection",
     ]
 
 
-def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
+def test_local_runner_teardown_forces_actors_and_keeps_other_dependencies_when_backend_does_not_stop():
     from vane.runners.local.runner import _shutdown_local_write_resources
 
     events = []
@@ -387,25 +386,24 @@ def test_local_runner_teardown_keeps_dependencies_when_backend_does_not_stop():
         def close(self):
             raise AssertionError("driver connection must remain alive")
 
-    class UnexpectedPool:
+    class FakePool:
         def shutdown(self, *, kill):
-            raise AssertionError("actor pool must remain alive")
+            events.append(f"pool:{kill}")
 
     errors = _shutdown_local_write_resources(
         FakeBackend(),
         FakeFragmentExecutor(),
         UnexpectedConn(),
-        [UnexpectedPool()],
-        kill_actor_pools=True,
+        [FakePool()],
         timeout_s=7.0,
     )
 
-    assert events == ["backend-request", "fragments-request", "backend-join"]
+    assert events == ["backend-request", "fragments-request", "backend-join", "pool:True"]
     assert len(errors) == 1
     assert "backend join timed out" in str(errors[0])
 
 
-def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
+def test_local_runner_teardown_forces_actors_and_keeps_connection_when_fragment_close_fails():
     from vane.runners.local.runner import _shutdown_local_write_resources
 
     events = []
@@ -429,16 +427,15 @@ def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
         def close(self):
             raise AssertionError("driver connection must remain alive")
 
-    class UnexpectedPool:
+    class FakePool:
         def shutdown(self, *, kill):
-            raise AssertionError("actor pool must remain alive")
+            events.append(f"pool:{kill}")
 
     errors = _shutdown_local_write_resources(
         FakeBackend(),
         FakeFragmentExecutor(),
         UnexpectedConn(),
-        [UnexpectedPool()],
-        kill_actor_pools=False,
+        [FakePool()],
         timeout_s=7.0,
     )
 
@@ -449,4 +446,5 @@ def test_local_runner_teardown_keeps_dependencies_when_fragment_close_fails():
         "fragments-request",
         "backend-join",
         "fragments-close",
+        "pool:True",
     ]

@@ -692,13 +692,10 @@ def _make_batch_actor(
 def _relation_arrow_schema(relation: DuckDBPyRelation) -> pa.Schema:
     import pyarrow as pa
 
-    from vane.datasource import _convert_duckdb_pytype
-
-    names = list(relation.columns)
-    types = list(relation.types)
-    if len(names) != len(types):
-        raise RuntimeError("relation returned inconsistent column names and types")
-    return pa.schema([pa.field(name, _convert_duckdb_pytype(dtype)) for name, dtype in zip(names, types, strict=True)])
+    schema = relation._arrow_schema()
+    if not isinstance(schema, pa.Schema):
+        raise TypeError(f"relation returned {type(schema).__name__}, expected pyarrow.Schema")
+    return schema
 
 
 def _quote_identifier(identifier: str) -> str:

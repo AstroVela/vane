@@ -7,7 +7,6 @@ import math
 import os
 import secrets
 import time
-import warnings
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -38,22 +37,8 @@ from vane.runners.ray.safe_get import (
 _ACTOR_CLOSE_TIMEOUT_S = 5.0
 
 
-def _warn_actor_close_errors(errors: list[str]) -> None:
-    if not errors:
-        return
-    try:
-        warnings.warn(
-            "Ray UDF actors were killed after graceful callable cleanup failed: " + "; ".join(errors),
-            RuntimeWarning,
-            stacklevel=3,
-        )
-    except BaseException:
-        # Cleanup diagnostics cannot retain already-killed query resources.
-        pass
-
-
 class _OwnedUDFActorPoolsError(RuntimeError):
-    """Carry actor pools whose teardown must remain retryable by the driver."""
+    """Carry actor cleanup diagnostics and pools that remain retryable."""
 
     def __init__(
         self,
@@ -65,6 +50,13 @@ class _OwnedUDFActorPoolsError(RuntimeError):
         super().__init__(message)
         self.owned_actor_pools = list(owned_actor_pools)
         self.creation_error = creation_error
+
+
+def _actor_pool_terminated(pool: Any) -> bool:
+    """Return true only when a pool proves that no actor handle remains."""
+
+    actors = getattr(pool, "actors", None)
+    return actors is not None and not actors
 
 
 def _with_actor_thread_env(
@@ -245,9 +237,15 @@ class UDFActorPoolBase:
                 kill_errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
                 remaining_actors.append(actor)
         self.actors = remaining_actors
-        _warn_actor_close_errors(close_errors)
         if kill_errors:
-            raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(kill_errors))
+            details = list(kill_errors)
+            if close_errors:
+                details.extend(close_errors)
+            raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(details))
+        if close_errors:
+            raise RuntimeError(
+                "Ray UDF actors were terminated after graceful callable cleanup failed: " + "; ".join(close_errors)
+            )
 
 
 def apply_actor_node_options(
@@ -687,7 +685,8 @@ def _create_actor_pools_for_nodes(
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
-                remaining_owned.append(actors_obj)
+                if not _actor_pool_terminated(actors_obj):
+                    remaining_owned.append(actors_obj)
         if cleanup_errors:
             creation_error = getattr(execution_error, "creation_error", execution_error)
             raise _OwnedUDFActorPoolsError(
@@ -720,7 +719,8 @@ def wait_for_actor_pools_ready(actor_pools: list[UDFActorPoolBase]) -> None:
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
                 cleanup_errors.append(f"{type(cleanup_error).__name__}: {cleanup_error}")
-                remaining_owned.append(actors_obj)
+                if not _actor_pool_terminated(actors_obj):
+                    remaining_owned.append(actors_obj)
         if cleanup_errors:
             creation_error = getattr(readiness_error, "creation_error", readiness_error)
             raise _OwnedUDFActorPoolsError(

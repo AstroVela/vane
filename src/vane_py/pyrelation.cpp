@@ -1422,6 +1422,20 @@ duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTable(idx_t batch_size) {
 	return ToArrowTableInternal(batch_size, false);
 }
 
+py::object DuckDBPyRelation::GetArrowSchema() {
+	ClientProperties client_properties;
+	if (rel) {
+		client_properties = rel->context->GetContext()->GetClientProperties();
+	} else if (result) {
+		client_properties = result->GetClientProperties();
+	} else {
+		throw InternalException("DuckDBPyRelation must have a relation or result to export its Arrow schema");
+	}
+	py::list batches;
+	auto empty_table = pyarrow::ToArrowTable(types, names, std::move(batches), client_properties);
+	return empty_table.attr("schema");
+}
+
 py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) {
 	if (!result) {
 		if (!rel) {

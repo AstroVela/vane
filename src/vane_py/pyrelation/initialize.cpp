@@ -323,6 +323,8 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 
 	relation_module.def("filter", &DuckDBPyRelation::Filter, "Filter the relation object by the filter in filter_expr",
 	                    py::arg("filter_expr"));
+	relation_module.def("_arrow_schema", &DuckDBPyRelation::GetArrowSchema,
+	                    "Return the Arrow schema without executing the relation");
 	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
 	relation_module.def(
 	    "map_batches",

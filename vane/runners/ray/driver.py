@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 import weakref
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Executor, ThreadPoolExecutor
@@ -122,6 +123,13 @@ def _retain_udf_actor_pools_for_cleanup(
                 plan_pools.append(pool)
 
 
+def _udf_actor_pool_terminated(pool: Any) -> bool:
+    """Return true only when the pool proves that no actor handle remains."""
+
+    actors = getattr(pool, "actors", None)
+    return actors is not None and not actors
+
+
 def _shutdown_unregistered_udf_actor_pools(
     owner: Any,
     plan_id: str,
@@ -137,14 +145,16 @@ def _shutdown_unregistered_udf_actor_pools(
             pool.shutdown()
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
-            remaining.append(pool)
+            if not _udf_actor_pool_terminated(pool):
+                remaining.append(pool)
     if not cleanup_errors:
         return
-    _retain_udf_actor_pools_for_cleanup(
-        owner,
-        plan_id,
-        list(reversed(remaining)),
-    )
+    if remaining:
+        _retain_udf_actor_pools_for_cleanup(
+            owner,
+            plan_id,
+            list(reversed(remaining)),
+        )
     raise RuntimeError(
         "Ray actor UDF activation failed and actor cleanup also failed: "
         f"activation={type(activation_error).__name__}: {activation_error}; "
@@ -208,6 +218,14 @@ class QueryExecutionCleanupError(RuntimeError):
             primary_error=primary_error,
             cleanup_errors=cleanup,
         )
+
+
+class _QueryCleanupDiagnostic(RuntimeError):
+    """Report cleanup diagnostics after all query ownership was released."""
+
+    def __init__(self, message: str, diagnostics: tuple[BaseException, ...]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -1629,6 +1647,7 @@ class RayQueryDriverActor:
         self._active_udf_actors: list[UDFActorPoolBase] = []
         self._active_udf_actors_by_plan: dict[str, list[UDFActorPoolBase]] = {}
         self._active_udf_actor_by_unit: dict[str, dict[str, UDFActorPoolBase]] = {}
+        self._udf_actor_cleanup_diagnostics_by_plan: dict[str, list[BaseException]] = {}
         self._query_udf_actor_lifecycle_locks: dict[str, threading.RLock] = {}
         self._query_udf_actor_nodes: dict[str, dict[str, dict[str, Any]]] = {}
         self._query_udf_session_configs: dict[str, dict[str, str]] = {}
@@ -5217,7 +5236,22 @@ class RayQueryDriverActor:
                         # The callback was overtaken by a newer frontier snapshot.
                         continue
                     pool._vane_retired = True
-                pool.shutdown()
+                shutdown_error: BaseException | None = None
+                try:
+                    pool.shutdown()
+                except BaseException as exc:
+                    if not _udf_actor_pool_terminated(pool):
+                        raise
+                    shutdown_error = exc
+                if shutdown_error is not None:
+                    diagnostic = RuntimeError(
+                        f"Ray actor UDF pool {resource_unit_id} retired after graceful callable cleanup failed: "
+                        f"{type(shutdown_error).__name__}: {shutdown_error}"
+                    )
+                    diagnostic.__cause__ = shutdown_error
+                    with self._session_lock:
+                        stored_diagnostics = self._udf_actor_cleanup_diagnostics_by_plan.setdefault(query_key, [])
+                        stored_diagnostics.append(diagnostic)
                 if not manager.complete_actor_pool_retirement(resource_unit_id):
                     raise RuntimeError(f"Ray actor UDF pool retirement state disappeared for {resource_unit_id}")
                 with self._session_lock:
@@ -5698,15 +5732,18 @@ class RayQueryDriverActor:
                             if not cleanup_active_by_unit:
                                 self._active_udf_actor_by_unit.pop(plan_id, None)
                 if cleanup_owned:
+                    cleanup_error: BaseException | None = None
                     try:
                         if pool.actors:
                             pool.shutdown()
-                    except BaseException as cleanup_error:
-                        raise RuntimeError(
-                            "Ray actor UDF activation failed and actor cleanup also failed: "
-                            f"activation={type(activation_error).__name__}: {activation_error}; "
-                            f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
-                        ) from activation_error
+                    except BaseException as exc:
+                        if not _udf_actor_pool_terminated(pool):
+                            raise RuntimeError(
+                                "Ray actor UDF activation failed and actor cleanup also failed: "
+                                f"activation={type(activation_error).__name__}: {activation_error}; "
+                                f"cleanup={type(exc).__name__}: {exc}"
+                            ) from activation_error
+                        cleanup_error = exc
                     if not manager.complete_actor_pool_retirement(resource_unit_id):
                         manager.set_ready_actor_slots(resource_unit_id, {})
                         manager.set_submitted_actor_slots(resource_unit_id, set())
@@ -5723,6 +5760,12 @@ class RayQueryDriverActor:
                                 pass
                             if not plan_pools:
                                 self._active_udf_actors_by_plan.pop(plan_id, None)
+                    if cleanup_error is not None:
+                        raise RuntimeError(
+                            "Ray actor UDF activation failed after graceful callable cleanup also failed: "
+                            f"activation={type(activation_error).__name__}: {activation_error}; "
+                            f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+                        ) from activation_error
             raise
 
     def _watch_query_udf_actor_pool_readiness(
@@ -5978,24 +6021,19 @@ class RayQueryDriverActor:
             self._active_vllm_actors_by_plan[plan_id] = list(created)
         return created
 
-    def _cleanup_udf_actor_pools(self, plan_id: str) -> None:
+    def _cleanup_udf_actor_pools(self, plan_id: str) -> list[BaseException]:
         plan_key = str(plan_id)
         lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
         with lifecycle_lock:
-            pools = list(self._active_udf_actors_by_plan.get(plan_key, ()))
+            with self._session_lock:
+                pools = list(self._active_udf_actors_by_plan.get(plan_key, ()))
             if not pools:
-                return
-            errors: list[str] = []
-            remaining_pools: list[Any] = []
-            for pool in pools:
+                return []
+            errors: list[BaseException] = []
+            diagnostics: list[BaseException] = []
+
+            def release_pool_ownership(pool: Any) -> None:
                 with self._session_lock:
-                    pool._vane_retired = True
-                try:
-                    pool.shutdown()
-                except BaseException as exc:
-                    errors.append(f"{type(exc).__name__}: {exc}")
-                    remaining_pools.append(pool)
-                else:
                     try:
                         self._active_udf_actors.remove(pool)
                     except ValueError:
@@ -6007,14 +6045,32 @@ class RayQueryDriverActor:
                                 active_by_unit.pop(resource_unit_id, None)
                         if not active_by_unit:
                             self._active_udf_actor_by_unit.pop(plan_key, None)
-            if remaining_pools:
-                self._active_udf_actors_by_plan[plan_key] = remaining_pools
-            else:
-                self._active_udf_actors_by_plan.pop(plan_key, None)
+                    plan_pools = self._active_udf_actors_by_plan.get(plan_key)
+                    if plan_pools is not None:
+                        plan_pools[:] = [active_pool for active_pool in plan_pools if active_pool is not pool]
+                        if not plan_pools:
+                            self._active_udf_actors_by_plan.pop(plan_key, None)
+
+            for pool in pools:
+                with self._session_lock:
+                    pool._vane_retired = True
+                try:
+                    pool.shutdown()
+                except BaseException as exc:
+                    if _udf_actor_pool_terminated(pool):
+                        diagnostics.append(exc)
+                        release_pool_ownership(pool)
+                    else:
+                        errors.append(exc)
+                else:
+                    release_pool_ownership(pool)
             if errors:
+                details = [f"{type(exc).__name__}: {exc}" for exc in errors]
+                details.extend(f"{type(exc).__name__}: {exc}" for exc in diagnostics)
                 raise RuntimeError(
-                    f"failed to shut down {len(errors)} query-owned UDF actor pool(s): " + "; ".join(errors)
-                )
+                    f"failed to shut down {len(errors)} query-owned UDF actor pool(s): " + "; ".join(details)
+                ) from errors[0]
+            return diagnostics
 
     def _cleanup_vllm_actor_pools(self, plan_id: str) -> None:
         plan_key = str(plan_id)
@@ -6074,6 +6130,7 @@ class RayQueryDriverActor:
                     or plan_key in self._result_partition_ref_counters
                     or plan_key in self._active_udf_actors_by_plan
                     or plan_key in self._active_udf_actor_by_unit
+                    or plan_key in self._udf_actor_cleanup_diagnostics_by_plan
                     or plan_key in self._active_vllm_actors_by_plan
                     or plan_key in self._query_udf_actor_nodes
                     or plan_key in self._query_udf_session_configs
@@ -6174,6 +6231,7 @@ class RayQueryDriverActor:
                 self._plan_session_ids.pop(plan_key)
                 self._plan_query_ids.pop(plan_key, None)
                 self._plan_connections.pop(plan_key, None)
+                self._udf_actor_cleanup_diagnostics_by_plan.pop(plan_key, None)
                 terminal_errors = getattr(self, "_query_terminal_errors", None)
                 if terminal_errors is not None:
                     terminal_errors.pop(query_key, None)
@@ -6200,6 +6258,7 @@ class RayQueryDriverActor:
                     or plan_key in self._result_partition_ref_counters
                     or plan_key in self._active_udf_actors_by_plan
                     or plan_key in self._active_udf_actor_by_unit
+                    or plan_key in self._udf_actor_cleanup_diagnostics_by_plan
                     or plan_key in self._active_vllm_actors_by_plan
                     or plan_key in self._query_udf_actor_nodes
                     or plan_key in self._query_udf_session_configs
@@ -6226,7 +6285,7 @@ class RayQueryDriverActor:
                     raise RuntimeError(f"query plan connection identity changed before teardown: {plan_key}")
             lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
             with lifecycle_lock:
-                self._teardown_plan_resources_once(
+                cleanup_diagnostics = self._teardown_plan_resources_once(
                     lifecycle,
                     query_id,
                     query_connection,
@@ -6238,6 +6297,12 @@ class RayQueryDriverActor:
                 lifecycle_locks = getattr(self, "_query_udf_actor_lifecycle_locks", None)
                 if lifecycle_locks is not None and lifecycle_locks.get(plan_key) is lifecycle_lock:
                     lifecycle_locks.pop(plan_key, None)
+            if cleanup_diagnostics:
+                raise _QueryCleanupDiagnostic(
+                    f"query plan {plan_key} graceful actor cleanup failed: "
+                    + "; ".join(f"{type(exc).__name__}: {exc}" for exc in cleanup_diagnostics),
+                    tuple(cleanup_diagnostics),
+                ) from cleanup_diagnostics[0]
         finally:
             with self._plan_teardown_condition:
                 self._plan_teardowns_in_progress.discard(plan_key)
@@ -6250,9 +6315,11 @@ class RayQueryDriverActor:
         query_connection: Any | None,
         *,
         drop_fragments: bool,
-    ) -> None:
+    ) -> list[BaseException]:
         plan_id = lifecycle.plan_id
         errors: list[BaseException] = []
+        with self._session_lock:
+            cleanup_diagnostics = list(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
         execution_owner_errors: list[BaseException] = []
         self.curr_plans.pop(plan_id, None)
         self.curr_streams.pop(plan_id, None)
@@ -6285,7 +6352,7 @@ class RayQueryDriverActor:
                 if counters is not None:
                     counters.pop(str(plan_id), None)
         try:
-            self._cleanup_udf_actor_pools(str(plan_id))
+            cleanup_diagnostics.extend(self._cleanup_udf_actor_pools(str(plan_id)))
         except BaseException as exc:
             errors.append(exc)
             execution_owner_errors.append(exc)
@@ -6317,13 +6384,33 @@ class RayQueryDriverActor:
             except BaseException as exc:
                 errors.append(exc)
         if errors:
+            details = [f"{type(exc).__name__}: {exc}" for exc in errors]
+            details.extend(
+                f"graceful actor cleanup diagnostic: {type(exc).__name__}: {exc}" for exc in cleanup_diagnostics
+            )
+            raise RuntimeError(f"query plan {plan_id} teardown failed: " + "; ".join(details)) from errors[0]
+        try:
+            self._release_plan_session_state(lifecycle, query_id, query_connection)
+        except BaseException as release_error:
+            if not cleanup_diagnostics:
+                raise
+            details = "; ".join(
+                f"graceful actor cleanup diagnostic: {type(exc).__name__}: {exc}" for exc in cleanup_diagnostics
+            )
             raise RuntimeError(
-                f"query plan {plan_id} teardown failed: " + "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
-            ) from errors[0]
-        self._release_plan_session_state(lifecycle, query_id, query_connection)
+                f"query plan {plan_id} session release failed: "
+                f"{type(release_error).__name__}: {release_error}; {details}"
+            ) from release_error
+        return cleanup_diagnostics
 
     def _cleanup_finished_plan(self, plan_id: str) -> None:
-        self._teardown_plan_resources(plan_id)
+        try:
+            self._teardown_plan_resources(plan_id)
+        except _QueryCleanupDiagnostic as cleanup_diagnostic:
+            try:
+                warnings.warn(str(cleanup_diagnostic), RuntimeWarning, stacklevel=2)
+            except BaseException:
+                pass
 
     def _finish_terminal_query(self, plan_id: str, query_id: str) -> None:
         reason = str(getattr(self, "_query_terminal_errors", {}).get(str(query_id), ""))
@@ -6332,6 +6419,9 @@ class RayQueryDriverActor:
         primary_error = RuntimeError(reason)
         try:
             self._teardown_plan_resources(plan_id)
+        except _QueryCleanupDiagnostic as cleanup_diagnostic:
+            if hasattr(primary_error, "add_note"):
+                primary_error.add_note(f"query cleanup diagnostic: {cleanup_diagnostic}")
         except BaseException as teardown_error:
             aggregate_error = QueryExecutionCleanupError.from_errors(
                 f"terminal query {query_id} failed and deterministic teardown also failed",
@@ -7137,13 +7227,15 @@ class RayQueryDriverActor:
         try:
             await _run_in_executor_with_owned_side_effects(
                 self._get_driver_lifecycle_executor(),
-                self._cleanup_finished_plan,
+                self._teardown_plan_resources,
                 operation_id,
             )
         except asyncio.CancelledError:
             # The owned cleanup call completed before waiter cancellation was
             # exposed, so there is no cleanup work left to retry.
             pass
+        except _QueryCleanupDiagnostic as cleanup_diagnostic:
+            cleanup_warnings += (self._copy_cleanup_warning("COPY cleanup retry", cleanup_diagnostic),)
         except BaseException as cleanup_error:
             cleanup_state = "pending"
             cleanup_warnings += (self._copy_cleanup_warning("COPY cleanup retry", cleanup_error),)
@@ -7553,7 +7645,8 @@ class RayQueryDriverActor:
                 )
                 cleanup_state: Literal["complete", "pending"] = "complete"
                 if teardown_error is not None:
-                    cleanup_state = "pending"
+                    if not isinstance(teardown_error, _QueryCleanupDiagnostic):
+                        cleanup_state = "pending"
                     cleanup_warnings += (
                         self._copy_cleanup_warning(
                             "COPY post-commit teardown",
@@ -7660,7 +7753,8 @@ class RayQueryDriverActor:
             # The owned teardown completed before cancellation was exposed.
             pass
         except BaseException as teardown_error:
-            final_cleanup_state = "pending"
+            if not isinstance(teardown_error, _QueryCleanupDiagnostic):
+                final_cleanup_state = "pending"
             cleanup_warnings += (
                 self._copy_cleanup_warning(
                     "COPY post-commit teardown",

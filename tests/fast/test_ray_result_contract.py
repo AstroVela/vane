@@ -294,6 +294,7 @@ def _make_local_query_driver_actor():
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_udf_actor_by_unit = {}
+    runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}
     runner._query_udf_actor_nodes = {}
     runner._query_udf_session_configs = {}
@@ -1458,6 +1459,44 @@ def test_query_driver_copy_result_logging_failure_replays_committed_success(monk
     assert any("stderr unavailable" in warning for warning in first.cleanup_warnings)
     assert plan_calls == 1
     assert teardown_calls == [(plan_id, plan_id, True)]
+
+
+def test_query_driver_committed_copy_close_diagnostic_is_not_retryable_cleanup(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-close-diagnostic"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_calls = 0
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            return _committed_copy_result(rows_copied=5)
+
+    def _teardown(_self, actual_plan_id):
+        nonlocal teardown_calls
+        teardown_calls += 1
+        assert actual_plan_id == plan_id
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+        close_error = RuntimeError("planned callable close failure")
+        raise driver._QueryCleanupDiagnostic(
+            f"query plan {plan_id} graceful actor cleanup failed: {close_error}",
+            (close_error,),
+        )
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert outcome.cleanup_state == "complete"
+    assert any("planned callable close failure" in warning for warning in outcome.cleanup_warnings)
+    assert plan_id not in runner._copy_cleanup_pending_terminals
+    assert teardown_calls == 1
 
 
 def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
@@ -3272,7 +3311,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     assert runner._plan_query_ids["failed-plan"] == "failed-query"
     assert runner._plan_session_ids["failed-plan"] == _TEST_SESSION_ID
 
-    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: None)
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [])
     monkeypatch.setattr(cls, "_drop_query_fragments_sync", lambda *_args: None)
     cls._cleanup_finished_plan(runner, "failed-plan")
 
@@ -3309,6 +3348,7 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         attempts["actors"] += 1
         if attempts["actors"] == 1:
             raise RuntimeError("actor release failed")
+        return []
 
     def _cleanup_vllm_actors(_self, actual_plan_id):
         calls.append(f"vllm:{actual_plan_id}")
@@ -3373,6 +3413,93 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     assert plan_id not in runner._plan_session_ids
     assert runner._leased_result_partition_refs == {}
     assert runner._result_partition_ref_counters == {}
+
+
+def test_teardown_reports_actor_close_diagnostic_after_releasing_lifecycle_lock(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    phase_close_error = RuntimeError("planned phase callable close failure")
+    close_error = RuntimeError("planned callable close failure")
+    runner._udf_actor_cleanup_diagnostics_by_plan[plan_id] = [phase_close_error]
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(RuntimeError, match="planned phase callable close failure") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert exc_info.value.diagnostics == (phase_close_error, close_error)
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+    assert runner._udf_actor_cleanup_diagnostics_by_plan == {}
+    assert runner._query_udf_actor_lifecycle_locks == {}
+
+
+def test_teardown_preserves_actor_close_diagnostic_when_later_cleanup_fails(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic-with-later-failure"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    close_error = RuntimeError("planned callable close failure")
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+    monkeypatch.setattr(
+        cls,
+        "_cleanup_vllm_actor_pools",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("planned vllm cleanup failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="teardown failed") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "planned vllm cleanup failure" in str(exc_info.value)
+    assert "graceful actor cleanup diagnostic" in str(exc_info.value)
+    assert "planned callable close failure" in str(exc_info.value)
+    assert plan_id in runner._plan_lifecycles
+
+
+def test_teardown_preserves_actor_close_diagnostic_when_session_release_fails(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic-with-session-release-failure"
+    close_error = RuntimeError("planned callable close failure")
+
+    class _QueryConnection:
+        def close(self):
+            raise RuntimeError("planned query connection close failure")
+
+    _bind_test_plan_session(
+        runner,
+        plan_id,
+        query_id="",
+        query_connection=_QueryConnection(),
+    )
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(RuntimeError, match="session release failed") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "planned query connection close failure" in str(exc_info.value)
+    assert "graceful actor cleanup diagnostic" in str(exc_info.value)
+    assert "planned callable close failure" in str(exc_info.value)
+    assert plan_id in runner._plan_lifecycles
+
+
+def test_finished_read_plan_warns_for_completed_actor_cleanup_diagnostic(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    close_error = RuntimeError("planned callable close failure")
+    diagnostic = driver._QueryCleanupDiagnostic(
+        f"query plan read-plan graceful actor cleanup failed: {close_error}",
+        (close_error,),
+    )
+
+    monkeypatch.setattr(
+        cls,
+        "_teardown_plan_resources",
+        lambda *_args: (_ for _ in ()).throw(diagnostic),
+    )
+
+    with pytest.warns(RuntimeWarning, match="planned callable close failure"):
+        cls._cleanup_finished_plan(runner, "read-plan")
 
 
 def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retry(monkeypatch):

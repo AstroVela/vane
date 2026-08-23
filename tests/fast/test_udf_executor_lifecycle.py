@@ -1473,10 +1473,37 @@ def test_udf_actor_shutdown_closes_executors_before_killing_actors(monkeypatch, 
     actors._owns_actors = True
     actors.actors = [Actor("actor-0"), Actor("actor-1")]
 
-    actors.shutdown()
+    if close_fails:
+        with pytest.raises(RuntimeError, match="planned actor close failure"):
+            actors.shutdown()
+    else:
+        actors.shutdown()
 
     assert events == ["close:actor-0", "close:actor-1", "kill:actor-0", "kill:actor-1"]
     assert actors.actors == []
+
+
+def test_udf_actor_readiness_cleanup_does_not_retain_terminated_pool(monkeypatch):
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
+
+    readiness_error = RuntimeError("planned readiness failure")
+    pool = types.SimpleNamespace(actors=["actor-0"])
+
+    def fail_readiness(_ray, _pool):
+        raise readiness_error
+
+    def shutdown():
+        pool.actors = []
+        raise RuntimeError("planned callable close failure")
+
+    pool.shutdown = shutdown
+    monkeypatch.setattr(actor_pool_mod, "_resolve_actor_pool_init_refs", fail_readiness)
+
+    with pytest.raises(RuntimeError, match="planned callable close failure") as exc_info:
+        actor_pool_mod.wait_for_actor_pools_ready([pool])
+
+    assert exc_info.value.owned_actor_pools == []
+    assert exc_info.value.creation_error is readiness_error
 
 
 def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypatch):
@@ -7485,6 +7512,7 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
     executor._closed = False
     executor._broken_error = None
+    executor._actor_lost = False
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     executor._worker_lifetime_scope = subprocess_exec.ExecutionCancellationScope("shutdown-worker", 1)
@@ -7498,6 +7526,89 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor._sock = sock
     executor._proc = proc
     return executor
+
+
+def test_single_subprocess_reported_submit_error_closes_worker_gracefully():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    error = b"planned write failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
+        + error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    with pytest.raises(RuntimeError, match="planned write failure"):
+        executor._recv_submit_result()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert executor._closed
+    assert executor._broken_error == "planned write failure"
+    assert not executor._actor_lost
+    assert proc.kill_calls == 0
+    assert sock.closed
+
+
+def test_single_subprocess_reported_submit_error_preserves_close_failure():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    submit_error = b"planned write failure"
+    close_error = b"planned close failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(submit_error))
+        + submit_error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(close_error))
+        + close_error
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    with pytest.raises(
+        RuntimeError,
+        match="planned write failure.*graceful broken-worker cleanup failed.*planned close failure",
+    ):
+        executor._recv_submit_result()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert executor._closed
+    assert executor._broken_error == "planned write failure"
+    assert proc.kill_calls == 0
+    assert sock.closed
+
+
+def test_single_subprocess_reported_finish_error_closes_worker_gracefully():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    error = b"planned finish failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
+        + error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+    executor._finished_submitting = False
+
+    with pytest.raises(RuntimeError, match="planned finish failure"):
+        executor.finished_submitting()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [
+        (subprocess_exec._MSG_FINISHED, b""),
+        (subprocess_exec._MSG_CLOSE, b""),
+    ]
+    assert executor._closed
+    assert executor._broken_error == "planned finish failure"
+    assert not executor._actor_lost
+    assert proc.kill_calls == 0
+    assert sock.closed
 
 
 def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():

@@ -200,6 +200,30 @@ class _CloseMarkerBound(_Bound):
         return _CloseMarkerWorker(self._marker_path)
 
 
+class _FailingWorkerWithCloseMarker(DataSinkWorker):
+    def __init__(self, marker_path: str) -> None:
+        self._marker_path = marker_path
+
+    def write(self, table: pa.Table) -> WriteResult:
+        raise RuntimeError("planned marked worker failure")
+
+    def abort(self, error: BaseException) -> None:
+        Path(self._marker_path).write_text("abort\n", encoding="utf-8")
+
+    def close(self) -> None:
+        with Path(self._marker_path).open("a", encoding="utf-8") as marker:
+            marker.write("close\n")
+
+
+class _FailingBoundWithCloseMarker(_Bound):
+    def __init__(self, marker_path: Path) -> None:
+        super().__init__()
+        self._marker_path = str(marker_path)
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _FailingWorkerWithCloseMarker(self._marker_path)
+
+
 class _CountingBound(_Bound):
     def __init__(self, options: DataSinkExecutionOptions) -> None:
         super().__init__(options=options)
@@ -221,6 +245,15 @@ class _CountingBound(_Bound):
                 super().close()
 
         return _CountingWorker()
+
+
+class _SchemaSink(DataSink):
+    def __init__(self) -> None:
+        self.schema: pa.Schema | None = None
+
+    def bind(self, schema: pa.Schema) -> BoundDataSink:
+        self.schema = schema
+        return _Bound()
 
 
 def _native_result(
@@ -519,6 +552,34 @@ def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
     assert summary.warnings == ("planned cleanup warning",)
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_type"),
+    [
+        ("SELECT 1.23::DECIMAL(10, 2) AS value", pa.decimal128(10, 2)),
+        ("SELECT UUID '00000000-0000-0000-0000-000000000001' AS value", pa.string()),
+        ("SELECT TIMETZ '12:34:56+08' AS value", pa.time64("us")),
+        ("SELECT 'a'::ENUM('a', 'b') AS value", pa.dictionary(pa.uint8(), pa.string())),
+    ],
+)
+def test_datasink_bind_uses_complete_native_arrow_schema(monkeypatch, query, expected_type):
+    from vane import runners
+
+    operation_id = "complete-arrow-schema"
+
+    class FakeRunner:
+        def run_datasink(self, relation):
+            return _native_result(operation_id)
+
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+    sink = _SchemaSink()
+
+    vane.sql(query).write_datasink(sink, operation_id=operation_id)
+
+    assert sink.schema is not None
+    assert sink.schema.field("value").type == expected_type
+
+
 def test_mock_distributed_unknown_preserves_partial_results(monkeypatch):
     from vane import runners
 
@@ -699,22 +760,24 @@ def test_local_fte_datasink(monkeypatch):
     assert summary.rows_received == 3
 
 
-def test_local_fte_datasink_worker_failure_is_unknown(monkeypatch):
+def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(monkeypatch, tmp_path):
     from vane import runners
     from vane.runners.local.runner import LocalRunner
 
     runner = LocalRunner(num_workers=1)
     monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
     monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    marker = tmp_path / "local-failed-worker-cleanup"
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_Bound(fail=True)),
+            _Sink(_FailingBoundWithCloseMarker(marker)),
             operation_id="local-fte-failure",
         )
 
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert exc_info.value.safe_to_retry is True
+    assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
 
 
 def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
@@ -819,6 +882,10 @@ def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
             operation_id="ray-datasink",
         )
         assert close_marker.read_text(encoding="utf-8") == "closed"
+        close_failure_summary = vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(fail_close=True)),
+            operation_id="ray-datasink-close-failure",
+        )
         empty_summary = vane.sql("SELECT 1 AS id WHERE false").write_datasink(
             _Sink(_KeyedBound(reject_open=True)),
             operation_id="ray-datasink-empty",
@@ -838,6 +905,8 @@ def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
 
     assert summary.outcome is WriteOutcome.APPLIED
     assert summary.rows_received == 4
+    assert close_failure_summary.outcome is WriteOutcome.APPLIED
+    assert any("planned close failure" in warning for warning in close_failure_summary.warnings)
     assert empty_summary.outcome is WriteOutcome.APPLIED
     assert empty_summary.results == ()
     assert duplicate_exc_info.value.outcome is WriteOutcome.ABORTED

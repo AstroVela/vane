@@ -696,11 +696,25 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF subprocess scope-resource cleanup failed: {details}") from cleanup_errors[0]
 
-    def _mark_broken(self, error: str, *, actor_lost: bool = False) -> None:
+    def _mark_broken(
+        self,
+        error: str,
+        *,
+        actor_lost: bool = False,
+        graceful_close: bool = False,
+    ) -> None:
         self._actor_lost = self._actor_lost or actor_lost
         if self._broken_error is None:
             self._broken_error = error
-        self.close(kill=True)
+        self.close(kill=not graceful_close)
+
+    def _mark_reported_error(self, error: str) -> None:
+        try:
+            self._mark_broken(error, graceful_close=True)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                f"{error}; graceful broken-worker cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            ) from cleanup_error
 
     def _mark_broken_after_cleanup_failure(self, error: BaseException) -> str:
         try:
@@ -878,7 +892,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
                 error = payload.decode("utf-8", errors="replace")
-                self._mark_broken(error)
+                self._mark_reported_error(error)
                 raise RuntimeError(error)
             if msg_type == _MSG_TASK_CANCELLED:
                 error = payload.decode("utf-8", errors="replace") or "UDF subprocess task cancelled"
@@ -1101,7 +1115,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError(self._broken_error) from exc
         if msg_type == _MSG_ERROR:
             error = payload.decode("utf-8", errors="replace")
-            self._mark_broken(error)
+            self._mark_reported_error(error)
             raise RuntimeError(error)
         self._finished_submitting = True
 

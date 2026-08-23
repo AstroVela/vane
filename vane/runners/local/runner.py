@@ -135,7 +135,6 @@ def _shutdown_local_write_resources(
     conn: Any,
     actor_pools: list[Any],
     *,
-    kill_actor_pools: bool,
     timeout_s: float,
 ) -> list[BaseException]:
     """Stop execution before releasing any resource a fragment may still use."""
@@ -158,15 +157,20 @@ def _shutdown_local_write_resources(
         backend.shutdown(timeout_s=max(0.0, deadline - time.monotonic()))
     except BaseException as exc:
         errors.append(exc)
+        errors.extend(_shutdown_udf_actor_pools(actor_pools, kill=True))
         return errors
 
     try:
         fragment_executor.close(timeout_s=max(0.0, deadline - time.monotonic()))
     except BaseException as exc:
         errors.append(exc)
+        errors.extend(_shutdown_udf_actor_pools(actor_pools, kill=True))
         return errors
 
-    errors.extend(_shutdown_udf_actor_pools(actor_pools, kill=kill_actor_pools))
+    # Reaching actor cleanup proves that backend and fragment execution have
+    # quiesced. Let resident callables release provider state before their
+    # processes exit, including after an ordinary write failure.
+    errors.extend(_shutdown_udf_actor_pools(actor_pools, kill=False))
     try:
         conn.close()
     except BaseException as exc:
@@ -540,7 +544,6 @@ class LocalRunner(Runner):
                 fragment_executor,
                 conn,
                 udf_actor_pools,
-                kill_actor_pools=not write_succeeded,
                 timeout_s=fragment_executor.close_timeout_s,
             )
             _record_unknown_copy_cleanup_errors(
@@ -677,7 +680,6 @@ class LocalRunner(Runner):
                 fragment_executor,
                 conn,
                 udf_actor_pools,
-                kill_actor_pools=result is None or result.get("outcome_unknown") is True,
                 timeout_s=fragment_executor.close_timeout_s,
             )
             if result is not None:
