@@ -326,7 +326,7 @@ public:
 struct GlobalWriteCSVData : public GlobalFunctionData {
 	GlobalWriteCSVData(CSVReaderOptions &options, FileSystem &fs_p, const string &file_path_p,
 	                   FileCompressionType compression)
-	    : writer(options, fs_p, file_path_p, compression), fs(fs_p), file_path(file_path_p) {
+	    : writer(options, fs_p, file_path_p, compression) {
 	}
 
 	idx_t FileSize() {
@@ -362,29 +362,18 @@ struct GlobalWriteCSVData : public GlobalFunctionData {
 		written_statistics = statistics;
 	}
 
-	void FinalizeWrittenStatistics() {
-		optional_ptr<CopyFunctionFileStatistics> statistics;
-		{
-			lock_guard<mutex> guard(statistics_lock);
-			statistics = written_statistics;
-		}
-		if (!statistics) {
+	void FinalizeWrittenStatistics(idx_t file_size) {
+		lock_guard<mutex> guard(statistics_lock);
+		if (!written_statistics) {
 			return;
 		}
-		auto handle = fs.OpenFile(file_path, FileFlags::FILE_FLAGS_READ);
-		const auto file_size = handle->GetFileSize();
-		lock_guard<mutex> guard(statistics_lock);
-		if (written_statistics) {
-			written_statistics->row_count = rows_written.load();
-			written_statistics->file_size_bytes = file_size;
-		}
+		written_statistics->row_count = rows_written.load();
+		written_statistics->file_size_bytes = file_size;
 	}
 
 	CSVWriter writer;
 
 private:
-	FileSystem &fs;
-	string file_path;
 	mutex local_state_lock;
 	vector<unique_ptr<CSVWriterState>> local_states;
 	atomic<idx_t> rows_written {0};
@@ -485,8 +474,8 @@ void WriteCSVFinalize(ClientContext &context, FunctionData &bind_data, GlobalFun
 	} else if (global_state.writer.WrittenAnything()) {
 		global_state.writer.WriteRawString(global_state.writer.writer_options.newline);
 	}
-	global_state.writer.Close();
-	global_state.FinalizeWrittenStatistics();
+	const auto file_size = global_state.writer.CloseAndGetFileSize();
+	global_state.FinalizeWrittenStatistics(file_size);
 }
 
 static void WriteCSVGetWrittenStatistics(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,

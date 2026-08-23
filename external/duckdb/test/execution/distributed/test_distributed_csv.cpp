@@ -6,6 +6,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/distributed/plan/scan_split.hpp"
@@ -23,6 +24,40 @@
 using namespace duckdb;
 
 namespace {
+
+class NoReadReopenCSVFileSystem : public LocalFileSystem {
+public:
+	explicit NoReadReopenCSVFileSystem(string target_path_p) : target_path(std::move(target_path_p)) {
+	}
+
+	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
+	                                optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == target_path) {
+			if (flags.OpenForReading()) {
+				read_open_attempts++;
+				throw IOException("CSV statistics must not reopen the completed file for reading");
+			}
+			if (flags.OpenForWriting()) {
+				write_open_attempts++;
+			}
+		}
+		return LocalFileSystem::OpenFile(path, flags, opener);
+	}
+
+	bool CanHandleFile(const string &path) override {
+		return path == target_path;
+	}
+
+	string GetName() const override {
+		return "NoReadReopenCSVFileSystem";
+	}
+
+	atomic<idx_t> read_open_attempts {0};
+	atomic<idx_t> write_open_attempts {0};
+
+private:
+	string target_path;
+};
 
 struct CSVTestRow {
 	int64_t id;
@@ -226,6 +261,38 @@ static void WriteCSVBytes(const string &path, const string &contents) {
 	REQUIRE(output.good());
 }
 
+TEST_CASE("CSV COPY statistics use the writer's final physical size", "[distributed][csv][copy]") {
+	const auto run_case = [&](const string &suffix, const string &compression) {
+		const auto path = TestCreatePath("distributed_csv_no_read_reopen" + suffix);
+		TestDeleteFile(path);
+
+		DuckDB db(nullptr);
+		auto tracking_fs = make_uniq<NoReadReopenCSVFileSystem>(path);
+		auto *tracking_fs_ptr = tracking_fs.get();
+		db.instance->GetFileSystem().RegisterSubSystem(std::move(tracking_fs));
+		Connection connection(db);
+		auto result = connection.Query(StringUtil::Format(
+		    "COPY (SELECT i, repeat('payload-', 16) AS payload FROM range(128) values_table(i)) TO '%s' "
+		    "(FORMAT CSV, HEADER, COMPRESSION %s, RETURN_STATS)",
+		    path, compression));
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(result->RowCount() == 1);
+		REQUIRE(tracking_fs_ptr->write_open_attempts.load() == 1);
+		REQUIRE(tracking_fs_ptr->read_open_attempts.load() == 0);
+
+		LocalFileSystem local_fs;
+		auto file_handle = local_fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+		const auto actual_size = file_handle->GetFileSize();
+		const auto reported_size = result->GetValue(2, 0).GetValue<uint64_t>();
+		REQUIRE(reported_size == actual_size);
+		file_handle.reset();
+		TestDeleteFile(path);
+	};
+
+	run_case(".csv", "NONE");
+	run_case(".csv.gz", "GZIP");
+}
+
 static vector<CSVTestRow> ExecuteAllCSVSplits(DuckDB &db, Connection &connection, const PlannedCSVScan &planned,
                                               idx_t first_node_id) {
 	vector<CSVTestRow> result;
@@ -292,6 +359,14 @@ TEST_CASE("Distributed CSV byte ranges round-trip and execute explicitly", "[dis
 	}
 	std::sort(actual.begin(), actual.end());
 	REQUIRE(actual == expected);
+
+	// The auto-detect overload must reuse the coordinator's bound dialect and
+	// schema on every range instead of sniffing from a mid-file offset.
+	const auto auto_query =
+	    StringUtil::Format("SELECT id, payload FROM read_csv_auto('%s', buffer_size=1024, max_line_size=256)", path);
+	auto auto_planned = PlanCSVScan(db, coordinator, auto_query, 4);
+	REQUIRE(auto_planned.splits.size() == 4);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, auto_planned, 150) == expected);
 
 	auto merged = CSVSplitBatch(planned.splits[0]);
 	merged.Merge(CSVSplitBatch(planned.splits[2]));
@@ -567,11 +642,14 @@ TEST_CASE("Distributed CSV whole-file union splits preserve reader state and fil
 	TestDeleteFile(second_path);
 }
 
-TEST_CASE("Distributed CSV handles empty input and rejects unsafe range modes", "[distributed][csv]") {
+TEST_CASE("Distributed CSV uses whole-file splits for byte-range-unsafe modes", "[distributed][csv]") {
 	const auto path = TestCreatePath("distributed_csv_planning_modes.csv");
+	const auto gzip_path = TestCreatePath("distributed_csv_planning_modes.csv.gz");
 	TestDeleteFile(path);
+	TestDeleteFile(gzip_path);
 	DuckDB db(nullptr);
 	Connection connection(db);
+	Connection worker(db);
 
 	WriteCSVBytes(path, "");
 	const auto empty_file_query = [&](const string &options) {
@@ -579,8 +657,9 @@ TEST_CASE("Distributed CSV handles empty input and rejects unsafe range modes", 
 		                          "columns={'id':'BIGINT','payload':'VARCHAR'}, %s)",
 		                          path, options);
 	};
-	REQUIRE_THROWS_WITH(PlanCSVScan(db, connection, empty_file_query("parallel=false"), 2),
-	                    Catch::Matchers::Contains("requires parallel=true"));
+	auto empty_file = PlanCSVScan(db, connection, empty_file_query("parallel=false"), 2);
+	REQUIRE(empty_file.splits.size() == 1);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, empty_file, 700).empty());
 
 	WriteCSVBytes(path, "id,payload\n");
 	const auto explicit_query = [&](const string &options) {
@@ -589,16 +668,37 @@ TEST_CASE("Distributed CSV handles empty input and rejects unsafe range modes", 
 		                          path, options);
 	};
 	auto empty = PlanCSVScan(db, connection, explicit_query("buffer_size=256, max_line_size=64"), 4);
-	Connection worker(db);
-	REQUIRE(ExecuteAllCSVSplits(db, worker, empty, 700).empty());
+	REQUIRE(ExecuteAllCSVSplits(db, worker, empty, 710).empty());
 
-	WriteCSVRangeFixture(path, 128);
-	REQUIRE_THROWS_WITH(PlanCSVScan(db, connection, explicit_query("parallel=false"), 2),
-	                    Catch::Matchers::Contains("requires parallel=true"));
-	REQUIRE_THROWS_WITH(PlanCSVScan(db, connection, explicit_query("skip=1"), 2),
-	                    Catch::Matchers::Contains("does not support skip_rows"));
+	const auto expected = WriteCSVRangeFixture(path, 128);
+	auto serial = PlanCSVScan(db, connection, explicit_query("parallel=false"), 2);
+	REQUIRE(serial.splits.size() == 1);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, serial, 720) == expected);
+	auto skipped_header = PlanCSVScan(db, connection, empty_file_query("skip=1"), 2);
+	REQUIRE(skipped_header.splits.size() == 1);
+	REQUIRE(ExecuteAllCSVSplits(db, worker, skipped_header, 730) == expected);
 	REQUIRE_THROWS_WITH(PlanCSVScan(db, connection, explicit_query("store_rejects=true"), 2),
 	                    Catch::Matchers::Contains("does not support store_rejects"));
 
+	WriteCSVBytes(path, "id,payload\n1,caf\xE9\n");
+	auto latin1 = PlanCSVScan(db, connection, explicit_query("encoding='latin-1'"), 4);
+	REQUIRE(latin1.splits.size() == 1);
+	const vector<CSVTestRow> latin1_expected = {{1, "caf\xC3\xA9"}};
+	REQUIRE(ExecuteAllCSVSplits(db, worker, latin1, 735) == latin1_expected);
+
+	auto copy_result = connection.Query(
+	    StringUtil::Format("COPY (SELECT * FROM (VALUES (1::BIGINT, 'compressed')) values_table(id, payload)) TO '%s' "
+	                       "(FORMAT CSV, HEADER, COMPRESSION GZIP)",
+	                       gzip_path));
+	REQUIRE_NO_FAIL(*copy_result);
+	const auto gzip_query = StringUtil::Format("SELECT id, payload FROM read_csv('%s', header=true, auto_detect=false, "
+	                                           "columns={'id':'BIGINT','payload':'VARCHAR'}, compression='gzip')",
+	                                           gzip_path);
+	auto compressed = PlanCSVScan(db, connection, gzip_query, 4);
+	REQUIRE(compressed.splits.size() == 1);
+	const vector<CSVTestRow> compressed_expected = {{1, "compressed"}};
+	REQUIRE(ExecuteAllCSVSplits(db, worker, compressed, 740) == compressed_expected);
+
 	TestDeleteFile(path);
+	TestDeleteFile(gzip_path);
 }

@@ -632,32 +632,10 @@ static DistributedScanSplit MakeDistributedCSVSplit(const DistributedCSVSplitPay
 	return result;
 }
 
-static void ValidateCSVByteRangePlanning(const CSVFileSnapshot &file, const CSVReaderOptions &options,
-                                         const CSVPlanningFileProperties &properties) {
-	if (!options.parallel) {
-		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" requires parallel=true",
-		                            file.path);
-	}
-	if (options.GetSkipRows() > 0) {
-		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" does not support skip_rows",
-		                            file.path);
-	}
-	if (options.dialect_options.rows_until_header > 0) {
-		throw InvalidInputException(
-		    "Distributed byte-range scanning of CSV file \"%s\" does not support leading rows before the header",
-		    file.path);
-	}
-	if (StringUtil::Lower(options.encoding) != "utf-8") {
-		throw InvalidInputException("Distributed byte-range scanning of CSV file \"%s\" requires UTF-8 input",
-		                            file.path);
-	}
-	if (properties.compression != FileCompressionType::UNCOMPRESSED) {
-		throw InvalidInputException("Distributed byte-range scanning requires an uncompressed CSV file: \"%s\"",
-		                            file.path);
-	}
-	if (!properties.can_seek || properties.is_pipe) {
-		throw InvalidInputException("Distributed byte-range scanning requires a seekable CSV file: \"%s\"", file.path);
-	}
+static bool SupportsCSVByteRangePlanning(const CSVReaderOptions &options, const CSVPlanningFileProperties &properties) {
+	return options.parallel && options.GetSkipRows() == 0 && options.dialect_options.rows_until_header == 0 &&
+	       StringUtil::Lower(options.encoding) == "utf-8" &&
+	       properties.compression == FileCompressionType::UNCOMPRESSED && properties.can_seek && !properties.is_pipe;
 }
 
 static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunctionDistributedScanPlanningInput &input) {
@@ -705,7 +683,6 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 
 	vector<CSVPlanningFileProperties> properties;
 	properties.reserve(files.size());
-	const bool requires_byte_range_inspection = files.size() == 1 && input.target_split_count > 1;
 	for (idx_t file_idx = 0; file_idx < snapshots.size(); file_idx++) {
 		try {
 			properties.push_back(InspectCSVPlanningFile(input, snapshots[file_idx], csv_data.options));
@@ -718,9 +695,6 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 		} catch (const OutOfMemoryException &) {
 			throw;
 		} catch (const Exception &) {
-			if (requires_byte_range_inspection) {
-				throw;
-			}
 			// Whole-file tasks do not require a planning-time handle. Some object
 			// stores can reopen an already-bound file only with execution-context
 			// credentials; in that case retain an unknown byte estimate and let the
@@ -735,11 +709,11 @@ static vector<DistributedScanSplit> PlanDistributedCSVSplits(const TableFunction
 		}
 	}
 
-	if (files.size() == 1 && input.target_split_count > 1) {
-		ValidateCSVByteRangePlanning(snapshots[0], csv_data.options, properties[0]);
-	}
-
-	if (files.size() == 1 && input.target_split_count > 1 && properties[0].size > 0) {
+	// target_split_count is a scheduling hint. If this reader configuration is
+	// not byte-range safe, retain one explicit whole-file task instead of
+	// turning the requested granularity into a correctness requirement.
+	if (files.size() == 1 && input.target_split_count > 1 && properties[0].size > 0 &&
+	    SupportsCSVByteRangePlanning(csv_data.options, properties[0])) {
 		const auto minimum_range_size = MaxValue<idx_t>(2, CSVIterator::BytesPerThread(csv_data.options));
 		const auto safe_range_count = MaxValue<idx_t>(1, properties[0].size / minimum_range_size);
 		const auto range_count = MinValue<idx_t>(input.target_split_count, safe_range_count);

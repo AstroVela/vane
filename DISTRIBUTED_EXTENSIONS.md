@@ -256,13 +256,12 @@ metadata, reader options, union-by-name per-file state, and complete
 `OpenFileInfo` options. It is detached until an assignment is applied, and an
 explicit empty assignment remains a zero-row scan. Compressed, non-seekable,
 non-UTF-8, `skip_rows`, and leading-row header detection cannot be byte-range
-split. If the planner requests more than one split for a single input using one
-of those modes, planning fails explicitly instead of silently reducing the
-requested split granularity. Pipe inputs are rejected at every granularity
-because they cannot provide retryable tasks. Rejects-table scans are not
-distributed. CSV itself has no snapshot identifier, so referenced files must
-remain immutable for the lifetime of the query and its retries; a same-size
-replacement cannot be detected by this protocol.
+split, so a single replayable input in one of those modes produces one explicit
+whole-file split even when the target granularity hint is larger. Pipe inputs
+are rejected at every granularity because they cannot provide retryable tasks.
+Rejects-table scans are not distributed. CSV itself has no snapshot identifier,
+so referenced files must remain immutable for the lifetime of the query and its
+retries; a same-size replacement cannot be detected by this protocol.
 
 ## Distributed writes
 

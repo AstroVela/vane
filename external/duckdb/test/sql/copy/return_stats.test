@@ -257,6 +257,12 @@ COPY integers TO '__TEST_DIR__/test_copy_to_file.csv' (RETURN_STATS);
 ----
 <REGEX>:.*test_copy_to_file.csv	200000	<REGEX>:\d+	NULL	{}	NULL
 
+# Compressed CSV reports physical bytes produced by the compression stream
+query IIIIII
+COPY integers TO '__TEST_DIR__/test_copy_to_file.csv.zst' (FORMAT CSV, COMPRESSION ZSTD, RETURN_STATS);
+----
+<REGEX>:.*test_copy_to_file.csv.zst	200000	<REGEX>:[1-9]\d*	NULL	{}	NULL
+
 # 128-bit decimal stats are big-endian; unifying row-group bounds must decode
 # before comparing, otherwise the file-level min/max get swapped
 statement ok
