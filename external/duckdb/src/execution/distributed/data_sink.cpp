@@ -4,9 +4,29 @@
 #include "duckdb/execution/distributed/data_sink.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
 namespace distributed {
+
+string BoundDataSinkOutcomeError(const string &error) {
+	string normalized = error;
+	if (!Utf8Proc::IsValid(normalized.c_str(), normalized.size())) {
+		normalized = Utf8Proc::RemoveInvalid(normalized.c_str(), normalized.size());
+	}
+	if (normalized.size() <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES) {
+		return normalized;
+	}
+
+	const string omission = "...";
+	static_assert(DATA_SINK_MAX_OUTCOME_ERROR_BYTES > 3);
+	const auto remaining = DATA_SINK_MAX_OUTCOME_ERROR_BYTES - omission.size();
+	const auto prefix_bytes = remaining / 2;
+	const auto suffix_bytes = remaining - prefix_bytes;
+	auto prefix = Utf8Proc::RemoveInvalid(normalized.c_str(), prefix_bytes);
+	auto suffix = Utf8Proc::RemoveInvalid(normalized.c_str() + normalized.size() - suffix_bytes, suffix_bytes);
+	return prefix + omission + suffix;
+}
 
 DuckDBResult<DistributedDataSinkResult> ParseDataSinkPartitions(const string &operation_id,
                                                                 const vector<ResultPartitionRef> &partitions) {

@@ -12,6 +12,7 @@ namespace distributed {
 static constexpr idx_t DATA_SINK_MAX_OPERATION_ID_BYTES = 256;
 static constexpr idx_t DATA_SINK_MAX_METADATA_BYTES = 64 * 1024;
 static constexpr idx_t DATA_SINK_MAX_WARNINGS_BYTES = 64 * 1024;
+static constexpr idx_t DATA_SINK_MAX_OUTCOME_ERROR_BYTES = 4 * 1024;
 static constexpr idx_t DATA_SINK_MAX_WRITE_RESULTS = 1000000;
 static constexpr idx_t DATA_SINK_MAX_TOTAL_RESULT_BYTES = 64 * 1024 * 1024;
 
@@ -35,6 +36,7 @@ struct DistributedDataSinkResult {
 
 DuckDBResult<DistributedDataSinkResult> ParseDataSinkPartitions(const string &operation_id,
                                                                 const vector<ResultPartitionRef> &partitions);
+string BoundDataSinkOutcomeError(const string &error);
 
 } // namespace distributed
 } // namespace duckdb

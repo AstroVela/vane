@@ -95,3 +95,14 @@ TEST_CASE("DataSink worker result protocol rejects ambiguous or invalid payloads
 
 	REQUIRE(ParseDataSinkPartitions("", {}).is_err());
 }
+
+TEST_CASE("DataSink outcome diagnostics are bounded before coordinator transport", "[distributed][datasink]") {
+	const string oversized = "diagnostic-head:" + string(DATA_SINK_MAX_OUTCOME_ERROR_BYTES, 'x') + ":diagnostic-tail";
+	const auto bounded = BoundDataSinkOutcomeError(oversized);
+
+	REQUIRE(bounded.size() == DATA_SINK_MAX_OUTCOME_ERROR_BYTES);
+	REQUIRE(StringUtil::StartsWith(bounded, "diagnostic-head:"));
+	REQUIRE(StringUtil::EndsWith(bounded, ":diagnostic-tail"));
+	REQUIRE(StringUtil::Contains(bounded, "..."));
+	REQUIRE(BoundDataSinkOutcomeError("short diagnostic") == "short diagnostic");
+}

@@ -2710,6 +2710,72 @@ def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(
     ]
 
 
+def test_ray_query_driver_client_datasink_failure_cancels_and_closes_plan(monkeypatch):
+    run_future = object()
+    close_future = object()
+    resolved = []
+    cancelled = []
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    runner = SimpleNamespace(
+        run_datasink_plan=_RemoteMethod(run_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+
+    def _resolve(ref, **kwargs):
+        resolved.append((ref, kwargs))
+        if ref is run_future:
+            raise FutureTimeoutError("planned DataSink response failure after execution started")
+        assert ref is close_future
+        return None
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    plan = _FakePhysicalPlanWithoutPlanAttr("failed-datasink")
+    with pytest.raises(FutureTimeoutError, match="after execution started"):
+        client.run_datasink_plan(plan)
+
+    assert cancelled == [(run_future, False)]
+    assert runner.close_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "failed-datasink",
+        )
+    ]
+    assert resolved == [
+        (run_future, {}),
+        (
+            run_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+        (
+            close_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+    ]
+
+
 def test_ray_query_driver_client_stream_start_reports_teardown_failure(monkeypatch):
     run_future = object()
     close_future = object()

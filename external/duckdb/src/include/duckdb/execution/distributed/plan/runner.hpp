@@ -835,7 +835,7 @@ public:
 			}
 			result.outcome_aborted = false;
 			result.outcome_unknown = true;
-			result.outcome_error = StringUtil::Join(errors, "; ");
+			result.outcome_error = BoundDataSinkOutcomeError(StringUtil::Join(errors, "; "));
 			return DuckDBResult<PlanResult>::ok(PlanResult::make_data_sink(std::move(result)));
 		};
 

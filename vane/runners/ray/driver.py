@@ -8700,6 +8700,13 @@ class RayQueryDriverClient:
             except BaseException as progress_error:
                 if hasattr(execution_error, "add_note"):
                     execution_error.add_note(_cleanup_warning("DataSink progress finalization", progress_error))
+            self._teardown_failed_plan(
+                runner,
+                future,
+                session_id=session_id,
+                plan_id=plan_id,
+                operation_error=execution_error,
+            )
             if hasattr(execution_error, "traceback_str") or hasattr(execution_error, "cause"):
                 raise RuntimeError(_safe_remote_error_message(execution_error)) from None
             raise

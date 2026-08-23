@@ -2867,7 +2867,7 @@ struct PyPhysicalPlanWrapperRunner {
 			out["write_results"] = py::list();
 			out["outcome_aborted"] = py::bool_(false);
 			out["outcome_unknown"] = py::bool_(true);
-			out["outcome_error"] = py::str(std::move(error));
+			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(error));
 			py::list cleanup_warnings;
 			if (cleanup_error) {
 				cleanup_warnings.append("native DataSink fragment cleanup failed: " + exception_message(cleanup_error));
@@ -2931,7 +2931,7 @@ struct PyPhysicalPlanWrapperRunner {
 			out["operation_id"] = py::str(finalized.data_sink_result.operation_id);
 			out["outcome_aborted"] = py::bool_(finalized.data_sink_result.outcome_aborted);
 			out["outcome_unknown"] = py::bool_(finalized.data_sink_result.outcome_unknown);
-			out["outcome_error"] = py::str(finalized.data_sink_result.outcome_error);
+			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(finalized.data_sink_result.outcome_error));
 			py::list write_results;
 			auto json_loads = py::module_::import("json").attr("loads");
 			for (const auto &result : finalized.data_sink_result.write_results) {
