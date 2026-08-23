@@ -505,19 +505,17 @@ static py::object BorrowPythonObjectHolder(const shared_ptr<void> &holder) {
 	return py::reinterpret_borrow<py::object>(*boxed);
 }
 
-struct CollectorOutputLeaseCallbacks {
-	std::function<void()> handoff;
-	std::function<void()> release;
-};
+struct ExecutorSlot;
 
 struct PendingCollectorOutputLeaseCallback {
-	uint64_t slot_id;
+	uint64_t generation;
+	shared_ptr<ExecutorSlot> slot;
+	bool completes_fence;
 	std::function<void()> callback;
 };
 
-static CollectorOutputLeaseCallbacks MakeCollectorOutputLeaseCallbacks(const py::object &collector, uint64_t slot_id,
-                                                                       const string &request_id,
-                                                                       const string &lease_id);
+static UDFOutputLease MakeCollectorOutputLease(const py::object &collector, uint64_t slot_id, uint64_t generation,
+                                               const string &request_id, const string &lease_id);
 
 static bool PyDictContains(const py::dict &dict, const char *key) {
 	return dict.contains(py::str(key));
@@ -1084,6 +1082,10 @@ struct ExecutorSlot {
 	// State flags
 	atomic<bool> finished_submitting_acked {false};
 	atomic<bool> all_tasks_finished {false};
+	// A DATA lease registers its first ownership transition before the terminal
+	// event for that submit can be observed. This prevents a queued Python
+	// handoff/release callback from racing successful query completion.
+	atomic<idx_t> pending_output_lease_callbacks {0};
 	atomic<bool> cleanup_cancel_requested {false};
 	atomic<bool> collector_retired {false};
 	idx_t collector_cleanup_retry_count = 0;
@@ -1282,17 +1284,72 @@ public:
 		work_cv.notify_one();
 	}
 
-	void EnqueueOutputLeaseRelease(uint64_t slot_id, std::function<void()> release) {
-		if (!release) {
+	shared_ptr<ExecutorSlot> RegisterOutputLeaseCallbackFence(uint64_t slot_id, uint64_t generation) {
+		lock_guard<mutex> lifecycle_guard(global_lock);
+		if (lifecycle_state != DispatcherLifecycleState::ACCEPTING) {
+			return nullptr;
+		}
+		auto entry = slots.find(slot_id);
+		if (entry == slots.end() || !entry->second || !IsActiveSlotGeneration(*entry->second, generation)) {
+			return nullptr;
+		}
+		entry->second->pending_output_lease_callbacks.fetch_add(1);
+		return entry->second;
+	}
+
+	void CompleteOutputLeaseCallbackFence(const shared_ptr<ExecutorSlot> &slot) {
+		if (!slot) {
 			return;
 		}
-		{
-			lock_guard<mutex> lifecycle_guard(global_lock);
-			if (lifecycle_state != DispatcherLifecycleState::ACCEPTING) {
-				return;
+		auto pending = slot->pending_output_lease_callbacks.load();
+		while (pending > 0 && !slot->pending_output_lease_callbacks.compare_exchange_weak(pending, pending - 1)) {
+		}
+		if (pending == 0) {
+			RecordDispatcherError(StringUtil::Format("udf output lease callback fence underflow for slot %llu",
+			                                         static_cast<unsigned long long>(slot->id)));
+			return;
+		}
+		if (pending == 1) {
+			NotifyWork();
+		}
+	}
+
+	void EnqueueOutputLeaseRelease(uint64_t slot_id, uint64_t generation, std::function<void()> release,
+	                               shared_ptr<ExecutorSlot> reserved_fence = nullptr) {
+		if (!release) {
+			CompleteOutputLeaseCallbackFence(reserved_fence);
+			return;
+		}
+		shared_ptr<ExecutorSlot> tracked_slot = std::move(reserved_fence);
+		const bool completes_fence = static_cast<bool>(tracked_slot);
+		bool enqueued = false;
+		try {
+			{
+				lock_guard<mutex> lifecycle_guard(global_lock);
+				if (lifecycle_state == DispatcherLifecycleState::ACCEPTING) {
+					if (!tracked_slot) {
+						auto entry = slots.find(slot_id);
+						if (entry != slots.end() && entry->second &&
+						    IsActiveSlotGeneration(*entry->second, generation)) {
+							tracked_slot = entry->second;
+						}
+					}
+					lock_guard<mutex> lock(output_lease_release_lock);
+					output_lease_releases.push_back({generation, tracked_slot, completes_fence, std::move(release)});
+					enqueued = true;
+				}
 			}
-			lock_guard<mutex> lock(output_lease_release_lock);
-			output_lease_releases.push_back({slot_id, std::move(release)});
+		} catch (...) {
+			if (completes_fence) {
+				CompleteOutputLeaseCallbackFence(tracked_slot);
+			}
+			throw;
+		}
+		if (!enqueued) {
+			if (completes_fence) {
+				CompleteOutputLeaseCallbackFence(tracked_slot);
+			}
+			return;
 		}
 		NotifyWork();
 	}
@@ -1407,36 +1464,36 @@ private:
 			lock_guard<mutex> lock(output_lease_release_lock);
 			releases.swap(output_lease_releases);
 		}
-		std::unordered_map<uint64_t, string> failures;
 		for (auto &release : releases) {
+			string failure;
 			if (!release.callback) {
+				if (release.completes_fence) {
+					CompleteOutputLeaseCallbackFence(release.slot);
+				}
 				continue;
 			}
 			try {
 				release.callback();
 			} catch (const py::error_already_set &ex) {
-				failures.emplace(release.slot_id, StringUtil::Format("udf output lease release failed: %s", ex.what()));
+				failure = StringUtil::Format("udf output lease callback failed: %s", ex.what());
 			} catch (const std::exception &ex) {
-				failures.emplace(release.slot_id, StringUtil::Format("udf output lease release failed: %s", ex.what()));
+				failure = StringUtil::Format("udf output lease callback failed: %s", ex.what());
 			} catch (...) {
-				failures.emplace(release.slot_id, "udf output lease release failed with an unknown exception");
+				failure = "udf output lease callback failed with an unknown exception";
 			}
-		}
-		for (auto &failure : failures) {
-			shared_ptr<ExecutorSlot> slot;
-			{
-				lock_guard<mutex> guard(global_lock);
-				auto entry = slots.find(failure.first);
-				if (entry != slots.end()) {
-					slot = entry->second;
-				}
+			if (release.completes_fence) {
+				CompleteOutputLeaseCallbackFence(release.slot);
 			}
-			if (slot && PayloadUsesRayStreamCollector(slot->payload)) {
-				SetSlotError(*slot, failure.second);
+			if (failure.empty()) {
+				continue;
+			}
+			if (release.slot && IsActiveSlotGeneration(*release.slot, release.generation) &&
+			    PayloadUsesRayStreamCollector(release.slot->payload)) {
+				SetSlotError(*release.slot, failure);
 			} else {
 				// A retired slot has already fenced collector ownership. Its
 				// stale descriptor callback cannot affect a later query.
-				UDFDebugLog(failure.second);
+				UDFDebugLog(failure);
 			}
 		}
 		if (!releases.empty()) {
@@ -1553,6 +1610,9 @@ private:
 							has_pending_cleanup_cancel = true;
 							continue;
 						}
+						if (slot->pending_output_lease_callbacks.load() > 0) {
+							continue;
+						}
 						if (slot->collector_cleanup_retry_scheduled &&
 						    std::chrono::steady_clock::now() < slot->collector_cleanup_retry_deadline) {
 							note_collector_cleanup_retry(*slot);
@@ -1575,7 +1635,7 @@ private:
 				if (!slot)
 					continue; // skip cleaned-up slots
 				if (IsSlotActive(*slot) && slot->finished_submitting_acked.load() && slot->inflight_count.load() == 0 &&
-				    !slot->all_tasks_finished.load()) {
+				    slot->pending_output_lease_callbacks.load() == 0 && !slot->all_tasks_finished.load()) {
 					slot->all_tasks_finished.store(true);
 					NotifySlotFinished(*slot);
 					did_work = true;
@@ -1685,7 +1745,7 @@ private:
 					try {
 						did_work |= DrainOutputLeaseReleases_WithGIL();
 					} catch (const std::exception &ex) {
-						auto msg = StringUtil::Format("udf output lease release failed: %s", ex.what());
+						auto msg = StringUtil::Format("udf output lease callback failed: %s", ex.what());
 						for (auto *slot : active) {
 							if (!slot || !PayloadUsesRayStreamCollector(slot->payload) ||
 							    slot->abort_requested.load()) {
@@ -1859,9 +1919,9 @@ private:
 			while (DrainOutputLeaseReleases_WithGIL()) {
 			}
 		} catch (const py::error_already_set &ex) {
-			RecordDispatcherError(StringUtil::Format("udf output lease final release failed: %s", ex.what()));
+			RecordDispatcherError(StringUtil::Format("udf output lease final callback failed: %s", ex.what()));
 		} catch (const std::exception &ex) {
-			RecordDispatcherError(StringUtil::Format("udf output lease final release failed: %s", ex.what()));
+			RecordDispatcherError(StringUtil::Format("udf output lease final callback failed: %s", ex.what()));
 		}
 		auto shutdown_collector = [&](unique_ptr<RegisteredObject> &collector) {
 			if (!collector) {
@@ -1972,6 +2032,9 @@ private:
 		UDFDebugLog(StringUtil::Format(
 		    "cleanup_start slot=%llu inflight=%lld retiring=%s", static_cast<unsigned long long>(id),
 		    static_cast<long long>(slot_ptr->inflight_count.load()), IsSlotRetiring(*slot_ptr) ? "true" : "false"));
+		if (slot_ptr->pending_output_lease_callbacks.load() > 0) {
+			return false;
+		}
 		// Cancel any collector-side records for this slot before destroying the
 		// Python executor. Normal cleanup has no records left; timeout cleanup
 		// uses this as the explicit retire path for late generator events.
@@ -2241,7 +2304,8 @@ private:
 		if (slot.abort_requested.load() || slot.has_error.load()) {
 			return;
 		}
-		if (!slot.finished_submitting_acked.load() || slot.inflight_count.load() != 0) {
+		if (!slot.finished_submitting_acked.load() || slot.inflight_count.load() != 0 ||
+		    slot.pending_output_lease_callbacks.load() != 0) {
 			return;
 		}
 		bool expected = false;
@@ -3002,9 +3066,9 @@ private:
 								throw InvalidInputException(
 								    "udf stream result collector data event is missing output lease identity");
 							}
-							auto callbacks = MakeCollectorOutputLeaseCallbacks(
-							    udf_stream_result_collector->obj, slot_id, output_request_id, output_lease_id);
-							output_lease = UDFOutputLease(std::move(callbacks.handoff), std::move(callbacks.release));
+							output_lease =
+							    MakeCollectorOutputLease(udf_stream_result_collector->obj, slot_id, slot_generation,
+							                             output_request_id, output_lease_id);
 						}
 						if (!slot) {
 							output_lease.Release();
@@ -3407,55 +3471,73 @@ struct CollectorOutputLeaseCallbackState {
 	mutex lock;
 	bool handed_off = false;
 	bool released = false;
+	shared_ptr<ExecutorSlot> transition_fence;
 };
 
-static CollectorOutputLeaseCallbacks MakeCollectorOutputLeaseCallbacks(const py::object &collector, uint64_t slot_id,
-                                                                       const string &request_id,
-                                                                       const string &lease_id) {
+static UDFOutputLease MakeCollectorOutputLease(const py::object &collector, uint64_t slot_id, uint64_t generation,
+                                               const string &request_id, const string &lease_id) {
 	auto collector_holder = MakePythonObjectHolder(py::reinterpret_borrow<py::object>(collector));
 	auto state = std::make_shared<CollectorOutputLeaseCallbackState>();
-	CollectorOutputLeaseCallbacks callbacks;
-	callbacks.handoff = [collector_holder, state, slot_id, request_id, lease_id]() {
-		{
-			lock_guard<mutex> guard(state->lock);
-			if (state->released || state->handed_off) {
+	state->transition_fence = GlobalPythonDispatcher::Instance().RegisterOutputLeaseCallbackFence(slot_id, generation);
+	std::function<void()> handoff;
+	std::function<void()> release;
+	try {
+		handoff = [collector_holder, state, slot_id, generation, request_id, lease_id]() {
+			shared_ptr<ExecutorSlot> transition_fence;
+			{
+				lock_guard<mutex> guard(state->lock);
+				if (state->released || state->handed_off) {
+					return;
+				}
+				state->handed_off = true;
+				transition_fence = std::move(state->transition_fence);
+			}
+			if (!PythonRuntimeUsableForUDFTeardown()) {
+				GlobalPythonDispatcher::Instance().CompleteOutputLeaseCallbackFence(transition_fence);
 				return;
 			}
-			state->handed_off = true;
-		}
-		if (!PythonRuntimeUsableForUDFTeardown()) {
-			return;
-		}
-		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
-		    slot_id, [collector_holder, request_id, lease_id]() {
-			    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
-			    if (collector_obj.is_none()) {
-				    return;
-			    }
-			    collector_obj.attr("handoff_output_block_lease")(py::str(request_id), py::str(lease_id));
-		    });
-	};
-	callbacks.release = [collector_holder, state, slot_id, request_id, lease_id]() {
-		{
-			lock_guard<mutex> guard(state->lock);
-			if (state->released) {
+			GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
+			    slot_id, generation,
+			    [collector_holder, request_id, lease_id]() {
+				    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
+				    if (collector_obj.is_none()) {
+					    return;
+				    }
+				    collector_obj.attr("handoff_output_block_lease")(py::str(request_id), py::str(lease_id));
+			    },
+			    std::move(transition_fence));
+		};
+		release = [collector_holder, state, slot_id, generation, request_id, lease_id]() {
+			shared_ptr<ExecutorSlot> transition_fence;
+			{
+				lock_guard<mutex> guard(state->lock);
+				if (state->released) {
+					return;
+				}
+				state->released = true;
+				transition_fence = std::move(state->transition_fence);
+			}
+			if (!PythonRuntimeUsableForUDFTeardown()) {
+				GlobalPythonDispatcher::Instance().CompleteOutputLeaseCallbackFence(transition_fence);
 				return;
 			}
-			state->released = true;
-		}
-		if (!PythonRuntimeUsableForUDFTeardown()) {
-			return;
-		}
-		GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
-		    slot_id, [collector_holder, request_id, lease_id]() {
-			    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
-			    if (collector_obj.is_none()) {
-				    return;
-			    }
-			    collector_obj.attr("release_output_block_lease")(py::str(request_id), py::str(lease_id));
-		    });
-	};
-	return callbacks;
+			GlobalPythonDispatcher::Instance().EnqueueOutputLeaseRelease(
+			    slot_id, generation,
+			    [collector_holder, request_id, lease_id]() {
+				    auto collector_obj = BorrowPythonObjectHolder(collector_holder);
+				    if (collector_obj.is_none()) {
+					    return;
+				    }
+				    collector_obj.attr("release_output_block_lease")(py::str(request_id), py::str(lease_id));
+			    },
+			    std::move(transition_fence));
+		};
+		return UDFOutputLease(std::move(handoff), std::move(release));
+	} catch (...) {
+		GlobalPythonDispatcher::Instance().CompleteOutputLeaseCallbackFence(state->transition_fence);
+		state->transition_fence.reset();
+		throw;
+	}
 }
 
 // ─── DispatchedUDFPythonExecutor ────────────────────────────────────────
