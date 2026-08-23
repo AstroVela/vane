@@ -1967,6 +1967,17 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 	PyExecuteRelation(write_csv);
 }
 
+void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
+	if (format.empty()) {
+		throw InvalidInputException("write_file requires a non-empty format");
+	}
+	auto write_file = rel->WriteFileRel(filename, format);
+	if (TryDispatchToRunner(write_file, connection_owner)) {
+		return;
+	}
+	PyExecuteRelation(write_file);
+}
+
 // should this return a rel with the new view?
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::CreateView(const string &view_name, bool replace) {
 	rel->CreateView(view_name, replace);

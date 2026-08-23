@@ -243,6 +243,34 @@ retained as a worker fallback.
 
 ## Distributed writes
 
+### Ordinary COPY-format file writes
+
+Python relations can route any registered DuckDB COPY format through the
+distributed file-artifact path with
+`relation.write_file(path, format="format_name")`. This constructs a normal
+`CopyStatement`; it does not register an extension write operator or add
+format-specific behavior to Vane. The `write_csv` and `write_parquet`
+convenience methods construct the same format-neutral relation while retaining
+their format-specific option surfaces. The named `CopyFunction` must provide:
+
+- owned `FunctionData::Copy()` state;
+- matching `serialize` and `deserialize` callbacks;
+- `copy_to_get_written_statistics` with exact row and file byte counts.
+
+The coordinator binds the source and COPY format once. Each selected source
+task receives a cloned physical COPY sink and a unique run-scoped worker output
+path. Retries create a different immutable output path, and finalization uses
+only the selected attempts when it publishes the manifest. An empty source is
+still scheduled as an explicit empty input and must produce a valid zero-row
+artifact when the format's `write_empty_file` behavior is enabled.
+
+The output filesystem remains part of the format contract. Every worker and the
+coordinator must resolve the output namespace consistently; Vane does not turn
+a local-only writer into an object-store writer or copy node-local artifacts
+between hosts.
+
+### Extension-owned write roots
+
 `ExtensionWriteTaskProvider` is the coordinator-side contract exposed by the
 extension's ordinary physical root. That root is never serialized or run on a
 worker. It returns only a `DistributedExtensionWritePlan`: the extension name,
@@ -456,11 +484,12 @@ distributed tests before an extension is enabled in release builds.
 
 The engine-level suite covers scan callback discovery, opaque fat-split payload
 serialization, explicit worker bind serde, split subset application,
-empty assignments, schema validation, file and callback write translation,
-write callback execution, binary fragment and artifact envelopes, runtime
-query/task-attempt identity, pre-write validation, selected-result propagation,
-row-count validation, transaction ordering, pre-finalize abort behavior, and
-terminal unknown outcomes after finalization starts.
+empty assignments, schema validation, generic COPY-format relation binding,
+file and callback write translation, write callback execution, binary fragment
+and artifact envelopes, runtime query/task-attempt identity, pre-write
+validation, selected-result propagation, row-count validation, transaction
+ordering, pre-finalize abort behavior, and terminal unknown outcomes after
+finalization starts.
 
 Each concrete extension adds its own adapter tests for catalog pinning, split
 semantics, object storage, commit behavior, and failure boundaries.

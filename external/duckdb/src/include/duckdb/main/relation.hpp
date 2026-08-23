@@ -216,6 +216,12 @@ public:
 	DUCKDB_API void
 	WriteParquet(const string &parquet_file,
 	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	//! Write a relation through any registered COPY TO format
+	DUCKDB_API shared_ptr<Relation>
+	WriteFileRel(const string &file_path, const string &format,
+	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	DUCKDB_API void WriteFile(const string &file_path, const string &format,
+	                          case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
 
 	//! Update a table, can only be used on a TableRelation
 	DUCKDB_API virtual void Update(const string &update, const string &condition = string());
@@ -302,6 +308,7 @@ protected:
 	}
 
 private:
+	friend class Binder;
 	friend class ClientContext;
 	friend class DuckDBPyRelation;
 	friend class RelationStatement;
