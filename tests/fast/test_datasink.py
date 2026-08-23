@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
+from pathlib import Path
 
 import cloudpickle
 import pyarrow as pa
@@ -18,8 +20,8 @@ from vane.datasink import (
     DataSink,
     DataSinkCapabilities,
     DataSinkExecutionOptions,
+    DataSinkWorker,
     DataSinkWriteError,
-    DataSinkWriter,
     EnvironmentSecret,
     RetryMode,
     WriteContext,
@@ -29,16 +31,16 @@ from vane.datasink import (
 )
 
 
-class _Writer(DataSinkWriter):
+class _Worker(DataSinkWorker):
     def __init__(self, *, fail: bool = False, fail_close: bool = False, reject_open: bool = False) -> None:
         if reject_open:
-            raise AssertionError("writer must not open for rejected keyed input")
+            raise AssertionError("worker must not open for rejected keyed input")
         self._fail = fail
         self._fail_close = fail_close
 
     def write(self, table: pa.Table) -> WriteResult:
         if self._fail:
-            raise RuntimeError("planned writer failure")
+            raise RuntimeError("planned worker failure")
         return WriteResult(
             rows_received=table.num_rows,
             rows_affected=table.num_rows,
@@ -74,9 +76,9 @@ class _Bound(BoundDataSink):
     def execution_options(self) -> DataSinkExecutionOptions:
         return self._options
 
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
         assert context.operation_id
-        return _Writer(fail=self._fail, fail_close=self._fail_close)
+        return _Worker(fail=self._fail, fail_close=self._fail_close)
 
 
 class _Sink(DataSink):
@@ -97,8 +99,8 @@ class _KeyedBound(_Bound, BoundKeyedUpsertSink):
     def key_columns(self) -> tuple[str, ...]:
         return ("id",)
 
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
-        return _Writer(reject_open=self._reject_open)
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _Worker(reject_open=self._reject_open)
 
 
 class _SecretBound(_Bound):
@@ -113,7 +115,7 @@ class _UnserializableBound(_Bound):
         self.lock = threading.Lock()
 
 
-class _ReplayWriter(DataSinkWriter):
+class _ReplayWorker(DataSinkWorker):
     def __init__(self, store: dict[tuple[str, int], int], context: WriteContext) -> None:
         self._store = store
         self._context = context
@@ -129,11 +131,11 @@ class _ReplayBound(_Bound):
         super().__init__()
         self.store: dict[tuple[str, int], int] = {}
 
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
-        return _ReplayWriter(self.store, context)
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _ReplayWorker(self.store, context)
 
 
-class _TrackingWriter(DataSinkWriter):
+class _TrackingWorker(DataSinkWorker):
     def __init__(self, calls: list[str]) -> None:
         self._calls = calls
 
@@ -154,30 +156,71 @@ class _TrackingBound(_Bound):
         super().__init__()
         self._calls = calls
 
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
         self._calls.append("open")
-        return _TrackingWriter(self._calls)
+        return _TrackingWorker(self._calls)
 
 
-class _SlowWriter(_Writer):
+class _SlowWorker(_Worker):
     def write(self, table: pa.Table) -> WriteResult:
         time.sleep(0.05)
         return super().write(table)
 
 
 class _SlowBound(_Bound):
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
-        return _SlowWriter()
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _SlowWorker()
 
 
-class _TimeoutWriter(DataSinkWriter):
+class _TimeoutWorker(DataSinkWorker):
     def write(self, table: pa.Table) -> WriteResult:
         raise TimeoutError("planned provider timeout")
 
 
 class _TimeoutBound(_Bound):
-    def open_writer(self, context: WriteContext) -> DataSinkWriter:
-        return _TimeoutWriter()
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _TimeoutWorker()
+
+
+class _CloseMarkerWorker(_Worker):
+    def __init__(self, marker_path: str) -> None:
+        super().__init__()
+        self._marker_path = marker_path
+
+    def close(self) -> None:
+        Path(self._marker_path).write_text("closed", encoding="utf-8")
+
+
+class _CloseMarkerBound(_Bound):
+    def __init__(self, marker_path: Path) -> None:
+        super().__init__()
+        self._marker_path = str(marker_path)
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _CloseMarkerWorker(self._marker_path)
+
+
+class _CountingBound(_Bound):
+    def __init__(self, options: DataSinkExecutionOptions) -> None:
+        super().__init__(options=options)
+        self.opens = 0
+        self.writes = 0
+        self.closes = 0
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        self.opens += 1
+        owner = self
+
+        class _CountingWorker(_Worker):
+            def write(self, table: pa.Table) -> WriteResult:
+                owner.writes += 1
+                return super().write(table)
+
+            def close(self) -> None:
+                owner.closes += 1
+                super().close()
+
+        return _CountingWorker()
 
 
 def _native_result(
@@ -207,20 +250,25 @@ def _native_result(
     }
 
 
-def test_local_fast_datasink_applies_and_aggregates(monkeypatch):
+def test_local_fast_datasink_applies_aggregates_and_closes_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT i::INTEGER AS id FROM range(0, 5) t(i)")
+    close_marker = tmp_path / "local-fast-worker-closed"
 
-    summary = relation.write_datasink(_Sink(), operation_id="local-fast-applied")
+    summary = relation.write_datasink(
+        _Sink(_CloseMarkerBound(close_marker)),
+        operation_id="local-fast-applied",
+    )
 
     assert summary.operation_id == "local-fast-applied"
     assert summary.outcome is WriteOutcome.APPLIED
     assert summary.rows_received == 5
     assert summary.rows_affected == 5
     assert summary.batch_count >= 1
+    assert close_marker.read_text(encoding="utf-8") == "closed"
 
 
-def test_local_fast_empty_input_does_not_open_a_writer(monkeypatch):
+def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT 1 AS id WHERE false")
 
@@ -232,20 +280,21 @@ def test_local_fast_empty_input_does_not_open_a_writer(monkeypatch):
     assert summary.rows_affected == 0
 
 
-def test_close_failure_after_applied_write_becomes_warning(monkeypatch):
-    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+def test_worker_close_failure_is_reported_during_actor_teardown():
+    from vane.datasink import _SinkBatchRuntime
 
-    summary = vane.sql("SELECT 1 AS id").write_datasink(_Sink(_Bound(fail_close=True)))
+    runtime = _SinkBatchRuntime(_Bound(fail_close=True), WriteContext("close-failure"), None)
+    runtime(pa.table({"id": [1]}))
 
-    assert summary.outcome is WriteOutcome.APPLIED
-    assert any("close() failed" in warning for warning in summary.warnings)
+    with pytest.raises(RuntimeError, match="planned close failure"):
+        runtime.close()
 
 
-def test_writer_failure_is_unknown_and_safe_to_retry(monkeypatch):
+def test_worker_failure_is_unknown_and_safe_to_retry(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
     with pytest.raises(DataSinkWriteError) as exc_info:
-        vane.sql("SELECT 1 AS id").write_datasink(_Sink(_Bound(fail=True)), operation_id="writer-failure")
+        vane.sql("SELECT 1 AS id").write_datasink(_Sink(_Bound(fail=True)), operation_id="worker-failure")
 
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert exc_info.value.safe_to_retry is True
@@ -312,7 +361,76 @@ def test_execution_options_reject_invalid_resource_requests(kwargs):
         DataSinkExecutionOptions(**kwargs)
 
 
-def test_keyed_duplicate_validation_aborts_before_writer_open(monkeypatch):
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"worker_count": 0},
+        {"worker_count": True},
+        {"worker_count": 1.5},
+    ],
+)
+def test_execution_options_reject_invalid_worker_requests(kwargs):
+    with pytest.raises((TypeError, ValueError)):
+        DataSinkExecutionOptions(**kwargs)
+
+
+def test_execution_options_map_to_actor_backends():
+    options = DataSinkExecutionOptions(worker_count=3, batch_size=20)
+
+    assert options.map_batches_kwargs("ray") == {
+        "batch_size": 20,
+        "execution_backend": "ray_actor",
+        "actor_number": 3,
+    }
+    assert options.map_batches_kwargs("local") == {
+        "batch_size": 20,
+        "execution_backend": "subprocess_actor",
+        "actor_number": 3,
+    }
+    assert DataSinkExecutionOptions().worker_count == 1
+    with pytest.raises(ValueError, match="unsupported DataSink runner"):
+        options.map_batches_kwargs("unsupported")
+
+
+def test_datasink_actor_reuses_and_closes_worker_after_cloudpickle_round_trip():
+    from vane.datasink import _make_batch_actor
+
+    context = WriteContext("worker-lifecycle")
+    actor_bound = _CountingBound(DataSinkExecutionOptions(worker_count=1))
+    actor_type = _make_batch_actor(actor_bound, context, None)
+    assert inspect.isclass(actor_type)
+    assert not inspect.signature(actor_type).parameters
+
+    restored_type = cloudpickle.loads(cloudpickle.dumps(actor_type))
+    actor = restored_type()
+    first = actor(pa.table({"id": [1]}))
+    second = actor(pa.table({"id": [2]}))
+
+    assert first.num_rows == second.num_rows == 1
+    assert actor._runtime._sink.opens == 1
+    assert actor._runtime._sink.writes == 2
+    actor._vane_close()
+    actor._vane_close()
+    assert actor._runtime._sink.closes == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        actor(pa.table({"id": [3]}))
+
+
+def test_local_fast_datasink_respects_actor_pool_size(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    options = DataSinkExecutionOptions(worker_count=2, batch_size=1)
+
+    summary = vane.sql("SELECT i::INTEGER AS id FROM range(0, 4) t(i)").write_datasink(
+        _Sink(_Bound(options=options)),
+        operation_id="local-fast-actor",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == 4
+    assert summary.batch_count == 4
+
+
+def test_keyed_duplicate_validation_aborts_before_worker_open(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT * FROM (VALUES (1, 'a'), (1, 'b')) t(id, value)")
 
@@ -324,7 +442,7 @@ def test_keyed_duplicate_validation_aborts_before_writer_open(monkeypatch):
     assert {result.state for result in exc_info.value.summary.results} == {WriteState.ABORTED}
 
 
-def test_keyed_null_validation_aborts_before_writer_open(monkeypatch):
+def test_keyed_null_validation_aborts_before_worker_open(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT NULL::INTEGER AS id, 'a' AS value")
 
@@ -344,7 +462,7 @@ def test_keyed_unique_input_is_applied(monkeypatch):
     assert summary.rows_received == 2
 
 
-def test_replayed_and_losing_attempts_converge_for_idempotent_writer():
+def test_replayed_and_losing_attempts_converge_for_idempotent_worker():
     from vane.datasink import _results_from_arrow, _SinkBatchRuntime
 
     bound = _ReplayBound()
@@ -355,6 +473,7 @@ def test_replayed_and_losing_attempts_converge_for_idempotent_writer():
     first = runtime(table)
     losing_replay = runtime(table)
     selected_results = _results_from_arrow(context.operation_id, first)
+    runtime.close()
 
     assert first.num_rows == losing_replay.num_rows == 1
     assert bound.store == {("replayed-operation", 1): 10, ("replayed-operation", 2): 20}
@@ -362,7 +481,7 @@ def test_replayed_and_losing_attempts_converge_for_idempotent_writer():
     assert selected_results[0].rows_received == 2
 
 
-def test_writer_failure_runs_local_abort_and_close_cleanup():
+def test_worker_failure_aborts_then_closes_during_actor_teardown():
     from vane.datasink import _SinkBatchRuntime
 
     calls: list[str] = []
@@ -371,6 +490,11 @@ def test_writer_failure_runs_local_abort_and_close_cleanup():
     with pytest.raises(RuntimeError, match="planned tracking failure"):
         runtime(pa.table({"id": [1]}))
 
+    assert calls == ["open", "write", "abort"]
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        runtime(pa.table({"id": [2]}))
+    runtime.close()
+    runtime.close()
     assert calls == ["open", "write", "abort", "close"]
 
 
@@ -681,15 +805,20 @@ def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch)
     assert "planned provider timeout" in exc_info.value.detail
 
 
-def test_real_ray_datasink(ray_local, monkeypatch):
+def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
     from vane import runners
     from vane.runners.ray.runner import RayRunner
 
     runner = RayRunner(address=None, max_task_backlog=None)
     monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
     monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+    close_marker = tmp_path / "ray-worker-closed"
     try:
-        summary = vane.sql("SELECT * FROM range(0, 4)").write_datasink(_Sink(), operation_id="ray-datasink")
+        summary = vane.sql("SELECT * FROM range(0, 4)").write_datasink(
+            _Sink(_CloseMarkerBound(close_marker)),
+            operation_id="ray-datasink",
+        )
+        assert close_marker.read_text(encoding="utf-8") == "closed"
         empty_summary = vane.sql("SELECT 1 AS id WHERE false").write_datasink(
             _Sink(_KeyedBound(reject_open=True)),
             operation_id="ray-datasink-empty",

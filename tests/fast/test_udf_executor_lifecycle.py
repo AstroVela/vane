@@ -1416,11 +1416,11 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
     actors.actors = ["actor-0", "actor-1"]
 
     with pytest.raises(RuntimeError, match="transient kill failure"):
-        actors.shutdown()
+        actors.shutdown(kill=True)
 
     assert actors.actors == ["actor-0"]
 
-    actors.shutdown()
+    actors.shutdown(kill=True)
 
     assert actors.actors == []
     assert fake_ray.attempts == [
@@ -1428,6 +1428,55 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
         ("actor-1", True),
         ("actor-0", True),
     ]
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_udf_actor_shutdown_closes_executors_before_killing_actors(monkeypatch, close_fails):
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    events = []
+
+    class Ref:
+        def __init__(self) -> None:
+            self._future = Future()
+            if close_fails:
+                self._future.set_exception(RuntimeError("planned actor close failure"))
+            else:
+                self._future.set_result(None)
+
+        def future(self):
+            return self._future
+
+    class CloseExecutor:
+        def __init__(self, actor_name):
+            self._actor_name = actor_name
+
+        def remote(self):
+            events.append(f"close:{self._actor_name}")
+            return Ref()
+
+    class Actor:
+        def __init__(self, name):
+            self.name = name
+            self.close_executor = CloseExecutor(name)
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+
+        def kill(self, actor, *, no_restart):
+            assert no_restart is True
+            events.append(f"kill:{actor.name}")
+
+    monkeypatch.setitem(sys.modules, "ray", FakeRay())
+    actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    actors._owns_actors = True
+    actors.actors = [Actor("actor-0"), Actor("actor-1")]
+
+    actors.shutdown()
+
+    assert events == ["close:actor-0", "close:actor-1", "kill:actor-0", "kill:actor-1"]
+    assert actors.actors == []
 
 
 def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypatch):
@@ -2428,6 +2477,34 @@ def test_udf_runtime_close_flushes_compute_tail_before_releasing_callable():
     assert output.column("x").to_pylist() == list(range(2048))
     assert set(output.column("batch_rows").to_pylist()) == {2048}
     assert executor._map_fn is None
+
+
+def test_udf_runtime_invokes_internal_callable_close_hook_once():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class InternallyManagedActor:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __call__(self, table):
+            return table
+
+        def _vane_close(self) -> None:
+            self.close_calls += 1
+
+    executor = UDFExecutor(
+        _subprocess_map_payload(
+            InternallyManagedActor,
+            execution_backend="subprocess_actor",
+            actor_number=1,
+        )
+    )
+    actor = executor._map_fn
+
+    executor.close()
+    executor.close()
+
+    assert actor.close_calls == 1
 
 
 def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():

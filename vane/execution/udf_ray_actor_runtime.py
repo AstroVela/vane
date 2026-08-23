@@ -268,6 +268,12 @@ def _actor_class(
             configure_ray_actor_loaded_torch_threads(self._payload)
             return executor
 
+        def close_executor(self) -> None:
+            """Deterministically close the resident callable before actor termination."""
+            executor, self.executor = self.executor, None
+            if executor is not None:
+                executor.close()
+
         def _run_row_preserving_batch(
             self,
             table: pa.Table,

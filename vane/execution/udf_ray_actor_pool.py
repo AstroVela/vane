@@ -7,6 +7,7 @@ import math
 import os
 import secrets
 import time
+import warnings
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -33,6 +34,22 @@ from vane.runners.ray.safe_get import (
     configured_ray_get_timeout_s,
     resolve_object_refs_blocking,
 )
+
+_ACTOR_CLOSE_TIMEOUT_S = 5.0
+
+
+def _warn_actor_close_errors(errors: list[str]) -> None:
+    if not errors:
+        return
+    try:
+        warnings.warn(
+            "Ray UDF actors were killed after graceful callable cleanup failed: " + "; ".join(errors),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    except BaseException:
+        # Cleanup diagnostics cannot retain already-killed query resources.
+        pass
 
 
 class _OwnedUDFActorPoolsError(RuntimeError):
@@ -119,7 +136,7 @@ class UDFActorPoolBase:
                 self._init_refs.append(actor.init_payload.remote(payload_ref))
         except BaseException as creation_error:
             try:
-                self.shutdown()
+                self.shutdown(kill=True)
             except BaseException as cleanup_error:
                 raise _OwnedUDFActorPoolsError(
                     "UDF actor pool creation failed and partial actor cleanup also failed: "
@@ -200,17 +217,37 @@ class UDFActorPoolBase:
 
         import ray
 
-        errors: list[str] = []
+        close_errors: list[str] = []
+        actors = list(self.actors)
+        if not kill and actors:
+            close_refs: list[Any] = []
+            for actor_index, actor in enumerate(actors):
+                try:
+                    close_refs.append(actor.close_executor.remote())
+                except BaseException as exc:
+                    close_errors.append(f"actor-{actor_index} close submission: {type(exc).__name__}: {exc}")
+            if close_refs:
+                try:
+                    resolve_object_refs_blocking(
+                        close_refs,
+                        timeout=_ACTOR_CLOSE_TIMEOUT_S,
+                        honor_query_deadline=False,
+                    )
+                except BaseException as exc:
+                    close_errors.append(f"actor close: {type(exc).__name__}: {exc}")
+
+        kill_errors: list[str] = []
         remaining_actors: list[Any] = []
-        for actor_index, actor in enumerate(self.actors):
+        for actor_index, actor in enumerate(actors):
             try:
                 ray.kill(actor, no_restart=True)
             except BaseException as exc:
-                errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
+                kill_errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
                 remaining_actors.append(actor)
         self.actors = remaining_actors
-        if errors:
-            raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(errors))
+        _warn_actor_close_errors(close_errors)
+        if kill_errors:
+            raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(kill_errors))
 
 
 def apply_actor_node_options(

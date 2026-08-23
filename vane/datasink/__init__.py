@@ -4,10 +4,10 @@
 """Generic immediate, idempotent Python DataSink contracts.
 
 A sink binds once on the driver. Its bound form is serialized into a replayable
-Arrow batch operator, and every worker opens a short-lived writer for one
-batch. The first protocol intentionally supports only externally idempotent,
-immediately visible writes; Vane never reports exactly-once delivery or remote
-rollback.
+Arrow actor operator, and every actor lazily opens one long-lived worker for
+its batches. The first protocol intentionally supports only externally
+idempotent, immediately visible writes; Vane never reports exactly-once
+delivery or remote rollback.
 """
 
 from __future__ import annotations
@@ -188,8 +188,9 @@ class DataSinkCapabilities:
 
 @dataclass(frozen=True)
 class DataSinkExecutionOptions:
-    """Resource and batching requests for the internal Arrow operator."""
+    """Actor-pool, resource, and batching requests for the internal Arrow operator."""
 
+    worker_count: int = 1
     batch_size: int | None = None
     cpus: float | None = None
     gpus: float | None = None
@@ -198,6 +199,11 @@ class DataSinkExecutionOptions:
     task_input_max_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        worker_count = self.worker_count
+        if isinstance(worker_count, bool) or not isinstance(worker_count, int):
+            raise TypeError("worker_count must be a positive integer")
+        if worker_count <= 0:
+            raise ValueError("worker_count must be a positive integer")
         for name in ("batch_size", "memory_bytes", "target_max_batch_bytes", "task_input_max_bytes"):
             value = getattr(self, name)
             if value is None:
@@ -215,8 +221,16 @@ class DataSinkExecutionOptions:
             if not math.isfinite(float(value)) or float(value) < 0:
                 raise ValueError(f"{name} must be a finite non-negative number or None")
 
-    def map_batches_kwargs(self) -> dict[str, Any]:
-        return {
+    def map_batches_kwargs(self, runner_type: str) -> dict[str, Any]:
+        normalized_runner = str(runner_type).strip().lower()
+        if normalized_runner == "ray":
+            execution_backend = "ray_actor"
+        elif normalized_runner in {"local", "local-fast"}:
+            execution_backend = "subprocess_actor"
+        else:
+            raise ValueError(f"unsupported DataSink runner type: {runner_type!r}")
+
+        options: dict[str, Any] = {
             name: value
             for name in (
                 "batch_size",
@@ -228,6 +242,9 @@ class DataSinkExecutionOptions:
             )
             if (value := getattr(self, name)) is not None
         }
+        options["execution_backend"] = execution_backend
+        options["actor_number"] = self.worker_count
+        return options
 
 
 @dataclass(frozen=True)
@@ -416,12 +433,12 @@ def _restore_datasink_write_error(
     return DataSinkWriteError(summary, detail, safe_to_retry=safe_to_retry)
 
 
-class DataSinkWriter(ABC):
-    """Worker-local writer opened for exactly one Arrow compute batch."""
+class DataSinkWorker(ABC):
+    """Long-lived sink worker owned by one DataSink actor process."""
 
     @abstractmethod
     def write(self, table: pa.Table) -> WriteResult:
-        """Apply one batch using idempotent external semantics."""
+        """Apply one of this actor's batches using idempotent external semantics."""
 
     def abort(self, error: BaseException) -> None:
         """Release worker-local state after failure; this is not remote rollback."""
@@ -447,7 +464,7 @@ class BoundDataSink(ABC):
         return relation
 
     @abstractmethod
-    def open_writer(self, context: WriteContext) -> DataSinkWriter: ...
+    def open_worker(self, context: WriteContext) -> DataSinkWorker: ...
 
 
 class BoundKeyedUpsertSink(BoundDataSink):
@@ -575,6 +592,36 @@ class _SinkBatchRuntime:
         self._sink = sink
         self._context = context
         self._key_validation = key_validation
+        self._worker: DataSinkWorker | None = None
+        self._failed = False
+        self._closed = False
+
+    def _get_or_open_worker(self) -> DataSinkWorker:
+        if self._closed:
+            raise RuntimeError("DataSink actor worker is closed")
+        if self._failed:
+            raise RuntimeError("DataSink actor worker cannot be reused after a write failure")
+        worker = self._worker
+        if worker is None:
+            try:
+                worker = self._sink.open_worker(self._context)
+                if not isinstance(worker, DataSinkWorker):
+                    raise TypeError(
+                        f"BoundDataSink.open_worker() must return DataSinkWorker, got {type(worker).__name__}"
+                    )
+            except BaseException:
+                self._failed = True
+                raise
+            self._worker = worker
+        return worker
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.close()
 
     def __call__(self, table: pa.Table) -> pa.Table:
         import pyarrow as pa
@@ -599,74 +646,47 @@ class _SinkBatchRuntime:
                 ),
             )
 
-        writer = self._sink.open_writer(self._context)
-        if not isinstance(writer, DataSinkWriter):
-            raise TypeError(f"BoundDataSink.open_writer() must return DataSinkWriter, got {type(writer).__name__}")
-        primary_error: BaseException | None = None
-        result: WriteResult | None = None
+        worker = self._get_or_open_worker()
         try:
-            result = writer.write(table)
+            result = worker.write(table)
             if not isinstance(result, WriteResult):
-                raise TypeError(f"DataSinkWriter.write() must return WriteResult, got {type(result).__name__}")
+                raise TypeError(f"DataSinkWorker.write() must return WriteResult, got {type(result).__name__}")
             if result.state is not WriteState.APPLIED:
-                raise ValueError("DataSinkWriter.write() must return state='applied'")
+                raise ValueError("DataSinkWorker.write() must return state='applied'")
             if result.rows_received != table.num_rows:
                 raise ValueError(
-                    f"DataSinkWriter rows_received={result.rows_received} does not match input rows={table.num_rows}"
+                    f"DataSinkWorker rows_received={result.rows_received} does not match input rows={table.num_rows}"
                 )
         except BaseException as error:
-            primary_error = error
+            self._failed = True
             try:
-                writer.abort(error)
+                worker.abort(error)
             except BaseException as abort_error:
                 if hasattr(error, "add_note"):
                     error.add_note(
-                        "DataSinkWriter.abort() local cleanup also failed: "
+                        "DataSinkWorker.abort() local cleanup also failed: "
                         f"{type(abort_error).__name__}: {_safe_error_message(abort_error)}"
                     )
             raise
-        finally:
-            try:
-                writer.close()
-            except BaseException as close_error:
-                if primary_error is not None:
-                    if hasattr(primary_error, "add_note"):
-                        primary_error.add_note(
-                            "DataSinkWriter.close() also failed: "
-                            f"{type(close_error).__name__}: {_safe_error_message(close_error)}"
-                        )
-                elif result is not None:
-                    result = WriteResult(
-                        rows_received=result.rows_received,
-                        rows_affected=result.rows_affected,
-                        bytes_received=result.bytes_received,
-                        metadata=result.metadata,
-                        warnings=_append_warning(
-                            result.warnings,
-                            "DataSinkWriter.close() failed after the external write was applied: "
-                            f"{type(close_error).__name__}: {_safe_error_message(close_error)}",
-                            limit=_MAX_WRITE_RESULT_WARNINGS,
-                        ),
-                        state=result.state,
-                    )
-                else:
-                    raise
-        if result is None:
-            raise RuntimeError("DataSinkWriter completed without a WriteResult")
         return _result_to_wire_table(self._context, result)
 
 
-def _make_batch_function(
+def _make_batch_actor(
     sink: BoundDataSink,
     context: WriteContext,
     key_validation: _KeyValidation | None,
-) -> Any:
-    runtime = _SinkBatchRuntime(sink, context, key_validation)
+) -> type[Any]:
+    class DataSinkBatchActor:
+        def __init__(self) -> None:
+            self._runtime = _SinkBatchRuntime(sink, context, key_validation)
 
-    def execute_datasink_batch(table: pa.Table) -> pa.Table:
-        return runtime(table)
+        def __call__(self, table: pa.Table) -> pa.Table:
+            return self._runtime(table)
 
-    return execute_datasink_batch
+        def _vane_close(self) -> None:
+            self._runtime.close()
+
+    return DataSinkBatchActor
 
 
 def _relation_arrow_schema(relation: DuckDBPyRelation) -> pa.Schema:
@@ -949,22 +969,22 @@ def write_datasink(
     key_validation = None
     if isinstance(bound, BoundKeyedUpsertSink):
         prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
-    batch_function = _make_batch_function(bound, context, key_validation)
+    runner_type = get_or_infer_runner_type()
+    batch_actor = _make_batch_actor(bound, context, key_validation)
     try:
-        cloudpickle.dumps(batch_function)
+        cloudpickle.dumps(batch_actor)
     except BaseException as error:
-        raise TypeError("DataSink worker callable must be cloudpickle-serializable before execution") from error
+        raise TypeError("DataSink actor class must be cloudpickle-serializable before execution") from error
     mapped = prepared_relation.map_batches(
-        batch_function,
+        batch_actor,
         schema=_wire_output_schema(),
-        **options.map_batches_kwargs(),
+        **options.map_batches_kwargs(runner_type),
     )
     terminal = mapped._mark_datasink(context.operation_id)
 
     results: tuple[WriteResult, ...] = ()
     warnings: tuple[str, ...] = ()
     try:
-        runner_type = get_or_infer_runner_type()
         if runner_type == "local-fast":
             results = _results_from_arrow(context.operation_id, terminal.to_arrow_table())
             states = {result.state for result in results}
@@ -972,7 +992,7 @@ def write_datasink(
                 raise _aborted_error(
                     context,
                     results,
-                    "keyed DataSink input validation rejected the operation before writers opened",
+                    "keyed DataSink input validation rejected the operation before workers opened",
                 )
             if WriteState.ABORTED in states:
                 raise _unknown_error(context, results, "DataSink results mixed applied and aborted states")
@@ -990,7 +1010,7 @@ def write_datasink(
         if native_result["outcome_aborted"]:
             detail = native_result.get("outcome_error")
             if not isinstance(detail, str) or not detail:
-                detail = "DataSink input was rejected before writers opened"
+                detail = "DataSink input was rejected before workers opened"
             raise _aborted_error(context, results, detail, warnings)
         return _summary(context, WriteOutcome.APPLIED, results, warnings)
     except DataSinkWriteError:
@@ -1010,8 +1030,8 @@ __all__ = [
     "DataSink",
     "DataSinkCapabilities",
     "DataSinkExecutionOptions",
+    "DataSinkWorker",
     "DataSinkWriteError",
-    "DataSinkWriter",
     "EnvironmentSecret",
     "RetryMode",
     "WriteContext",

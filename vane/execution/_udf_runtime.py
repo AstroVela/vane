@@ -893,9 +893,8 @@ class UDFExecutor:
     def close(self) -> None:
         """Flush buffered work and deterministically release the loaded callable.
 
-        Callables that were bound an async runtime additionally get their
-        ``close()`` hook invoked (provider clients close on the owned loop)
-        before the loop itself is shut down.
+        Internal lifecycle hooks and callables bound to an async runtime close
+        before any owned async loop is shut down.
         """
         if self._closed:
             return
@@ -906,7 +905,10 @@ class UDFExecutor:
             map_fn, self._map_fn = self._map_fn, None
             runtime, self._async_runtime = self._async_runtime, None
             try:
-                if runtime is not None:
+                vane_close_fn = getattr(map_fn, "_vane_close", None)
+                if callable(vane_close_fn):
+                    vane_close_fn()
+                elif runtime is not None:
                     close_fn = getattr(map_fn, "close", None)
                     if callable(close_fn):
                         close_fn()

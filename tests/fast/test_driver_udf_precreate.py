@@ -2073,7 +2073,7 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
     assert owned_pools[0].actors == ["actor-0"]
 
     fail_kill = False
-    owned_pools[0].shutdown()
+    owned_pools[0].shutdown(kill=True)
     assert owned_pools[0].actors == []
 
 

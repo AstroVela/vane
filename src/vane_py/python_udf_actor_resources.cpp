@@ -188,7 +188,7 @@ public:
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 
-	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData> error) override {
 		prepared_statements.clear();
 		if (resources.empty()) {
 			return;
@@ -198,7 +198,7 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources();
+		ShutdownResources(error && error->HasError());
 	}
 
 	~PythonUDFActorResourceState() override {
@@ -210,7 +210,7 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources();
+		ShutdownResources(true);
 	}
 
 private:
@@ -272,19 +272,19 @@ private:
 				ApplyHandlesMap(bind_nodes, handles_map);
 			}
 		} catch (...) {
-			ShutdownResources();
+			ShutdownResources(true);
 			throw;
 		}
 	}
 
-	void ShutdownResources() {
+	void ShutdownResources(bool kill) {
 		if (resources.empty()) {
 			return;
 		}
 		for (auto it = resources.rbegin(); it != resources.rend(); ++it) {
 			try {
 				if (pybind11::hasattr(*it, "shutdown")) {
-					it->attr("shutdown")(pybind11::arg("kill") = true);
+					it->attr("shutdown")(pybind11::arg("kill") = kill);
 				}
 			} catch (const pybind11::error_already_set &) {
 				PyErr_Clear();
