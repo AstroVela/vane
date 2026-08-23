@@ -1678,6 +1678,56 @@ def test_vllm_prompt_rejects_invalid_options_during_planning(options):
         vane.ai.prompt(vane.col("text"), provider="vllm", **options)
 
 
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"max_tokens": 0}, "max_tokens"),
+        ({"max_new_tokens": -1}, "max_new_tokens"),
+        ({"temperature": float("nan")}, "temperature"),
+        ({"temperature": -0.1}, "temperature"),
+        ({"gpus_per_actor": 0}, "gpus_per_actor"),
+        ({"gpus_per_actor": 1.5}, "gpus_per_actor"),
+        ({"max_buffer_size": -1}, "max_buffer_size"),
+        ({"inflight_limit": "8"}, "inflight_limit"),
+        ({"load_balance_threshold": -1}, "load_balance_threshold"),
+        ({"engine_init_timeout_s": float("inf")}, "engine_init_timeout_s"),
+        ({"engine_args": []}, "engine_args"),
+        ({"generate_args": []}, "generate_args"),
+        ({"generate_args": {"sampling_params": []}}, "sampling_params"),
+        ({"generate_args": {"sampling_params": "[]"}}, "sampling_params"),
+        ({"generate_args": {"sampling_params": "not-json"}}, "sampling_params"),
+        (
+            {"generate_args": {"sampling_params": {"max_new_tokens": 0}}},
+            "sampling_params.max_new_tokens",
+        ),
+        (
+            {"generate_args": {"sampling_params": {"temperature": float("nan")}}},
+            "sampling_params.temperature",
+        ),
+    ],
+)
+def test_sglang_prompt_rejects_invalid_options_during_planning(options, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        vane.ai.prompt(vane.col("text"), provider="sglang", **options)
+
+
+def test_sglang_prompt_accepts_resource_and_sampling_boundaries():
+    vane.ai.prompt(
+        vane.col("text"),
+        provider="sglang",
+        max_tokens=1,
+        max_new_tokens=1,
+        temperature=0,
+        gpus_per_actor=0.5,
+        max_buffer_size=0,
+        inflight_limit=0,
+        load_balance_threshold=0,
+        engine_init_timeout_s=0,
+        engine_args={},
+        generate_args={"sampling_params": '{"max_new_tokens":1,"temperature":0}'},
+    )
+
+
 def test_ai_prompt_vllm_rejects_images_and_execution_backend():
     relation = vane.connect().sql("select 'question'::VARCHAR as question, '\\x89504e470d0a1a0a'::BLOB as image")
     with pytest.raises(ValueError, match="does not support Prompt image"):
