@@ -33,6 +33,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 
 namespace duckdb {
 namespace distributed {
