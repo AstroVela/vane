@@ -6384,22 +6384,22 @@ class RayQueryDriverActor:
             except BaseException as exc:
                 errors.append(exc)
         if errors:
-            details = [f"{type(exc).__name__}: {exc}" for exc in errors]
-            details.extend(
+            error_details = [f"{type(exc).__name__}: {exc}" for exc in errors]
+            error_details.extend(
                 f"graceful actor cleanup diagnostic: {type(exc).__name__}: {exc}" for exc in cleanup_diagnostics
             )
-            raise RuntimeError(f"query plan {plan_id} teardown failed: " + "; ".join(details)) from errors[0]
+            raise RuntimeError(f"query plan {plan_id} teardown failed: " + "; ".join(error_details)) from errors[0]
         try:
             self._release_plan_session_state(lifecycle, query_id, query_connection)
         except BaseException as release_error:
             if not cleanup_diagnostics:
                 raise
-            details = "; ".join(
+            diagnostic_details = "; ".join(
                 f"graceful actor cleanup diagnostic: {type(exc).__name__}: {exc}" for exc in cleanup_diagnostics
             )
             raise RuntimeError(
                 f"query plan {plan_id} session release failed: "
-                f"{type(release_error).__name__}: {release_error}; {details}"
+                f"{type(release_error).__name__}: {release_error}; {diagnostic_details}"
             ) from release_error
         return cleanup_diagnostics
 
