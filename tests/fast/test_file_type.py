@@ -349,6 +349,10 @@ def test_file_rejects_min_max_bypasses(connection, aggregate):
         "arg_max(1, value, 1)",
         "median(value)",
         "quantile_disc(value, 0.5)",
+        "histogram(value)",
+        "histogram(value, [value])",
+        "histogram_exact(value, [value])",
+        "histogram(struct_pack(value := value))",
     ],
 )
 def test_file_rejects_other_ordering_aggregate_bypasses(connection, aggregate):

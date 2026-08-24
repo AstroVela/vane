@@ -1,5 +1,6 @@
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "core_functions/aggregate/nested_functions.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "core_functions/aggregate/histogram_helpers.hpp"
@@ -398,6 +399,9 @@ unique_ptr<FunctionData> HistogramBinBindFunction(ClientContext &context, Aggreg
 	for (auto &arg : arguments) {
 		if (arg->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
+		}
+		if (TypeVisitor::Contains(arg->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("%s does not support FILE values", function.name);
 		}
 	}
 
