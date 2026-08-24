@@ -251,6 +251,30 @@ private:
 	bool fail_removal = false;
 };
 
+class PhantomRemoteDirectoryFileSystem : public MappedRemoteFileSystem {
+public:
+	PhantomRemoteDirectoryFileSystem(string local_root, string phantom_directory)
+	    : MappedRemoteFileSystem(std::move(local_root)), phantom_directory(std::move(phantom_directory)) {
+	}
+
+	bool DirectoryExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return true;
+		}
+		return MappedRemoteFileSystem::DirectoryExists(path, opener);
+	}
+
+	void RemoveDirectory(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return;
+		}
+		MappedRemoteFileSystem::RemoveDirectory(path, opener);
+	}
+
+private:
+	string phantom_directory;
+};
+
 class WindowsPathFileSystem : public LocalFileSystem {
 public:
 	string PathSeparator(const string &) override {
@@ -1019,6 +1043,27 @@ TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
 	REQUIRE_FALSE(local_fs.FileExists(data_file));
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
 	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Direct-target cleanup ignores phantom remote directories",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_phantom_remote_directory");
+	const string base_path = "s3://bucket/out";
+	const string run_id = "run-direct-target";
+	auto run_prefix = BuildCopyDirectWriteRunDirectory(base_path, run_id, "/");
+	PhantomRemoteDirectoryFileSystem fs(test_dir.fs.JoinPath(test_dir.path, "remote"), run_prefix);
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, data_file, "stale");
+	REQUIRE(fs.DirectoryExists(run_prefix));
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE_FALSE(fs.FileExists(data_file));
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path));
 }
 
 TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata cleanup finishes",

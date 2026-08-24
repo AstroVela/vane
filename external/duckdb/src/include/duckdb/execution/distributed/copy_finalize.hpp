@@ -1241,6 +1241,7 @@ inline bool DistributedCopyMayUseDirectTargetLayout(FileSystem &fs, const std::s
 inline DuckDBResult<DistributedCopyPrefixCleanupResult>
 CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
                              const std::string &remove_last = std::string()) {
+	const bool has_directory_semantics = !FileSystem::IsRemoteFile(prefix);
 	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, prefix);
 	if (files_res.is_err()) {
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(files_res.error());
@@ -1262,7 +1263,8 @@ CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
 	}
 
 	DistributedCopyPrefixCleanupResult result;
-	result.existed = !files.empty() || !remove_last.empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix);
+	result.existed = !files.empty() || !remove_last.empty() ||
+	                 (has_directory_semantics && DistributedCopyDirectoryExistsNoThrow(fs, prefix));
 	auto remove_res = RemoveDistributedCopyFiles(fs, files);
 	if (remove_res.is_err()) {
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remove_res.error());
@@ -1313,7 +1315,13 @@ CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
 		}
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(remaining_res.error());
 	}
-	if (!remaining_res.value().empty() || DistributedCopyDirectoryExistsNoThrow(fs, prefix)) {
+	// Object stores have no real directories. Their filesystem adapters can
+	// report a prefix as a directory even after its final object was removed.
+	// For remote paths, the authoritative cleanup condition is therefore an
+	// empty object listing. Local filesystems retain the stricter directory
+	// removal check.
+	if (!remaining_res.value().empty() ||
+	    (has_directory_semantics && DistributedCopyDirectoryExistsNoThrow(fs, prefix))) {
 		auto cleanup_error = directory_removal_error.empty()
 		                         ? "distributed COPY prefix still exists after cleanup: " + prefix
 		                         : directory_removal_error;
