@@ -423,6 +423,7 @@ def test_ray_actor_wait_raises_stored_executor_error():
     executor._per_executor_wait_tokens_observed = {}
     executor._async_waiter_lock = threading.Lock()
     executor._async_waiters = {}
+    executor._shutdown_called = False
     executor._notify_state_change = lambda **_kwargs: None
 
     with pytest.raises(RuntimeError, match="vllm task failed: sentinel request failure"):

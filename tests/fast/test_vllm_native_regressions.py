@@ -156,6 +156,68 @@ def _run_recording_sql(monkeypatch, prompts, options, *, executor=None, threads=
         con.close()
 
 
+def test_native_local_vllm_result_wait_honors_expired_query_deadline(monkeypatch):
+    import vane.execution.vllm as vllm
+
+    class DeadlineProbeCondition:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def wait_for(self, _predicate, timeout=None):
+            if timeout is None:
+                raise AssertionError("local result wait did not receive the query deadline")
+            return False
+
+        def notify_all(self) -> None:
+            pass
+
+    class StalledLocalExecutor(vllm.LocalVLLMExecutor):
+        def __init__(self) -> None:
+            self.submissions = []
+            self.completed_tasks = deque()
+            self.error_message = None
+            self.on_error = "raise"
+            self.running_task_count = 0
+            self.task_count_lock = threading.Lock()
+            self._result_cv = DeadlineProbeCondition()
+            self._finished_submitting = False
+            self._shutdown_called = False
+            self._per_executor_deques = {}
+            self._per_executor_running_task_count = {}
+            self._per_executor_finished = set()
+            self._per_executor_errors = {}
+            self._per_executor_aborted = set()
+            self._ensure_wakeup_state()
+
+        def submit(self, prefix, prompts, _rows) -> None:
+            prompt_values = tuple(prompts)
+            self.submissions.append((prefix, prompt_values))
+            with self.task_count_lock:
+                self.running_task_count += len(prompt_values)
+            self._notify_state_change(force=True)
+
+    executor = StalledLocalExecutor()
+    monkeypatch.setenv("VANE_QUERY_DEADLINE_EPOCH_S", "0")
+
+    with pytest.raises(Exception, match="query deadline expired before vLLM wait"):
+        _run_recording_sql(
+            monkeypatch,
+            ["alpha", "beta"],
+            {
+                "do_prefix_routing": False,
+                "batch_size": 1,
+                "inflight_limit": 1,
+            },
+            executor=executor,
+        )
+
+    assert executor.submissions == [(None, ("alpha",))]
+    assert executor._shutdown_called
+
+
 @pytest.mark.parametrize("do_prefix_routing", [False, True])
 def test_native_vllm_propagates_null_prompts_without_submitting_them(monkeypatch, do_prefix_routing):
     executor, rows = _run_recording_sql(
