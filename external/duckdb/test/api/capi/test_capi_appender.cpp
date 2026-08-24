@@ -1048,6 +1048,115 @@ TEST_CASE("Test append duckdb_value values in C API", "[capi]") {
 	tester.Cleanup();
 }
 
+TEST_CASE("Test FILE validation in C API appender", "[capi][file]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+	REQUIRE_NO_FAIL(tester.Query("CREATE TABLE files(value FILE)"));
+
+	SECTION("duckdb_append_value rejects an invalid FILE") {
+		duckdb_appender appender;
+		REQUIRE(duckdb_appender_create(tester.connection, nullptr, "files", &appender) == DuckDBSuccess);
+		auto file_type = duckdb_appender_column_type(appender, 0);
+
+		duckdb_value fields[5];
+		for (auto &field : fields) {
+			field = duckdb_create_null_value();
+		}
+		auto file_value = duckdb_create_struct_value(file_type, fields);
+		REQUIRE(file_value != nullptr);
+		REQUIRE(duckdb_append_value(appender, file_value) == DuckDBError);
+		REQUIRE(string(duckdb_appender_error(appender)) == "Appender FILE url cannot be NULL");
+
+		duckdb_destroy_value(&file_value);
+		for (auto &field : fields) {
+			duckdb_destroy_value(&field);
+		}
+		duckdb_destroy_logical_type(&file_type);
+		REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+	}
+
+	SECTION("duckdb_append_data_chunk rejects an invalid FILE") {
+		duckdb_appender appender;
+		REQUIRE(duckdb_appender_create(tester.connection, nullptr, "files", &appender) == DuckDBSuccess);
+		auto file_type = duckdb_appender_column_type(appender, 0);
+		auto data_chunk = duckdb_create_data_chunk(&file_type, 1);
+		REQUIRE(data_chunk != nullptr);
+
+		auto file_vector = duckdb_data_chunk_get_vector(data_chunk, 0);
+		duckdb_vector_assign_string_element(duckdb_struct_vector_get_child(file_vector, 0), 0, "object");
+		auto position =
+		    reinterpret_cast<int64_t *>(duckdb_vector_get_data(duckdb_struct_vector_get_child(file_vector, 2)));
+		auto size = reinterpret_cast<int64_t *>(duckdb_vector_get_data(duckdb_struct_vector_get_child(file_vector, 3)));
+		position[0] = -1;
+		size[0] = 1;
+		duckdb_vector_assign_string_element(duckdb_struct_vector_get_child(file_vector, 4), 0, "sha256:digest");
+		duckdb_data_chunk_set_size(data_chunk, 1);
+
+		REQUIRE(duckdb_append_data_chunk(appender, data_chunk) == DuckDBError);
+		REQUIRE(string(duckdb_appender_error(appender)) == "Appender FILE position and size must be non-negative");
+
+		duckdb_destroy_data_chunk(&data_chunk);
+		duckdb_destroy_logical_type(&file_type);
+		REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+	}
+
+	SECTION("nested FILE values are validated") {
+		REQUIRE_NO_FAIL(tester.Query("CREATE TABLE nested_files(value STRUCT(payload FILE))"));
+		duckdb_appender appender;
+		REQUIRE(duckdb_appender_create(tester.connection, nullptr, "nested_files", &appender) == DuckDBSuccess);
+		auto struct_type = duckdb_appender_column_type(appender, 0);
+		auto file_type = duckdb_struct_type_child_type(struct_type, 0);
+
+		duckdb_value file_fields[] = {duckdb_create_varchar("object"), duckdb_create_null_value(),
+		                              duckdb_create_null_value(), duckdb_create_null_value(),
+		                              duckdb_create_varchar("invalid")};
+		auto file_value = duckdb_create_struct_value(file_type, file_fields);
+		REQUIRE(file_value != nullptr);
+		auto struct_value = duckdb_create_struct_value(struct_type, &file_value);
+		REQUIRE(struct_value != nullptr);
+		REQUIRE(duckdb_append_value(appender, struct_value) == DuckDBError);
+		REQUIRE(string(duckdb_appender_error(appender)) ==
+		        "Appender FILE checksum must have the form <algorithm>:<digest>");
+
+		duckdb_destroy_value(&struct_value);
+		duckdb_destroy_value(&file_value);
+		for (auto &field : file_fields) {
+			duckdb_destroy_value(&field);
+		}
+		duckdb_destroy_logical_type(&file_type);
+		duckdb_destroy_logical_type(&struct_type);
+		REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+	}
+
+	SECTION("NULL nested parents hide invalid FILE children") {
+		REQUIRE_NO_FAIL(tester.Query("CREATE TABLE nested_files(value STRUCT(payload FILE))"));
+		duckdb_appender appender;
+		REQUIRE(duckdb_appender_create(tester.connection, nullptr, "nested_files", &appender) == DuckDBSuccess);
+		auto struct_type = duckdb_appender_column_type(appender, 0);
+		auto data_chunk = duckdb_create_data_chunk(&struct_type, 1);
+		REQUIRE(data_chunk != nullptr);
+
+		auto struct_vector = duckdb_data_chunk_get_vector(data_chunk, 0);
+		auto file_vector = duckdb_struct_vector_get_child(struct_vector, 0);
+		auto url_vector = duckdb_struct_vector_get_child(file_vector, 0);
+		duckdb_vector_ensure_validity_writable(url_vector);
+		duckdb_validity_set_row_invalid(duckdb_vector_get_validity(url_vector), 0);
+		duckdb_vector_ensure_validity_writable(struct_vector);
+		duckdb_validity_set_row_invalid(duckdb_vector_get_validity(struct_vector), 0);
+		duckdb_data_chunk_set_size(data_chunk, 1);
+
+		REQUIRE(duckdb_append_data_chunk(appender, data_chunk) == DuckDBSuccess);
+		REQUIRE(duckdb_appender_close(appender) == DuckDBSuccess);
+		auto result = tester.Query("SELECT value IS NULL FROM nested_files");
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(result->Fetch<bool>(0, 0));
+
+		duckdb_destroy_data_chunk(&data_chunk);
+		duckdb_destroy_logical_type(&struct_type);
+		REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+	}
+}
+
 TEST_CASE("Test append to different catalog in C API") {
 	CAPITester tester;
 	REQUIRE(tester.OpenDatabase(nullptr));

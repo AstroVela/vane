@@ -1714,8 +1714,94 @@ bool FileLogicalType::IsFile(const LogicalType &type) {
 	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
 }
 
+static void ValidateFileFields(bool url_is_valid, bool position_is_valid, int64_t position, bool size_is_valid,
+                               int64_t size, const string *checksum, const string &source) {
+	if (!url_is_valid) {
+		throw InvalidInputException("%s url cannot be NULL", source);
+	}
+	if (position_is_valid != size_is_valid) {
+		throw InvalidInputException("%s position and size must either both be NULL or both be non-NULL", source);
+	}
+	if (position_is_valid) {
+		if (position < 0 || size < 0) {
+			throw InvalidInputException("%s position and size must be non-negative", source);
+		}
+		if (position > NumericLimits<int64_t>::Maximum() - size) {
+			throw InvalidInputException("%s byte range exceeds BIGINT", source);
+		}
+	}
+	if (checksum) {
+		auto separator = checksum->find(':');
+		if (separator == string::npos || separator == 0 || separator + 1 == checksum->size() ||
+		    checksum->find(':', separator + 1) != string::npos) {
+			throw InvalidInputException("%s checksum must have the form <algorithm>:<digest>", source);
+		}
+	}
+}
+
+void FileLogicalType::Validate(const Value &value, const string &source) {
+	if (value.IsNull()) {
+		return;
+	}
+	auto &type = value.type();
+	if (IsFile(type)) {
+		auto &children = StructValue::GetChildren(value);
+		D_ASSERT(children.size() == FIELD_COUNT);
+
+		auto position_is_valid = !children[POSITION].IsNull();
+		auto size_is_valid = !children[SIZE].IsNull();
+		auto position = position_is_valid ? BigIntValue::Get(children[POSITION]) : 0;
+		auto size = size_is_valid ? BigIntValue::Get(children[SIZE]) : 0;
+		const string *checksum = nullptr;
+		if (!children[CHECKSUM].IsNull()) {
+			checksum = &StringValue::Get(children[CHECKSUM]);
+		}
+		ValidateFileFields(!children[URL].IsNull(), position_is_valid, position, size_is_valid, size, checksum, source);
+		return;
+	}
+	if (!TypeVisitor::Contains(type, IsFile)) {
+		return;
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			Validate(child, source);
+		}
+		return;
+	case LogicalTypeId::UNION:
+		Validate(UnionValue::GetValue(value), source);
+		return;
+	case LogicalTypeId::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			Validate(child, source);
+		}
+		return;
+	case LogicalTypeId::MAP:
+		for (auto &child : MapValue::GetChildren(value)) {
+			Validate(child, source);
+		}
+		return;
+	case LogicalTypeId::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			Validate(child, source);
+		}
+		return;
+	default:
+		throw InternalException("Unsupported logical type containing FILE: %s", type.ToString());
+	}
+}
+
 void FileLogicalType::Validate(Vector &value, idx_t count, const string &source) {
-	D_ASSERT(IsFile(value.GetType()));
+	if (!IsFile(value.GetType())) {
+		if (!TypeVisitor::Contains(value.GetType(), IsFile)) {
+			return;
+		}
+		for (idx_t row = 0; row < count; row++) {
+			Validate(value.GetValue(row), source);
+		}
+		return;
+	}
 	auto &children = StructVector::GetEntries(value);
 	D_ASSERT(children.size() == FIELD_COUNT);
 
@@ -1740,37 +1826,21 @@ void FileLogicalType::Validate(Vector &value, idx_t count, const string &source)
 		}
 
 		auto url_index = url_data.sel->get_index(row);
-		if (!url_data.validity.RowIsValid(url_index)) {
-			throw InvalidInputException("%s url cannot be NULL", source);
-		}
-
 		auto position_index = position_data.sel->get_index(row);
 		auto size_index = size_data.sel->get_index(row);
 		auto position_is_valid = position_data.validity.RowIsValid(position_index);
 		auto size_is_valid = size_data.validity.RowIsValid(size_index);
-		if (position_is_valid != size_is_valid) {
-			throw InvalidInputException("%s position and size must either both be NULL or both be non-NULL", source);
-		}
-		if (position_is_valid) {
-			auto position = positions[position_index];
-			auto size = sizes[size_index];
-			if (position < 0 || size < 0) {
-				throw InvalidInputException("%s position and size must be non-negative", source);
-			}
-			if (position > NumericLimits<int64_t>::Maximum() - size) {
-				throw InvalidInputException("%s byte range exceeds BIGINT", source);
-			}
-		}
-
+		auto position = position_is_valid ? positions[position_index] : 0;
+		auto size = size_is_valid ? sizes[size_index] : 0;
 		auto checksum_index = checksum_data.sel->get_index(row);
+		string checksum;
+		const string *checksum_ptr = nullptr;
 		if (checksum_data.validity.RowIsValid(checksum_index)) {
-			auto checksum = checksums[checksum_index].GetString();
-			auto separator = checksum.find(':');
-			if (separator == string::npos || separator == 0 || separator + 1 == checksum.size() ||
-			    checksum.find(':', separator + 1) != string::npos) {
-				throw InvalidInputException("%s checksum must have the form <algorithm>:<digest>", source);
-			}
+			checksum = checksums[checksum_index].GetString();
+			checksum_ptr = &checksum;
 		}
+		ValidateFileFields(url_data.validity.RowIsValid(url_index), position_is_valid, position, size_is_valid, size,
+		                   checksum_ptr, source);
 	}
 }
 
