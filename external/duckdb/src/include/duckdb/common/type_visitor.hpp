@@ -24,6 +24,11 @@ struct TypeVisitor {
 
 template <class F>
 inline LogicalType TypeVisitor::VisitReplace(const LogicalType &type, F &&func) {
+	// FILE is a governed logical value, not a generic STRUCT whose children may be rewritten independently.
+	// Treat it as an atomic type so recursive rewrites cannot silently erase its alias and invariants.
+	if (FileLogicalType::IsFile(type)) {
+		return func(type);
+	}
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT: {
 		if (!type.AuxInfo()) {

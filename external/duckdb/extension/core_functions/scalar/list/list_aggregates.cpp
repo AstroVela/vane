@@ -12,6 +12,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/common/owning_string_map.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 namespace duckdb {
 
@@ -436,6 +437,9 @@ unique_ptr<FunctionData> ListAggregatesBind(ClientContext &context, ScalarFuncti
 	} else {
 		// Unreachable
 		throw InvalidInputException("First argument of list aggregate must be a list, map or array");
+	}
+	if (!IS_AGGR && TypeVisitor::Contains(child_type, FileLogicalType::IsFile)) {
+		throw BinderException("%s does not support FILE values", bound_function.name);
 	}
 
 	string function_name = "histogram";

@@ -334,6 +334,9 @@ void Binder::BindModifiers(BoundQueryNode &result, idx_t table_index, const vect
 				}
 			}
 			for (auto &expr : distinct.target_distincts) {
+				if (TypeVisitor::Contains(expr->return_type, FileLogicalType::IsFile)) {
+					throw BinderException(expr->GetQueryLocation(), "DISTINCT does not support FILE values");
+				}
 				ExpressionBinder::PushCollation(context, expr, expr->return_type);
 			}
 			break;
@@ -515,6 +518,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 			LogicalType group_type;
 			auto bound_expr = group_binder.Bind(group_expressions[i], &group_type);
 			D_ASSERT(bound_expr->return_type.id() != LogicalTypeId::INVALID);
+			if (TypeVisitor::Contains(bound_expr->return_type, FileLogicalType::IsFile)) {
+				throw BinderException(bound_expr->GetQueryLocation(), "GROUP BY does not support FILE values");
+			}
 
 			// find out whether the expression contains a subquery, it can't be copied if so
 			auto &bound_expr_ref = *bound_expr;
@@ -655,6 +661,9 @@ BoundStatement Binder::BindSelectNode(SelectNode &statement, BoundStatement from
 
 	for (auto &group_by_all_index : group_by_all_indexes) {
 		auto &expr = result.select_list[group_by_all_index];
+		if (TypeVisitor::Contains(expr->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(expr->GetQueryLocation(), "GROUP BY does not support FILE values");
+		}
 		auto group_ref = make_uniq<BoundColumnRefExpression>(
 		    expr->return_type, ColumnBinding(result.group_index, result.groups.group_expressions.size()));
 		result.groups.group_expressions.push_back(std::move(expr));

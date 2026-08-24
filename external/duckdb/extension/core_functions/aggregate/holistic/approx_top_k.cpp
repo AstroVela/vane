@@ -3,6 +3,7 @@
 #include "duckdb/function/aggregate/sort_key_helpers.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/common/string_map_set.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/printer.hpp"
 
 namespace duckdb {
@@ -393,6 +394,9 @@ unique_ptr<FunctionData> ApproxTopKBind(ClientContext &context, AggregateFunctio
 		if (arg->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
 		}
+	}
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("approx_top_k does not support FILE values");
 	}
 	if (arguments[0]->return_type.id() == LogicalTypeId::VARCHAR) {
 		function.SetStateUpdateCallback(ApproxTopKUpdate<string_t, HistogramStringFunctor>);

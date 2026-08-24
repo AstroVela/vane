@@ -12,6 +12,7 @@
 #include "duckdb/planner/expression_binder/select_bind_state.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 namespace duckdb {
 
@@ -286,6 +287,13 @@ BoundStatement Binder::BindNode(SetOperationNode &statement) {
 				}
 			}
 			result.types.push_back(result_type);
+		}
+	}
+	if (result.setop_type == SetOperationType::INTERSECT || result.setop_type == SetOperationType::EXCEPT) {
+		for (auto &type : result.types) {
+			if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+				throw BinderException("INTERSECT and EXCEPT do not support FILE values");
+			}
 		}
 	}
 

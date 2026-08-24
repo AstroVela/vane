@@ -11,6 +11,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/common/types/value_map.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/planner/tableref/bound_pivotref.hpp"
@@ -534,6 +535,9 @@ static void BindPivotInList(unique_ptr<ParsedExpression> &expr, vector<Value> &v
 			throw BinderException(expr->GetQueryLocation(), "PIVOT IN list must contain constant expressions");
 		}
 		auto folded_value = ExpressionExecutor::EvaluateScalar(binder.context, *bound_expr);
+		if (TypeVisitor::Contains(folded_value.type(), FileLogicalType::IsFile)) {
+			throw BinderException(expr->GetQueryLocation(), "PIVOT IN list does not support FILE values");
+		}
 		values.push_back(folded_value);
 	} break;
 	}

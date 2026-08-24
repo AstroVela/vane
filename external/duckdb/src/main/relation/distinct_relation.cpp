@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "duckdb/main/relation/distinct_relation.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node.hpp"
@@ -56,6 +57,9 @@ BoundStatement DistinctRelation::BindAsInput(Binder &binder) {
 	targets.reserve(visible_columns.size());
 	for (auto &column : visible_columns) {
 		auto target = relation_binder.Bind(column);
+		if (TypeVisitor::Contains(target->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(target->GetQueryLocation(), "DISTINCT does not support FILE values");
+		}
 		ExpressionBinder::PushCollation(binder.context, target, target->return_type);
 		targets.push_back(std::move(target));
 	}

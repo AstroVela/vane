@@ -32,7 +32,7 @@ struct StructExtractAtFun {
 	static constexpr const char *Example = "struct_extract_at({'i': 3, 'v2': 3, 'v3': 0}, 2)";
 	static constexpr const char *Categories = "";
 
-	static ScalarFunction GetFunction();
+	static ScalarFunctionSet GetFunctions();
 	static unique_ptr<FunctionData> GetBindData(idx_t index);
 };
 

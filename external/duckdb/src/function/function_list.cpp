@@ -183,7 +183,7 @@ static const StaticFunctionDefinition function[] = {
 	DUCKDB_SCALAR_FUNCTION(StructConcatFun),
 	DUCKDB_SCALAR_FUNCTION(StructContainsFun),
 	DUCKDB_SCALAR_FUNCTION_SET(StructExtractFun),
-	DUCKDB_SCALAR_FUNCTION(StructExtractAtFun),
+	DUCKDB_SCALAR_FUNCTION_SET(StructExtractAtFun),
 	DUCKDB_SCALAR_FUNCTION_ALIAS(StructHasFun),
 	DUCKDB_SCALAR_FUNCTION_ALIAS(StructIndexofFun),
 	DUCKDB_SCALAR_FUNCTION(StructPackFun),

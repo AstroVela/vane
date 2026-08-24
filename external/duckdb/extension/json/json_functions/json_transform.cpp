@@ -3,6 +3,7 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -87,6 +88,9 @@ static unique_ptr<FunctionData> JSONTransformBind(ClientContext &context, Scalar
 		JSONAllocator json_allocator(Allocator::DefaultAllocator());
 		auto doc = JSONCommon::ReadDocument(structure_string, JSONCommon::READ_FLAG, json_allocator.GetYYAlc());
 		bound_function.return_type = StructureStringToType(doc->root, context);
+		if (TypeVisitor::Contains(bound_function.return_type, FileLogicalType::IsFile)) {
+			throw BinderException("json_transform does not support FILE output types");
+		}
 	}
 	return make_uniq<VariableReturnBindData>(bound_function.return_type);
 }

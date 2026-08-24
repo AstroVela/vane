@@ -237,6 +237,10 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 	}
 	for (auto &part_expr : window.partitions) {
 		auto &bound_partition = BoundExpression::GetExpression(*part_expr);
+		if (TypeVisitor::Contains(bound_partition->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(bound_partition->GetQueryLocation(),
+			                      "Window PARTITION BY does not support FILE values");
+		}
 		ExpressionBinder::PushCollation(context, bound_partition, bound_partition->return_type);
 	}
 	for (auto &order : window.orders) {
@@ -271,6 +275,13 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 		}
 		types.push_back(bound->return_type);
 		children.push_back(std::move(bound));
+	}
+	if (window.distinct) {
+		for (auto &type : types) {
+			if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+				throw BinderException(error_context, "DISTINCT window aggregates do not support FILE values");
+			}
+		}
 	}
 	//  Determine the function type.
 	LogicalType sql_type;

@@ -282,6 +282,15 @@ void IsHistogramOtherBinFunction(DataChunk &args, ExpressionState &state, Vector
 	}
 }
 
+static unique_ptr<FunctionData> IsHistogramOtherBinBind(ClientContext &, ScalarFunction &,
+                                                        vector<unique_ptr<Expression>> &arguments) {
+	D_ASSERT(arguments.size() == 1);
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("is_histogram_other_bin does not support FILE values");
+	}
+	return nullptr;
+}
+
 template <class OP, class T>
 void HistogramBinFinalizeFunction(Vector &state_vector, AggregateInputData &, Vector &result, idx_t count,
                                   idx_t offset) {
@@ -425,7 +434,7 @@ AggregateFunction HistogramExactFun::GetFunction() {
 
 ScalarFunction IsHistogramOtherBinFun::GetFunction() {
 	return ScalarFunction("is_histogram_other_bin", {LogicalType::ANY}, LogicalType::BOOLEAN,
-	                      IsHistogramOtherBinFunction);
+	                      IsHistogramOtherBinFunction, IsHistogramOtherBinBind);
 }
 
 } // namespace duckdb

@@ -53,6 +53,9 @@ static unique_ptr<FunctionData> StructConcatBind(ClientContext &context, ScalarF
 		if (arg->return_type.id() != LogicalTypeId::STRUCT) {
 			throw InvalidInputException("struct_concat: Argument at position \"%d\" is not a STRUCT", arg_idx + 1);
 		}
+		if (FileLogicalType::IsFile(arg->return_type)) {
+			throw BinderException("struct_concat does not support FILE values");
+		}
 
 		const auto &child_types = StructType::GetChildTypes(arg->return_type);
 		for (const auto &child : child_types) {

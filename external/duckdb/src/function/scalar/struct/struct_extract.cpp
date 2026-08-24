@@ -12,6 +12,8 @@
 #include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/storage/statistics/struct_stats.hpp"
 #include "duckdb/function/scalar/struct_utils.hpp"
+#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 namespace duckdb {
 
@@ -30,6 +32,37 @@ static void StructExtractFunction(DataChunk &args, ExpressionState &state, Vecto
 	result.Verify(args.size());
 }
 
+static void FileAwareStructExtractFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &info = func_expr.bind_info->Cast<StructExtractBindData>();
+	auto &file = args.data[0];
+
+	file.Verify(args.size());
+	auto &children = StructVector::GetEntries(file);
+	D_ASSERT(info.index < children.size());
+	auto &file_child = children[info.index];
+
+	UnifiedVectorFormat file_data;
+	file.ToUnifiedFormat(args.size(), file_data);
+	if (file_data.validity.AllValid()) {
+		result.Reference(*file_child);
+		result.Verify(args.size());
+		return;
+	}
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	VectorOperations::Copy(*file_child, result, args.size(), 0, 0);
+	result.Flatten(args.size());
+	auto &result_validity = FlatVector::Validity(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto file_index = file_data.sel->get_index(row);
+		if (!file_data.validity.RowIsValid(file_index)) {
+			result_validity.SetInvalid(row);
+		}
+	}
+	result.Verify(args.size());
+}
+
 static unique_ptr<FunctionData> StructExtractBind(ClientContext &context, ScalarFunction &bound_function,
                                                   vector<unique_ptr<Expression>> &arguments) {
 	D_ASSERT(bound_function.arguments.size() == 2);
@@ -38,6 +71,10 @@ static unique_ptr<FunctionData> StructExtractBind(ClientContext &context, Scalar
 		throw ParameterNotResolvedException();
 	}
 	D_ASSERT(LogicalTypeId::STRUCT == child_type.id());
+	if (TypeVisitor::Contains(child_type, FileLogicalType::IsFile)) {
+		bound_function.SetFunctionCallback(FileAwareStructExtractFunction);
+		bound_function.SetStatisticsCallback(nullptr);
+	}
 	auto &struct_children = StructType::GetChildTypes(child_type);
 	if (struct_children.empty()) {
 		throw InternalException("Can't extract something from an empty struct");
@@ -102,6 +139,10 @@ static unique_ptr<FunctionData> StructExtractBindInternal(ClientContext &context
 		throw ParameterNotResolvedException();
 	}
 	D_ASSERT(LogicalTypeId::STRUCT == child_type.id());
+	if (TypeVisitor::Contains(child_type, FileLogicalType::IsFile)) {
+		bound_function.SetFunctionCallback(FileAwareStructExtractFunction);
+		bound_function.SetStatisticsCallback(nullptr);
+	}
 	auto &struct_children = StructType::GetChildTypes(child_type);
 	if (struct_children.empty()) {
 		throw InternalException("Can't extract something from an empty struct");
@@ -179,8 +220,13 @@ ScalarFunctionSet StructExtractFun::GetFunctions() {
 	return struct_extract_set;
 }
 
-ScalarFunction StructExtractAtFun::GetFunction() {
-	return GetExtractAtFunction();
+ScalarFunctionSet StructExtractAtFun::GetFunctions() {
+	ScalarFunctionSet struct_extract_at_set("struct_extract_at");
+	struct_extract_at_set.AddFunction(GetExtractAtFunction());
+	auto file_extract_at = GetExtractAtFunction();
+	file_extract_at.arguments[0] = FileLogicalType::Create();
+	struct_extract_at_set.AddFunction(std::move(file_extract_at));
+	return struct_extract_at_set;
 }
 
 } // namespace duckdb

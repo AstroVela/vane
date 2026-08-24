@@ -1,3 +1,4 @@
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp" // VariableReturnBindData
@@ -57,6 +58,9 @@ static unique_ptr<FunctionData> StructValuesBind(ClientContext &context, ScalarF
 	if (arg_type == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
+	if (FileLogicalType::IsFile(arg_type)) {
+		throw BinderException("struct_values does not support FILE values");
+	}
 
 	// Since the type of the argument we declared of in `GetFunction` doesn't contain the inner STRUCT type,
 	// we should take it from the arguments
@@ -73,9 +77,18 @@ static unique_ptr<FunctionData> StructValuesBind(ClientContext &context, ScalarF
 	return nullptr;
 }
 
-ScalarFunction StructValuesFun::GetFunction() {
+static ScalarFunction GetStructValuesFunction() {
 	ScalarFunction func({LogicalTypeId::STRUCT}, LogicalTypeId::STRUCT, StructValuesFunction, StructValuesBind);
 	return func;
+}
+
+ScalarFunctionSet StructValuesFun::GetFunctions() {
+	ScalarFunctionSet struct_values_set("struct_values");
+	struct_values_set.AddFunction(GetStructValuesFunction());
+	auto file_values = GetStructValuesFunction();
+	file_values.arguments[0] = FileLogicalType::Create();
+	struct_values_set.AddFunction(std::move(file_values));
+	return struct_values_set;
 }
 
 } // namespace duckdb

@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 #include "duckdb/common/uhugeint.hpp"
 #include "utf8proc_wrapper.hpp"
@@ -773,6 +774,10 @@ Value Value::VARIANT(vector<Value> val) {
 }
 
 void MapKeyCheck(value_set_t &unique_keys, const Value &key) {
+	if (TypeVisitor::Contains(key.type(), FileLogicalType::IsFile)) {
+		throw InvalidInputException("MAP does not support FILE keys");
+	}
+
 	// NULL key check.
 	if (key.IsNull()) {
 		MapVector::EvalMapInvalidReason(MapInvalidReason::NULL_KEY);

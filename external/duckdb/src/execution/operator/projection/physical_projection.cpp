@@ -8,6 +8,7 @@
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -100,6 +101,10 @@ unique_ptr<LazyDataChunk> MakeStructExtractProjection(const LazyDataChunk &input
 		return nullptr;
 	}
 	auto &struct_type = input.logical_types[0];
+	if (TypeVisitor::Contains(struct_type, FileLogicalType::IsFile)) {
+		// FILE extraction must execute its bound callback so root validity masks hidden child values.
+		return nullptr;
+	}
 	vector<LogicalType> raw_types;
 	vector<string> raw_names;
 	auto child_count = StructType::GetChildCount(struct_type);

@@ -64,6 +64,9 @@ static unique_ptr<FunctionData> StructUpdateBind(ClientContext &context, ScalarF
 	if (LogicalTypeId::STRUCT != arguments[0]->return_type.id()) {
 		throw InvalidInputException("The first argument to struct_update must be a STRUCT");
 	}
+	if (FileLogicalType::IsFile(arguments[0]->return_type)) {
+		throw BinderException("struct_update does not support FILE values");
+	}
 	if (arguments.size() < 2) {
 		throw InvalidInputException("Can't update nothing into a STRUCT");
 	}

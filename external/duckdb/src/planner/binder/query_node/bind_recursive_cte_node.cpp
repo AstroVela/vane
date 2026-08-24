@@ -1,4 +1,5 @@
 #include "duckdb/common/enums/deprecated_using_key_syntax.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression_map.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -87,6 +88,9 @@ BoundStatement Binder::BindNode(RecursiveCTENode &statement) {
 	for (auto &expr : statement.key_targets) {
 		auto bound_expr = expression_binder.Bind(expr);
 		D_ASSERT(bound_expr->type == ExpressionType::BOUND_COLUMN_REF);
+		if (TypeVisitor::Contains(bound_expr->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(bound_expr->GetQueryLocation(), "Recursive CTE keys do not support FILE values");
+		}
 		key_targets.push_back(std::move(bound_expr));
 	}
 
@@ -121,6 +125,14 @@ BoundStatement Binder::BindNode(RecursiveCTENode &statement) {
 	// Check if there is a reference to the recursive or recurring table, if not create a set operator.
 	auto cte_binding = right_binder->GetCTEBinding(BindingAlias(ctename));
 	bool ref_cte = cte_binding && cte_binding->IsReferenced();
+	const bool uses_full_row_distinct = !union_all && (!is_using_key || (!ref_cte && !ref_recurring));
+	if (uses_full_row_distinct) {
+		for (const auto &type : result.types) {
+			if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+				throw BinderException("Recursive UNION does not support FILE values");
+			}
+		}
+	}
 	if (!ref_cte && !ref_recurring) {
 		auto root =
 		    make_uniq<LogicalSetOperation>(setop_index, result.types.size(), std::move(left_node),

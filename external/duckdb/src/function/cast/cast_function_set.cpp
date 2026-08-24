@@ -10,6 +10,8 @@
 #include "duckdb/main/settings.hpp"
 
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/type_map.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/planner/collation_binding.hpp"
@@ -56,14 +58,89 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 	return DBConfig::GetConfig(db).GetCollationBinding();
 }
 
+static bool FileCastPreservesIdentity(const LogicalType &source, const LogicalType &target) {
+	const auto source_is_file = FileLogicalType::IsFile(source);
+	const auto target_is_file = FileLogicalType::IsFile(target);
+	if (source_is_file || target_is_file) {
+		return (source_is_file && target_is_file) || (source.id() == LogicalTypeId::SQLNULL && target_is_file);
+	}
+
+	const auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	const auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	if (!source_contains_file && !target_contains_file) {
+		return true;
+	}
+	if (source.id() == LogicalTypeId::SQLNULL) {
+		return true;
+	}
+
+	const auto source_is_sequence = source.id() == LogicalTypeId::LIST || source.id() == LogicalTypeId::ARRAY;
+	const auto target_is_sequence = target.id() == LogicalTypeId::LIST || target.id() == LogicalTypeId::ARRAY;
+	if (source_is_sequence || target_is_sequence) {
+		if (!source_is_sequence || !target_is_sequence) {
+			return false;
+		}
+		auto &source_child =
+		    source.id() == LogicalTypeId::LIST ? ListType::GetChildType(source) : ArrayType::GetChildType(source);
+		auto &target_child =
+		    target.id() == LogicalTypeId::LIST ? ListType::GetChildType(target) : ArrayType::GetChildType(target);
+		return FileCastPreservesIdentity(source_child, target_child);
+	}
+
+	if (source.id() == LogicalTypeId::MAP || target.id() == LogicalTypeId::MAP) {
+		if (source.id() != LogicalTypeId::MAP || target.id() != LogicalTypeId::MAP) {
+			return false;
+		}
+		return FileCastPreservesIdentity(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       FileCastPreservesIdentity(MapType::ValueType(source), MapType::ValueType(target));
+	}
+
+	if (source.id() != LogicalTypeId::STRUCT || target.id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	auto &source_children = StructType::GetChildTypes(source);
+	auto &target_children = StructType::GetChildTypes(target);
+	if (StructType::IsUnnamed(source) || StructType::IsUnnamed(target)) {
+		if (source_children.size() != target_children.size()) {
+			return false;
+		}
+		for (idx_t child_index = 0; child_index < source_children.size(); child_index++) {
+			if (!FileCastPreservesIdentity(source_children[child_index].second, target_children[child_index].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	for (auto &source_child : source_children) {
+		optional_idx target_index;
+		for (idx_t child_index = 0; child_index < target_children.size(); child_index++) {
+			if (StringUtil::CIEquals(source_child.first, target_children[child_index].first)) {
+				target_index = child_index;
+				break;
+			}
+		}
+		if (!target_index.IsValid()) {
+			if (TypeVisitor::Contains(source_child.second, FileLogicalType::IsFile)) {
+				return false;
+			}
+			continue;
+		}
+		if (!FileCastPreservesIdentity(source_child.second, target_children[target_index.GetIndex()].second)) {
+			return false;
+		}
+	}
+	// Target-only fields are populated with NULL by DuckDB's named STRUCT cast. A target-only FILE is therefore a
+	// valid root-NULL FILE rather than a constructor bypass.
+	return true;
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
 		return DefaultCasts::NopCast;
 	}
-	const auto source_is_file = FileLogicalType::IsFile(source);
-	const auto target_is_file = FileLogicalType::IsFile(target);
-	if (source_is_file != target_is_file && source.id() != LogicalTypeId::SQLNULL) {
+	if (!FileCastPreservesIdentity(source, target)) {
 		throw BinderException(get_input.query_location, "Cannot cast %s to %s", source.ToString(), target.ToString());
 	}
 	// the first function is the default

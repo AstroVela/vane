@@ -4,6 +4,7 @@
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -19,6 +20,9 @@ void ValidateRangeOrders(const vector<BoundOrderByNode> &orders) {
 	for (const auto &order : orders) {
 		if (!order.expression) {
 			throw InvalidInputException("range repartition order expression cannot be null");
+		}
+		if (TypeVisitor::Contains(order.expression->return_type, FileLogicalType::IsFile)) {
+			throw InvalidInputException("range repartition does not support FILE values");
 		}
 		if (order.type != OrderType::ASCENDING && order.type != OrderType::DESCENDING) {
 			throw InvalidInputException("range repartition requires explicit ASC or DESC order");
@@ -60,6 +64,11 @@ std::vector<ExprRef> CopyRangeExpressions(const vector<BoundOrderByNode> &orders
 
 HashRepartitionConfig::HashRepartitionConfig(size_t num_partitions, std::vector<ExprRef> by)
     : num_partitions(num_partitions), by(std::move(by)) {
+	for (const auto &expression : this->by) {
+		if (expression && TypeVisitor::Contains(expression->return_type, FileLogicalType::IsFile)) {
+			throw InvalidInputException("hash repartition does not support FILE values");
+		}
+	}
 }
 
 std::vector<std::string> HashRepartitionConfig::multiline_display() const {

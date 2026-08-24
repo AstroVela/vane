@@ -264,6 +264,13 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 		arguments.push_back(child->return_type);
 		children.push_back(std::move(child));
 	}
+	if (aggr.distinct) {
+		for (auto &type : types) {
+			if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+				throw BinderException(aggr, "DISTINCT aggregates do not support FILE values");
+			}
+		}
+	}
 
 	// bind the aggregate
 	FunctionBinder function_binder(binder);

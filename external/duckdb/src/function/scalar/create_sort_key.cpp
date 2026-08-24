@@ -824,6 +824,9 @@ unique_ptr<FunctionData> DecodeSortKeyBind(ClientContext &context, ScalarFunctio
 		const auto &col_def = col_list.GetColumn(PhysicalIndex(0));
 		const auto &col_name = col_def.GetName();
 		const auto &col_type = TransformStringToLogicalType(col_def.GetType().ToString(), context);
+		if (TypeVisitor::Contains(col_type, FileLogicalType::IsFile)) {
+			throw BinderException("decode_sort_key does not support FILE values");
+		}
 
 		// Keep track of this to validate the arguments
 		const auto physical_type = col_type.InternalType();

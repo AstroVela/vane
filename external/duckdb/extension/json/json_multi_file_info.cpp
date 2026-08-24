@@ -1,5 +1,6 @@
 #include "json_multi_file_info.hpp"
 #include "json_scan.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parallel/async_result.hpp"
 
@@ -90,7 +91,11 @@ bool JSONMultiFileInfo::ParseOption(ClientContext &context, const string &key, c
 			if (val.type().id() != LogicalTypeId::VARCHAR) {
 				throw BinderException("read_json \"columns\" parameter type specification must be VARCHAR.");
 			}
-			options.sql_type_list.emplace_back(TransformStringToLogicalType(StringValue::Get(val), context));
+			auto sql_type = TransformStringToLogicalType(StringValue::Get(val), context);
+			if (TypeVisitor::Contains(sql_type, FileLogicalType::IsFile)) {
+				throw BinderException("read_json does not support FILE column types");
+			}
+			options.sql_type_list.emplace_back(std::move(sql_type));
 		}
 		D_ASSERT(options.name_list.size() == options.sql_type_list.size());
 		if (options.name_list.empty()) {
@@ -362,6 +367,11 @@ void JSONMultiFileInfo::BindReader(ClientContext &context, vector<LogicalType> &
 void JSONMultiFileInfo::FinalizeCopyBind(ClientContext &context, BaseFileReaderOptions &options_p,
                                          const vector<string> &expected_names,
                                          const vector<LogicalType> &expected_types) {
+	for (const auto &expected_type : expected_types) {
+		if (TypeVisitor::Contains(expected_type, FileLogicalType::IsFile)) {
+			throw BinderException("COPY FROM JSON does not support FILE column types");
+		}
+	}
 	auto &reader_options = options_p.Cast<JSONFileReaderOptions>();
 	auto &options = reader_options.options;
 	options.name_list = expected_names;

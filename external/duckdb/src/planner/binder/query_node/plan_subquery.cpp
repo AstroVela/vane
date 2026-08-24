@@ -18,6 +18,7 @@
 #include "duckdb/common/enums/logical_operator_type.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp"
 #include "duckdb/main/settings.hpp"
@@ -252,6 +253,20 @@ static bool PerformDelimOnType(const LogicalType &type) {
 }
 
 static bool PerformDuplicateElimination(Binder &binder, CorrelatedColumns &correlated_columns) {
+	bool contains_file = false;
+	for (auto &col : correlated_columns) {
+		if (TypeVisitor::Contains(col.type, FileLogicalType::IsFile)) {
+			contains_file = true;
+			break;
+		}
+	}
+	if (contains_file) {
+		auto binding = ColumnBinding(binder.GenerateTableIndex(), 0);
+		CorrelatedColumnInfo info(binding, LogicalType::BIGINT, "delim_index", 0);
+		correlated_columns.AddColumn(std::move(info));
+		correlated_columns.SetDelimIndexToZero();
+		return false;
+	}
 	if (!ClientConfig::GetConfig(binder.context).enable_optimizer) {
 		// if optimizations are disabled we always do a delim join
 		return true;
@@ -280,6 +295,13 @@ static unique_ptr<Expression> PlanCorrelatedSubquery(Binder &binder, BoundSubque
                                                      unique_ptr<LogicalOperator> plan) {
 	auto &correlated_columns = expr.binder->correlated_columns;
 	// FIXME: there should be a way of disabling decorrelation for ANY queries as well, but not for now...
+	if (expr.subquery_type == SubqueryType::ANY) {
+		for (auto &col : correlated_columns) {
+			if (TypeVisitor::Contains(col.type, FileLogicalType::IsFile)) {
+				throw BinderException("Correlated quantified subqueries do not support FILE values");
+			}
+		}
+	}
 	bool perform_delim =
 	    expr.subquery_type == SubqueryType::ANY ? true : PerformDuplicateElimination(binder, correlated_columns);
 	D_ASSERT(expr.IsCorrelated());

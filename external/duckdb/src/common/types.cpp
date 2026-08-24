@@ -1945,6 +1945,9 @@ bool ArrayType::IsAnySize(const LogicalType &type) {
 }
 
 LogicalType ArrayType::ConvertToList(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return type;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::ARRAY: {
 		return LogicalType::LIST(ConvertToList(ArrayType::GetChildType(type)));

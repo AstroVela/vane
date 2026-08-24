@@ -1,6 +1,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/hyperloglog.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "core_functions/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -94,10 +95,21 @@ AggregateFunction GetApproxCountDistinctFunction(const LogicalType &input_type) 
 	return fun;
 }
 
+unique_ptr<FunctionData> BindApproxCountDistinct(ClientContext &, AggregateFunction &,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	D_ASSERT(arguments.size() == 1);
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("approx_count_distinct does not support FILE values");
+	}
+	return nullptr;
+}
+
 } // namespace
 
 AggregateFunction ApproxCountDistinctFun::GetFunction() {
-	return GetApproxCountDistinctFunction(LogicalType::ANY);
+	auto function = GetApproxCountDistinctFunction(LogicalType::ANY);
+	function.SetBindCallback(BindApproxCountDistinct);
+	return function;
 }
 
 } // namespace duckdb

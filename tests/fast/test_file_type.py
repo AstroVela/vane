@@ -85,6 +85,37 @@ def test_file_alias_survives_unrelated_nested_null_resolution(connection):
     assert row == ("FILE", "s3://bucket/missing.bin", None)
 
 
+def test_file_alias_survives_unrelated_recursive_type_replacement(connection):
+    row = connection.execute(
+        f"""
+        SELECT typeof(value.file), typeof(value.number), value.file.url, value.number
+        FROM (
+            SELECT replace_type(
+                struct_pack(file := {FILE}, number := 1::INTEGER),
+                NULL::INTEGER,
+                NULL::BIGINT
+            ) AS value
+        )
+        """
+    ).fetchone()
+
+    assert row == ("FILE", "BIGINT", "s3://bucket/missing.bin", 1)
+
+
+def test_nested_file_casts_allow_only_null_introduction(connection):
+    row = connection.execute(
+        """
+        SELECT
+            typeof(CAST([NULL] AS FILE[])[1]),
+            CAST([NULL] AS FILE[])[1] IS NULL,
+            typeof(CAST(struct_pack(number := 1) AS STRUCT(number INTEGER, file FILE)).file),
+            CAST(struct_pack(number := 1) AS STRUCT(number INTEGER, file FILE)).file IS NULL
+        """
+    ).fetchone()
+
+    assert row == ("FILE", True, "FILE", True)
+
+
 def test_file_comparison_uses_fieldwise_sql_three_value_logic(connection):
     row = connection.execute(
         f"""
@@ -205,6 +236,47 @@ def test_file_comparison_propagates_stored_root_nulls(connection):
     assert rows == [(True, False), (None, None)]
 
 
+def test_file_stored_root_null_masks_hidden_children_and_comparisons(tmp_path: Path):
+    database = tmp_path / "hidden-file-children.db"
+    stored_file = "file('x', 'application/octet-stream', 0, 0, 'sha256:abcdef')"
+
+    with vane.connect(str(database)) as connection:
+        connection.execute("CREATE TABLE files(value FILE)")
+        connection.execute(
+            f"""
+            INSERT INTO files
+            SELECT constant_or_null({stored_file}, marker)
+            FROM (VALUES (NULL::INTEGER)) AS input(marker)
+            """
+        )
+
+    with vane.connect(str(database)) as connection:
+        row = connection.execute(
+            f"""
+            SELECT
+                value IS NULL,
+                value.url,
+                value.content_type,
+                value.position,
+                value.size,
+                value.checksum,
+                struct_extract_at(value, 1),
+                value.url IS NULL,
+                value = {stored_file},
+                {stored_file} = value,
+                value != {stored_file},
+                {stored_file} != value
+            FROM files
+            """
+        ).fetchone()
+
+    assert row == (True, None, None, None, None, None, None, True, None, None, None, None)
+
+    with vane.connect(str(database)) as connection:
+        assert connection.execute("SELECT count(*) FROM files WHERE value.url = 'x'").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM files WHERE value.url IS NULL").fetchone() == (1,)
+
+
 def test_file_comparison_cannot_be_shadowed(connection):
     connection.execute("CREATE MACRO __vane_file_equal(left_value, right_value) AS TRUE")
 
@@ -259,11 +331,11 @@ def test_file_rejects_nested_list_search_comparison_bypasses(connection):
 @pytest.mark.parametrize(
     "expression",
     [
-        f"map_contains(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
-        f"map_extract(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
-        f"element_at(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
-        f"map_extract_value(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
-        f"map([{FILE_WITH_NULL_METADATA}], [1])[{FILE_WITH_NULL_METADATA}]",
+        f"map_contains(value, {FILE_WITH_NULL_METADATA}) FROM (VALUES (NULL::MAP(FILE, INTEGER))) input(value)",
+        f"map_extract(value, {FILE_WITH_NULL_METADATA}) FROM (VALUES (NULL::MAP(FILE, INTEGER))) input(value)",
+        f"element_at(value, {FILE_WITH_NULL_METADATA}) FROM (VALUES (NULL::MAP(FILE, INTEGER))) input(value)",
+        f"map_extract_value(value, {FILE_WITH_NULL_METADATA}) FROM (VALUES (NULL::MAP(FILE, INTEGER))) input(value)",
+        f"value[{FILE_WITH_NULL_METADATA}] FROM (VALUES (NULL::MAP(FILE, INTEGER))) input(value)",
         f"list_has_any([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
         f"array_has_any([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
         f"[{FILE_WITH_NULL_METADATA}] && [{FILE_WITH_NULL_METADATA}]",
@@ -281,6 +353,55 @@ def test_file_rejects_nested_list_search_comparison_bypasses(connection):
 )
 def test_file_rejects_collection_search_comparison_bypasses(connection, expression):
     with pytest.raises(vane.BinderException, match="Collection search functions do not support FILE"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        f"list_distinct([{FILE_WITH_NULL_METADATA}, {FILE_WITH_NULL_METADATA}])",
+        f"array_distinct([{FILE_WITH_NULL_METADATA}, {FILE_WITH_NULL_METADATA}])",
+        f"list_unique([{FILE_WITH_NULL_METADATA}, {FILE_WITH_NULL_METADATA}])",
+        f"array_unique([{FILE_WITH_NULL_METADATA}, {FILE_WITH_NULL_METADATA}])",
+        (
+            "list_distinct(["
+            f"struct_pack(value := {FILE_WITH_NULL_METADATA}), "
+            f"struct_pack(value := {FILE_WITH_NULL_METADATA})"
+            "])"
+        ),
+    ],
+)
+def test_file_rejects_list_hash_comparison_bypasses(connection, expression):
+    with pytest.raises(vane.BinderException, match="does not support FILE values"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+@pytest.mark.parametrize(
+    ("expression", "message"),
+    [
+        (
+            f"map([{FILE_WITH_NULL_METADATA}, {FILE_WITH_NULL_METADATA}], [1, 2])",
+            "map does not support FILE keys",
+        ),
+        (
+            "map(["
+            f"struct_pack(value := {FILE_WITH_NULL_METADATA}), "
+            f"struct_pack(value := {FILE_WITH_NULL_METADATA})"
+            "], [1, 2])",
+            "map does not support FILE keys",
+        ),
+        (
+            f"map_from_entries([row({FILE_WITH_NULL_METADATA}, 1), row({FILE_WITH_NULL_METADATA}, 2)])",
+            "map_from_entries does not support FILE keys",
+        ),
+        (
+            f"map_from_entries(array_value(row({FILE_WITH_NULL_METADATA}, 1), row({FILE_WITH_NULL_METADATA}, 2)))",
+            "map_from_entries does not support FILE keys",
+        ),
+    ],
+)
+def test_file_rejects_map_key_hash_comparison_bypasses(connection, expression, message):
+    with pytest.raises(vane.BinderException, match=message):
         connection.execute(f"SELECT {expression}").fetchone()
 
 
@@ -310,29 +431,42 @@ def test_file_remains_usable_as_a_map_value(connection):
         "s3://bucket/missing.bin",
     )
 
+    row = connection.execute(
+        f"""
+        SELECT
+            typeof(map_from_entries([row('key', {FILE})])['key']),
+            (map_from_entries([row('key', {FILE})])['key']).url
+        """
+    ).fetchone()
+    assert row == ("FILE", "s3://bucket/missing.bin")
+
 
 @pytest.mark.parametrize(
-    "key",
+    "key_type",
     [
-        FILE_WITH_NULL_METADATA,
-        f"struct_pack(value := {FILE_WITH_NULL_METADATA})",
+        "FILE",
+        "STRUCT(value FILE)",
     ],
 )
-def test_file_rejects_map_concat_keys(connection, key):
+def test_file_rejects_map_concat_keys(connection, key_type):
     with pytest.raises(vane.BinderException, match="MAP_CONCAT does not support FILE map keys"):
-        connection.execute(f"SELECT map_concat(map([{key}], [1]), map([{key}], [2]))").fetchone()
+        connection.execute(
+            f"SELECT map_concat(NULL::MAP({key_type}, INTEGER), NULL::MAP({key_type}, INTEGER))"
+        ).fetchone()
 
 
 @pytest.mark.parametrize(
-    "key",
+    ("key", "key_type"),
     [
-        FILE_WITH_NULL_METADATA,
-        f"struct_pack(value := {FILE_WITH_NULL_METADATA})",
+        (FILE_WITH_NULL_METADATA, "FILE"),
+        (f"struct_pack(value := {FILE_WITH_NULL_METADATA})", "STRUCT(value FILE)"),
     ],
 )
-def test_file_rejects_switch_keys(connection, key):
+def test_file_rejects_switch_keys(connection, key, key_type):
     with pytest.raises(vane.BinderException, match="SWITCH does not support FILE map keys"):
-        connection.execute(f"SELECT switch({key}, map([{key}], [1]))").fetchone()
+        connection.execute(
+            f"SELECT switch({key}, value) FROM (VALUES (NULL::MAP({key_type}, INTEGER))) input(value)"
+        ).fetchone()
 
 
 @pytest.mark.parametrize(
@@ -402,6 +536,7 @@ def test_file_rejects_min_max_bypasses(connection, aggregate):
         "histogram(value, [value])",
         "histogram_exact(value, [value])",
         "histogram(struct_pack(value := value))",
+        "is_histogram_other_bin(value)",
     ],
 )
 def test_file_rejects_other_ordering_aggregate_bypasses(connection, aggregate):
@@ -430,6 +565,13 @@ def test_file_remains_usable_as_an_arg_min_result(connection):
         "CAST(ROW('x', NULL, NULL, NULL, NULL) AS FILE)",
         f"CAST({FILE} AS STRUCT(url VARCHAR, content_type VARCHAR, position BIGINT, size BIGINT, checksum VARCHAR))",
         f"CAST({FILE} AS VARCHAR)",
+        f"CAST([{FILE}] AS STRUCT(url VARCHAR, content_type VARCHAR, position BIGINT, size BIGINT, checksum VARCHAR)[])",
+        f"CAST([{FILE}] AS VARCHAR)",
+        "CAST([ROW('x', NULL, NULL, NULL, NULL)] AS FILE[])",
+        (
+            f"CAST(struct_pack(value := {FILE}) AS STRUCT(value STRUCT("
+            "url VARCHAR, content_type VARCHAR, position BIGINT, size BIGINT, checksum VARCHAR)))"
+        ),
     ],
 )
 def test_file_rejects_casts_that_bypass_the_constructor(connection, expression):
@@ -489,6 +631,200 @@ def test_file_rejects_casts_that_bypass_the_constructor(connection, expression):
 def test_file_rejects_struct_remapping_bypasses(connection, expression):
     with pytest.raises(vane.BinderException, match="remap_struct does not support FILE"):
         connection.execute(f"SELECT {expression}").fetchone()
+
+
+@pytest.mark.parametrize(
+    ("expression", "function_name"),
+    [
+        (f"struct_update({FILE}, url := 'other')", "struct_update"),
+        (f"struct_insert({FILE}, extra := 1)", "struct_insert"),
+        (f"struct_concat({FILE}, struct_pack(extra := 1))", "struct_concat"),
+        (f"struct_concat(struct_pack(extra := 1), {FILE})", "struct_concat"),
+        (f"struct_values({FILE})", "struct_values"),
+    ],
+)
+def test_file_rejects_struct_alias_stripping_bypasses(connection, expression, function_name):
+    with pytest.raises(vane.BinderException, match=rf"{function_name} does not support FILE values"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "json_transform('{}', '\"FILE\"')",
+        "json_transform('{}', '{\"value\":\"FILE\"}')",
+    ],
+)
+def test_file_rejects_dynamic_type_materialization_bypasses(connection, expression):
+    with pytest.raises(vane.BinderException, match="does not support FILE"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+def test_file_rejects_json_scan_materialization_bypass(connection, tmp_path: Path):
+    source = tmp_path / "file.json"
+    source.write_text('{"value":{"url":"hidden"}}')
+
+    with pytest.raises(vane.BinderException, match="read_json does not support FILE column types"):
+        connection.execute(f"SELECT * FROM read_json('{source}', columns={{value: 'FILE'}})").fetchall()
+
+    connection.execute("CREATE TABLE json_files(value FILE)")
+    with pytest.raises(vane.BinderException, match="COPY FROM JSON does not support FILE column types"):
+        connection.execute(f"COPY json_files FROM '{source}' (FORMAT JSON)")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        f"SELECT DISTINCT value FROM (VALUES ({FILE_WITH_NULL_METADATA})) AS input(value)",
+        f"SELECT DISTINCT struct_pack(value := value) FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT DISTINCT ON (value) value FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT count(*) FROM (VALUES ({FILE})) AS input(value) GROUP BY value",
+        f"SELECT count(*) FROM (VALUES ({FILE})) AS input(value) GROUP BY struct_pack(value := value)",
+        f"SELECT value FROM (VALUES ({FILE})) AS input(value) GROUP BY ALL",
+        f"SELECT {FILE_WITH_NULL_METADATA} UNION SELECT {FILE_WITH_NULL_METADATA}",
+        f"SELECT {FILE_WITH_NULL_METADATA} INTERSECT SELECT {FILE_WITH_NULL_METADATA}",
+        f"SELECT {FILE_WITH_NULL_METADATA} INTERSECT ALL SELECT {FILE_WITH_NULL_METADATA}",
+        f"SELECT {FILE_WITH_NULL_METADATA} EXCEPT SELECT {FILE_WITH_NULL_METADATA}",
+        f"SELECT {FILE_WITH_NULL_METADATA} EXCEPT ALL SELECT {FILE_WITH_NULL_METADATA}",
+        (f"SELECT row_number() OVER (PARTITION BY value) FROM (VALUES ({FILE_WITH_NULL_METADATA})) AS input(value)"),
+        (f"SELECT row_number() OVER (PARTITION BY struct_pack(value := value)) FROM (VALUES ({FILE})) AS input(value)"),
+        f"SELECT count(DISTINCT value) FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT count(DISTINCT value) OVER () FROM (VALUES ({FILE})) AS input(value)",
+        f"PIVOT (SELECT {FILE} AS key, 1 AS value) ON key IN (NULL::FILE) USING sum(value)",
+        (
+            "WITH RECURSIVE input(value, depth) AS ("
+            f"SELECT {FILE}, 0 "
+            "UNION "
+            "SELECT value, depth + 1 FROM input WHERE depth < 0"
+            ") SELECT * FROM input"
+        ),
+        (
+            "WITH RECURSIVE input(value, depth) USING KEY (value) AS ("
+            f"SELECT {FILE}, 0 "
+            "UNION ALL "
+            "SELECT value, depth + 1 FROM input WHERE depth < 0"
+            ") SELECT * FROM input"
+        ),
+        (
+            f"SELECT 1 = ANY (SELECT 1 WHERE outer_input.value.url IS NOT NULL) "
+            f"FROM (VALUES ({FILE})) AS outer_input(value)"
+        ),
+    ],
+)
+def test_file_rejects_query_hash_comparison_bypasses(connection, query):
+    with pytest.raises(vane.BinderException, match=r"(?:does|do) not support FILE values"):
+        connection.execute(query).fetchall()
+
+
+@pytest.mark.parametrize("value", [FILE, f"struct_pack(value := {FILE})"])
+def test_file_rejects_relation_hash_comparison_bypasses(connection, value):
+    relation = connection.sql(f"SELECT {value} AS value")
+
+    with pytest.raises(vane.BinderException, match="DISTINCT does not support FILE values"):
+        relation.local_exchange(1).distinct().fetchall()
+
+    with pytest.raises(vane.BinderException, match="Repartition keys do not support FILE values"):
+        relation.repartition(2, "value").fetchall()
+
+
+@pytest.mark.parametrize("value", [FILE, f"struct_pack(value := {FILE})"])
+def test_file_rejects_copy_partition_hash_comparison_bypasses(connection, tmp_path: Path, value):
+    destination = tmp_path / "partitioned"
+
+    with pytest.raises(vane.BinderException, match="PARTITION_BY does not support FILE values"):
+        connection.execute(
+            f"COPY (SELECT {value} AS value, 1 AS payload) TO '{destination}' (FORMAT CSV, PARTITION_BY (value))"
+        )
+
+
+def test_file_remains_usable_outside_query_hash_keys(connection):
+    rows = connection.execute(
+        f"""
+        SELECT 1 AS key, {FILE} AS value
+        UNION ALL
+        SELECT 2 AS key, file('other', NULL, NULL, NULL, NULL) AS value
+        """
+    ).fetchall()
+    assert [row[1]["url"] for row in rows] == ["s3://bucket/missing.bin", "other"]
+
+    row = connection.execute(
+        f"""
+        SELECT DISTINCT ON (key) key, value
+        FROM (VALUES (1, {FILE}), (1, {FILE})) AS input(key, value)
+        ORDER BY key
+        """
+    ).fetchone()
+    assert row[0] == 1
+    assert row[1]["url"] == "s3://bucket/missing.bin"
+
+    row = connection.execute(
+        f"""
+        SELECT key, typeof(any_value(value)), any_value(value)
+        FROM (VALUES (1, {FILE}), (1, {FILE})) AS input(key, value)
+        GROUP BY key
+        """
+    ).fetchone()
+    assert row[:2] == (1, "FILE")
+    assert row[2]["url"] == "s3://bucket/missing.bin"
+
+    rows = connection.execute(
+        f"""
+        WITH RECURSIVE files(depth, value) AS (
+            SELECT 0, {FILE}
+            UNION ALL
+            SELECT depth + 1, value FROM files WHERE depth < 1
+        )
+        SELECT depth, value FROM files ORDER BY depth
+        """
+    ).fetchall()
+    assert [row[0] for row in rows] == [0, 1]
+    assert [row[1]["url"] for row in rows] == ["s3://bucket/missing.bin"] * 2
+
+    rows = connection.execute(
+        f"""
+        SELECT (SELECT outer_input.value.url)
+        FROM (VALUES ({FILE}), ({FILE})) AS outer_input(value)
+        """
+    ).fetchall()
+    assert rows == [("s3://bucket/missing.bin",)] * 2
+
+
+def test_file_array_alias_survives_tuple_collection_payloads(connection):
+    rows = connection.execute(
+        f"""
+        SELECT key, typeof(files[1]), files[1].url
+        FROM (
+            VALUES
+                (2, array_value(file('other', NULL, NULL, NULL, NULL))),
+                (1, array_value({FILE}))
+        ) AS input(key, files)
+        ORDER BY key
+        """
+    ).fetchall()
+
+    assert rows == [
+        (1, "FILE", "s3://bucket/missing.bin"),
+        (2, "FILE", "other"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "hash(value)",
+        "hash(struct_pack(value := value))",
+        "approx_count_distinct(value)",
+        "mode(value)",
+        "entropy(value)",
+        "approx_top_k(value, 2)",
+        "list_approx_count_distinct([value, value])",
+        "list_mode([value, value])",
+        "list_entropy([value, value])",
+    ],
+)
+def test_file_rejects_explicit_hash_consumers(connection, expression):
+    with pytest.raises(vane.BinderException, match="does not support FILE values"):
+        connection.execute(f"SELECT {expression} FROM (VALUES ({FILE_WITH_NULL_METADATA})) AS input(value)").fetchone()
 
 
 @pytest.mark.parametrize("column_type", ["FILE", "FILE[]", "STRUCT(value FILE)"])

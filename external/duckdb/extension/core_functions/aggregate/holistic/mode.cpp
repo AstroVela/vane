@@ -1,6 +1,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "core_functions/aggregate/distributive_functions.hpp"
 #include "core_functions/aggregate/holistic_functions.hpp"
 #include "duckdb/common/owning_string_map.hpp"
@@ -502,6 +503,9 @@ AggregateFunction GetModeAggregate(const LogicalType &type) {
 
 unique_ptr<FunctionData> BindModeAggregate(ClientContext &context, AggregateFunction &function,
                                            vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("mode does not support FILE values");
+	}
 	function = GetModeAggregate(arguments[0]->return_type);
 	function.name = "mode";
 	return nullptr;
@@ -603,6 +607,9 @@ AggregateFunction GetEntropyFunction(const LogicalType &type) {
 
 unique_ptr<FunctionData> BindEntropyAggregate(ClientContext &context, AggregateFunction &function,
                                               vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("entropy does not support FILE values");
+	}
 	function = GetEntropyFunction(arguments[0]->return_type);
 	function.name = "entropy";
 	return nullptr;

@@ -25,6 +25,6 @@
       "parameters": "struct",
       "description": "Returns the field values of a STRUCT as an UnnamedStruct",
       "example": "struct_values({'a': 1, 'b': 'world'})",
-      "type": "scalar_function"
+      "type": "scalar_function_set"
     }
 ]

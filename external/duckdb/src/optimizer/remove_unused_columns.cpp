@@ -2,6 +2,7 @@
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/parser/parsed_data/vacuum_info.hpp"
@@ -911,6 +912,10 @@ bool BaseColumnPruner::HandleStructExtract(unique_ptr<Expression> &expr_p,
 	auto &function = expr_p->Cast<BoundFunctionExpression>();
 	auto &child = function.children[0];
 	D_ASSERT(child->return_type.id() == LogicalTypeId::STRUCT);
+	if (TypeVisitor::Contains(child->return_type, FileLogicalType::IsFile)) {
+		// FILE extraction must retain the parent vector so its root validity can mask hidden child values.
+		return false;
+	}
 	auto &bind_data = function.bind_info->Cast<StructExtractBindData>();
 	// struct extract, check if left child is a bound column ref
 	if (child->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {

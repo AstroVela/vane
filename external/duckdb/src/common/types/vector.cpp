@@ -2409,6 +2409,7 @@ const Vector &MapVector::GetValues(const Vector &vector) {
 
 MapInvalidReason MapVector::CheckMapValidity(Vector &map, idx_t count, const SelectionVector &sel) {
 	D_ASSERT(map.GetType().id() == LogicalTypeId::MAP);
+	const auto has_file_keys = TypeVisitor::Contains(MapType::KeyType(map.GetType()), FileLogicalType::IsFile);
 
 	// unify the MAP vector, which is a physical LIST vector
 	UnifiedVectorFormat map_data;
@@ -2432,6 +2433,9 @@ MapInvalidReason MapVector::CheckMapValidity(Vector &map, idx_t count, const Sel
 		value_set_t unique_keys;
 		auto length = map_entries[map_idx].length;
 		auto offset = map_entries[map_idx].offset;
+		if (has_file_keys && length > 0) {
+			throw InvalidInputException("MAP does not support FILE keys");
+		}
 
 		for (idx_t child_idx = 0; child_idx < length; child_idx++) {
 			auto key_idx = key_data.sel->get_index(offset + child_idx);

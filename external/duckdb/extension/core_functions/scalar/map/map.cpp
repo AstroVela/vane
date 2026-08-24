@@ -5,6 +5,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/types/value_map.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
 
 namespace duckdb {
@@ -169,6 +170,13 @@ static void MapFunction(DataChunk &args, ExpressionState &, Vector &result) {
 	result.Verify(row_count);
 }
 
+static unique_ptr<FunctionData> MapBind(ClientContext &, ScalarFunction &, vector<unique_ptr<Expression>> &arguments) {
+	if (!arguments.empty() && TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("map does not support FILE keys");
+	}
+	return nullptr;
+}
+
 ScalarFunctionSet MapFun::GetFunctions() {
 	ScalarFunction empty_func({}, LogicalType::MAP(LogicalType::SQLNULL, LogicalType::SQLNULL), MapFunction);
 	empty_func.SetFallible();
@@ -176,7 +184,7 @@ ScalarFunctionSet MapFun::GetFunctions() {
 	auto key_type = LogicalType::TEMPLATE("K");
 	auto val_type = LogicalType::TEMPLATE("V");
 	ScalarFunction value_func({LogicalType::LIST(key_type), LogicalType::LIST(val_type)},
-	                          LogicalType::MAP(key_type, val_type), MapFunction);
+	                          LogicalType::MAP(key_type, val_type), MapFunction, MapBind);
 	value_func.SetFallible();
 	value_func.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 

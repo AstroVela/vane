@@ -1,6 +1,7 @@
 #include "duckdb/optimizer/filter_combiner.hpp"
 
 #include "duckdb/common/enums/expression_type.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -202,6 +203,9 @@ static bool TryGetBoundColumnIndex(const vector<ColumnIndex> &column_ids, const 
 		auto &func = expr.Cast<BoundFunctionExpression>();
 		if (func.function.name == "struct_extract" || func.function.name == "struct_extract_at") {
 			auto &child_expr = func.children[0];
+			if (TypeVisitor::Contains(child_expr->return_type, FileLogicalType::IsFile)) {
+				return false;
+			}
 			return TryGetBoundColumnIndex(column_ids, *child_expr, result);
 		}
 		return false;

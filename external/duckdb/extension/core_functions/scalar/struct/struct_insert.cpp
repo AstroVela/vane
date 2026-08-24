@@ -41,6 +41,9 @@ static unique_ptr<FunctionData> StructInsertBind(ClientContext &context, ScalarF
 	if (LogicalTypeId::STRUCT != arguments[0]->return_type.id()) {
 		throw InvalidInputException("The first argument to struct_insert must be a STRUCT");
 	}
+	if (FileLogicalType::IsFile(arguments[0]->return_type)) {
+		throw BinderException("struct_insert does not support FILE values");
+	}
 	if (arguments.size() < 2) {
 		throw InvalidInputException("Can't insert nothing into a STRUCT");
 	}

@@ -3,6 +3,7 @@
 
 #include "duckdb/main/relation/repartition_relation.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/operator/exchange/repartition.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -56,6 +57,9 @@ BoundStatement RepartitionRelation::BindAsInput(Binder &binder) {
 		auto expr_copy = expr->Copy();
 		auto bound_expr = relation_binder.Bind(expr_copy);
 		if (bound_expr) {
+			if (TypeVisitor::Contains(bound_expr->return_type, FileLogicalType::IsFile)) {
+				throw BinderException(bound_expr->GetQueryLocation(), "Repartition keys do not support FILE values");
+			}
 			partition_exprs.emplace_back(bound_expr->Copy());
 			bound_partition_exprs.push_back(std::move(bound_expr));
 		}

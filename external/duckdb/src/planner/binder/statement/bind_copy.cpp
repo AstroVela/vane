@@ -12,6 +12,7 @@
 #include "duckdb/common/filename_pattern.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/relation.hpp"
@@ -291,6 +292,11 @@ BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &funct
 				select_node.types.push_back(expr->return_type);
 			}
 			select_node.plan = std::move(projection);
+		}
+	}
+	for (const auto partition_col : partition_cols) {
+		if (TypeVisitor::Contains(select_node.types[partition_col], FileLogicalType::IsFile)) {
+			throw BinderException("PARTITION_BY does not support FILE values");
 		}
 	}
 
