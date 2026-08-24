@@ -222,6 +222,9 @@ ArrowTypeExtension DBConfig::GetArrowExtension(ArrowExtensionMetadata info) cons
 
 ArrowTypeExtension DBConfig::GetArrowExtension(const LogicalType &type) const {
 	lock_guard<mutex> l(arrow_extensions->lock);
+	if (type.GetAlias() == FileLogicalType::TYPE_NAME && !FileLogicalType::IsFile(type)) {
+		throw InvalidInputException("The vane.file Arrow extension requires the canonical FILE logical type");
+	}
 	TypeInfo type_info(type);
 	if (!arrow_extensions->type_to_info[type_info].empty()) {
 		return GetArrowExtensionInternal(arrow_extensions->type_extensions,
@@ -234,6 +237,9 @@ ArrowTypeExtension DBConfig::GetArrowExtension(const LogicalType &type) const {
 
 bool DBConfig::HasArrowExtension(const LogicalType &type) const {
 	lock_guard<mutex> l(arrow_extensions->lock);
+	if (type.GetAlias() == FileLogicalType::TYPE_NAME && !FileLogicalType::IsFile(type)) {
+		return false;
+	}
 	TypeInfo type_info(type);
 	if (!arrow_extensions->type_to_info[type_info].empty()) {
 		return true;

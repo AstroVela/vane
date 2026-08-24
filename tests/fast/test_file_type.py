@@ -1080,6 +1080,126 @@ def test_file_type_rejects_invalid_arrow_values(connection):
         connection.from_arrow(arrow_table).fetchall()
 
 
+def test_file_type_arrow_ignores_inactive_sparse_union_slots(connection):
+    pa = pytest.importorskip("pyarrow")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+    file_field = pa.field(
+        "f",
+        file_storage_type,
+        metadata={
+            b"ARROW:extension:name": b"vane.file",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    file_values = pa.array(
+        [
+            {
+                "url": None,
+                "content_type": None,
+                "position": 0,
+                "size": None,
+                "checksum": None,
+            },
+            {
+                "url": "active",
+                "content_type": None,
+                "position": None,
+                "size": None,
+                "checksum": None,
+            },
+        ],
+        type=file_storage_type,
+    )
+    union_type = pa.sparse_union([file_field, pa.field("n", pa.int64())], type_codes=[0, 1])
+    union_values = pa.UnionArray.from_sparse(
+        pa.array([1, 0], type=pa.int8()),
+        [file_values, pa.array([7, 8], type=pa.int64())],
+        field_names=["f", "n"],
+        type_codes=[0, 1],
+    )
+    arrow_table = pa.Table.from_arrays(
+        [union_values],
+        schema=pa.schema([pa.field("value", union_type)]),
+    )
+
+    rows = (
+        connection.from_arrow(arrow_table)
+        .project("union_tag(value), typeof(value.f), (value.f).url, value.n")
+        .fetchall()
+    )
+    assert rows == [
+        ("n", "FILE", None, 7),
+        ("f", "FILE", "active", None),
+    ]
+
+
+def test_file_type_arrow_ignores_children_of_null_lists(connection):
+    pa = pytest.importorskip("pyarrow")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+    file_field = pa.field(
+        "item",
+        file_storage_type,
+        metadata={
+            b"ARROW:extension:name": b"vane.file",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    file_values = pa.array(
+        [
+            {
+                "url": None,
+                "content_type": None,
+                "position": None,
+                "size": None,
+                "checksum": None,
+            },
+            {
+                "url": "active",
+                "content_type": None,
+                "position": None,
+                "size": None,
+                "checksum": None,
+            },
+        ],
+        type=file_storage_type,
+    )
+    list_type = pa.list_(file_field)
+    list_values = pa.ListArray.from_arrays(
+        pa.array([0, 1, 2], type=pa.int32()),
+        file_values,
+        type=list_type,
+        mask=pa.array([True, False]),
+    )
+    arrow_table = pa.Table.from_arrays(
+        [list_values],
+        schema=pa.schema([pa.field("value", list_type)]),
+    )
+
+    rows = connection.from_arrow(arrow_table).project("value IS NULL, typeof(value[1]), (value[1]).url").fetchall()
+    assert rows == [
+        (True, "FILE", None),
+        (False, "FILE", "active"),
+    ]
+
+
 def test_file_type_round_trips_through_local_exchange(connection):
     pytest.importorskip("pyarrow")
 

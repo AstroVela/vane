@@ -1,6 +1,7 @@
 #include "capi_tester.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 
 using namespace duckdb;
 using namespace std;
@@ -300,6 +301,32 @@ TEST_CASE("Test arrow in C API", "[capi][arrow]") {
 TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 	CAPITester tester;
 	REQUIRE(tester.OpenDatabase(nullptr));
+
+	SECTION("malformed FILE aliases stay ordinary Arrow structs") {
+		auto child_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+		const char *child_names[] = {"url"};
+		auto malformed_file = duckdb_create_struct_type(&child_type, child_names, 1);
+		duckdb_logical_type_set_alias(malformed_file, "FILE");
+
+		duckdb_logical_type types[] = {malformed_file};
+		const char *names[] = {"value"};
+		ArrowSchemaWrapper arrow_schema;
+		duckdb_arrow_options arrow_options;
+		duckdb_connection_get_arrow_options(tester.connection, &arrow_options);
+		auto error = duckdb_to_arrow_schema(arrow_options, types, names, 1, &arrow_schema.arrow_schema);
+		duckdb_destroy_arrow_options(&arrow_options);
+
+		REQUIRE(error == nullptr);
+		REQUIRE(arrow_schema.arrow_schema.n_children == 1);
+		auto &field = *arrow_schema.arrow_schema.children[0];
+		REQUIRE(string(field.format) == "+s");
+		REQUIRE(field.n_children == 1);
+		ArrowSchemaMetadata metadata(field.metadata);
+		REQUIRE_FALSE(metadata.HasExtension());
+
+		duckdb_destroy_logical_type(&malformed_file);
+		duckdb_destroy_logical_type(&child_type);
+	}
 
 	SECTION("roundtrip: duckdb table -> arrow -> duckdb chunk, validate correctness") {
 		// 1. Create and populate table
