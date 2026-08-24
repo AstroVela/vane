@@ -50,6 +50,7 @@
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -89,6 +90,47 @@ PhysicalPlanToPipelineNodeTranslator::PhysicalPlanToPipelineNodeTranslator(
       exchange_mgr_(std::make_shared<FlightExchangeManager>(ResolveFlightExchangeConfigFromEnv(), client_context)) {
 }
 
+void PhysicalPlanToPipelineNodeTranslator::CollectUnionOrderRequirements(const PhysicalOperator &op,
+                                                                         bool output_order_required) {
+	bool child_order_required;
+	if (op.type == PhysicalOperatorType::UNION) {
+		auto &union_op = op.Cast<PhysicalUnion>();
+		child_order_required = output_order_required || !union_op.allow_out_of_order;
+		if (child_order_required) {
+			ordered_unions_.insert(&union_op);
+		}
+	} else if (op.IsSink()) {
+		// A sink starts a new input pipeline. Its input ordering contract replaces
+		// any ordering required by consumers of the sink's materialized output.
+		const auto partition_info = op.RequiredPartitionInfo();
+		child_order_required = op.SinkOrderDependent() || partition_info.batch_index || !op.ParallelSink();
+	} else {
+		switch (op.OperatorOrder()) {
+		case OrderPreservationType::NO_ORDER:
+			child_order_required = false;
+			break;
+		case OrderPreservationType::INSERTION_ORDER:
+			child_order_required = output_order_required;
+			break;
+		case OrderPreservationType::FIXED_ORDER:
+			// Operators such as streaming LIMIT and streaming WINDOW select or
+			// compute rows according to their input sequence.
+			child_order_required = true;
+			break;
+		default:
+			throw InternalException("Unknown physical operator order-preservation type");
+		}
+	}
+
+	for (const auto &child : op.children) {
+		CollectUnionOrderRequirements(child.get(), child_order_required);
+	}
+}
+
+bool PhysicalPlanToPipelineNodeTranslator::UnionAllowsOutOfOrder(const PhysicalUnion &op) const {
+	return op.allow_out_of_order && ordered_unions_.find(&op) == ordered_unions_.end();
+}
+
 DuckDBResult<std::shared_ptr<DistributedPipelineNode>>
 PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
     PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context,
@@ -109,6 +151,11 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
 		    "pre-resolved distributed extension write protocol requires an extension write root"));
 	}
 	try {
+		bool root_order_required = true;
+		if (client_context) {
+			root_order_required = Settings::Get<PreserveInsertionOrderSetting>(*client_context);
+		}
+		translator.CollectUnionOrderRequirements(plan->Root(), root_order_required);
 		translator.VisitOperator(plan->Root());
 	} catch (const NotImplementedException &ex) {
 		ErrorData error(ex);

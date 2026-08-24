@@ -489,6 +489,21 @@ static DuckPhysicalPlanRef MakeSingleColumnUnionPlan(const vector<int64_t> &valu
 	return plan;
 }
 
+static std::shared_ptr<UnionNode> FindUnionNode(const PipelineNodeRef &node) {
+	if (!node) {
+		return nullptr;
+	}
+	if (auto union_node = std::dynamic_pointer_cast<UnionNode>(node)) {
+		return union_node;
+	}
+	for (const auto &child : node->children()) {
+		if (auto union_node = FindUnionNode(child)) {
+			return union_node;
+		}
+	}
+	return nullptr;
+}
+
 static idx_t SchemaColumnCount(const SchemaRef &schema) {
 	return GetSchemaTypes(schema).size();
 }
@@ -1309,6 +1324,39 @@ TEST_CASE("PhysicalPlanTranslator: N-way union fans in branch tasks without work
 		REQUIRE(task.second.task()->context().at("node_id") == std::to_string(branch_nodes[branch_idx]->node_id()));
 	}
 	REQUIRE_FALSE(task_stream.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: union fan-in follows downstream order requirements", "[distributed][union]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	PlanConfig config;
+	config.query_id = "union-order-requirements";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+
+	auto translate_union = [&](const string &sql) {
+		auto logical_plan = conn.ExtractPlan(sql);
+		REQUIRE(logical_plan != nullptr);
+		PhysicalPlanGenerator generator(*conn.context);
+		auto generated_plan = generator.Plan(std::move(logical_plan));
+		REQUIRE(generated_plan != nullptr);
+		auto result =
+		    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(generated_plan.release()), conn.context.get());
+		REQUIRE(result.is_ok());
+		auto union_node = FindUnionNode(result.value()->inner());
+		REQUIRE(union_node != nullptr);
+		return union_node;
+	};
+
+	REQUIRE_NO_FAIL(conn.Query("SET preserve_insertion_order=true"));
+	REQUIRE_FALSE(translate_union("SELECT 3 AS x UNION ALL SELECT 1 AS x")->allow_out_of_order());
+	REQUIRE_FALSE(
+	    translate_union("SELECT * FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x) LIMIT 1")->allow_out_of_order());
+	REQUIRE_FALSE(translate_union("SELECT * FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x) LIMIT 1 OFFSET 1")
+	                  ->allow_out_of_order());
+	REQUIRE(translate_union("SELECT count(*) FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x)")->allow_out_of_order());
+
+	REQUIRE_NO_FAIL(conn.Query("SET preserve_insertion_order=false"));
+	REQUIRE(translate_union("SELECT 3 AS x UNION ALL SELECT 1 AS x")->allow_out_of_order());
 }
 
 TEST_CASE("PhysicalPlanTranslator: union elides empty branches but retains one logical all-empty input",

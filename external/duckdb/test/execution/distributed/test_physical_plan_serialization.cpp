@@ -1879,6 +1879,44 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(sink.SinkHandle().output_partition_count == 4);
 }
 
+TEST_CASE("Exchange sink task binding rejects worker plans with multiple sinks",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	distributed::FlightExchangeConfig flight_config;
+	flight_config.node_id = "node-1";
+	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
+	vector<LogicalType> types {LogicalType::INTEGER};
+	auto &inner = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "inner-exchange", 4, RepartitionSpec::Type::Random,
+	                                                    vector<unique_ptr<Expression>> {}, "query-multiple-sinks",
+	                                                    "inner-output", exchange_mgr)
+	                  .Cast<PhysicalRemoteExchangeSink>();
+	auto &outer = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "outer-exchange", 4, RepartitionSpec::Type::Random,
+	                                                    vector<unique_ptr<Expression>> {}, "query-multiple-sinks",
+	                                                    "outer-output", exchange_mgr)
+	                  .Cast<PhysicalRemoteExchangeSink>();
+	outer.children.push_back(inner);
+	plan.SetRoot(outer);
+
+	const PhysicalRemoteExchangeSink *found_sink = nullptr;
+	string error;
+	REQUIRE_FALSE(distributed::TryGetUniqueRemoteExchangeSink(plan.Root(), found_sink, &error));
+	REQUIRE(error.find("at most one") != string::npos);
+	REQUIRE(found_sink == nullptr);
+
+	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+	descriptor.sink_instance.sink_handle.task_partition_id = 7;
+	descriptor.sink_instance.attempt_id = 2;
+	descriptor.sink_instance.query_id = "query-multiple-sinks";
+	descriptor.sink_instance.output_location = "outer-output__sink_7__attempt_2";
+	descriptor.sink_instance.output_partition_count = 4;
+	error.clear();
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, descriptor, &error));
+	REQUIRE(error.find("at most one") != string::npos);
+	REQUIRE_FALSE(outer.HasBoundSinkHandle());
+	REQUIRE_FALSE(inner.HasBoundSinkHandle());
+}
+
 TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker endpoint",
           "[serialization][physical_plan][exchange]") {
 	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;

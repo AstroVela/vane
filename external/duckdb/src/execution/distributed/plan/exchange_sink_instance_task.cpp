@@ -30,6 +30,27 @@ bool SetValidationError(std::string *error, const std::string &message) {
 	return false;
 }
 
+bool FindUniqueRemoteExchangeSink(const PhysicalOperator &op, const PhysicalRemoteExchangeSink *&sink, idx_t &count,
+                                  std::string *error) {
+	if (op.type == PhysicalOperatorType::EXCHANGE_SINK) {
+		auto *candidate = dynamic_cast<const PhysicalRemoteExchangeSink *>(&op);
+		if (!candidate) {
+			return SetValidationError(error, "EXCHANGE_SINK operator is not a PhysicalRemoteExchangeSink");
+		}
+		count++;
+		if (count > 1) {
+			return SetValidationError(error, "worker task plan must contain at most one remote exchange sink");
+		}
+		sink = candidate;
+	}
+	for (const auto &child : op.children) {
+		if (!FindUniqueRemoteExchangeSink(child.get(), sink, count, error)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const ExchangeSinkInstanceHandle &runtime_handle,
                                std::string *error) {
 	if (sink.SinkQueryId().empty()) {
@@ -131,6 +152,18 @@ void ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_
 
 } // namespace
 
+bool TryGetUniqueRemoteExchangeSink(const PhysicalOperator &op, const PhysicalRemoteExchangeSink *&sink,
+                                    std::string *error) {
+	const PhysicalRemoteExchangeSink *candidate = nullptr;
+	idx_t count = 0;
+	if (!FindUniqueRemoteExchangeSink(op, candidate, count, error)) {
+		sink = nullptr;
+		return false;
+	}
+	sink = candidate;
+	return true;
+}
+
 void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const {
 	if (!sink_instance.mark_join_build_summary.IsConsistent()) {
 		throw SerializationException("invalid MARK join build summary in exchange sink task");
@@ -203,22 +236,26 @@ bool ApplyExchangeSinkInstanceToPlan(duckdb::PhysicalPlan &plan, const ExchangeS
 		}
 		return false;
 	}
+	const PhysicalRemoteExchangeSink *planned_sink = nullptr;
+	if (!TryGetUniqueRemoteExchangeSink(plan.Root(), planned_sink, error)) {
+		return false;
+	}
+	if (!planned_sink) {
+		return SetValidationError(error, "no remote exchange sink found in plan");
+	}
 	idx_t validated = 0;
 	if (!ValidateExchangeSinkInstanceForOperator(plan.Root(), task.sink_instance, error, validated)) {
 		return false;
 	}
-	if (validated == 0) {
-		return SetValidationError(error, "no remote exchange sink found in plan");
+	if (validated != 1) {
+		return SetValidationError(error, "worker task plan remote exchange sink validation count is inconsistent");
 	}
 	idx_t applied = 0;
 	if (!ApplyExchangeSinkInstanceToOperator(plan.Root(), task, error, applied)) {
 		return false;
 	}
-	if (applied == 0) {
-		if (error) {
-			*error = "no remote exchange sink found in plan";
-		}
-		return false;
+	if (applied != 1) {
+		return SetValidationError(error, "worker task plan remote exchange sink application count is inconsistent");
 	}
 	ApplyRuntimeTaskIndexToOperator(plan.Root(), task.sink_instance.sink_handle.task_partition_id);
 	return true;

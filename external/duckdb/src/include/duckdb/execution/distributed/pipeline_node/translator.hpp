@@ -3,8 +3,9 @@
 
 #pragma once
 #include <memory>
-#include <vector>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
@@ -65,10 +66,14 @@ private:
 	ClientContext *client_context_;
 	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
+	std::unordered_set<const PhysicalUnion *> ordered_unions_;
 
 	int get_next_pipeline_node_id() {
 		return ++pipeline_node_id_counter_;
 	}
+
+	void CollectUnionOrderRequirements(const PhysicalOperator &op, bool output_order_required);
+	bool UnionAllowsOutOfOrder(const PhysicalUnion &op) const;
 
 public:
 	//! resolved_extension_write_info is borrowed only during translation and

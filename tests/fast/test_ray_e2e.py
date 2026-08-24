@@ -483,6 +483,33 @@ def test_ray_union_value_branches(ray_runner, duckdb_conn, sql):
     )
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "LIMIT 1",
+        "LIMIT 1 OFFSET 2",
+    ],
+)
+def test_ray_union_limit_and_offset_preserve_branch_order(ray_runner, duckdb_conn, suffix):
+    label = "test_ray_e2e: union limit preserves branch order"
+    duckdb_conn.execute("SET preserve_insertion_order=true")
+    sql = f"""
+        SELECT x
+        FROM (
+            SELECT * FROM (VALUES (3), (4)) AS first_branch(x)
+            UNION ALL
+            SELECT * FROM (VALUES (1), (2)) AS second_branch(x)
+        )
+        {suffix}
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper()
+    assert "ORDER: BRANCH ORDER" in plan_text.upper(), plan_text
+    parts = _run_iter_tables(ray_runner, relation, label)
+    _assert_results_match(duckdb_conn, sql, parts, label, ordered=True)
+
+
 def test_ray_union_parquet_branches_preserve_independent_scan_splits(ray_runner, duckdb_conn, parquet_path):
     sql = f"""
         SELECT a, b FROM read_parquet('{parquet_path}') WHERE a < 600

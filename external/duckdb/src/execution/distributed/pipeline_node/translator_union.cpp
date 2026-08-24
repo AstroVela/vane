@@ -41,7 +41,7 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	}
 
 	return std::make_shared<UnionNode>(get_next_pipeline_node_id(), plan_config_, children, std::move(schema),
-	                                   op.allow_out_of_order);
+	                                   UnionAllowsOutOfOrder(op));
 }
 
 } // namespace distributed

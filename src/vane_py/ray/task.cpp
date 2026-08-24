@@ -73,18 +73,6 @@ py::object GetLoadedRayModuleOrNone() {
 	return ray_mod;
 }
 
-const duckdb::PhysicalRemoteExchangeSink *FindRemoteExchangeSink(const duckdb::PhysicalOperator &op) {
-	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
-		return dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
-	}
-	for (auto &child : op.children) {
-		if (auto *sink = FindRemoteExchangeSink(child.get())) {
-			return sink;
-		}
-	}
-	return nullptr;
-}
-
 bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::ExchangeSinkInstanceHandle &out) {
 	if (obj.is_none()) {
 		return false;
@@ -1356,7 +1344,11 @@ py::object RayWorkerTask::ExchangeSinkConfig() const {
 	if (!plan_ref || !plan_ref->HasRoot()) {
 		return py::none();
 	}
-	auto *sink = FindRemoteExchangeSink(plan_ref->Root());
+	const duckdb::PhysicalRemoteExchangeSink *sink = nullptr;
+	std::string error;
+	if (!duckdb::distributed::TryGetUniqueRemoteExchangeSink(plan_ref->Root(), sink, &error)) {
+		throw duckdb::InvalidInputException("Invalid worker exchange sink plan: %s", error);
+	}
 	if (!sink) {
 		return py::none();
 	}
