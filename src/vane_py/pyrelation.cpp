@@ -37,6 +37,7 @@
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/python_udf_utils.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/python_conversion.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -2147,10 +2148,78 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 	PyExecuteRelation(insert);
 }
 
-void DuckDBPyRelation::Create(const string &table) {
+static unique_ptr<ParsedExpression> TransformCreateTablePropertyValue(const py::handle &value) {
+	if (py::isinstance<DuckDBPyExpression>(value)) {
+		auto expression = py::cast<shared_ptr<DuckDBPyExpression>>(value);
+		return expression->GetExpression().Copy();
+	}
+	return make_uniq<ConstantExpression>(TransformPythonValue(value, LogicalType::UNKNOWN, false));
+}
+
+static case_insensitive_map_t<unique_ptr<ParsedExpression>>
+TransformCreateTableProperties(const py::object &properties) {
+	case_insensitive_map_t<unique_ptr<ParsedExpression>> result;
+	if (properties.is_none()) {
+		return result;
+	}
+	if (!py::is_dict_like(properties)) {
+		throw InvalidInputException("create only accepts 'properties' as a mapping of string keys to values");
+	}
+
+	for (auto item : py::dict(properties)) {
+		if (!py::isinstance<py::str>(item.first)) {
+			throw InvalidInputException("create property names must be strings");
+		}
+		auto name = py::cast<string>(item.first);
+		if (name.empty()) {
+			throw InvalidInputException("create property names must not be empty");
+		}
+		if (result.find(name) != result.end()) {
+			throw InvalidInputException("create property names must be unique case-insensitively: '%s'", name);
+		}
+		result.emplace(std::move(name), TransformCreateTablePropertyValue(item.second));
+	}
+	return result;
+}
+
+static vector<unique_ptr<ParsedExpression>> TransformCreateTablePartitionKeys(ClientContext &context,
+                                                                              const py::object &partition_by) {
+	vector<unique_ptr<ParsedExpression>> result;
+	if (partition_by.is_none()) {
+		return result;
+	}
+	if (py::isinstance<py::str>(partition_by) || !py::isinstance<py::sequence>(partition_by)) {
+		throw InvalidInputException("create only accepts 'partition_by' as a sequence of Expression or str values");
+	}
+
+	for (auto item : py::list(partition_by)) {
+		if (py::isinstance<py::str>(item)) {
+			auto expressions = Parser::ParseExpressionList(py::cast<string>(item), context.GetParserOptions());
+			if (expressions.size() != 1) {
+				throw InvalidInputException("create partition expressions must contain exactly one expression");
+			}
+			result.push_back(std::move(expressions[0]));
+			continue;
+		}
+		if (!py::isinstance<DuckDBPyExpression>(item)) {
+			string actual_type = py::str(py::type::of(item));
+			throw InvalidInputException("create partition expressions must be Expression or str values, not '%s'",
+			                            actual_type);
+		}
+		auto expression = py::cast<shared_ptr<DuckDBPyExpression>>(item);
+		result.push_back(expression->GetExpression().Copy());
+	}
+	return result;
+}
+
+void DuckDBPyRelation::Create(const string &table, const py::object &properties, const py::object &partition_by) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
-	auto create = rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false);
+	auto table_options = TransformCreateTableProperties(properties);
+	auto partition_keys = TransformCreateTablePartitionKeys(*rel->context->GetContext(), partition_by);
+	auto create =
+	    rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false,
+	                   OnCreateConflict::ERROR_ON_CONFLICT, std::move(table_options), std::move(partition_keys));
 	if (TryDispatchToRunner(create, connection_owner, "CTAS")) {
 		return;
 	}

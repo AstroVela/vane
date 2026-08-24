@@ -10,14 +10,60 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/main/relation/explain_relation.hpp"
+#include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "iostream"
 #include "test_helpers.hpp"
 #include "duckdb/main/relation/materialized_relation.hpp"
 
 using namespace duckdb;
 using namespace std;
+
+namespace {
+
+class NoBindRelationContextWrapper final : public duckdb::RelationContextWrapper {
+public:
+	explicit NoBindRelationContextWrapper(const duckdb::shared_ptr<duckdb::ClientContext> &context)
+	    : duckdb::RelationContextWrapper(context) {
+	}
+
+	void TryBindRelation(duckdb::Relation &, duckdb::vector<duckdb::ColumnDefinition> &) override {
+	}
+};
+
+} // namespace
+
+TEST_CASE("Create table relations preserve structured options and partition expressions", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto context = make_shared_ptr<NoBindRelationContextWrapper>(con.context);
+	duckdb::vector<duckdb::vector<Value>> values;
+	values.push_back({Value::INTEGER(1), Value("north")});
+	auto source = make_shared_ptr<ValueRelation>(context, values, duckdb::vector<duckdb::string> {"id", "region"},
+	                                             "create_source");
+	case_insensitive_map_t<duckdb::unique_ptr<ParsedExpression>> options;
+	options.emplace("location", make_uniq<ConstantExpression>(Value("s3://warehouse/table")));
+	options.emplace("format-version", make_uniq<ConstantExpression>(Value::INTEGER(2)));
+	auto partition_keys = Parser::ParseExpressionList("bucket(16, id), region");
+
+	auto relation =
+	    source->CreateRel("catalog_name", "schema_name", "table_name", false, OnCreateConflict::ERROR_ON_CONFLICT,
+	                      std::move(options), std::move(partition_keys));
+	REQUIRE(relation->type == RelationType::CREATE_TABLE_RELATION);
+	auto &create = relation->Cast<CreateTableRelation>();
+	REQUIRE(create.catalog_name == "catalog_name");
+	REQUIRE(create.schema_name == "schema_name");
+	REQUIRE(create.table_name == "table_name");
+	REQUIRE(create.table_options.size() == 2);
+	REQUIRE(create.table_options.at("LOCATION")->ToString() == "'s3://warehouse/table'");
+	REQUIRE(create.table_options.at("FORMAT-VERSION")->ToString() == "2");
+	REQUIRE(create.partition_keys.size() == 2);
+	REQUIRE(create.partition_keys[0]->ToString() == "bucket(16, id)");
+	REQUIRE(create.partition_keys[1]->ToString() == "region");
+}
 
 TEST_CASE("Test simple relation API", "[relation_api]") {
 	DuckDB db(nullptr);
