@@ -115,6 +115,11 @@ public:
 	//! The score of how well this secret's scope matches the path (by default: the length of the longest matching
 	//! prefix)
 	virtual int64_t MatchScore(const string &path) const;
+	//! Whether MatchScore follows BaseSecret's standard longest-prefix scope semantics.
+	//! Custom secret classes must explicitly certify this contract.
+	virtual bool UsesStandardPrefixMatching() const {
+		return typeid(BaseSecret) == typeid(*this);
+	}
 	//! Prints the secret as a string
 	virtual string ToString(SecretDisplayType mode = SecretDisplayType::REDACTED) const;
 	//! Serialize this secret
@@ -178,6 +183,10 @@ public:
 		redact_keys = secret.redact_keys;
 		serializable = true;
 	};
+
+	bool UsesStandardPrefixMatching() const override {
+		return typeid(KeyValueSecret) == typeid(*this);
+	}
 	KeyValueSecret(KeyValueSecret &&secret) noexcept
 	    : BaseSecret(std::move(secret.prefix_paths), std::move(secret.type), std::move(secret.provider),
 	                 std::move(secret.name)) {

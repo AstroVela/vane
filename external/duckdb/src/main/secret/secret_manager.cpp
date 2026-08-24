@@ -91,7 +91,17 @@ void SecretManager::LoadSecretStorageInternal(unique_ptr<SecretStorage> storage)
 		}
 	}
 
+	if (secret_storage_generation == NumericLimits<uint64_t>::Maximum()) {
+		throw InternalException("Secret storage registry generation exhausted");
+	}
 	secret_storages[storage->GetName()] = std::move(storage);
+	secret_storage_generation++;
+}
+
+uint64_t SecretManager::GetSecretStorageGeneration(CatalogTransaction transaction) {
+	InitializeSecrets(transaction);
+	lock_guard<mutex> lock(manager_lock);
+	return secret_storage_generation;
 }
 
 // FIXME: use serialization scripts?
@@ -492,6 +502,29 @@ vector<SecretEntry> SecretManager::AllSecrets(CatalogTransaction transaction) {
 	}
 
 	return result;
+}
+
+bool SecretManager::ScanSecretMetadata(CatalogTransaction transaction,
+                                       const secret_storage_metadata_callback_t &storage_callback,
+                                       const secret_metadata_callback_t &secret_callback) {
+	InitializeSecrets(transaction);
+
+	for (const auto &storage_ref : GetSecretStorages()) {
+		auto &storage = storage_ref.get();
+		auto included_in_lookups = storage.IncludeInLookups();
+		SecretStorageMetadata storage_metadata {storage.GetName(), included_in_lookups,
+		                                        storage.UsesStandardSecretLookup()};
+		if (!storage_callback(storage_metadata)) {
+			return false;
+		}
+		if (!included_in_lookups) {
+			continue;
+		}
+		if (!storage.ScanSecretMetadata(secret_callback, &transaction)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 vector<SecretType> SecretManager::AllSecretTypes() {

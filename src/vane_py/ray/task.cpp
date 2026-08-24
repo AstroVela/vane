@@ -1306,6 +1306,7 @@ py::object RayWorkerTask::Plan() const {
 	auto udf_registrations_obj = ray_cxx.attr("_lookup_query_udf_registrations")(resource_query_id_obj);
 	auto udf_actor_handles_obj = ray_cxx.attr("_lookup_query_udf_actor_handles")(resource_query_id_obj);
 	auto connection_snapshot_obj = ray_cxx.attr("_lookup_query_connection_snapshot")(resource_query_id_obj);
+	auto scoped_secret_refs_obj = ray_cxx.attr("_lookup_query_scoped_secret_refs")(resource_query_id_obj);
 
 	// Keep ownership locally until the capsule is fully constructed. Capsule
 	// construction can allocate and raise before its destructor callback owns
@@ -1316,7 +1317,7 @@ py::object RayWorkerTask::Plan() const {
 	plan_copy.release();
 	auto create_fn = ray_cxx.attr("_create_physical_plan_from_capsule");
 	return create_fn(plan_capsule, query_id_obj, resource_query_id_obj, udf_registrations_obj, udf_actor_handles_obj,
-	                 connection_snapshot_obj);
+	                 connection_snapshot_obj, scoped_secret_refs_obj);
 }
 
 py::dict RayWorkerTask::Inputs() const {
