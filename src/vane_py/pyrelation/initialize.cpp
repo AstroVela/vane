@@ -425,8 +425,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	         py::arg("table_name"));
 
 	DefineMethod({"create", "to_table"}, relation_module, &DuckDBPyRelation::Create,
-	             "Creates a new table named table_name with the contents of the relation object",
-	             py::arg("table_name"));
+	             "Creates a new table with the contents of the relation object. Table properties are passed as "
+	             "structured expressions to the target catalog, and partition_by accepts SQL expression strings or "
+	             "Expression objects.",
+	             py::arg("table_name"), py::kw_only(), py::arg("properties") = py::none(),
+	             py::arg("partition_by") = py::none());
 
 	DefineMethod({"create_view", "to_view"}, relation_module, &DuckDBPyRelation::CreateView,
 	             "Creates a view named view_name that refers to the relation object", py::arg("view_name"),

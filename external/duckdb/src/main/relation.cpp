@@ -959,14 +959,19 @@ void Relation::Insert(vector<vector<unique_ptr<ParsedExpression>>> &&expressions
 }
 
 shared_ptr<Relation> Relation::CreateRel(const string &schema_name, const string &table_name, bool temporary,
-                                         OnCreateConflict on_conflict) {
-	return CreateRel(INVALID_CATALOG, schema_name, table_name, temporary, on_conflict);
+                                         OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> options,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys) {
+	return CreateRel(INVALID_CATALOG, schema_name, table_name, temporary, on_conflict, std::move(options),
+	                 std::move(partition_keys));
 }
 
 shared_ptr<Relation> Relation::CreateRel(const string &catalog_name, const string &schema_name,
-                                         const string &table_name, bool temporary, OnCreateConflict on_conflict) {
+                                         const string &table_name, bool temporary, OnCreateConflict on_conflict,
+                                         case_insensitive_map_t<unique_ptr<ParsedExpression>> options,
+                                         vector<unique_ptr<ParsedExpression>> partition_keys) {
 	return make_shared_ptr<CreateTableRelation>(shared_from_this(), catalog_name, schema_name, table_name, temporary,
-	                                            on_conflict);
+	                                            on_conflict, std::move(options), std::move(partition_keys));
 }
 
 void Relation::Create(const string &table_name, bool temporary, OnCreateConflict on_conflict) {

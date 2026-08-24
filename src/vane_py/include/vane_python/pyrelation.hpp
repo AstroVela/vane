@@ -276,7 +276,7 @@ public:
 	void Update(const py::object &set, const py::object &where = py::none());
 	void Delete(const py::object &where = py::none());
 
-	void Create(const string &table);
+	void Create(const string &table, const py::object &properties, const py::object &partition_by);
 
 	py::str Type();
 	py::list Columns();

@@ -192,10 +192,14 @@ public:
 	//! Create a table and insert the data from this relation into that table
 	DUCKDB_API shared_ptr<Relation> CreateRel(const string &schema_name, const string &table_name,
 	                                          bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
+	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
+	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
 	DUCKDB_API shared_ptr<Relation> CreateRel(const string &catalog_name, const string &schema_name,
 	                                          const string &table_name, bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
+	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
+	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
 	DUCKDB_API void Create(const string &table_name, bool temporary = false,
 	                       OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
 	DUCKDB_API void Create(const string &schema_name, const string &table_name, bool temporary = false,

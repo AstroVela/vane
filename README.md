@@ -127,6 +127,29 @@ Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` 
 
 Each cross-worker partition read has a five-minute deadline covering its complete Flight DoGet stream. Override it with `VANE_FLIGHT_CALL_TIMEOUT_S`, or set it to `0` to disable the deadline. The deadline is not reset when a schema or record batch arrives. Query interruption independently cancels an in-flight Flight call, so interrupted consumers release the producer-side stream and its shuffle-file read lease.
 
+### Catalog-backed table creation
+
+Relations can create catalog-backed tables with storage-format-neutral table properties and partition expressions:
+
+```python
+import vane
+
+relation = vane.sql("SELECT id, event_date FROM source_table")
+relation.create(
+    "catalog.schema.table",
+    properties={
+        "format-version": "2",
+        "write.data.path": "s3://bucket/table/data",
+    },
+    partition_by=["bucket(16, id)", vane.ColumnExpression("event_date")],
+)
+```
+
+The target catalog defines which properties and partition expressions it supports. With the Ray runner, CTAS is
+submitted as a distributed write and any planning or execution error is returned directly; it is never retried in
+local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckDB backend. An unset or empty
+`VANE_RUNNER` selects Ray.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
