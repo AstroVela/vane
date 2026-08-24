@@ -366,6 +366,10 @@ static bool ApplyExtensionScanSplits(PhysicalTableScan &scan, const ScanSplitBat
 	}
 	const auto &callbacks = scan.function.GetDistributedScanCallbacks();
 	callbacks.Validate(scan.function);
+	if (!scan.bind_data && callbacks.bind_data_mode == TableFunctionDistributedBindDataMode::REQUIRED) {
+		SetApplyError(error, "distributed table function requires worker bind data: " + scan.function.name);
+		return false;
+	}
 	const auto &capability = callbacks.GetCapability();
 	const auto &first_split = batch.splits[0];
 	if (first_split.extension_capability != capability) {
@@ -393,7 +397,7 @@ static bool ApplyExtensionScanSplits(PhysicalTableScan &scan, const ScanSplitBat
 		assigned.estimated_bytes = split.estimated_bytes;
 		assigned_splits.push_back(std::move(assigned));
 	}
-	callbacks.apply_splits(*scan.bind_data, assigned_splits);
+	callbacks.apply_splits(scan.bind_data.get(), assigned_splits);
 	scan.extra_info.total_files = optional_idx(assigned_splits.size());
 	scan.extra_info.filtered_files = optional_idx(assigned_splits.size());
 	scan.distributed_scan_splits_applied = true;
@@ -415,12 +419,6 @@ static bool ApplyScanSplitBatchesToOperator(PhysicalOperator &op, const ScanSpli
 			auto it = batches.find(node_id);
 			if (it == batches.end()) {
 				stats.missing_batch++;
-			} else if (!scan.bind_data) {
-				matched_batches.insert(node_id);
-				stats.missing_bind++;
-				stats.invalid_assignment++;
-				SetApplyError(error,
-				              "scan split batch assigned to table function with null bind data: " + scan.function.name);
 			} else {
 				matched_batches.insert(node_id);
 				const auto &batch = *it->second;
@@ -432,6 +430,11 @@ static bool ApplyScanSplitBatchesToOperator(PhysicalOperator &op, const ScanSpli
 						stats.non_multi_bind++;
 						stats.invalid_assignment++;
 					}
+				} else if (!scan.bind_data) {
+					stats.missing_bind++;
+					stats.invalid_assignment++;
+					SetApplyError(error, "scan split batch assigned to table function with null bind data: " +
+					                         scan.function.name);
 				} else if (scan.function.HasDistributedScanCallbacks()) {
 					SetApplyError(error,
 					              "file scan split assigned to extension table function '" + scan.function.name + "'");
@@ -926,18 +929,17 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 					}
 					return false;
 				}
-				if (!scan.bind_data) {
-					if (error) {
-						*error = "FTE scan source queue target has null bind_data for scan_node_id=" +
-						         std::to_string(node_id);
-					}
-					return false;
-				}
 				if (scan.function.HasDistributedScanCallbacks()) {
 					if (!ApplyFteExtensionScanSplits(scan, entry->second, extension_batch_cache, error)) {
 						return false;
 					}
 					applied++;
+				} else if (!scan.bind_data) {
+					if (error) {
+						*error = "FTE scan source queue target has null bind_data for scan_node_id=" +
+						         std::to_string(node_id);
+					}
+					return false;
 				} else if (auto *multi_bind = dynamic_cast<MultiFileBindData *>(scan.bind_data.get())) {
 					auto cached_file_list = dynamic_file_list_cache.find(entry->second.get());
 					if (cached_file_list == dynamic_file_list_cache.end()) {

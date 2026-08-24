@@ -187,8 +187,8 @@ vector<DistributedSequenceSplit> DecodeDistributedSequenceSplits(const vector<Di
 	return result;
 }
 
-static bool DistributedSequenceSplitsEqual(const vector<DistributedSequenceSplit> &left,
-                                           const vector<DistributedSequenceSplit> &right) {
+bool DistributedSequenceSplitsEqual(const vector<DistributedSequenceSplit> &left,
+                                    const vector<DistributedSequenceSplit> &right) {
 	if (left.size() != right.size()) {
 		return false;
 	}
@@ -519,7 +519,10 @@ static unique_ptr<FunctionData> RangeFunctionDeserialize(Deserializer &deseriali
 
 static vector<DistributedScanSplit>
 PlanDistributedIntegerRange(const TableFunctionDistributedScanPlanningInput &input) {
-	auto &bind_data = input.bind_data.Cast<RangeFunctionBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed integer range requires bind data");
+	}
+	auto &bind_data = input.bind_data->Cast<RangeFunctionBindData>();
 	if (!bind_data.has_parameters) {
 		throw InvalidInputException("distributed integer range requires scalar bound parameters");
 	}
@@ -528,7 +531,10 @@ PlanDistributedIntegerRange(const TableFunctionDistributedScanPlanningInput &inp
 
 static unique_ptr<FunctionData>
 CreateDistributedIntegerRangeWorkerBind(const TableFunctionDistributedScanInput &input) {
-	auto &source_bind = input.bind_data.Cast<RangeFunctionBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed integer range requires bind data");
+	}
+	auto &source_bind = input.bind_data->Cast<RangeFunctionBindData>();
 	if (!source_bind.has_parameters) {
 		throw InvalidInputException("distributed integer range requires scalar bound parameters");
 	}
@@ -538,9 +544,12 @@ CreateDistributedIntegerRangeWorkerBind(const TableFunctionDistributedScanInput 
 	return std::move(result);
 }
 
-static void ApplyDistributedIntegerRangeSplits(FunctionData &worker_bind_data,
+static void ApplyDistributedIntegerRangeSplits(optional_ptr<FunctionData> worker_bind_data,
                                                const vector<DistributedScanSplit> &splits) {
-	auto &bind_data = worker_bind_data.Cast<RangeFunctionBindData>();
+	if (!worker_bind_data) {
+		throw InvalidInputException("distributed integer range requires worker bind data");
+	}
+	auto &bind_data = worker_bind_data->Cast<RangeFunctionBindData>();
 	if (!bind_data.distributed || !bind_data.has_parameters) {
 		throw InvalidInputException("distributed integer range splits require a worker bind");
 	}
@@ -881,7 +890,10 @@ static unique_ptr<FunctionData> RangeDateTimeDeserialize(Deserializer &deseriali
 
 static vector<DistributedScanSplit>
 PlanDistributedDateTimeRange(const TableFunctionDistributedScanPlanningInput &input) {
-	auto &bind_data = input.bind_data.Cast<RangeDateTimeBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed timestamp range requires bind data");
+	}
+	auto &bind_data = input.bind_data->Cast<RangeDateTimeBindData>();
 	if (!bind_data.has_parameters) {
 		throw InvalidInputException("distributed timestamp range requires scalar bound parameters");
 	}
@@ -890,7 +902,10 @@ PlanDistributedDateTimeRange(const TableFunctionDistributedScanPlanningInput &in
 
 static unique_ptr<FunctionData>
 CreateDistributedDateTimeRangeWorkerBind(const TableFunctionDistributedScanInput &input) {
-	auto &source_bind = input.bind_data.Cast<RangeDateTimeBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed timestamp range requires bind data");
+	}
+	auto &source_bind = input.bind_data->Cast<RangeDateTimeBindData>();
 	if (!source_bind.has_parameters) {
 		throw InvalidInputException("distributed timestamp range requires scalar bound parameters");
 	}
@@ -900,9 +915,12 @@ CreateDistributedDateTimeRangeWorkerBind(const TableFunctionDistributedScanInput
 	return std::move(result);
 }
 
-static void ApplyDistributedDateTimeRangeSplits(FunctionData &worker_bind_data,
+static void ApplyDistributedDateTimeRangeSplits(optional_ptr<FunctionData> worker_bind_data,
                                                 const vector<DistributedScanSplit> &splits) {
-	auto &bind_data = worker_bind_data.Cast<RangeDateTimeBindData>();
+	if (!worker_bind_data) {
+		throw InvalidInputException("distributed timestamp range requires worker bind data");
+	}
+	auto &bind_data = worker_bind_data->Cast<RangeDateTimeBindData>();
 	if (!bind_data.distributed || !bind_data.has_parameters) {
 		throw InvalidInputException("distributed timestamp range splits require a worker bind");
 	}

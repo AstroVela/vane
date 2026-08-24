@@ -365,6 +365,9 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	for (const auto &function : ReadCSVTableFunction::GetFunctions()) {
 		add_core_table_function(function);
 	}
+	add_core_table_function(RepeatTableFunction::GetFunction());
+	add_core_table_function(RepeatRowTableFunction::GetFunction());
+	add_core_table_function(UnnestTableFunction::GetFunction());
 	distributed_extension_manager->RegisterExtension(core_manifest);
 
 	// initialize the secret manager

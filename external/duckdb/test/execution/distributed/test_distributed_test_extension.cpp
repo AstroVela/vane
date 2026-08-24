@@ -358,7 +358,10 @@ static unique_ptr<FunctionData> DistributedTestScanDeserialize(Deserializer &des
 
 static unique_ptr<FunctionData> DistributedTestCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
 	distributed_test_create_worker_bind_calls++;
-	auto &source_bind = input.bind_data.Cast<DistributedTestScanBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed test scan requires bind data");
+	}
+	auto &source_bind = input.bind_data->Cast<DistributedTestScanBindData>();
 	auto worker_bind = make_uniq<DistributedTestScanBindData>();
 	worker_bind->requested_unit_count = source_bind.requested_unit_count;
 	return std::move(worker_bind);
@@ -366,7 +369,10 @@ static unique_ptr<FunctionData> DistributedTestCreateWorkerBind(const TableFunct
 
 static vector<DistributedScanSplit> DistributedTestPlanSplits(const TableFunctionDistributedScanPlanningInput &input) {
 	distributed_test_last_target_split_count = input.target_split_count;
-	auto &bind_data = input.bind_data.Cast<DistributedTestScanBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed test scan requires bind data");
+	}
+	auto &bind_data = input.bind_data->Cast<DistributedTestScanBindData>();
 	vector<DistributedScanSplit> result;
 	result.reserve(bind_data.units.size());
 	for (const auto &unit : bind_data.units) {
@@ -386,8 +392,12 @@ static vector<DistributedScanSplit> DistributedTestPlanSplits(const TableFunctio
 	return result;
 }
 
-static void DistributedTestApplySplits(FunctionData &worker_bind_data, const vector<DistributedScanSplit> &splits) {
-	auto &bind_data = worker_bind_data.Cast<DistributedTestScanBindData>();
+static void DistributedTestApplySplits(optional_ptr<FunctionData> worker_bind_data,
+                                       const vector<DistributedScanSplit> &splits) {
+	if (!worker_bind_data) {
+		throw InvalidInputException("distributed test scan requires worker bind data");
+	}
+	auto &bind_data = worker_bind_data->Cast<DistributedTestScanBindData>();
 	vector<DistributedTestSourceUnit> assigned_units;
 	assigned_units.reserve(splits.size());
 	for (const auto &split : splits) {
@@ -519,6 +529,11 @@ TEST_CASE("Distributed synthetic extension transports file splits with an explic
 	incomplete_callbacks.create_worker_bind = nullptr;
 	REQUIRE_THROWS_WITH(incomplete_function.SetDistributedScanCallbacks(std::move(incomplete_callbacks)),
 	                    Catch::Matchers::Contains("create_worker_bind"));
+	auto invalid_bind_mode_function = DistributedTestScanFunction();
+	auto invalid_bind_mode_callbacks = invalid_bind_mode_function.GetDistributedScanCallbacks();
+	invalid_bind_mode_callbacks.bind_data_mode = static_cast<TableFunctionDistributedBindDataMode>(255);
+	REQUIRE_THROWS_WITH(invalid_bind_mode_function.SetDistributedScanCallbacks(std::move(invalid_bind_mode_callbacks)),
+	                    Catch::Matchers::Contains("invalid bind-data mode"));
 
 	DuckDB coordinator_db(nullptr);
 	coordinator_db.LoadStaticExtension<DistributedTestExtension>();

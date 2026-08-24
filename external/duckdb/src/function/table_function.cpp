@@ -48,6 +48,51 @@ DistributedScanSplit DistributedScanSplit::Deserialize(Deserializer &deserialize
 	return result;
 }
 
+namespace {
+
+vector<DistributedScanSplit> PlanDistributedSingletonSource(const TableFunctionDistributedScanPlanningInput &input) {
+	DistributedScanSplit split;
+	split.split_id = "0";
+	if (input.estimated_cardinality != DConstants::INVALID_INDEX) {
+		split.estimated_cardinality = optional_idx(input.estimated_cardinality);
+	}
+	split.Validate();
+	return {std::move(split)};
+}
+
+unique_ptr<FunctionData> CreateDistributedSingletonWorkerBind(const TableFunctionDistributedScanInput &input) {
+	if (!input.bind_data) {
+		return nullptr;
+	}
+	return input.bind_data->Copy();
+}
+
+void ApplyDistributedSingletonSource(optional_ptr<FunctionData>, const vector<DistributedScanSplit> &splits) {
+	if (splits.size() != 1) {
+		throw InvalidInputException("distributed singleton source requires exactly one assigned split");
+	}
+	const auto &split = splits[0];
+	split.Validate();
+	if (split.split_id != "0" || !split.payload.empty()) {
+		throw InvalidInputException("distributed singleton source received an invalid split");
+	}
+}
+
+} // namespace
+
+TableFunctionDistributedScanCallbacks
+MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode bind_data_mode) {
+	TableFunctionDistributedScanCallbacks callbacks;
+	callbacks.protocol_version = DISTRIBUTED_SINGLETON_SOURCE_PROTOCOL_VERSION;
+	callbacks.split_codec = {DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC,
+	                         DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC_VERSION};
+	callbacks.bind_data_mode = bind_data_mode;
+	callbacks.plan_splits = PlanDistributedSingletonSource;
+	callbacks.create_worker_bind = CreateDistributedSingletonWorkerBind;
+	callbacks.apply_splits = ApplyDistributedSingletonSource;
+	return callbacks;
+}
+
 TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, table_function_t function_,
                              table_function_bind_t bind, table_function_init_global_t init_global,
                              table_function_init_local_t init_local)
@@ -132,6 +177,14 @@ void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &fun
 		throw InvalidInputException(
 		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
+	switch (bind_data_mode) {
+	case TableFunctionDistributedBindDataMode::REQUIRED:
+	case TableFunctionDistributedBindDataMode::OPTIONAL:
+		break;
+	default:
+		throw InvalidInputException("Distributed scan callbacks for table function '%s' have an invalid bind-data mode",
+		                            function_name);
+	}
 	split_codec.Validate("Distributed scan split codec for table function '" + function_name + "'");
 }
 
@@ -182,8 +235,9 @@ const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallb
 
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
 	return protocol_version == other.protocol_version && capability == other.capability &&
-	       split_codec == other.split_codec && plan_splits == other.plan_splits &&
-	       create_worker_bind == other.create_worker_bind && apply_splits == other.apply_splits;
+	       split_codec == other.split_codec && bind_data_mode == other.bind_data_mode &&
+	       plan_splits == other.plan_splits && create_worker_bind == other.create_worker_bind &&
+	       apply_splits == other.apply_splits;
 }
 
 void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
