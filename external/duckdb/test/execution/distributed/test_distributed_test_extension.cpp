@@ -617,8 +617,9 @@ TEST_CASE("Distributed synthetic extension transports file splits with an explic
 	auto empty_worker_plan = CloneAndApply(worker, empty_planned.worker_plan, empty_roundtrip, 8);
 	string empty_assignment_error;
 	REQUIRE(distributed::ValidateDistributedScanSplitsApplied(*empty_worker_plan, &empty_assignment_error));
-	auto &empty_bind =
-	    empty_worker_plan->Root().Cast<PhysicalTableScan>().bind_data->Cast<DistributedTestScanBindData>();
+	auto &empty_worker_scan = empty_worker_plan->Root().Cast<PhysicalTableScan>();
+	REQUIRE(empty_worker_scan.distributed_scan_empty);
+	auto &empty_bind = empty_worker_scan.bind_data->Cast<DistributedTestScanBindData>();
 	REQUIRE(empty_bind.units.empty());
 
 	auto missing_fte_batch_plan = distributed::ClonePhysicalPlanOrThrow(
@@ -647,6 +648,7 @@ TEST_CASE("Distributed synthetic extension transports file splits with an explic
 	string empty_fte_error;
 	REQUIRE(distributed::ApplyFteScanSourceQueuesToPlan(*empty_fte_plan, empty_fte_queues, &empty_fte_error));
 	REQUIRE(empty_fte_scan.distributed_scan_splits_applied);
+	REQUIRE(empty_fte_scan.distributed_scan_empty);
 	REQUIRE(empty_fte_scan.bind_data->Cast<DistributedTestScanBindData>().units.empty());
 
 	auto duplicate_fte_plan = make_uniq<PhysicalPlan>(Allocator::DefaultAllocator());

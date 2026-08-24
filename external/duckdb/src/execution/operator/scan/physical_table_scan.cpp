@@ -41,6 +41,10 @@ class TableScanGlobalSourceState : public GlobalSourceState {
 public:
 	TableScanGlobalSourceState(ClientContext &context, const PhysicalTableScan &op) {
 		physical_table_scan_execution_strategy = Settings::Get<DebugPhysicalTableScanExecutionStrategySetting>(context);
+		if (op.distributed_scan_empty) {
+			max_threads = 1;
+			return;
+		}
 
 		if (op.dynamic_filters && op.dynamic_filters->HasFilters()) {
 			table_filters = op.dynamic_filters->GetFinalTableFilters(op, op.table_filters.get());
@@ -92,6 +96,9 @@ class TableScanLocalSourceState : public LocalSourceState {
 public:
 	TableScanLocalSourceState(ExecutionContext &context, TableScanGlobalSourceState &gstate,
 	                          const PhysicalTableScan &op) {
+		if (op.distributed_scan_empty) {
+			return;
+		}
 		if (op.function.init_local) {
 			TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.projection_ids,
 			                             gstate.GetTableFilters(op), op.extra_info.sample_options, &op);
@@ -168,6 +175,10 @@ static void ValidateAsyncStrategyResult(const PhysicalTableScanExecutionStrategy
 
 SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                     OperatorSourceInput &input) const {
+	if (distributed_scan_empty) {
+		chunk.SetCardinality(0);
+		return SourceResultType::FINISHED;
+	}
 	D_ASSERT(!column_ids.empty());
 	auto &g_state = input.global_state.Cast<TableScanGlobalSourceState>();
 	auto &l_state = input.local_state.Cast<TableScanLocalSourceState>();
@@ -242,6 +253,11 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 }
 
 ProgressData PhysicalTableScan::GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const {
+	if (distributed_scan_empty) {
+		ProgressData res;
+		res.SetInvalid();
+		return res;
+	}
 	auto &gstate = gstate_p.Cast<TableScanGlobalSourceState>();
 	ProgressData res;
 	if (function.table_scan_progress) {
@@ -262,7 +278,7 @@ ProgressData PhysicalTableScan::GetProgress(ClientContext &context, GlobalSource
 }
 
 bool PhysicalTableScan::SupportsPartitioning(const OperatorPartitionInfo &partition_info) const {
-	if (!function.get_partition_data) {
+	if (distributed_scan_empty || !function.get_partition_data) {
 		return false;
 	}
 	// FIXME: actually check if partition info is supported
@@ -410,7 +426,7 @@ bool PhysicalTableScan::Equals(const PhysicalOperator &other_p) const {
 }
 
 bool PhysicalTableScan::ParallelSource() const {
-	if (!function.function) {
+	if (distributed_scan_empty || !function.function) {
 		// table in-out functions cannot be executed in parallel as part of a PhysicalTableScan
 		// since they have only a single input row
 		return false;
@@ -420,7 +436,7 @@ bool PhysicalTableScan::ParallelSource() const {
 
 InsertionOrderPreservingMap<string> PhysicalTableScan::ExtraSourceParams(GlobalSourceState &gstate_p,
                                                                          LocalSourceState &lstate) const {
-	if (!function.dynamic_to_string) {
+	if (distributed_scan_empty || !function.dynamic_to_string) {
 		return InsertionOrderPreservingMap<string>();
 	}
 	auto &gstate = gstate_p.Cast<TableScanGlobalSourceState>();
@@ -432,7 +448,7 @@ InsertionOrderPreservingMap<string> PhysicalTableScan::ExtraSourceParams(GlobalS
 
 void PhysicalTableScan::GetMetrics(ClientContext &context, GlobalSourceState &gstate_p, LocalSourceState &lstate,
                                    const profiler_settings_t &requested_metrics, profiler_metrics_t &metrics) const {
-	if (!function.get_metrics && !function.rows_scanned) {
+	if (distributed_scan_empty || (!function.get_metrics && !function.rows_scanned)) {
 		return;
 	}
 	auto &gstate = gstate_p.Cast<TableScanGlobalSourceState>();

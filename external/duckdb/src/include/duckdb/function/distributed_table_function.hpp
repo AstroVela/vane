@@ -99,7 +99,9 @@ typedef unique_ptr<FunctionData> (*table_function_create_distributed_worker_bind
     const TableFunctionDistributedScanInput &input);
 
 //! Decode and install the assigned opaque splits into a deserialized worker
-//! bind object. An empty vector must install an empty scan.
+//! bind object. An empty vector is an explicit empty assignment: the callback
+//! must clear retained assignment state, and the runtime suppresses execution
+//! after the callback returns.
 typedef void (*table_function_apply_distributed_scan_splits_t)(optional_ptr<FunctionData> worker_bind_data,
                                                                const vector<DistributedScanSplit> &splits);
 

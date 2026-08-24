@@ -199,6 +199,16 @@ TEST_CASE("Distributed standalone unnest uses one scheduler-owned source split",
 	REQUIRE(ExecutePortableAssignment(connection, empty.worker_plan, empty.splits[0], 501).empty());
 }
 
+TEST_CASE("Distributed singleton source installs an explicit empty assignment", "[distributed][portable_source]") {
+	DuckDB db(nullptr);
+	Connection connection(db);
+	auto planned = PlanPortableSource(db, connection, "SELECT * FROM unnest([1, 2, 3])", 1);
+	REQUIRE(planned.splits.size() == 1);
+	auto explicit_empty =
+	    distributed::ScanSplit::EmptyExtension(planned.splits[0].extension_capability, planned.splits[0].split_codec);
+	REQUIRE(ExecutePortableAssignment(connection, planned.worker_plan, explicit_empty, 550).empty());
+}
+
 TEST_CASE("Distributed singleton source rejects malformed assignments", "[distributed][portable_source]") {
 	DuckDB db(nullptr);
 	Connection connection(db);

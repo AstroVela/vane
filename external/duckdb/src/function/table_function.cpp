@@ -68,6 +68,9 @@ unique_ptr<FunctionData> CreateDistributedSingletonWorkerBind(const TableFunctio
 }
 
 void ApplyDistributedSingletonSource(optional_ptr<FunctionData>, const vector<DistributedScanSplit> &splits) {
+	if (splits.empty()) {
+		return;
+	}
 	if (splits.size() != 1) {
 		throw InvalidInputException("distributed singleton source requires exactly one assigned split");
 	}

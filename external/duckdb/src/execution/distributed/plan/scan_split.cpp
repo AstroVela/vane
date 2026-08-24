@@ -401,6 +401,7 @@ static bool ApplyExtensionScanSplits(PhysicalTableScan &scan, const ScanSplitBat
 	scan.extra_info.total_files = optional_idx(assigned_splits.size());
 	scan.extra_info.filtered_files = optional_idx(assigned_splits.size());
 	scan.distributed_scan_splits_applied = true;
+	scan.distributed_scan_empty = batch.splits[0].empty;
 	return true;
 }
 
