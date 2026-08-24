@@ -26,6 +26,8 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Callable
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -185,6 +187,8 @@ class LocalEngineExecutor(LLMExecutor):
         self._engine_init_task: asyncio.Task[None] | None = None
         self._engine_shutdown_lock = threading.Lock()
         self._engine_shutdown_complete = False
+        self._engine_shutdown_future: Future[None] | None = None
+        self._deferred_loop_stop_registered = False
         self._lifecycle_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_called = False
@@ -328,8 +332,30 @@ class LocalEngineExecutor(LLMExecutor):
             try:
                 self._shutdown_engine_once()
             finally:
-                self.loop.close()
-                asyncio.set_event_loop(None)
+                try:
+                    self.loop.close()
+                    asyncio.set_event_loop(None)
+                finally:
+                    self._shutdown_complete = True
+
+    @staticmethod
+    def _stop_event_loop_threadsafe(loop: asyncio.AbstractEventLoop) -> None:
+        if loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except RuntimeError:
+            pass
+
+    def _stop_event_loop_after_shutdown(
+        self,
+        shutdown_future: Future[None],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if self._deferred_loop_stop_registered:
+            return
+        self._deferred_loop_stop_registered = True
+        shutdown_future.add_done_callback(lambda _future: self._stop_event_loop_threadsafe(loop))
 
     async def _shutdown_on_event_loop(self) -> None:
         """Finish initialization, cancel generation, then release the engine."""
@@ -763,27 +789,47 @@ class LocalEngineExecutor(LLMExecutor):
 
             loop = getattr(self, "loop", None)
             loop_thread = getattr(self, "loop_thread", None)
+            deferred_loop_stop = False
             try:
                 if loop is not None and loop_thread is not None and loop_thread.is_alive() and not loop.is_closed():
                     if threading.current_thread() is loop_thread:
                         self._shutdown_engine_once()
                     else:
-                        shutdown_future = asyncio.run_coroutine_threadsafe(self._shutdown_on_event_loop(), loop)
-                        shutdown_future.result()
+                        shutdown_future = self._engine_shutdown_future
+                        if shutdown_future is None:
+                            shutdown_future = asyncio.run_coroutine_threadsafe(self._shutdown_on_event_loop(), loop)
+                            self._engine_shutdown_future = shutdown_future
+                        if self.engine_ready.is_set():
+                            shutdown_timeout_s = None
+                        else:
+                            try:
+                                shutdown_timeout_s = self._engine_ready_wait_timeout_s()
+                            except TimeoutError:
+                                shutdown_timeout_s = 0.0
+                        try:
+                            shutdown_future.result(timeout=shutdown_timeout_s)
+                        except FutureTimeoutError:
+                            if shutdown_future.done():
+                                raise
+                            # A synchronous engine constructor blocks its owning
+                            # event loop and cannot be cancelled safely. Return
+                            # at the configured/query deadline, but retain the
+                            # shutdown coroutine so it tears the engine down on
+                            # that loop if initialization eventually finishes.
+                            self._stop_event_loop_after_shutdown(shutdown_future, loop)
+                            deferred_loop_stop = True
+                            return
                 else:
                     # Ray-actor mode constructs and tears down the engine on the
                     # actor directly; use_threading=False has no loop thread.
                     self._shutdown_engine_once()
             finally:
-                if loop is not None and loop_thread is not None:
-                    if not loop.is_closed():
-                        try:
-                            loop.call_soon_threadsafe(loop.stop)
-                        except RuntimeError:
-                            pass
+                if loop is not None and loop_thread is not None and not deferred_loop_stop:
+                    self._stop_event_loop_threadsafe(loop)
                     if threading.current_thread() is not loop_thread:
                         loop_thread.join()
-                self._shutdown_complete = True
+                if not deferred_loop_stop:
+                    self._shutdown_complete = True
 
 
 class RayActorExecutorMixin:

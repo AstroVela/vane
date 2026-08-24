@@ -33,6 +33,12 @@ def test_prompt_options_are_plain_closed_mappings():
     assert normalize_prompt_options("openai", options, relation=False) == options
 
 
+def test_prompt_options_declares_sglang_native_token_limit():
+    options: PromptOptions = {"max_new_tokens": 32}
+
+    assert normalize_prompt_options("sglang", options, relation=False) == options
+
+
 def test_prompt_outer_normalization_leaves_provider_values_for_adapter_validation():
     options: PromptOptions = {"temperature": -0.1}
 

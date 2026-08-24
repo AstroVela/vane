@@ -53,7 +53,11 @@ class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
             except json.JSONDecodeError as exc:
                 raise ValueError("sglang sampling_params JSON could not be parsed") from exc
         if isinstance(sampling_params, Mapping):
-            return dict(sampling_params)
+            materialized = dict(sampling_params)
+            max_tokens = materialized.pop("max_tokens", None)
+            if max_tokens is not None:
+                materialized.setdefault("max_new_tokens", max_tokens)
+            return materialized
         raise TypeError("sglang sampling_params must be a mapping or JSON object")
 
     def _create_engine(self) -> None:
@@ -168,6 +172,14 @@ def normalize_options(options: Any | None) -> dict[str, Any]:
     merged.update(options)
     merged["engine_args"] = dict(merged.get("engine_args") or {})
     merged["generate_args"] = dict(merged.get("generate_args") or {})
+    if "model_path" in merged["engine_args"]:
+        raise ValueError("sglang engine_args.model_path is not supported; use the top-level model argument")
+    if "stream" in merged["generate_args"]:
+        stream = merged["generate_args"]["stream"]
+        if not isinstance(stream, bool):
+            raise TypeError("sglang generate_args.stream must be a bool")
+        if stream:
+            raise ValueError("sglang generate_args.stream=True is not supported")
     merged["on_error"] = str(merged.get("on_error") or "raise").lower()
     if merged["on_error"] not in ("raise", "log", "null"):
         raise ValueError("sglang on_error must be one of: raise, log, null")
@@ -203,9 +215,20 @@ def build_executor(model: str, options: Any | None) -> LLMExecutor:
                 engine_init_timeout_s=opts.get("engine_init_timeout_s"),
                 actor_cls=SGLangRayLocalExecutor,
             )
-        from vane.execution.vllm import RemoteVLLMExecutor
+        from vane.execution.vllm import RemoteVLLMExecutor, _attach_vllm_cleanup_failure
 
-        return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
+        try:
+            return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
+        except BaseException as construction_error:
+            try:
+                llm_actors.shutdown()
+            except BaseException as cleanup_error:
+                _attach_vllm_cleanup_failure(
+                    construction_error,
+                    "sglang actor pool construction rollback",
+                    cleanup_error,
+                )
+            raise
 
     opts = _restore_native_vllm_secrets(opts)
     return SGLangLocalExecutor(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -151,6 +152,46 @@ def test_sglang_shutdown_waits_for_initialization_and_closes_late_engine(monkeyp
         executor.submit(None, ["late"], pa.table({"prompt": ["late"]}))
     with pytest.raises(RuntimeError, match="executor is shutting down"):
         asyncio.run(executor.submit_async(["late"], pa.table({"prompt": ["late"]})))
+
+
+def test_sglang_shutdown_timeout_defers_cleanup_until_initialization_finishes(monkeypatch):
+    init_started = threading.Event()
+    allow_init = threading.Event()
+    instances = []
+
+    class StalledEngine(_FakeEngine):
+        def __init__(self, model_path=None, **kwargs):
+            init_started.set()
+            assert allow_init.wait(timeout=2)
+            super().__init__(model_path=model_path, **kwargs)
+            instances.append(self)
+
+    sglang_module = types.ModuleType("sglang")
+    sglang_module.Engine = StalledEngine
+    monkeypatch.setitem(sys.modules, "sglang", sglang_module)
+
+    from vane.execution.sglang import SGLangLocalExecutor
+
+    executor = SGLangLocalExecutor("test-model", {}, {}, engine_init_timeout_s=0.05)
+    assert init_started.wait(timeout=2)
+
+    started = time.monotonic()
+    executor.shutdown()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert executor.loop_thread.is_alive()
+    assert executor._shutdown_complete is False
+
+    allow_init.set()
+    executor.loop_thread.join(timeout=2)
+
+    assert executor.loop_thread.is_alive() is False
+    assert executor._shutdown_complete is True
+    assert len(instances) == 1
+    assert instances[0].shutdown_calls == 1
+    assert instances[0].shutdown_loop is instances[0].creation_loop
+    assert executor.llm is None
 
 
 def test_sglang_shutdown_cancels_generation_before_engine_teardown(monkeypatch):
@@ -352,6 +393,45 @@ def test_sglang_plan_lowers_prompt_controls_into_sampling_params():
     assert sampling["json_schema"] == '{"type": "object"}'
 
 
+@pytest.mark.parametrize(
+    ("sampling_params", "expected"),
+    [
+        ({"max_tokens": 32}, {"max_new_tokens": 32}),
+        ({"max_tokens": 32, "max_new_tokens": 40}, {"max_new_tokens": 40}),
+    ],
+)
+def test_sglang_plan_translates_nested_max_tokens_alias(sampling_params, expected):
+    from vane.ai.providers.sglang import NativeSGLangPromptPlan
+
+    original = dict(sampling_params)
+    plan = NativeSGLangPromptPlan(
+        sglang_options={"generate_args": {"sampling_params": sampling_params}},
+    )
+
+    options = plan.build_physical_vllm_options()
+
+    assert options["generate_args"]["sampling_params"] == expected
+    assert sampling_params == original
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"engine_args": {"model_path": "other-model"}}, "engine_args.model_path"),
+        ({"generate_args": {"stream": True}}, "stream=True"),
+        ({"generate_args": {"stream": 1}}, "stream.*bool"),
+    ],
+)
+def test_sglang_normalize_rejects_conflicting_or_streaming_options(options, message):
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+    from vane.execution.sglang import normalize_options
+
+    envelope = _build_native_vllm_options_argument(options, engine="sglang")
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        normalize_options(envelope)
+
+
 def test_sglang_builder_forwards_background_loop_controls(monkeypatch):
     import vane.execution.sglang as sglang
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -412,3 +492,34 @@ def test_sglang_secrets_restore_before_named_pool_creation(monkeypatch):
     assert leases == {}
     assert captured["engine_args"]["hf_token"] == "hf_SGLANG-ENGINE-TOKEN"
     assert captured["generate_args"]["api_key"] == "sk-SGLANG-GENERATE-KEY"
+
+
+def test_sglang_anonymous_pool_rolls_back_remote_executor_construction(monkeypatch):
+    import vane.execution.sglang as sglang
+    import vane.execution.vllm as vllm
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
+
+    events = []
+
+    class Owner:
+        def shutdown(self):
+            events.append("owner-shutdown")
+
+    owner = Owner()
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(vllm, "LLMActors", lambda **_kwargs: owner)
+
+    def fail_remote_executor(_actors, *, pool_name=None):
+        assert pool_name is None
+        events.append("remote-construction")
+        raise KeyboardInterrupt("construction interrupted")
+
+    monkeypatch.setattr(vllm, "RemoteVLLMExecutor", fail_remote_executor)
+    envelope = _build_native_vllm_options_argument({"use_ray": True}, engine="sglang")
+
+    with pytest.raises(KeyboardInterrupt, match="construction interrupted"):
+        sglang.build_executor("test-model", envelope)
+
+    assert events == ["remote-construction", "owner-shutdown"]

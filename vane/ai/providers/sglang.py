@@ -68,7 +68,17 @@ def _validate_sglang_prompt_options(options: Mapping[str, Any]) -> dict[str, Any
             raise TypeError(f"Prompt option {name!r} must be a mapping")
         _validate_sglang_json(value, name)
 
+    engine_args = copied.get("engine_args", {})
+    if "model_path" in engine_args:
+        raise ValueError("Prompt option 'engine_args.model_path' is not supported; use the top-level 'model' argument")
+
     generate_args = copied.get("generate_args", {})
+    if "stream" in generate_args:
+        stream = generate_args["stream"]
+        if not isinstance(stream, bool):
+            raise TypeError("Prompt option 'generate_args.stream' must be a bool")
+        if stream:
+            raise ValueError("Prompt option 'generate_args.stream=True' is not supported")
     sampling_params = generate_args.get("sampling_params")
     if isinstance(sampling_params, str):
         try:
@@ -178,6 +188,9 @@ class NativeSGLangPromptPlan(NativeInferencePlan):
             raise TypeError("SGLang sampling_params must be a mapping or JSON string")
         generate_args["sampling_params"] = sampling_params
 
+        max_tokens = sampling_params.pop("max_tokens", None)
+        if max_tokens is not None:
+            sampling_params.setdefault("max_new_tokens", max_tokens)
         for name, value in sampling_overrides.items():
             sampling_params.setdefault(name, value)
         if self.return_format is not None:

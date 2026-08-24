@@ -40,6 +40,8 @@ class PromptOptions(TypedDict, total=False):
 
     # Anthropic keeps its native output-token name.
     max_tokens: int | None
+    # SGLang keeps its native output-token name.
+    max_new_tokens: int | None
     top_k: int | None
 
     # Native vLLM provider options.
