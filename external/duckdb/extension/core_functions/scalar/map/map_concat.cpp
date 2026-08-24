@@ -3,6 +3,7 @@
 #include "duckdb/parser/expression/bound_expression.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/unordered_map.hpp"
@@ -163,6 +164,9 @@ unique_ptr<FunctionData> MapConcatBind(ClientContext &context, ScalarFunction &b
 		}
 		if (map.id() != LogicalTypeId::MAP) {
 			throw InvalidInputException("MAP_CONCAT only takes map arguments");
+		}
+		if (TypeVisitor::Contains(MapType::KeyType(map), FileLogicalType::IsFile)) {
+			throw BinderException("MAP_CONCAT does not support FILE map keys");
 		}
 		is_null = false;
 		if (IsEmptyMap(map)) {

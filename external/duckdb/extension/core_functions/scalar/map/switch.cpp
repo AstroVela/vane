@@ -5,6 +5,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 namespace duckdb {
 namespace {
@@ -48,6 +49,9 @@ unique_ptr<FunctionData> SwitchBindReturnType(ClientContext &context, ScalarFunc
 		throw BinderException("Switch: No map argument found");
 	}
 	auto &cases = arguments[map_index];
+	if (TypeVisitor::Contains(MapType::KeyType(cases->return_type), FileLogicalType::IsFile)) {
+		throw BinderException("SWITCH does not support FILE map keys");
+	}
 	if (cases->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		throw BinderException("SWITCH expected a constant map for the cases");
 	}

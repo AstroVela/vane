@@ -152,6 +152,31 @@ def test_file_comparison_supports_scalar_subqueries(connection):
     )
 
 
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (
+            "file('A', 'application/octet-stream', 0, 1, 'sha256:abcdef')",
+            "file('a', 'application/octet-stream', 0, 1, 'sha256:abcdef')",
+        ),
+        (
+            "file('x', 'TEXT/PLAIN', 0, 1, 'sha256:abcdef')",
+            "file('x', 'text/plain', 0, 1, 'sha256:abcdef')",
+        ),
+        (
+            "file('x', 'application/octet-stream', 0, 1, 'sha256:ABCDEF')",
+            "file('x', 'application/octet-stream', 0, 1, 'sha256:abcdef')",
+        ),
+    ],
+)
+def test_file_comparison_uses_binary_string_semantics(connection, left, right):
+    connection.execute("SET default_collation = 'nocase'")
+
+    assert connection.execute(
+        f"SELECT {left} = {right}, (SELECT {left}) = {right}, {left} != {right}, (SELECT {left}) != {right}"
+    ).fetchone() == (False, False, True, True)
+
+
 def test_file_comparison_does_not_duplicate_volatile_operands(connection):
     connection.execute("CREATE SEQUENCE file_comparison_sequence START 1")
 
@@ -284,6 +309,30 @@ def test_file_remains_usable_as_a_map_value(connection):
         "FILE",
         "s3://bucket/missing.bin",
     )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        FILE_WITH_NULL_METADATA,
+        f"struct_pack(value := {FILE_WITH_NULL_METADATA})",
+    ],
+)
+def test_file_rejects_map_concat_keys(connection, key):
+    with pytest.raises(vane.BinderException, match="MAP_CONCAT does not support FILE map keys"):
+        connection.execute(f"SELECT map_concat(map([{key}], [1]), map([{key}], [2]))").fetchone()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        FILE_WITH_NULL_METADATA,
+        f"struct_pack(value := {FILE_WITH_NULL_METADATA})",
+    ],
+)
+def test_file_rejects_switch_keys(connection, key):
+    with pytest.raises(vane.BinderException, match="SWITCH does not support FILE map keys"):
+        connection.execute(f"SELECT switch({key}, map([{key}], [1]))").fetchone()
 
 
 @pytest.mark.parametrize(

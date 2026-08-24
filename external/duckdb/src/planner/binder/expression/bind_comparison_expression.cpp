@@ -6,6 +6,8 @@
 
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/bound_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/collate_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -190,7 +192,13 @@ static unique_ptr<ParsedExpression> FileFieldExpression(const Expression &file, 
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(make_uniq<BoundExpression>(file.Copy()));
 	children.push_back(make_uniq<ConstantExpression>(Value(StructType::GetChildName(file.return_type, field_index))));
-	return make_uniq<OperatorExpression>(ExpressionType::STRUCT_EXTRACT, std::move(children));
+	unique_ptr<ParsedExpression> result =
+	    make_uniq<OperatorExpression>(ExpressionType::STRUCT_EXTRACT, std::move(children));
+	if (StructType::GetChildType(file.return_type, field_index).id() == LogicalTypeId::VARCHAR) {
+		result = make_uniq<CastExpression>(LogicalType::VARCHAR, std::move(result));
+		result = make_uniq<CollateExpression>("binary", std::move(result));
+	}
+	return result;
 }
 
 static unique_ptr<ParsedExpression> FileComparisonExpression(const Expression &left, const Expression &right,
