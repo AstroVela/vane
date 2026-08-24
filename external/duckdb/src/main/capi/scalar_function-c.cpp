@@ -523,8 +523,13 @@ duckdb_state duckdb_register_scalar_function_set(duckdb_connection connection, d
 		    duckdb::TypeVisitor::Contains(scalar_function.GetReturnType(), duckdb::LogicalTypeId::ANY)) {
 			return DuckDBError;
 		}
+		if (duckdb::TypeVisitor::Contains(scalar_function.GetReturnType(), duckdb::FileLogicalType::IsFile) ||
+		    duckdb::TypeVisitor::Contains(scalar_function.varargs, duckdb::FileLogicalType::IsFile)) {
+			return DuckDBError;
+		}
 		for (const auto &argument : scalar_function.arguments) {
-			if (duckdb::TypeVisitor::Contains(argument, duckdb::LogicalTypeId::INVALID)) {
+			if (duckdb::TypeVisitor::Contains(argument, duckdb::LogicalTypeId::INVALID) ||
+			    duckdb::TypeVisitor::Contains(argument, duckdb::FileLogicalType::IsFile)) {
 				return DuckDBError;
 			}
 		}

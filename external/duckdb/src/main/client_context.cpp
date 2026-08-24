@@ -13,6 +13,7 @@
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/progress_bar/progress_bar.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
@@ -34,6 +35,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -1295,6 +1297,20 @@ void ClientContext::DisableProfiling() {
 }
 
 void ClientContext::RegisterFunction(CreateFunctionInfo &info) {
+	if (info.type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		auto &scalar_info = info.Cast<CreateScalarFunctionInfo>();
+		for (auto &function : scalar_info.functions.functions) {
+			if (TypeVisitor::Contains(function.GetReturnType(), FileLogicalType::IsFile) ||
+			    TypeVisitor::Contains(function.varargs, FileLogicalType::IsFile)) {
+				throw InvalidInputException("FILE inputs and outputs are not supported by scalar UDFs yet");
+			}
+			for (auto &argument : function.arguments) {
+				if (TypeVisitor::Contains(argument, FileLogicalType::IsFile)) {
+					throw InvalidInputException("FILE inputs and outputs are not supported by scalar UDFs yet");
+				}
+			}
+		}
+	}
 	RunFunctionInTransaction([&]() {
 		auto existing_function = Catalog::GetEntry<ScalarFunctionCatalogEntry>(*this, INVALID_CATALOG, info.schema,
 		                                                                       info.name, OnEntryNotFound::RETURN_NULL);

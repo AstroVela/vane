@@ -203,6 +203,16 @@ TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
 		children[FileLogicalType::CHECKSUM] = make_uniq<Vector>(LogicalType::BIGINT);
 		REQUIRE_THROWS_WITH(FileLogicalType::Validate(malformed_vector, 1, "Vector FILE"),
 		                    Catch::Matchers::Contains("must have type VARCHAR, not BIGINT"));
+
+		auto actual_outer_type = LogicalType::STRUCT({{"payload", malformed_type}});
+		auto malformed_inner =
+		    Value::STRUCT(malformed_type, {Value("nested"), Value(), Value(), Value(), Value::BIGINT(1)});
+		auto nested_file = Value::STRUCT(actual_outer_type, {std::move(malformed_inner)});
+		nested_file.Reinterpret(LogicalType::STRUCT({{"payload", file_type}}));
+		result = con.Query("SELECT ?", nested_file);
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(),
+		                             "Query parameter FILE field \"checksum\" must have type VARCHAR, not BIGINT"));
 	}
 
 	SECTION("valid FILE values remain accepted") {
@@ -216,4 +226,21 @@ TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
 		REQUIRE(CHECK_COLUMN(result, 1, {0}));
 		REQUIRE(CHECK_COLUMN(result, 2, {1}));
 	}
+}
+
+TEST_CASE("Native scalar UDF FILE signatures are rejected", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	scalar_function_t function = [](DataChunk &, ExpressionState &, Vector &) {
+	};
+	auto file_type = FileLogicalType::Create();
+	auto nested_file_type = LogicalType::STRUCT({{"payload", file_type}});
+
+	REQUIRE_THROWS_WITH(con.CreateVectorizedFunction("file_return_udf", {}, file_type, function),
+	                    Catch::Matchers::Contains("FILE inputs and outputs are not supported by scalar UDFs yet"));
+	REQUIRE_THROWS_WITH(
+	    con.CreateVectorizedFunction("file_input_udf", {nested_file_type}, LogicalType::BOOLEAN, function),
+	    Catch::Matchers::Contains("FILE inputs and outputs are not supported by scalar UDFs yet"));
+	REQUIRE_THROWS_WITH(con.CreateVectorizedFunction("file_varargs_udf", {}, LogicalType::BOOLEAN, function, file_type),
+	                    Catch::Matchers::Contains("FILE inputs and outputs are not supported by scalar UDFs yet"));
 }

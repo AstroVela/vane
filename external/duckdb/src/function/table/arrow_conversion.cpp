@@ -143,33 +143,52 @@ static ArrowListOffsetData ConvertArrowListViewOffsetsTemplated(Vector &vector, 
 	auto &start_offset = result.start_offset;
 	auto &list_size = result.list_size;
 
-	list_size = 0;
 	auto offsets = ArrowBufferData<BUFFER_TYPE>(array, 1) + effective_offset;
 	auto sizes = ArrowBufferData<BUFFER_TYPE>(array, 2) + effective_offset;
 
 	// In ListArrays the offsets have to be sequential
 	// ListViewArrays do not have this same constraint
-	// for that reason we need to keep track of the lowest offset, so we can skip all the data that comes before it
-	// when we scan the child data
+	// For that reason we scan the full span between the lowest referenced offset and the highest referenced end.
+	// Gaps inside that span are masked by child_reachability below.
 
-	auto lowest_offset = size ? offsets[0] : 0;
+	bool has_referenced_children = false;
+	idx_t lowest_offset = 0;
+	idx_t highest_offset = 0;
 	auto list_data = FlatVector::GetData<list_entry_t>(vector);
 	for (idx_t i = 0; i < size; i++) {
 		auto &le = list_data[i];
-		le.offset = offsets[i];
-		le.length = sizes[i];
-		list_size += le.length;
-		if (sizes[i] != 0) {
-			lowest_offset = MinValue(lowest_offset, offsets[i]);
+		le.offset = NumericCast<idx_t>(offsets[i]);
+		le.length = NumericCast<idx_t>(sizes[i]);
+		if (le.length == 0) {
+			continue;
+		}
+		if (le.offset > NumericLimits<idx_t>::Maximum() - le.length) {
+			throw InvalidInputException("Arrow ListView offset and size overflow");
+		}
+		auto end_offset = le.offset + le.length;
+		if (!has_referenced_children) {
+			lowest_offset = le.offset;
+			highest_offset = end_offset;
+			has_referenced_children = true;
+		} else {
+			lowest_offset = MinValue(lowest_offset, le.offset);
+			highest_offset = MaxValue(highest_offset, end_offset);
 		}
 	}
-	start_offset = lowest_offset;
-	if (start_offset) {
-		// We start scanning the child data at the 'start_offset' so we need to fix up the created list entries
+	if (!has_referenced_children) {
+		start_offset = 0;
+		list_size = 0;
 		for (idx_t i = 0; i < size; i++) {
-			auto &le = list_data[i];
-			le.offset = le.offset <= start_offset ? 0 : le.offset - start_offset;
+			list_data[i].offset = 0;
 		}
+		return result;
+	}
+	start_offset = lowest_offset;
+	list_size = highest_offset - lowest_offset;
+	// We start scanning the child data at start_offset, so normalize every referenced list entry to that window.
+	for (idx_t i = 0; i < size; i++) {
+		auto &le = list_data[i];
+		le.offset = le.length == 0 ? 0 : le.offset - start_offset;
 	}
 	return result;
 }

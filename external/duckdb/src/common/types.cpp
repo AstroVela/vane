@@ -1748,62 +1748,89 @@ static void ValidateFileFieldType(const LogicalType &actual_type, idx_t field_in
 	}
 }
 
-void FileLogicalType::Validate(const Value &value, const string &source) {
+static void ValidateFileValue(const Value &value, const LogicalType &declared_type, const string &source) {
 	if (value.IsNull()) {
 		return;
 	}
-	auto &type = value.type();
-	if (IsFile(type)) {
+	if (!FileLogicalType::IsFile(declared_type) && !TypeVisitor::Contains(declared_type, FileLogicalType::IsFile)) {
+		return;
+	}
+	if (value.type().InternalType() != declared_type.InternalType()) {
+		throw InvalidInputException("%s value declared as %s has incompatible actual type %s", source, declared_type,
+		                            value.type());
+	}
+	if (FileLogicalType::IsFile(declared_type)) {
 		auto &children = StructValue::GetChildren(value);
-		if (children.size() != FIELD_COUNT) {
-			throw InvalidInputException("%s must contain exactly %llu fields", source, FIELD_COUNT);
+		if (children.size() != FileLogicalType::FIELD_COUNT) {
+			throw InvalidInputException("%s must contain exactly %llu fields", source, FileLogicalType::FIELD_COUNT);
 		}
-		for (idx_t field_index = 0; field_index < FIELD_COUNT; field_index++) {
+		for (idx_t field_index = 0; field_index < FileLogicalType::FIELD_COUNT; field_index++) {
 			ValidateFileFieldType(children[field_index].type(), field_index, source);
 		}
 
-		auto position_is_valid = !children[POSITION].IsNull();
-		auto size_is_valid = !children[SIZE].IsNull();
-		auto position = position_is_valid ? BigIntValue::Get(children[POSITION]) : 0;
-		auto size = size_is_valid ? BigIntValue::Get(children[SIZE]) : 0;
+		auto position_is_valid = !children[FileLogicalType::POSITION].IsNull();
+		auto size_is_valid = !children[FileLogicalType::SIZE].IsNull();
+		auto position = position_is_valid ? BigIntValue::Get(children[FileLogicalType::POSITION]) : 0;
+		auto size = size_is_valid ? BigIntValue::Get(children[FileLogicalType::SIZE]) : 0;
 		const string *checksum = nullptr;
-		if (!children[CHECKSUM].IsNull()) {
-			checksum = &StringValue::Get(children[CHECKSUM]);
+		if (!children[FileLogicalType::CHECKSUM].IsNull()) {
+			checksum = &StringValue::Get(children[FileLogicalType::CHECKSUM]);
 		}
-		ValidateFileFields(!children[URL].IsNull(), position_is_valid, position, size_is_valid, size, checksum, source);
-		return;
-	}
-	if (!TypeVisitor::Contains(type, IsFile)) {
+		ValidateFileFields(!children[FileLogicalType::URL].IsNull(), position_is_valid, position, size_is_valid, size,
+		                   checksum, source);
 		return;
 	}
 
-	switch (type.id()) {
+	switch (declared_type.id()) {
 	case LogicalTypeId::STRUCT:
-		for (auto &child : StructValue::GetChildren(value)) {
-			Validate(child, source);
+	case LogicalTypeId::UNION: {
+		auto &children = StructValue::GetChildren(value);
+		auto &declared_children = StructType::GetChildTypes(declared_type);
+		if (children.size() != declared_children.size()) {
+			throw InvalidInputException("%s container declared as %s must contain exactly %llu fields", source,
+			                            declared_type, declared_children.size());
 		}
-		return;
-	case LogicalTypeId::UNION:
-		Validate(UnionValue::GetValue(value), source);
-		return;
-	case LogicalTypeId::LIST:
-		for (auto &child : ListValue::GetChildren(value)) {
-			Validate(child, source);
+		if (declared_type.id() == LogicalTypeId::STRUCT) {
+			for (idx_t child_index = 0; child_index < children.size(); child_index++) {
+				ValidateFileValue(children[child_index], declared_children[child_index].second, source);
+			}
+			return;
 		}
-		return;
-	case LogicalTypeId::MAP:
-		for (auto &child : MapValue::GetChildren(value)) {
-			Validate(child, source);
+		if (children[0].type() != LogicalType::UTINYINT || children[0].IsNull()) {
+			throw InvalidInputException("%s UNION tag must be a non-NULL UTINYINT", source);
 		}
-		return;
-	case LogicalTypeId::ARRAY:
-		for (auto &child : ArrayValue::GetChildren(value)) {
-			Validate(child, source);
+		auto tag = UTinyIntValue::Get(children[0]);
+		if (tag >= UnionType::GetMemberCount(declared_type)) {
+			throw InvalidInputException("%s UNION tag is out of range", source);
 		}
+		ValidateFileValue(children[tag + 1], declared_children[tag + 1].second, source);
 		return;
-	default:
-		throw InternalException("Unsupported logical type containing FILE: %s", type.ToString());
 	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::MAP:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateFileValue(child, ListType::GetChildType(declared_type), source);
+		}
+		return;
+	case LogicalTypeId::ARRAY: {
+		auto &children = ArrayValue::GetChildren(value);
+		auto declared_size = ArrayType::GetSize(declared_type);
+		if (children.size() != declared_size) {
+			throw InvalidInputException("%s ARRAY declared with %llu elements contains %llu values", source,
+			                            declared_size, children.size());
+		}
+		for (auto &child : children) {
+			ValidateFileValue(child, ArrayType::GetChildType(declared_type), source);
+		}
+		return;
+	}
+	default:
+		throw InternalException("Unsupported logical type containing FILE: %s", declared_type.ToString());
+	}
+}
+
+void FileLogicalType::Validate(const Value &value, const string &source) {
+	ValidateFileValue(value, value.type(), source);
 }
 
 void FileLogicalType::Validate(Vector &value, idx_t count, const string &source) {

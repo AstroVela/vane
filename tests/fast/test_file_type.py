@@ -1277,6 +1277,53 @@ def test_file_type_arrow_ignores_children_of_null_lists(connection):
     ]
 
 
+def test_file_type_arrow_list_view_validates_sparse_child_span(connection):
+    pa = pytest.importorskip("pyarrow")
+    if not hasattr(pa, "ListViewArray"):
+        pytest.skip("The PyArrow version does not support ListViewArray")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+    file_field = pa.field(
+        "item",
+        file_storage_type,
+        metadata={
+            b"ARROW:extension:name": b"vane.file",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    file_values = [
+        {
+            "url": None,
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        }
+        for _ in range(101)
+    ]
+    file_values[0]["url"] = "first"
+    file_values[100]["url"] = "last"
+    list_type = pa.list_view(file_field)
+    list_values = pa.ListViewArray.from_arrays(
+        offsets=pa.array([0, 100], type=pa.int32()),
+        sizes=pa.array([1, 1], type=pa.int32()),
+        values=pa.array(file_values, type=file_storage_type),
+        type=list_type,
+    )
+    arrow_table = pa.Table.from_arrays([list_values], schema=pa.schema([pa.field("value", list_type)]))
+
+    rows = connection.from_arrow(arrow_table).project("typeof(value[1]), (value[1]).url").fetchall()
+    assert rows == [("FILE", "first"), ("FILE", "last")]
+
+
 def test_file_type_round_trips_through_local_exchange(connection):
     pytest.importorskip("pyarrow")
 

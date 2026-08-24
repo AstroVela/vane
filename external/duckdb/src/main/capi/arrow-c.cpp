@@ -58,6 +58,9 @@ duckdb_error_data duckdb_data_chunk_to_arrow(duckdb_arrow_options arrow_options,
 	    *arrow_options_wrapper->properties.client_context, dchunk->GetTypes());
 
 	try {
+		for (idx_t column_index = 0; column_index < dchunk->ColumnCount(); column_index++) {
+			duckdb::FileLogicalType::Validate(dchunk->data[column_index], dchunk->size(), "Arrow FILE");
+		}
 		ArrowConverter::ToArrowArray(*dchunk, out_arrow_array, arrow_options_wrapper->properties, extension_type_cast);
 	} catch (const duckdb::Exception &ex) {
 		return duckdb_create_error_data(DUCKDB_ERROR_INVALID_INPUT, ex.what());

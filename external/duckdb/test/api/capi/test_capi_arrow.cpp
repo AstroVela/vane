@@ -374,6 +374,35 @@ TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 		duckdb_destroy_result(&result);
 	}
 
+	SECTION("DuckDB-to-Arrow conversion validates FILE values") {
+		duckdb_result result;
+		REQUIRE(duckdb_query(tester.connection, "SELECT NULL::FILE AS value", &result) == DuckDBSuccess);
+		auto file_type = duckdb_column_logical_type(&result, 0);
+		auto chunk = duckdb_create_data_chunk(&file_type, 1);
+		REQUIRE(chunk != nullptr);
+		duckdb_data_chunk_set_size(chunk, 1);
+
+		auto file_vector = duckdb_data_chunk_get_vector(chunk, 0);
+		auto url_vector = duckdb_struct_vector_get_child(file_vector, FileLogicalType::URL);
+		duckdb_vector_ensure_validity_writable(url_vector);
+		duckdb_validity_set_row_invalid(duckdb_vector_get_validity(url_vector), 0);
+
+		duckdb_arrow_options arrow_options;
+		duckdb_connection_get_arrow_options(tester.connection, &arrow_options);
+		ArrowArray arrow_array;
+		arrow_array.Init();
+		auto error = duckdb_data_chunk_to_arrow(arrow_options, chunk, &arrow_array);
+		REQUIRE(error != nullptr);
+		REQUIRE(StringUtil::Contains(duckdb_error_data_message(error), "Arrow FILE url cannot be NULL"));
+		REQUIRE(arrow_array.release == nullptr);
+
+		duckdb_destroy_error_data(&error);
+		duckdb_destroy_arrow_options(&arrow_options);
+		duckdb_destroy_data_chunk(&chunk);
+		duckdb_destroy_logical_type(&file_type);
+		duckdb_destroy_result(&result);
+	}
+
 	SECTION("roundtrip: duckdb table -> arrow -> duckdb chunk, validate correctness") {
 		// 1. Create and populate table
 		REQUIRE_NO_FAIL(tester.Query("CREATE TABLE big_table(i INTEGER);"));

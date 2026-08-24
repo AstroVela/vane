@@ -217,6 +217,39 @@ TEST_CASE("Test scalar functions with INVALID and ANY types", "[capi]") {
 	duckdb_destroy_logical_type(&invalid_type);
 }
 
+TEST_CASE("Test scalar functions with FILE types", "[capi][file]") {
+	CAPITester tester;
+	REQUIRE(tester.OpenDatabase(nullptr));
+
+	duckdb_result result;
+	REQUIRE(duckdb_query(tester.connection, "SELECT NULL::FILE", &result) == DuckDBSuccess);
+	auto file_type = duckdb_column_logical_type(&result, 0);
+	auto nested_file_type = duckdb_create_list_type(file_type);
+	auto boolean_type = duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN);
+
+	auto function = DummyScalarFunction();
+	duckdb_scalar_function_set_return_type(function, file_type);
+	REQUIRE(duckdb_register_scalar_function(tester.connection, function) == DuckDBError);
+	duckdb_destroy_scalar_function(&function);
+
+	function = DummyScalarFunction();
+	duckdb_scalar_function_add_parameter(function, nested_file_type);
+	duckdb_scalar_function_set_return_type(function, boolean_type);
+	REQUIRE(duckdb_register_scalar_function(tester.connection, function) == DuckDBError);
+	duckdb_destroy_scalar_function(&function);
+
+	function = DummyScalarFunction();
+	duckdb_scalar_function_set_varargs(function, file_type);
+	duckdb_scalar_function_set_return_type(function, boolean_type);
+	REQUIRE(duckdb_register_scalar_function(tester.connection, function) == DuckDBError);
+	duckdb_destroy_scalar_function(&function);
+
+	duckdb_destroy_logical_type(&boolean_type);
+	duckdb_destroy_logical_type(&nested_file_type);
+	duckdb_destroy_logical_type(&file_type);
+	duckdb_destroy_result(&result);
+}
+
 void my_dummy_bind(duckdb_bind_info) {
 }
 
