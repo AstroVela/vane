@@ -697,6 +697,7 @@ def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
 
     ready = FakeReady()
     executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._shutdown_called = False
     executor.use_threading = True
     executor.engine_ready = ready
     executor.engine_error_message = None

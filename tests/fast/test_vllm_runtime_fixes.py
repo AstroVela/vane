@@ -29,6 +29,7 @@ def _native_vllm_envelope(public_options_json):
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": public_options_json,
         "__vane_vllm_secret_payload": b'{"payload_version":1,"values":[]}',
+        "engine": "vllm",
     }
 
 
@@ -291,6 +292,7 @@ def test_vllm_opaque_secret_payload_is_strictly_validated(secret_payload, messag
         "__vane_vllm_payload_version": 1,
         "__vane_vllm_public_options_json": json.dumps(public_options),
         "__vane_vllm_secret_payload": secret_payload,
+        "engine": "vllm",
     }
 
     normalized = vllm.normalize_options(envelope)
@@ -368,6 +370,27 @@ def test_native_executor_materializes_structured_outputs_params(monkeypatch):
     assert isinstance(executor.sampling_params.structured_outputs, StructuredOutputsParams)
     assert executor.sampling_params.structured_outputs.options == {"json": schema}
     assert executor.sampling_params.options == {"max_tokens": 8}
+
+
+def test_local_vllm_executor_explicitly_shuts_down_engine():
+    from vane.execution.vllm import LocalVLLMExecutor
+
+    class Engine:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
+
+    engine = Engine()
+    executor = LocalVLLMExecutor.__new__(LocalVLLMExecutor)
+    executor.llm = engine
+
+    executor._shutdown_engine()
+    executor._shutdown_engine()
+
+    assert engine.shutdown_calls == 1
+    assert executor.llm is None
 
 
 def test_ray_actor_releases_only_terminal_per_executor_state():
@@ -576,6 +599,7 @@ def test_ray_actor_abort_waits_for_late_wait_token_before_releasing_state():
 
 
 def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
+    import vane.execution._llm_executor as llm_executor
     import vane.execution.vllm as vllm
 
     executor = vllm.RayLocalVLLMExecutor.__new__(vllm.RayLocalVLLMExecutor)
@@ -605,8 +629,8 @@ def test_ray_actor_abort_wait_uses_control_rpc_timeout(monkeypatch):
         sleep_calls.append(delay)
 
     monkeypatch.setenv("VANE_VLLM_CONTROL_RPC_TIMEOUT_S", "10")
-    monkeypatch.setattr(vllm, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
-    monkeypatch.setattr(vllm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(llm_executor, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(llm_executor.asyncio, "sleep", fake_sleep)
 
     with pytest.raises(RuntimeError, match="abort waiter timeout-wait did not acknowledge termination"):
         asyncio.run(executor.abort_executor("executor", "timeout-wait"))
@@ -638,6 +662,7 @@ def test_ray_actor_abort_installs_tombstone_before_awaiting_engine_abort():
     executor.completed_tasks = deque()
     executor.error_message = None
     executor._shutdown_called = False
+    executor._lifecycle_lock = threading.Lock()
     executor._finished_submitting = False
     executor.running_task_count = 0
     executor.task_count_lock = threading.Lock()

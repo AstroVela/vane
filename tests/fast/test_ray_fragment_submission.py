@@ -12094,12 +12094,13 @@ def test_fte_attempt_create_starts_status_watcher(monkeypatch):
 
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
-        stats = handle.fte_registry_stats()["event_schedulers"]["query-fte-watcher"]
-        if stats["event_counts"].get("TaskStatusChanged") == 1:
+        registry_stats = handle.fte_registry_stats()
+        stats = registry_stats["event_schedulers"]["query-fte-watcher"]
+        if stats["event_counts"].get("TaskStatusChanged") == 1 and registry_stats["status_watcher_count"] == 0:
             break
         time.sleep(0.01)
     else:
-        raise AssertionError("status watcher did not publish terminal task status")
+        raise AssertionError("status watcher did not publish terminal task status and unregister")
 
     assert ("wait_status", running.task_id.to_dict(), None, 1.0) in actor.fte_calls
     query_status = handle.fte_query_status("query-fte-watcher")

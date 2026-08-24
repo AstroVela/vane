@@ -147,14 +147,15 @@ def build_ai_prompt_sql_spec(
     # vLLM already has a native, relation-scoped physical operator. Keep its
     # executor alive across every input batch and let PhysicalVLLM send the
     # single terminal signal when the relation is exhausted.
-    from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+    from vane.ai.protocols import NativeInferencePlan
+    from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         if image_input:
-            raise ValueError("native vLLM ai_prompt does not support image inputs")
+            raise ValueError("native inference ai_prompt does not support image inputs")
 
         native_options = descriptor.build_physical_vllm_options()
-        options_argument = _build_native_vllm_options_argument(native_options)
+        options_argument = _build_native_vllm_options_argument(native_options, engine=descriptor.get_engine())
 
         spec = {
             "execution_kind": "native_vllm",

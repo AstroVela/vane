@@ -59,7 +59,7 @@ from vane.ai.options import (
     normalize_prompt_options,
     validate_embed_options,
 )
-from vane.ai.protocols import NativePrompterPlan
+from vane.ai.protocols import NativeInferencePlan, NativePrompterPlan
 from vane.ai.provider import (
     Provider,
     ProviderCapabilityError,
@@ -69,7 +69,7 @@ from vane.ai.provider import (
     _safe_provider_execution_error,
     load_provider,
 )
-from vane.ai.providers.vllm import NativeVLLMPromptPlan, _build_native_vllm_options_argument
+from vane.ai.providers.vllm import _build_native_vllm_options_argument
 from vane.ai.typing import JSONSchema, UDFOptions
 
 if TYPE_CHECKING:
@@ -1660,11 +1660,12 @@ def _prompt_provider_family(provider: Any) -> str | None:
         "vane.ai.providers.anthropic": "anthropic",
         "vane.ai.providers.google": "google",
         "vane.ai.providers.vllm": "vllm",
+        "vane.ai.providers.sglang": "sglang",
     }
     if module in families:
         return families[module]
     name = getattr(provider, "name", None)
-    if isinstance(name, str) and name.casefold() in {"openai", "anthropic", "google", "vllm"}:
+    if isinstance(name, str) and name.casefold() in {"openai", "anthropic", "google", "vllm", "sglang"}:
         return name.casefold()
     return None
 
@@ -1705,9 +1706,9 @@ def _prepare_prompt_call(
     max_concurrency = prepared.pop("max_concurrency_per_actor", None)
     max_retries = prepared.pop("max_retries", None)
 
-    if family == "vllm":
+    if family in {"vllm", "sglang"}:
         if return_raw_response:
-            raise ValueError("Provider 'vllm' does not support return_raw_response")
+            raise ValueError(f"Provider {family!r} does not support return_raw_response")
         prepared["actor_number"] = actor_number if actor_number is not None else 1
         prepared["batch_size"] = batch_size if batch_size is not None else 128
         prepared["max_retries"] = max_retries if max_retries is not None else 0
@@ -1724,7 +1725,7 @@ def _prepare_prompt_call(
         provider_name = getattr(resolved_provider, "name", type(resolved_provider).__name__)
         raise ValueError(f"Provider {provider_name!r} is not a prompt provider") from exc
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         descriptor.on_error = on_error
         return descriptor, UDFOptions(on_error=on_error), execution_backend, structured_output
     if isinstance(descriptor, NativePrompterPlan):
@@ -1787,7 +1788,7 @@ def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Expre
     return vane.FunctionExpression("__vane_ai_prompt", message)
 
 
-def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPromptPlan) -> vane.Expression:
+def _build_native_vllm_expression(messages: list[Any], descriptor: NativeInferencePlan) -> vane.Expression:
     """Build the native row-preserving ``vllm()`` expression."""
     message_expressions = [as_expression(message) for message in messages]
     if len(message_expressions) == 1:
@@ -1806,7 +1807,9 @@ def _build_native_vllm_expression(messages: list[Any], descriptor: NativeVLLMPro
             messages_expr,
         )
 
-    options_argument = _build_native_vllm_options_argument(descriptor.build_physical_vllm_options())
+    options_argument = _build_native_vllm_options_argument(
+        descriptor.build_physical_vllm_options(), engine=descriptor.get_engine()
+    )
 
     return vane.FunctionExpression(
         "vllm",
@@ -1855,9 +1858,9 @@ def _prompt_relation(
         relation=True,
     )
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         if any(value != "VARCHAR" for value in message_types):
-            raise ValueError("Provider 'vllm' does not support Prompt image inputs")
+            raise ValueError(f"Provider {descriptor.get_provider()!r} does not support Prompt image inputs")
         expression = _build_native_vllm_expression(message_expressions, descriptor)
         if structured_output is not None:
             input_column = "__vane_vllm_response"
@@ -1942,7 +1945,7 @@ def _prompt_expression(
         relation=False,
     )
 
-    if isinstance(descriptor, NativeVLLMPromptPlan):
+    if isinstance(descriptor, NativeInferencePlan):
         validated_messages = [_validated_prompt_message(message, text_only=True) for message in message_expressions]
         expression = _build_native_vllm_expression(validated_messages, descriptor)
         if structured_output is None:

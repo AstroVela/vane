@@ -92,10 +92,31 @@ ADBC facade.
 Optional features are provided as extras:
 
 ```bash
-pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
+pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers likewise)
+pip install 'vane-ai[vllm]'     # Native vLLM inference on Linux x86-64
+pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
 ```
+
+The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
+CUDA-specific wheel index for the host. For a CUDA 12.9 environment, install the extra and then apply SGLang's cu129
+wheel overrides before running Vane:
+
+```bash
+uv pip install 'vane-ai[sglang]'
+uv pip install --force-reinstall torch==2.11.0 torchaudio==2.11.0 torchvision \
+  --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel==0.4.5 \
+  --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm==0.1.5.post1 \
+  --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
+This CUDA 12.9 installation path was smoke-tested on NVIDIA Ada (compute capability 8.9) with driver 570.207,
+PyTorch 2.11.0+cu129, `sglang-kernel` 0.4.5+cu129, and Ray 2.58.0. This is a validated reference configuration, not an
+exhaustive hardware compatibility list. Do not run a later unconstrained dependency sync after the overrides, because
+it can replace the cu129 packages with SGLang's default CUDA 13 variants.
 
 The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
 
