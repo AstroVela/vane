@@ -590,6 +590,47 @@ def test_file_type_round_trips_through_arrow(connection):
     ]
 
 
+def test_file_type_arrow_parent_null_hides_child_values(connection):
+    pa = pytest.importorskip("pyarrow")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+    hidden_file = pa.StructArray.from_arrays(
+        [
+            pa.array(["hidden-url"]),
+            pa.array(["application/hidden"]),
+            pa.array([1], type=pa.int64()),
+            pa.array([2], type=pa.int64()),
+            pa.array(["sha256:hidden"]),
+        ],
+        type=file_storage_type,
+        mask=pa.array([True]),
+    )
+    file_field = pa.field(
+        "value",
+        file_storage_type,
+        metadata={
+            b"ARROW:extension:name": b"vane.file",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    arrow_table = pa.Table.from_arrays([hidden_file], schema=pa.schema([file_field]))
+
+    row = (
+        connection.from_arrow(arrow_table)
+        .project("value IS NULL, value.url, value.content_type, value.position, value.size, value.checksum")
+        .fetchone()
+    )
+    assert row == (True, None, None, None, None, None)
+
+
 def test_file_type_rejects_invalid_arrow_values(connection):
     pa = pytest.importorskip("pyarrow")
 

@@ -323,8 +323,12 @@ struct ArrowFile {
 	}
 
 	static void ArrowToDuck(ClientContext &, Vector &source, Vector &result, idx_t count) {
+		source.Flatten(count);
 		auto result_validity = FlatVector::Validity(result);
 		FlatVector::Validity(source) = result_validity;
+		for (auto &child : StructVector::GetEntries(source)) {
+			FlatVector::Validity(*child).Combine(result_validity, count);
+		}
 		FileLogicalType::Validate(source, count, "Arrow FILE");
 		result.Reference(source);
 		FlatVector::Validity(result) = std::move(result_validity);
