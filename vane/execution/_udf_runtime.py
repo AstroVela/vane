@@ -41,6 +41,18 @@ from vane.udf import FunctionNullHandling
 BATCH_SIZE = 2048
 DEFAULT_TARGET_MAX_BATCH_BYTES = 128 * 1024 * 1024
 TARGET_MAX_BATCH_BYTES_ENV = "VANE_UDF_TARGET_MAX_BATCH_BYTES"
+MAX_CLOSE_ERROR_BYTES = 4096
+
+
+def _bounded_close_error(error: BaseException) -> str:
+    try:
+        detail = str(error)
+    except BaseException:
+        return f"{type(error).__name__} (error text unavailable)"
+    encoded = detail.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_CLOSE_ERROR_BYTES:
+        return f"{type(error).__name__} (error text exceeds {MAX_CLOSE_ERROR_BYTES} bytes and was omitted)"
+    return f"{type(error).__name__}: {encoded.decode('utf-8')}"
 
 
 def _load_runtime_callable(
@@ -898,8 +910,11 @@ class UDFExecutor:
         """
         if self._closed:
             return
+        close_errors: list[tuple[str, BaseException]] = []
         try:
             self.finished_submitting()
+        except BaseException as error:
+            close_errors.append(("finished_submitting", error))
         finally:
             self._closed = True
             map_fn, self._map_fn = self._map_fn, None
@@ -912,9 +927,19 @@ class UDFExecutor:
                     close_fn = getattr(map_fn, "close", None)
                     if callable(close_fn):
                         close_fn()
+            except BaseException as error:
+                close_errors.append(("callable", error))
             finally:
                 if runtime is not None:
-                    runtime.close()
+                    try:
+                        runtime.close()
+                    except BaseException as error:
+                        close_errors.append(("async_runtime", error))
+        if len(close_errors) == 1:
+            raise close_errors[0][1]
+        if close_errors:
+            details = "; ".join(f"{stage}={_bounded_close_error(error)}" for stage, error in close_errors)
+            raise RuntimeError(f"UDF executor close failed: {details}") from close_errors[0][1]
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

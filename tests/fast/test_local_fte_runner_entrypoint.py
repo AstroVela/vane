@@ -94,6 +94,21 @@ def test_local_runner_preloads_arrow_dataset_imports():
     _preload_arrow_dataset_imports()
 
 
+def test_local_runner_cleanup_note_cannot_mask_primary_failure():
+    from vane.runners.local.runner import _add_exception_note
+
+    class _UnnotableError(RuntimeError):
+        @property
+        def add_note(self):
+            raise RuntimeError("planned add_note lookup failure")
+
+    primary_error = _UnnotableError("planned primary failure")
+
+    _add_exception_note(primary_error, "secondary cleanup failure")
+
+    assert str(primary_error) == "planned primary failure"
+
+
 def test_local_runner_rejects_unknown_native_copy_outcome():
     from vane.runners import CopyOutcomeUnknownError
     from vane.runners.local.runner import _require_known_copy_outcome

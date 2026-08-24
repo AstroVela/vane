@@ -30,6 +30,73 @@ if TYPE_CHECKING:
 
 _ARROW_DATASET_PRELOAD_LOCK = threading.Lock()
 _ARROW_DATASET_PRELOADED: bool = False
+_DATASINK_CLEANUP_WARNING_MAX_BYTES = 4 * 1024
+_DATASINK_CLEANUP_WARNING_LIMIT = 16
+_DATASINK_CLEANUP_WARNINGS_OMITTED = "additional DataSink cleanup warnings omitted"
+
+
+def _bounded_datasink_cleanup_warning(value: object) -> str:
+    try:
+        text = str(value).strip()
+    except BaseException:
+        text = "<cleanup warning unavailable>"
+    encoded = text.encode("utf-8", "replace")
+    if len(encoded) <= _DATASINK_CLEANUP_WARNING_MAX_BYTES:
+        return encoded.decode("utf-8")
+    omission = "…".encode()
+    remaining = _DATASINK_CLEANUP_WARNING_MAX_BYTES - len(omission)
+    prefix_size = remaining // 2
+    suffix_size = remaining - prefix_size
+    return (
+        encoded[:prefix_size].decode("utf-8", "ignore")
+        + omission.decode()
+        + encoded[-suffix_size:].decode("utf-8", "ignore")
+    )
+
+
+def _datasink_cleanup_warning(stage: str, error: BaseException) -> str:
+    try:
+        message = str(error)
+    except BaseException:
+        message = "<error message unavailable>"
+    return _bounded_datasink_cleanup_warning(f"{stage} failed: {type(error).__name__}: {message}")
+
+
+def _add_exception_note(error: BaseException, note: str) -> None:
+    """Attach a cleanup diagnostic without replacing the primary failure."""
+
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+    except BaseException:
+        pass
+
+
+def _append_datasink_cleanup_warning(result: dict[str, Any], warning: str) -> None:
+    raw_warnings = result.get("data_sink_cleanup_warnings", ())
+    if isinstance(raw_warnings, str):
+        raw_items = (raw_warnings,) if raw_warnings else ()
+    elif isinstance(raw_warnings, (list, tuple)):
+        raw_items = raw_warnings
+    else:
+        raw_items = ()
+
+    warnings: list[str] = []
+    for item in raw_items[: _DATASINK_CLEANUP_WARNING_LIMIT + 1]:
+        if len(warnings) == _DATASINK_CLEANUP_WARNING_LIMIT:
+            warnings[-1] = _DATASINK_CLEANUP_WARNINGS_OMITTED
+            break
+        normalized = _bounded_datasink_cleanup_warning(item)
+        if normalized:
+            warnings.append(normalized)
+    if len(warnings) < _DATASINK_CLEANUP_WARNING_LIMIT:
+        normalized = _bounded_datasink_cleanup_warning(warning)
+        if normalized:
+            warnings.append(normalized)
+    elif warnings[-1] != _DATASINK_CLEANUP_WARNINGS_OMITTED:
+        warnings[-1] = _DATASINK_CLEANUP_WARNINGS_OMITTED
+    result["data_sink_cleanup_warnings"] = warnings
 
 
 def _arrow_dataset_is_preloaded() -> bool:
@@ -565,7 +632,7 @@ class LocalRunner(Runner):
         DistributedPhysicalPlanRunner = require_ray_cxx_attr("DistributedPhysicalPlanRunner")
 
         query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_relation(relation, query_id)
+        logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
         conn = vane.connect()
         fragment_executor = _InProcessFragmentExecutor()
         backend = NativeFteWorkerManagerBackend(
@@ -578,22 +645,10 @@ class LocalRunner(Runner):
         result: dict[str, Any] | None = None
         progress_diagnostics: list[tuple[str, BaseException]] = []
 
-        def format_warning(stage: str, error: BaseException) -> str:
-            try:
-                message = str(error)
-            except BaseException:
-                message = "<error message unavailable>"
-            return f"{stage} failed: {type(error).__name__}: {message}"
-
         def append_warning(stage: str, error: BaseException) -> None:
             if result is None:
                 return
-            raw_warnings = result.get("data_sink_cleanup_warnings", ())
-            warnings = [raw_warnings] if isinstance(raw_warnings, str) and raw_warnings else []
-            if not isinstance(raw_warnings, str) and isinstance(raw_warnings, (list, tuple)):
-                warnings.extend(str(warning) for warning in raw_warnings)
-            warnings.append(format_warning(stage, error))
-            result["data_sink_cleanup_warnings"] = warnings
+            _append_datasink_cleanup_warning(result, _datasink_cleanup_warning(stage, error))
 
         try:
             physical_plan = logical_plan.to_physical_plan(conn)
@@ -642,9 +697,9 @@ class LocalRunner(Runner):
                         append_warning(stage, diagnostic_error)
             finally:
                 primary_error = sys.exc_info()[1]
-                if result is None and primary_error is not None and hasattr(primary_error, "add_note"):
+                if result is None and primary_error is not None:
                     for stage, diagnostic_error in progress_diagnostics:
-                        primary_error.add_note(format_warning(stage, diagnostic_error))
+                        _add_exception_note(primary_error, _datasink_cleanup_warning(stage, diagnostic_error))
                 finalization_error: BaseException | None = None
                 try:
                     write_executor.shutdown(wait=True)
@@ -652,8 +707,10 @@ class LocalRunner(Runner):
                     if result is not None:
                         append_warning("DataSink executor shutdown", shutdown_error)
                     elif primary_error is not None:
-                        if hasattr(primary_error, "add_note"):
-                            primary_error.add_note(format_warning("DataSink executor shutdown", shutdown_error))
+                        _add_exception_note(
+                            primary_error,
+                            _datasink_cleanup_warning("DataSink executor shutdown", shutdown_error),
+                        )
                     else:
                         finalization_error = shutdown_error
                 if renderer is not None:
@@ -663,13 +720,16 @@ class LocalRunner(Runner):
                         if result is not None:
                             append_warning("DataSink progress finalization", progress_error)
                         elif primary_error is not None:
-                            if hasattr(primary_error, "add_note"):
-                                primary_error.add_note(format_warning("DataSink progress finalization", progress_error))
+                            _add_exception_note(
+                                primary_error,
+                                _datasink_cleanup_warning("DataSink progress finalization", progress_error),
+                            )
                         elif finalization_error is None:
                             finalization_error = progress_error
-                        elif hasattr(finalization_error, "add_note"):
-                            finalization_error.add_note(
-                                format_warning("DataSink progress finalization", progress_error)
+                        else:
+                            _add_exception_note(
+                                finalization_error,
+                                _datasink_cleanup_warning("DataSink progress finalization", progress_error),
                             )
                 if finalization_error is not None:
                     raise finalization_error
@@ -685,12 +745,15 @@ class LocalRunner(Runner):
             if result is not None:
                 for cleanup_error in cleanup_errors:
                     append_warning("DataSink local resource shutdown", cleanup_error)
-            elif primary_error is not None and hasattr(primary_error, "add_note"):
+            elif primary_error is not None:
                 for cleanup_error in cleanup_errors:
-                    primary_error.add_note(format_warning("DataSink local resource shutdown", cleanup_error))
+                    _add_exception_note(
+                        primary_error,
+                        _datasink_cleanup_warning("DataSink local resource shutdown", cleanup_error),
+                    )
             elif cleanup_errors:
                 details = "; ".join(
-                    format_warning("DataSink local resource shutdown", error) for error in cleanup_errors
+                    _datasink_cleanup_warning("DataSink local resource shutdown", error) for error in cleanup_errors
                 )
                 raise RuntimeError(f"failed to shut down local DataSink resources: {details}") from cleanup_errors[0]
 

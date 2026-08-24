@@ -1120,8 +1120,10 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 	return snapshot_obj;
 }
 
+enum class DuckDBRelationPlanKind : uint8_t { READ, WRITE, DATA_SINK };
+
 static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::object query_id_obj,
-                                                   bool require_auto_commit) {
+                                                   DuckDBRelationPlanKind plan_kind) {
 	if (!py::isinstance<duckdb::DuckDBPyRelation>(relation_obj)) {
 		throw py::type_error("Expected a Vane DuckDBPyRelation object");
 	}
@@ -1134,21 +1136,30 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	    rel->type == RelationType::CREATE_TABLE_RELATION || rel->type == RelationType::INSERT_RELATION ||
 	    rel->type == RelationType::DELETE_RELATION || rel->type == RelationType::UPDATE_RELATION ||
 	    rel->type == RelationType::WRITE_FILE_RELATION;
-	if (require_auto_commit) {
+	const bool is_datasink_relation = dynamic_cast<DataSinkRelation *>(rel.get()) != nullptr;
+	if (plan_kind == DuckDBRelationPlanKind::WRITE || plan_kind == DuckDBRelationPlanKind::DATA_SINK) {
 		if (!rel->context) {
-			throw duckdb::InternalException("Cannot validate distributed write transaction: relation has no context");
+			throw duckdb::InternalException(
+			    "Cannot validate distributed terminal transaction: relation has no context");
 		}
 		auto client_context = rel->context->GetContext();
 		if (!client_context->transaction.IsAutoCommit()) {
-			throw duckdb::InvalidInputException(
-			    "distributed writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
+			const auto terminal_name =
+			    plan_kind == DuckDBRelationPlanKind::DATA_SINK ? "DataSink writes" : "distributed writes";
+			throw duckdb::InvalidInputException("%s require DuckDB auto-commit mode and cannot participate in an "
+			                                    "explicit transaction",
+			                                    terminal_name);
 		}
-		if (!is_write_relation) {
-			throw duckdb::InvalidInputException("from_duckdb_write_relation requires a write relation");
-		}
-	} else if (is_write_relation) {
+	}
+	if (plan_kind == DuckDBRelationPlanKind::WRITE && !is_write_relation) {
+		throw duckdb::InvalidInputException("from_duckdb_write_relation requires a write relation");
+	}
+	if (plan_kind == DuckDBRelationPlanKind::DATA_SINK && !is_datasink_relation) {
+		throw duckdb::InvalidInputException("from_duckdb_datasink_relation requires a DataSink relation");
+	}
+	if (plan_kind == DuckDBRelationPlanKind::READ && (is_write_relation || is_datasink_relation)) {
 		throw duckdb::InvalidInputException(
-		    "from_duckdb_relation does not accept write relations; use from_duckdb_write_relation");
+		    "from_duckdb_relation does not accept terminal write relations; use the matching terminal factory");
 	}
 
 	PyLogicalPlan plan;

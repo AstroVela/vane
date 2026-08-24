@@ -21,6 +21,9 @@ public:
 	string ToString(idx_t depth) override;
 	string GetQuery() override;
 	string GetAlias() override;
+	bool IsReadOnly() override {
+		return false;
+	}
 
 	bool InheritsColumnBindings() override {
 		return true;

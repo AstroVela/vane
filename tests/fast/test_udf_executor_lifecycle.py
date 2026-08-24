@@ -1483,6 +1483,68 @@ def test_udf_actor_shutdown_closes_executors_before_killing_actors(monkeypatch, 
     assert actors.actors == []
 
 
+def test_udf_actor_shutdown_settles_every_submitted_close_after_one_fails(monkeypatch):
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    events = []
+
+    class TrackingFuture(Future):
+        def __init__(self, actor_name, *, error=None):
+            super().__init__()
+            self.actor_name = actor_name
+            if error is None:
+                self.set_result(None)
+            else:
+                self.set_exception(error)
+
+        def result(self, timeout=None):
+            events.append(f"settle:{self.actor_name}")
+            return super().result(timeout=timeout)
+
+    class CloseExecutor:
+        def __init__(self, actor_name, *, error=None):
+            self.actor_name = actor_name
+            self.error = error
+
+        def remote(self):
+            events.append(f"close:{self.actor_name}")
+            return types.SimpleNamespace(future=lambda: TrackingFuture(self.actor_name, error=self.error))
+
+    class Actor:
+        def __init__(self, name, *, close_error=None):
+            self.name = name
+            self.close_executor = CloseExecutor(name, error=close_error)
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+
+        def kill(self, actor, *, no_restart):
+            assert no_restart is True
+            events.append(f"kill:{actor.name}")
+
+    monkeypatch.setitem(sys.modules, "ray", FakeRay())
+    actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    actors._owns_actors = True
+    actors.actors = [
+        Actor("actor-0", close_error=RuntimeError("planned first close failure")),
+        Actor("actor-1"),
+    ]
+
+    with pytest.raises(RuntimeError, match="planned first close failure"):
+        actors.shutdown()
+
+    assert events == [
+        "close:actor-0",
+        "close:actor-1",
+        "settle:actor-0",
+        "settle:actor-1",
+        "kill:actor-0",
+        "kill:actor-1",
+    ]
+    assert actors.actors == []
+
+
 def test_udf_actor_readiness_cleanup_does_not_retain_terminated_pool(monkeypatch):
     import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
@@ -2532,6 +2594,59 @@ def test_udf_runtime_invokes_internal_callable_close_hook_once():
     executor.close()
 
     assert actor.close_calls == 1
+
+
+def test_udf_runtime_preserves_callable_and_async_runtime_close_failures():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class FailingActor:
+        def _vane_close(self) -> None:
+            raise RuntimeError("planned callable close failure")
+
+    class FailingRuntime:
+        def close(self) -> None:
+            raise RuntimeError("planned async runtime close failure")
+
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._closed = False
+    executor._finished_submitting = True
+    executor._map_fn = FailingActor()
+    executor._async_runtime = FailingRuntime()
+
+    with pytest.raises(RuntimeError, match="planned callable close failure") as exc_info:
+        executor.close()
+
+    assert "planned async runtime close failure" in str(exc_info.value)
+    assert executor._closed is True
+    assert executor._map_fn is None
+    assert executor._async_runtime is None
+
+
+def test_udf_runtime_close_handles_unprintable_cleanup_failure():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class UnprintableError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("planned error formatting failure")
+
+    class FailingActor:
+        def _vane_close(self) -> None:
+            raise UnprintableError()
+
+    class FailingRuntime:
+        def close(self) -> None:
+            raise RuntimeError("planned async runtime close failure")
+
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._closed = False
+    executor._finished_submitting = True
+    executor._map_fn = FailingActor()
+    executor._async_runtime = FailingRuntime()
+
+    with pytest.raises(RuntimeError, match="error text unavailable") as exc_info:
+        executor.close()
+
+    assert "planned async runtime close failure" in str(exc_info.value)
 
 
 def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():
@@ -7987,6 +8102,19 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST, release_type]
     release_payload = vane_pickle.loads(messages[1][1])
     assert release_payload == {"grant_id": 99}
+
+
+def test_subprocess_worker_formats_fully_unprintable_exception():
+    import vane.execution.udf_subprocess_worker as worker
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned worker error str failure")
+
+        def __repr__(self):
+            raise RuntimeError("planned worker error repr failure")
+
+    assert worker._format_exception(_UnprintableError()) == "<unprintable _UnprintableError>"
 
 
 def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):

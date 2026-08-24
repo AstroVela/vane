@@ -7,6 +7,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/operator/helper/physical_data_sink.hpp"
+#include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
 
@@ -19,7 +20,8 @@ BoundStatement BindDataSinkOperatorExtension(ClientContext &, Binder &, Operator
 } // namespace
 
 LogicalDataSink::LogicalDataSink(string operation_id_p) : operation_id(std::move(operation_id_p)) {
-	if (operation_id.empty() || operation_id.size() > 256) {
+	if (operation_id.empty() || operation_id.size() > 256 ||
+	    !Utf8Proc::IsValid(operation_id.c_str(), operation_id.size())) {
 		throw InvalidInputException("DataSink operation identity must contain 1 to 256 UTF-8 bytes");
 	}
 }

@@ -1175,6 +1175,9 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
 	} catch (const std::exception &e) {
 		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+	} catch (...) {
+		terminal_result = ResultType::err(
+		    duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));
 	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	if (!poll_result_cache_->result.has_value()) {

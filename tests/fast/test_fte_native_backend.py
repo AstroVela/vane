@@ -3809,6 +3809,100 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
     con.close()
 
 
+def test_cxx_python_backend_finished_query_respects_exhausted_drain_timeout(monkeypatch):
+    class PendingHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-drain-timeout"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.ready = threading.Event()
+            self.release_calls = 0
+
+        def done(self):
+            return self.ready.is_set()
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-drain-timeout",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = PendingHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setenv("VANE_FTE_QUERY_WAIT_TIMEOUT_S", "0.000001")
+    con = vane.connect()
+    query_id = f"python-backend-drain-timeout-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    outcome = []
+
+    def collect():
+        try:
+            collect_result_stream(runner.run_plan(plan, con))
+        except BaseException as error:  # pragma: no cover - asserted below
+            outcome.append(error)
+
+    thread = threading.Thread(target=collect)
+    thread.start()
+    try:
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            backend.handle.ready.set()
+            thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        assert len(outcome) == 1
+        assert "timed out draining Python backend FTE result handles" in str(outcome[0])
+        assert backend.handle.release_calls == 0
+        runner.drop_query_fragments(query_id)
+        assert backend.handle.release_calls == 1
+    finally:
+        backend.handle.ready.set()
+        if thread.is_alive():
+            thread.join(timeout=2.0)
+        con.close()
+
+
 def test_cxx_run_plan_startup_failure_cleans_query_replay_snapshot():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
 
@@ -37,6 +38,39 @@ struct DistributedDataSinkResult {
 DuckDBResult<void> ValidateDataSinkResultBudget(idx_t write_result_count, idx_t total_result_bytes,
                                                 idx_t next_result_bytes);
 
+//! Stateful, streaming validation for the bounded DataSink worker-result wire
+//! protocol. PhysicalDataSink uses this before a local/task result collector can
+//! materialize unbounded output, while DataSinkResultCollector reuses it for the
+//! coordinator-wide aggregate limit.
+class DataSinkResultValidationState {
+public:
+	explicit DataSinkResultValidationState(string operation_id);
+
+	DuckDBResult<void> ValidateOperationId() const;
+	DuckDBResult<void> ValidateSchema(const vector<LogicalType> &types) const;
+	DuckDBResult<void> ValidateAdditionalResultCount(idx_t additional_count) const;
+	DuckDBResult<void> Append(const DataChunk &chunk, vector<DataSinkWriteResult> *retained_results = nullptr);
+
+	const string &operation_id() const {
+		return operation_id_;
+	}
+	const string &result_state() const {
+		return result_state_;
+	}
+	idx_t write_result_count() const {
+		return write_result_count_;
+	}
+	idx_t total_result_bytes() const {
+		return total_result_bytes_;
+	}
+
+private:
+	string operation_id_;
+	idx_t write_result_count_ = 0;
+	idx_t total_result_bytes_ = 0;
+	string result_state_;
+};
+
 class DataSinkResultCollector {
 public:
 	explicit DataSinkResultCollector(string operation_id);
@@ -45,11 +79,8 @@ public:
 	DuckDBResult<DistributedDataSinkResult> Finalize();
 
 private:
-	DuckDBResult<void> ValidateOperationId() const;
-
 	DistributedDataSinkResult result_;
-	idx_t total_result_bytes_ = 0;
-	string result_state_;
+	DataSinkResultValidationState validation_state_;
 	bool finalized_ = false;
 };
 

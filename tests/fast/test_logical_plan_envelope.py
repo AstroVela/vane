@@ -77,6 +77,33 @@ def test_distributed_write_plan_rejects_read_relation():
         )
 
 
+def test_datasink_plan_factory_requires_exact_terminal_relation():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    relation = connection.sql("SELECT 42 AS value")
+    terminal = relation._mark_datasink("datasink-terminal")
+
+    with pytest.raises(Exception, match="does not accept terminal write relations"):
+        ray_cxx.PyLogicalPlan.from_duckdb_relation(terminal, "datasink-passed-to-read-path")
+    with pytest.raises(Exception, match="requires a DataSink relation"):
+        ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(relation, "read-passed-to-datasink-path")
+
+
+def test_datasink_plan_factory_rechecks_transaction_at_serialization_boundary():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    terminal = connection.sql("SELECT 42 AS value")._mark_datasink("datasink-before-transaction")
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(Exception, match="cannot participate in an explicit transaction"):
+            ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(
+                terminal,
+                "explicit-transaction-datasink-plan",
+            )
+    finally:
+        connection.execute("ROLLBACK")
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

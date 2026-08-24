@@ -471,6 +471,10 @@ public:
 				    "event=wait_query_done elapsed_ms=" + std::to_string(FteRunnerElapsedMs(execute_started_at)) +
 				    " query_id=" + FteRunnerFormatField(query_id) +
 				    " result=ok output_count=" + std::to_string(outputs.size()));
+				if (publish_results_incrementally && !outputs.empty()) {
+					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+					    "streaming FTE result drain returned outputs outside its publication callback"));
+				}
 				if (!publish_results_incrementally) {
 					for (auto &output : outputs) {
 						auto send_res = output_sender.send(std::move(output));
@@ -550,6 +554,12 @@ public:
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a physical plan root"));
 		}
 		auto extension_write_provider = physical_plan->Root().GetExtensionWriteTaskProvider();
+		const bool has_data_sink_root = physical_plan->Root().type == PhysicalOperatorType::DATA_SINK;
+		if (has_data_sink_root && !client_context_->transaction.IsAutoCommit()) {
+			return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+			    "distributed DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit "
+			    "transaction"));
+		}
 		unique_ptr<DistributedExtensionWriteInfo> extension_write_info;
 		string extension_write_query_id;
 		vector<DistributedWriteTaskResult> selected_task_results;
@@ -724,7 +734,6 @@ public:
 				                       extension_write_info->Name())));
 			}
 		}
-		const bool has_data_sink_root = physical_plan->Root().type == PhysicalOperatorType::DATA_SINK;
 		if ((has_data_sink_root &&
 		     (data_sink_count != 1 || copy_sink_count != 0 || callback_sink_count != 0 || extension_write_provider)) ||
 		    (!has_data_sink_root && data_sink_count != 0)) {
@@ -837,10 +846,11 @@ public:
 		DataSinkResultCollector data_sink_results(data_sink_node ? data_sink_node->operation_id() : string());
 		auto data_sink_unknown_after_worker_abort = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
 			D_ASSERT(data_sink_node);
-			vector<string> errors {primary_error.what()};
+			vector<string> errors {BoundDataSinkOutcomeError(primary_error.what())};
 			auto abort_res = abort_write_workers();
 			if (abort_res.is_err()) {
-				errors.push_back("worker abort barrier failed: " + string(abort_res.error().what()));
+				errors.push_back(
+				    BoundDataSinkOutcomeError("worker abort barrier failed: " + string(abort_res.error().what())));
 			}
 			DistributedDataSinkResult result;
 			result.operation_id = data_sink_node->operation_id();
@@ -848,7 +858,8 @@ public:
 			if (parsed.is_ok()) {
 				result = std::move(parsed).value();
 			} else {
-				errors.push_back("selected worker results could not be parsed: " + string(parsed.error().what()));
+				errors.push_back(BoundDataSinkOutcomeError("selected worker results could not be parsed: " +
+				                                                   string(parsed.error().what())));
 			}
 			result.outcome_aborted = false;
 			result.outcome_unknown = true;

@@ -8,21 +8,16 @@
 
 namespace duckdb {
 
-//! Marks a Python DataSink terminal without changing local DuckDB results.
-//! Distributed translation replaces this passthrough operator with a
-//! coordinator-owned result collector; workers execute only its child plan.
+//! Marks and validates a Python DataSink terminal without changing its rows.
+//! Local execution validates before result materialization. Distributed
+//! translation appends the same bounded validator to every worker task and
+//! uses a coordinator-owned collector for the aggregate bound.
 class PhysicalDataSink : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::DATA_SINK;
 
 	PhysicalDataSink(PhysicalPlan &physical_plan, vector<LogicalType> types, string operation_id,
-	                 idx_t estimated_cardinality)
-	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
-	      operation_id(std::move(operation_id)) {
-		if (this->operation_id.empty() || this->operation_id.size() > 256) {
-			throw InvalidInputException("DataSink operation identity must contain 1 to 256 UTF-8 bytes");
-		}
-	}
+	                 idx_t estimated_cardinality);
 
 	string operation_id;
 
@@ -36,11 +31,9 @@ public:
 		return result;
 	}
 
-	OperatorResultType Execute(ExecutionContext &, DataChunk &input, DataChunk &chunk, GlobalOperatorState &,
-	                           OperatorState &) const override {
-		chunk.Reference(input);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
+	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
+	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	                           GlobalOperatorState &global_state, OperatorState &operator_state) const override;
 
 	bool ParallelOperator() const override {
 		return true;

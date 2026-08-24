@@ -4,8 +4,10 @@
 #include "duckdb/main/relation/data_sink_relation.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_data_sink.hpp"
+#include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
 
@@ -13,7 +15,8 @@ DataSinkRelation::DataSinkRelation(shared_ptr<Relation> child_p, string operatio
     : Relation(child_p->context, RelationType::EXTENSION_RELATION), child(std::move(child_p)),
       operation_id(std::move(operation_id_p)) {
 	D_ASSERT(child.get() != this);
-	if (operation_id.empty() || operation_id.size() > 256) {
+	if (operation_id.empty() || operation_id.size() > 256 ||
+	    !Utf8Proc::IsValid(operation_id.c_str(), operation_id.size())) {
 		throw InvalidInputException("DataSink operation identity must contain 1 to 256 UTF-8 bytes");
 	}
 	TryBindRelation(columns);
@@ -45,6 +48,10 @@ BoundStatement DataSinkRelation::Bind(Binder &binder) {
 }
 
 BoundStatement DataSinkRelation::BindAsInput(Binder &binder) {
+	if (!binder.context.transaction.IsAutoCommit()) {
+		throw InvalidInputException(
+		    "DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
 	auto child_ref = BindRelationInput(binder, *child);
 	auto child_bound = binder.Bind(*child_ref);
 	auto sink = make_uniq<LogicalDataSink>(operation_id);

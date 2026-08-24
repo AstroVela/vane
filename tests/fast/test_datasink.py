@@ -311,6 +311,59 @@ def test_local_fast_datasink_applies_aggregates_and_closes_worker(monkeypatch, t
     assert close_marker.read_text(encoding="utf-8") == "closed"
 
 
+def test_datasink_rejects_source_explicit_transaction_before_binding():
+    connection = vane.connect()
+    relation = connection.sql("SELECT 1 AS id")
+    sink = _SchemaSink()
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(Exception, match="cannot participate in an explicit transaction"):
+            relation.write_datasink(sink, operation_id="explicit-transaction-datasink")
+    finally:
+        connection.execute("ROLLBACK")
+
+    assert sink.schema is None
+
+
+def test_datasink_terminal_rechecks_transaction_when_it_is_bound():
+    connection = vane.connect()
+    terminal = connection.sql("SELECT 1 AS id")._mark_datasink("late-explicit-transaction-datasink")
+    connection.execute("BEGIN")
+    try:
+        with pytest.raises(vane.InvalidInputException, match="cannot participate in an explicit transaction"):
+            terminal.to_arrow_table()
+    finally:
+        connection.execute("ROLLBACK")
+
+
+def test_datasink_rechecks_transaction_on_prepared_relation(monkeypatch):
+    from vane import runners
+
+    source = vane.connect().sql("SELECT 1 AS id")
+    prepared_connection = vane.connect()
+    prepared = prepared_connection.sql("SELECT 2 AS id")
+
+    class _PreparedRelationBound(_Bound):
+        def prepare_input(self, relation):
+            return prepared
+
+    monkeypatch.setattr(cloudpickle, "dumps", lambda _value: b"serialized")
+    monkeypatch.setattr(
+        runners,
+        "get_or_infer_runner_type",
+        lambda: (_ for _ in ()).throw(AssertionError("runner selection must not run")),
+    )
+    prepared_connection.execute("BEGIN")
+    try:
+        with pytest.raises(vane.InvalidInputException, match="cannot participate in an explicit transaction"):
+            source.write_datasink(
+                _Sink(_PreparedRelationBound()),
+                operation_id="prepared-explicit-transaction-datasink",
+            )
+    finally:
+        prepared_connection.execute("ROLLBACK")
+
+
 def test_local_fast_datasink_worker_failure_closes_after_abort(monkeypatch, tmp_path):
     from vane.execution.udf_subprocess import LocalSubprocessActorPool
 
@@ -374,6 +427,13 @@ def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     assert summary.rows_affected == 0
 
 
+def test_datasink_terminal_rejects_invalid_empty_wire_schema():
+    terminal = vane.sql("SELECT 1 AS invalid_wire_column WHERE false")._mark_datasink("invalid-empty-schema")
+
+    with pytest.raises(Exception, match="DataSink worker result schema"):
+        terminal.to_arrow_table()
+
+
 def test_worker_close_failure_is_reported_during_actor_teardown():
     from vane.datasink import _SinkBatchRuntime
 
@@ -382,6 +442,105 @@ def test_worker_close_failure_is_reported_during_actor_teardown():
 
     with pytest.raises(RuntimeError, match="planned close failure"):
         runtime.close()
+
+
+def test_worker_abort_diagnostic_cannot_mask_original_failure():
+    from vane.datasink import _SinkBatchRuntime
+
+    class _UnnotableWriteError(RuntimeError):
+        @property
+        def add_note(self):
+            raise RuntimeError("planned add_note lookup failure")
+
+    primary_error = _UnnotableWriteError("planned primary write failure")
+
+    class _AbortFailureWorker(DataSinkWorker):
+        def write(self, table: pa.Table) -> WriteResult:
+            raise primary_error
+
+        def abort(self, error: BaseException) -> None:
+            assert error is primary_error
+            raise RuntimeError("planned abort failure")
+
+    class _AbortFailureBound(_Bound):
+        def open_worker(self, context: WriteContext) -> DataSinkWorker:
+            return _AbortFailureWorker()
+
+    runtime = _SinkBatchRuntime(_AbortFailureBound(), WriteContext("abort-note-failure"), None)
+
+    with pytest.raises(_UnnotableWriteError) as exc_info:
+        runtime(pa.table({"id": [1]}))
+
+    assert exc_info.value is primary_error
+
+
+def test_worker_result_publication_failure_aborts_and_poison_actor(monkeypatch):
+    from vane import datasink as datasink_module
+    from vane.datasink import _SinkBatchRuntime
+
+    calls: list[str] = []
+
+    class _PublicationWorker(DataSinkWorker):
+        def write(self, table: pa.Table) -> WriteResult:
+            calls.append("write")
+            return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+        def abort(self, error: BaseException) -> None:
+            assert isinstance(error, MemoryError)
+            calls.append("abort")
+
+    class _PublicationBound(_Bound):
+        def open_worker(self, context: WriteContext) -> DataSinkWorker:
+            calls.append("open")
+            return _PublicationWorker()
+
+    runtime = _SinkBatchRuntime(_PublicationBound(), WriteContext("publication-failure"), None)
+    monkeypatch.setattr(
+        datasink_module,
+        "_result_to_wire_table",
+        lambda *_args: (_ for _ in ()).throw(MemoryError("planned Arrow publication failure")),
+    )
+
+    with pytest.raises(MemoryError, match="planned Arrow publication failure"):
+        runtime(pa.table({"id": [1]}))
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        runtime(pa.table({"id": [2]}))
+
+    assert calls == ["open", "write", "abort"]
+
+
+def test_actor_input_boundary_failure_aborts_an_already_open_worker():
+    from vane.datasink import _SinkBatchRuntime
+
+    calls: list[str] = []
+
+    class _InputBoundaryWorker(DataSinkWorker):
+        def write(self, table: pa.Table) -> WriteResult:
+            calls.append("write")
+            return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+        def abort(self, error: BaseException) -> None:
+            assert isinstance(error, TypeError)
+            calls.append("abort")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class _InputBoundaryBound(_Bound):
+        def open_worker(self, context: WriteContext) -> DataSinkWorker:
+            calls.append("open")
+            return _InputBoundaryWorker()
+
+    runtime = _SinkBatchRuntime(_InputBoundaryBound(), WriteContext("input-boundary-failure"), None)
+    runtime(pa.table({"id": [1]}))
+
+    with pytest.raises(TypeError, match="expected pyarrow.Table"):
+        runtime(object())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        runtime(pa.table({"id": [2]}))
+    runtime.close()
+
+    assert calls == ["open", "write", "abort", "close"]
 
 
 def test_worker_failure_is_unknown_and_safe_to_retry(monkeypatch):
@@ -613,6 +772,33 @@ def test_mock_distributed_result_uses_only_selected_results(monkeypatch):
     assert summary.warnings == ("planned cleanup warning",)
 
 
+@pytest.mark.parametrize("outcome_aborted", [False, True])
+def test_malformed_cleanup_warnings_do_not_change_known_outcome(monkeypatch, outcome_aborted):
+    from vane import runners
+
+    operation_id = "malformed-cleanup-warnings"
+    native_result = _native_result(operation_id, outcome_aborted=outcome_aborted)
+    native_result["data_sink_cleanup_warnings"] = object()
+
+    class FakeRunner:
+        def run_datasink(self, relation):
+            return native_result
+
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: FakeRunner())
+
+    if outcome_aborted:
+        with pytest.raises(DataSinkWriteError) as exc_info:
+            vane.sql("SELECT * FROM range(0, 2)").write_datasink(_Sink(), operation_id=operation_id)
+        assert exc_info.value.outcome is WriteOutcome.ABORTED
+        summary = exc_info.value.summary
+    else:
+        summary = vane.sql("SELECT * FROM range(0, 2)").write_datasink(_Sink(), operation_id=operation_id)
+        assert summary.outcome is WriteOutcome.APPLIED
+
+    assert summary.warnings == ("DataSink cleanup diagnostics were malformed and ignored",)
+
+
 @pytest.mark.parametrize(
     ("query", "expected_type"),
     [
@@ -741,6 +927,8 @@ def test_write_result_rejects_unbounded_metadata_and_warnings():
         WriteResult(rows_received=1, warnings=("\x01" * (4 * 1024),) * 4)
     with pytest.raises(ValueError, match="zero rows_affected"):
         WriteResult(rows_received=1, rows_affected=1, state=WriteState.ABORTED)
+    with pytest.raises(TypeError, match="sequence of strings"):
+        WriteResult(rows_received=1, warnings=(warning for warning in ("never-consumed",)))
 
 
 def test_summary_aggregates_are_bounded_by_result_count_not_uint64():
@@ -762,6 +950,34 @@ def test_summary_aggregates_are_bounded_by_result_count_not_uint64():
             rows_affected=0,
             bytes_received=0,
             warnings="warning",
+        )
+
+
+def test_summary_enforces_the_aggregate_wire_payload_limit(monkeypatch):
+    from vane import datasink as datasink_module
+
+    result = WriteResult(rows_received=1, rows_affected=1, metadata={"value": "payload"})
+    wire_bytes = datasink_module._result_wire_bytes("bounded-summary", result)
+    monkeypatch.setattr(datasink_module, "_MAX_TOTAL_RESULT_BYTES", wire_bytes - 1)
+
+    with pytest.raises(ValueError, match="64 MiB coordinator payload limit"):
+        vane.WriteSummary(
+            operation_id="bounded-summary",
+            outcome=WriteOutcome.APPLIED,
+            results=(result,),
+            rows_received=1,
+            rows_affected=1,
+            bytes_received=0,
+        )
+
+    with pytest.raises(TypeError, match="sequence of WriteResult"):
+        vane.WriteSummary(
+            operation_id="bounded-summary",
+            outcome=WriteOutcome.APPLIED,
+            results=(item for item in (result,)),
+            rows_received=1,
+            rows_affected=1,
+            bytes_received=0,
         )
 
 
@@ -799,6 +1015,20 @@ def test_cleanup_warnings_and_outcome_detail_are_bounded():
     warnings = _cleanup_warnings({"data_sink_cleanup_warnings": ["x" * 10_000] * 20})
     assert len(warnings) == 16
     assert all(len(warning.encode("utf-8")) <= 4 * 1024 for warning in warnings)
+    assert warnings[-1] == "additional DataSink warnings omitted"
+
+    literal_sentinel = vane.datasink._summary(
+        WriteContext("literal-warning"),
+        WriteOutcome.APPLIED,
+        (
+            WriteResult(
+                rows_received=1,
+                rows_affected=1,
+                warnings=("additional DataSink warnings omitted", "later warning"),
+            ),
+        ),
+    )
+    assert literal_sentinel.warnings == ("additional DataSink warnings omitted", "later warning")
 
     summary = vane.datasink._summary(WriteContext("bounded-detail"), WriteOutcome.UNKNOWN, ())
     error = DataSinkWriteError(summary, "detail-head:" + "x" * 10_000 + ":provider-root-cause", safe_to_retry=True)
@@ -850,7 +1080,7 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
 
     def shutdown_with_warning(*args, **kwargs):
         errors = original_shutdown(*args, **kwargs)
-        errors.append(RuntimeError("planned local cleanup failure"))
+        errors.append(RuntimeError("cleanup-head:" + "x" * 10_000 + ":cleanup-root-cause"))
         return errors
 
     monkeypatch.setattr(local_runner_module, "_shutdown_local_write_resources", shutdown_with_warning)
@@ -861,7 +1091,10 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
     summary = vane.sql("SELECT 1 AS id").write_datasink(_Sink(), operation_id="local-cleanup-warning")
 
     assert summary.outcome is WriteOutcome.APPLIED
-    assert any("planned local cleanup failure" in warning for warning in summary.warnings)
+    assert len(summary.warnings) == 1
+    assert len(summary.warnings[0].encode("utf-8")) <= 4 * 1024
+    assert "cleanup-head:" in summary.warnings[0]
+    assert summary.warnings[0].endswith(":cleanup-root-cause")
 
 
 def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):

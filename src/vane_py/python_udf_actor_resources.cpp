@@ -28,6 +28,7 @@ namespace py = pybind11;
 
 static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_LIMIT = 16;
 static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES = 4 * 1024;
+static constexpr const char *UDF_ACTOR_CLEANUP_WARNINGS_OMITTED = "additional UDF actor cleanup warnings omitted";
 
 static bool IsUTF8ContinuationByte(char byte) {
 	return (static_cast<unsigned char>(byte) & 0xC0U) == 0x80U;
@@ -56,7 +57,7 @@ static string CleanupWarningFromPythonError(const py::error_already_set &error) 
 	string detail;
 	try {
 		detail = py::str(error.value()).cast<string>();
-	} catch (const py::error_already_set &) {
+	} catch (...) {
 		PyErr_Clear();
 		detail = "<cleanup error message unavailable>";
 	}
@@ -349,10 +350,15 @@ private:
 					it->attr("shutdown")(pybind11::arg("kill") = kill);
 				}
 			} catch (const pybind11::error_already_set &error) {
-				if (capture_errors && cleanup_warnings.size() < UDF_ACTOR_CLEANUP_WARNING_LIMIT) {
+				if (!capture_errors) {
+					PyErr_Clear();
+					continue;
+				}
+				if (cleanup_warnings.size() < UDF_ACTOR_CLEANUP_WARNING_LIMIT) {
 					cleanup_warnings.push_back(CleanupWarningFromPythonError(error));
 				} else {
 					PyErr_Clear();
+					cleanup_warnings.back() = UDF_ACTOR_CLEANUP_WARNINGS_OMITTED;
 				}
 			}
 		}

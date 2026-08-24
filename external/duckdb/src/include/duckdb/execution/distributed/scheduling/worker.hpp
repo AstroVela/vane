@@ -154,10 +154,18 @@ public:
 	}
 
 	/// Wait for a query while publishing each selected output as it is drained.
-	/// Implementations may stop draining immediately when the callback fails.
+	/// Implementations must stop draining immediately when the callback fails.
+	/// DataSink uses this method to enforce coordinator result bounds before all
+	/// selected outputs are retained, so collecting first is not a safe fallback.
+	/// A successful implementation must return an empty vector: every selected
+	/// output is transferred exactly once through the callback.
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
 	wait_fte_query_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
-		return wait_fte_query(query_id, timeout_s, std::move(on_output));
+		(void)query_id;
+		(void)timeout_s;
+		(void)on_output;
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("worker manager does not support streaming FTE result drain"));
 	}
 
 	virtual DuckDBResult<std::vector<MaterializedOutput>>

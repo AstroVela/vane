@@ -37,6 +37,7 @@ _MAX_WRITE_RESULT_WARNINGS = 4
 _MAX_SUMMARY_WARNINGS = 16
 _MAX_WARNING_BYTES = 4 * 1024
 _MAX_UINT64 = (1 << 64) - 1
+_WARNINGS_OMITTED = "additional DataSink warnings omitted"
 
 
 class CommitProtocol(str, Enum):
@@ -136,6 +137,17 @@ def _bounded_warning(value: str) -> str:
     return encoded[:prefix_size].decode("utf-8", "ignore") + omission + encoded[-suffix_size:].decode("utf-8", "ignore")
 
 
+def _add_exception_note(error: BaseException, note: str) -> None:
+    """Attach a diagnostic without allowing a hostile exception to mask itself."""
+
+    try:
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            add_note(note)
+    except BaseException:
+        pass
+
+
 def _append_warning(warnings: tuple[str, ...], warning: str, *, limit: int) -> tuple[str, ...]:
     normalized = _bounded_warning(warning)
     if not normalized:
@@ -143,8 +155,8 @@ def _append_warning(warnings: tuple[str, ...], warning: str, *, limit: int) -> t
     if len(warnings) < limit:
         return warnings + (normalized,)
     if limit == 1:
-        return ("additional DataSink warnings omitted",)
-    return warnings[: limit - 1] + ("additional DataSink warnings omitted",)
+        return (_WARNINGS_OMITTED,)
+    return warnings[: limit - 1] + (_WARNINGS_OMITTED,)
 
 
 @dataclass(frozen=True)
@@ -290,7 +302,7 @@ class WriteResult:
         object.__setattr__(self, "state", WriteState(self.state))
         metadata = _json_mapping("WriteResult.metadata", self.metadata)
         object.__setattr__(self, "metadata", cast(Mapping[str, Any], _freeze_json(metadata)))
-        if isinstance(cast(object, self.warnings), str):
+        if not isinstance(cast(object, self.warnings), (list, tuple)):
             raise TypeError("WriteResult.warnings must be a sequence of strings")
         warnings = tuple(self.warnings)
         if len(warnings) > _MAX_WRITE_RESULT_WARNINGS:
@@ -327,6 +339,18 @@ class WriteResult:
         )
 
 
+def _result_wire_bytes(operation_id: str, result: WriteResult) -> int:
+    metadata = json.dumps(_plain_json_value("metadata", result.metadata), sort_keys=True, separators=(",", ":"))
+    warnings = json.dumps(result.warnings, separators=(",", ":"))
+    return (
+        len(operation_id.encode("utf-8"))
+        + len(result.state.value)
+        + 3 * 8
+        + len(metadata.encode("utf-8"))
+        + len(warnings.encode("utf-8"))
+    )
+
+
 @dataclass(frozen=True)
 class WriteSummary:
     """Aggregated driver-visible result for one operation."""
@@ -343,11 +367,18 @@ class WriteSummary:
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation_id", WriteContext(self.operation_id).operation_id)
         object.__setattr__(self, "outcome", WriteOutcome(self.outcome))
+        if not isinstance(cast(object, self.results), (list, tuple)):
+            raise TypeError("WriteSummary.results must be a sequence of WriteResult values")
         results = tuple(self.results)
         if len(results) > _MAX_WRITE_RESULTS:
             raise ValueError("WriteSummary.results must contain at most 1000000 values")
         if any(not isinstance(result, WriteResult) for result in results):
             raise TypeError("WriteSummary.results must contain only WriteResult values")
+        total_result_bytes = 0
+        for result in results:
+            total_result_bytes += _result_wire_bytes(self.operation_id, result)
+            if total_result_bytes > _MAX_TOTAL_RESULT_BYTES:
+                raise ValueError("WriteSummary.results exceeds the 64 MiB coordinator payload limit")
         object.__setattr__(self, "results", results)
         states = {result.state for result in results}
         if self.outcome is WriteOutcome.APPLIED and WriteState.ABORTED in states:
@@ -370,7 +401,7 @@ class WriteSummary:
         object.__setattr__(
             self, "metadata", cast(Mapping[str, Any], _freeze_json(_json_mapping("metadata", self.metadata)))
         )
-        if isinstance(cast(object, self.warnings), str):
+        if not isinstance(cast(object, self.warnings), (list, tuple)):
             raise TypeError("WriteSummary.warnings must be a sequence of strings")
         warnings = tuple(self.warnings)
         if len(warnings) > _MAX_SUMMARY_WARNINGS:
@@ -416,7 +447,11 @@ class DataSinkWriteError(RuntimeError):
         self.operation_id = summary.operation_id
         self.outcome = summary.outcome
         self.safe_to_retry = bool(safe_to_retry)
-        self.detail = _bounded_warning(str(detail)) or "DataSink failed without outcome detail"
+        try:
+            detail_text = str(detail)
+        except BaseException:
+            detail_text = "<outcome detail unavailable>"
+        self.detail = _bounded_warning(detail_text) or "DataSink failed without outcome detail"
         super().__init__(
             f"DataSink operation {summary.operation_id} ended with outcome {summary.outcome.value}: {self.detail}"
         )
@@ -438,13 +473,13 @@ class DataSinkWorker(ABC):
 
     @abstractmethod
     def write(self, table: pa.Table) -> WriteResult:
-        """Apply one of this actor's batches using idempotent external semantics."""
+        """Apply one batch immediately and return only after its writes are visible."""
 
     def abort(self, error: BaseException) -> None:
         """Release worker-local state after failure; this is not remote rollback."""
 
     def close(self) -> None:
-        """Release worker-local resources."""
+        """Release worker-local resources without publishing or flushing writes."""
 
 
 class BoundDataSink(ABC):
@@ -623,31 +658,49 @@ class _SinkBatchRuntime:
         if worker is not None:
             worker.close()
 
-    def __call__(self, table: pa.Table) -> pa.Table:
-        import pyarrow as pa
-
-        if isinstance(table, pa.RecordBatch):
-            table = pa.Table.from_batches([table])
-        if not isinstance(table, pa.Table):
-            raise TypeError(f"DataSink worker expected pyarrow.Table, got {type(table).__name__}")
-        rejection_reason = None
-        if self._key_validation is not None:
-            table, rejection_reason = self._key_validation.strip_and_validate(table)
-        if table.num_rows == 0:
-            return _empty_wire_table()
-        if rejection_reason is not None:
-            return _result_to_wire_table(
-                self._context,
-                WriteResult(
-                    rows_received=table.num_rows,
-                    rows_affected=0,
-                    metadata={"validation_error": rejection_reason},
-                    state=WriteState.ABORTED,
-                ),
+    def _abort_after_failure(self, error: BaseException) -> None:
+        if self._failed:
+            return
+        self._failed = True
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.abort(error)
+        except BaseException as abort_error:
+            _add_exception_note(
+                error,
+                _bounded_warning(
+                    "DataSinkWorker.abort() local cleanup also failed: "
+                    f"{type(abort_error).__name__}: {_safe_error_message(abort_error)}"
+                )
             )
 
-        worker = self._get_or_open_worker()
+    def __call__(self, table: pa.Table) -> pa.Table:
         try:
+            import pyarrow as pa
+
+            if isinstance(table, pa.RecordBatch):
+                table = pa.Table.from_batches([table])
+            if not isinstance(table, pa.Table):
+                raise TypeError(f"DataSink worker expected pyarrow.Table, got {type(table).__name__}")
+            rejection_reason = None
+            if self._key_validation is not None:
+                table, rejection_reason = self._key_validation.strip_and_validate(table)
+            if table.num_rows == 0:
+                return _empty_wire_table()
+            if rejection_reason is not None:
+                return _result_to_wire_table(
+                    self._context,
+                    WriteResult(
+                        rows_received=table.num_rows,
+                        rows_affected=0,
+                        metadata={"validation_error": rejection_reason},
+                        state=WriteState.ABORTED,
+                    ),
+                )
+
+            worker = self._get_or_open_worker()
             result = worker.write(table)
             if not isinstance(result, WriteResult):
                 raise TypeError(f"DataSinkWorker.write() must return WriteResult, got {type(result).__name__}")
@@ -657,18 +710,10 @@ class _SinkBatchRuntime:
                 raise ValueError(
                     f"DataSinkWorker rows_received={result.rows_received} does not match input rows={table.num_rows}"
                 )
+            return _result_to_wire_table(self._context, result)
         except BaseException as error:
-            self._failed = True
-            try:
-                worker.abort(error)
-            except BaseException as abort_error:
-                if hasattr(error, "add_note"):
-                    error.add_note(
-                        "DataSinkWorker.abort() local cleanup also failed: "
-                        f"{type(abort_error).__name__}: {_safe_error_message(abort_error)}"
-                    )
+            self._abort_after_failure(error)
             raise
-        return _result_to_wire_table(self._context, result)
 
 
 def _make_batch_actor(
@@ -770,18 +815,6 @@ def _write_result_from_mapping(operation_id: str, payload: Mapping[str, Any]) ->
     )
 
 
-def _result_wire_bytes(operation_id: str, result: WriteResult) -> int:
-    metadata = json.dumps(_plain_json_value("metadata", result.metadata), sort_keys=True, separators=(",", ":"))
-    warnings = json.dumps(result.warnings, separators=(",", ":"))
-    return (
-        len(operation_id.encode("utf-8"))
-        + len(result.state.value)
-        + 3 * 8
-        + len(metadata.encode("utf-8"))
-        + len(warnings.encode("utf-8"))
-    )
-
-
 def _results_from_native(operation_id: str, payload: Mapping[str, Any]) -> tuple[WriteResult, ...]:
     native_operation_id = payload.get("operation_id")
     outcome_unknown = payload.get("outcome_unknown")
@@ -863,15 +896,26 @@ def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult
 
 
 def _cleanup_warnings(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    raw = payload.get("data_sink_cleanup_warnings", ())
-    if isinstance(raw, str):
-        raw = (raw,) if raw else ()
-    if not isinstance(raw, (list, tuple)) or any(not isinstance(item, str) for item in raw):
-        raise TypeError("native DataSink cleanup warnings must be a sequence of strings")
-    warnings: tuple[str, ...] = ()
-    for item in raw:
-        warnings = _append_warning(warnings, item, limit=_MAX_SUMMARY_WARNINGS)
-    return warnings
+    try:
+        raw = payload.get("data_sink_cleanup_warnings", ())
+        if isinstance(raw, str):
+            raw = (raw,) if raw else ()
+        if not isinstance(raw, (list, tuple)):
+            raise TypeError("native DataSink cleanup warnings must be a sequence of strings")
+        warnings: tuple[str, ...] = ()
+        # Inspect at most one item beyond the public limit. Runner boundaries
+        # cap this payload too, but a malformed custom Runner must not force an
+        # unbounded validation pass here.
+        for item in raw[: _MAX_SUMMARY_WARNINGS + 1]:
+            if not isinstance(item, str):
+                raise TypeError("native DataSink cleanup warnings must be a sequence of strings")
+            warnings = _append_warning(warnings, item, limit=_MAX_SUMMARY_WARNINGS)
+        return warnings
+    except BaseException:
+        # Cleanup warnings are diagnostic-only. Once the runner has returned a
+        # terminal result, a malformed custom diagnostic payload must not turn
+        # a known applied/aborted write into an ambiguous outcome.
+        return ("DataSink cleanup diagnostics were malformed and ignored",)
 
 
 def _summary(
@@ -881,9 +925,15 @@ def _summary(
     warnings: tuple[str, ...] = (),
 ) -> WriteSummary:
     summary_warnings = warnings
+    warnings_overflowed = False
     for result in results:
         for warning in result.warnings:
+            warnings_overflowed = len(summary_warnings) >= _MAX_SUMMARY_WARNINGS
             summary_warnings = _append_warning(summary_warnings, warning, limit=_MAX_SUMMARY_WARNINGS)
+            if warnings_overflowed:
+                break
+        if warnings_overflowed:
+            break
     affected = [result.rows_affected for result in results]
     rows_affected = None if any(value is None for value in affected) else sum(affected)  # type: ignore[arg-type]
     return WriteSummary(
@@ -941,6 +991,7 @@ def write_datasink(
         raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
     if not isinstance(sink, DataSink):
         raise TypeError(f"sink must be DataSink, got {type(sink).__name__}")
+    relation._validate_datasink_transaction()
     context = WriteContext(str(uuid.uuid4()) if operation_id is None else operation_id)
     bound = sink.bind(_relation_arrow_schema(relation))
     if not isinstance(bound, BoundDataSink):
@@ -963,6 +1014,7 @@ def write_datasink(
     prepared_relation = bound.prepare_input(relation)
     if not isinstance(prepared_relation, RuntimeDuckDBPyRelation):
         raise TypeError("BoundDataSink.prepare_input() must return DuckDBPyRelation")
+    prepared_relation._validate_datasink_transaction()
     key_validation = None
     if isinstance(bound, BoundKeyedUpsertSink):
         prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
@@ -986,9 +1038,20 @@ def write_datasink(
             try:
                 table = terminal.to_arrow_table()
             finally:
-                warnings = _cleanup_warnings(
-                    {"data_sink_cleanup_warnings": terminal._take_udf_actor_cleanup_warnings()}
-                )
+                try:
+                    raw_cleanup_warnings = terminal._take_udf_actor_cleanup_warnings()
+                    warnings = _cleanup_warnings({"data_sink_cleanup_warnings": raw_cleanup_warnings})
+                except BaseException as cleanup_error:
+                    # Query completion has already established the write
+                    # outcome. A diagnostic getter failure must neither mask
+                    # the execution error nor turn a successful write into an
+                    # ambiguous one.
+                    warnings = _append_warning(
+                        warnings,
+                        "DataSink actor cleanup diagnostics failed: "
+                        f"{type(cleanup_error).__name__}: {_safe_error_message(cleanup_error)}",
+                        limit=_MAX_SUMMARY_WARNINGS,
+                    )
             results = _results_from_arrow(context.operation_id, table)
             states = {result.state for result in results}
             if states == {WriteState.ABORTED}:

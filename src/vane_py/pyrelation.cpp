@@ -308,9 +308,20 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &n
 	return DeriveRelation(rel->LocalExchange(num_partitions));
 }
 
-unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {
+void DuckDBPyRelation::ValidateDataSinkTransaction() {
 	AssertRelation();
-	(void)rel->context->GetContext();
+	if (!rel->context) {
+		throw InternalException("Cannot validate DataSink transaction: relation has no context");
+	}
+	auto context = rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException(
+		    "DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {
+	ValidateDataSinkTransaction();
 	return DeriveRelation(make_shared_ptr<DataSinkRelation>(rel, operation_id));
 }
 

@@ -116,6 +116,33 @@ def _make_test_physical_plan(con=None):
     ).to_physical_plan(con)
 
 
+def test_ray_driver_exception_diagnostics_cannot_mask_primary_failure():
+    class _OpaqueError(RuntimeError):
+        def __getattribute__(self, name):
+            if name in {"add_note", "args", "cause", "traceback_str"}:
+                raise RuntimeError(f"planned {name} lookup failure")
+            return super().__getattribute__(name)
+
+    primary_error = _OpaqueError("planned primary failure")
+
+    driver._add_exception_note(primary_error, "secondary cleanup failure")
+
+    assert driver._has_remote_error_details(primary_error) is False
+    assert driver._safe_remote_error_message(primary_error) == "_OpaqueError from remote Ray task"
+
+
+def test_ray_driver_nested_exception_diagnostics_cannot_mask_primary_failure():
+    class _OpaqueDiagnostic(str):
+        def strip(self, *args, **kwargs):
+            raise RuntimeError("planned diagnostic normalization failure")
+
+    primary_error = RuntimeError("planned primary failure")
+    primary_error.traceback_str = _OpaqueDiagnostic("remote traceback")
+
+    assert driver._has_remote_error_details(primary_error) is True
+    assert driver._safe_remote_error_message(primary_error) == "RuntimeError from remote Ray task"
+
+
 class _DummyStream:
     def __init__(self, items):
         self.items = list(items)
@@ -2989,6 +3016,28 @@ def test_ray_query_driver_client_stream_preserves_primary_and_cleanup_failures(m
     assert "planned mid-stream cleanup failure" in str(error.value)
 
 
+def test_query_execution_cleanup_error_preserves_unprintable_failures():
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned str failure")
+
+        def __repr__(self):
+            raise RuntimeError("planned repr failure")
+
+    primary_error = _UnprintableError()
+    cleanup_error = _UnprintableError()
+
+    error = driver.QueryExecutionCleanupError.from_errors(
+        "planned query failure",
+        primary_error,
+        [cleanup_error],
+    )
+
+    assert error.primary_error is primary_error
+    assert error.cleanup_errors == (cleanup_error,)
+    assert str(error).count("<error message unavailable>") == 2
+
+
 def test_ray_query_driver_client_stream_failure_accepts_concurrent_detach_cleanup(monkeypatch):
     run_future = object()
     close_future = object()
@@ -3518,6 +3567,26 @@ def test_teardown_reports_actor_close_diagnostic_after_releasing_lifecycle_lock(
     assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
     assert runner._udf_actor_cleanup_diagnostics_by_plan == {}
     assert runner._query_udf_actor_lifecycle_locks == {}
+
+
+def test_teardown_actor_close_diagnostic_handles_unprintable_failure(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-unprintable-diagnostic"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned cleanup diagnostic str failure")
+
+    close_error = _UnprintableError()
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(driver._QueryCleanupDiagnostic) as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "_UnprintableError: <error message unavailable>" in str(exc_info.value)
+    assert exc_info.value.diagnostics == (close_error,)
+    assert plan_id not in runner._plan_lifecycles
 
 
 def test_teardown_preserves_actor_close_diagnostic_when_later_cleanup_fails(monkeypatch):
@@ -9110,6 +9179,131 @@ def test_streaming_wait_does_not_publish_loser_after_selected_attempt_was_publis
         assert worker.selected.get_result_sync_calls == 1
         assert worker.selected.release_calls == 1
         manager.drop_query_fragments(query_id)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("fail_after", "throw_after", "message"),
+    [
+        (1, -1, "planned streaming callback failure"),
+        (-1, 1, "streaming FTE output callback threw: planned streaming callback exception"),
+    ],
+)
+def test_streaming_wait_does_not_retain_already_finalized_handle_after_later_callback_failure(
+    monkeypatch,
+    fail_after,
+    throw_after,
+    message,
+):
+    pa = pytest.importorskip("pyarrow")
+
+    class _OutputHandle:
+        worker_id = "worker-streaming-callback-failure"
+
+        def __init__(self, task_id, value):
+            self.task_id = _fake_task_attempt_id(task_id)
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self._result = vane.ray_cxx.RayTaskResult.success([pa.table({"value": [value]})], [], None)
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return self._result
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class _Worker:
+        def __init__(self):
+            self.pop_calls = 0
+            self.handles = []
+
+        def fte_query_status(self, query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [
+                    f"{query_id}.0.0.0",
+                    f"{query_id}.0.1.0",
+                ],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            self.pop_calls += 1
+            if self.pop_calls != 1:
+                return []
+            self.handles = [
+                _OutputHandle(
+                    {
+                        "query_id": query_id,
+                        "fragment_execution_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                    },
+                    1,
+                ),
+                _OutputHandle(
+                    {
+                        "query_id": query_id,
+                        "fragment_execution_id": 0,
+                        "partition_id": 1,
+                        "attempt_id": 0,
+                    },
+                    2,
+                ),
+            ]
+            return list(self.handles)
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-streaming-callback-failure",
+                worker,
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-streaming-callback-failure"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+        with pytest.raises(Exception, match=message):
+            manager._wait_fte_query_streaming_for_test(query_id, 1.0, fail_after, throw_after)
+        assert [handle.release_calls for handle in worker.handles] == [1, 0]
+
+        manager.drop_query_fragments(query_id)
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
     finally:
         manager.shutdown()
 

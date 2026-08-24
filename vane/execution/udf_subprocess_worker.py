@@ -221,8 +221,15 @@ def _arrow_table_to_ipc_bytes(table: pa.Table) -> bytes:
 def _format_exception(exc: BaseException) -> str:
     try:
         return "".join(TracebackException.from_exception(exc).format())
-    except Exception:
-        return repr(exc)
+    except BaseException:
+        try:
+            return repr(exc)
+        except BaseException:
+            try:
+                error_type = type(exc).__name__
+            except BaseException:
+                error_type = "BaseException"
+            return f"<unprintable {error_type}>"
 
 
 def _send_input_consumed(

@@ -219,6 +219,7 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     runner = object.__new__(runner_cls)
     events: list[str] = []
     runner._driver_shutdown_lock = asyncio.Lock()
+    runner._session_lock = threading.RLock()
     runner._plan_runner_lifecycle_lock = threading.RLock()
     runner._driver_shutdown_started = False
     runner._driver_shutdown_complete = False
@@ -242,6 +243,61 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     assert runner._driver_executors_shutdown is True
     with pytest.raises(RuntimeError, match="executor is shut down"):
         runner_cls._get_driver_lifecycle_executor(runner)
+
+
+def test_driver_actor_runtime_shutdown_cancels_unbounded_datasink_cleanup_retry(monkeypatch):
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._driver_shutdown_lock = asyncio.Lock()
+    runner._session_lock = threading.RLock()
+    runner._plan_runner_lifecycle_lock = threading.RLock()
+    runner._driver_shutdown_started = False
+    runner._driver_shutdown_complete = False
+    runner._datasink_cleanup_tasks = {}
+    runner.plan_runner = None
+    attempts = 0
+
+    async def stop_maintenance():
+        return None
+
+    def fail_cleanup(*_args):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("persistent cleanup failure")
+
+    runner.stop_query_resource_maintenance = stop_maintenance
+    monkeypatch.setattr(runner_cls, "_teardown_plan_resources", fail_cleanup)
+
+    async def start_retry_and_shutdown():
+        lifecycle = SimpleNamespace()
+        cleanup_key = ("plan", id(lifecycle))
+        cleanup_task = asyncio.create_task(runner_cls._retry_datasink_cleanup_until_complete(runner, "plan", lifecycle))
+        runner._datasink_cleanup_tasks[cleanup_key] = cleanup_task
+        while attempts == 0:
+            await asyncio.sleep(0)
+        await asyncio.wait_for(runner_cls._shutdown_runtime(runner), timeout=1.0)
+        return cleanup_task
+
+    cleanup_task = asyncio.run(start_retry_and_shutdown())
+
+    assert attempts == 1
+    assert cleanup_task.done()
+    assert runner._driver_shutdown_complete is True
+
+
+def test_driver_cleanup_warning_is_bounded_before_actor_transport():
+    from vane.runners.ray.driver import _cleanup_warning
+
+    warning = _cleanup_warning(
+        "DataSink teardown",
+        RuntimeError("diagnostic-head:" + "x" * 10_000 + ":diagnostic-tail"),
+    )
+
+    assert len(warning.encode("utf-8")) <= 4 * 1024
+    assert warning.startswith("DataSink teardown failed: RuntimeError: diagnostic-head:")
+    assert warning.endswith(":diagnostic-tail")
 
 
 def test_driver_actor_rejects_detach_from_non_owner():
@@ -2181,6 +2237,18 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
 
     assert killed == [{"actor": "actor-0", "no_restart": True}]
     assert pool.actors == []
+
+
+def test_udf_actor_cleanup_diagnostic_handles_unprintable_failure():
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned actor cleanup str failure")
+
+    diagnostic = actor_pool_mod._actor_cleanup_failure("close", 7, _UnprintableError())
+
+    assert diagnostic == "actor-7 close: _UnprintableError: <cleanup error message unavailable>"
 
 
 def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):

@@ -121,6 +121,7 @@ TEST_CASE("DataSink worker result protocol rejects ambiguous or invalid payloads
 	REQUIRE(StringUtil::Contains(schema_result.error().what(), "worker result schema"));
 
 	REQUIRE(ParseDataSinkPartitions("", {}).is_err());
+	REQUIRE(ParseDataSinkPartitions(string("\xFF", 1), {}).is_err());
 }
 
 TEST_CASE("DataSink outcome diagnostics are bounded before coordinator transport", "[distributed][datasink]") {
@@ -160,4 +161,31 @@ TEST_CASE("DataSink result partitions are bounded while the coordinator collects
 
 	REQUIRE(
 	    ValidateDataSinkResultBudget(DATA_SINK_MAX_WRITE_RESULTS - 1, DATA_SINK_MAX_TOTAL_RESULT_BYTES - 1, 1).is_ok());
+}
+
+TEST_CASE("DataSink streaming validation rejects output before a task collector can exceed its byte budget",
+          "[distributed][datasink]") {
+	const string operation_id = "streaming-budget";
+	vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                           LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetValue(0, 0, Value(operation_id));
+	chunk.SetValue(1, 0, Value("applied"));
+	chunk.SetValue(2, 0, Value::UBIGINT(1));
+	chunk.SetValue(3, 0, Value::UBIGINT(1));
+	chunk.SetValue(4, 0, Value::UBIGINT(1));
+	chunk.SetValue(5, 0, Value(string(DATA_SINK_MAX_METADATA_BYTES, 'x')));
+	chunk.SetValue(6, 0, Value("[]"));
+	chunk.SetCardinality(1);
+
+	DataSinkResultValidationState validation(operation_id);
+	DuckDBResult<void> append_result = DuckDBResult<void>::ok();
+	for (idx_t index = 0; index < 2000 && append_result.is_ok(); index++) {
+		append_result = validation.Append(chunk);
+	}
+
+	REQUIRE(append_result.is_err());
+	REQUIRE(StringUtil::Contains(append_result.error().what(), "64 MiB coordinator payload limit"));
+	REQUIRE(validation.total_result_bytes() <= DATA_SINK_MAX_TOTAL_RESULT_BYTES);
 }

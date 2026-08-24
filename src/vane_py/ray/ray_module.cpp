@@ -6,6 +6,7 @@
 #include "task.hpp"
 #include "worker.hpp"
 #include "worker_manager.hpp"
+#include "bounded_diagnostics.hpp"
 #include "safe_pyobject.hpp"
 #include "datasource_function.hpp"
 
@@ -88,6 +89,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/relation/data_sink_relation.hpp>
 #include <duckdb/execution/operator/helper/physical_materialized_collector.hpp>
 #include <duckdb/execution/operator/helper/physical_data_sink.hpp>
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp>
@@ -612,9 +614,18 @@ void register_ray_bindings(py::module_ &mod) {
 	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
 	    .def(
 	        "_wait_fte_query_streaming_for_test",
-	        [](RayWorkerManager &self, const string &query_id, double timeout_s) {
+	        [](RayWorkerManager &self, const string &query_id, double timeout_s, int64_t fail_after,
+	           int64_t throw_after) {
 		        size_t output_count = 0;
-		        auto on_output = [&output_count](const duckdb::distributed::MaterializedOutput &) {
+		        auto on_output = [&output_count, fail_after,
+		                          throw_after](const duckdb::distributed::MaterializedOutput &) {
+			        if (throw_after >= 0 && output_count >= static_cast<size_t>(throw_after)) {
+				        throw std::runtime_error("planned streaming callback exception");
+			        }
+			        if (fail_after >= 0 && output_count >= static_cast<size_t>(fail_after)) {
+				        return duckdb::distributed::DuckDBResult<void>::err(
+				            duckdb::distributed::DuckDBError::external_error("planned streaming callback failure"));
+			        }
 			        output_count++;
 			        return duckdb::distributed::DuckDBResult<void>::ok();
 		        };
@@ -627,7 +638,8 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 		        return output_count;
 	        },
-	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1,
+	        py::arg("throw_after") = -1)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {
@@ -1121,7 +1133,7 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     false);
+			                                                     DuckDBRelationPlanKind::READ);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
@@ -1134,7 +1146,20 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     true);
+			                                                     DuckDBRelationPlanKind::WRITE);
+		                } catch (const py::type_error &) {
+			                throw;
+		                } catch (const py::error_already_set &) {
+			                throw;
+		                } catch (const std::exception &ex) {
+			                throw py::value_error(ex.what());
+		                }
+	                })
+	    .def_static("from_duckdb_datasink_relation",
+	                [](py::object relation_obj, py::object query_id_obj) {
+		                try {
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     DuckDBRelationPlanKind::DATA_SINK);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
