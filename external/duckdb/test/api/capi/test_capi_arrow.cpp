@@ -328,6 +328,52 @@ TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 		duckdb_destroy_logical_type(&child_type);
 	}
 
+	SECTION("Arrow-to-DuckDB conversion validates FILE values") {
+		duckdb_result result;
+		REQUIRE(duckdb_query(tester.connection, "SELECT file('valid', NULL, NULL, NULL, NULL) AS value", &result) ==
+		        DuckDBSuccess);
+		auto chunk = duckdb_result_get_chunk(result, 0);
+		REQUIRE(chunk != nullptr);
+
+		duckdb_arrow_options arrow_options;
+		duckdb_connection_get_arrow_options(tester.connection, &arrow_options);
+		ArrowArray arrow_array;
+		auto error = duckdb_data_chunk_to_arrow(arrow_options, chunk, &arrow_array);
+		REQUIRE(error == nullptr);
+
+		auto file_type = duckdb_column_logical_type(&result, 0);
+		duckdb_logical_type types[] = {file_type};
+		const char *names[] = {"value"};
+		ArrowSchemaWrapper arrow_schema;
+		error = duckdb_to_arrow_schema(arrow_options, types, names, 1, &arrow_schema.arrow_schema);
+		REQUIRE(error == nullptr);
+		duckdb_destroy_arrow_options(&arrow_options);
+
+		duckdb_arrow_converted_schema converted_schema = nullptr;
+		error = duckdb_schema_from_arrow(tester.connection, &arrow_schema.arrow_schema, &converted_schema);
+		REQUIRE(error == nullptr);
+
+		REQUIRE(arrow_array.n_children == 1);
+		auto file_array = arrow_array.children[0];
+		REQUIRE(file_array->n_children == FileLogicalType::FIELD_COUNT);
+		auto url_array = file_array->children[FileLogicalType::URL];
+		uint8_t invalid_url = 0;
+		url_array->null_count = 1;
+		url_array->buffers[0] = &invalid_url;
+
+		duckdb_data_chunk out_chunk = nullptr;
+		error = duckdb_data_chunk_from_arrow(tester.connection, &arrow_array, converted_schema, &out_chunk);
+		REQUIRE(error != nullptr);
+		REQUIRE(StringUtil::Contains(duckdb_error_data_message(error), "Arrow FILE url cannot be NULL"));
+		REQUIRE(out_chunk == nullptr);
+		duckdb_destroy_error_data(&error);
+
+		duckdb_destroy_arrow_converted_schema(&converted_schema);
+		duckdb_destroy_logical_type(&file_type);
+		duckdb_destroy_data_chunk(&chunk);
+		duckdb_destroy_result(&result);
+	}
+
 	SECTION("roundtrip: duckdb table -> arrow -> duckdb chunk, validate correctness") {
 		// 1. Create and populate table
 		REQUIRE_NO_FAIL(tester.Query("CREATE TABLE big_table(i INTEGER);"));

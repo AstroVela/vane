@@ -35,6 +35,26 @@ def test_file_constructor_is_pure_and_exposes_canonical_fields(connection):
     )
 
 
+def test_file_supports_all_struct_extraction_forms(connection):
+    rows = connection.execute(
+        f"""
+        SELECT
+            struct_extract(value, 'url'),
+            struct_extract(value, 1),
+            struct_extract_at(value, 1),
+            array_extract(value, 'url'),
+            array_extract(value, 1),
+            value['url'],
+            value[1]
+        FROM (VALUES ({FILE}), (NULL::FILE)) AS input(value)
+        ORDER BY value IS NULL
+        """
+    ).fetchall()
+
+    url = "s3://bucket/missing.bin"
+    assert rows == [(url, url, url, url, url, url, url), (None, None, None, None, None, None, None)]
+
+
 @pytest.mark.parametrize(
     ("expression", "message"),
     [
@@ -1078,6 +1098,63 @@ def test_file_type_rejects_invalid_arrow_values(connection):
 
     with pytest.raises(vane.InvalidInputException, match="Arrow FILE url cannot be NULL"):
         connection.from_arrow(arrow_table).fetchall()
+
+
+def test_file_type_arrow_dictionary_validates_only_referenced_values(connection):
+    pa = pytest.importorskip("pyarrow")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+
+    class FileExtensionType(pa.ExtensionType):
+        def __init__(self):
+            pa.ExtensionType.__init__(self, file_storage_type, "vane.file")
+
+        def __arrow_ext_serialize__(self):
+            return b""
+
+        @classmethod
+        def __arrow_ext_deserialize__(cls, storage_type, serialized):
+            return cls()
+
+    file_values = FileExtensionType().wrap_array(
+        pa.array(
+            [
+                {
+                    "url": "active",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                },
+                {
+                    "url": None,
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                },
+            ],
+            type=file_storage_type,
+        )
+    )
+
+    unreferenced_invalid = pa.DictionaryArray.from_arrays(pa.array([0], type=pa.int8()), file_values)
+    rows = (
+        connection.from_arrow(pa.table({"value": unreferenced_invalid})).project("typeof(value), value.url").fetchall()
+    )
+    assert rows == [("FILE", "active")]
+
+    referenced_invalid = pa.DictionaryArray.from_arrays(pa.array([1], type=pa.int8()), file_values)
+    with pytest.raises(vane.InvalidInputException, match="Arrow FILE url cannot be NULL"):
+        connection.from_arrow(pa.table({"value": referenced_invalid})).fetchall()
 
 
 def test_file_type_arrow_ignores_inactive_sparse_union_slots(connection):

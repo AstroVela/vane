@@ -335,7 +335,6 @@ struct ArrowFile {
 		for (auto &child : StructVector::GetEntries(source)) {
 			FlatVector::Validity(*child).Combine(result_validity, count);
 		}
-		FileLogicalType::Validate(source, count, "Arrow FILE");
 		result.Reference(source);
 		FlatVector::Validity(result) = std::move(result_validity);
 	}

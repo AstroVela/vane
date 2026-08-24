@@ -1,5 +1,6 @@
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
@@ -139,6 +140,7 @@ duckdb_error_data duckdb_data_chunk_from_arrow(duckdb_connection connection, str
 				return duckdb_create_error_data(DUCKDB_ERROR_NOT_IMPLEMENTED,
 				                                "Only Default Physical Types are currently supported");
 			}
+			duckdb::FileLogicalType::Validate(dchunk->data[i], dchunk->size(), "Arrow FILE");
 		} catch (const duckdb::Exception &ex) {
 			return duckdb_create_error_data(DUCKDB_ERROR_INVALID_INPUT, ex.what());
 		} catch (const std::exception &ex) {

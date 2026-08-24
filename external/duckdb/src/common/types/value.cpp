@@ -745,6 +745,10 @@ Value Value::TIMESTAMP(int32_t year, int32_t month, int32_t day, int32_t hour, i
 Value Value::STRUCT(const LogicalType &type, vector<Value> struct_values) {
 	Value result;
 	auto child_types = StructType::GetChildTypes(type);
+	if (struct_values.size() != child_types.size()) {
+		throw InvalidInputException("STRUCT value requires %llu fields, but %llu values were provided",
+		                            child_types.size(), struct_values.size());
+	}
 	for (size_t i = 0; i < struct_values.size(); i++) {
 		struct_values[i] = struct_values[i].DefaultCastAs(child_types[i].second);
 	}

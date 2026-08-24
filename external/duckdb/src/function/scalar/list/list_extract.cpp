@@ -1,6 +1,7 @@
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
@@ -177,6 +178,12 @@ ScalarFunctionSet ArrayExtractFun::GetFunctions() {
 	array_extract_set.AddFunction(sfun);
 	array_extract_set.AddFunction(GetKeyExtractFunction());
 	array_extract_set.AddFunction(GetIndexExtractFunction());
+	auto file_key_extract = GetKeyExtractFunction();
+	file_key_extract.arguments[0] = FileLogicalType::Create();
+	array_extract_set.AddFunction(std::move(file_key_extract));
+	auto file_index_extract = GetIndexExtractFunction();
+	file_index_extract.arguments[0] = FileLogicalType::Create();
+	array_extract_set.AddFunction(std::move(file_index_extract));
 	return array_extract_set;
 }
 

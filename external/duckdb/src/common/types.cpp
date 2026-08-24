@@ -1746,7 +1746,9 @@ void FileLogicalType::Validate(const Value &value, const string &source) {
 	auto &type = value.type();
 	if (IsFile(type)) {
 		auto &children = StructValue::GetChildren(value);
-		D_ASSERT(children.size() == FIELD_COUNT);
+		if (children.size() != FIELD_COUNT) {
+			throw InvalidInputException("%s must contain exactly %llu fields", source, FIELD_COUNT);
+		}
 
 		auto position_is_valid = !children[POSITION].IsNull();
 		auto size_is_valid = !children[SIZE].IsNull();
@@ -1803,7 +1805,9 @@ void FileLogicalType::Validate(Vector &value, idx_t count, const string &source)
 		return;
 	}
 	auto &children = StructVector::GetEntries(value);
-	D_ASSERT(children.size() == FIELD_COUNT);
+	if (children.size() != FIELD_COUNT) {
+		throw InvalidInputException("%s must contain exactly %llu fields", source, FIELD_COUNT);
+	}
 
 	UnifiedVectorFormat value_data;
 	UnifiedVectorFormat url_data;

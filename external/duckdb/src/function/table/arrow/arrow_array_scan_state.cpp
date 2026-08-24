@@ -30,8 +30,16 @@ void ArrowArrayScanState::AddDictionary(unique_ptr<Vector> dictionary_p, ArrowAr
 	D_ASSERT(owned_data);
 	D_ASSERT(arrow_dict);
 	arrow_dictionary = arrow_dict;
+	dictionary_owned_data = owned_data;
 	// Make sure the data referenced by the dictionary stays alive
-	dictionary->GetBuffer()->SetAuxiliaryData(make_uniq<ArrowAuxiliaryData>(owned_data));
+	auto owner_buffer = dictionary->GetBuffer();
+	if (!owner_buffer) {
+		// STRUCT vectors have no primary data buffer; their children live in the auxiliary buffer instead.
+		owner_buffer = dictionary->GetAuxiliary();
+	}
+	if (owner_buffer) {
+		owner_buffer->SetAuxiliaryData(make_uniq<ArrowAuxiliaryData>(owned_data));
+	}
 }
 
 bool ArrowArrayScanState::HasDictionary() const {

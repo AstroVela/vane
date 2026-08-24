@@ -165,6 +165,24 @@ TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
 		REQUIRE(CHECK_COLUMN(count, 0, {0}));
 	}
 
+	SECTION("malformed FILE field counts are rejected safely") {
+		auto file_type = FileLogicalType::Create();
+		REQUIRE_THROWS_WITH(Value::STRUCT(file_type, {Value("object"), Value(), Value(), Value()}),
+		                    Catch::Matchers::Contains("STRUCT value requires 5 fields, but 4 values were provided"));
+		REQUIRE_THROWS_WITH(Value::STRUCT(file_type, {Value("object"), Value(), Value(), Value(), Value(), Value()}),
+		                    Catch::Matchers::Contains("STRUCT value requires 5 fields, but 6 values were provided"));
+
+		auto four_field_type = LogicalType::STRUCT({{"url", LogicalType::VARCHAR},
+		                                            {"content_type", LogicalType::VARCHAR},
+		                                            {"position", LogicalType::BIGINT},
+		                                            {"size", LogicalType::BIGINT}});
+		auto malformed_file = Value::STRUCT(four_field_type, {Value("object"), Value(), Value(), Value()});
+		malformed_file.Reinterpret(std::move(file_type));
+		auto result = con.Query("SELECT ?", malformed_file);
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Query parameter FILE must contain exactly 5 fields"));
+	}
+
 	SECTION("valid FILE values remain accepted") {
 		auto valid_file =
 		    Value::STRUCT(FileLogicalType::Create(), {Value("object"), Value("application/octet-stream"),

@@ -147,7 +147,7 @@ static unique_ptr<FunctionData> StructExtractBindInternal(ClientContext &context
 	if (struct_children.empty()) {
 		throw InternalException("Can't extract something from an empty struct");
 	}
-	if (struct_extract && !StructType::IsUnnamed(child_type)) {
+	if (struct_extract && !StructType::IsUnnamed(child_type) && !FileLogicalType::IsFile(child_type)) {
 		throw BinderException(
 		    "struct_extract with an integer key can only be used on unnamed structs, use a string key instead");
 	}
@@ -214,9 +214,12 @@ ScalarFunctionSet StructExtractFun::GetFunctions() {
 	ScalarFunctionSet struct_extract_set("struct_extract");
 	struct_extract_set.AddFunction(GetKeyExtractFunction());
 	struct_extract_set.AddFunction(GetIndexExtractFunction());
-	auto file_extract = GetKeyExtractFunction();
-	file_extract.arguments[0] = FileLogicalType::Create();
-	struct_extract_set.AddFunction(std::move(file_extract));
+	auto file_key_extract = GetKeyExtractFunction();
+	file_key_extract.arguments[0] = FileLogicalType::Create();
+	struct_extract_set.AddFunction(std::move(file_key_extract));
+	auto file_index_extract = GetIndexExtractFunction();
+	file_index_extract.arguments[0] = FileLogicalType::Create();
+	struct_extract_set.AddFunction(std::move(file_index_extract));
 	return struct_extract_set;
 }
 

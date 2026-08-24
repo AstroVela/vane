@@ -99,6 +99,8 @@ public:
 	optional_ptr<ArrowArray> arrow_dictionary = nullptr;
 	// Cache the (optional) dictionary of this array
 	unique_ptr<Vector> dictionary;
+	//! Keep the Arrow dictionary alive while its cached Vector is reused across batches
+	shared_ptr<ArrowArrayWrapper> dictionary_owned_data;
 	//! Run-end-encoding state
 	ArrowRunEndEncodingState run_end_encoding;
 	ClientContext &context;
