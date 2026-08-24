@@ -1,10 +1,26 @@
 #include "duckdb/execution/operator/csv_scanner/csv_file_scanner.hpp"
 
+#include "duckdb/execution/operator/csv_scanner/csv_scan_range.hpp"
 #include "duckdb/execution/operator/csv_scanner/sniffer/csv_sniffer.hpp"
 #include "duckdb/execution/operator/csv_scanner/skip_scanner.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 
 namespace duckdb {
+
+static void DetectNewLineFromFileStartForScanRange(ClientContext &context, const OpenFileInfo &file,
+                                                   CSVReaderOptions &options, bool per_file_single_threaded) {
+	CSVScanRange scan_range;
+	if (options.dialect_options.state_machine_options.new_line != NewLineIdentifier::NOT_SET ||
+	    !CSVScanRange::TryGet(file, scan_range)) {
+		return;
+	}
+
+	// A range can begin next to an embedded newline in a quoted field. Detect the convention from the original file
+	// before narrowing the reader so every range uses the same state machine.
+	auto detection_manager =
+	    make_shared_ptr<CSVBufferManager>(context, options, CSVScanRange::Strip(file), per_file_single_threaded);
+	options.dialect_options.state_machine_options.new_line = CSVSniffer::DetectNewLineDelimiter(*detection_manager);
+}
 
 CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, CSVReaderOptions options_p,
                          const MultiFileOptions &file_options, const vector<string> &names,
@@ -13,6 +29,7 @@ CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, CSV
     : BaseFileReader(file_p), buffer_manager(std::move(buffer_manager_p)),
       error_handler(make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue())),
       options(std::move(options_p)) {
+	DetectNewLineFromFileStartForScanRange(context, file, options, per_file_single_threaded);
 	// Initialize Buffer Manager
 	if (!buffer_manager) {
 		buffer_manager = make_shared_ptr<CSVBufferManager>(context, options, file, per_file_single_threaded);
@@ -53,6 +70,7 @@ CSVFileScan::CSVFileScan(ClientContext &context, const OpenFileInfo &file_p, con
                          const MultiFileOptions &file_options)
     : BaseFileReader(file_p), error_handler(make_shared_ptr<CSVErrorHandler>(options_p.ignore_errors.GetValue())),
       options(options_p) {
+	DetectNewLineFromFileStartForScanRange(context, file, options, false);
 	buffer_manager = make_shared_ptr<CSVBufferManager>(context, options, file);
 	// Initialize On Disk and Size of file
 	on_disk_file = buffer_manager->file_handle->OnDiskFile();
@@ -82,6 +100,11 @@ CSVUnionData::~CSVUnionData() {
 }
 
 void CSVFileScan::SetStart() {
+	if (buffer_manager->HasScanRange() && buffer_manager->GetScanRangeStart() > 0) {
+		// The ordinary parallel CSV synchronization now skips the partial record at the beginning of this range.
+		start_iterator.first_one = false;
+		return;
+	}
 	idx_t rows_to_skip = options.GetSkipRows() + state_machine->dialect_options.header.GetValue();
 
 	if (rows_to_skip == 0) {

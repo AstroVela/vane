@@ -795,7 +795,11 @@ def test_connection_snapshot_captures_exact_extension_contract():
         "table_function:range(BIGINT)@1,"
         "table_function:range(BIGINT, BIGINT)@1,"
         "table_function:range(BIGINT, BIGINT, BIGINT)@1,"
-        "table_function:range(TIMESTAMP, TIMESTAMP, INTERVAL)@1}",
+        "table_function:range(TIMESTAMP, TIMESTAMP, INTERVAL)@1,"
+        "table_function:read_csv(VARCHAR)@1,"
+        "table_function:read_csv(VARCHAR[])@1,"
+        "table_function:read_csv_auto(VARCHAR)@1,"
+        "table_function:read_csv_auto(VARCHAR[])@1}",
     ]
 
 

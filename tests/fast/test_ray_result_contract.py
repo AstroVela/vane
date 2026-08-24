@@ -7226,6 +7226,108 @@ def test_run_copy_plan_uses_distributed_worker_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
+@pytest.mark.parametrize(
+    "compression,suffix,preserve_insertion_order",
+    [(None, ".csv", False), ("gzip", ".csv.gz", True)],
+)
+def test_run_csv_copy_plan_serializes_writer_and_returns_exact_stats(
+    tmp_path,
+    monkeypatch,
+    compression,
+    suffix,
+    preserve_insertion_order,
+):
+    captured = []
+    monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    class _DummyRunner:
+        def run_write(self, relation):
+            captured.append(relation)
+            return {"ok": True}
+
+    import vane.runners as runners_mod
+
+    monkeypatch.setattr(runners_mod, "set_runner_ray", lambda *_args, **_kwargs: _DummyRunner())
+
+    con = vane.connect()
+    con.execute(f"SET preserve_insertion_order={'true' if preserve_insertion_order else 'false'}")
+    src = tmp_path / "csv_copy_input"
+    dst = tmp_path / f"csv_copy_output{suffix}"
+    con.execute(
+        f"""
+        COPY (
+            SELECT
+                i::INTEGER AS id,
+                CASE WHEN i % 7 = 1 THEN NULL ELSE 'value|' || i::VARCHAR END AS label,
+                DATE '2026-08-10' + i::INTEGER AS event_date,
+                (i % 4)::INTEGER AS file_id
+            FROM range(40) tbl(i)
+        ) TO '{src}' (FORMAT PARQUET, PARTITION_BY (file_id))
+        """
+    )
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    con.read_parquet(str(src / "**" / "*.parquet")).project("id, label, event_date").write_csv(
+        str(dst),
+        sep="|",
+        na_rep="NULL",
+        date_format="%Y%m%d",
+        compression=compression,
+    )
+    assert captured, "expected write relation to be captured"
+
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+        captured[0],
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
+
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    with _registered_low_level_plan(plan, con):
+        result = runner.run_copy_plan(plan, con)
+
+    assert result["rows_copied"] == 40
+    assert len(result["files"]) == 4
+    assert sum(entry["row_count"] for entry in result["files"]) == 40
+    assert all(entry["file_size_bytes"] > 0 for entry in result["files"])
+    assert result["copy_output_committed"] is True
+
+    committed = vane.ray_cxx.read_committed_copy_direct_write_result(
+        result["copy_output_base_path"],
+        result["copy_output_run_id"],
+    )
+    committed_paths = [entry["final_path"] for entry in committed["files"]]
+    assert len(committed_paths) == 4
+    file_list = ", ".join(f"'{path}'" for path in committed_paths)
+    assert con.execute(
+        f"""
+        SELECT id, label, event_date::VARCHAR
+        FROM read_csv(
+            [{file_list}],
+            delim='|',
+            nullstr='NULL',
+            dateformat='%Y%m%d',
+            header=true,
+            auto_detect=false,
+            columns={{'id': 'INTEGER', 'label': 'VARCHAR', 'event_date': 'DATE'}}
+        )
+        ORDER BY id
+        """
+    ).fetchall() == [
+        (
+            row_id,
+            None if row_id % 7 == 1 else f"value|{row_id}",
+            f"2026-08-{10 + row_id:02d}" if row_id < 22 else f"2026-09-{row_id - 21:02d}",
+        )
+        for row_id in range(40)
+    ]
+    assert not Path(str(dst) + ".duckdb_staging").exists()
+    con.close()
+
+
+@pytest.mark.usefixtures("ray_local")
 def test_run_copy_plan_trailing_separator_uses_one_lifecycle_namespace(tmp_path, monkeypatch):
     captured = []
     monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)

@@ -212,6 +212,12 @@ and `VANE_RAY_SCAN_SPLIT_MIN_COUNT`. It is not a task count. An extension may
 return more or fewer splits, but every returned split must remain independently
 executable and have an ID unique within that logical scan source.
 
+The planning input also borrows the coordinator `FileSystem` for the duration
+of the callback. File-backed implementations may use it to inspect the
+already-selected files and produce size estimates or safe byte boundaries.
+They must not retain the filesystem or any connection-level resource in worker
+bind data.
+
 Extensions may return per-split byte and cardinality estimates for balancing.
 Vane never opens or parses an extension payload to infer those estimates, even
 when the payload encodes a URI; split interpretation remains extension-owned.
@@ -240,6 +246,22 @@ an FTE queue replace it before executor initialization. Planning emits one
 occurrences of the same path. A zero-file MultiFile scan is represented by one
 explicit empty file split. The coordinator's original file list is never
 retained as a worker fallback.
+
+Vane's built-in CSV reader uses the extension-owned contract because a single
+seekable CSV file can be split below file granularity. A multi-file scan emits
+one split per bound file. A single uncompressed UTF-8 file may emit explicit
+byte ranges, with overlap used only to finish the record that starts inside a
+range. The worker bind serializes the bound schema, projection-facing column
+metadata, reader options, union-by-name per-file state, and complete
+`OpenFileInfo` options. It is detached until an assignment is applied, and an
+explicit empty assignment remains a zero-row scan. Compressed, non-seekable,
+non-UTF-8, `skip_rows`, and leading-row header detection cannot be byte-range
+split, so a single replayable input in one of those modes produces one explicit
+whole-file split even when the target granularity hint is larger. Pipe inputs
+are rejected at every granularity because they cannot provide retryable tasks.
+Rejects-table scans are not distributed. CSV itself has no snapshot identifier,
+so referenced files must remain immutable for the lifetime of the query and its
+retries; a same-size replacement cannot be detected by this protocol.
 
 ## Distributed writes
 

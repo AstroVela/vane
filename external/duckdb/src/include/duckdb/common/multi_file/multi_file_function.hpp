@@ -261,8 +261,12 @@ public:
 	                                             optional_ptr<TableFilterSet> table_filters, ClientContext &context,
 	                                             optional_idx file_idx, MultiFileGlobalState &global_state) {
 		auto &reader = *reader_data.reader;
-		// Mark the file in the file list we are scanning here
-		reader.file_list_idx = file_idx;
+		// Mark the file in the file list we are scanning here. A reader reconstructed
+		// from an explicit distributed split may already carry its stable coordinator
+		// index so virtual file_index values remain invariant across workers.
+		if (!reader.file_list_idx.IsValid()) {
+			reader.file_list_idx = file_idx;
+		}
 
 		// 'reader_bind.schema' could be set explicitly by:
 		// 1. The MultiFileReader::Bind call

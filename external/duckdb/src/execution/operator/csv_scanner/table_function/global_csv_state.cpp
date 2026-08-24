@@ -44,10 +44,16 @@ void CSVGlobalState::FinishScan(unique_ptr<StringValueScanner> scanner) {
 
 unique_ptr<StringValueScanner> CSVGlobalState::Next(shared_ptr<CSVFileScan> &current_file_ptr) {
 	auto &current_file = *current_file_ptr;
+	const bool has_scan_range = current_file.buffer_manager->HasScanRange();
+	const auto buffer_size = current_file.options.buffer_size_option.GetValue();
+	bool restrict_scan_range_end = false;
+	idx_t scan_range_end_buffer_idx = 0;
+	idx_t scan_range_end_pos = 0;
 	if (!initialized) {
 		// initialize the boundary for this file
 		current_boundary = current_file.start_iterator;
-		current_boundary.SetCurrentBoundaryToPosition(single_threaded, current_file.options);
+		current_boundary.buffer_size = buffer_size;
+		current_boundary.SetCurrentBoundaryToPosition(single_threaded && !has_scan_range, current_file.options);
 		if (current_boundary.done && context.client_data->debug_set_max_line_length) {
 			context.client_data->debug_max_line_length =
 			    MaxValue<idx_t>(context.client_data->debug_max_line_length, current_boundary.pos.buffer_pos);
@@ -62,6 +68,43 @@ unique_ptr<StringValueScanner> CSVGlobalState::Next(shared_ptr<CSVFileScan> &cur
 			return nullptr;
 		}
 	}
+	if (has_scan_range) {
+		const auto scan_end = current_file.buffer_manager->GetScanRangeSize();
+		const auto current_position = current_boundary.GetGlobalCurrentPos();
+		bool owns_post_header_boundary_row = false;
+		if (current_position >= scan_end) {
+			// Parallel CSV boundaries deliberately let the preceding scanner finish one record while the following
+			// scanner synchronizes past it. When the first range ends exactly where header skipping stops (or on the LF
+			// half of CRLF), no ordinary scanner has been launched yet to own that record. Launch a zero-width boundary
+			// here so ProcessExtraRow establishes the same ownership rule. If the header ends farther beyond this
+			// range, the following range starts inside the header and owns the first data record itself.
+			const bool header_ends_at_boundary = current_position == scan_end;
+			const bool header_ends_on_crlf_half =
+			    current_position > scan_end && current_position - scan_end == 1 &&
+			    current_file.options.dialect_options.state_machine_options.new_line == NewLineIdentifier::CARRY_ON;
+			owns_post_header_boundary_row = current_boundary.first_one &&
+			                                current_file.buffer_manager->GetScanRangeStart() == 0 &&
+			                                current_file.options.dialect_options.header.GetValue() &&
+			                                (header_ends_at_boundary || header_ends_on_crlf_half);
+			if (!owns_post_header_boundary_row) {
+				return nullptr;
+			}
+		}
+		if (owns_post_header_boundary_row) {
+			current_boundary.SetEnd(current_boundary.pos.buffer_pos);
+		} else {
+			const auto end_buffer_idx = (scan_end - 1) / buffer_size;
+			const auto end_buffer_pos = (scan_end - 1) % buffer_size + 1;
+			if (current_boundary.GetBufferIdx() == end_buffer_idx && current_boundary.GetEndPos() > end_buffer_pos) {
+				// Keep the overlap visible while StringValueScanner synchronizes to the next complete record. It
+				// installs the logical ownership end immediately after synchronization so rows beginning outside this
+				// range are never emitted.
+				restrict_scan_range_end = true;
+				scan_range_end_buffer_idx = end_buffer_idx;
+				scan_range_end_pos = end_buffer_pos;
+			}
+		}
+	}
 	// create the scanner for this file
 	if (current_buffer_in_use->buffer_idx != current_boundary.GetBufferIdx()) {
 		current_buffer_in_use =
@@ -72,6 +115,9 @@ unique_ptr<StringValueScanner> CSVGlobalState::Next(shared_ptr<CSVFileScan> &cur
 	auto csv_scanner =
 	    make_uniq<StringValueScanner>(scanner_idx++, current_file.buffer_manager, current_file.state_machine,
 	                                  current_file.error_handler, current_file_ptr, false, current_boundary);
+	if (restrict_scan_range_end) {
+		csv_scanner->SetScanRangeEnd(scan_range_end_buffer_idx, scan_range_end_pos);
+	}
 
 	csv_scanner->buffer_tracker = current_buffer_in_use;
 	// We initialize the scan
