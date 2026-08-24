@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
@@ -214,6 +215,16 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 		}
 	} else if (depth > 0 && !aggregate_binder.HasBoundColumns()) {
 		return BindResult("Aggregate with only constant parameters has to be bound in the root subquery");
+	}
+
+	if (aggr.order_bys) {
+		for (auto &order : aggr.order_bys->orders) {
+			auto &order_expr = BoundExpression::GetExpression(*order.expression);
+			if (TypeVisitor::Contains(order_expr->return_type, FileLogicalType::IsFile)) {
+				throw BinderException(order_expr->GetQueryLocation(),
+				                      "Aggregate ORDER BY does not support FILE values");
+			}
+		}
 	}
 
 	if (aggr.filter) {

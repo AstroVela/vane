@@ -1,5 +1,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "core_functions/aggregate/distributive_functions.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
@@ -13,6 +14,13 @@
 namespace duckdb {
 
 namespace {
+
+static void RejectFileOrderingArgument(const vector<unique_ptr<Expression>> &arguments) {
+	D_ASSERT(arguments.size() >= 2);
+	if (TypeVisitor::Contains(arguments[1]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("arg_min/arg_max ordering arguments do not support FILE values");
+	}
+}
 
 struct ArgMinMaxStateBase {
 	ArgMinMaxStateBase() : is_initialized(false), arg_null(false), val_null(false) {
@@ -187,6 +195,7 @@ struct ArgMinMaxBase {
 	template <ArgMinMaxNullHandling NULL_HANDLING>
 	static unique_ptr<FunctionData> Bind(ClientContext &context, AggregateFunction &function,
 	                                     vector<unique_ptr<Expression>> &arguments) {
+		RejectFileOrderingArgument(arguments);
 		if (arguments[1]->return_type.InternalType() == PhysicalType::VARCHAR) {
 			ExpressionBinder::PushCollation(context, arguments[1], arguments[1]->return_type);
 		}
@@ -350,6 +359,7 @@ struct VectorArgMinMaxBase : ArgMinMaxBase<COMPARATOR> {
 	template <ArgMinMaxNullHandling NULL_HANDLING>
 	static unique_ptr<FunctionData> Bind(ClientContext &context, AggregateFunction &function,
 	                                     vector<unique_ptr<Expression>> &arguments) {
+		RejectFileOrderingArgument(arguments);
 		if (arguments[1]->return_type.InternalType() == PhysicalType::VARCHAR) {
 			ExpressionBinder::PushCollation(context, arguments[1], arguments[1]->return_type);
 		}
@@ -520,6 +530,7 @@ AggregateFunction GetDecimalArgMinMaxFunction(const LogicalType &by_type, const 
 template <class OP, ArgMinMaxNullHandling NULL_HANDLING>
 unique_ptr<FunctionData> BindDecimalArgMinMax(ClientContext &context, AggregateFunction &function,
                                               vector<unique_ptr<Expression>> &arguments) {
+	RejectFileOrderingArgument(arguments);
 	auto decimal_type = arguments[0]->return_type;
 	auto by_type = arguments[1]->return_type;
 
@@ -850,6 +861,7 @@ void SpecializeArgMinMaxNullNFunction(PhysicalType val_type, PhysicalType arg_ty
 template <ArgMinMaxNullHandling NULL_HANDLING, bool NULLS_LAST, class COMPARATOR>
 unique_ptr<FunctionData> ArgMinMaxNBind(ClientContext &context, AggregateFunction &function,
                                         vector<unique_ptr<Expression>> &arguments) {
+	RejectFileOrderingArgument(arguments);
 	for (auto &arg : arguments) {
 		if (arg->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();

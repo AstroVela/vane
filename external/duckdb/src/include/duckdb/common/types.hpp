@@ -530,6 +530,7 @@ struct FileLogicalType {
 
 	DUCKDB_API static LogicalType Create();
 	DUCKDB_API static bool IsFile(const LogicalType &type);
+	DUCKDB_API static void Validate(Vector &value, idx_t count, const string &source);
 };
 
 struct MapType {

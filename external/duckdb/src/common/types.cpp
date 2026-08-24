@@ -1714,6 +1714,66 @@ bool FileLogicalType::IsFile(const LogicalType &type) {
 	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
 }
 
+void FileLogicalType::Validate(Vector &value, idx_t count, const string &source) {
+	D_ASSERT(IsFile(value.GetType()));
+	auto &children = StructVector::GetEntries(value);
+	D_ASSERT(children.size() == FIELD_COUNT);
+
+	UnifiedVectorFormat value_data;
+	UnifiedVectorFormat url_data;
+	UnifiedVectorFormat position_data;
+	UnifiedVectorFormat size_data;
+	UnifiedVectorFormat checksum_data;
+	value.ToUnifiedFormat(count, value_data);
+	children[URL]->ToUnifiedFormat(count, url_data);
+	children[POSITION]->ToUnifiedFormat(count, position_data);
+	children[SIZE]->ToUnifiedFormat(count, size_data);
+	children[CHECKSUM]->ToUnifiedFormat(count, checksum_data);
+
+	auto positions = UnifiedVectorFormat::GetData<int64_t>(position_data);
+	auto sizes = UnifiedVectorFormat::GetData<int64_t>(size_data);
+	auto checksums = UnifiedVectorFormat::GetData<string_t>(checksum_data);
+	for (idx_t row = 0; row < count; row++) {
+		auto value_index = value_data.sel->get_index(row);
+		if (!value_data.validity.RowIsValid(value_index)) {
+			continue;
+		}
+
+		auto url_index = url_data.sel->get_index(row);
+		if (!url_data.validity.RowIsValid(url_index)) {
+			throw InvalidInputException("%s url cannot be NULL", source);
+		}
+
+		auto position_index = position_data.sel->get_index(row);
+		auto size_index = size_data.sel->get_index(row);
+		auto position_is_valid = position_data.validity.RowIsValid(position_index);
+		auto size_is_valid = size_data.validity.RowIsValid(size_index);
+		if (position_is_valid != size_is_valid) {
+			throw InvalidInputException("%s position and size must either both be NULL or both be non-NULL", source);
+		}
+		if (position_is_valid) {
+			auto position = positions[position_index];
+			auto size = sizes[size_index];
+			if (position < 0 || size < 0) {
+				throw InvalidInputException("%s position and size must be non-negative", source);
+			}
+			if (position > NumericLimits<int64_t>::Maximum() - size) {
+				throw InvalidInputException("%s byte range exceeds BIGINT", source);
+			}
+		}
+
+		auto checksum_index = checksum_data.sel->get_index(row);
+		if (checksum_data.validity.RowIsValid(checksum_index)) {
+			auto checksum = checksums[checksum_index].GetString();
+			auto separator = checksum.find(':');
+			if (separator == string::npos || separator == 0 || separator + 1 == checksum.size() ||
+			    checksum.find(':', separator + 1) != string::npos) {
+				throw InvalidInputException("%s checksum must have the form <algorithm>:<digest>", source);
+			}
+		}
+	}
+}
+
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
 	auto info = make_shared_ptr<AggregateStateTypeInfo>(std::move(state_type));
 	return LogicalType(LogicalTypeId::AGGREGATE_STATE, std::move(info));

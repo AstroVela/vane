@@ -15,6 +15,8 @@
 
 namespace duckdb {
 class ArrowTypeExtensionData;
+class ArrowTypeExtension;
+class ClientContext;
 struct DBConfig;
 struct ArrowConverter {
 	DUCKDB_API static void ToArrowSchema(ArrowSchema *out_schema, const vector<LogicalType> &types,
@@ -42,5 +44,9 @@ struct DuckDBArrowSchemaHolder {
 	vector<unsafe_unique_array<char>> metadata_info;
 	vector<unsafe_unique_array<char>> extension_format;
 };
+
+DUCKDB_API void PopulateArrowFileSchema(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child,
+                                        const LogicalType &type, ClientContext &context,
+                                        const ArrowTypeExtension &extension);
 
 } // namespace duckdb

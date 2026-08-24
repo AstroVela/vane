@@ -1,6 +1,7 @@
 #include "core_functions/scalar/list_functions.hpp"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -251,6 +252,12 @@ static void ListSortFunction(DataChunk &args, ExpressionState &state, Vector &re
 	}
 }
 
+static void RejectFileListOrdering(const LogicalType &list_type) {
+	if (TypeVisitor::Contains(ListType::GetChildType(list_type), FileLogicalType::IsFile)) {
+		throw BinderException("List ordering functions do not support FILE values");
+	}
+}
+
 static unique_ptr<FunctionData> ListSortBind(ClientContext &context, ScalarFunction &bound_function,
                                              vector<unique_ptr<Expression>> &arguments, OrderType &order,
                                              OrderByNullType &null_order) {
@@ -264,6 +271,7 @@ static unique_ptr<FunctionData> ListSortBind(ClientContext &context, ScalarFunct
 	}
 
 	arguments[0] = BoundCastExpression::AddArrayCastToList(context, std::move(arguments[0]));
+	RejectFileListOrdering(arguments[0]->return_type);
 	child_type = ListType::GetChildType(arguments[0]->return_type);
 
 	bound_function.arguments[0] = arguments[0]->return_type;
@@ -301,6 +309,7 @@ static unique_ptr<FunctionData> ListGradeUpBind(ClientContext &context, ScalarFu
 	null_order = config.ResolveNullOrder(context, order, null_order);
 
 	arguments[0] = BoundCastExpression::AddArrayCastToList(context, std::move(arguments[0]));
+	RejectFileListOrdering(arguments[0]->return_type);
 
 	bound_function.arguments[0] = arguments[0]->return_type;
 	bound_function.SetReturnType(LogicalType::LIST(LogicalTypeId::BIGINT));

@@ -1,6 +1,7 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/null_value.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
@@ -333,6 +334,9 @@ static AggregateFunction GetMinMaxOperator(const LogicalType &type) {
 template <class OP, class OP_STRING, class OP_VECTOR>
 unique_ptr<FunctionData> BindMinMax(ClientContext &context, AggregateFunction &function,
                                     vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("%s does not support FILE values", function.name);
+	}
 	// We should also push collations for non-VARCHAR here, but we aren't ready for it yet (see internal #8704)
 	const auto collation = arguments[0]->return_type.id() == LogicalTypeId::VARCHAR &&
 	                       (!StringType::GetCollation(arguments[0]->return_type).empty() ||
@@ -518,6 +522,9 @@ void SpecializeMinMaxNFunction(PhysicalType arg_type, AggregateFunction &functio
 template <class COMPARATOR>
 unique_ptr<FunctionData> MinMaxNBind(ClientContext &context, AggregateFunction &function,
                                      vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("%s does not support FILE values", function.name);
+	}
 	for (auto &arg : arguments) {
 		if (arg->return_type.id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();

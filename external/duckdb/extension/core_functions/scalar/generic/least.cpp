@@ -1,4 +1,5 @@
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "core_functions/scalar/generic_functions.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -197,6 +198,9 @@ unique_ptr<FunctionData> BindLeastGreatest(ClientContext &context, ScalarFunctio
 		break;
 	default:
 		break;
+	}
+	if (TypeVisitor::Contains(child_type, FileLogicalType::IsFile)) {
+		throw BinderException("%s does not support FILE values", bound_function.name);
 	}
 	using OP = typename LEAST_GREATER_OP::OP;
 	switch (child_type.InternalType()) {

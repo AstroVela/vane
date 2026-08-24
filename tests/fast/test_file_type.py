@@ -130,6 +130,41 @@ def test_file_comparison_keeps_three_value_logic_in_joins(connection):
     assert count == 1
 
 
+def test_file_equality_remains_a_hash_join_condition(connection):
+    plan = connection.execute(
+        f"""
+        EXPLAIN
+        SELECT *
+        FROM (VALUES ({FILE}), ({FILE_WITH_NULL_METADATA})) AS left_side(value)
+        JOIN (VALUES ({FILE}), ({FILE_WITH_NULL_METADATA})) AS right_side(value)
+          ON left_side.value = right_side.value
+        """
+    ).fetchone()[1]
+
+    assert "HASH_JOIN" in plan
+    assert "BLOCKWISE_NL_JOIN" not in plan
+
+
+def test_file_comparison_supports_scalar_subqueries(connection):
+    assert connection.execute(f"SELECT (SELECT {FILE}) = {FILE}, (SELECT {FILE}) != {FILE}").fetchone() == (
+        True,
+        False,
+    )
+
+
+def test_file_comparison_does_not_duplicate_volatile_operands(connection):
+    connection.execute("CREATE SEQUENCE file_comparison_sequence START 1")
+
+    assert connection.execute(
+        """
+        SELECT
+            file(nextval('file_comparison_sequence')::VARCHAR, NULL, NULL, NULL, NULL)
+            = file(nextval('file_comparison_sequence')::VARCHAR, NULL, NULL, NULL, NULL)
+        """
+    ).fetchone() == (False,)
+    assert connection.execute("SELECT currval('file_comparison_sequence')").fetchone() == (2,)
+
+
 def test_file_comparison_propagates_stored_root_nulls(connection):
     connection.execute("CREATE TEMP TABLE file_values(value FILE)")
     connection.execute(f"INSERT INTO file_values VALUES ({FILE}), (NULL)")
@@ -186,14 +221,154 @@ def test_file_rejects_unsupported_comparisons(connection, predicate):
     ],
 )
 def test_file_rejects_list_search_comparison_bypasses(connection, function_name):
-    with pytest.raises(vane.BinderException, match="List search functions do not support FILE"):
+    with pytest.raises(vane.BinderException, match="Collection search functions do not support FILE"):
         connection.execute(f"SELECT {function_name}([{FILE}], {FILE})").fetchone()
 
 
 def test_file_rejects_nested_list_search_comparison_bypasses(connection):
     value = f"struct_pack(value := {FILE})"
-    with pytest.raises(vane.BinderException, match="List search functions do not support FILE"):
+    with pytest.raises(vane.BinderException, match="Collection search functions do not support FILE"):
         connection.execute(f"SELECT list_contains([{value}], {value})").fetchone()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        f"map_contains(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
+        f"map_extract(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
+        f"element_at(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
+        f"map_extract_value(map([{FILE_WITH_NULL_METADATA}], [1]), {FILE_WITH_NULL_METADATA})",
+        f"map([{FILE_WITH_NULL_METADATA}], [1])[{FILE_WITH_NULL_METADATA}]",
+        f"list_has_any([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"array_has_any([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"[{FILE_WITH_NULL_METADATA}] && [{FILE_WITH_NULL_METADATA}]",
+        f"list_has_all([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"array_has_all([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"[{FILE_WITH_NULL_METADATA}] @> [{FILE_WITH_NULL_METADATA}]",
+        f"[{FILE_WITH_NULL_METADATA}] <@ [{FILE_WITH_NULL_METADATA}]",
+        f"list_intersect([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"array_intersect([{FILE_WITH_NULL_METADATA}], [{FILE_WITH_NULL_METADATA}])",
+        f"struct_contains(row({FILE_WITH_NULL_METADATA}), {FILE_WITH_NULL_METADATA})",
+        f"struct_has(row({FILE_WITH_NULL_METADATA}), {FILE_WITH_NULL_METADATA})",
+        f"struct_position(row({FILE_WITH_NULL_METADATA}), {FILE_WITH_NULL_METADATA})",
+        f"struct_indexof(row({FILE_WITH_NULL_METADATA}), {FILE_WITH_NULL_METADATA})",
+    ],
+)
+def test_file_rejects_collection_search_comparison_bypasses(connection, expression):
+    with pytest.raises(vane.BinderException, match="Collection search functions do not support FILE"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+def test_file_remains_usable_as_a_map_value(connection):
+    row = connection.execute(
+        f"""
+        WITH input(value) AS (VALUES (map(['key'], [{FILE}])))
+        SELECT
+            map_contains(value, 'key'),
+            typeof(map_extract_value(value, 'key')),
+            (map_extract_value(value, 'key')).url,
+            typeof(map_extract(value, 'key')[1]),
+            (map_extract(value, 'key')[1]).url,
+            typeof(value['key']),
+            (value['key']).url
+        FROM input
+        """
+    ).fetchone()
+
+    assert row == (
+        True,
+        "FILE",
+        "s3://bucket/missing.bin",
+        "FILE",
+        "s3://bucket/missing.bin",
+        "FILE",
+        "s3://bucket/missing.bin",
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        f"SELECT value FROM (VALUES ({FILE})) AS input(value) ORDER BY value",
+        f"SELECT value FROM (VALUES ({FILE})) AS input(value) ORDER BY struct_pack(value := value)",
+        f"SELECT list(value ORDER BY value) FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY value) FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT row_number() OVER (ORDER BY value) FROM (VALUES ({FILE})) AS input(value)",
+        f"SELECT first_value(value ORDER BY value) OVER () FROM (VALUES ({FILE})) AS input(value)",
+    ],
+)
+def test_file_rejects_ordering_bypasses(connection, query):
+    with pytest.raises(
+        vane.BinderException,
+        match=r"(?:ORDER BY does not|ordering functions do not) support FILE values",
+    ):
+        connection.execute(query).fetchall()
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        f"list_sort([{FILE}])",
+        f"array_sort([{FILE}])",
+        f"list_reverse_sort([{FILE}])",
+        f"array_reverse_sort([{FILE}])",
+        f"list_grade_up([{FILE}])",
+        f"list_sort([struct_pack(value := {FILE})])",
+        f"least({FILE}, {FILE})",
+        f"greatest({FILE}, {FILE})",
+        f"create_sort_key({FILE}, 'ASC NULLS LAST')",
+    ],
+)
+def test_file_rejects_generic_ordering_functions(connection, expression):
+    with pytest.raises(vane.BinderException, match="support FILE values"):
+        connection.execute(f"SELECT {expression}").fetchone()
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [
+        "min(value)",
+        "max(value)",
+        "min(value, 1)",
+        "max(value, 1)",
+        "min(struct_pack(value := value))",
+        "max(struct_pack(value := value))",
+    ],
+)
+def test_file_rejects_min_max_bypasses(connection, aggregate):
+    with pytest.raises(vane.BinderException, match="does not support FILE values"):
+        connection.execute(f"SELECT {aggregate} FROM (VALUES ({FILE})) AS input(value)").fetchone()
+
+
+@pytest.mark.parametrize(
+    "aggregate",
+    [
+        "arg_min(1, value)",
+        "arg_max(1, value)",
+        "arg_min(1, value, 1)",
+        "arg_max(1, value, 1)",
+        "median(value)",
+        "quantile_disc(value, 0.5)",
+    ],
+)
+def test_file_rejects_other_ordering_aggregate_bypasses(connection, aggregate):
+    with pytest.raises(vane.BinderException, match="support FILE values"):
+        connection.execute(f"SELECT {aggregate} FROM (VALUES ({FILE})) AS input(value)").fetchone()
+
+
+def test_file_remains_usable_as_an_arg_min_result(connection):
+    row = connection.execute(
+        f"""
+        SELECT typeof(arg_min(value, key)), (arg_min(value, key)).url
+        FROM (
+            VALUES
+                (2, {FILE}),
+                (1, file('other', NULL, NULL, NULL, NULL))
+        ) AS input(key, value)
+        """
+    ).fetchone()
+
+    assert row == ("FILE", "other")
 
 
 @pytest.mark.parametrize(
@@ -334,6 +509,95 @@ def test_typed_null_file_is_supported(connection):
         "FILE",
         True,
     )
+
+
+def test_file_type_round_trips_through_arrow(connection):
+    pytest.importorskip("pyarrow")
+
+    arrow_table = connection.sql(
+        f"""
+        SELECT 0 AS row_id, {FILE} AS value, struct_pack(value := {FILE}) AS nested
+        UNION ALL
+        SELECT 1 AS row_id, NULL::FILE AS value, struct_pack(value := NULL::FILE) AS nested
+        """
+    ).to_arrow_table()
+    extension_name = b"ARROW:extension:name"
+    assert arrow_table.schema.field("value").metadata[extension_name] == b"vane.file"
+    assert arrow_table.schema.field("nested").type.field("value").metadata[extension_name] == b"vane.file"
+
+    rows = (
+        connection.from_arrow(arrow_table)
+        .project("row_id, typeof(value), typeof(nested.value), value.url, nested.value.url")
+        .order("row_id")
+        .fetchall()
+    )
+    assert rows == [
+        (0, "FILE", "FILE", "s3://bucket/missing.bin", "s3://bucket/missing.bin"),
+        (1, "FILE", "FILE", None, None),
+    ]
+
+
+def test_file_type_rejects_invalid_arrow_values(connection):
+    pa = pytest.importorskip("pyarrow")
+
+    file_storage_type = pa.struct(
+        [
+            pa.field("url", pa.string()),
+            pa.field("content_type", pa.string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.string()),
+        ]
+    )
+    file_field = pa.field(
+        "value",
+        file_storage_type,
+        metadata={
+            b"ARROW:extension:name": b"vane.file",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    invalid_file = pa.array(
+        [
+            {
+                "url": None,
+                "content_type": None,
+                "position": None,
+                "size": None,
+                "checksum": None,
+            }
+        ],
+        type=file_storage_type,
+    )
+    arrow_table = pa.Table.from_arrays([invalid_file], schema=pa.schema([file_field]))
+
+    with pytest.raises(vane.InvalidInputException, match="Arrow FILE url cannot be NULL"):
+        connection.from_arrow(arrow_table).fetchall()
+
+
+def test_file_type_round_trips_through_local_exchange(connection):
+    pytest.importorskip("pyarrow")
+
+    relation = connection.sql(
+        """
+        SELECT
+            i,
+            file('object-' || i, NULL, NULL, NULL, NULL) AS value,
+            struct_pack(value := file('nested-' || i, NULL, NULL, NULL, NULL)) AS nested
+        FROM range(2) AS input(i)
+        """
+    )
+    rows = (
+        relation.local_exchange(1)
+        .project("i, typeof(value), typeof(nested.value), value.url, nested.value.url")
+        .order("i")
+        .fetchall()
+    )
+
+    assert rows == [
+        (0, "FILE", "FILE", "object-0", "nested-0"),
+        (1, "FILE", "FILE", "object-1", "nested-1"),
+    ]
 
 
 def test_file_type_round_trips_through_storage(tmp_path: Path):

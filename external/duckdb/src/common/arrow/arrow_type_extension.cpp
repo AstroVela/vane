@@ -294,6 +294,43 @@ struct ArrowJson {
 	}
 };
 
+struct ArrowFile {
+	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
+	                                     const ArrowSchemaMetadata &) {
+		if (!schema.format || string(schema.format) != "+s" ||
+		    schema.n_children != static_cast<int64_t>(FileLogicalType::FIELD_COUNT) || !schema.children) {
+			throw InvalidInputException("Arrow extension type \"vane.file\" requires the canonical FILE struct");
+		}
+
+		auto file_type = FileLogicalType::Create();
+		auto &fields = StructType::GetChildTypes(file_type);
+		vector<shared_ptr<ArrowType>> children;
+		children.reserve(FileLogicalType::FIELD_COUNT);
+		for (idx_t field_index = 0; field_index < FileLogicalType::FIELD_COUNT; field_index++) {
+			auto child_schema = schema.children[field_index];
+			if (!child_schema || !child_schema->name || string(child_schema->name) != fields[field_index].first) {
+				throw InvalidInputException("Arrow extension type \"vane.file\" has an invalid field at index %d",
+				                            field_index);
+			}
+			auto child = ArrowType::GetArrowLogicalType(context, *child_schema);
+			if (child->GetDuckType(true) != fields[field_index].second) {
+				throw InvalidInputException("Arrow extension type \"vane.file\" has an invalid type for field \"%s\"",
+				                            fields[field_index].first);
+			}
+			children.emplace_back(std::move(child));
+		}
+		return make_uniq<ArrowType>(std::move(file_type), make_uniq<ArrowStructInfo>(std::move(children)));
+	}
+
+	static void ArrowToDuck(ClientContext &, Vector &source, Vector &result, idx_t count) {
+		auto result_validity = FlatVector::Validity(result);
+		FlatVector::Validity(source) = result_validity;
+		FileLogicalType::Validate(source, count, "Arrow FILE");
+		result.Reference(source);
+		FlatVector::Validity(result) = std::move(result_validity);
+	}
+};
+
 struct ArrowBit {
 	static unique_ptr<ArrowType> GetType(ClientContext &context, const ArrowSchema &schema,
 	                                     const ArrowSchemaMetadata &schema_metadata) {
@@ -570,6 +607,11 @@ struct ArrowGeometry {
 };
 
 void ArrowTypeExtensionSet::Initialize(const DBConfig &config) {
+	config.RegisterArrowExtension(
+	    {"vane.file", &PopulateArrowFileSchema, &ArrowFile::GetType,
+	     make_shared_ptr<ArrowTypeExtensionData>(FileLogicalType::Create(), FileLogicalType::Create(),
+	                                             &ArrowFile::ArrowToDuck, nullptr)});
+
 	// Types that are 1:1
 	config.RegisterArrowExtension({"arrow.uuid", "w:16", make_shared_ptr<ArrowTypeExtensionData>(LogicalType::UUID)});
 	config.RegisterArrowExtension(

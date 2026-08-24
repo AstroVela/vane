@@ -1,6 +1,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/scalar/list_functions.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
+#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/common/string_map_set.hpp"
@@ -181,6 +182,7 @@ static void ListIntersectFunction(DataChunk &args, ExpressionState &state, Vecto
 static unique_ptr<FunctionData> ListIntersectBind(ClientContext &context, ScalarFunction &bound_function,
                                                   vector<unique_ptr<Expression>> &arguments) {
 	D_ASSERT(bound_function.arguments.size() == 2);
+	BindFileCollectionSearch(context, bound_function, arguments);
 	arguments[0] = BoundCastExpression::AddArrayCastToList(context, std::move(arguments[0]));
 	arguments[1] = BoundCastExpression::AddArrayCastToList(context, std::move(arguments[1]));
 	return nullptr;

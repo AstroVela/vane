@@ -1,5 +1,6 @@
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
@@ -368,6 +369,9 @@ void Binder::BindModifiers(BoundQueryNode &result, idx_t table_index, const vect
 			}
 			for (auto &order_node : order.orders) {
 				auto &expr = order_node.expression;
+				if (TypeVisitor::Contains(expr->return_type, FileLogicalType::IsFile)) {
+					throw BinderException(expr->GetQueryLocation(), "ORDER BY does not support FILE values");
+				}
 				ExpressionBinder::PushCollation(context, order_node.expression, expr->return_type);
 			}
 			break;

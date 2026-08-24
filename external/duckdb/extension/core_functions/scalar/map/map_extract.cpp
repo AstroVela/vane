@@ -1,5 +1,6 @@
 #include "core_functions/scalar/map_functions.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/function/scalar/list/contains_or_position.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -117,7 +118,8 @@ ScalarFunction MapExtractValueFun::GetFunction() {
 	auto key_type = LogicalType::TEMPLATE("K");
 	auto val_type = LogicalType::TEMPLATE("V");
 
-	ScalarFunction fun({LogicalType::MAP(key_type, val_type), key_type}, val_type, MapExtractValueFunc);
+	ScalarFunction fun({LogicalType::MAP(key_type, val_type), key_type}, val_type, MapExtractValueFunc,
+	                   BindFileMapSearch);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return fun;
 }
@@ -127,7 +129,7 @@ ScalarFunction MapExtractFun::GetFunction() {
 	auto val_type = LogicalType::TEMPLATE("V");
 
 	ScalarFunction fun({LogicalType::MAP(key_type, val_type), key_type}, LogicalType::LIST(val_type),
-	                   MapExtractListFunc);
+	                   MapExtractListFunc, BindFileMapSearch);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return fun;
 }

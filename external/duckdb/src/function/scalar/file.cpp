@@ -11,7 +11,7 @@
 #include "duckdb/function/scalar/file_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
@@ -19,58 +19,8 @@ namespace duckdb {
 
 namespace {
 
-static void ValidateFileArguments(DataChunk &args) {
-	UnifiedVectorFormat url_data;
-	UnifiedVectorFormat position_data;
-	UnifiedVectorFormat size_data;
-	UnifiedVectorFormat checksum_data;
-	args.data[FileLogicalType::URL].ToUnifiedFormat(args.size(), url_data);
-	args.data[FileLogicalType::POSITION].ToUnifiedFormat(args.size(), position_data);
-	args.data[FileLogicalType::SIZE].ToUnifiedFormat(args.size(), size_data);
-	args.data[FileLogicalType::CHECKSUM].ToUnifiedFormat(args.size(), checksum_data);
-
-	auto positions = UnifiedVectorFormat::GetData<int64_t>(position_data);
-	auto sizes = UnifiedVectorFormat::GetData<int64_t>(size_data);
-	auto checksums = UnifiedVectorFormat::GetData<string_t>(checksum_data);
-	for (idx_t row = 0; row < args.size(); row++) {
-		auto url_index = url_data.sel->get_index(row);
-		if (!url_data.validity.RowIsValid(url_index)) {
-			throw InvalidInputException("file() url cannot be NULL");
-		}
-
-		auto position_index = position_data.sel->get_index(row);
-		auto size_index = size_data.sel->get_index(row);
-		auto position_is_valid = position_data.validity.RowIsValid(position_index);
-		auto size_is_valid = size_data.validity.RowIsValid(size_index);
-		if (position_is_valid != size_is_valid) {
-			throw InvalidInputException("file() position and size must either both be NULL or both be non-NULL");
-		}
-		if (position_is_valid) {
-			auto position = positions[position_index];
-			auto size = sizes[size_index];
-			if (position < 0 || size < 0) {
-				throw InvalidInputException("file() position and size must be non-negative");
-			}
-			if (position > NumericLimits<int64_t>::Maximum() - size) {
-				throw InvalidInputException("file() byte range exceeds BIGINT");
-			}
-		}
-
-		auto checksum_index = checksum_data.sel->get_index(row);
-		if (checksum_data.validity.RowIsValid(checksum_index)) {
-			auto checksum = checksums[checksum_index].GetString();
-			auto separator = checksum.find(':');
-			if (separator == string::npos || separator == 0 || separator + 1 == checksum.size() ||
-			    checksum.find(':', separator + 1) != string::npos) {
-				throw InvalidInputException("file() checksum must have the form <algorithm>:<digest>");
-			}
-		}
-	}
-}
-
 static void FileConstructorFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	D_ASSERT(args.ColumnCount() == FileLogicalType::FIELD_COUNT);
-	ValidateFileArguments(args);
 
 	bool all_constant = true;
 	auto &children = StructVector::GetEntries(result);
@@ -81,6 +31,7 @@ static void FileConstructorFunction(DataChunk &args, ExpressionState &state, Vec
 		children[index]->Reference(args.data[index]);
 	}
 	result.SetVectorType(all_constant ? VectorType::CONSTANT_VECTOR : VectorType::FLAT_VECTOR);
+	FileLogicalType::Validate(result, args.size(), "file()");
 	result.Verify(args.size());
 }
 
@@ -144,6 +95,28 @@ static ScalarFunction GetFileComparison() {
 }
 
 } // namespace
+
+unique_ptr<FunctionData> BindFileCollectionSearch(ClientContext &, ScalarFunction &,
+                                                  vector<unique_ptr<Expression>> &arguments) {
+	for (auto &argument : arguments) {
+		if (TypeVisitor::Contains(argument->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("Collection search functions do not support FILE values");
+		}
+	}
+	return nullptr;
+}
+
+unique_ptr<FunctionData> BindFileMapSearch(ClientContext &, ScalarFunction &,
+                                           vector<unique_ptr<Expression>> &arguments) {
+	D_ASSERT(arguments.size() == 2);
+	auto &map_type = arguments[0]->return_type;
+	if ((map_type.id() == LogicalTypeId::MAP &&
+	     TypeVisitor::Contains(MapType::KeyType(map_type), FileLogicalType::IsFile)) ||
+	    TypeVisitor::Contains(arguments[1]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("Collection search functions do not support FILE values");
+	}
+	return nullptr;
+}
 
 vector<ScalarFunction> FileFunctions::GetFunctions() {
 	vector<ScalarFunction> result;

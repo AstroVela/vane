@@ -2,6 +2,7 @@
 
 #include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/radix.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -49,6 +50,9 @@ unique_ptr<FunctionData> CreateSortKeyBind(ClientContext &context, ScalarFunctio
 	bool all_constant = true;
 	idx_t constant_size = 0;
 	for (idx_t i = 0; i < arguments.size(); i += 2) {
+		if (TypeVisitor::Contains(arguments[i]->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("create_sort_key does not support FILE values");
+		}
 		auto physical_type = arguments[i]->return_type.InternalType();
 		if (!TypeIsConstantSize(physical_type)) {
 			all_constant = false;

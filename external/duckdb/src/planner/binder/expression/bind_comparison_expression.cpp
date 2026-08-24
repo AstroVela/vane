@@ -6,11 +6,13 @@
 
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/bound_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/catalog/catalog_entry/collate_catalog_entry.hpp"
@@ -184,6 +186,36 @@ LogicalType ExpressionBinder::GetExpressionReturnType(const Expression &expr) {
 	return expr.return_type;
 }
 
+static unique_ptr<ParsedExpression> FileFieldExpression(const Expression &file, idx_t field_index) {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<BoundExpression>(file.Copy()));
+	children.push_back(make_uniq<ConstantExpression>(Value(StructType::GetChildName(file.return_type, field_index))));
+	return make_uniq<OperatorExpression>(ExpressionType::STRUCT_EXTRACT, std::move(children));
+}
+
+static unique_ptr<ParsedExpression> FileComparisonExpression(const Expression &left, const Expression &right,
+                                                             ExpressionType comparison_type) {
+	vector<unique_ptr<ParsedExpression>> fields_equal;
+	fields_equal.reserve(FileLogicalType::FIELD_COUNT);
+	for (idx_t field_index = 0; field_index < FileLogicalType::FIELD_COUNT; field_index++) {
+		fields_equal.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                                       FileFieldExpression(left, field_index),
+		                                                       FileFieldExpression(right, field_index)));
+	}
+
+	unique_ptr<ParsedExpression> result =
+	    make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(fields_equal));
+	if (comparison_type == ExpressionType::COMPARE_NOTEQUAL) {
+		result = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(result));
+	}
+	return result;
+}
+
+static bool CanExpandFileComparison(const Expression &expression) {
+	return !expression.HasSubquery() && !expression.IsVolatile() &&
+	       expression.GetExpressionClass() != ExpressionClass::BOUND_EXPANDED;
+}
+
 BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t depth) {
 	// first try to bind the children of the case expression
 	ErrorData error;
@@ -208,6 +240,14 @@ BindResult ExpressionBinder::BindExpression(ComparisonExpression &expr, idx_t de
 		                                  left_sql_type.ToString(), right_sql_type.ToString()));
 	}
 	if (FileLogicalType::IsFile(input_type)) {
+		left = BoundCastExpression::AddCastToType(context, std::move(left), input_type);
+		right = BoundCastExpression::AddCastToType(context, std::move(right), input_type);
+		if (CanExpandFileComparison(*left) && CanExpandFileComparison(*right)) {
+			auto comparison = FileComparisonExpression(*left, *right, expr.GetExpressionType());
+			comparison->SetQueryLocation(expr.GetQueryLocation());
+			return BindExpression(comparison, depth);
+		}
+
 		vector<unique_ptr<ParsedExpression>> children;
 		children.push_back(make_uniq<BoundExpression>(std::move(left)));
 		children.push_back(make_uniq<BoundExpression>(std::move(right)));

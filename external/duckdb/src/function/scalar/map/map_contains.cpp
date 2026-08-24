@@ -1,3 +1,4 @@
+#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/function/scalar/list/contains_or_position.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/function/scalar/map_functions.hpp"
@@ -23,7 +24,7 @@ ScalarFunction MapContainsFun::GetFunction() {
 	auto val_type = LogicalType::TEMPLATE("V");
 
 	ScalarFunction fun("map_contains", {LogicalType::MAP(key_type, val_type), key_type}, LogicalType::BOOLEAN,
-	                   MapContainsFunction);
+	                   MapContainsFunction, BindFileMapSearch);
 	return fun;
 }
 

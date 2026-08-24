@@ -1,5 +1,6 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
@@ -385,6 +386,9 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 		auto type = config.ResolveOrder(context, order.type);
 		auto null_order = config.ResolveNullOrder(context, type, order.null_order);
 		auto expression = GetExpression(order.expression);
+		if (TypeVisitor::Contains(expression->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(expression->GetQueryLocation(), "Window ORDER BY does not support FILE values");
+		}
 		result->orders.emplace_back(type, null_order, std::move(expression));
 	}
 
@@ -393,6 +397,9 @@ BindResult BaseSelectBinder::BindWindow(WindowExpression &window, idx_t depth) {
 		auto type = config.ResolveOrder(context, order.type);
 		auto null_order = config.ResolveNullOrder(context, type, order.null_order);
 		auto expression = GetExpression(order.expression);
+		if (TypeVisitor::Contains(expression->return_type, FileLogicalType::IsFile)) {
+			throw BinderException(expression->GetQueryLocation(), "Window ORDER BY does not support FILE values");
+		}
 		result->arg_orders.emplace_back(type, null_order, std::move(expression));
 	}
 

@@ -4,6 +4,7 @@
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/operator/abs.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "core_functions/aggregate/quantile_state.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -565,6 +566,9 @@ static Value CheckQuantile(const Value &quantile_val) {
 
 unique_ptr<FunctionData> BindQuantile(ClientContext &context, AggregateFunction &function,
                                       vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+		throw BinderException("quantile_disc does not support FILE values");
+	}
 	if (arguments.size() < 2) {
 		throw BinderException("QUANTILE requires a range argument between [0, 1]");
 	}
@@ -654,6 +658,9 @@ struct MedianFunction {
 
 	static unique_ptr<FunctionData> Bind(ClientContext &context, AggregateFunction &function,
 	                                     vector<unique_ptr<Expression>> &arguments) {
+		if (TypeVisitor::Contains(arguments[0]->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("median does not support FILE values");
+		}
 		function = GetAggregate(arguments[0]->return_type);
 		return make_uniq<QuantileBindData>(Value::DECIMAL(int16_t(5), 2, 1));
 	}

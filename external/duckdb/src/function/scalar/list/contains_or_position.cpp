@@ -1,21 +1,11 @@
 #include "duckdb/function/scalar/list_functions.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
-#include "duckdb/common/type_visitor.hpp"
+#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/function/scalar/list/contains_or_position.hpp"
 
 namespace duckdb {
-
-static unique_ptr<FunctionData> ListSearchBind(ClientContext &, ScalarFunction &,
-                                               vector<unique_ptr<Expression>> &arguments) {
-	for (auto &argument : arguments) {
-		if (TypeVisitor::Contains(argument->return_type, FileLogicalType::IsFile)) {
-			throw BinderException("List search functions do not support FILE values");
-		}
-	}
-	return nullptr;
-}
 
 template <class RETURN_TYPE, bool FIND_NULLS = false>
 static void ListSearchFunction(DataChunk &input, ExpressionState &state, Vector &result) {
@@ -39,12 +29,12 @@ static void ListSearchFunction(DataChunk &input, ExpressionState &state, Vector 
 
 ScalarFunction ListContainsFun::GetFunction() {
 	return ScalarFunction({LogicalType::LIST(LogicalType::TEMPLATE("T")), LogicalType::TEMPLATE("T")},
-	                      LogicalType::BOOLEAN, ListSearchFunction<bool>, ListSearchBind);
+	                      LogicalType::BOOLEAN, ListSearchFunction<bool>, BindFileCollectionSearch);
 }
 
 ScalarFunction ListPositionFun::GetFunction() {
 	auto fun = ScalarFunction({LogicalType::LIST(LogicalType::TEMPLATE("T")), LogicalType::TEMPLATE("T")},
-	                          LogicalType::INTEGER, ListSearchFunction<int32_t, true>, ListSearchBind);
+	                          LogicalType::INTEGER, ListSearchFunction<int32_t, true>, BindFileCollectionSearch);
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	return fun;
 }

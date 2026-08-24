@@ -347,6 +347,9 @@ LogicalType ArrowType::GetDuckType(bool use_dictionary) const {
 	if (!use_dictionary) {
 		return type;
 	}
+	if (FileLogicalType::IsFile(type)) {
+		return type;
+	}
 	// Dictionaries can exist in arbitrarily nested schemas
 	// have to reconstruct the type
 	auto id = type.id();

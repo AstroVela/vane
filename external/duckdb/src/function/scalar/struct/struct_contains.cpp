@@ -1,4 +1,5 @@
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp"
 #include "duckdb/function/scalar/list/contains_or_position.hpp"
@@ -228,6 +229,9 @@ static unique_ptr<FunctionData> StructContainsBind(ClientContext &context, Scala
 
 		new_child_types.push_back(max_child_type);
 		bound_function.arguments[1] = max_child_type;
+	}
+	if (TypeVisitor::Contains(max_child_type, FileLogicalType::IsFile)) {
+		throw BinderException("Collection search functions do not support FILE values");
 	}
 
 	child_list_t<LogicalType> cast_children;

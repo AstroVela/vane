@@ -93,6 +93,17 @@ void SetArrowStructFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &chi
 	}
 }
 
+void PopulateArrowFileSchema(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
+                             ClientContext &context, const ArrowTypeExtension &extension) {
+	D_ASSERT(FileLogicalType::IsFile(type));
+	auto options = context.GetClientProperties();
+	SetArrowStructFormat(root_holder, child, type, options, context);
+
+	const auto schema_metadata = ArrowSchemaMetadata::ArrowCanonicalType(extension.GetInfo().GetExtensionName());
+	root_holder.metadata_info.emplace_back(schema_metadata.SerializeMetadata());
+	child.metadata = root_holder.metadata_info.back().get();
+}
+
 void SetArrowMapFormat(DuckDBArrowSchemaHolder &root_holder, ArrowSchema &child, const LogicalType &type,
                        ClientProperties &options, ClientContext &context) {
 	child.format = "+m";

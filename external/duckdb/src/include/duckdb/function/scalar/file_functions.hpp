@@ -18,4 +18,9 @@ struct FileFunctions {
 	static vector<ScalarFunction> GetFunctions();
 };
 
+DUCKDB_API unique_ptr<FunctionData> BindFileCollectionSearch(ClientContext &context, ScalarFunction &function,
+                                                             vector<unique_ptr<Expression>> &arguments);
+DUCKDB_API unique_ptr<FunctionData> BindFileMapSearch(ClientContext &context, ScalarFunction &function,
+                                                      vector<unique_ptr<Expression>> &arguments);
+
 } // namespace duckdb

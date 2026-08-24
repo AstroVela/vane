@@ -1,6 +1,7 @@
 #include "duckdb/function/lambda_functions.hpp"
 #include "core_functions/scalar/list_functions.hpp"
 #include "duckdb/function/create_sort_key.hpp"
+#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/string_map_set.hpp"
 
@@ -165,13 +166,13 @@ static void ListHasAllFunction(DataChunk &args, ExpressionState &state, Vector &
 
 ScalarFunction ListHasAnyFun::GetFunction() {
 	ScalarFunction fun({LogicalType::LIST(LogicalType::TEMPLATE("T")), LogicalType::LIST(LogicalType::TEMPLATE("T"))},
-	                   LogicalType::BOOLEAN, ListHasAnyFunction);
+	                   LogicalType::BOOLEAN, ListHasAnyFunction, BindFileCollectionSearch);
 	return fun;
 }
 
 ScalarFunction ListHasAllFun::GetFunction() {
 	ScalarFunction fun({LogicalType::LIST(LogicalType::TEMPLATE("T")), LogicalType::LIST(LogicalType::TEMPLATE("T"))},
-	                   LogicalType::BOOLEAN, ListHasAllFunction);
+	                   LogicalType::BOOLEAN, ListHasAllFunction, BindFileCollectionSearch);
 	return fun;
 }
 
