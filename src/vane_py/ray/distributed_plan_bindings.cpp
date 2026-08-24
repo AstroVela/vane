@@ -1419,6 +1419,20 @@ public:
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
 	    duckdb::distributed::MaterializedOutputCallback on_output) override {
+		return WaitFteQuery(query_id, timeout_s, task_contexts, std::move(on_output), false);
+	}
+
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
+	wait_fte_query_streaming(const string &query_id, double timeout_s,
+	                         duckdb::distributed::MaterializedOutputCallback on_output) override {
+		const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
+		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+	}
+
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
+	    const string &query_id, double timeout_s,
+	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
 		if (query_id.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
@@ -1490,6 +1504,19 @@ public:
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError::external_error("Python backend FTE query canceled: " + status_message));
 			}
+			if (stream_outputs && !selected_attempt_task_ids.empty()) {
+				const double remaining_timeout_s =
+				    has_deadline
+				        ? std::max(0.0,
+				                   std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
+				        : -1.0;
+				auto stream_res =
+				    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+				                       task_contexts.empty() ? nullptr : &task_contexts, true, on_output, true);
+				if (stream_res.is_err()) {
+					return stream_res;
+				}
+			}
 			if (!task_contexts.empty() && !matched) {
 				if (!registration_pending) {
 					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
@@ -1510,14 +1537,15 @@ public:
 		    has_deadline
 		        ? std::max(0.0, std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
 		        : -1.0;
-		auto drain_res = DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
-		                                    task_contexts.empty() ? nullptr : &task_contexts, false);
+		auto drain_res = DrainResultHandles(
+		    query_id, remaining_timeout_s, selected_attempt_task_ids, task_contexts.empty() ? nullptr : &task_contexts,
+		    stream_outputs, stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {});
 		if (drain_res.is_err()) {
 			return drain_res;
 		}
 		std::vector<duckdb::distributed::MaterializedOutput> outputs;
 		for (auto &output : drain_res.value()) {
-			if (on_output) {
+			if (!stream_outputs && on_output) {
 				auto callback_res = on_output(output);
 				if (callback_res.is_err()) {
 					ClearResultHandles(query_id);
@@ -2138,7 +2166,8 @@ private:
 	                   const std::unordered_set<string> &selected_attempt_task_ids,
 	                   const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	                       *task_context_filter,
-	                   bool release_payloads) {
+	                   bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output = {},
+	                   bool selected_only = false) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		{
 			lock_guard<mutex> guard(mutex_);
@@ -2172,7 +2201,21 @@ private:
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retained_handles;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> pending =
 		    std::move(handles);
-		if (!selected_attempt_task_ids.empty()) {
+		if (selected_only) {
+			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> selected_pending;
+			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> unselected_pending;
+			selected_pending.reserve(pending.size());
+			unselected_pending.reserve(pending.size());
+			for (auto &handle : pending) {
+				if (selected_attempt_task_ids.find(handle->GetFteTaskId()) != selected_attempt_task_ids.end()) {
+					selected_pending.push_back(std::move(handle));
+				} else {
+					unselected_pending.push_back(std::move(handle));
+				}
+			}
+			pending = std::move(selected_pending);
+			StorePythonTaskResultHandles(query_id, std::move(unselected_pending));
+		} else if (!selected_attempt_task_ids.empty()) {
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> selected_pending;
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
 			std::vector<string> release_errors;
@@ -2230,8 +2273,23 @@ private:
 				bool retain_payload_until_query_cleanup = false;
 				if (produced_output) {
 					retain_payload_until_query_cleanup =
-					    !release_payloads && !payload.second.has_exchange_sink_instance();
-					outputs.push_back(std::move(payload.second));
+					    !on_output && !release_payloads && !payload.second.has_exchange_sink_instance();
+					if (on_output) {
+						auto callback_res = on_output(payload.second);
+						if (callback_res.is_err()) {
+							still_pending.push_back(std::move(handle));
+							for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
+								still_pending.push_back(std::move(pending[pending_index]));
+							}
+							StorePythonTaskResultHandles(query_id, std::move(still_pending));
+							RetainPythonTaskResultHandles(query_id, std::move(retained_handles));
+							return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+							    callback_res.error());
+						}
+					}
+					if (!on_output) {
+						outputs.push_back(std::move(payload.second));
+					}
 				}
 				try {
 					handle->AckPollResult();

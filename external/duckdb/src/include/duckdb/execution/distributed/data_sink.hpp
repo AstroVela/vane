@@ -34,6 +34,25 @@ struct DistributedDataSinkResult {
 	string outcome_error;
 };
 
+DuckDBResult<void> ValidateDataSinkResultBudget(idx_t write_result_count, idx_t total_result_bytes,
+                                                idx_t next_result_bytes);
+
+class DataSinkResultCollector {
+public:
+	explicit DataSinkResultCollector(string operation_id);
+
+	DuckDBResult<void> Append(const ResultPartitionRef &partition);
+	DuckDBResult<DistributedDataSinkResult> Finalize();
+
+private:
+	DuckDBResult<void> ValidateOperationId() const;
+
+	DistributedDataSinkResult result_;
+	idx_t total_result_bytes_ = 0;
+	string result_state_;
+	bool finalized_ = false;
+};
+
 DuckDBResult<DistributedDataSinkResult> ParseDataSinkPartitions(const string &operation_id,
                                                                 const vector<ResultPartitionRef> &partitions);
 string BoundDataSinkOutcomeError(const string &error);

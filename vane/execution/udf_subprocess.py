@@ -1222,7 +1222,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         f"UDF subprocess graceful shutdown returned unexpected message type {msg_type:#x}"
                     )
             except (socket.timeout, EOFError, OSError) as exc:
-                _subprocess_debug_log(f"worker graceful shutdown timed out or disconnected: {exc}")
+                graceful_error = RuntimeError(
+                    f"UDF subprocess graceful shutdown timed out or disconnected: {type(exc).__name__}: {exc}"
+                )
             except BaseException as exc:
                 graceful_error = exc
             if proc.poll() is None:
@@ -1230,7 +1232,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 try:
                     proc.wait(timeout=remaining)
                 except (subprocess.TimeoutExpired, TimeoutError) as exc:
-                    _subprocess_debug_log(f"worker graceful shutdown did not exit before deadline: {exc}")
+                    if graceful_error is None:
+                        graceful_error = RuntimeError(
+                            "UDF subprocess graceful shutdown did not exit before deadline: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
                 except BaseException as exc:
                     if graceful_error is None:
                         graceful_error = exc

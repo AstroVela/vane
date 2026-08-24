@@ -16,6 +16,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <type_traits>
@@ -229,6 +230,63 @@ TEST_CASE("Streaming channel: closing receiver releases queued values", "[distri
 	REQUIRE(state->is_empty());
 	REQUIRE(payload_lifetime.expired());
 	REQUIRE(sender.send(std::make_shared<int>(43)).is_err());
+}
+
+TEST_CASE("Streaming channel: optional pending capacity backpressures producers", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_while_full = second_finished.load();
+	auto first = receiver.recv();
+	producer.join();
+	REQUIRE_FALSE(finished_while_full);
+	REQUIRE(first.first);
+	REQUIRE(first.second == 1);
+	REQUIRE(second_finished.load());
+	REQUIRE(second_result.is_ok());
+	auto second = receiver.recv();
+	REQUIRE(second.first);
+	REQUIRE(second.second == 2);
+}
+
+TEST_CASE("Streaming channel: closing a capacity-limited receiver wakes a blocked producer",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_before_close = second_finished.load();
+	receiver.close();
+	producer.join();
+	REQUIRE_FALSE(finished_before_close);
+	REQUIRE(second_result.is_err());
 }
 
 TEST_CASE("Streaming channel: moving receiver transfers channel ownership", "[distributed][streaming_channel]") {

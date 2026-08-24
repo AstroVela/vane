@@ -222,6 +222,7 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     runner._plan_runner_lifecycle_lock = threading.RLock()
     runner._driver_shutdown_started = False
     runner._driver_shutdown_complete = False
+    runner._datasink_cleanup_tasks = {}
     runner.plan_runner = SimpleNamespace(shutdown=lambda: events.append("workers-shutdown"))
 
     async def stop_maintenance():

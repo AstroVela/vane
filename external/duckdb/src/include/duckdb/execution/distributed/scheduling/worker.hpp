@@ -24,8 +24,6 @@ namespace distributed {
 
 // Forward declarations
 class WorkerSnapshot;
-template <typename T>
-class UnboundedChannelState;
 
 //------------------------------------------------------------------------------
 // Worker Snapshot
@@ -108,15 +106,6 @@ public:
 	/// Shutdown all workers
 	virtual DuckDBResult<void> shutdown() = 0;
 
-	/// Optional hook for runners that support streaming task outputs through a
-	/// shared MaterializedOutput channel. Default is a no-op.
-	virtual void set_streaming_results_channel_state(std::shared_ptr<UnboundedChannelState<MaterializedOutput>> state) {
-	}
-
-	/// Optional hook to clear the shared streaming output channel state.
-	virtual void clear_streaming_results_channel_state() {
-	}
-
 	/// Fired when the FTE task event stream for a query has been fully
 	/// consumed. This is the production no-more-input signal for dynamic task
 	/// inputs.
@@ -162,6 +151,13 @@ public:
 			}
 		}
 		return res;
+	}
+
+	/// Wait for a query while publishing each selected output as it is drained.
+	/// Implementations may stop draining immediately when the callback fails.
+	virtual DuckDBResult<std::vector<MaterializedOutput>>
+	wait_fte_query_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+		return wait_fte_query(query_id, timeout_s, std::move(on_output));
 	}
 
 	virtual DuckDBResult<std::vector<MaterializedOutput>>

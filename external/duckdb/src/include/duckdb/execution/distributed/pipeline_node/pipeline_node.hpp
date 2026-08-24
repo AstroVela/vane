@@ -135,6 +135,10 @@ public:
 		return res;
 	}
 	virtual DuckDBResult<std::vector<MaterializedOutput>>
+	wait_query_finished_streaming(const std::string &query_id, double timeout_s, MaterializedOutputCallback on_output) {
+		return wait_query_finished(query_id, timeout_s, std::move(on_output));
+	}
+	virtual DuckDBResult<std::vector<MaterializedOutput>>
 	wait_query_finished(const std::string &query_id, double timeout_s,
 	                    const std::unordered_set<TaskContext, TaskContextHash> &task_contexts,
 	                    MaterializedOutputCallback on_output) {

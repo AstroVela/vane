@@ -33,6 +33,33 @@ ResultPartitionRef DataSinkPartition(const string &operation_id, const string &s
 	return std::make_shared<ColumnDataResultPartition>(std::move(collection));
 }
 
+class ReportedCountDataSinkPartition final : public ResultPartition {
+public:
+	explicit ReportedCountDataSinkPartition(size_t rows) : rows_(rows) {
+	}
+
+	DuckDBResult<size_t> size_bytes() const override {
+		return DuckDBResult<size_t>::ok(0);
+	}
+
+	DuckDBResult<size_t> num_rows() const override {
+		return DuckDBResult<size_t>::ok(rows_);
+	}
+
+	std::shared_ptr<ColumnDataCollection> to_column_data() const override {
+		materialized_ = true;
+		return nullptr;
+	}
+
+	bool materialized() const {
+		return materialized_;
+	}
+
+private:
+	size_t rows_;
+	mutable bool materialized_ = false;
+};
+
 } // namespace
 
 TEST_CASE("DataSink worker results preserve applied and aborted outcomes", "[distributed][datasink]") {
@@ -105,4 +132,32 @@ TEST_CASE("DataSink outcome diagnostics are bounded before coordinator transport
 	REQUIRE(StringUtil::EndsWith(bounded, ":diagnostic-tail"));
 	REQUIRE(StringUtil::Contains(bounded, "..."));
 	REQUIRE(BoundDataSinkOutcomeError("short diagnostic") == "short diagnostic");
+}
+
+TEST_CASE("DataSink result partitions are bounded while the coordinator collects them", "[distributed][datasink]") {
+	DataSinkResultCollector collector("incremental-operation");
+	auto partition = DataSinkPartition("incremental-operation", "applied", 1, Value::UBIGINT(1), 8);
+	std::weak_ptr<ResultPartition> retained_partition = partition;
+	REQUIRE(collector.Append(partition).is_ok());
+	partition.reset();
+	REQUIRE(retained_partition.expired());
+	auto collected = collector.Finalize();
+	REQUIRE(collected.is_ok());
+	REQUIRE(collected.value().write_results.size() == 1);
+	auto oversized_partition = std::make_shared<ReportedCountDataSinkPartition>(DATA_SINK_MAX_WRITE_RESULTS + 1);
+	DataSinkResultCollector oversized_collector("oversized-operation");
+	auto oversized_result = oversized_collector.Append(oversized_partition);
+	REQUIRE(oversized_result.is_err());
+	REQUIRE_FALSE(oversized_partition->materialized());
+
+	auto row_result = ValidateDataSinkResultBudget(DATA_SINK_MAX_WRITE_RESULTS, 0, 1);
+	REQUIRE(row_result.is_err());
+	REQUIRE(StringUtil::Contains(row_result.error().what(), "1000000 write-result limit"));
+
+	auto byte_result = ValidateDataSinkResultBudget(0, DATA_SINK_MAX_TOTAL_RESULT_BYTES, 1);
+	REQUIRE(byte_result.is_err());
+	REQUIRE(StringUtil::Contains(byte_result.error().what(), "64 MiB coordinator payload limit"));
+
+	REQUIRE(
+	    ValidateDataSinkResultBudget(DATA_SINK_MAX_WRITE_RESULTS - 1, DATA_SINK_MAX_TOTAL_RESULT_BYTES - 1, 1).is_ok());
 }

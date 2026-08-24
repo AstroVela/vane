@@ -7656,7 +7656,8 @@ def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch
     executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
 
     started = time.monotonic()
-    executor.close(kill=False)
+    with pytest.raises(RuntimeError, match="graceful shutdown timed out or disconnected"):
+        executor.close(kill=False)
     elapsed = time.monotonic() - started
 
     messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
@@ -7677,7 +7678,8 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
     executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
 
     started = time.monotonic()
-    executor.close(kill=False)
+    with pytest.raises(RuntimeError, match="graceful shutdown timed out or disconnected"):
+        executor.close(kill=False)
     elapsed = time.monotonic() - started
 
     assert elapsed >= 0.015

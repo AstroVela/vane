@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "duckdb/execution/distributed/data_sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 
 namespace duckdb {
@@ -36,9 +35,6 @@ public:
 	}
 	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
 		return child_->produce_tasks(plan_context);
-	}
-	DuckDBResult<DistributedDataSinkResult> finalize(const vector<ResultPartitionRef> &partitions) const {
-		return ParseDataSinkPartitions(operation_id_, partitions);
 	}
 	const string &operation_id() const {
 		return operation_id_;

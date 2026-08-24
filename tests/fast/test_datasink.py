@@ -200,6 +200,16 @@ class _CloseMarkerBound(_Bound):
         return _CloseMarkerWorker(self._marker_path)
 
 
+class _BlockingCloseWorker(_Worker):
+    def close(self) -> None:
+        time.sleep(60)
+
+
+class _BlockingCloseBound(_Bound):
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _BlockingCloseWorker()
+
+
 class _FailingWorkerWithCloseMarker(DataSinkWorker):
     def __init__(self, marker_path: str) -> None:
         self._marker_path = marker_path
@@ -801,6 +811,24 @@ def test_local_fte_datasink_cleanup_failure_is_warning(monkeypatch):
 
     assert summary.outcome is WriteOutcome.APPLIED
     assert any("planned local cleanup failure" in warning for warning in summary.warnings)
+
+
+def test_local_fte_datasink_close_timeout_is_cleanup_warning(monkeypatch):
+    from vane import runners
+    from vane.runners.local.runner import LocalRunner
+
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
+    runner = LocalRunner(num_workers=1)
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    summary = vane.sql("SELECT 1 AS id").write_datasink(
+        _Sink(_BlockingCloseBound()),
+        operation_id="local-close-timeout-warning",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
 
 
 def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):

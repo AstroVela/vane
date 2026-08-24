@@ -610,6 +610,24 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 	        },
 	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
+	    .def(
+	        "_wait_fte_query_streaming_for_test",
+	        [](RayWorkerManager &self, const string &query_id, double timeout_s) {
+		        size_t output_count = 0;
+		        auto on_output = [&output_count](const duckdb::distributed::MaterializedOutput &) {
+			        output_count++;
+			        return duckdb::distributed::DuckDBResult<void>::ok();
+		        };
+		        auto res = [&]() {
+			        py::gil_scoped_release release;
+			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+		        }();
+		        if (res.is_err()) {
+			        throw duckdb::InternalException(res.error().what());
+		        }
+		        return output_count;
+	        },
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {

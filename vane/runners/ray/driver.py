@@ -76,6 +76,8 @@ _DEFAULT_CLIENT_LEASE_TIMEOUT_S = 60.0
 _DEFAULT_CLIENT_HEARTBEAT_INTERVAL_S = 10.0
 _TASK_COMPLETION_CLEANUP_RETRY_MIN_S = 0.01
 _TASK_COMPLETION_CLEANUP_RETRY_MAX_S = 1.0
+_DATASINK_CLEANUP_RETRY_MIN_S = 0.01
+_DATASINK_CLEANUP_RETRY_MAX_S = 1.0
 _QUERY_ADMISSION_BATCH_SIZE = 64
 # Whole-query consumers must not share a pool with the producer/control work
 # they can synchronously trigger. These executors are intentionally partitioned
@@ -1633,6 +1635,7 @@ class RayQueryDriverActor:
         # impossible; it must never authorize the same write to run again.
         self._copy_operation_identities: dict[str, tuple[str, str]] = {}
         self._copy_cleanup_tasks: dict[str, asyncio.Task[CopyPlanOutcome]] = {}
+        self._datasink_cleanup_tasks: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._driver_handle = ray.get_runtime_context().current_actor
         # Avoid referencing C++ types at import time; store opaque plan objects and
         # lazily instantiate the plan runner when first required.
@@ -2350,6 +2353,9 @@ class RayQueryDriverActor:
                 plan_runner = self.plan_runner
             await self.stop_client_lease_maintenance()
             await self.stop_query_resource_maintenance()
+            cleanup_tasks = tuple(self._datasink_cleanup_tasks.values())
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             if plan_runner is not None:
                 await _run_in_executor_with_owned_side_effects(
                     self._get_driver_lifecycle_executor(),
@@ -6240,12 +6246,15 @@ class RayQueryDriverActor:
     def _teardown_plan_resources(
         self,
         plan_id: str,
+        expected_lifecycle: _PlanLifecycle | None = None,
     ) -> None:
         plan_key = str(plan_id)
         with self._plan_teardown_condition:
             while plan_key in self._plan_teardowns_in_progress:
                 self._plan_teardown_condition.wait()
             lifecycle = self._plan_lifecycles.get(plan_key)
+            if expected_lifecycle is not None and lifecycle is not expected_lifecycle:
+                return
             if lifecycle is None:
                 if (
                     plan_key in self._plan_session_ids
@@ -7298,6 +7307,58 @@ class RayQueryDriverActor:
             cleanup_task.add_done_callback(discard_completed_cleanup)
         return await self._await_copy_operation(cleanup_task)
 
+    async def _retry_datasink_cleanup_until_complete(
+        self,
+        plan_id: str,
+        lifecycle: _PlanLifecycle,
+    ) -> None:
+        retry_delay_s = _DATASINK_CLEANUP_RETRY_MIN_S
+        while True:
+            try:
+                await _run_in_executor_with_owned_side_effects(
+                    self._get_driver_lifecycle_executor(),
+                    self._teardown_plan_resources,
+                    plan_id,
+                    lifecycle,
+                )
+            except asyncio.CancelledError:
+                raise
+            except _QueryCleanupDiagnostic:
+                return
+            except BaseException:
+                await asyncio.sleep(retry_delay_s)
+                retry_delay_s = min(
+                    _DATASINK_CLEANUP_RETRY_MAX_S,
+                    retry_delay_s * 2.0,
+                )
+            else:
+                return
+
+    def _schedule_datasink_cleanup_retry(self, plan_id: str, lifecycle: _PlanLifecycle) -> None:
+        plan_key = str(plan_id)
+        with self._session_lock:
+            if self._plan_lifecycles.get(plan_key) is not lifecycle:
+                return
+        cleanup_key = (plan_key, id(lifecycle))
+        current = self._datasink_cleanup_tasks.get(cleanup_key)
+        if current is not None and not current.done():
+            return
+        cleanup_task = asyncio.create_task(
+            self._retry_datasink_cleanup_until_complete(plan_key, lifecycle),
+            name=f"vane-datasink-cleanup:{plan_key}",
+        )
+        self._datasink_cleanup_tasks[cleanup_key] = cleanup_task
+
+        def discard_completed_cleanup(completed: asyncio.Task[None]) -> None:
+            if self._datasink_cleanup_tasks.get(cleanup_key) is completed:
+                self._datasink_cleanup_tasks.pop(cleanup_key, None)
+            try:
+                completed.result()
+            except BaseException:
+                pass
+
+        cleanup_task.add_done_callback(discard_completed_cleanup)
+
     async def _run_datasink_plan_for_session(
         self,
         session_id: str,
@@ -7321,6 +7382,10 @@ class RayQueryDriverActor:
                 warnings.extend(raw_warnings)
             warnings.append(self._copy_cleanup_warning(stage, error))
             result["data_sink_cleanup_warnings"] = warnings
+
+        def retain_incomplete_teardown(error: BaseException | None) -> None:
+            if error is not None and not isinstance(error, _QueryCleanupDiagnostic):
+                self._schedule_datasink_cleanup_retry(plan_id, lifecycle)
 
         try:
             plan, prepared_plan_id, query_connection = await _run_in_executor_with_owned_side_effects(
@@ -7414,6 +7479,7 @@ class RayQueryDriverActor:
                 pass
             except BaseException as error:
                 teardown_error = error
+            retain_incomplete_teardown(teardown_error)
 
             observed_result: Mapping[str, Any] | None = None
             if plan_execution is not None:
@@ -7468,6 +7534,7 @@ class RayQueryDriverActor:
             pass
         except BaseException as error:
             teardown_error = error
+        retain_incomplete_teardown(teardown_error)
         if teardown_error is not None:
             add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
         return public_result
