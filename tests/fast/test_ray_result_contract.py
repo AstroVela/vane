@@ -20,7 +20,7 @@ import pytest
 import vane
 from tests.result_stream_helpers import collect_result_stream
 from vane.runners.common import PartitionMetadata
-from vane.runners.fte.fte_exchange import ExchangeSinkHandle, ExchangeSinkInstanceHandle
+from vane.runners.exchange_sink import bind_exchange_sink_instance
 from vane.runners.ray import driver, partition_metadata
 from vane.runners.ray.partition_metadata import PartitionMetadataAccessor
 from vane.runners.ray.safe_get import QueryDeadlineExceeded
@@ -6839,7 +6839,7 @@ def test_describe_native_progress_materializes_deferred_clone_without_execution(
     assert scan_pipeline["input_rows"] == 10
 
 
-def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_collector(
+def test_remote_exchange_sink_executes_bound_attempt_without_exposing_result_collector(
     tmp_path,
     monkeypatch,
     request,
@@ -6933,19 +6933,12 @@ def test_remote_exchange_sink_accepts_nested_query_id_without_exposing_result_co
                     for node_id, entry in task_inputs.items()
                     if entry["kind"] == "exchange_source_task"
                 }
-                native_sink_instance = task.exchange_sink_instance()
-                sink_instance = ExchangeSinkInstanceHandle(
-                    ExchangeSinkHandle(
-                        native_sink_instance["query_id"],
-                        "nested-query-id-regression",
-                        native_sink_instance["partition_id"],
-                    ),
-                    native_sink_instance["attempt_id"],
-                    native_sink_instance.get("output_location"),
-                ).to_dict()
-                sink_instance["output_partition_count"] = native_sink_instance["output_partition_count"]
-                assert "query_id" not in sink_instance
-                assert sink_instance["sink_handle"]["query_id"] == native_sink_instance["query_id"]
+                sink_config = task.exchange_sink_config()
+                sink_instance = bind_exchange_sink_instance(
+                    sink_config,
+                    attempt_id=0,
+                    task_partition_id=len(sink_results),
+                )
                 sink_topologies.append(topology)
                 sink_results.append(
                     runner.execute_native(

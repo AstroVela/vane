@@ -49,7 +49,7 @@ public:
 
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
-	//! Bind the LOCAL state to the actual FTE task partition before execution.
+	//! Bind the LOCAL state to the scheduler-owned task partition before execution.
 	void ApplyRuntimeTaskIndex(idx_t runtime_task_index);
 	int64_t GetEffectiveSeed() const;
 

@@ -68,6 +68,7 @@
 #include "duckdb/execution/distributed/pipeline_node/sample.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/expression_scan.hpp"
+#include "duckdb/execution/distributed/pipeline_node/union.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sort.hpp"
 #include "duckdb/execution/distributed/pipeline_node/streaming_udf_passthrough.hpp"
@@ -462,6 +463,45 @@ static unique_ptr<ColumnDataCollection> MakeSingleValueCollection(const vector<L
 	chunk.SetCardinality(1);
 	collection->Append(chunk);
 	return collection;
+}
+
+static DuckPhysicalPlanRef MakeSingleColumnUnionPlan(const vector<int64_t> &values, const vector<bool> &empty_branches,
+                                                     bool allow_out_of_order = true) {
+	if (values.size() != empty_branches.size()) {
+		throw InvalidInputException("test UNION values and empty-branch flags must have equal length");
+	}
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> types = {LogicalType::BIGINT};
+	ArenaLinkedList<reference<PhysicalOperator>> children(plan->ArenaRef());
+	for (idx_t child_idx = 0; child_idx < values.size(); child_idx++) {
+		if (empty_branches[child_idx]) {
+			auto &empty = plan->Make<PhysicalEmptyResult>(types, 0);
+			children.push_back(empty);
+			continue;
+		}
+		auto collection = MakeSingleValueCollection(types, {Value::BIGINT(values[child_idx])});
+		auto &scan =
+		    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 1, std::move(collection));
+		children.push_back(scan);
+	}
+	auto &union_op = plan->Make<PhysicalUnion>(types, children, values.size(), allow_out_of_order);
+	plan->SetRoot(union_op);
+	return plan;
+}
+
+static std::shared_ptr<UnionNode> FindUnionNode(const PipelineNodeRef &node) {
+	if (!node) {
+		return nullptr;
+	}
+	if (auto union_node = std::dynamic_pointer_cast<UnionNode>(node)) {
+		return union_node;
+	}
+	for (const auto &child : node->children()) {
+		if (auto union_node = FindUnionNode(child)) {
+			return union_node;
+		}
+	}
+	return nullptr;
 }
 
 static idx_t SchemaColumnCount(const SchemaRef &schema) {
@@ -1247,6 +1287,152 @@ TEST_CASE("PhysicalPlanTranslator: empty result -> EmptyResultSourceNode", "[dis
 	REQUIRE(task.first);
 	REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::EMPTY_RESULT);
 	REQUIRE_FALSE(task_stream.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: N-way union fans in branch tasks without worker union operators",
+          "[distributed][union]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	PlanConfig config;
+	config.query_idx = 7;
+	config.query_id = "n-way-union";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto res = physical_plan_to_pipeline_node(
+	    config, MakeSingleColumnUnionPlan({11, 22, 33}, {false, false, false}, false), conn.context.get());
+	REQUIRE(res.is_ok());
+	auto union_node = std::dynamic_pointer_cast<UnionNode>(res.value()->inner());
+	REQUIRE(union_node != nullptr);
+	REQUIRE_FALSE(union_node->allow_out_of_order());
+	REQUIRE_FALSE(union_node->is_statically_empty_result());
+	REQUIRE(union_node->children().size() == 3);
+	REQUIRE(union_node->config().clustering_spec()->type() == ClusteringSpec::Type::Unknown);
+	REQUIRE(union_node->config().clustering_spec()->num_partitions() == 3);
+	REQUIRE(GetSchemaTypes(union_node->config().schema()) == vector<LogicalType> {LogicalType::BIGINT});
+
+	auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
+	PlanExecutionContext execution_context(task_executor, conn.context);
+	auto task_stream = res.value()->produce_tasks(execution_context);
+	const auto branch_nodes = union_node->children();
+	for (idx_t branch_idx = 0; branch_idx < branch_nodes.size(); branch_idx++) {
+		auto task = task_stream.poll_next();
+		REQUIRE(task.first);
+		REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::COLUMN_DATA_SCAN);
+		const auto task_context = task.second.task()->task_context();
+		REQUIRE(task_context.last_node_id() == branch_nodes[branch_idx]->node_id());
+		REQUIRE(
+		    (task_context.node_ids() == vector<NodeID> {branch_nodes[branch_idx]->node_id(), union_node->node_id()}));
+		REQUIRE(task.second.task()->context().at("node_id") == std::to_string(branch_nodes[branch_idx]->node_id()));
+	}
+	REQUIRE_FALSE(task_stream.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: union fan-in follows downstream order requirements", "[distributed][union]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	PlanConfig config;
+	config.query_id = "union-order-requirements";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+
+	auto translate_union = [&](const string &sql) {
+		auto logical_plan = conn.ExtractPlan(sql);
+		REQUIRE(logical_plan != nullptr);
+		PhysicalPlanGenerator generator(*conn.context);
+		auto generated_plan = generator.Plan(std::move(logical_plan));
+		REQUIRE(generated_plan != nullptr);
+		auto result =
+		    physical_plan_to_pipeline_node(config, DuckPhysicalPlanRef(generated_plan.release()), conn.context.get());
+		REQUIRE(result.is_ok());
+		auto union_node = FindUnionNode(result.value()->inner());
+		REQUIRE(union_node != nullptr);
+		return union_node;
+	};
+
+	REQUIRE_NO_FAIL(conn.Query("SET preserve_insertion_order=true"));
+	REQUIRE_FALSE(translate_union("SELECT 3 AS x UNION ALL SELECT 1 AS x")->allow_out_of_order());
+	REQUIRE_FALSE(
+	    translate_union("SELECT * FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x) LIMIT 1")->allow_out_of_order());
+	REQUIRE_FALSE(translate_union("SELECT * FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x) LIMIT 1 OFFSET 1")
+	                  ->allow_out_of_order());
+	REQUIRE(translate_union("SELECT count(*) FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x)")->allow_out_of_order());
+
+	REQUIRE_NO_FAIL(conn.Query("SET preserve_insertion_order=false"));
+	REQUIRE(translate_union("SELECT 3 AS x UNION ALL SELECT 1 AS x")->allow_out_of_order());
+}
+
+TEST_CASE("PhysicalPlanTranslator: union elides empty branches but retains one logical all-empty input",
+          "[distributed][union]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	PlanConfig config;
+	config.query_id = "empty-union";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+
+	SECTION("one physical branch remains after optimizer pruning") {
+		auto res = physical_plan_to_pipeline_node(config, MakeSingleColumnUnionPlan({42}, {false}), conn.context.get());
+		REQUIRE(res.is_ok());
+		auto union_node = std::dynamic_pointer_cast<UnionNode>(res.value()->inner());
+		REQUIRE(union_node != nullptr);
+		REQUIRE(union_node->children().size() == 1);
+		REQUIRE(union_node->config().clustering_spec()->num_partitions() == 1);
+	}
+
+	SECTION("mixed branches") {
+		auto res = physical_plan_to_pipeline_node(config, MakeSingleColumnUnionPlan({0, 42, 0}, {true, false, true}),
+		                                          conn.context.get());
+		REQUIRE(res.is_ok());
+		auto union_node = std::dynamic_pointer_cast<UnionNode>(res.value()->inner());
+		REQUIRE(union_node != nullptr);
+		REQUIRE_FALSE(union_node->is_statically_empty_result());
+		REQUIRE(union_node->children().size() == 3);
+		REQUIRE(union_node->config().clustering_spec()->num_partitions() == 1);
+
+		auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
+		PlanExecutionContext execution_context(task_executor, conn.context);
+		auto task_stream = res.value()->produce_tasks(execution_context);
+		auto task = task_stream.poll_next();
+		REQUIRE(task.first);
+		REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::COLUMN_DATA_SCAN);
+		REQUIRE(task.second.task()->task_context().last_node_id() == union_node->children()[1]->node_id());
+		REQUIRE_FALSE(task_stream.poll_next().first);
+	}
+
+	SECTION("all branches empty") {
+		auto res =
+		    physical_plan_to_pipeline_node(config, MakeSingleColumnUnionPlan({0, 0}, {true, true}), conn.context.get());
+		REQUIRE(res.is_ok());
+		auto union_node = std::dynamic_pointer_cast<UnionNode>(res.value()->inner());
+		REQUIRE(union_node != nullptr);
+		REQUIRE(union_node->is_statically_empty_result());
+		REQUIRE(union_node->config().clustering_spec()->num_partitions() == 1);
+
+		PlanExecutionContext execution_context(nullptr, conn.context);
+		auto task_stream = res.value()->produce_tasks(execution_context);
+		auto task = task_stream.poll_next();
+		REQUIRE(task.first);
+		REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::EMPTY_RESULT);
+		REQUIRE((task.second.task()->task_context().node_ids() ==
+		         vector<NodeID> {union_node->children().front()->node_id(), union_node->node_id()}));
+		REQUIRE_FALSE(task_stream.poll_next().first);
+	}
+}
+
+TEST_CASE("PhysicalPlanTranslator: union rejects malformed branch schemas", "[distributed][union]") {
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> child_types = {LogicalType::INTEGER};
+	vector<LogicalType> union_types = {LogicalType::BIGINT};
+	ArenaLinkedList<reference<PhysicalOperator>> children(plan->ArenaRef());
+	for (int value : {1, 2}) {
+		auto collection = MakeSingleValueCollection(child_types, {Value::INTEGER(value)});
+		auto &scan = plan->Make<PhysicalColumnDataScan>(child_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 1,
+		                                                std::move(collection));
+		children.push_back(scan);
+	}
+	auto &union_op = plan->Make<PhysicalUnion>(union_types, children, 2, true);
+	plan->SetRoot(union_op);
+
+	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan);
+	REQUIRE(res.is_err());
+	REQUIRE_THAT(res.error().what(), Catch::Matchers::Contains("schema does not match"));
 }
 
 TEST_CASE("PhysicalPlanTranslator: ungrouped aggregate executes over an empty-result input", "[distributed]") {

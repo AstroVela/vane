@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,19 +30,15 @@ struct ExchangeContext {
 
 // ─── Sink Handles ────────────────────────────────────────
 
-/// Identifies a logical sink within an Exchange (one per task partition).
-/// Identifies the logical sink for one task partition.
+/// Identifies the logical sink for one scheduler-owned task partition.
 struct ExchangeSinkHandle {
-	idx_t task_partition_id = 0;
+	idx_t task_partition_id = DConstants::INVALID_INDEX;
 };
 
-/// Identifies a concrete sink instance (supports retries via attempt_id).
 /// Identifies one concrete sink attempt for a logical sink.
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
-	/// Derive the concrete sink identity from the FTE fragment partition.
-	bool fte_task_identity = false;
 	/// Query that owns this concrete attempt.
 	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),

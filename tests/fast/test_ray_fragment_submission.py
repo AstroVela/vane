@@ -310,7 +310,7 @@ class _FakeTask:
         inputs=None,
         plan=None,
         task_context=None,
-        exchange_sink_instance=None,
+        exchange_sink_config=None,
     ):
         self._name = name
         self._context = dict(context or {})
@@ -324,7 +324,7 @@ class _FakeTask:
             )
         self._inputs = inputs or {}
         self._plan = plan if plan is not None else {"plan": name}
-        self._exchange_sink_instance = exchange_sink_instance
+        self._exchange_sink_config = exchange_sink_config
         if task_context is None:
             try:
                 last_node_id = int(self._context.get("node_id", 0))
@@ -355,8 +355,8 @@ class _FakeTask:
         self.plan_calls += 1
         return self._plan
 
-    def exchange_sink_instance(self):
-        return self._exchange_sink_instance
+    def exchange_sink_config(self):
+        return self._exchange_sink_config
 
 
 class _InputsFailingTask(_FakeTask):
@@ -368,9 +368,9 @@ class _MissingInputsTask(_FakeTask):
     Inputs = None
 
 
-class _ExchangeSinkInstanceFailingTask(_FakeTask):
-    def exchange_sink_instance(self):
-        raise RuntimeError("exchange sink instance exploded")
+class _ExchangeSinkConfigFailingTask(_FakeTask):
+    def exchange_sink_config(self):
+        raise RuntimeError("exchange sink config exploded")
 
 
 def _exchange_selector_payload(
@@ -634,13 +634,10 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
                     name=f"sample-input-{node_id}",
                     context={"query_id": query_id, "node_id": node_id},
                     inputs={node_id: {"kind": "scan_split_batch", "data": node_id.encode()}},
-                    exchange_sink_instance={
-                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                        "task_partition_id": 0,
-                        "partition_id": 0,
-                        "attempt_id": 0,
-                        "output_location": f"{query_id}_coordinator__sink_0__attempt_0",
-                        "fte_task_identity": True,
+                    exchange_sink_config={
+                        "query_id": query_id,
+                        "output_partition_count": 1,
+                        "output_location_prefix": f"{query_id}_coordinator",
                     },
                 )
                 for node_id in ordered_node_ids
@@ -659,12 +656,12 @@ def test_fte_materialized_sink_identity_is_independent_of_fragment_registration_
 
     for node_id in node_ids:
         assert (
-            first_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_node[node_id]["exchange_sink_instance"]["task_partition_id"]
+            first_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_node[node_id]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_node["7"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_node["42"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_node["7"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_node["42"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_node["7"]["task_id"]["fragment_execution_id"]
@@ -692,13 +689,10 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
                         "fragment_id": f"{execution_query_id}:orderby:42:OrderByFinal:{task_idx}",
                         "stable_task_partition_id": str(task_idx),
                     },
-                    exchange_sink_instance={
-                        "sink_handle": {"task_partition_id": 0, "partition_id": 0},
-                        "task_partition_id": 0,
-                        "partition_id": 0,
-                        "attempt_id": 0,
-                        "output_location": f"{execution_query_id}_coordinator__sink_0__attempt_0",
-                        "fte_task_identity": True,
+                    exchange_sink_config={
+                        "query_id": execution_query_id,
+                        "output_partition_count": 1,
+                        "output_location_prefix": f"{execution_query_id}_coordinator",
                     },
                 )
                 for task_idx in ordered_task_indices
@@ -713,12 +707,12 @@ def test_fte_materialized_sink_identity_distinguishes_explicit_fragments_in_one_
 
     for task_idx in ("0", "1"):
         assert (
-            first_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
-            == second_by_task[task_idx]["exchange_sink_instance"]["task_partition_id"]
+            first_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+            == second_by_task[task_idx]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
         )
     assert (
-        first_by_task["0"]["exchange_sink_instance"]["task_partition_id"]
-        != first_by_task["1"]["exchange_sink_instance"]["task_partition_id"]
+        first_by_task["0"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
+        != first_by_task["1"]["exchange_sink_instance"]["sink_handle"]["task_partition_id"]
     )
     assert (
         first_by_task["0"]["task_id"]["fragment_execution_id"]
@@ -786,16 +780,39 @@ def test_submit_tasks_rejects_task_without_inputs_method():
     assert task.plan_calls == 0
 
 
-def test_submit_tasks_propagates_exchange_sink_instance_errors():
+def test_submit_tasks_propagates_exchange_sink_config_errors():
     actor = _FakeActor()
     handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
-    task = _ExchangeSinkInstanceFailingTask(
+    task = _ExchangeSinkConfigFailingTask(
         name="scan-task-sink-fail",
         context={"query_id": "query-sink-fail", "node_id": "17"},
         plan={"plan": "scan"},
     )
 
-    with pytest.raises(RuntimeError, match="exchange sink instance exploded"):
+    with pytest.raises(RuntimeError, match="exchange sink config exploded"):
+        handle.submit_tasks([task])
+
+    assert actor.register_payloads == []
+    assert actor.fte_calls == []
+    assert task.plan_calls == 0
+
+
+def test_submit_tasks_rejects_invalid_exchange_sink_config_before_registering_fragment():
+    actor = _FakeActor()
+    handle = RayWorkerActorHandle(actor, memory_capacity_bytes=1 << 60)
+    task = _FakeTask(
+        name="scan-task-invalid-sink-config",
+        context={"query_id": "query-invalid-sink-config", "node_id": "17"},
+        plan={"plan": "scan"},
+        exchange_sink_config={
+            "query_id": "query-invalid-sink-config",
+            "output_partition_count": 1,
+            "output_location_prefix": "invalid-sink-config",
+            "fte_task_identity": True,
+        },
+    )
+
+    with pytest.raises(ValueError, match="unexpected fields.*fte_task_identity"):
         handle.submit_tasks([task])
 
     assert actor.register_payloads == []
@@ -5416,11 +5433,18 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
     query_id = "query-metadata-merge"
     fragment_id = f"{query_id}:node:7"
     key = (query_id, fragment_id)
+    exchange_sink_config = {
+        "query_id": query_id,
+        "output_partition_count": 1,
+        "output_location_prefix": "merged-exchange",
+    }
     stage = FteFragmentExecution(
         query_id,
         0,
         fragment_id=fragment_id,
+        logical_fragment_identity=fragment_id,
         context={"scan_split_batch_nodes": "7,8"},
+        exchange_sink_config=exchange_sink_config,
         task_memory_bytes=64,
     )
     first = stage.add_partition(0)
@@ -5445,7 +5469,7 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
                 "query_id": query_id,
                 "fragment_id": fragment_id,
                 "task_context_info": {"metadata": "merged"},
-                "exchange_sink_instance": {"sink": "merged"},
+                "exchange_sink_config": exchange_sink_config,
             },
             dynamic_scan_sources={"7"},
             dynamic_exchange_sources={"8"},
@@ -5464,11 +5488,8 @@ def test_fte_existing_fragment_metadata_merge_serializes_with_partition_add(monk
 
     assert first.descriptor.source_node_ids == {"7", "8"}
     assert second.descriptor.source_node_ids == {"7", "8"}
-    assert second.descriptor.task_context_info == {
-        "metadata": "merged",
-        "exchange_sink_instance": {"sink": "merged"},
-    }
-    assert second.descriptor.exchange_sink_instance == {"sink": "merged"}
+    assert second.descriptor.task_context_info == {"metadata": "merged"}
+    assert second.descriptor.exchange_sink_config == exchange_sink_config
 
 
 def test_available_fte_workers_snapshots_registry_before_concurrent_removal(monkeypatch):

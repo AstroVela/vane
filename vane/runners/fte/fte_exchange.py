@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -77,9 +76,6 @@ def _sink_instance_payload(exchange_sink_instance: Any) -> dict[str, Any]:
     return {}
 
 
-_FTE_TASK_IDENTITY_COMPONENT_BITS = 32
-_FTE_TASK_IDENTITY_COMPONENT_MAX = (1 << _FTE_TASK_IDENTITY_COMPONENT_BITS) - 1
-_FTE_TASK_IDENTITY_INVALID = (1 << (_FTE_TASK_IDENTITY_COMPONENT_BITS * 2)) - 1
 _FTE_STABLE_TASK_IDENTITY_MASK = (1 << 63) - 1
 
 
@@ -98,80 +94,6 @@ def _stable_fte_task_identity(logical_fragment_identity: str, partition_id: int)
         person=b"vane-ray-fte-v1",
     ).digest()
     return int.from_bytes(digest, "big") & _FTE_STABLE_TASK_IDENTITY_MASK, identity_key
-
-
-def _fte_task_partition_identity(fragment_execution_id: int, partition_id: int) -> int:
-    fragment_execution_id = _check_non_negative("fragment_execution_id", fragment_execution_id)
-    partition_id = _check_non_negative("task_partition_id", partition_id)
-    if fragment_execution_id > _FTE_TASK_IDENTITY_COMPONENT_MAX:
-        raise ValueError("fragment_execution_id exceeds the FTE sink identity range")
-    if partition_id > _FTE_TASK_IDENTITY_COMPONENT_MAX:
-        raise ValueError("task_partition_id exceeds the FTE sink identity range")
-    identity = (fragment_execution_id << _FTE_TASK_IDENTITY_COMPONENT_BITS) | partition_id
-    if identity == _FTE_TASK_IDENTITY_INVALID:
-        raise ValueError("FTE sink identity collides with the reserved invalid task index")
-    return identity
-
-
-def derive_exchange_sink_instance_for_attempt(
-    exchange_sink_instance: Any,
-    attempt_id: int,
-    task_partition_id: int | None = None,
-    fragment_execution_id: int | None = None,
-    stable_task_identity: int | None = None,
-) -> Any:
-    payload = _sink_instance_payload(exchange_sink_instance)
-    if not payload:
-        return exchange_sink_instance
-    attempt_id = _check_non_negative("attempt_id", attempt_id)
-    derived = dict(payload)
-    derived["attempt_id"] = attempt_id
-    preserve_plan_sink_partition = bool(derived.get("preserve_plan_exchange_sink_instance"))
-    use_fte_task_identity = bool(derived.get("fte_task_identity"))
-    if preserve_plan_sink_partition and use_fte_task_identity:
-        raise ValueError("exchange sink identity cannot be both plan-preserved and FTE-derived")
-
-    runtime_task_partition_id = task_partition_id
-    if use_fte_task_identity:
-        if stable_task_identity is not None:
-            runtime_task_partition_id = _check_non_negative("stable_task_identity", stable_task_identity)
-        else:
-            if task_partition_id is None or fragment_execution_id is None:
-                raise ValueError("FTE-derived exchange sink identity requires fragment and partition ids")
-            runtime_task_partition_id = _fte_task_partition_identity(fragment_execution_id, task_partition_id)
-        if runtime_task_partition_id == _FTE_TASK_IDENTITY_INVALID:
-            raise ValueError("FTE sink identity collides with the reserved invalid task index")
-    elif runtime_task_partition_id is not None:
-        runtime_task_partition_id = _check_non_negative("task_partition_id", runtime_task_partition_id)
-
-    if runtime_task_partition_id is not None:
-        if not preserve_plan_sink_partition:
-            derived["task_partition_id"] = runtime_task_partition_id
-            derived["partition_id"] = runtime_task_partition_id
-            sink_handle = dict(derived.get("sink_handle") or {})
-            sink_handle["task_partition_id"] = runtime_task_partition_id
-            sink_handle["partition_id"] = runtime_task_partition_id
-            derived["sink_handle"] = sink_handle
-
-    location = derived.get("output_location") or derived.get("attempt_path")
-    if location is not None:
-        location_text = str(location)
-        if runtime_task_partition_id is not None and not preserve_plan_sink_partition:
-            replaced = re.sub(
-                r"(__sink_)\d+(__attempt_)\d+$",
-                rf"\g<1>{runtime_task_partition_id}\g<2>{attempt_id}",
-                location_text,
-            )
-        else:
-            replaced = re.sub(r"(__attempt_)\d+$", rf"\g<1>{attempt_id}", location_text)
-        if replaced != location_text:
-            derived["output_location"] = replaced
-            if "attempt_path" in derived:
-                derived["attempt_path"] = replaced
-        elif "attempt_path" in derived and "output_location" not in derived:
-            derived["output_location"] = location_text
-
-    return derived
 
 
 def _partition_key_from_arrow_path(path: Path, root: Path) -> str:

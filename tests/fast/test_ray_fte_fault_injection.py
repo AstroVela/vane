@@ -222,7 +222,7 @@ class _RayFteTask:
             }
         }
 
-    def exchange_sink_instance(self):
+    def exchange_sink_config(self):
         return None
 
     def plan(self):
@@ -270,7 +270,7 @@ class _NativeDynamicScanWorkerTask:
     def Inputs(self):
         return {self.node_id: {"kind": "scan_split_batch", "data": self.split_batch}}
 
-    def exchange_sink_instance(self):
+    def exchange_sink_config(self):
         return None
 
     def plan(self):

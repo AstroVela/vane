@@ -226,6 +226,8 @@ public:
 	void AllRequiredSinksFinished() override;
 	std::vector<ExchangeSourceHandle> GetSourceHandles() override;
 	idx_t GetNumPartitions() const override;
+	const ExchangeContext &GetContext() const override;
+	const std::string &GetSinkOutputLocationPrefix() const override;
 	void CleanupUnselectedAttempts();
 	void Close() override;
 

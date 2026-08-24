@@ -27,35 +27,6 @@ static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const strin
 	}
 }
 
-static std::shared_ptr<duckdb::distributed::FlightExchangeManager>
-FindFlightExchangeSinkManager(const duckdb::PhysicalOperator &op) {
-	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
-		auto *sink = dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
-		if (sink) {
-			return std::dynamic_pointer_cast<duckdb::distributed::FlightExchangeManager>(sink->GetExchangeManager());
-		}
-	}
-	for (auto &child : op.children) {
-		auto manager = FindFlightExchangeSinkManager(child.get());
-		if (manager) {
-			return manager;
-		}
-	}
-	return nullptr;
-}
-
-static const duckdb::PhysicalRemoteExchangeSink *FindRemoteExchangeSinkOperator(const duckdb::PhysicalOperator &op) {
-	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
-		return dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
-	}
-	for (auto &child : op.children) {
-		if (auto *sink = FindRemoteExchangeSinkOperator(child.get())) {
-			return sink;
-		}
-	}
-	return nullptr;
-}
-
 struct PyPhysicalPlanWrapper {
 	static constexpr uint64_t INIT_MAGIC = 0x445046504C414E31ULL;
 	uint64_t init_magic_;
@@ -3106,7 +3077,15 @@ struct PyPhysicalPlanWrapperRunner {
 		duckdb::ApplyDistributedWriteTaskContext(*physical_plan, distributed_write_task_context);
 
 		auto &root_op = physical_plan->Root();
-		auto task_flight_manager = FindFlightExchangeSinkManager(root_op);
+		const duckdb::PhysicalRemoteExchangeSink *task_exchange_sink = nullptr;
+		string exchange_sink_error;
+		if (!duckdb::distributed::TryGetUniqueRemoteExchangeSink(root_op, task_exchange_sink, &exchange_sink_error)) {
+			throw py::value_error("Invalid worker exchange sink plan: " + exchange_sink_error);
+		}
+		auto task_flight_manager = task_exchange_sink
+		                               ? std::dynamic_pointer_cast<duckdb::distributed::FlightExchangeManager>(
+		                                     task_exchange_sink->GetExchangeManager())
+		                               : nullptr;
 		auto task_flight_port = [&]() {
 			return task_flight_manager ? task_flight_manager->GetPublishedFlightServerPort() : 0;
 		};
@@ -3121,8 +3100,8 @@ struct PyPhysicalPlanWrapperRunner {
 				return py::none();
 			}
 			auto completed_task = *exchange_sink_instance_task;
-			if (auto *sink = FindRemoteExchangeSinkOperator(root_op)) {
-				completed_task.sink_instance = sink->SinkHandle();
+			if (task_exchange_sink) {
+				completed_task.sink_instance = task_exchange_sink->SinkHandle();
 			}
 			completed_task.sink_instance.flight_host = task_flight_host();
 			completed_task.sink_instance.flight_server_epoch = task_flight_server_epoch();
