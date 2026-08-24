@@ -59,12 +59,13 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 }
 
 static bool FileCastPreservesIdentity(const LogicalType &source, const LogicalType &target) {
-	const auto source_is_file = FileLogicalType::IsFile(source);
-	const auto target_is_file = FileLogicalType::IsFile(target);
-	if (source_is_file || target_is_file) {
-		return (source_is_file && target_is_file) || (source.id() == LogicalTypeId::SQLNULL && target_is_file);
+	// ANY and TEMPLATE are binder placeholders that resolve to the source type rather than executable casts.
+	if (target.id() == LogicalTypeId::ANY || target.id() == LogicalTypeId::TEMPLATE) {
+		return true;
 	}
 
+	const auto source_is_file = FileLogicalType::IsFile(source);
+	const auto target_is_file = FileLogicalType::IsFile(target);
 	const auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
 	const auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
 	if (!source_contains_file && !target_contains_file) {
@@ -72,6 +73,49 @@ static bool FileCastPreservesIdentity(const LogicalType &source, const LogicalTy
 	}
 	if (source.id() == LogicalTypeId::SQLNULL) {
 		return true;
+	}
+	if (target.IsNested() && !target.AuxInfo()) {
+		// Generic nested function arguments are resolved to the concrete source type by their bind callbacks. FILE
+		// itself must still use its dedicated overload instead of matching a generic STRUCT argument.
+		return source.id() == target.id() && !source_is_file;
+	}
+	if (source.IsNested() && !source.AuxInfo()) {
+		return false;
+	}
+
+	if (source.id() == LogicalTypeId::UNION && target.id() == LogicalTypeId::UNION) {
+		for (idx_t source_index = 0; source_index < UnionType::GetMemberCount(source); source_index++) {
+			auto &source_name = UnionType::GetMemberName(source, source_index);
+			optional_idx target_index;
+			for (idx_t candidate_index = 0; candidate_index < UnionType::GetMemberCount(target); candidate_index++) {
+				if (StringUtil::CIEquals(source_name, UnionType::GetMemberName(target, candidate_index))) {
+					target_index = candidate_index;
+					break;
+				}
+			}
+			if (!target_index.IsValid() ||
+			    !FileCastPreservesIdentity(UnionType::GetMemberType(source, source_index),
+			                               UnionType::GetMemberType(target, target_index.GetIndex()))) {
+				return false;
+			}
+		}
+		// Target-only members can never be selected by a value from the source UNION.
+		return true;
+	}
+	if (target.id() == LogicalTypeId::UNION) {
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			if (FileCastPreservesIdentity(source, UnionType::GetMemberType(target, target_index))) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (source.id() == LogicalTypeId::UNION) {
+		return false;
+	}
+
+	if (source_is_file || target_is_file) {
+		return source_is_file && target_is_file;
 	}
 
 	const auto source_is_sequence = source.id() == LogicalTypeId::LIST || source.id() == LogicalTypeId::ARRAY;
@@ -258,6 +302,9 @@ private:
 
 int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, const LogicalType &source,
                                           const LogicalType &target) {
+	if (!FileCastPreservesIdentity(source, target)) {
+		return -1;
+	}
 	// check if a cast has been registered
 	if (map_info) {
 		auto entry = map_info->GetEntry(source, target);

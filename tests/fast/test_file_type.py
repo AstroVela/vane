@@ -116,6 +116,81 @@ def test_nested_file_casts_allow_only_null_introduction(connection):
     assert row == ("FILE", True, "FILE", True)
 
 
+def test_file_union_casts_preserve_file_members(connection):
+    row = connection.execute(
+        f"""
+        SELECT union_tag(value), typeof(value.f), (value.f).url, value.n
+        FROM (
+            SELECT CAST(
+                union_value(f := {FILE})
+                AS UNION(f FILE, n BIGINT)
+            ) AS value
+        )
+        """
+    ).fetchone()
+
+    assert row == ("f", "FILE", "s3://bucket/missing.bin", None)
+
+
+def test_file_union_all_resolves_a_file_preserving_common_type(connection):
+    rows = connection.execute(
+        f"""
+        SELECT union_tag(value), typeof(value.f), (value.f).url, value.n
+        FROM (
+            SELECT union_value(f := {FILE}) AS value
+            UNION ALL
+            SELECT CAST(
+                42::BIGINT
+                AS UNION(f FILE, n BIGINT)
+            ) AS value
+        )
+        ORDER BY union_tag(value)
+        """
+    ).fetchall()
+
+    assert rows == [
+        ("f", "FILE", "s3://bucket/missing.bin", None),
+        ("n", "FILE", None, 42),
+    ]
+
+
+def test_file_implicit_cast_reporting_obeys_file_identity_rules(connection):
+    row = connection.execute(
+        f"""
+        SELECT
+            can_cast_implicitly(
+                {FILE},
+                NULL::STRUCT(
+                    url VARCHAR,
+                    content_type VARCHAR,
+                    position BIGINT,
+                    size BIGINT,
+                    checksum VARCHAR
+                )
+            ),
+            can_cast_implicitly(
+                union_value(f := {FILE}),
+                NULL::UNION(f FILE, n BIGINT)
+            ),
+            can_cast_implicitly(
+                union_value(f := {FILE}),
+                NULL::UNION(
+                    f STRUCT(
+                        url VARCHAR,
+                        content_type VARCHAR,
+                        position BIGINT,
+                        size BIGINT,
+                        checksum VARCHAR
+                    ),
+                    n BIGINT
+                )
+            )
+        """
+    ).fetchone()
+
+    assert row == (False, True, False)
+
+
 def test_file_comparison_uses_fieldwise_sql_three_value_logic(connection):
     row = connection.execute(
         f"""
