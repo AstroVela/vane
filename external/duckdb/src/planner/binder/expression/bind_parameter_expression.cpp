@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
+#include "duckdb/common/types.hpp"
 #include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -20,6 +27,7 @@ BindResult ExpressionBinder::BindExpression(ParameterExpression &expr, idx_t dep
 	if (param_data_it != parameter_data.end()) {
 		// it has! emit a constant directly
 		auto &data = param_data_it->second;
+		FileLogicalType::Validate(data.GetValue(), "Query parameter FILE");
 		auto return_type = parameters->GetReturnType(parameter_id);
 		bool is_literal =
 		    return_type.id() == LogicalTypeId::INTEGER_LITERAL || return_type.id() == LogicalTypeId::STRING_LITERAL;

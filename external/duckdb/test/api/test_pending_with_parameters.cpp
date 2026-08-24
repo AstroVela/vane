@@ -133,3 +133,47 @@ TEST_CASE("Pending Query with Parameters with transactions", "[api]") {
 	CheckSimpleQueryAfterModification(con1);
 	CheckSimpleQueryAfterModification(con2);
 }
+
+TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE files(value FILE)"));
+
+	SECTION("top-level FILE values are validated") {
+		auto invalid_file = Value::STRUCT(FileLogicalType::Create(), {Value(), Value(), Value(), Value(), Value()});
+		auto result = con.Query("INSERT INTO files VALUES (?)", invalid_file);
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Query parameter FILE url cannot be NULL"));
+
+		auto count = con.Query("SELECT count(*) FROM files");
+		REQUIRE(CHECK_COLUMN(count, 0, {0}));
+	}
+
+	SECTION("nested FILE values are validated recursively") {
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE nested_files(value STRUCT(payload FILE))"));
+		auto file_type = FileLogicalType::Create();
+		auto invalid_file = Value::STRUCT(file_type, {Value("object"), Value(), Value(), Value(), Value("invalid")});
+		auto struct_type = LogicalType::STRUCT({{"payload", file_type}});
+		auto nested_file = Value::STRUCT(struct_type, {std::move(invalid_file)});
+
+		auto result = con.Query("INSERT INTO nested_files VALUES (?)", nested_file);
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(),
+		                             "Query parameter FILE checksum must have the form <algorithm>:<digest>"));
+
+		auto count = con.Query("SELECT count(*) FROM nested_files");
+		REQUIRE(CHECK_COLUMN(count, 0, {0}));
+	}
+
+	SECTION("valid FILE values remain accepted") {
+		auto valid_file =
+		    Value::STRUCT(FileLogicalType::Create(), {Value("object"), Value("application/octet-stream"),
+		                                              Value::BIGINT(0), Value::BIGINT(1), Value("sha256:digest")});
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO files VALUES (?)", valid_file));
+
+		auto result = con.Query("SELECT value.url, value.position, value.size FROM files");
+		REQUIRE(CHECK_COLUMN(result, 0, {"object"}));
+		REQUIRE(CHECK_COLUMN(result, 1, {0}));
+		REQUIRE(CHECK_COLUMN(result, 2, {1}));
+	}
+}
