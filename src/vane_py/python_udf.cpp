@@ -15,6 +15,7 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/result_arrow_wrapper.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/function.hpp"
@@ -22,6 +23,7 @@
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "duckdb/common/types/arrow_aux_data.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "vane_python/python_conversion.hpp"
 #include <mutex>
@@ -446,6 +448,19 @@ static std::pair<bool, double> ParseOptionalNonNegativeDouble(const py::object &
 	return std::make_pair(true, parsed);
 }
 
+static unique_ptr<FunctionData> BindPythonUDF(ClientContext &, ScalarFunction &bound_function,
+                                              vector<unique_ptr<Expression>> &arguments) {
+	if (TypeVisitor::Contains(bound_function.GetReturnType(), FileLogicalType::IsFile)) {
+		throw BinderException("FILE inputs and outputs are not supported by Python UDFs yet");
+	}
+	for (auto &argument : arguments) {
+		if (TypeVisitor::Contains(argument->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("FILE inputs and outputs are not supported by Python UDFs yet");
+		}
+	}
+	return nullptr;
+}
+
 struct PythonUDFData {
 public:
 	PythonUDFData(const string &name, bool vectorized, FunctionNullHandling null_handling)
@@ -467,6 +482,14 @@ public:
 	void Verify() {
 		if (return_type == LogicalType::INVALID) {
 			throw InvalidInputException("Could not infer the return type, please set it explicitly");
+		}
+		if (TypeVisitor::Contains(return_type, FileLogicalType::IsFile)) {
+			throw InvalidInputException("FILE inputs and outputs are not supported by Python UDFs yet");
+		}
+		for (auto &parameter : parameters) {
+			if (TypeVisitor::Contains(parameter, FileLogicalType::IsFile)) {
+				throw InvalidInputException("FILE inputs and outputs are not supported by Python UDFs yet");
+			}
 		}
 	}
 
@@ -572,7 +595,7 @@ public:
 		}
 		FunctionStability function_side_effects =
 		    side_effects ? FunctionStability::VOLATILE : FunctionStability::CONSISTENT;
-		ScalarFunction scalar_function(name, std::move(parameters), return_type, func, nullptr, nullptr, nullptr,
+		ScalarFunction scalar_function(name, std::move(parameters), return_type, func, BindPythonUDF, nullptr, nullptr,
 		                               nullptr, varargs, function_side_effects, null_handling);
 		return scalar_function;
 	}

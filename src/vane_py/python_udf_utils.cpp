@@ -13,6 +13,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -30,6 +31,12 @@ namespace {
 constexpr idx_t DEFAULT_UDF_TARGET_MAX_BATCH_BYTES = 134217728;
 constexpr const char *UDF_TARGET_MAX_BATCH_BYTES_ENV = "VANE_UDF_TARGET_MAX_BATCH_BYTES";
 static std::atomic<uint64_t> registered_expression_sequence {0};
+
+static void RejectFileUDFType(const LogicalType &type) {
+	if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+		throw InvalidInputException("FILE inputs and outputs are not supported by Python UDFs yet");
+	}
+}
 
 static Value BuildShapeValue(const vector<idx_t> &shape) {
 	vector<Value> shape_values;
@@ -393,10 +400,12 @@ Value BuildPythonUDFPayload(
 			auto name_obj = item.first;
 			auto type_obj = item.second;
 			auto type = py::cast<shared_ptr<DuckDBPyType>>(type_obj);
+			RejectFileUDFType(type->Type());
 			output_names.push_back(std::string(py::str(name_obj)));
 			output_logical_types.push_back(type->Type());
 		}
 	} else if (return_type) {
+		RejectFileUDFType(return_type->Type());
 		output_names.emplace_back("value");
 		output_logical_types.push_back(return_type->Type());
 	} else {
@@ -462,6 +471,10 @@ Value BuildScalarUDFPayload(const string &name, const py::function &udf, const s
 	ValidateUDFCallableShape(udf, execution_backend);
 	if (!return_type) {
 		throw InvalidInputException("map requires return_type");
+	}
+	RejectFileUDFType(return_type->Type());
+	for (auto &passthrough_type : passthrough_types) {
+		RejectFileUDFType(passthrough_type);
 	}
 	if (default_parallelism == 0) {
 		throw InvalidInputException("default_parallelism must be a positive integer");

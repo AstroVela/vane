@@ -514,6 +514,24 @@ struct StructType {
 	DUCKDB_API static bool IsUnnamed(const LogicalType &type);
 };
 
+struct FileLogicalType {
+	static constexpr const char *TYPE_NAME = "FILE";
+	static constexpr const char *EQUAL_FUNCTION_NAME = "__vane_file_equal";
+	static constexpr const char *NOT_EQUAL_FUNCTION_NAME = "__vane_file_not_equal";
+
+	enum FieldIndex : idx_t {
+		URL = 0,
+		CONTENT_TYPE = 1,
+		POSITION = 2,
+		SIZE = 3,
+		CHECKSUM = 4,
+		FIELD_COUNT = 5,
+	};
+
+	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static bool IsFile(const LogicalType &type);
+};
+
 struct MapType {
 	DUCKDB_API static const LogicalType &KeyType(const LogicalType &type);
 	DUCKDB_API static const LogicalType &ValueType(const LogicalType &type);

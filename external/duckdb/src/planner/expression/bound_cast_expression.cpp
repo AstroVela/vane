@@ -1,8 +1,15 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_default_expression.hpp"
 #include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/main/config.hpp"
@@ -53,6 +60,11 @@ static unique_ptr<Expression> AddCastToTypeInternal(unique_ptr<Expression> expr,
 	D_ASSERT(expr);
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_PARAMETER) {
 		auto &parameter = expr->Cast<BoundParameterExpression>();
+		auto target_contains_file = TypeVisitor::Contains(target_type, FileLogicalType::IsFile);
+		if (target_contains_file && parameter.parameter_data->return_type != target_type) {
+			throw BinderException(get_input.query_location,
+			                      "Cannot infer a parameter as FILE; construct it with file(...) instead");
+		}
 		if (!target_type.IsValid()) {
 			// invalidate the parameter
 			parameter.parameter_data->return_type = LogicalType::INVALID;

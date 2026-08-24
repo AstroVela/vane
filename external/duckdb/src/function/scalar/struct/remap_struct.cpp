@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp"
 #include "duckdb/function/scalar/nested_functions.hpp"
@@ -560,6 +567,11 @@ unique_ptr<FunctionData> RemapStructBind(ClientContext &context, ScalarFunction 
 			throw BinderException("Struct remap can only remap nested types, not '%s'", arg->return_type.ToString());
 		} else if (arg->return_type.id() == LogicalTypeId::STRUCT && StructType::IsUnnamed(arg->return_type)) {
 			throw BinderException("Struct remap can only remap named structs");
+		}
+	}
+	for (auto &argument : arguments) {
+		if (TypeVisitor::Contains(argument->return_type, FileLogicalType::IsFile)) {
+			throw BinderException("remap_struct does not support FILE values");
 		}
 	}
 	auto &from_type = arguments[0]->return_type;

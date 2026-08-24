@@ -1,5 +1,12 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/function/cast/cast_function_set.hpp"
 
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include "duckdb/common/pair.hpp"
@@ -53,6 +60,11 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
 		return DefaultCasts::NopCast;
+	}
+	const auto source_is_file = FileLogicalType::IsFile(source);
+	const auto target_is_file = FileLogicalType::IsFile(target);
+	if (source_is_file != target_is_file && source.id() != LogicalTypeId::SQLNULL) {
+		throw BinderException(get_input.query_location, "Cannot cast %s to %s", source.ToString(), target.ToString());
 	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards

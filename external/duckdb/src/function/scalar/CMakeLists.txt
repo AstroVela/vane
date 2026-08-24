@@ -23,6 +23,7 @@ add_library_unity(
   OBJECT
   compressed_materialization_utils.cpp
   create_sort_key.cpp
+  file.cpp
   strftime_format.cpp
   nested_functions.cpp
   pragma_functions.cpp

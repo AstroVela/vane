@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/planner/expression_binder.hpp"
 
 #include "duckdb/parser/expression/list.hpp"
@@ -281,6 +287,9 @@ bool ExpressionBinder::ContainsType(const LogicalType &type, LogicalTypeId targe
 LogicalType ExpressionBinder::ExchangeType(const LogicalType &type, LogicalTypeId target, LogicalType new_type) {
 	if (type.id() == target) {
 		return new_type;
+	}
+	if (!ContainsType(type, target)) {
+		return type;
 	}
 	switch (type.id()) {
 	case LogicalTypeId::STRUCT: {

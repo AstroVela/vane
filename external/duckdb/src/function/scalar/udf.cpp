@@ -15,6 +15,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -35,6 +36,12 @@ bool UDFFunctionData::Equals(const FunctionData &other_p) const {
 }
 
 namespace udf_helpers {
+
+static void RejectFileType(const LogicalType &type) {
+	if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+		throw BinderException("FILE inputs and outputs are not supported by Python UDFs yet");
+	}
+}
 
 void ThrowIfNotConstant(const Expression &arg, const string &name) {
 	if (!arg.IsFoldable()) {
@@ -203,6 +210,10 @@ unique_ptr<FunctionData> UDFBind(ClientContext &context, ScalarFunction &bound_f
 	}
 
 	auto return_type = udf_helpers::ResolvePayloadReturnType(payload);
+	udf_helpers::RejectFileType(return_type);
+	for (idx_t argument_index = 0; argument_index < payload_index; argument_index++) {
+		udf_helpers::RejectFileType(arguments[argument_index]->return_type);
+	}
 
 	// Remove payload from arguments, manually handling varargs case
 	// (Function::EraseArgument requires arguments.size() == bound_function.arguments.size(),
@@ -243,6 +254,11 @@ unique_ptr<FunctionData> UDFDeserialize(Deserializer &deserializer, ScalarFuncti
 	auto payload = deserializer.ReadProperty<Value>(101, "payload");
 	auto return_type = deserializer.ReadProperty<LogicalType>(102, "return_type");
 	auto payload_return_type = udf_helpers::ResolvePayloadReturnType(payload);
+	udf_helpers::RejectFileType(return_type);
+	udf_helpers::RejectFileType(payload_return_type);
+	for (auto &argument : function.arguments) {
+		udf_helpers::RejectFileType(argument);
+	}
 	if (payload_return_type != return_type) {
 		throw SerializationException("udf: serialized return type '%s' does not match payload return type '%s'",
 		                             return_type.ToString(), payload_return_type.ToString());

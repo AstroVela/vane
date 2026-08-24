@@ -1,4 +1,11 @@
+// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
+// SPDX-FileCopyrightText: 2026 Vane contributors
+// SPDX-License-Identifier: MIT
+//
+// Modified by Vane contributors.
+
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -157,6 +164,17 @@ BindResult ExpressionBinder::BindExpression(SubqueryExpression &expr, idx_t dept
 
 	auto result = make_uniq<BoundSubqueryExpression>(return_type);
 	if (expr.subquery_type == SubqueryType::ANY) {
+		for (auto &child : child_expressions) {
+			if (TypeVisitor::Contains(child->return_type, FileLogicalType::IsFile)) {
+				throw BinderException(expr, "FILE does not support quantified subquery comparisons");
+			}
+		}
+		for (auto &type : bound_node.types) {
+			if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+				throw BinderException(expr, "FILE does not support quantified subquery comparisons");
+			}
+		}
+
 		// ANY comparison
 		// cast child and subquery child to equivalent types
 		// Special case: if we have a single struct child and multiple subquery types,

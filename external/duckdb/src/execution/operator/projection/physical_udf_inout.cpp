@@ -18,6 +18,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/udf_executor.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/external_block.hpp"
@@ -3408,6 +3409,12 @@ static LogicalType UDFTableFunctionSerializationReturnType(const LogicalType &re
 	return return_type == LogicalType::VARCHAR ? LogicalType::BIGINT : LogicalType::VARCHAR;
 }
 
+static void RejectFileTableUDFType(const LogicalType &type) {
+	if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+		throw BinderException("FILE inputs and outputs are not supported by Python UDFs yet");
+	}
+}
+
 static void UDFTableFunctionSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                                       const TableFunction &) {
 	if (!bind_data) {
@@ -3428,6 +3435,8 @@ static unique_ptr<FunctionData> UDFTableFunctionDeserialize(Deserializer &deseri
 	auto payload = deserializer.ReadProperty<Value>(101, "payload");
 	auto return_type = deserializer.ReadProperty<LogicalType>(102, "return_type");
 	auto payload_return_type = udf_helpers::ResolvePayloadReturnType(payload);
+	RejectFileTableUDFType(return_type);
+	RejectFileTableUDFType(payload_return_type);
 	if (payload_return_type != return_type) {
 		throw SerializationException("udf: serialized return type '%s' does not match payload return type '%s'",
 		                             return_type.ToString(), payload_return_type.ToString());
@@ -3508,6 +3517,12 @@ static unique_ptr<FunctionData> UDFRegisteredBind(ClientContext &context, TableF
 	auto &info = input.info->Cast<UDFTableInfo>();
 	return_types = info.output_types;
 	return_names = info.output_names;
+	for (auto &input_type : input.input_table_types) {
+		RejectFileTableUDFType(input_type);
+	}
+	for (auto &return_type : return_types) {
+		RejectFileTableUDFType(return_type);
+	}
 
 	LogicalType return_type;
 	if (return_types.size() == 1) {
