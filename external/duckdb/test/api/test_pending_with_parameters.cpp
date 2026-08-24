@@ -183,6 +183,28 @@ TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
 		REQUIRE(StringUtil::Contains(result->GetError(), "Query parameter FILE must contain exactly 5 fields"));
 	}
 
+	SECTION("malformed FILE field types are rejected safely") {
+		auto file_type = FileLogicalType::Create();
+		auto malformed_type = LogicalType::STRUCT({{"url", LogicalType::VARCHAR},
+		                                           {"content_type", LogicalType::VARCHAR},
+		                                           {"position", LogicalType::BIGINT},
+		                                           {"size", LogicalType::BIGINT},
+		                                           {"checksum", LogicalType::BIGINT}});
+		auto malformed_file =
+		    Value::STRUCT(malformed_type, {Value("object"), Value(), Value(), Value(), Value::BIGINT(1)});
+		malformed_file.Reinterpret(file_type);
+		auto result = con.Query("SELECT ?", malformed_file);
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(),
+		                             "Query parameter FILE field \"checksum\" must have type VARCHAR, not BIGINT"));
+
+		Vector malformed_vector(file_type);
+		auto &children = StructVector::GetEntries(malformed_vector);
+		children[FileLogicalType::CHECKSUM] = make_uniq<Vector>(LogicalType::BIGINT);
+		REQUIRE_THROWS_WITH(FileLogicalType::Validate(malformed_vector, 1, "Vector FILE"),
+		                    Catch::Matchers::Contains("must have type VARCHAR, not BIGINT"));
+	}
+
 	SECTION("valid FILE values remain accepted") {
 		auto valid_file =
 		    Value::STRUCT(FileLogicalType::Create(), {Value("object"), Value("application/octet-stream"),

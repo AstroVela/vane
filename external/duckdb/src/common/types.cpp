@@ -1739,6 +1739,15 @@ static void ValidateFileFields(bool url_is_valid, bool position_is_valid, int64_
 	}
 }
 
+static void ValidateFileFieldType(const LogicalType &actual_type, idx_t field_index, const string &source) {
+	static const auto file_type = FileLogicalType::Create();
+	auto &expected_field = StructType::GetChildTypes(file_type)[field_index];
+	if (actual_type != expected_field.second) {
+		throw InvalidInputException("%s field \"%s\" must have type %s, not %s", source, expected_field.first,
+		                            expected_field.second, actual_type);
+	}
+}
+
 void FileLogicalType::Validate(const Value &value, const string &source) {
 	if (value.IsNull()) {
 		return;
@@ -1748,6 +1757,9 @@ void FileLogicalType::Validate(const Value &value, const string &source) {
 		auto &children = StructValue::GetChildren(value);
 		if (children.size() != FIELD_COUNT) {
 			throw InvalidInputException("%s must contain exactly %llu fields", source, FIELD_COUNT);
+		}
+		for (idx_t field_index = 0; field_index < FIELD_COUNT; field_index++) {
+			ValidateFileFieldType(children[field_index].type(), field_index, source);
 		}
 
 		auto position_is_valid = !children[POSITION].IsNull();
@@ -1807,6 +1819,9 @@ void FileLogicalType::Validate(Vector &value, idx_t count, const string &source)
 	auto &children = StructVector::GetEntries(value);
 	if (children.size() != FIELD_COUNT) {
 		throw InvalidInputException("%s must contain exactly %llu fields", source, FIELD_COUNT);
+	}
+	for (idx_t field_index = 0; field_index < FIELD_COUNT; field_index++) {
+		ValidateFileFieldType(children[field_index]->GetType(), field_index, source);
 	}
 
 	UnifiedVectorFormat value_data;
