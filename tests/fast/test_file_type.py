@@ -7,7 +7,6 @@ import pytest
 
 import vane
 
-
 FILE = "file('s3://bucket/missing.bin', 'application/octet-stream', 10, 20, 'sha256:abcdef')"
 FILE_WITH_NULL_METADATA = "file('s3://bucket/missing.bin', NULL, NULL, NULL, NULL)"
 
@@ -170,6 +169,31 @@ def test_file_comparison_cannot_be_shadowed(connection):
 def test_file_rejects_unsupported_comparisons(connection, predicate):
     with pytest.raises(vane.BinderException):
         connection.execute(f"SELECT {predicate}").fetchone()
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    [
+        "list_contains",
+        "array_contains",
+        "list_has",
+        "array_has",
+        "contains",
+        "list_position",
+        "list_indexof",
+        "array_position",
+        "array_indexof",
+    ],
+)
+def test_file_rejects_list_search_comparison_bypasses(connection, function_name):
+    with pytest.raises(vane.BinderException, match="List search functions do not support FILE"):
+        connection.execute(f"SELECT {function_name}([{FILE}], {FILE})").fetchone()
+
+
+def test_file_rejects_nested_list_search_comparison_bypasses(connection):
+    value = f"struct_pack(value := {FILE})"
+    with pytest.raises(vane.BinderException, match="List search functions do not support FILE"):
+        connection.execute(f"SELECT list_contains([{value}], {value})").fetchone()
 
 
 @pytest.mark.parametrize(
