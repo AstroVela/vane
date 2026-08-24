@@ -26,6 +26,44 @@ namespace {
 
 namespace py = pybind11;
 
+static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_LIMIT = 16;
+static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES = 4 * 1024;
+
+static bool IsUTF8ContinuationByte(char byte) {
+	return (static_cast<unsigned char>(byte) & 0xC0U) == 0x80U;
+}
+
+static string BoundCleanupWarning(string warning) {
+	StringUtil::Trim(warning);
+	if (warning.size() <= UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES) {
+		return warning;
+	}
+	static constexpr const char *OMISSION = "...";
+	static constexpr idx_t OMISSION_BYTES = 3;
+	const auto remaining = UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES - OMISSION_BYTES;
+	idx_t prefix_end = remaining / 2;
+	while (prefix_end > 0 && IsUTF8ContinuationByte(warning[prefix_end])) {
+		prefix_end--;
+	}
+	idx_t suffix_start = warning.size() - (remaining - remaining / 2);
+	while (suffix_start < warning.size() && IsUTF8ContinuationByte(warning[suffix_start])) {
+		suffix_start++;
+	}
+	return warning.substr(0, prefix_end) + OMISSION + warning.substr(suffix_start);
+}
+
+static string CleanupWarningFromPythonError(const py::error_already_set &error) {
+	string detail;
+	try {
+		detail = py::str(error.value()).cast<string>();
+	} catch (const py::error_already_set &) {
+		PyErr_Clear();
+		detail = "<cleanup error message unavailable>";
+	}
+	PyErr_Clear();
+	return BoundCleanupWarning("Python UDF actor resource cleanup failed: " + detail);
+}
+
 static shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
 	if (obj.is_none()) {
 		return nullptr;
@@ -157,6 +195,10 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 class PythonUDFActorResourceState : public ClientContextState {
 public:
 	void BeginScope() {
+		if (scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+		}
 		scope_depth++;
 	}
 
@@ -164,6 +206,16 @@ public:
 		if (scope_depth > 0) {
 			scope_depth--;
 		}
+		if (scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+		}
+	}
+
+	vector<string> TakeCleanupWarnings() {
+		vector<string> result;
+		result.swap(cleanup_warnings);
+		return result;
 	}
 
 	bool CanRequestRebind() override {
@@ -188,8 +240,10 @@ public:
 		return RebindQueryInfo::DO_NOT_REBIND;
 	}
 
-	void QueryEnd(ClientContext &, optional_ptr<ErrorData> error) override {
+	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
 		prepared_statements.clear();
+		const auto capture_errors = capture_cleanup_warnings;
+		capture_cleanup_warnings = false;
 		if (resources.empty()) {
 			return;
 		}
@@ -198,7 +252,11 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources(error && error->HasError());
+		// ClientContext drains every executor task before invoking QueryEnd. The
+		// actor callables can therefore release provider state even when the
+		// query itself failed; forced termination is reserved for setup rollback
+		// and context destruction where quiescence is not established here.
+		ShutdownResources(false, capture_errors);
 	}
 
 	~PythonUDFActorResourceState() override {
@@ -210,7 +268,7 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources(true);
+		ShutdownResources(true, false);
 	}
 
 private:
@@ -224,6 +282,10 @@ private:
 		}
 		Prepare(context, prepared);
 		prepared_statements.insert(&prepared);
+		// PendingQuery may first close an older streaming query on this
+		// connection. Arm warning capture only after preparing the plan that
+		// belongs to the active execution scope.
+		capture_cleanup_warnings = true;
 	}
 
 	void Prepare(ClientContext &context, PreparedStatementData &prepared) {
@@ -272,12 +334,12 @@ private:
 				ApplyHandlesMap(bind_nodes, handles_map);
 			}
 		} catch (...) {
-			ShutdownResources(true);
+			ShutdownResources(true, false);
 			throw;
 		}
 	}
 
-	void ShutdownResources(bool kill) {
+	void ShutdownResources(bool kill, bool capture_errors) {
 		if (resources.empty()) {
 			return;
 		}
@@ -286,8 +348,12 @@ private:
 				if (pybind11::hasattr(*it, "shutdown")) {
 					it->attr("shutdown")(pybind11::arg("kill") = kill);
 				}
-			} catch (const pybind11::error_already_set &) {
-				PyErr_Clear();
+			} catch (const pybind11::error_already_set &error) {
+				if (capture_errors && cleanup_warnings.size() < UDF_ACTOR_CLEANUP_WARNING_LIMIT) {
+					cleanup_warnings.push_back(CleanupWarningFromPythonError(error));
+				} else {
+					PyErr_Clear();
+				}
 			}
 		}
 		resources.clear();
@@ -301,8 +367,10 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	bool capture_cleanup_warnings = false;
 	unordered_set<PreparedStatementData *> prepared_statements;
 	vector<pybind11::object> resources;
+	vector<string> cleanup_warnings;
 };
 
 ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context) {
@@ -314,6 +382,13 @@ ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparatio
 	if (state) {
 		state->EndScope();
 	}
+}
+
+vector<string> ScopedPythonUDFActorResourcePreparation::TakeCleanupWarnings() {
+	if (!state) {
+		return {};
+	}
+	return state->TakeCleanupWarnings();
 }
 
 } // namespace duckdb

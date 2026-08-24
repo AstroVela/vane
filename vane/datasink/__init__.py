@@ -983,17 +983,24 @@ def write_datasink(
     warnings: tuple[str, ...] = ()
     try:
         if runner_type == "local-fast":
-            results = _results_from_arrow(context.operation_id, terminal.to_arrow_table())
+            try:
+                table = terminal.to_arrow_table()
+            finally:
+                warnings = _cleanup_warnings(
+                    {"data_sink_cleanup_warnings": terminal._take_udf_actor_cleanup_warnings()}
+                )
+            results = _results_from_arrow(context.operation_id, table)
             states = {result.state for result in results}
             if states == {WriteState.ABORTED}:
                 raise _aborted_error(
                     context,
                     results,
                     "keyed DataSink input validation rejected the operation before workers opened",
+                    warnings,
                 )
             if WriteState.ABORTED in states:
-                raise _unknown_error(context, results, "DataSink results mixed applied and aborted states")
-            return _summary(context, WriteOutcome.APPLIED, results)
+                raise _unknown_error(context, results, "DataSink results mixed applied and aborted states", warnings)
+            return _summary(context, WriteOutcome.APPLIED, results, warnings)
         native_result = get_or_create_runner().run_datasink(terminal)
         if not isinstance(native_result, Mapping):
             raise TypeError(f"Runner.run_datasink() returned {type(native_result).__name__}, expected a mapping")

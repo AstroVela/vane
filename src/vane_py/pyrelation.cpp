@@ -1187,21 +1187,45 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	return true;
 }
 
-static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false) {
+static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false,
+                                                 vector<string> *cleanup_warnings = nullptr) {
+	if (cleanup_warnings) {
+		cleanup_warnings->clear();
+	}
 	if (!rel) {
 		return nullptr;
 	}
 	auto context = rel->context->GetContext();
 	D_ASSERT(py::gil_check());
 	ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
-	py::gil_scoped_release release;
-	auto pending_query = context->PendingQuery(rel, stream_result);
-	return DuckDBPyConnection::CompletePendingQuery(*pending_query);
+	try {
+		unique_ptr<QueryResult> result;
+		{
+			py::gil_scoped_release release;
+			auto pending_query = context->PendingQuery(rel, stream_result);
+			result = DuckDBPyConnection::CompletePendingQuery(*pending_query);
+		}
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		return result;
+	} catch (...) {
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		throw;
+	}
 }
 
 unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 	this->executed = true;
-	return PyExecuteRelation(rel, stream_result);
+	return PyExecuteRelation(rel, stream_result, &udf_actor_cleanup_warnings);
+}
+
+vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
+	vector<string> result;
+	result.swap(udf_actor_cleanup_warnings);
+	return result;
 }
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {

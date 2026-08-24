@@ -311,6 +311,57 @@ def test_local_fast_datasink_applies_aggregates_and_closes_worker(monkeypatch, t
     assert close_marker.read_text(encoding="utf-8") == "closed"
 
 
+def test_local_fast_datasink_worker_failure_closes_after_abort(monkeypatch, tmp_path):
+    from vane.execution.udf_subprocess import LocalSubprocessActorPool
+
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    marker = tmp_path / "local-fast-failed-worker-cleanup"
+    shutdown_kill_values: list[bool] = []
+    original_shutdown = LocalSubprocessActorPool.shutdown
+
+    def tracked_shutdown(self, *, kill=False):
+        if not self._closed:
+            shutdown_kill_values.append(bool(kill))
+        return original_shutdown(self, kill=kill)
+
+    monkeypatch.setattr(LocalSubprocessActorPool, "shutdown", tracked_shutdown)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_FailingBoundWithCloseMarker(marker)),
+            operation_id="local-fast-worker-failure",
+        )
+
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert shutdown_kill_values == [False]
+    assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
+
+
+def test_local_fast_datasink_close_failure_is_cleanup_warning(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    summary = vane.sql("SELECT 1 AS id").write_datasink(
+        _Sink(_Bound(fail_close=True)),
+        operation_id="local-fast-close-failure",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert any("planned close failure" in warning for warning in summary.warnings)
+
+
+def test_local_fast_datasink_close_timeout_is_cleanup_warning(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    monkeypatch.setenv("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", "0.02")
+
+    summary = vane.sql("SELECT 1 AS id").write_datasink(
+        _Sink(_BlockingCloseBound()),
+        operation_id="local-fast-close-timeout",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
+
+
 def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT 1 AS id WHERE false")

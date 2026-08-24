@@ -326,6 +326,7 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	relation_module.def("_arrow_schema", &DuckDBPyRelation::GetArrowSchema,
 	                    "Return the Arrow schema without executing the relation");
 	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
+	relation_module.def("_take_udf_actor_cleanup_warnings", &DuckDBPyRelation::TakeUDFActorCleanupWarnings);
 	relation_module.def(
 	    "map_batches",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,

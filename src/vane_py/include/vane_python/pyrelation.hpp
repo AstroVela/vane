@@ -205,6 +205,7 @@ public:
 	duckdb::pyarrow::Table ToArrowTable(idx_t batch_size);
 
 	duckdb::pyarrow::Table ToArrowTableInternal(idx_t batch_size, bool to_polars);
+	vector<string> TakeUDFActorCleanupWarnings();
 
 	py::object GetArrowSchema();
 
@@ -339,6 +340,7 @@ private:
 	vector<LogicalType> types;
 	vector<string> names;
 	shared_ptr<DuckDBPyResult> result;
+	vector<string> udf_actor_cleanup_warnings;
 	std::string rendered_result;
 };
 
