@@ -32,6 +32,7 @@
 #include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/main/relation/unnest_relation.hpp"
 #include "duckdb/main/relation/update_relation.hpp"
+#include "duckdb/main/relation/data_sink_relation.hpp"
 #include "vane_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
@@ -305,6 +306,23 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &n
 		num_partitions = num_partitions_obj.cast<idx_t>();
 	}
 	return DeriveRelation(rel->LocalExchange(num_partitions));
+}
+
+void DuckDBPyRelation::ValidateDataSinkTransaction() {
+	AssertRelation();
+	if (!rel->context) {
+		throw InternalException("Cannot validate DataSink transaction: relation has no context");
+	}
+	auto context = rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException(
+		    "DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {
+	ValidateDataSinkTransaction();
+	return DeriveRelation(make_shared_ptr<DataSinkRelation>(rel, operation_id));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
@@ -1180,21 +1198,45 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	return true;
 }
 
-static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false) {
+static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false,
+                                                 vector<string> *cleanup_warnings = nullptr) {
+	if (cleanup_warnings) {
+		cleanup_warnings->clear();
+	}
 	if (!rel) {
 		return nullptr;
 	}
 	auto context = rel->context->GetContext();
 	D_ASSERT(py::gil_check());
 	ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
-	py::gil_scoped_release release;
-	auto pending_query = context->PendingQuery(rel, stream_result);
-	return DuckDBPyConnection::CompletePendingQuery(*pending_query);
+	try {
+		unique_ptr<QueryResult> result;
+		{
+			py::gil_scoped_release release;
+			auto pending_query = context->PendingQuery(rel, stream_result);
+			result = DuckDBPyConnection::CompletePendingQuery(*pending_query);
+		}
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		return result;
+	} catch (...) {
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		throw;
+	}
 }
 
 unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 	this->executed = true;
-	return PyExecuteRelation(rel, stream_result);
+	return PyExecuteRelation(rel, stream_result, &udf_actor_cleanup_warnings);
+}
+
+vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
+	vector<string> result;
+	result.swap(udf_actor_cleanup_warnings);
+	return result;
 }
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
@@ -1413,6 +1455,20 @@ duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, 
 
 duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTable(idx_t batch_size) {
 	return ToArrowTableInternal(batch_size, false);
+}
+
+py::object DuckDBPyRelation::GetArrowSchema() {
+	ClientProperties client_properties;
+	if (rel) {
+		client_properties = rel->context->GetContext()->GetClientProperties();
+	} else if (result) {
+		client_properties = result->GetClientProperties();
+	} else {
+		throw InternalException("DuckDBPyRelation must have a relation or result to export its Arrow schema");
+	}
+	py::list batches;
+	auto empty_table = pyarrow::ToArrowTable(types, names, std::move(batches), client_properties);
+	return empty_table.attr("schema");
 }
 
 py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) {

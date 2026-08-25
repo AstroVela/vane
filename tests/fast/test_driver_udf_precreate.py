@@ -219,9 +219,11 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     runner = object.__new__(runner_cls)
     events: list[str] = []
     runner._driver_shutdown_lock = asyncio.Lock()
+    runner._session_lock = threading.RLock()
     runner._plan_runner_lifecycle_lock = threading.RLock()
     runner._driver_shutdown_started = False
     runner._driver_shutdown_complete = False
+    runner._datasink_cleanup_tasks = {}
     runner.plan_runner = SimpleNamespace(shutdown=lambda: events.append("workers-shutdown"))
 
     async def stop_maintenance():
@@ -241,6 +243,63 @@ def test_driver_actor_runtime_shutdown_reaches_plan_runner_once():
     assert runner._driver_executors_shutdown is True
     with pytest.raises(RuntimeError, match="executor is shut down"):
         runner_cls._get_driver_lifecycle_executor(runner)
+
+
+def test_driver_actor_runtime_shutdown_cancels_unbounded_datasink_cleanup_retry(monkeypatch):
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    runner = object.__new__(runner_cls)
+    runner._driver_shutdown_lock = asyncio.Lock()
+    runner._session_lock = threading.RLock()
+    runner._plan_runner_lifecycle_lock = threading.RLock()
+    runner._driver_shutdown_started = False
+    runner._driver_shutdown_complete = False
+    runner._datasink_cleanup_tasks = {}
+    events = []
+    runner.plan_runner = SimpleNamespace(shutdown=lambda: events.append("plan-runner-shutdown"))
+    attempts = 0
+
+    async def stop_maintenance():
+        return None
+
+    def fail_cleanup(*_args):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("persistent cleanup failure")
+
+    runner.stop_query_resource_maintenance = stop_maintenance
+    monkeypatch.setattr(runner_cls, "_teardown_plan_resources", fail_cleanup)
+
+    async def start_retry_and_shutdown():
+        lifecycle = SimpleNamespace()
+        cleanup_key = ("plan", id(lifecycle))
+        cleanup_task = asyncio.create_task(runner_cls._retry_datasink_cleanup_until_complete(runner, "plan", lifecycle))
+        runner._datasink_cleanup_tasks[cleanup_key] = cleanup_task
+        while attempts == 0:
+            await asyncio.sleep(0)
+        await asyncio.wait_for(runner_cls._shutdown_runtime(runner), timeout=1.0)
+        return cleanup_task
+
+    cleanup_task = asyncio.run(start_retry_and_shutdown())
+
+    assert attempts == 1
+    assert cleanup_task.done()
+    assert events == ["plan-runner-shutdown"]
+    assert runner._driver_shutdown_complete is True
+
+
+def test_driver_cleanup_warning_is_bounded_before_actor_transport():
+    from vane.runners.ray.driver import _cleanup_warning
+
+    warning = _cleanup_warning(
+        "DataSink teardown",
+        RuntimeError("diagnostic-head:" + "x" * 10_000 + ":diagnostic-tail"),
+    )
+
+    assert len(warning.encode("utf-8")) <= 4 * 1024
+    assert warning.startswith("DataSink teardown failed: RuntimeError: diagnostic-head:")
+    assert warning.endswith(":diagnostic-tail")
 
 
 def test_driver_actor_rejects_detach_from_non_owner():
@@ -1019,6 +1078,51 @@ def test_actor_pool_opens_after_first_ray_core_actor_becomes_ready(monkeypatch):
     assert wait_calls[1][1:] == (2, 0)
 
 
+def test_actor_pool_first_readiness_failure_diagnostics_are_bounded(monkeypatch):
+    import vane.execution.udf_ray as udf_ray
+
+    class _Ref:
+        def __init__(self, actor_index):
+            self.actor_index = actor_index
+
+        def future(self):
+            actor_index = self.actor_index
+
+            class _Future:
+                def result(self, timeout=None):
+                    raise RuntimeError(f"planned actor-{actor_index} initialization failure")
+
+            return _Future()
+
+    refs = [_Ref(actor_index) for actor_index in range(20)]
+    killed = []
+    fake_ray = types.SimpleNamespace(
+        wait=lambda pending, **_kwargs: (list(pending), []),
+        kill=lambda actor, no_restart=True: killed.append((actor, no_restart)),
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("VANE_RAY_ACTOR_INIT_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
+    pool = SimpleNamespace(
+        actors=[f"actor-{actor_index}" for actor_index in range(20)],
+        actor_node_ids=[""] * 20,
+        _init_refs=refs,
+        _confirmed_ready=set(),
+        _owns_actors=True,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        udf_ray.wait_for_first_actor_pool_ready(pool)
+
+    assert "all 20 UDF actors failed during initialization" in str(exc_info.value)
+    assert "actor-0 initialization failure" in str(exc_info.value)
+    assert "actor-2 initialization failure" in str(exc_info.value)
+    assert "actor-3 initialization failure" not in str(exc_info.value)
+    assert pool.actors == []
+    assert len(killed) == 20
+
+
 def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
     from concurrent.futures import Future
 
@@ -1207,6 +1311,130 @@ def test_stale_execution_phase_callback_does_not_retire_current_actor_pool(
     assert shutdowns == []
     assert pool._vane_retired is False
     assert runner._active_udf_actor_by_unit["q1"]["resource:q1:actor"] is pool
+
+
+def test_plan_actor_cleanup_reports_close_failure_without_retaining_terminated_pool():
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+
+    class Pool:
+        def __init__(self):
+            self._vane_retired = False
+            self.actors = ["actor-0"]
+
+        def shutdown(self):
+            self.actors = []
+            raise RuntimeError("planned callable close failure")
+
+    pool = Pool()
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
+        _active_udf_actors=[pool],
+        _active_udf_actors_by_plan={"q1": [pool]},
+    )
+
+    diagnostics = runner_cls._cleanup_udf_actor_pools(runner, "q1")
+
+    assert len(diagnostics) == 1
+    assert "planned callable close failure" in str(diagnostics[0])
+    assert runner._active_udf_actor_by_unit == {}
+    assert runner._active_udf_actors == []
+    assert "q1" not in runner._active_udf_actors_by_plan
+
+
+def test_phase_actor_retirement_records_close_failure_after_releasing_terminated_pool(monkeypatch):
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+
+    class Pool:
+        def __init__(self):
+            self._vane_retired = False
+            self.actors = ["actor-0"]
+
+        def shutdown(self):
+            self.actors = []
+            raise RuntimeError("planned phase close failure")
+
+    pool = Pool()
+    retirements = []
+    manager = SimpleNamespace(
+        begin_actor_pool_retirement=lambda resource_unit_id: retirements.append(("begin", resource_unit_id)) or True,
+        complete_actor_pool_retirement=lambda resource_unit_id: (
+            retirements.append(("complete", resource_unit_id)) or True
+        ),
+    )
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _query_id: manager)
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
+        _active_udf_actors=[pool],
+        _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_cleanup_diagnostics_by_plan={},
+    )
+
+    runner_cls._retire_udf_actor_pools_outside_phase(
+        runner,
+        "q1",
+        ("resource:q1:new-phase",),
+    )
+
+    assert retirements == [
+        ("begin", "resource:q1:actor"),
+        ("complete", "resource:q1:actor"),
+    ]
+    assert runner._active_udf_actor_by_unit["q1"] == {}
+    assert runner._active_udf_actors == []
+    assert "q1" not in runner._active_udf_actors_by_plan
+    assert len(runner._udf_actor_cleanup_diagnostics_by_plan["q1"]) == 1
+    assert "planned phase close failure" in str(runner._udf_actor_cleanup_diagnostics_by_plan["q1"][0])
+
+
+def test_phase_actor_retirement_preserves_close_failure_when_completion_fails(monkeypatch):
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+
+    class Pool:
+        def __init__(self):
+            self._vane_retired = False
+            self.actors = ["actor-0"]
+
+        def shutdown(self):
+            self.actors = []
+            raise RuntimeError("planned phase close failure")
+
+    pool = Pool()
+    manager = SimpleNamespace(
+        begin_actor_pool_retirement=lambda _resource_unit_id: True,
+        complete_actor_pool_retirement=lambda _resource_unit_id: False,
+    )
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _query_id: manager)
+    runner = SimpleNamespace(
+        _session_lock=threading.RLock(),
+        _active_udf_actor_by_unit={"q1": {"resource:q1:actor": pool}},
+        _active_udf_actors=[pool],
+        _active_udf_actors_by_plan={"q1": [pool]},
+        _udf_actor_cleanup_diagnostics_by_plan={},
+    )
+
+    with pytest.raises(RuntimeError, match="retirement state disappeared"):
+        runner_cls._retire_udf_actor_pools_outside_phase(
+            runner,
+            "q1",
+            ("resource:q1:new-phase",),
+        )
+
+    assert pool._vane_retired
+    assert runner._active_udf_actor_by_unit["q1"]["resource:q1:actor"] is pool
+    assert runner._active_udf_actors == [pool]
+    assert runner._active_udf_actors_by_plan["q1"] == [pool]
+    assert len(runner._udf_actor_cleanup_diagnostics_by_plan["q1"]) == 1
+    assert "planned phase close failure" in str(runner._udf_actor_cleanup_diagnostics_by_plan["q1"][0])
 
 
 def test_phase_actor_retirement_serializes_plan_cleanup(monkeypatch):
@@ -1935,6 +2163,105 @@ def test_actor_readiness_cleanup_failure_keeps_registered_pool_owned(monkeypatch
     assert "q1" not in runner._active_udf_actor_by_unit
 
 
+def test_actor_readiness_close_failure_releases_terminated_pool(monkeypatch):
+    import vane.execution.udf_ray as udf_ray
+    import vane.runners.ray.query_resource_runtime as resource_runtime
+    from vane.runners.ray.driver import RayQueryDriverActor
+
+    runner_cls = RayQueryDriverActor.__ray_metadata__.modified_class
+    resource_unit_id = "resource:q1:actor"
+    events = []
+
+    class _Manager:
+        def current_eligible_resource_unit_ids(self):
+            return (resource_unit_id,)
+
+        def set_submitted_actor_slots(self, unit_id, actor_indices):
+            events.append(("submitted", unit_id, set(actor_indices)))
+
+        def complete_actor_pool_retirement(self, unit_id):
+            events.append(("complete", unit_id))
+            return False
+
+        def set_ready_actor_slots(self, unit_id, actor_nodes):
+            events.append(("ready", unit_id, dict(actor_nodes)))
+
+    manager = _Manager()
+    monkeypatch.setattr(resource_runtime, "get_query_resource_manager", lambda _query_id: manager)
+
+    class _Pool:
+        def __init__(self):
+            self.actors = ["actor-0"]
+            self.actor_node_ids = [""]
+            self._init_refs = [object()]
+
+        def shutdown(self):
+            self.actors = []
+            raise RuntimeError("planned readiness close failure")
+
+    pool = _Pool()
+    monkeypatch.setattr(
+        udf_ray,
+        "prepare_actor_pools_for_nodes",
+        lambda *_args, **_kwargs: (
+            [pool],
+            {
+                "node-1": {
+                    "actor_handles": ["actor-0"],
+                    "actor_node_ids": [""],
+                    "actor_dispatch_indices": [],
+                    "actor_init_refs": list(pool._init_refs),
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        udf_ray,
+        "wait_for_first_actor_pool_ready",
+        lambda _pool: (_ for _ in ()).throw(RuntimeError("planned readiness failure")),
+    )
+    runner = SimpleNamespace(
+        _query_resource_lock=threading.RLock(),
+        _session_lock=threading.RLock(),
+        _query_resource_graphs={
+            "q1": SimpleNamespace(unit_by_id=lambda _unit_id: SimpleNamespace(backend="ray_actor"))
+        },
+        _query_allocations={"q1": object()},
+        _query_udf_actor_nodes={"q1": {resource_unit_id: {"node_id": "node-1"}}},
+        _query_udf_session_configs={"q1": {}},
+        _plan_session_ids={"q1": "session-1"},
+        _active_udf_actor_by_unit={"q1": {}},
+        _active_udf_actors=[],
+        _active_udf_actors_by_plan={},
+        _driver_handle=object(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="activation failed after graceful callable cleanup also failed.*planned readiness close failure",
+    ):
+        runner_cls._activate_query_udf_actor_pool_sync(
+            runner,
+            {
+                "query_id": "q1",
+                "resource_unit_id": resource_unit_id,
+                "physical_node_id": "node-1",
+            },
+            _QUERY_GENERATION_CAPABILITY,
+        )
+
+    assert events == [
+        ("submitted", resource_unit_id, {0}),
+        ("complete", resource_unit_id),
+        ("ready", resource_unit_id, {}),
+        ("submitted", resource_unit_id, set()),
+    ]
+    assert pool._vane_retired is True
+    assert runner._active_udf_actor_by_unit == {}
+    assert runner._active_udf_actors == []
+    assert runner._active_udf_actors_by_plan == {}
+
+
 def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
     import vane.execution.udf_ray_actor_pool as actor_pool_mod
 
@@ -1952,11 +2279,46 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
     pool = actor_pool_mod.UDFActorPoolBase.__new__(actor_pool_mod.UDFActorPoolBase)
     pool._owns_actors = True
     pool.actors = ["actor-0"]
+    pool._init_refs = ["init-ref-0"]
+    pool._payload_ref = "payload-ref"
 
     pool.shutdown(kill=True)
 
     assert killed == [{"actor": "actor-0", "no_restart": True}]
     assert pool.actors == []
+    assert pool._init_refs == []
+    assert pool._payload_ref is None
+
+
+def test_udf_actor_cleanup_diagnostic_handles_unprintable_failure():
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned actor cleanup str failure")
+
+    diagnostic = actor_pool_mod._actor_cleanup_failure("close", 7, _UnprintableError())
+
+    assert diagnostic == "actor-7 close: _UnprintableError: <cleanup error message unavailable>"
+
+    exact_args_diagnostic = actor_pool_mod._actor_cleanup_failure(
+        "close",
+        7,
+        _UnprintableError("safe actor cleanup detail"),
+    )
+    assert exact_args_diagnostic == "actor-7 close: _UnprintableError: safe actor cleanup detail"
+
+    class _OversizedTypeNameError(RuntimeError):
+        pass
+
+    _OversizedTypeNameError.__name__ = "x" * 100_000
+    oversized_type_diagnostic = actor_pool_mod._actor_cleanup_failure(
+        "kill",
+        8,
+        _OversizedTypeNameError("planned actor cleanup failure"),
+    )
+
+    assert oversized_type_diagnostic == "actor-8 kill: BaseException: planned actor cleanup failure"
 
 
 def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):
@@ -2073,7 +2435,7 @@ def test_udf_actor_pool_constructor_exposes_partial_actor_when_cleanup_fails(mon
     assert owned_pools[0].actors == ["actor-0"]
 
     fail_kill = False
-    owned_pools[0].shutdown()
+    owned_pools[0].shutdown(kill=True)
     assert owned_pools[0].actors == []
 
 

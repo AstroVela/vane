@@ -16,7 +16,10 @@
  */
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -229,6 +232,127 @@ TEST_CASE("Streaming channel: closing receiver releases queued values", "[distri
 	REQUIRE(state->is_empty());
 	REQUIRE(payload_lifetime.expired());
 	REQUIRE(sender.send(std::make_shared<int>(43)).is_err());
+}
+
+TEST_CASE("Streaming channel: optional pending capacity backpressures producers", "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_while_full = second_finished.load();
+	auto first = receiver.recv();
+	producer.join();
+	REQUIRE_FALSE(finished_while_full);
+	REQUIRE(first.first);
+	REQUIRE(first.second == 1);
+	REQUIRE(second_finished.load());
+	REQUIRE(second_result.is_ok());
+	auto second = receiver.recv();
+	REQUIRE(second.first);
+	REQUIRE(second.second == 2);
+}
+
+TEST_CASE("Streaming channel: closing a capacity-limited receiver wakes a blocked producer",
+          "[distributed][streaming_channel]") {
+	auto ch_pair_ = create_unbounded_channel<int>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	REQUIRE(sender.send(1).is_ok());
+
+	std::atomic<bool> second_started {false};
+	std::atomic<bool> second_finished {false};
+	DuckDBResult<void> second_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		second_started.store(true);
+		second_result = sender.send(2);
+		second_finished.store(true);
+	});
+	while (!second_started.load()) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	const bool finished_before_close = second_finished.load();
+	receiver.close();
+	producer.join();
+	REQUIRE_FALSE(finished_before_close);
+	REQUIRE(second_result.is_err());
+}
+
+TEST_CASE("Streaming channel: receiver closure wakes producers before destroying queued values",
+          "[distributed][streaming_channel]") {
+	struct DestructionGate {
+		std::mutex mutex;
+		std::condition_variable condition;
+		bool producer_started = false;
+		bool producer_finished = false;
+		bool destructor_entered = false;
+		bool allow_destruction = false;
+	};
+
+	auto gate = std::make_shared<DestructionGate>();
+	auto ch_pair_ = create_unbounded_channel<std::shared_ptr<int>>(1);
+	auto sender = std::move(ch_pair_.first);
+	auto receiver = std::move(ch_pair_.second);
+	auto queued = std::shared_ptr<int>(new int(1), [gate](int *value) {
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		gate->destructor_entered = true;
+		gate->condition.notify_all();
+		gate->condition.wait(lock, [gate] { return gate->allow_destruction; });
+		delete value;
+	});
+	REQUIRE(sender.send(std::move(queued)).is_ok());
+
+	DuckDBResult<void> blocked_result = DuckDBResult<void>::ok();
+	std::thread producer([&]() {
+		{
+			std::lock_guard<std::mutex> lock(gate->mutex);
+			gate->producer_started = true;
+		}
+		gate->condition.notify_all();
+		blocked_result = sender.send(std::make_shared<int>(2));
+		{
+			std::lock_guard<std::mutex> lock(gate->mutex);
+			gate->producer_finished = true;
+		}
+		gate->condition.notify_all();
+	});
+	{
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		gate->condition.wait(lock, [gate] { return gate->producer_started; });
+	}
+
+	std::thread closer([&receiver]() { receiver.close(); });
+	bool destructor_entered = false;
+	bool producer_finished_before_destruction = false;
+	{
+		std::unique_lock<std::mutex> lock(gate->mutex);
+		destructor_entered =
+		    gate->condition.wait_for(lock, std::chrono::seconds(2), [gate] { return gate->destructor_entered; });
+		producer_finished_before_destruction =
+		    destructor_entered &&
+		    gate->condition.wait_for(lock, std::chrono::seconds(2), [gate] { return gate->producer_finished; });
+		gate->allow_destruction = true;
+	}
+	gate->condition.notify_all();
+	producer.join();
+	closer.join();
+
+	REQUIRE(destructor_entered);
+	REQUIRE(producer_finished_before_destruction);
+	REQUIRE(blocked_result.is_err());
 }
 
 TEST_CASE("Streaming channel: moving receiver transfers channel ownership", "[distributed][streaming_channel]") {

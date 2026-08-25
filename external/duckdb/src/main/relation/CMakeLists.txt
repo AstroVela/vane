@@ -13,6 +13,7 @@ add_library_unity(
   create_table_relation.cpp
   create_view_relation.cpp
   cross_product_relation.cpp
+  data_sink_relation.cpp
   delete_relation.cpp
   delim_get_relation.cpp
   distinct_relation.cpp

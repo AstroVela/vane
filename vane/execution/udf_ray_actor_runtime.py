@@ -217,6 +217,8 @@ def _actor_class(
             # Payload is injected via init_payload() immediately after creation.
             self._payload: dict[str, Any] | None = None
             self.executor: RuntimeUDFExecutor | None = None  # lazy init on first streaming submission
+            self._executor_closed = False
+            self._executor_close_started = False
             self._vane_location_report_ref: Any | None = None
             self._vane_location_report_error: BaseException | None = None
             try:
@@ -234,6 +236,8 @@ def _actor_class(
 
         def init_payload(self, payload: dict[str, Any]) -> str:
             """Inject payload after construction to avoid Ray object-store GC issues."""
+            if self._executor_closed or self._executor_close_started:
+                raise RuntimeError("Ray UDF actor executor is closed")
             self._payload = payload
             _actor_debug_log("init_payload", self._payload)
             if self.executor is None:
@@ -255,6 +259,8 @@ def _actor_class(
             return node_id
 
         def _ensure_executor(self, effective_payload: dict[str, Any]) -> RuntimeUDFExecutor:
+            if self._executor_closed or self._executor_close_started:
+                raise RuntimeError("Ray UDF actor executor is closed")
             executor = self.executor
             if executor is not None:
                 return executor
@@ -267,6 +273,17 @@ def _actor_class(
             self.executor = executor
             configure_ray_actor_loaded_torch_threads(self._payload)
             return executor
+
+        def close_executor(self) -> None:
+            """Deterministically close the resident callable before actor termination."""
+            if self._executor_closed:
+                return
+            self._executor_close_started = True
+            executor = self.executor
+            if executor is not None:
+                executor.close()
+            self.executor = None
+            self._executor_closed = True
 
         def _run_row_preserving_batch(
             self,

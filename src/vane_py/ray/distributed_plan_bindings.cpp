@@ -1419,9 +1419,27 @@ public:
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
 	    duckdb::distributed::MaterializedOutputCallback on_output) override {
+		return WaitFteQuery(query_id, timeout_s, task_contexts, std::move(on_output), false);
+	}
+
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
+	wait_fte_query_streaming(const string &query_id, double timeout_s,
+	                         duckdb::distributed::MaterializedOutputCallback on_output) override {
+		const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
+		return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+	}
+
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
+	    const string &query_id, double timeout_s,
+	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
 		if (query_id.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::value_error("query_id must be non-empty"));
+		}
+		if (stream_outputs && !on_output) {
+			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+			    DuckDBError::value_error("streaming FTE result drain requires an output callback"));
 		}
 		auto active_owner = BeginResultHandleOperation(query_id);
 		if (!active_owner) {
@@ -1430,104 +1448,145 @@ public:
 		}
 		PyBackendResultOperationGuard operation(
 		    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
-
-		std::unordered_set<string> selected_attempt_task_ids;
-		const bool has_deadline = timeout_s > 0.0;
-		const auto deadline = has_deadline ? std::chrono::steady_clock::now() +
-		                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-		                                             std::chrono::duration<double>(timeout_s))
-		                                   : std::chrono::steady_clock::time_point::max();
-		while (true) {
-			bool failed = false;
-			bool finished = false;
-			bool canceled = false;
-			bool matched = true;
-			bool registration_pending = false;
-			string status_message;
+		auto fail_after_result_cleanup = [&](const string &stage, const char *detail) {
+			::vane::BoundedErrorDetails errors;
+			errors.Add(stage, detail);
 			try {
-				duckdb::PythonGILWrapper gil;
-				auto backend = backend_.get();
-				py::object status_obj;
-				if (task_contexts.empty()) {
-					status_obj = backend.attr("fte_query_status")(query_id);
-				} else {
-					py::list py_task_contexts;
-					for (const auto &task_context : task_contexts) {
-						py::dict info;
-						info["query_idx"] = task_context.query_idx();
-						info["last_node_id"] = task_context.last_node_id();
-						info["task_id"] = task_context.task_id();
-						py::list node_ids;
-						for (auto node_id : task_context.node_ids()) {
-							node_ids.append(node_id);
-						}
-						info["node_ids"] = std::move(node_ids);
-						py_task_contexts.append(std::move(info));
-					}
-					status_obj = backend.attr("fte_query_status")(query_id, std::move(py_task_contexts));
-				}
-				status_message = PyStatusMessage(status_obj);
-				failed = RequiredStatusBool(status_obj, "failed");
-				finished = RequiredStatusBool(status_obj, "finished");
-				canceled = OptionalStatusBool(status_obj, "canceled", false);
-				if (!task_contexts.empty()) {
-					matched = RequiredStatusBool(status_obj, "matched");
-					registration_pending = OptionalStatusBool(status_obj, "registration_pending", false);
-				}
-				selected_attempt_task_ids = SelectedAttemptTaskIds(status_obj);
-			} catch (const std::exception &e) {
 				ClearResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError(string("Python backend fte_query_status failed: ") + e.what()));
+			} catch (const std::exception &cleanup_error) {
+				errors.Add("Python backend result cleanup", cleanup_error.what());
+			} catch (...) {
+				errors.Add("Python backend result cleanup", "unknown error");
 			}
-			if (failed) {
-				ClearResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("Python backend FTE query failed: " + status_message));
-			}
-			if (canceled) {
-				ClearResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("Python backend FTE query canceled: " + status_message));
-			}
-			if (!task_contexts.empty() && !matched) {
-				if (!registration_pending) {
-					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-					    DuckDBError::external_error(
-					        "Python backend FTE query scope did not match any registered fragment: " + status_message));
-				}
-			} else if (finished) {
-				break;
-			}
-			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("timed out waiting for Python backend FTE query: " + status_message));
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
+			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+			    DuckDBError(errors.AppendTo("Python backend FTE query wait failed")));
+		};
 
-		const double remaining_timeout_s =
-		    has_deadline
-		        ? std::max(0.0, std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
-		        : -1.0;
-		auto drain_res = DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
-		                                    task_contexts.empty() ? nullptr : &task_contexts, false);
-		if (drain_res.is_err()) {
-			return drain_res;
-		}
-		std::vector<duckdb::distributed::MaterializedOutput> outputs;
-		for (auto &output : drain_res.value()) {
-			if (on_output) {
-				auto callback_res = on_output(output);
-				if (callback_res.is_err()) {
-					ClearResultHandles(query_id);
-					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-					    callback_res.error());
+		try {
+			std::unordered_set<string> selected_attempt_task_ids;
+			const bool has_deadline = timeout_s > 0.0;
+			const auto deadline = has_deadline ? std::chrono::steady_clock::now() +
+			                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			                                             std::chrono::duration<double>(timeout_s))
+			                                   : std::chrono::steady_clock::time_point::max();
+			while (true) {
+				bool failed = false;
+				bool finished = false;
+				bool canceled = false;
+				bool matched = true;
+				bool registration_pending = false;
+				string status_message;
+				try {
+					duckdb::PythonGILWrapper gil;
+					auto backend = backend_.get();
+					py::object status_obj;
+					if (task_contexts.empty()) {
+						status_obj = backend.attr("fte_query_status")(query_id);
+					} else {
+						py::list py_task_contexts;
+						for (const auto &task_context : task_contexts) {
+							py::dict info;
+							info["query_idx"] = task_context.query_idx();
+							info["last_node_id"] = task_context.last_node_id();
+							info["task_id"] = task_context.task_id();
+							py::list node_ids;
+							for (auto node_id : task_context.node_ids()) {
+								node_ids.append(node_id);
+							}
+							info["node_ids"] = std::move(node_ids);
+							py_task_contexts.append(std::move(info));
+						}
+						status_obj = backend.attr("fte_query_status")(query_id, std::move(py_task_contexts));
+					}
+					failed = RequiredStatusBool(status_obj, "failed");
+					finished = RequiredStatusBool(status_obj, "finished");
+					canceled = OptionalStatusBool(status_obj, "canceled", false);
+					if (!task_contexts.empty()) {
+						matched = RequiredStatusBool(status_obj, "matched");
+						registration_pending = OptionalStatusBool(status_obj, "registration_pending", false);
+					}
+					selected_attempt_task_ids = SelectedAttemptTaskIds(status_obj);
+					status_message = PyStatusMessage(status_obj, failed, finished, canceled, matched,
+					                                 registration_pending, selected_attempt_task_ids.size());
+				} catch (const std::exception &e) {
+					return fail_after_result_cleanup("Python backend fte_query_status failed", e.what());
 				}
+				if (failed) {
+					return fail_after_result_cleanup("Python backend FTE query failed", status_message.c_str());
+				}
+				if (canceled) {
+					return fail_after_result_cleanup("Python backend FTE query canceled", status_message.c_str());
+				}
+				if (stream_outputs && !selected_attempt_task_ids.empty()) {
+					auto coverage_res = ValidateResultHandleCoverage(query_id, selected_attempt_task_ids);
+					if (coverage_res.is_err()) {
+						return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
+						                                 coverage_res.error().what());
+					}
+					const double remaining_timeout_s =
+					    has_deadline
+					        ? std::max(
+					              0.0,
+					              std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
+					        : -1.0;
+					auto stream_res =
+					    DrainResultHandles(query_id, remaining_timeout_s, selected_attempt_task_ids,
+					                       task_contexts.empty() ? nullptr : &task_contexts, true, on_output, true);
+					if (stream_res.is_err()) {
+						return stream_res;
+					}
+				}
+				if (!task_contexts.empty() && !matched) {
+					if (!registration_pending) {
+						return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+						    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+						        "Python backend FTE query scope did not match any registered fragment",
+						        status_message.c_str())));
+					}
+				} else if (finished) {
+					break;
+				}
+				if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+					    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+					        "timed out waiting for Python backend FTE query", status_message.c_str())));
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
 			}
-			outputs.push_back(std::move(output));
+
+			const double remaining_timeout_s =
+			    has_deadline
+			        ? std::max(0.0, std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
+			        : -1.0;
+			auto coverage_res = ValidateResultHandleCoverage(query_id, selected_attempt_task_ids);
+			if (coverage_res.is_err()) {
+				return fail_after_result_cleanup("Python backend selected-attempt/result-handle validation",
+				                                 coverage_res.error().what());
+			}
+			auto drain_res = DrainResultHandles(
+			    query_id, remaining_timeout_s, selected_attempt_task_ids,
+			    task_contexts.empty() ? nullptr : &task_contexts, stream_outputs,
+			    stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
+			if (drain_res.is_err()) {
+				return drain_res;
+			}
+			std::vector<duckdb::distributed::MaterializedOutput> outputs;
+			for (auto &output : drain_res.value()) {
+				if (!stream_outputs && on_output) {
+					auto callback_res = on_output(output);
+					if (callback_res.is_err()) {
+						return fail_after_result_cleanup("Python backend FTE output callback",
+						                                 callback_res.error().what());
+					}
+				}
+				outputs.push_back(std::move(output));
+			}
+			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
+		} catch (const std::exception &ex) {
+			return fail_after_result_cleanup("Python backend wait_fte_query failed", ex.what());
+		} catch (...) {
+			return fail_after_result_cleanup("Python backend wait_fte_query failed", "unknown error");
 		}
-		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 	}
 
 	DuckDBResult<void> abort_and_quiesce_query(const string &query_id) override {
@@ -1659,6 +1718,7 @@ private:
 	    retained_result_handles_by_query_;
 	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
 	    cleanup_retry_result_handles_by_query_;
+	std::unordered_map<string, std::unordered_map<string, size_t>> result_handle_counts_by_query_;
 
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
 		std::string query_id;
@@ -1833,12 +1893,79 @@ private:
 		return py::int_(py::reinterpret_borrow<py::object>(dict[key])).cast<uint64_t>();
 	}
 
-	static string PyStatusMessage(const py::object &status_obj) {
-		try {
-			return py::str(status_obj).cast<string>();
-		} catch (...) {
-			return "<unprintable status>";
+	static bool TryBoundedTextValue(const py::object &value, const char *field_name, string &result) {
+		if (!py::isinstance<py::str>(value)) {
+			throw duckdb::InternalException("FTE query status field '%s' must be a string", field_name);
 		}
+		result = ::vane::BoundedPythonDiagnosticText(value);
+		return result.find_first_not_of(" \t\n\r\f\v") != string::npos;
+	}
+
+	static bool TryBoundedStatusText(const py::dict &status, const char *field_name, string &result) {
+		auto key = py::str(field_name);
+		if (!status.contains(key) || py::reinterpret_borrow<py::object>(status[key]).is_none()) {
+			return false;
+		}
+		return TryBoundedTextValue(py::reinterpret_borrow<py::object>(status[key]), field_name, result);
+	}
+
+	static bool TryBoundedFailedPartitionText(const py::dict &status, string &result) {
+		auto failed_key = py::str("failed_partitions");
+		if (!status.contains(failed_key) || py::reinterpret_borrow<py::object>(status[failed_key]).is_none()) {
+			return false;
+		}
+		auto failed_obj = py::reinterpret_borrow<py::object>(status[failed_key]);
+		if (!py::isinstance<py::list>(failed_obj)) {
+			throw duckdb::InternalException("FTE query status field 'failed_partitions' must be a list");
+		}
+		auto failed_partitions = failed_obj.cast<py::list>();
+		const auto detail_limit = ::vane::BoundedErrorDetails::MAX_DETAILS;
+		for (size_t index = 0; index < failed_partitions.size() && index < detail_limit; ++index) {
+			auto partition_obj = py::reinterpret_borrow<py::object>(failed_partitions[index]);
+			if (!py::isinstance<py::dict>(partition_obj)) {
+				throw duckdb::InternalException("FTE query status failed_partitions entries must be dicts");
+			}
+			auto partition = partition_obj.cast<py::dict>();
+			auto latest_key = py::str("latest_failure");
+			if (!partition.contains(latest_key) ||
+			    py::reinterpret_borrow<py::object>(partition[latest_key]).is_none()) {
+				continue;
+			}
+			auto latest = py::reinterpret_borrow<py::object>(partition[latest_key]);
+			if (py::isinstance<py::str>(latest)) {
+				if (TryBoundedTextValue(latest, "failed_partitions.latest_failure", result)) {
+					return true;
+				}
+				continue;
+			}
+			if (!py::isinstance<py::dict>(latest)) {
+				continue;
+			}
+			auto failure = latest.cast<py::dict>();
+			for (const char *field_name : {"message", "failure_reason"}) {
+				auto key = py::str(field_name);
+				if (failure.contains(key) && !py::reinterpret_borrow<py::object>(failure[key]).is_none() &&
+				    TryBoundedTextValue(py::reinterpret_borrow<py::object>(failure[key]), field_name, result)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	static string PyStatusMessage(const py::object &status_obj, bool failed, bool finished, bool canceled, bool matched,
+	                              bool registration_pending, size_t selected_attempt_count) {
+		auto status = status_obj.cast<py::dict>();
+		string message;
+		if (TryBoundedStatusText(status, "message", message) ||
+		    TryBoundedStatusText(status, "scheduler_failure", message) ||
+		    TryBoundedFailedPartitionText(status, message)) {
+			return message;
+		}
+		return "failed=" + string(failed ? "true" : "false") + ", finished=" + (finished ? "true" : "false") +
+		       ", canceled=" + (canceled ? "true" : "false") + ", matched=" + (matched ? "true" : "false") +
+		       ", registration_pending=" + (registration_pending ? "true" : "false") +
+		       ", selected_attempt_count=" + std::to_string(selected_attempt_count);
 	}
 
 	static bool RequiredStatusBool(const py::object &status_obj, const char *field_name) {
@@ -1876,21 +2003,42 @@ private:
 	static std::unordered_set<string> SelectedAttemptTaskIds(const py::object &status_obj) {
 		std::unordered_set<string> selected;
 		if (!py::isinstance<py::dict>(status_obj)) {
-			return selected;
+			throw duckdb::InternalException("FTE query status must be a dict");
 		}
 		auto status = status_obj.cast<py::dict>();
 		auto key = py::str("selected_attempt_task_ids");
 		if (!status.contains(key)) {
-			return selected;
+			throw duckdb::InternalException("FTE query status must include 'selected_attempt_task_ids'");
 		}
 		auto selected_obj = py::reinterpret_borrow<py::object>(status[key]);
 		if (selected_obj.is_none()) {
-			return selected;
+			throw duckdb::InternalException("FTE query status selected_attempt_task_ids must be a list");
+		}
+		if (!py::isinstance<py::list>(selected_obj)) {
+			throw duckdb::InternalException("FTE query status selected_attempt_task_ids must be a list");
 		}
 		for (auto item : selected_obj) {
-			auto value = py::str(py::reinterpret_borrow<py::object>(item)).cast<string>();
-			if (!value.empty()) {
-				selected.insert(std::move(value));
+			auto item_obj = py::reinterpret_borrow<py::object>(item);
+			if (!py::isinstance<py::str>(item_obj)) {
+				throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be strings");
+			}
+			const auto character_count = PyUnicode_GetLength(item_obj.ptr());
+			if (character_count < 0) {
+				throw py::error_already_set();
+			}
+			if (static_cast<size_t>(character_count) > ::vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+				throw duckdb::InternalException(
+				    "FTE query status selected_attempt_task_ids entry exceeds 4096 characters");
+			}
+			auto value = item_obj.cast<string>();
+			if (value.size() > ::vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+				throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 bytes");
+			}
+			if (value.empty()) {
+				throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be non-empty");
+			}
+			if (!selected.insert(std::move(value)).second) {
+				throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be unique");
 			}
 		}
 		return selected;
@@ -1901,11 +2049,53 @@ private:
 		if (query_id.empty() || raw_handles.is_none()) {
 			return;
 		}
+		std::vector<py::object> python_handles;
+		auto release_python_handles = [&](::vane::BoundedErrorDetails &errors) {
+			for (size_t index = 0; index < python_handles.size(); index++) {
+				try {
+					python_handles[index].attr("release_result_payload")();
+				} catch (const std::exception &ex) {
+					errors.Add("release[" + std::to_string(index) + "]", ex.what());
+				} catch (...) {
+					errors.Add("release[" + std::to_string(index) + "]", "unknown release error");
+				}
+			}
+		};
+		try {
+			for (auto item : raw_handles) {
+				python_handles.push_back(py::reinterpret_borrow<py::object>(item));
+			}
+		} catch (const std::exception &ex) {
+			::vane::BoundedErrorDetails errors;
+			errors.Add("iteration", ex.what());
+			release_python_handles(errors);
+			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+		} catch (...) {
+			::vane::BoundedErrorDetails errors;
+			errors.Add("iteration", "unknown iteration error");
+			release_python_handles(errors);
+			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+		}
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> wrapped;
-		for (auto item : raw_handles) {
-			auto py_handle = py::reinterpret_borrow<py::object>(item);
-			auto handle = duckdb::distributed::python::ray::MakePythonTaskResultHandle(std::move(py_handle));
-			wrapped.push_back(make_uniq<duckdb::distributed::python::ray::PythonTaskResultHandle>(std::move(handle)));
+		wrapped.reserve(python_handles.size());
+		try {
+			for (const auto &py_handle : python_handles) {
+				auto handle = duckdb::distributed::python::ray::MakePythonTaskResultHandle(py_handle);
+				wrapped.push_back(
+				    make_uniq<duckdb::distributed::python::ray::PythonTaskResultHandle>(std::move(handle)));
+			}
+		} catch (const std::exception &ex) {
+			wrapped.clear();
+			::vane::BoundedErrorDetails errors;
+			errors.Add("conversion", ex.what());
+			release_python_handles(errors);
+			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
+		} catch (...) {
+			wrapped.clear();
+			::vane::BoundedErrorDetails errors;
+			errors.Add("conversion", "unknown conversion error");
+			release_python_handles(errors);
+			throw std::runtime_error(errors.AppendTo("failed to adopt Python backend result handle batch"));
 		}
 		if (wrapped.empty()) {
 			return;
@@ -1915,8 +2105,13 @@ private:
 			lock_guard<mutex> guard(mutex_);
 			if (!query_closed) {
 				auto &stored = result_handles_by_query_[query_id];
+				auto &counts = result_handle_counts_by_query_[query_id];
 				stored.reserve(stored.size() + wrapped.size());
 				for (auto &handle : wrapped) {
+					auto &count = counts[handle->GetFteTaskId()];
+					if (count < 2) {
+						count++;
+					}
 					stored.push_back(std::move(handle));
 				}
 			}
@@ -1924,6 +2119,38 @@ private:
 		if (query_closed) {
 			ReleaseLatePythonTaskResultHandles(query_id, std::move(wrapped));
 		}
+	}
+
+	DuckDBResult<void> ValidateResultHandleCoverage(const string &query_id,
+	                                                const std::unordered_set<string> &selected_attempt_task_ids) const {
+		size_t missing = 0;
+		size_t duplicate = 0;
+		{
+			lock_guard<mutex> guard(mutex_);
+			auto query_it = result_handle_counts_by_query_.find(query_id);
+			for (const auto &task_id : selected_attempt_task_ids) {
+				size_t count = 0;
+				if (query_it != result_handle_counts_by_query_.end()) {
+					auto task_it = query_it->second.find(task_id);
+					if (task_it != query_it->second.end()) {
+						count = task_it->second;
+					}
+				}
+				missing += count == 0 ? 1 : 0;
+				duplicate += count > 1 ? 1 : 0;
+			}
+		}
+		if (duplicate > 0) {
+			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+			    "Python backend returned multiple result handles for one selected attempt; duplicate selected attempt "
+			    "count=" +
+			    std::to_string(duplicate)));
+		}
+		if (missing > 0) {
+			return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+			    "Python backend returned no result handle for " + std::to_string(missing) + " selected attempt(s)"));
+		}
+		return DuckDBResult<void>::ok();
 	}
 
 	void StorePythonTaskResultHandles(
@@ -1984,26 +2211,23 @@ private:
 	void ReleaseLatePythonTaskResultHandles(
 	    const string &query_id,
 	    std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles) {
-		std::vector<string> errors;
+		::vane::BoundedErrorDetails errors;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
 		for (size_t index = 0; index < handles.size(); index++) {
 			try {
 				handles[index]->ReleasePollResult();
 			} catch (const std::exception &ex) {
-				errors.push_back("late[" + std::to_string(index) + "]: " + ex.what());
+				errors.Add("late[" + std::to_string(index) + "]", ex.what());
 				retry_handles.push_back(std::move(handles[index]));
 			} catch (...) {
-				errors.push_back("late[" + std::to_string(index) + "]: unknown release error");
+				errors.Add("late[" + std::to_string(index) + "]", "unknown release error");
 				retry_handles.push_back(std::move(handles[index]));
 			}
 		}
 		StoreCleanupRetryResultHandles(query_id, std::move(retry_handles));
-		if (!errors.empty()) {
-			string message = "failed to release late Python backend result handle(s) for closed query " + query_id;
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			throw std::runtime_error(message);
+		if (errors) {
+			throw std::runtime_error(
+			    errors.AppendTo("failed to release late Python backend result handle(s) for closed query " + query_id));
 		}
 	}
 
@@ -2030,17 +2254,17 @@ private:
 				cleanup_retry_result_handles_by_query_.erase(cleanup_retry_it);
 			}
 		}
-		std::vector<string> errors;
+		::vane::BoundedErrorDetails errors;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
 		auto release_all = [&](auto &owned_handles, const char *kind) {
 			for (size_t index = 0; index < owned_handles.size(); index++) {
 				try {
 					owned_handles[index]->ReleasePollResult();
 				} catch (const std::exception &ex) {
-					errors.push_back(string(kind) + "[" + std::to_string(index) + "]: " + ex.what());
+					errors.Add(string(kind) + "[" + std::to_string(index) + "]", ex.what());
 					retry_handles.push_back(std::move(owned_handles[index]));
 				} catch (...) {
-					errors.push_back(string(kind) + "[" + std::to_string(index) + "]: unknown release error");
+					errors.Add(string(kind) + "[" + std::to_string(index) + "]", "unknown release error");
 					retry_handles.push_back(std::move(owned_handles[index]));
 				}
 			}
@@ -2053,33 +2277,30 @@ private:
 		} else {
 			StorePythonTaskResultHandles(query_id, std::move(retry_handles));
 		}
-		if (!errors.empty()) {
-			string message = "failed to release " + std::to_string(errors.size()) + " backend result handle(s)";
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			throw std::runtime_error(message);
+		if (errors) {
+			throw std::runtime_error(
+			    errors.AppendTo("failed to release " + std::to_string(errors.Count()) + " backend result handle(s)"));
 		}
 	}
 
 	void ClearResultHandlesForLifecycle(const QueryLifecycleCoordinator::Teardown &teardown) {
-		std::vector<string> errors;
+		::vane::BoundedErrorDetails errors;
 		for (const auto &query_id : teardown.execution_query_ids) {
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &ex) {
-				errors.push_back(query_id + ": " + ex.what());
+				errors.Add(query_id, ex.what());
 			} catch (...) {
-				errors.push_back(query_id + ": unknown cleanup error");
+				errors.Add(query_id, "unknown cleanup error");
 			}
 		}
-		if (!errors.empty()) {
-			string message =
-			    "failed to clear Python backend result handles for owner " + teardown.lifecycle.owner_query_id;
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			throw std::runtime_error(message);
+		if (errors) {
+			throw std::runtime_error(errors.AppendTo("failed to clear Python backend result handles for owner " +
+			                                         teardown.lifecycle.owner_query_id));
+		}
+		lock_guard<mutex> guard(mutex_);
+		for (const auto &query_id : teardown.execution_query_ids) {
+			result_handle_counts_by_query_.erase(query_id);
 		}
 	}
 
@@ -2113,24 +2334,25 @@ private:
 			for (const auto &entry : cleanup_retry_result_handles_by_query_) {
 				query_ids.insert(entry.first);
 			}
+			for (const auto &entry : result_handle_counts_by_query_) {
+				query_ids.insert(entry.first);
+			}
 		}
-		std::vector<string> errors;
+		::vane::BoundedErrorDetails errors;
 		for (const auto &query_id : query_ids) {
 			try {
 				ClearResultHandles(query_id);
 			} catch (const std::exception &ex) {
-				errors.push_back(query_id + ": " + ex.what());
+				errors.Add(query_id, ex.what());
 			} catch (...) {
-				errors.push_back(query_id + ": unknown cleanup error");
+				errors.Add(query_id, "unknown cleanup error");
 			}
 		}
-		if (!errors.empty()) {
-			string message = "failed to clear Python backend result handles";
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			throw std::runtime_error(message);
+		if (errors) {
+			throw std::runtime_error(errors.AppendTo("failed to clear Python backend result handles"));
 		}
+		lock_guard<mutex> guard(mutex_);
+		result_handle_counts_by_query_.clear();
 	}
 
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
@@ -2138,7 +2360,8 @@ private:
 	                   const std::unordered_set<string> &selected_attempt_task_ids,
 	                   const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	                       *task_context_filter,
-	                   bool release_payloads) {
+	                   bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output = {},
+	                   bool selected_only = false) {
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> handles;
 		{
 			lock_guard<mutex> guard(mutex_);
@@ -2172,22 +2395,37 @@ private:
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retained_handles;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> pending =
 		    std::move(handles);
-		if (!selected_attempt_task_ids.empty()) {
+		if (selected_only) {
+			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> selected_pending;
+			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> unselected_pending;
+			selected_pending.reserve(pending.size());
+			unselected_pending.reserve(pending.size());
+			for (auto &handle : pending) {
+				if (selected_attempt_task_ids.find(handle->GetFteTaskId()) != selected_attempt_task_ids.end()) {
+					selected_pending.push_back(std::move(handle));
+				} else {
+					unselected_pending.push_back(std::move(handle));
+				}
+			}
+			pending = std::move(selected_pending);
+			StorePythonTaskResultHandles(query_id, std::move(unselected_pending));
+		} else if (!selected_attempt_task_ids.empty()) {
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> selected_pending;
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
-			std::vector<string> release_errors;
+			::vane::BoundedErrorDetails release_errors;
 			selected_pending.reserve(pending.size());
 			for (size_t index = 0; index < pending.size(); index++) {
 				auto &handle = pending[index];
 				if (selected_attempt_task_ids.find(handle->GetFteTaskId()) == selected_attempt_task_ids.end()) {
 					try {
-						handle->AckPollResult();
+						// ACK transfers output-lease ownership to the consumer. A losing
+						// attempt has no consumer, so release its lease-owning handle directly.
 						handle->ReleasePollResult();
 					} catch (const std::exception &ex) {
-						release_errors.push_back("unselected[" + std::to_string(index) + "]: " + ex.what());
+						release_errors.Add("unselected[" + std::to_string(index) + "]", ex.what());
 						retry_handles.push_back(std::move(handle));
 					} catch (...) {
-						release_errors.push_back("unselected[" + std::to_string(index) + "]: unknown release error");
+						release_errors.Add("unselected[" + std::to_string(index) + "]", "unknown release error");
 						retry_handles.push_back(std::move(handle));
 					}
 					continue;
@@ -2196,71 +2434,132 @@ private:
 			}
 			pending = std::move(selected_pending);
 			StorePythonTaskResultHandles(query_id, std::move(retry_handles));
-			if (!release_errors.empty()) {
+			if (release_errors) {
 				StorePythonTaskResultHandles(query_id, std::move(pending));
-				string message = "failed to release unselected Python backend result handle(s)";
-				for (const auto &error : release_errors) {
-					message += "; " + error;
-				}
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(DuckDBError(message));
+				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(DuckDBError(
+				    release_errors.AppendTo("failed to release unselected Python backend result handle(s)")));
 			}
 		}
-		const bool has_deadline = timeout_s > 0.0;
-		const auto deadline = has_deadline ? std::chrono::steady_clock::now() +
-		                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-		                                             std::chrono::duration<double>(timeout_s))
-		                                   : std::chrono::steady_clock::time_point::max();
+		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
+		if (on_output) {
+			std::stable_sort(pending.begin(), pending.end(), [](const auto &lhs, const auto &rhs) {
+				const auto lhs_context = lhs->GetTaskContext();
+				const auto rhs_context = rhs->GetTaskContext();
+				if (lhs_context.query_idx() != rhs_context.query_idx()) {
+					return lhs_context.query_idx() < rhs_context.query_idx();
+				}
+				if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
+					return lhs_context.last_node_id() < rhs_context.last_node_id();
+				}
+				if (lhs_context.task_id() != rhs_context.task_id()) {
+					return lhs_context.task_id() < rhs_context.task_id();
+				}
+				return lhs->GetFteTaskId() < rhs->GetFteTaskId();
+			});
+		}
+		// Internal helper convention: negative timeout means no deadline; zero means poll once then time out.
+		const auto deadline = timeout_s >= 0.0 ? std::chrono::steady_clock::now() +
+		                                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+		                                                 std::chrono::duration<double>(timeout_s))
+		                                       : std::chrono::steady_clock::time_point::max();
 		while (!pending.empty()) {
 			std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> still_pending;
-			std::vector<string> drain_errors;
 			for (size_t index = 0; index < pending.size(); index++) {
 				auto &handle = pending[index];
+				auto retain_drain_failure = [&](DuckDBError error, bool publication_attempted = false) {
+					if (publication_attempted) {
+						// A validation callback or downstream channel send may already
+						// have had effects. Keep this handle cleanup-only so a repeated
+						// wait cannot publish the same output again.
+						retained_handles.push_back(std::move(handle));
+					} else {
+						still_pending.push_back(std::move(handle));
+					}
+					for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
+						still_pending.push_back(std::move(pending[pending_index]));
+					}
+					StorePythonTaskResultHandles(query_id, std::move(still_pending));
+					RetainPythonTaskResultHandles(query_id, std::move(retained_handles));
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(std::move(error));
+				};
 				auto polled = handle->poll();
 				if (!polled.first) {
 					still_pending.push_back(std::move(handle));
+					if (on_output) {
+						for (size_t pending_index = index + 1; pending_index < pending.size(); pending_index++) {
+							still_pending.push_back(std::move(pending[pending_index]));
+						}
+						break;
+					}
 					continue;
 				}
 				if (polled.second.is_err()) {
-					drain_errors.push_back(polled.second.error().what());
-					still_pending.push_back(std::move(handle));
-					continue;
+					return retain_drain_failure(DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+					    "failed to poll Python backend result handle[" + std::to_string(index) + "]",
+					    polled.second.error().what())));
 				}
 				auto payload = std::move(polled.second).value();
 				const bool produced_output = payload.first;
 				bool retain_payload_until_query_cleanup = false;
-				if (produced_output) {
+				bool publication_attempted = false;
+				if (produced_output && !discard_unselected_outputs) {
 					retain_payload_until_query_cleanup =
-					    !release_payloads && !payload.second.has_exchange_sink_instance();
-					outputs.push_back(std::move(payload.second));
+					    !on_output && !release_payloads && !payload.second.has_exchange_sink_instance();
+					if (on_output) {
+						publication_attempted = true;
+						try {
+							auto callback_res = on_output(payload.second);
+							if (callback_res.is_err()) {
+								return retain_drain_failure(callback_res.error(), true);
+							}
+						} catch (const std::exception &ex) {
+							return retain_drain_failure(
+							    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+							        "streaming Python backend output callback threw", ex.what())),
+							    true);
+						} catch (...) {
+							return retain_drain_failure(
+							    DuckDBError::external_error(
+							        "streaming Python backend output callback threw an unknown exception"),
+							    true);
+						}
+					}
+					if (!on_output) {
+						outputs.push_back(std::move(payload.second));
+					}
 				}
 				try {
-					handle->AckPollResult();
+					// An empty final selection means this handle was deliberately discarded.
+					if (!discard_unselected_outputs) {
+						handle->AckPollResult();
+					}
 					if (retain_payload_until_query_cleanup) {
 						retained_handles.push_back(std::move(handle));
 					} else {
 						handle->ReleasePollResult();
 					}
 				} catch (const std::exception &ex) {
-					still_pending.push_back(std::move(handle));
-					drain_errors.push_back(string("failed to finalize Python backend result handle: ") + ex.what());
+					// A streaming drain has consumed this handle's terminal state even
+					// when it produced no output. Once finalization starts, retry only
+					// cleanup; re-polling could re-run a one-shot Python result getter.
+					const bool consumed_by_stream = static_cast<bool>(on_output);
+					return retain_drain_failure(
+					    DuckDBError::external_error(::vane::BoundedErrorDetails::FormatDetail(
+					        "failed to finalize Python backend result handle[" + std::to_string(index) + "]",
+					        ex.what())),
+					    publication_attempted || consumed_by_stream);
 				} catch (...) {
-					still_pending.push_back(std::move(handle));
-					drain_errors.push_back("failed to finalize Python backend result handle: unknown error");
+					const bool consumed_by_stream = static_cast<bool>(on_output);
+					return retain_drain_failure(
+					    DuckDBError::external_error("failed to finalize Python backend result handle[" +
+					                                std::to_string(index) + "]: unknown error"),
+					    publication_attempted || consumed_by_stream);
 				}
-			}
-			if (!drain_errors.empty()) {
-				StorePythonTaskResultHandles(query_id, std::move(still_pending));
-				RetainPythonTaskResultHandles(query_id, std::move(retained_handles));
-				string message = "failed to drain Python backend result handle(s)";
-				for (const auto &error : drain_errors) {
-					message += "; " + error;
-				}
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(DuckDBError(message));
 			}
 			if (still_pending.empty()) {
 				break;
 			}
-			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
+			if (std::chrono::steady_clock::now() >= deadline) {
 				StorePythonTaskResultHandles(query_id, std::move(still_pending));
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 				    DuckDBError("timed out draining Python backend FTE result handles"));
@@ -2820,6 +3119,158 @@ struct PyPhysicalPlanWrapperRunner {
 				throw std::runtime_error("distributed COPY execution and teardown both failed: execution=" +
 				                         exception_message(execution_error) +
 				                         "; teardown=" + exception_message(cleanup_error));
+			}
+			std::rethrow_exception(execution_error);
+		}
+	}
+
+	py::dict run_datasink_plan(const PyPhysicalPlanWrapper &plan,
+	                           duckdb::shared_ptr<duckdb::ClientContext> client_context = nullptr,
+	                           duckdb::distributed::python::ray::SafePyObject py_conn_keepalive =
+	                               duckdb::distributed::python::ray::SafePyObject(),
+	                           duckdb::distributed::python::ray::SafePyObject on_execution_started =
+	                               duckdb::distributed::python::ray::SafePyObject()) {
+		using namespace duckdb::distributed;
+		(void)py_conn_keepalive;
+		bool query_owner_registered = false;
+		bool cleanup_done = false;
+		bool execution_started = false;
+		string operation_id;
+		std::exception_ptr cleanup_error;
+		auto exception_message = [](const std::exception_ptr &error) {
+			try {
+				std::rethrow_exception(error);
+			} catch (const std::exception &ex) {
+				return BoundDataSinkOutcomeError(ex.what());
+			} catch (...) {
+				return string("unknown exception");
+			}
+		};
+		auto cleanup_warning = [&](const string &stage, const std::exception_ptr &error) {
+			return BoundDataSinkOutcomeError(stage + " failed: " + exception_message(error));
+		};
+		auto cleanup = [&]() {
+			if (cleanup_done) {
+				return;
+			}
+			cleanup_done = true;
+			if (!query_owner_registered) {
+				return;
+			}
+			try {
+				drop_query_fragments(plan.idx());
+			} catch (...) {
+				cleanup_error = std::current_exception();
+			}
+		};
+		auto unknown_result = [&](string error) {
+			py::dict out;
+			out["operation_id"] = py::str(operation_id);
+			out["write_results"] = py::list();
+			out["outcome_aborted"] = py::bool_(false);
+			out["outcome_unknown"] = py::bool_(true);
+			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(error));
+			py::list cleanup_warnings;
+			if (cleanup_error) {
+				cleanup_warnings.append(cleanup_warning("native DataSink fragment cleanup", cleanup_error));
+			}
+			out["data_sink_cleanup_warnings"] = std::move(cleanup_warnings);
+			return out;
+		};
+
+		try {
+			const bool replay_state_created = RegisterQueryPythonReplayState(
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			try {
+				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
+			} catch (...) {
+				if (!query_owner_registered && replay_state_created) {
+					CleanupQueryPythonReplayState(plan.resource_query_id_);
+				}
+				throw;
+			}
+			query_owner_registered = true;
+			if (!plan.plan_ || !plan.plan_->physical_plan() || !plan.plan_->physical_plan()->HasRoot()) {
+				throw py::value_error("DistributedPhysicalPlan for DataSink has no physical root");
+			}
+			auto &physical_root = plan.plan_->physical_plan()->Root();
+			if (physical_root.type != PhysicalOperatorType::DATA_SINK) {
+				throw py::value_error("DistributedPhysicalPlan for DataSink must have a DATA_SINK root");
+			}
+			operation_id = physical_root.Cast<PhysicalDataSink>().operation_id;
+
+			auto runner = std::make_shared<PlanRunner>(worker_manager_, client_context);
+			DuckDBResult<PlanRunner::PlanResult> plan_result;
+			{
+				py::gil_scoped_release release;
+				auto publish_execution_started = [&]() {
+					execution_started = true;
+					if (!on_execution_started.has_value()) {
+						return;
+					}
+					py::gil_scoped_acquire acquire;
+					on_execution_started.get()();
+				};
+				plan_result = runner->run_plan(plan.plan_, {}, publish_execution_started);
+			}
+			if (plan_result.is_err()) {
+				rethrow_submission_error(plan.idx(), plan_result.error().what());
+				throw py::value_error(plan_result.error().what());
+			}
+			auto finalized = std::move(plan_result).value();
+			if (finalized.tag != PlanRunner::PlanResult::DATA_SINK) {
+				throw py::value_error("run_plan did not return a DataSink result for a DataSink plan");
+			}
+
+			vector<string> post_execution_warnings;
+			try {
+				rethrow_submission_error(plan.idx());
+			} catch (...) {
+				post_execution_warnings.push_back(
+				    cleanup_warning("native DataSink post-execution submission state", std::current_exception()));
+			}
+			py::dict out;
+			out["operation_id"] = py::str(finalized.data_sink_result.operation_id);
+			out["outcome_aborted"] = py::bool_(finalized.data_sink_result.outcome_aborted);
+			out["outcome_unknown"] = py::bool_(finalized.data_sink_result.outcome_unknown);
+			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(finalized.data_sink_result.outcome_error));
+			py::list write_results;
+			auto json_loads = py::module_::import("json").attr("loads");
+			for (const auto &result : finalized.data_sink_result.write_results) {
+				py::dict item;
+				item["operation_id"] = py::str(result.operation_id);
+				item["state"] = py::str(result.state);
+				item["rows_received"] = py::int_(result.rows_received);
+				item["rows_affected"] = result.rows_affected.IsNull()
+				                            ? py::object(py::none())
+				                            : py::object(py::int_(result.rows_affected.GetValue<uint64_t>()));
+				item["bytes_received"] = py::int_(result.bytes_received);
+				item["metadata"] = json_loads(result.metadata_json);
+				item["warnings"] = json_loads(result.warnings_json);
+				write_results.append(std::move(item));
+			}
+			out["write_results"] = std::move(write_results);
+			cleanup();
+			py::list cleanup_warnings;
+			for (const auto &warning : post_execution_warnings) {
+				cleanup_warnings.append(warning);
+			}
+			if (cleanup_error) {
+				cleanup_warnings.append(cleanup_warning("native DataSink fragment cleanup", cleanup_error));
+			}
+			out["data_sink_cleanup_warnings"] = std::move(cleanup_warnings);
+			return out;
+		} catch (...) {
+			auto execution_error = std::current_exception();
+			cleanup();
+			if (execution_started) {
+				return unknown_result("distributed DataSink result handling failed after execution started: " +
+				                      exception_message(execution_error));
+			}
+			if (cleanup_error) {
+				throw std::runtime_error(BoundDataSinkOutcomeError(
+				    "distributed DataSink setup and teardown both failed: setup=" + exception_message(execution_error) +
+				    "; teardown=" + exception_message(cleanup_error)));
 			}
 			std::rethrow_exception(execution_error);
 		}

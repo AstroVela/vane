@@ -28,6 +28,7 @@
 
 #include "duckdb/common/limits.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/distributed/data_sink.hpp"
 
 #include "duckdb/execution/distributed/utils/channel.hpp"
 #include "duckdb/execution/distributed/scheduling/worker.hpp"
@@ -36,6 +37,7 @@
 #include "duckdb/execution/distributed/pipeline_node/translator_api.hpp"
 #include "duckdb/execution/distributed/pipeline_node/sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
+#include "duckdb/execution/distributed/pipeline_node/data_sink_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
@@ -270,6 +272,12 @@ public:
 	}
 
 	DuckDBResult<std::vector<MaterializedOutput>>
+	wait_query_finished_streaming(const std::string &query_id, double timeout_s,
+	                              MaterializedOutputCallback on_output) override {
+		return worker_manager_->wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>>
 	wait_query_finished(const std::string &query_id, double timeout_s,
 	                    const std::unordered_set<TaskContext, TaskContextHash> &task_contexts,
 	                    MaterializedOutputCallback on_output) override {
@@ -294,7 +302,18 @@ public:
 	// coordinator. This runs in a background thread spawned by run_plan.
 	DuckDBResult<void> execute_plan(std::shared_ptr<DistributedPipelineNode> pipeline_node,
 	                                std::shared_ptr<PlanTaskExecutor> task_executor,
-	                                UnboundedSender<MaterializedOutput> output_sender, TaskInputs initial_inputs = {}) {
+	                                UnboundedSender<MaterializedOutput> output_sender, TaskInputs initial_inputs = {},
+	                                MaterializedOutputCallback validate_incremental_output = {}) {
+		const bool bound_execution_errors = static_cast<bool>(validate_incremental_output);
+		auto execution_error = [&](const DuckDBError &error) -> DuckDBResult<void> {
+			if (!bound_execution_errors) {
+				return DuckDBResult<void>::err(error);
+			}
+			return DuckDBResult<void>::err(DuckDBError::external_error(BoundDataSinkOutcomeError(error.what())));
+		};
+		auto execution_error_detail = [&](const DuckDBError &error) {
+			return bound_execution_errors ? BoundDataSinkOutcomeError(error.what()) : string(error.what());
+		};
 		if (pipeline_node->is_statically_empty_result()) {
 			return DuckDBResult<void>::ok();
 		}
@@ -345,10 +364,10 @@ public:
 			                << " submit_elapsed_ms=" << FteRunnerElapsedMs(submit_started_at)
 			                << " result=" << (submit_res.is_err() ? "err" : "ok");
 			if (submit_res.is_err()) {
-				submit_done_msg << " error=" << FteRunnerFormatField(submit_res.error().what());
+				submit_done_msg << " error=" << FteRunnerFormatField(execution_error_detail(submit_res.error()));
 			}
 			FteRunnerDebugLog(submit_done_msg.str());
-			return submit_res;
+			return submit_res.is_err() ? execution_error(submit_res.error()) : DuckDBResult<void>::ok();
 		};
 
 		try {
@@ -425,7 +444,7 @@ public:
 
 				auto submit_res = submit_fte_events(std::move(fte_events));
 				if (submit_res.is_err()) {
-					return DuckDBResult<void>::err(submit_res.error());
+					return submit_res;
 				}
 			}
 
@@ -436,30 +455,49 @@ public:
 			if (!fte_source_node_ids.empty()) {
 				auto exhausted_res = fte_task_submitter->task_input_stream_exhausted(query_id, fte_source_node_ids);
 				if (exhausted_res.is_err()) {
-					return DuckDBResult<void>::err(exhausted_res.error());
+					return execution_error(exhausted_res.error());
 				}
 			}
 			if (!query_id.empty()) {
 				FteRunnerDebugLog(
 				    "event=wait_query_start elapsed_ms=" + std::to_string(FteRunnerElapsedMs(execute_started_at)) +
 				    " query_id=" + FteRunnerFormatField(query_id) + " total_events=" + std::to_string(fte_event_count));
-				auto wait_res = fte_task_submitter->wait_query_finished(query_id, FteQueryWaitTimeoutSeconds());
+				auto publish_output = [&output_sender, &validate_incremental_output](
+				                          const MaterializedOutput &output) -> DuckDBResult<void> {
+					if (validate_incremental_output) {
+						auto validation_res = validate_incremental_output(output);
+						if (validation_res.is_err()) {
+							return validation_res;
+						}
+					}
+					return output_sender.send(output);
+				};
+				auto wait_res = validate_incremental_output
+				                    ? fte_task_submitter->wait_query_finished_streaming(
+				                          query_id, FteQueryWaitTimeoutSeconds(), publish_output)
+				                    : fte_task_submitter->wait_query_finished(query_id, FteQueryWaitTimeoutSeconds());
 				if (wait_res.is_err()) {
 					FteRunnerDebugLog(
 					    "event=wait_query_done elapsed_ms=" + std::to_string(FteRunnerElapsedMs(execute_started_at)) +
 					    " query_id=" + FteRunnerFormatField(query_id) +
-					    " result=err error=" + FteRunnerFormatField(wait_res.error().what()));
-					return DuckDBResult<void>::err(wait_res.error());
+					    " result=err error=" + FteRunnerFormatField(execution_error_detail(wait_res.error())));
+					return execution_error(wait_res.error());
 				}
 				auto outputs = std::move(wait_res).value();
 				FteRunnerDebugLog(
 				    "event=wait_query_done elapsed_ms=" + std::to_string(FteRunnerElapsedMs(execute_started_at)) +
 				    " query_id=" + FteRunnerFormatField(query_id) +
 				    " result=ok output_count=" + std::to_string(outputs.size()));
-				for (auto &output : outputs) {
-					auto send_res = output_sender.send(std::move(output));
-					if (send_res.is_err()) {
-						return DuckDBResult<void>::err(send_res.error());
+				if (validate_incremental_output && !outputs.empty()) {
+					return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+					    "streaming FTE result drain returned outputs outside its publication callback"));
+				}
+				if (!validate_incremental_output) {
+					for (auto &output : outputs) {
+						auto send_res = output_sender.send(std::move(output));
+						if (send_res.is_err()) {
+							return execution_error(send_res.error());
+						}
 					}
 				}
 			} else if (fte_event_count > 0) {
@@ -467,6 +505,9 @@ public:
 				    DuckDBError::invalid_state_error("FTE runner cannot wait for query completion without query_id"));
 			}
 		} catch (const std::exception &ex) {
+			if (validate_incremental_output) {
+				return DuckDBResult<void>::err(DuckDBError::external_error(BoundDataSinkOutcomeError(ex.what())));
+			}
 			return DuckDBResult<void>::err(DuckDBError::external_error(ex.what()));
 		} catch (...) {
 			return DuckDBResult<void>::err(DuckDBError::external_error("execute_plan unknown exception"));
@@ -475,15 +516,15 @@ public:
 		return DuckDBResult<void>::ok();
 	}
 
-	/// Unified result type: streaming (SELECT), finalized COPY, or an extension
-	/// write whose coordinator hook ran in the Vane-owned transaction.
+	/// Unified terminal result type. Each tag owns an independent protocol.
 	struct PlanResult {
-		enum Tag { STREAMING, COPY, EXTENSION_WRITE };
+		enum Tag { STREAMING, COPY, EXTENSION_WRITE, DATA_SINK };
 		Tag tag;
 		// Only one of these is valid depending on tag
 		PlanResultStream stream;
 		DistributedCopyResult copy_result;
 		DistributedExtensionWriteResult extension_write_result;
+		DistributedDataSinkResult data_sink_result;
 
 		// Streaming constructor
 		static PlanResult make_streaming(std::shared_ptr<PlanTaskExecutor> te,
@@ -507,11 +548,17 @@ public:
 			r.extension_write_result = std::move(result);
 			return r;
 		}
+		static PlanResult make_data_sink(DistributedDataSinkResult result) {
+			PlanResult r;
+			r.tag = DATA_SINK;
+			r.data_sink_result = std::move(result);
+			return r;
+		}
 	};
 
-	/// Unified run_plan: auto-detects sink nodes and handles both streaming and finalize paths.
-	/// - Non-sink plans → returns PlanResultStream (streaming pull)
-	/// - Sink plans (CopyFinish) → collects all outputs, calls finalize(), returns DistributedCopyResult
+	/// Unified run_plan: auto-detects terminal protocols and handles streaming and finalized results.
+	/// - Non-terminal plans → returns PlanResultStream (streaming pull)
+	/// - Terminal plans → collect selected outputs and finalize their protocol-specific result
 	DuckDBResult<PlanResult> run_plan(std::shared_ptr<DistributedPhysicalPlan> plan, TaskInputs initial_inputs = {},
 	                                  std::function<void()> on_execution_started = {}) {
 		if (!client_context_) {
@@ -527,6 +574,12 @@ public:
 			return DuckDBResult<PlanResult>::err(DuckDBError("run_plan requires a physical plan root"));
 		}
 		auto extension_write_provider = physical_plan->Root().GetExtensionWriteTaskProvider();
+		const bool has_data_sink_root = physical_plan->Root().type == PhysicalOperatorType::DATA_SINK;
+		if (has_data_sink_root && !client_context_->transaction.IsAutoCommit()) {
+			return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+			    "distributed DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit "
+			    "transaction"));
+		}
 		unique_ptr<DistributedExtensionWriteInfo> extension_write_info;
 		string extension_write_query_id;
 		vector<DistributedWriteTaskResult> selected_task_results;
@@ -648,8 +701,10 @@ public:
 		// ── Step 2: Resolve the exact sink protocol ──
 		std::shared_ptr<CopyFinishNode> copy_sink_node;
 		std::shared_ptr<ExtensionWriteSinkNode> callback_sink_node;
+		std::shared_ptr<DataSinkFinishNode> data_sink_node;
 		idx_t copy_sink_count = 0;
 		idx_t callback_sink_count = 0;
+		idx_t data_sink_count = 0;
 		std::function<void(const DistributedPipelineNodeRef &)> find_sinks = [&](const DistributedPipelineNodeRef &n) {
 			if (!n) {
 				return;
@@ -668,6 +723,12 @@ public:
 						callback_sink_node = std::move(callback_sink);
 					}
 				}
+				if (auto data_sink = std::dynamic_pointer_cast<DataSinkFinishNode>(impl)) {
+					data_sink_count++;
+					if (!data_sink_node) {
+						data_sink_node = std::move(data_sink);
+					}
+				}
 			}
 			for (auto &child : n->arc_children()) {
 				find_sinks(child);
@@ -676,13 +737,13 @@ public:
 		find_sinks(pipeline_node);
 		if (extension_write_provider) {
 			if (extension_write_info->mode == DistributedWriteMode::FILE_ARTIFACT &&
-			    (copy_sink_count != 1 || callback_sink_count != 0)) {
+			    (copy_sink_count != 1 || callback_sink_count != 0 || data_sink_count != 0)) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed file-artifact write %s did not translate to exactly one COPY sink",
 				                       extension_write_info->Name())));
 			}
 			if (extension_write_info->mode == DistributedWriteMode::CALLBACK &&
-			    (callback_sink_count != 1 || copy_sink_count != 0)) {
+			    (callback_sink_count != 1 || copy_sink_count != 0 || data_sink_count != 0)) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed callback write %s did not translate to exactly one callback sink",
 				                       extension_write_info->Name())));
@@ -692,6 +753,12 @@ public:
 				    StringUtil::Format("distributed file-artifact write %s requires worker direct-write output",
 				                       extension_write_info->Name())));
 			}
+		}
+		if ((has_data_sink_root &&
+		     (data_sink_count != 1 || copy_sink_count != 0 || callback_sink_count != 0 || extension_write_provider)) ||
+		    (!has_data_sink_root && data_sink_count != 0)) {
+			return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
+			    "distributed DataSink must be the only terminal sink and the physical plan root"));
 		}
 
 		std::string sink_base_path;
@@ -779,6 +846,10 @@ public:
 			try {
 				return worker_manager_->abort_and_quiesce_query(plan->query_id());
 			} catch (const std::exception &ex) {
+				if (data_sink_node) {
+					return DuckDBResult<void>::err(DuckDBError::external_error(BoundDataSinkOutcomeError(
+					    "worker manager threw while aborting FTE query: " + BoundDataSinkOutcomeError(ex.what()))));
+				}
 				return DuckDBResult<void>::err(DuckDBError::external_error(
 				    "worker manager threw while aborting FTE query: " + std::string(ex.what())));
 			} catch (...) {
@@ -795,8 +866,38 @@ public:
 			}
 			return fail_after_write_cleanup(primary_error);
 		};
+		vector<ResultPartitionRef> collected_partitions;
+		auto data_sink_results =
+		    std::make_shared<DataSinkResultCollector>(data_sink_node ? data_sink_node->operation_id() : string());
+		std::shared_ptr<UnboundedChannelState<MaterializedOutput>> data_sink_output_state;
+		auto disconnect_data_sink_output = [&]() {
+			if (data_sink_output_state) {
+				data_sink_output_state->disconnect_receiver();
+			}
+		};
+		auto data_sink_unknown_after_worker_abort = [&](const DuckDBError &primary_error) -> DuckDBResult<PlanResult> {
+			D_ASSERT(data_sink_node);
+			vector<string> errors {BoundDataSinkOutcomeError(primary_error.what())};
+			auto abort_res = abort_write_workers();
+			if (abort_res.is_err()) {
+				errors.push_back(BoundDataSinkOutcomeError("worker abort barrier failed: " +
+				                                           BoundDataSinkOutcomeError(abort_res.error().what())));
+			}
+			DistributedDataSinkResult result;
+			result.operation_id = data_sink_node->operation_id();
+			auto parsed = data_sink_results->Finalize();
+			if (parsed.is_ok()) {
+				result = std::move(parsed).value();
+			} else {
+				errors.push_back(BoundDataSinkOutcomeError("selected worker results could not be parsed: " +
+				                                           BoundDataSinkOutcomeError(parsed.error().what())));
+			}
+			result.outcome_aborted = false;
+			result.outcome_unknown = true;
+			result.outcome_error = BoundDataSinkOutcomeError(StringUtil::Join(errors, "; "));
+			return DuckDBResult<PlanResult>::ok(PlanResult::make_data_sink(std::move(result)));
+		};
 
-		bool streaming_channel_state_installed = false;
 		bool direct_write_lifecycle_may_exist = false;
 		bool execution_may_have_started = false;
 		try {
@@ -813,14 +914,16 @@ public:
 			}
 
 			// ── Step 3: Common setup — result channel + FTE execution ──
-			auto channel_pair = create_unbounded_channel<MaterializedOutput>();
+			// DataSink result parsing runs synchronously in the publication callback,
+			// before the selected handle is acknowledged. Keep at most one validated
+			// output queued so the coordinator also bounds RefBundle ownership.
+			auto channel_pair = create_unbounded_channel<MaterializedOutput>(data_sink_node ? 1 : 0);
 			auto sender = std::move(channel_pair.first);
 			auto receiver = std::move(channel_pair.second);
 			auto execute_status = std::make_shared<PlanExecutionStatus>();
 			auto output_state = sender.state();
-			if (worker_manager_) {
-				worker_manager_->set_streaming_results_channel_state(sender.state());
-				streaming_channel_state_installed = true;
+			if (data_sink_node) {
+				data_sink_output_state = output_state;
 			}
 			auto task_executor = std::make_shared<PlanTaskExecutor>(client_context_, execute_status);
 
@@ -831,55 +934,66 @@ public:
 			auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
 			auto initial_inputs_ptr = std::make_shared<TaskInputs>(std::move(initial_inputs));
 			execution_may_have_started = true;
-			task_executor->ScheduleTask([self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
-			                             initial_inputs_ptr]() mutable {
-				std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
-				auto publish_error = [&](const DuckDBError &error) {
-					execute_status->RecordError(error);
-					if (output_state) {
-						output_state->close();
+			MaterializedOutputCallback validate_incremental_output;
+			if (data_sink_node) {
+				const auto data_sink_node_id = data_sink_node->result_node_id();
+				validate_incremental_output =
+				    [data_sink_results, data_sink_node_id](const MaterializedOutput &output) -> DuckDBResult<void> {
+					if (!output.has_node_id(data_sink_node_id)) {
+						return DuckDBResult<void>::ok();
 					}
+					return data_sink_results->Append(output.fragments());
 				};
-				auto clear_worker_channel = [&]() {
-					if (self->worker_manager_) {
-						self->worker_manager_->clear_streaming_results_channel_state();
-					}
-				};
-				try {
-					output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
-					auto result = self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
-					                                 std::move(*initial_inputs_ptr));
-					clear_worker_channel();
-					if (result.is_err()) {
-						publish_error(result.error());
-					}
-					output_lifetime_guard.reset();
-				} catch (const std::exception &ex) {
-					clear_worker_channel();
-					DuckDBError error = DuckDBError::external_error(string("execute_plan task threw: ") + ex.what());
-					publish_error(error);
-					output_lifetime_guard.reset();
-				} catch (...) {
-					clear_worker_channel();
-					DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
-					publish_error(error);
-					output_lifetime_guard.reset();
-				}
-			});
+			}
+			const bool bound_execution_errors = static_cast<bool>(validate_incremental_output);
+			task_executor->ScheduleTask(
+			    [self, pipeline_node, sender_ptr, output_state, execute_status, task_executor, initial_inputs_ptr,
+			     bound_execution_errors,
+			     validate_incremental_output = std::move(validate_incremental_output)]() mutable {
+				    std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
+				    auto publish_error = [&](const DuckDBError &error) {
+					    execute_status->RecordError(error);
+					    if (output_state) {
+						    output_state->close();
+					    }
+				    };
+				    try {
+					    output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
+					    auto result =
+					        self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
+					                           std::move(*initial_inputs_ptr), std::move(validate_incremental_output));
+					    if (result.is_err()) {
+						    publish_error(result.error());
+					    }
+					    output_lifetime_guard.reset();
+				    } catch (const std::exception &ex) {
+					    DuckDBError error =
+					        bound_execution_errors
+					            ? DuckDBError::external_error(BoundDataSinkOutcomeError(
+					                  "execute_plan task threw: " + BoundDataSinkOutcomeError(ex.what())))
+					            : DuckDBError::external_error(string("execute_plan task threw: ") + ex.what());
+					    publish_error(error);
+					    output_lifetime_guard.reset();
+				    } catch (...) {
+					    DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
+					    publish_error(error);
+					    output_lifetime_guard.reset();
+				    }
+			    });
 			if (on_execution_started) {
 				on_execution_started();
 			}
 
 			// ── Step 4: Dispatch based on the exact sink protocol ──
-			if (!copy_sink_node && !callback_sink_node) {
+			if (!copy_sink_node && !callback_sink_node && !data_sink_node) {
 				// Streaming path: return pull-based stream
 				return DuckDBResult<PlanResult>::ok(PlanResult::make_streaming(
 				    std::move(task_executor), std::move(receiver), std::move(execute_status)));
 			}
 
-			const auto sink_node_id =
-			    callback_sink_node ? callback_sink_node->node_id() : copy_sink_node->copy_sink()->node_id();
-			vector<ResultPartitionRef> partitions;
+			const auto sink_node_id = data_sink_node       ? data_sink_node->result_node_id()
+			                          : callback_sink_node ? callback_sink_node->node_id()
+			                                               : copy_sink_node->copy_sink()->node_id();
 			std::shared_ptr<DuckDBError> deferred_collection_error;
 			auto capture_execution_error = [&]() {
 				auto execution_error = execute_status->GetError();
@@ -898,7 +1012,7 @@ public:
 					// Drain the plan-control channel to its terminal state before
 					// entering the worker abort barrier. Queued results are irrelevant
 					// after the first execution or result-contract failure.
-					if (deferred_collection_error) {
+					if (deferred_collection_error && !data_sink_node) {
 						continue;
 					}
 					if (!item.second.has_node_id(sink_node_id)) {
@@ -911,16 +1025,25 @@ public:
 						                       extension_write_info->Name())));
 						continue;
 					}
-					for (auto &part : item.second.fragments()) {
-						partitions.push_back(part);
+					if (!data_sink_node) {
+						for (auto &part : item.second.fragments()) {
+							collected_partitions.push_back(part);
+						}
 					}
 				}
 			} catch (const std::exception &ex) {
+				if (data_sink_node) {
+					receiver.close();
+				}
 				capture_execution_error();
 				if (!deferred_collection_error) {
-					deferred_collection_error = std::make_shared<DuckDBError>(DuckDBError::external_error(ex.what()));
+					deferred_collection_error = std::make_shared<DuckDBError>(DuckDBError::external_error(
+					    data_sink_node ? BoundDataSinkOutcomeError(ex.what()) : string(ex.what())));
 				}
 			} catch (...) {
+				if (data_sink_node) {
+					receiver.close();
+				}
 				capture_execution_error();
 				if (!deferred_collection_error) {
 					deferred_collection_error = std::make_shared<DuckDBError>(
@@ -930,12 +1053,23 @@ public:
 
 			capture_execution_error();
 			if (deferred_collection_error) {
+				if (data_sink_node) {
+					return data_sink_unknown_after_worker_abort(*deferred_collection_error);
+				}
 				return fail_after_worker_abort(*deferred_collection_error);
+			}
+
+			if (data_sink_node) {
+				auto finalize_res = data_sink_results->Finalize();
+				if (finalize_res.is_err()) {
+					return data_sink_unknown_after_worker_abort(finalize_res.error());
+				}
+				return DuckDBResult<PlanResult>::ok(PlanResult::make_data_sink(std::move(finalize_res).value()));
 			}
 
 			if (copy_sink_node) {
 				auto worker_write_ms = DistributedCopyElapsedMillis(worker_write_started);
-				auto finalize_res = copy_sink_node->finalize(partitions, *client_context_);
+				auto finalize_res = copy_sink_node->finalize(collected_partitions, *client_context_);
 				if (finalize_res.is_err()) {
 					if (extension_write_provider) {
 						return fail_after_write_cleanup(finalize_res.error());
@@ -1012,7 +1146,8 @@ public:
 			DistributedExtensionWriteResult result;
 			result.info = *extension_write_info;
 			try {
-				vector<ResultPartitionRef> extension_partitions(partitions.begin(), partitions.end());
+				vector<ResultPartitionRef> extension_partitions(collected_partitions.begin(),
+				                                                collected_partitions.end());
 				selected_task_results = ParseDistributedWriteTaskResults(
 				    *extension_write_info, extension_write_query_id, extension_partitions);
 				for (const auto &task_result : selected_task_results) {
@@ -1058,11 +1193,11 @@ public:
 			}
 		} catch (const std::exception &ex) {
 			const auto execution_error =
-			    DuckDBError::external_error("distributed write setup or execution threw: " + string(ex.what()));
+			    data_sink_node
+			        ? DuckDBError::external_error(BoundDataSinkOutcomeError(
+			              "distributed DataSink setup or execution threw: " + BoundDataSinkOutcomeError(ex.what())))
+			        : DuckDBError::external_error("distributed write setup or execution threw: " + string(ex.what()));
 			if (extension_finalize_started) {
-				if (streaming_channel_state_installed && worker_manager_) {
-					worker_manager_->clear_streaming_results_channel_state();
-				}
 				DistributedExtensionWriteResult result;
 				result.info = *extension_write_info;
 				return extension_outcome_unknown(
@@ -1071,14 +1206,10 @@ public:
 				        string(ex.what()));
 			}
 			if (execution_may_have_started) {
-				auto result = fail_after_worker_abort(execution_error);
-				if (streaming_channel_state_installed && worker_manager_) {
-					worker_manager_->clear_streaming_results_channel_state();
-				}
+				disconnect_data_sink_output();
+				auto result = data_sink_node ? data_sink_unknown_after_worker_abort(execution_error)
+				                             : fail_after_worker_abort(execution_error);
 				return result;
-			}
-			if (streaming_channel_state_installed && worker_manager_) {
-				worker_manager_->clear_streaming_results_channel_state();
 			}
 			if (direct_write_lifecycle_may_exist) {
 				return fail_after_copy_cleanup(execution_error);
@@ -1088,9 +1219,6 @@ public:
 			const auto execution_error =
 			    DuckDBError::external_error("distributed write setup or execution threw an unknown exception");
 			if (extension_finalize_started) {
-				if (streaming_channel_state_installed && worker_manager_) {
-					worker_manager_->clear_streaming_results_channel_state();
-				}
 				DistributedExtensionWriteResult result;
 				result.info = *extension_write_info;
 				return extension_outcome_unknown(
@@ -1098,14 +1226,10 @@ public:
 				    "extension coordinator finalization outcome is unknown; artifacts were retained");
 			}
 			if (execution_may_have_started) {
-				auto result = fail_after_worker_abort(execution_error);
-				if (streaming_channel_state_installed && worker_manager_) {
-					worker_manager_->clear_streaming_results_channel_state();
-				}
+				disconnect_data_sink_output();
+				auto result = data_sink_node ? data_sink_unknown_after_worker_abort(execution_error)
+				                             : fail_after_worker_abort(execution_error);
 				return result;
-			}
-			if (streaming_channel_state_installed && worker_manager_) {
-				worker_manager_->clear_streaming_results_channel_state();
 			}
 			if (direct_write_lifecycle_may_exist) {
 				return fail_after_copy_cleanup(execution_error);

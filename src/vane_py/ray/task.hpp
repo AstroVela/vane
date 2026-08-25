@@ -202,6 +202,7 @@ private:
 	std::string fte_task_id_;
 	std::shared_ptr<RayTaskPollState> poll_state_;
 	std::shared_ptr<PollResultCache> poll_result_cache_;
+	bool acked_ = false;
 	bool released_ = false;
 };
 

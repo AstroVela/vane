@@ -20,6 +20,7 @@
 #include "duckdb/execution/operator/helper/physical_limit_percent.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_limit.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/order/physical_order.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
@@ -78,6 +79,7 @@
 // Include distributed pipeline translator headers (lightweight declarations)
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
+#include "duckdb/execution/distributed/pipeline_node/data_sink_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/extension_write_sink.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/distributed/plan/fte_split_queue.hpp"
@@ -1286,6 +1288,40 @@ TEST_CASE("PhysicalPlanTranslator: empty result -> EmptyResultSourceNode", "[dis
 	auto task = task_stream.poll_next();
 	REQUIRE(task.first);
 	REQUIRE(task.second.task()->plan()->Root().type == PhysicalOperatorType::EMPTY_RESULT);
+	REQUIRE_FALSE(task_stream.poll_next().first);
+}
+
+TEST_CASE("PhysicalPlanTranslator: DataSink appends a validating terminal to every worker task",
+          "[distributed][datasink]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	auto plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                           LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	auto &dummy = plan->Make<PhysicalDummyScan>(types, 1);
+	auto &sink = plan->Make<PhysicalDataSink>(types, "translator-datasink", 1);
+	sink.children.push_back(dummy);
+	plan->SetRoot(sink);
+
+	PlanConfig config;
+	config.query_id = "translator-datasink-query";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated = physical_plan_to_pipeline_node(config, plan, conn.context.get());
+	REQUIRE(translated.is_ok());
+	auto finish = std::dynamic_pointer_cast<DataSinkFinishNode>(translated.value()->inner());
+	REQUIRE(finish != nullptr);
+	REQUIRE(finish->result_node_id() == finish->node_id());
+
+	auto task_executor = std::make_shared<PlanTaskExecutor>(conn.context);
+	PlanExecutionContext execution_context(task_executor, conn.context);
+	auto task_stream = translated.value()->produce_tasks(execution_context);
+	auto task = task_stream.poll_next();
+	REQUIRE(task.first);
+	auto &task_root = task.second.task()->plan()->Root();
+	REQUIRE(task_root.type == PhysicalOperatorType::DATA_SINK);
+	REQUIRE(task_root.Cast<PhysicalDataSink>().operation_id == "translator-datasink");
+	REQUIRE(task_root.children.size() == 1);
+	REQUIRE(task.second.task()->task_context().node_ids().back() == finish->node_id());
 	REQUIRE_FALSE(task_stream.poll_next().first);
 }
 

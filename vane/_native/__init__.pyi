@@ -29,6 +29,7 @@ if typing.TYPE_CHECKING:
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
+    from vane.datasink import DataSink, WriteSummary
     from vane.runners.runner import Runner as _Runner
 
     # the field_ids argument to to_parquet and write_parquet has a recursive structure
@@ -548,6 +549,10 @@ class DuckDBPyRelation:
         self, expression: str, groups: str = "", window_spec: str = "", projected_columns: str = ""
     ) -> DuckDBPyRelation: ...
     def local_exchange(self, num_partitions: typing.SupportsInt | None = None) -> DuckDBPyRelation: ...
+    def _arrow_schema(self) -> pyarrow.lib.Schema: ...
+    def _validate_datasink_transaction(self) -> None: ...
+    def _mark_datasink(self, operation_id: str) -> DuckDBPyRelation: ...
+    def _take_udf_actor_cleanup_warnings(self) -> lst[str]: ...
     def map(
         self,
         map_function: Callable[..., typing.Any],
@@ -578,6 +583,7 @@ class DuckDBPyRelation:
         task_input_max_bytes: int | None = None,
         output_target_max_bytes: int | None = None,
     ) -> DuckDBPyRelation: ...
+    def write_datasink(self, sink: DataSink, *, operation_id: str | None = None) -> WriteSummary: ...
     def flat_map(
         self,
         function: Callable[..., typing.Any],

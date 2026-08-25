@@ -228,6 +228,49 @@ def test_actor_rows_mode_reuses_executor_across_calls(fake_ray):
     assert second[0].to_pydict() == {"keep": ["b"], "y": [6]}
 
 
+def test_actor_close_executor_is_terminal(fake_ray):
+    payload = _rows_payload(_AddOne)
+    actor = _make_actor(payload)
+
+    actor.close_executor()
+    actor.close_executor()
+
+    assert actor.executor is None
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor._ensure_executor(payload)
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor.init_payload(payload)
+
+
+def test_actor_close_executor_retains_failed_executor_for_retry(fake_ray):
+    payload = _rows_payload(_AddOne)
+    actor = _make_actor(payload)
+    executor = actor.executor
+    close_calls = 0
+
+    def transient_close():
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("planned actor executor close failure")
+
+    executor.close = transient_close
+
+    with pytest.raises(RuntimeError, match="planned actor executor close failure"):
+        actor.close_executor()
+
+    assert actor.executor is executor
+    assert actor._executor_closed is False
+    with pytest.raises(RuntimeError, match="actor executor is closed"):
+        actor._ensure_executor(payload)
+
+    actor.close_executor()
+
+    assert close_calls == 2
+    assert actor.executor is None
+    assert actor._executor_closed is True
+
+
 def test_reconstructed_actor_reconciles_new_node_before_user_code(fake_ray, monkeypatch):
     from vane.runners.ray.query_runtime_protocol import (
         RAY_ACTOR_GENERATION_CAPABILITY_ENV,

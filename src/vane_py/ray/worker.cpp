@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "worker.hpp"
+#include "bounded_diagnostics.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include <pybind11/pybind11.h>
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
@@ -88,6 +90,19 @@ std::string FteTaskIdStringFromPythonHandle(const py::object &handle) {
 	       std::to_string(attempt_id);
 }
 
+void ReleasePoppedFteResultHandles(const py::list &py_handles, vane::BoundedErrorDetails &errors) {
+	for (size_t index = 0; index < py_handles.size(); ++index) {
+		try {
+			auto handle = py::reinterpret_borrow<py::object>(py_handles[index]);
+			handle.attr("release_result_payload")();
+		} catch (const std::exception &ex) {
+			errors.Add("release[" + std::to_string(index) + "]", ex.what());
+		} catch (...) {
+			errors.Add("release[" + std::to_string(index) + "]", "unknown release error");
+		}
+	}
+}
+
 bool RequiredStatusBool(const py::dict &status, const char *field_name) {
 	auto key = py::str(field_name);
 	if (!status.contains(key)) {
@@ -112,29 +127,122 @@ bool OptionalStatusBool(const py::dict &status, const char *field_name, bool def
 	return value.cast<bool>();
 }
 
+bool TryBoundedTextValue(const py::object &value, const char *field_name, std::string &result) {
+	if (!py::isinstance<py::str>(value)) {
+		throw duckdb::InternalException("FTE query status field '%s' must be a string", field_name);
+	}
+	result = vane::BoundedPythonDiagnosticText(value);
+	return result.find_first_not_of(" \t\n\r\f\v") != std::string::npos;
+}
+
+bool TryBoundedStatusText(const py::dict &status, const char *field_name, std::string &result) {
+	auto key = py::str(field_name);
+	if (!status.contains(key) || py::reinterpret_borrow<py::object>(status[key]).is_none()) {
+		return false;
+	}
+	return TryBoundedTextValue(py::reinterpret_borrow<py::object>(status[key]), field_name, result);
+}
+
+bool TryBoundedFailedPartitionText(const py::dict &status, std::string &result) {
+	auto failed_key = py::str("failed_partitions");
+	if (!status.contains(failed_key) || py::reinterpret_borrow<py::object>(status[failed_key]).is_none()) {
+		return false;
+	}
+	auto failed_obj = py::reinterpret_borrow<py::object>(status[failed_key]);
+	if (!py::isinstance<py::list>(failed_obj)) {
+		throw duckdb::InternalException("FTE query status field 'failed_partitions' must be a list");
+	}
+	auto failed_partitions = failed_obj.cast<py::list>();
+	const auto detail_limit = vane::BoundedErrorDetails::MAX_DETAILS;
+	for (size_t index = 0; index < failed_partitions.size() && index < detail_limit; ++index) {
+		auto partition_obj = py::reinterpret_borrow<py::object>(failed_partitions[index]);
+		if (!py::isinstance<py::dict>(partition_obj)) {
+			throw duckdb::InternalException("FTE query status failed_partitions entries must be dicts");
+		}
+		auto partition = partition_obj.cast<py::dict>();
+		auto latest_key = py::str("latest_failure");
+		if (!partition.contains(latest_key) || py::reinterpret_borrow<py::object>(partition[latest_key]).is_none()) {
+			continue;
+		}
+		auto latest = py::reinterpret_borrow<py::object>(partition[latest_key]);
+		if (py::isinstance<py::str>(latest)) {
+			if (TryBoundedTextValue(latest, "failed_partitions.latest_failure", result)) {
+				return true;
+			}
+			continue;
+		}
+		if (!py::isinstance<py::dict>(latest)) {
+			continue;
+		}
+		auto failure = latest.cast<py::dict>();
+		for (const char *field_name : {"message", "failure_reason"}) {
+			auto key = py::str(field_name);
+			if (failure.contains(key) && !py::reinterpret_borrow<py::object>(failure[key]).is_none() &&
+			    TryBoundedTextValue(py::reinterpret_borrow<py::object>(failure[key]), field_name, result)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+std::string QueryStatusMessage(const py::dict &status, const RayWorkerRuntime::QueryStatus &result) {
+	std::string message;
+	if (TryBoundedStatusText(status, "message", message) ||
+	    TryBoundedStatusText(status, "scheduler_failure", message) || TryBoundedFailedPartitionText(status, message)) {
+		return message;
+	}
+	return "failed=" + std::string(result.failed ? "true" : "false") +
+	       ", finished=" + (result.finished ? "true" : "false") + ", canceled=" + (result.canceled ? "true" : "false") +
+	       ", matched=" + (result.matched ? "true" : "false") +
+	       ", registration_pending=" + (result.registration_pending ? "true" : "false") +
+	       ", selected_attempt_count=" + std::to_string(result.selected_attempt_task_ids.size());
+}
+
+std::string RequiredSelectedAttemptTaskId(const py::handle &item) {
+	auto value = py::reinterpret_borrow<py::object>(item);
+	if (!py::isinstance<py::str>(value)) {
+		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be strings");
+	}
+	const auto character_count = PyUnicode_GetLength(value.ptr());
+	if (character_count < 0) {
+		throw py::error_already_set();
+	}
+	if (static_cast<size_t>(character_count) > vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 characters");
+	}
+	auto result = value.cast<std::string>();
+	if (result.size() > vane::BoundedErrorDetails::MAX_DETAIL_BYTES) {
+		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entry exceeds 4096 bytes");
+	}
+	if (result.empty()) {
+		throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be non-empty");
+	}
+	return result;
+}
+
 void FillSelectedAttemptTaskIds(const py::dict &status, RayWorkerRuntime::QueryStatus &result) {
 	auto key = py::str("selected_attempt_task_ids");
 	if (!status.contains(key)) {
-		return;
+		throw duckdb::InternalException("FTE query status must include 'selected_attempt_task_ids'");
 	}
 	auto selected_obj = py::reinterpret_borrow<py::object>(status[key]);
 	if (selected_obj.is_none()) {
-		return;
+		throw duckdb::InternalException("FTE query status selected_attempt_task_ids must be a list");
 	}
 	if (!py::isinstance<py::list>(selected_obj)) {
 		throw duckdb::InternalException("FTE query status selected_attempt_task_ids must be a list");
 	}
 	for (auto item : selected_obj) {
-		auto value = py::str(py::reinterpret_borrow<py::object>(item)).cast<std::string>();
-		if (!value.empty()) {
-			result.selected_attempt_task_ids.insert(std::move(value));
+		auto value = RequiredSelectedAttemptTaskId(item);
+		if (!result.selected_attempt_task_ids.insert(std::move(value)).second) {
+			throw duckdb::InternalException("FTE query status selected_attempt_task_ids entries must be unique");
 		}
 	}
 }
 
 RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj, bool scoped) {
 	RayWorkerRuntime::QueryStatus result;
-	result.message = py::str(status_obj).cast<std::string>();
 	if (!py::isinstance<py::dict>(status_obj)) {
 		throw duckdb::InternalException("FTE query status must be a dict");
 	}
@@ -147,6 +255,7 @@ RayWorkerRuntime::QueryStatus ParseFteQueryStatus(const py::object &status_obj, 
 		result.matched = RequiredStatusBool(status, "matched");
 	}
 	FillSelectedAttemptTaskIds(status, result);
+	result.message = QueryStatusMessage(status, result);
 	return result;
 }
 
@@ -176,13 +285,31 @@ void RayWorkerRuntime::SubmitFteTaskEvents(const std::vector<WorkerTask> &tasks)
 std::vector<RayTaskResultHandle> RayWorkerRuntime::WrapFtePythonHandles(const py::list &py_handles) {
 	std::vector<RayTaskResultHandle> handles;
 	handles.reserve(py_handles.size());
-	for (size_t i = 0; i < py_handles.size(); ++i) {
-		py::object py_task_handle = py::reinterpret_borrow<py::object>(py_handles[i]);
-		auto task_context = TaskContextForFteHandle(py_task_handle);
-		auto actual_worker_id = WorkerIdFromPythonHandle(py_task_handle);
-		auto fte_task_id = FteTaskIdStringFromPythonHandle(py_task_handle);
-		RayTaskResultHandle rh(task_context, py_task_handle, actual_worker_id, std::move(fte_task_id));
-		handles.push_back(std::move(rh));
+	try {
+		for (size_t i = 0; i < py_handles.size(); ++i) {
+			py::object py_task_handle = py::reinterpret_borrow<py::object>(py_handles[i]);
+			auto task_context = TaskContextForFteHandle(py_task_handle);
+			auto actual_worker_id = WorkerIdFromPythonHandle(py_task_handle);
+			auto fte_task_id = FteTaskIdStringFromPythonHandle(py_task_handle);
+			RayTaskResultHandle rh(task_context, py_task_handle, actual_worker_id, std::move(fte_task_id));
+			handles.push_back(std::move(rh));
+		}
+	} catch (const std::exception &ex) {
+		// pop_fte_result_handles transfers the whole batch out of the Python
+		// registry. If one item is malformed, every item in that batch still
+		// needs an explicit payload release, including handles wrapped before
+		// the validation failure and handles not reached yet.
+		handles.clear();
+		vane::BoundedErrorDetails errors;
+		errors.Add("conversion", ex.what());
+		ReleasePoppedFteResultHandles(py_handles, errors);
+		throw std::runtime_error(errors.AppendTo("failed to adopt popped FTE result handle batch"));
+	} catch (...) {
+		handles.clear();
+		vane::BoundedErrorDetails errors;
+		errors.Add("conversion", "unknown conversion error");
+		ReleasePoppedFteResultHandles(py_handles, errors);
+		throw std::runtime_error(errors.AppendTo("failed to adopt popped FTE result handle batch"));
 	}
 	return handles;
 }

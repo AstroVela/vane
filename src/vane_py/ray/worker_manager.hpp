@@ -48,6 +48,9 @@ public:
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
 	wait_fte_query(const string &query_id, double timeout_s,
 	               duckdb::distributed::MaterializedOutputCallback on_output) override;
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
+	wait_fte_query_streaming(const string &query_id, double timeout_s,
+	                         duckdb::distributed::MaterializedOutputCallback on_output) override;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> wait_fte_query(
 	    const string &query_id, double timeout_s,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
@@ -83,6 +86,7 @@ private:
 		    fte_result_handles_by_query;
 		std::unordered_map<string, std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>>>
 		    retained_fte_result_handles_by_query;
+		std::unordered_map<string, std::unordered_map<string, size_t>> fte_result_handle_counts_by_query;
 		std::unordered_map<string, std::vector<std::shared_ptr<RayWorkerRuntime>>> workers_by_query_owner;
 		idx_t active_operations = 0;
 		bool shutdown_started = false;
@@ -171,11 +175,19 @@ private:
 	                            std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles);
 	void ClearFteResultHandles(const string &query_id);
 	DuckDBResult<void> CollectFteResultHandles(const string &query_id);
+	DuckDBResult<void>
+	ValidateFteResultHandleCoverage(const string &query_id,
+	                                const std::unordered_set<string> &selected_attempt_task_ids) const;
 	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> DrainFteResultHandles(
 	    const string &query_id, double timeout_s, const RayWorkerRuntime::QueryStatus *finished_status = nullptr,
 	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
 	        *task_context_filter = nullptr,
-	    bool release_payloads = true);
+	    bool release_payloads = true, duckdb::distributed::MaterializedOutputCallback on_output = {},
+	    bool selected_only = false);
+	DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> WaitFteQuery(
+	    const string &query_id, double timeout_s,
+	    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
+	    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs);
 	DuckDBResult<RayWorkerRuntime::QueryStatus>
 	FteQueryStatus(const string &query_id,
 	               const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>

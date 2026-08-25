@@ -28,6 +28,7 @@ endif()
 
 # Source files for the distributed module
 set(DISTRIBUTED_SOURCES_COMMON
+    data_sink.cpp
     extension_write.cpp
     plan/distributed_physical_plan.cpp
     plan/exchange_sink_instance_task.cpp
@@ -40,6 +41,7 @@ set(DISTRIBUTED_SOURCES_COMMON
 
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
+    pipeline_node/data_sink_finish.cpp
     pipeline_node/empty_result_source.cpp
     pipeline_node/expression_scan.cpp
     pipeline_node/extension_write_sink.cpp
@@ -52,6 +54,7 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/translate.cpp
     pipeline_node/translator_aggregate.cpp
     pipeline_node/translator_copy.cpp
+    pipeline_node/translator_data_sink.cpp
     pipeline_node/translator_join.cpp
     pipeline_node/translator_misc_unary.cpp
     pipeline_node/translator_order_limit.cpp

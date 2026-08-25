@@ -10,10 +10,12 @@ import threading
 import time
 import uuid
 import weakref
+from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 
@@ -114,6 +116,75 @@ def _make_test_physical_plan(con=None):
         relation,
         str(uuid.uuid4()),
     ).to_physical_plan(con)
+
+
+def test_ray_driver_exception_diagnostics_cannot_mask_primary_failure():
+    class _OpaqueError(RuntimeError):
+        def __getattribute__(self, name):
+            if name in {"add_note", "args", "cause", "traceback_str"}:
+                raise RuntimeError(f"planned {name} lookup failure")
+            return super().__getattribute__(name)
+
+    primary_error = _OpaqueError("planned primary failure")
+
+    driver._add_exception_note(primary_error, "secondary cleanup failure")
+
+    assert driver._has_remote_error_details(primary_error) is False
+    assert driver._safe_remote_error_message(primary_error) == "_OpaqueError from remote Ray task"
+
+
+def test_ray_driver_exception_summary_bounds_oversized_type_name():
+    class OversizedTypeNameError(RuntimeError):
+        pass
+
+    OversizedTypeNameError.__name__ = "x" * 100_000
+
+    summary = driver._safe_exception_summary(OversizedTypeNameError("planned cleanup failure"))
+
+    assert summary == "BaseException: planned cleanup failure"
+    assert len(summary.encode("utf-8")) <= driver._CLEANUP_WARNING_MAX_BYTES
+
+
+def test_ray_driver_remote_error_fallback_bounds_oversized_type_name():
+    class _OpaqueError(RuntimeError):
+        def __getattribute__(self, name):
+            if name in {"args", "cause", "traceback_str"}:
+                raise RuntimeError(f"planned {name} lookup failure")
+            return super().__getattribute__(name)
+
+    _OpaqueError.__name__ = "x" * 100_000
+
+    assert driver._safe_remote_error_message(_OpaqueError()) == "BaseException from remote Ray task"
+
+
+def test_ray_driver_nested_exception_diagnostics_cannot_mask_primary_failure():
+    class _OpaqueDiagnostic(str):
+        def strip(self, *args, **kwargs):
+            raise RuntimeError("planned diagnostic normalization failure")
+
+    primary_error = RuntimeError("planned primary failure")
+    primary_error.traceback_str = _OpaqueDiagnostic("remote traceback")
+
+    assert driver._has_remote_error_details(primary_error) is True
+    assert driver._safe_remote_error_message(primary_error) == "RuntimeError from remote Ray task"
+
+
+def test_ray_driver_remote_error_message_is_bounded():
+    class _GuardedLargeText(str):
+        def strip(self, *_args, **_kwargs):
+            raise AssertionError("the unbounded input must be sliced before strip")
+
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("the unbounded input must be sliced before encode")
+
+    remote_error = RuntimeError("transport wrapper")
+    remote_error.cause = RuntimeError(_GuardedLargeText("diagnostic-head:" + "x" * 100_000 + ":diagnostic-tail"))
+
+    message = driver._safe_remote_error_message(remote_error)
+
+    assert len(message.encode("utf-8")) <= 4 * 1024
+    assert message.startswith("diagnostic-head:")
+    assert message.endswith(":diagnostic-tail")
 
 
 class _DummyStream:
@@ -294,6 +365,7 @@ def _make_local_query_driver_actor():
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_udf_actor_by_unit = {}
+    runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_lifecycle_locks = {}
     runner._query_udf_actor_nodes = {}
     runner._query_udf_session_configs = {}
@@ -328,6 +400,7 @@ def _make_local_query_driver_actor():
     runner._plan_connections = {}
     runner._plan_teardown_condition = threading.Condition(runner._session_lock)
     runner._plan_teardowns_in_progress = set()
+    runner._datasink_cleanup_tasks = {}
     session_connection = runner._duckdb_conn.cursor()
     runner._sessions = {
         _TEST_SESSION_ID: driver._DriverSession(
@@ -357,6 +430,14 @@ def _query_registration_stub(query_id: str):
 
 def _run_actor_copy_plan(runner, plan):
     return runner.run_copy_plan(
+        _TEST_RUNTIME_OWNER_ID,
+        _TEST_SESSION_ID,
+        plan,
+    )
+
+
+def _run_actor_datasink_plan(runner, plan):
+    return runner.run_datasink_plan(
         _TEST_RUNTIME_OWNER_ID,
         _TEST_SESSION_ID,
         plan,
@@ -694,12 +775,14 @@ def _bind_test_plan_session(
     *,
     query_id: str | None = None,
     query_connection=None,
+    plan_kind: Literal["query", "datasink", "copy"] = "query",
 ) -> driver._PlanLifecycle:
     plan_key = str(plan_id)
     query_key = str(plan_key if query_id is None else query_id)
     lifecycle = driver._PlanLifecycle(
         plan_id=plan_key,
         session_id=_TEST_SESSION_ID,
+        plan_kind=plan_kind,
     )
     if query_key:
         lifecycle.set_query_id(query_key)
@@ -741,7 +824,13 @@ def _run_test_plan_preparation(
     *,
     copy_plan: bool,
 ):
-    lifecycle = cls._register_plan_lifecycle(runner, _TEST_SESSION_ID, session, plan_id)
+    lifecycle = cls._register_plan_lifecycle(
+        runner,
+        _TEST_SESSION_ID,
+        session,
+        plan_id,
+        plan_kind="copy" if copy_plan else "query",
+    )
     try:
         if copy_plan:
             return cls._prepare_copy_plan_sync(
@@ -1458,6 +1547,194 @@ def test_query_driver_copy_result_logging_failure_replays_committed_success(monk
     assert any("stderr unavailable" in warning for warning in first.cleanup_warnings)
     assert plan_calls == 1
     assert teardown_calls == [(plan_id, plan_id, True)]
+
+
+def test_query_driver_committed_copy_close_diagnostic_is_not_retryable_cleanup(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "copy-committed-close-diagnostic"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_calls = 0
+
+    class _PlanRunner:
+        @staticmethod
+        def run_copy_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            return _committed_copy_result(rows_copied=5)
+
+    def _teardown(_self, actual_plan_id):
+        nonlocal teardown_calls
+        teardown_calls += 1
+        assert actual_plan_id == plan_id
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+        close_error = RuntimeError("planned callable close failure")
+        raise driver._QueryCleanupDiagnostic(
+            f"query plan {plan_id} graceful actor cleanup failed: {close_error}",
+            (close_error,),
+        )
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_build_local_progress_snapshot", lambda *_args: {"state": "FINISHED"})
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    outcome = asyncio.run(_run_actor_copy_plan(runner, logical_plan))
+
+    assert outcome.cleanup_state == "complete"
+    assert any("planned callable close failure" in warning for warning in outcome.cleanup_warnings)
+    assert plan_id not in runner._copy_cleanup_pending_terminals
+    assert teardown_calls == 1
+
+
+def test_query_driver_datasink_retries_incomplete_teardown(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-cleanup-retry"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_calls = 0
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            return {
+                "operation_id": plan_id,
+                "write_results": [],
+                "outcome_aborted": False,
+                "outcome_unknown": False,
+                "outcome_error": "",
+                "data_sink_cleanup_warnings": [],
+            }
+
+    def _teardown(_self, actual_plan_id, expected_lifecycle):
+        nonlocal teardown_calls
+        teardown_calls += 1
+        assert actual_plan_id == plan_id
+        lifecycle, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert expected_lifecycle is lifecycle
+        assert (query_id, drop_fragments) == (plan_id, True)
+        if teardown_calls < 3:
+            raise RuntimeError("planned retained DataSink cleanup failure")
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def run_and_wait_for_cleanup():
+        result = await _run_actor_datasink_plan(runner, logical_plan)
+        for _ in range(1000):
+            if plan_id not in runner._plan_lifecycles and not runner._datasink_cleanup_tasks:
+                break
+            await asyncio.sleep(0.001)
+        return result
+
+    try:
+        result = asyncio.run(run_and_wait_for_cleanup())
+    finally:
+        cls._shutdown_driver_executors(runner)
+
+    assert teardown_calls == 3
+    assert any(
+        "planned retained DataSink cleanup failure" in warning for warning in result["data_sink_cleanup_warnings"]
+    )
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+    assert not runner._datasink_cleanup_tasks
+
+
+def test_query_driver_shutdown_bounds_in_progress_datasink_cleanup(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    events: list[object] = []
+
+    class ImmediateExecutor:
+        def submit(self, callback, /, *args, **kwargs):
+            future = Future()
+            try:
+                future.set_result(callback(*args, **kwargs))
+            except BaseException as error:
+                future.set_exception(error)
+            return future
+
+        def shutdown(self, *, wait, cancel_futures):
+            events.append(("executor-shutdown", wait, cancel_futures))
+
+    class PlanRunner:
+        def shutdown(self):
+            events.append("plan-runner-shutdown")
+
+    async def run_shutdown():
+        release_cleanup = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+
+        async def stuck_cleanup():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                events.append("cleanup-cancelled")
+                cancellation_seen.set()
+                await release_cleanup.wait()
+
+        async def stop_client_maintenance():
+            events.append("client-maintenance-stopped")
+
+        async def stop_resource_maintenance():
+            events.append("resource-maintenance-stopped")
+
+        runner._driver_shutdown_lock = asyncio.Lock()
+        runner._driver_executors_shutdown = False
+        runner._driver_copy_executor = None
+        runner._driver_native_executor = None
+        runner._driver_lifecycle_executor = None
+        runner._driver_session_executor = ImmediateExecutor()
+        runner.plan_runner = PlanRunner()
+        runner.stop_client_lease_maintenance = stop_client_maintenance
+        runner.stop_query_resource_maintenance = stop_resource_maintenance
+        cleanup_task = asyncio.create_task(stuck_cleanup())
+        runner._datasink_cleanup_tasks[("plan", 1)] = cleanup_task
+        await asyncio.sleep(0)
+
+        started = time.monotonic()
+        await cls._shutdown_runtime(runner)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert cancellation_seen.is_set()
+        assert not cleanup_task.done()
+        assert runner._datasink_cleanup_tasks == {}
+        assert runner._driver_shutdown_complete
+
+        release_cleanup.set()
+        await cleanup_task
+
+    monkeypatch.setattr(driver, "_DATASINK_CLEANUP_SHUTDOWN_TIMEOUT_S", 0.01)
+    asyncio.run(run_shutdown())
+
+    assert events == [
+        "client-maintenance-stopped",
+        "resource-maintenance-stopped",
+        "cleanup-cancelled",
+        "plan-runner-shutdown",
+        ("executor-shutdown", False, True),
+    ]
+
+
+def test_query_driver_datasink_cleanup_retry_ignores_reused_plan_identity():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-cleanup-reused-plan"
+    old_lifecycle = _bind_test_plan_session(runner, plan_id)
+    _release_test_plan_session_state(cls, runner, plan_id)
+    new_lifecycle = _bind_test_plan_session(runner, plan_id)
+
+    cls._teardown_plan_resources(runner, plan_id, old_lifecycle)
+
+    assert runner._plan_lifecycles[plan_id] is new_lifecycle
+    assert runner._plan_session_ids[plan_id] == _TEST_SESSION_ID
+    assert plan_id in runner._sessions[_TEST_SESSION_ID].plan_ids
+    _release_test_plan_session_state(cls, runner, plan_id)
 
 
 def test_query_driver_committed_copy_teardown_is_retryable_without_reexecution(monkeypatch):
@@ -2710,6 +2987,72 @@ def test_ray_query_driver_client_stream_start_failure_cancels_and_retries_close(
     ]
 
 
+def test_ray_query_driver_client_datasink_failure_cancels_and_closes_plan(monkeypatch):
+    run_future = object()
+    close_future = object()
+    resolved = []
+    cancelled = []
+
+    class _RemoteMethod:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def remote(self, *args):
+            self.calls.append(args)
+            return self.result
+
+    runner = SimpleNamespace(
+        run_datasink_plan=_RemoteMethod(run_future),
+        close_plan=_RemoteMethod(close_future),
+    )
+    client = object.__new__(driver.RayQueryDriverClient)
+    client._owner_id = _TEST_RUNTIME_OWNER_ID
+    _initialize_test_query_driver_client(client, {_TEST_SESSION_ID: {}})
+    client.runner = runner
+
+    def _resolve(ref, **kwargs):
+        resolved.append((ref, kwargs))
+        if ref is run_future:
+            raise FutureTimeoutError("planned DataSink response failure after execution started")
+        assert ref is close_future
+        return None
+
+    monkeypatch.setattr(driver, "progress_enabled", lambda: False)
+    monkeypatch.setattr(driver, "resolve_object_refs_blocking", _resolve)
+    monkeypatch.setattr(driver.ray, "cancel", lambda ref, *, force: cancelled.append((ref, force)))
+
+    plan = _FakePhysicalPlanWithoutPlanAttr("failed-datasink")
+    with pytest.raises(FutureTimeoutError, match="after execution started"):
+        client.run_datasink_plan(plan)
+
+    assert cancelled == [(run_future, False)]
+    assert runner.close_plan.calls == [
+        (
+            _TEST_RUNTIME_OWNER_ID,
+            _TEST_SESSION_ID,
+            "failed-datasink",
+        )
+    ]
+    assert resolved == [
+        (run_future, {}),
+        (
+            run_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+        (
+            close_future,
+            {
+                "timeout": 300,
+                "honor_query_deadline": False,
+            },
+        ),
+    ]
+
+
 def test_ray_query_driver_client_stream_start_reports_teardown_failure(monkeypatch):
     run_future = object()
     close_future = object()
@@ -2798,6 +3141,43 @@ def test_ray_query_driver_client_stream_preserves_primary_and_cleanup_failures(m
     assert error.value.__cause__ is primary_error
     assert "planned mid-stream query failure" in str(error.value)
     assert "planned mid-stream cleanup failure" in str(error.value)
+
+
+def test_query_execution_cleanup_error_preserves_unprintable_failures():
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned str failure")
+
+        def __repr__(self):
+            raise RuntimeError("planned repr failure")
+
+    primary_error = _UnprintableError()
+    cleanup_error = _UnprintableError()
+
+    error = driver.QueryExecutionCleanupError.from_errors(
+        "planned query failure",
+        primary_error,
+        [cleanup_error],
+    )
+
+    assert error.primary_error is primary_error
+    assert error.cleanup_errors == (cleanup_error,)
+    assert str(error).count("<error message unavailable>") == 2
+
+
+def test_query_execution_cleanup_error_bounds_retained_failures():
+    cleanup_errors = [RuntimeError(f"cleanup-{index}") for index in range(100)]
+
+    error = driver.QueryExecutionCleanupError.from_errors(
+        "planned query failure",
+        RuntimeError("primary"),
+        cleanup_errors,
+    )
+
+    assert len(error.cleanup_errors) == driver._CLEANUP_DIAGNOSTIC_LIMIT
+    assert error.cleanup_errors[0] is cleanup_errors[0]
+    assert str(error.cleanup_errors[-1]) == driver._QUERY_CLEANUP_ERRORS_OMITTED
+    assert driver._QUERY_CLEANUP_ERRORS_OMITTED in str(error)
 
 
 def test_ray_query_driver_client_stream_failure_accepts_concurrent_detach_cleanup(monkeypatch):
@@ -3206,7 +3586,7 @@ def test_query_driver_run_plan_start_failure_runs_complete_teardown(monkeypatch)
     assert runner._plan_query_ids["failed-plan"] == "failed-query"
     assert runner._plan_session_ids["failed-plan"] == _TEST_SESSION_ID
 
-    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: None)
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [])
     monkeypatch.setattr(cls, "_drop_query_fragments_sync", lambda *_args: None)
     cls._cleanup_finished_plan(runner, "failed-plan")
 
@@ -3243,6 +3623,7 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
         attempts["actors"] += 1
         if attempts["actors"] == 1:
             raise RuntimeError("actor release failed")
+        return []
 
     def _cleanup_vllm_actors(_self, actual_plan_id):
         calls.append(f"vllm:{actual_plan_id}")
@@ -3307,6 +3688,174 @@ def test_teardown_plan_resources_attempts_every_owned_release(monkeypatch):
     assert plan_id not in runner._plan_session_ids
     assert runner._leased_result_partition_refs == {}
     assert runner._result_partition_ref_counters == {}
+
+
+def test_teardown_plan_resources_bounds_release_failures_after_attempting_every_owner(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "bounded-teardown-plan"
+    release_calls = []
+
+    class _OutputOwner:
+        def __init__(self, index):
+            self.index = index
+
+        def release(self):
+            release_calls.append(self.index)
+            raise RuntimeError(f"output-release-{self.index}")
+
+    owner_count = driver._CLEANUP_DIAGNOSTIC_LIMIT + 10
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    runner._leased_result_partition_refs = {
+        plan_id: {str(index): (object(), _OutputOwner(index)) for index in range(owner_count)}
+    }
+
+    with pytest.raises(RuntimeError, match="teardown failed") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert release_calls == list(range(owner_count))
+    assert driver._QUERY_CLEANUP_ERRORS_OMITTED in str(exc_info.value)
+
+
+def test_teardown_reports_actor_close_diagnostic_after_releasing_lifecycle_lock(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    phase_close_error = RuntimeError("planned phase callable close failure")
+    close_error = RuntimeError("planned callable close failure")
+    runner._udf_actor_cleanup_diagnostics_by_plan[plan_id] = [phase_close_error]
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(RuntimeError, match="planned phase callable close failure") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert exc_info.value.diagnostics == (phase_close_error, close_error)
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._plan_session_ids
+    assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
+    assert runner._udf_actor_cleanup_diagnostics_by_plan == {}
+    assert runner._query_udf_actor_lifecycle_locks == {}
+
+
+def test_teardown_actor_close_diagnostic_handles_unprintable_failure(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-unprintable-diagnostic"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned cleanup diagnostic str failure")
+
+    close_error = _UnprintableError()
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(driver._QueryCleanupDiagnostic) as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "_UnprintableError: <error message unavailable>" in str(exc_info.value)
+    assert exc_info.value.diagnostics == (close_error,)
+    assert plan_id not in runner._plan_lifecycles
+
+
+def test_teardown_preserves_actor_close_diagnostic_when_later_cleanup_fails(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic-with-later-failure"
+    _bind_test_plan_session(runner, plan_id, query_id="")
+    close_error = RuntimeError("planned callable close failure")
+
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+    monkeypatch.setattr(
+        cls,
+        "_cleanup_vllm_actor_pools",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("planned vllm cleanup failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="teardown failed") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "planned vllm cleanup failure" in str(exc_info.value)
+    assert "graceful actor cleanup diagnostic" in str(exc_info.value)
+    assert "planned callable close failure" in str(exc_info.value)
+    assert plan_id in runner._plan_lifecycles
+
+
+def test_teardown_preserves_actor_close_diagnostic_when_session_release_fails(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-close-diagnostic-with-session-release-failure"
+    close_error = RuntimeError("planned callable close failure")
+
+    class _QueryConnection:
+        def close(self):
+            raise RuntimeError("planned query connection close failure")
+
+    _bind_test_plan_session(
+        runner,
+        plan_id,
+        query_id="",
+        query_connection=_QueryConnection(),
+    )
+    monkeypatch.setattr(cls, "_cleanup_udf_actor_pools", lambda *_args: [close_error])
+
+    with pytest.raises(RuntimeError, match="session release failed") as exc_info:
+        cls._teardown_plan_resources(runner, plan_id)
+
+    assert "planned query connection close failure" in str(exc_info.value)
+    assert "graceful actor cleanup diagnostic" in str(exc_info.value)
+    assert "planned callable close failure" in str(exc_info.value)
+    assert plan_id in runner._plan_lifecycles
+
+
+def test_finished_read_plan_warns_for_completed_actor_cleanup_diagnostic(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    close_error = RuntimeError("planned callable close failure")
+    diagnostic = driver._QueryCleanupDiagnostic(
+        f"query plan read-plan graceful actor cleanup failed: {close_error}",
+        (close_error,),
+    )
+
+    monkeypatch.setattr(
+        cls,
+        "_teardown_plan_resources",
+        lambda *_args: (_ for _ in ()).throw(diagnostic),
+    )
+
+    with pytest.warns(RuntimeWarning, match="planned callable close failure"):
+        cls._cleanup_finished_plan(runner, "read-plan")
+
+
+def test_finished_datasink_plan_forces_actor_cleanup_after_graceful_failure(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-terminal-force-cleanup"
+    lifecycle = _bind_test_plan_session(
+        runner,
+        plan_id,
+        plan_kind="datasink",
+    )
+    teardown_calls = []
+
+    def _teardown(
+        _self,
+        actual_plan_id,
+        expected_lifecycle=None,
+        *,
+        force_udf_actor_cleanup=False,
+    ):
+        teardown_calls.append((actual_plan_id, expected_lifecycle, force_udf_actor_cleanup))
+        if not force_udf_actor_cleanup:
+            raise RuntimeError("planned retained DataSink actor")
+        assert expected_lifecycle is lifecycle
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    cls._cleanup_finished_plan(runner, plan_id)
+
+    assert teardown_calls == [
+        (plan_id, lifecycle, False),
+        (plan_id, lifecycle, True),
+    ]
+    assert plan_id not in runner._plan_lifecycles
+    assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
 
 
 def test_query_connection_close_failure_retains_plan_ownership_for_teardown_retry(monkeypatch):
@@ -3398,6 +3947,37 @@ def test_query_actor_pool_cleanup_retains_failed_pool_for_retry(cleanup_method, 
 
     assert getattr(runner, active_attr) == []
     assert getattr(runner, by_plan_attr) == {}
+
+
+def test_query_actor_pool_force_cleanup_releases_retryable_pool():
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "actor-force-cleanup"
+    shutdown_modes = []
+
+    class _Pool:
+        def __init__(self):
+            self.actors = ["actor-0"]
+
+        def shutdown(self, *, kill=False):
+            shutdown_modes.append(bool(kill))
+            if not kill:
+                raise RuntimeError("planned retryable callable cleanup failure")
+            self.actors = []
+
+    pool = _Pool()
+    runner._active_udf_actors = [pool]
+    runner._active_udf_actors_by_plan = {plan_id: [pool]}
+
+    with pytest.raises(RuntimeError, match="planned retryable callable cleanup failure"):
+        cls._cleanup_udf_actor_pools(runner, plan_id)
+
+    assert runner._active_udf_actors_by_plan == {plan_id: [pool]}
+
+    cls._cleanup_udf_actor_pools(runner, plan_id, force=True)
+
+    assert shutdown_modes == [False, True]
+    assert runner._active_udf_actors == []
+    assert runner._active_udf_actors_by_plan == {}
 
 
 def test_failed_execution_owner_cleanup_blocks_query_resource_release(monkeypatch):
@@ -5190,7 +5770,7 @@ def test_fte_worker_task_handle_starts_one_watcher_under_concurrent_polling(
     assert len(worker.calls) == 1
 
 
-def test_fte_finish_wins_atomically_over_concurrent_cancel():
+def test_fte_explicit_ack_wins_atomically_over_concurrent_cancel():
     ack_entered = threading.Event()
     release_ack = threading.Event()
 
@@ -5217,20 +5797,22 @@ def test_fte_finish_wins_atomically_over_concurrent_cancel():
         "task_id": task_id,
         "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
     }
-    finishing = threading.Thread(target=handle._apply_status, args=(status,))
-    finishing.start()
+    assert handle._apply_status(status) is None
+    acking = threading.Thread(target=handle.ack)
+    acking.start()
     assert ack_entered.wait(timeout=2)
 
     cancelling = threading.Thread(target=handle.cancel)
     cancelling.start()
     release_ack.set()
-    finishing.join(timeout=2)
+    acking.join(timeout=2)
     cancelling.join(timeout=2)
 
-    assert not finishing.is_alive()
+    assert not acking.is_alive()
     assert not cancelling.is_alive()
     result = handle.get_result_sync()
     assert result.has_output is True
+    assert worker.ack_calls == [task_id]
     assert [call[0] for call in worker.calls if call[0] == "cancel"] == []
     assert worker.release_calls == []
     assert len(worker.output_transfers) == 1
@@ -5445,12 +6027,19 @@ def test_fte_worker_task_handle_releases_adopted_and_remote_results_when_ack_fai
     )
 
     assert _wait_batch_ready(handle) == [0]
+    assert handle.get_result_sync().ok
+    assert worker.ack_calls == []
     with pytest.raises(RuntimeError, match="planned ack failure"):
-        handle.get_result_sync()
+        handle.ack()
 
     assert worker.ack_calls == [task_id]
-    assert worker.release_calls == [task_id]
+    assert worker.release_calls == []
     assert len(worker.new_owners) == 1
+    assert worker.new_owners[0].released is False
+
+    handle.release_result_payload()
+
+    assert worker.release_calls == [task_id]
     assert worker.new_owners[0].released is True
 
 
@@ -5480,6 +6069,8 @@ def test_fte_worker_task_handle_defers_attempt_selection_to_query_commit():
     result = handle.get_result_sync()
 
     assert result.ok
+    assert worker.ack_calls == []
+    handle.ack()
     assert worker.ack_calls == [task_id]
     assert worker.release_calls == []
     assert worker.output_transfers == [
@@ -5504,6 +6095,10 @@ def test_fte_worker_task_handle_acks_remote_result_once():
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
     assert handle.get_result_sync().ok
+    assert worker.ack_calls == []
+
+    handle.ack()
+    handle.ack()
 
     assert worker.ack_calls == [task_id]
 
@@ -5519,6 +6114,9 @@ def test_fte_worker_task_handle_ack_does_not_release_remote_result():
 
     assert _wait_batch_ready(handle) == [0]
     assert handle.get_result_sync().ok
+    assert worker.ack_calls == []
+
+    handle.ack()
 
     assert worker.ack_calls == [task_id]
     assert worker.release_calls == []
@@ -5533,6 +6131,37 @@ def test_fte_worker_task_handle_release_result_payload_calls_worker_once():
     handle.release_result_payload()
 
     assert worker.release_calls == [task_id]
+
+
+def test_fte_worker_task_handle_does_not_adopt_payload_after_release():
+    class _TrackingWorker(_FakeFteStatusWorker):
+        def finish_fte_task_with_outputs(self, task_id, query_task_lease, outputs):
+            raise AssertionError("released result payload must not be adopted")
+
+    worker = _TrackingWorker()
+    task_id = {"query_id": "q", "fragment_execution_id": 1, "partition_id": 2, "attempt_id": 0}
+    handle = driver.FteWorkerTaskHandle(
+        task_id,
+        worker,
+        query_task_lease={"lease_id": "lease-released-result"},
+    )
+    handle.release_result_payload()
+
+    assert (
+        handle._apply_status(
+            {
+                "state": "FINISHED",
+                "task_id": task_id,
+                "result": (["payload"], [{"num_rows": 5, "size_bytes": 64}], None, []),
+            }
+        )
+        is None
+    )
+
+    assert handle.get_result_sync().ok
+    assert handle.get_result_sync().has_output is False
+    assert worker.release_calls == [task_id]
+    assert worker.output_transfers == []
 
 
 def test_fte_worker_task_handle_enqueues_result_controls_without_sync_rpc():
@@ -5559,6 +6188,7 @@ def test_fte_worker_task_handle_enqueues_result_controls_without_sync_rpc():
     handle._result = driver.RayTaskResult.success([], [1], None)
 
     assert handle.get_result_sync().ok
+    handle.ack()
     handle.release_result_payload()
 
     assert worker.queued_controls == [("ack", task_id), ("release", task_id)]
@@ -7689,6 +8319,9 @@ def test_run_copy_plan_propagates_worker_task_failure_before_finalize(tmp_path, 
         def get_result_sync(self):
             raise self._error
 
+        def ack(self):
+            return None
+
         def cancel(self):
             self._is_done = True
 
@@ -7828,6 +8461,9 @@ def test_run_copy_plan_direct_write_failure_cleans_uncommitted_run(tmp_path, mon
 
         def get_result_sync(self):
             raise self._error
+
+        def ack(self):
+            return None
 
         def cancel(self):
             self._is_done = True
@@ -7995,6 +8631,71 @@ def test_wait_fte_query_propagates_status_errors(monkeypatch):
         manager.shutdown()
 
 
+def test_wait_fte_query_uses_later_nonempty_failed_partition_detail(monkeypatch):
+    class _FailedStatusWorkerHandle:
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": True,
+                "finished": False,
+                "message": "  ",
+                "scheduler_failure": "\t",
+                "selected_attempt_task_ids": [],
+                "failed_partitions": [
+                    {"latest_failure": {"message": "\n", "failure_reason": ""}},
+                    {
+                        "latest_failure": {
+                            "message": "\r",
+                            "failure_reason": "provider TimeoutError: request timed out",
+                        }
+                    },
+                ],
+            }
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-status-failed-detail",
+                _FailedStatusWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-status-failed-detail", "query-status-failed-detail")
+        with pytest.raises(Exception, match="provider TimeoutError: request timed out"):
+            manager.wait_fte_query("query-status-failed-detail", 1.0)
+    finally:
+        manager.shutdown()
+
+
 def test_wait_fte_query_releases_gil_while_waiting(monkeypatch):
     class _ThreadProgressWorkerHandle:
         def __init__(self):
@@ -8116,6 +8817,386 @@ def test_wait_fte_query_rejects_malformed_query_status(monkeypatch):
         manager.shutdown()
 
 
+def test_wait_fte_query_requires_selected_attempt_ids(monkeypatch):
+    class _MissingSelectedAttemptsWorkerHandle:
+        def __init__(self):
+            self.status_calls = 0
+
+        def fte_query_status(self, _query_id):
+            self.status_calls += 1
+            return {"failed": False, "finished": True}
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _MissingSelectedAttemptsWorkerHandle()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-status-missing-selected", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-status-missing-selected", "query-status-missing-selected")
+        with pytest.raises(Exception, match="must include 'selected_attempt_task_ids'"):
+            manager.wait_fte_query("query-status-missing-selected", 1.0)
+        assert worker.status_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_wait_fte_query_rejects_empty_selected_attempt_id(monkeypatch):
+    class _EmptySelectedAttemptWorkerHandle:
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [""],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-status-empty-selected",
+                _EmptySelectedAttemptWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-status-empty-selected", "query-status-empty-selected")
+        with pytest.raises(Exception, match="entries must be non-empty"):
+            manager.wait_fte_query("query-status-empty-selected", 1.0)
+    finally:
+        manager.shutdown()
+
+
+def test_wait_fte_query_rejects_duplicate_selected_attempt_id(monkeypatch):
+    selected_task_id = "query-status-duplicate-selected.0.0.0"
+
+    class _DuplicateSelectedAttemptWorkerHandle:
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [selected_task_id, selected_task_id],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-status-duplicate-selected",
+                _DuplicateSelectedAttemptWorkerHandle(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-status-duplicate-selected", "query-status-duplicate-selected")
+        with pytest.raises(Exception, match="entries must be unique"):
+            manager.wait_fte_query("query-status-duplicate-selected", 1.0)
+    finally:
+        manager.shutdown()
+
+
+def test_wait_fte_query_rejects_selected_attempt_without_result_handle(monkeypatch):
+    class _MissingSelectedHandleWorker:
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": ["query-selected-handle-missing.0.0.0"],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            return []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-selected-handle-missing",
+                _MissingSelectedHandleWorker(),
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-selected-handle-missing", "query-selected-handle-missing")
+        with pytest.raises(Exception, match="selected-attempt/result-handle validation"):
+            manager.wait_fte_query("query-selected-handle-missing", 1.0)
+    finally:
+        manager.shutdown()
+
+
+def test_wait_fte_query_rejects_duplicate_handles_for_selected_attempt(monkeypatch):
+    class _DuplicateHandle:
+        worker_id = "worker-duplicate-selected-handle"
+
+        def __init__(self):
+            self.task_id = _fake_task_attempt_id(
+                {
+                    "query_id": "query-duplicate-selected-handle",
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 0,
+                }
+            )
+            self.task_context_info = _fake_task_context_info(self.task_id)
+
+        def done(self):
+            raise AssertionError("duplicate selected handles must be rejected before polling")
+
+        def get_result_sync(self):
+            raise AssertionError("duplicate selected handles must not be materialized")
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            pass
+
+    class _Worker:
+        def __init__(self):
+            self.handles = [_DuplicateHandle(), _DuplicateHandle()]
+            self.pop_calls = 0
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handles[0].task_id)],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            self.pop_calls += 1
+            return self.handles if self.pop_calls == 1 else []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-duplicate-selected-handle", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-duplicate-selected-handle", "query-duplicate-selected-handle")
+        with pytest.raises(Exception, match="multiple result handles for one selected attempt"):
+            manager.wait_fte_query("query-duplicate-selected-handle", 1.0)
+    finally:
+        manager.shutdown()
+
+
+def test_wait_fte_query_drains_but_does_not_publish_handle_when_selection_is_empty(monkeypatch):
+    class _UnselectedHandle:
+        worker_id = "worker-unselected-empty"
+
+        def __init__(self):
+            self.task_id = _fake_task_attempt_id(
+                {
+                    "query_id": "query-unselected-empty",
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 0,
+                }
+            )
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self.get_result_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_calls += 1
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class _Worker:
+        def __init__(self):
+            self.handle = _UnselectedHandle()
+            self.pop_calls = 0
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            self.pop_calls += 1
+            return [self.handle] if self.pop_calls == 1 else []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-unselected-empty", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-unselected-empty", "query-unselected-empty")
+        assert manager.wait_fte_query("query-unselected-empty", 1.0) is None
+        assert worker.handle.get_result_calls == 1
+        assert worker.handle.ack_calls == 0
+        assert worker.handle.release_calls == 1
+    finally:
+        manager.shutdown()
+
+
 def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
     class _MalformedHandle:
         worker_id = "worker-handle-malformed"
@@ -8133,6 +9214,9 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
 
         def get_result_sync(self):
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
 
     class _MalformedHandleWorker:
         def __init__(self):
@@ -8187,6 +9271,96 @@ def test_wait_fte_query_rejects_result_handles_without_task_id(monkeypatch):
         manager.shutdown()
 
 
+def test_wait_fte_query_releases_popped_batch_when_later_handle_is_malformed(monkeypatch):
+    class _Handle:
+        worker_id = "worker-partial-handle-batch"
+
+        def __init__(self, *, malformed=False):
+            self.task_context_info = _fake_task_context_info(
+                {
+                    "query_id": "query-partial-handle-batch",
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 0,
+                }
+            )
+            if not malformed:
+                self.task_id = _fake_task_attempt_id(
+                    {
+                        "query_id": "query-partial-handle-batch",
+                        "fragment_execution_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                    }
+                )
+            self.release_calls = 0
+
+        def done(self):
+            return False
+
+        def get_result_sync(self):
+            raise AssertionError("batch conversion must fail before polling")
+
+        def ack(self):
+            raise AssertionError("batch conversion must fail before acknowledgement")
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class _Worker:
+        def __init__(self):
+            self.handles = [_Handle(), _Handle(malformed=True)]
+            self.pop_calls = 0
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, _query_id):
+            self.pop_calls += 1
+            return self.handles if self.pop_calls == 1 else []
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-partial-handle-batch", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        manager.worker_snapshots()
+        manager.register_query_owner("query-partial-handle-batch", "query-partial-handle-batch")
+        with pytest.raises(Exception, match="FTE result handle must provide task_id"):
+            manager.wait_fte_query("query-partial-handle-batch", 1.0)
+        assert [handle.release_calls for handle in worker.handles] == [1, 1]
+    finally:
+        manager.shutdown()
+
+
 def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
     class _MalformedHandle:
         def __init__(self):
@@ -8205,6 +9379,9 @@ def test_wait_fte_query_rejects_result_handles_without_worker_id(monkeypatch):
 
         def get_result_sync(self):
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
 
     class _MalformedHandleWorker:
         def __init__(self):
@@ -8281,6 +9458,9 @@ def test_wait_fte_query_propagates_selected_attempt_handle_errors(monkeypatch):
 
         def get_result_sync(self):
             raise RuntimeError("selected attempt failed")
+
+        def ack(self):
+            return None
 
         def release_result_payload(self):
             self.release_calls += 1
@@ -8381,6 +9561,9 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
         def get_result_sync(self):
             raise RuntimeError("loser attempt failed")
 
+        def ack(self):
+            return None
+
         def release_result_payload(self):
             self.release_calls += 1
 
@@ -8404,6 +9587,9 @@ def test_wait_fte_query_ignores_retry_loser_attempt_errors(monkeypatch):
 
         def get_result_sync(self):
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
 
         def release_result_payload(self):
             return None
@@ -8492,6 +9678,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
             self.task_context_info = _fake_task_context_info(self.task_id)
             self._result = vane.ray_cxx.RayTaskResult.no_output()
             self.fail_release_once = fail_release_once
+            self.ack_calls = 0
             self.release_calls = 0
 
         def done(self):
@@ -8499,6 +9686,9 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
 
         def get_result_sync(self):
             return self._result
+
+        def ack(self):
+            self.ack_calls += 1
 
         def release_result_payload(self):
             self.release_calls += 1
@@ -8591,6 +9781,7 @@ def test_wait_fte_query_release_failure_preserves_failed_handle_and_releases_res
 
         assert worker.handles[0].release_calls == 1
         assert worker.handles[1].release_calls == 1
+        assert [handle.ack_calls for handle in worker.handles] == [1, 1]
         manager.drop_query_fragments("query-release-failure")
         assert worker.handles[0].release_calls == 2
         assert worker.handles[1].release_calls == 1
@@ -8624,6 +9815,9 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
             self.get_result_sync_calls += 1
             raise AssertionError("pending loser attempt should not be drained")
 
+        def ack(self):
+            return None
+
         def release_result_payload(self):
             return None
 
@@ -8647,6 +9841,9 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
 
         def get_result_sync(self):
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            return None
 
         def release_result_payload(self):
             return None
@@ -8722,6 +9919,379 @@ def test_wait_fte_query_does_not_drain_pending_retry_loser_attempt(monkeypatch):
         manager.shutdown()
 
 
+def test_streaming_wait_does_not_publish_loser_after_selected_attempt_was_published(monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    class _AttemptHandle:
+        worker_id = "worker-streaming-retry"
+
+        def __init__(self, task_id, *, produces_output=False):
+            self.task_id = _fake_task_attempt_id(task_id)
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self._result = (
+                vane.ray_cxx.RayTaskResult.success([pa.table({"loser": [1]})], [], None)
+                if produces_output
+                else vane.ray_cxx.RayTaskResult.no_output()
+            )
+            self.get_result_sync_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_sync_calls += 1
+            return self._result
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class _Worker:
+        def __init__(self):
+            self.status_calls = 0
+            self.pop_calls = 0
+            self.loser = None
+            self.selected = None
+            self.selected_released_before_finish = False
+
+        def fte_query_status(self, query_id):
+            self.status_calls += 1
+            if self.status_calls >= 2 and self.selected is not None:
+                self.selected_released_before_finish = self.selected.release_calls == 1
+            return {
+                "failed": False,
+                "finished": self.status_calls >= 2,
+                "selected_attempt_task_ids": [f"{query_id}.0.0.1"],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            self.pop_calls += 1
+            if self.pop_calls != 1:
+                return []
+            self.loser = _AttemptHandle(
+                {
+                    "query_id": query_id,
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 0,
+                },
+                produces_output=True,
+            )
+            self.selected = _AttemptHandle(
+                {
+                    "query_id": query_id,
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 1,
+                }
+            )
+            return [self.loser, self.selected]
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-streaming-retry", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-streaming-retry"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert worker.loser is not None
+        assert worker.selected is not None
+        assert worker.selected_released_before_finish
+        assert worker.loser.ack_calls == 0
+        assert worker.loser.release_calls == 1
+        assert worker.selected.get_result_sync_calls == 1
+        assert worker.selected.ack_calls == 1
+        assert worker.selected.release_calls == 1
+        manager.drop_query_fragments(query_id)
+    finally:
+        manager.shutdown()
+
+
+def test_streaming_wait_treats_empty_final_selection_as_selecting_no_attempts(monkeypatch):
+    class _UnselectedHandle:
+        worker_id = "worker-empty-selection"
+
+        def __init__(self, task_id):
+            self.task_id = _fake_task_attempt_id(task_id)
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self.get_result_sync_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_sync_calls += 1
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class _Worker:
+        def __init__(self):
+            self.pop_calls = 0
+            self.handle = None
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            self.pop_calls += 1
+            if self.pop_calls != 1:
+                return []
+            self.handle = _UnselectedHandle(
+                {
+                    "query_id": query_id,
+                    "fragment_execution_id": 0,
+                    "partition_id": 0,
+                    "attempt_id": 0,
+                }
+            )
+            return [self.handle]
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime("worker-empty-selection", worker, 1.0, 0.0, 1024)
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-empty-selection"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert worker.handle is not None
+        assert worker.handle.get_result_sync_calls == 1
+        assert worker.handle.ack_calls == 0
+        assert worker.handle.release_calls == 1
+
+        manager.drop_query_fragments(query_id)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    (
+        "fail_after",
+        "throw_after",
+        "release_failures",
+        "message",
+        "expected_ack_calls",
+        "expected_release_calls_before_cleanup",
+        "expected_release_calls_after_cleanup",
+    ),
+    [
+        (1, -1, 0, "planned streaming callback failure", [1, 0], [1, 0], [1, 1]),
+        (-1, 1, 0, "streaming FTE output callback threw: planned streaming callback exception", [1, 0], [1, 0], [1, 1]),
+        (-1, -1, 1, "failed to finalize streamed FTE result handle", [1, 1], [1, 1], [1, 2]),
+    ],
+)
+def test_streaming_wait_does_not_republish_outputs_after_callback_or_finalization_failure(
+    monkeypatch,
+    fail_after,
+    throw_after,
+    release_failures,
+    message,
+    expected_ack_calls,
+    expected_release_calls_before_cleanup,
+    expected_release_calls_after_cleanup,
+):
+    pa = pytest.importorskip("pyarrow")
+
+    class _OutputHandle:
+        worker_id = "worker-streaming-callback-failure"
+
+        def __init__(self, task_id, value, *, release_failures=0):
+            self.task_id = _fake_task_attempt_id(task_id)
+            self.task_context_info = _fake_task_context_info(self.task_id)
+            self._result = vane.ray_cxx.RayTaskResult.success([pa.table({"value": [value]})], [], None)
+            self.get_result_sync_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+            self.release_failures = release_failures
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_sync_calls += 1
+            return self._result
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+            if self.release_calls <= self.release_failures:
+                raise RuntimeError("planned transient streaming result release failure")
+
+    class _Worker:
+        def __init__(self):
+            self.pop_calls = 0
+            self.handles = []
+
+        def fte_query_status(self, query_id):
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [
+                    f"{query_id}.0.0.0",
+                    f"{query_id}.0.1.0",
+                ],
+            }
+
+        def pop_fte_result_handles(self, query_id):
+            self.pop_calls += 1
+            if self.pop_calls != 1:
+                return []
+            self.handles = [
+                _OutputHandle(
+                    {
+                        "query_id": query_id,
+                        "fragment_execution_id": 0,
+                        "partition_id": 0,
+                        "attempt_id": 0,
+                    },
+                    1,
+                ),
+                _OutputHandle(
+                    {
+                        "query_id": query_id,
+                        "fragment_execution_id": 0,
+                        "partition_id": 1,
+                        "attempt_id": 0,
+                    },
+                    2,
+                    release_failures=release_failures,
+                ),
+            ]
+            return list(self.handles)
+
+        def stats_fragments(self):
+            return {"registered_total": 0, "existing_total": 0, "lookup_hits": 0}
+
+        def fte_prepare_drop_query(self, _query_id):
+            return {"tasks_removed": 0, "tasks_canceled": 0, "fragments_removed": 0}
+
+        def fte_cleanup_query(self, _query_id):
+            return {}
+
+        def prepare_shutdown(self):
+            return None
+
+        def finish_shutdown(self):
+            return None
+
+        def abort_shutdown(self):
+            return None
+
+    import vane.runners.ray.worker_handle as ray_worker_handle
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        ray_worker_handle,
+        "start_ray_workers",
+        lambda _existing_ids, _manager_instance_id: [
+            vane.ray_cxx.RayWorkerRuntime(
+                "worker-streaming-callback-failure",
+                worker,
+                1.0,
+                0.0,
+                1024,
+            )
+        ],
+    )
+    monkeypatch.setattr(ray_worker_handle, "try_autoscale", lambda _bundles: None)
+
+    manager = vane.ray_cxx.RayWorkerManager()
+    try:
+        query_id = "query-streaming-callback-failure"
+        manager.worker_snapshots()
+        manager.register_query_owner(query_id, query_id)
+        with pytest.raises(Exception, match=message):
+            manager._wait_fte_query_streaming_for_test(query_id, 1.0, fail_after, throw_after)
+        assert [handle.ack_calls for handle in worker.handles] == expected_ack_calls
+        assert [handle.release_calls for handle in worker.handles] == expected_release_calls_before_cleanup
+        assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
+
+        # Retrying the wait may finish pending handles, but must never invoke
+        # publication again for the handle whose callback outcome was ambiguous.
+        assert manager._wait_fte_query_streaming_for_test(query_id, 1.0) == 0
+        assert [handle.get_result_sync_calls for handle in worker.handles] == [1, 1]
+
+        manager.drop_query_fragments(query_id)
+        assert [handle.release_calls for handle in worker.handles] == expected_release_calls_after_cleanup
+    finally:
+        manager.shutdown()
+
+
 def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
     class _PendingAttemptHandle:
         worker_id = "worker-stale-failed"
@@ -8745,6 +10315,9 @@ def test_wait_fte_query_clears_cached_handles_after_failed_status(monkeypatch):
 
         def get_result_sync(self):
             raise AssertionError("stale cached handle should have been cleared")
+
+        def ack(self):
+            return None
 
         def release_result_payload(self):
             return None
@@ -8844,6 +10417,7 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self.worker = worker
+            self.ack_calls = 0
             self.get_result_sync_calls = 0
 
         def _ensure_started(self):
@@ -8855,6 +10429,9 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
         def get_result_sync(self):
             self.get_result_sync_calls += 1
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
 
         def release_result_payload(self):
             return None
@@ -8925,6 +10502,7 @@ def test_wait_fte_query_timeout_preserves_collected_handles(monkeypatch):
         manager.wait_fte_query("query-timeout-preserve", 1.0)
 
         assert worker.handle.get_result_sync_calls == 1
+        assert worker.handle.ack_calls == 1
         assert worker.pop_calls >= 2
     finally:
         manager.shutdown()
@@ -8943,6 +10521,7 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
             self.task_id = _fake_task_attempt_id(task_id)
             self.task_context_info = _fake_task_context_info(self.task_id)
             self.ready_at = time.monotonic() + 0.2
+            self.ack_calls = 0
             self.get_result_sync_calls = 0
 
         def _ensure_started(self):
@@ -8954,6 +10533,9 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
         def get_result_sync(self):
             self.get_result_sync_calls += 1
             return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
 
         def release_result_payload(self):
             return None
@@ -9024,6 +10606,7 @@ def test_wait_fte_query_respects_timeout_after_finished_status_during_drain(monk
         manager.wait_fte_query("query-drain-timeout", 1.0)
 
         assert worker.handle.get_result_sync_calls == 1
+        assert worker.handle.ack_calls == 1
         assert worker.pop_calls >= 1
     finally:
         manager.shutdown()

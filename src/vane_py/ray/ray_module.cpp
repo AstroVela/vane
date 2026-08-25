@@ -6,6 +6,8 @@
 #include "task.hpp"
 #include "worker.hpp"
 #include "worker_manager.hpp"
+#include "bounded_diagnostics.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include "safe_pyobject.hpp"
 #include "datasource_function.hpp"
 
@@ -88,7 +90,9 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/relation/data_sink_relation.hpp>
 #include <duckdb/execution/operator/helper/physical_materialized_collector.hpp>
+#include <duckdb/execution/operator/helper/physical_data_sink.hpp>
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp>
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp>
 #include <duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp>
@@ -609,6 +613,33 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 	        },
 	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
+	    .def(
+	        "_wait_fte_query_streaming_for_test",
+	        [](RayWorkerManager &self, const string &query_id, double timeout_s, int64_t fail_after,
+	           int64_t throw_after) {
+		        size_t output_count = 0;
+		        auto on_output = [&output_count, fail_after,
+		                          throw_after](const duckdb::distributed::MaterializedOutput &) {
+			        if (throw_after >= 0 && output_count >= static_cast<size_t>(throw_after)) {
+				        throw std::runtime_error("planned streaming callback exception");
+			        }
+			        if (fail_after >= 0 && output_count >= static_cast<size_t>(fail_after)) {
+				        return duckdb::distributed::DuckDBResult<void>::err(
+				            duckdb::distributed::DuckDBError::external_error("planned streaming callback failure"));
+			        }
+			        output_count++;
+			        return duckdb::distributed::DuckDBResult<void>::ok();
+		        };
+		        auto res = [&]() {
+			        py::gil_scoped_release release;
+			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+		        }();
+		        if (res.is_err()) {
+			        throw duckdb::InternalException(res.error().what());
+		        }
+		        return output_count;
+	        },
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {
@@ -1102,7 +1133,7 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     false);
+			                                                     DuckDBRelationPlanKind::READ);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
@@ -1115,7 +1146,20 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     true);
+			                                                     DuckDBRelationPlanKind::WRITE);
+		                } catch (const py::type_error &) {
+			                throw;
+		                } catch (const py::error_already_set &) {
+			                throw;
+		                } catch (const std::exception &ex) {
+			                throw py::value_error(ex.what());
+		                }
+	                })
+	    .def_static("from_duckdb_datasink_relation",
+	                [](py::object relation_obj, py::object query_id_obj) {
+		                try {
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     DuckDBRelationPlanKind::DATA_SINK);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
@@ -1291,6 +1335,68 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 		        return self.run_copy_plan(*plan_ptr, client_context, std::move(keepalive),
 		                                  std::move(on_execution_started));
+	        },
+	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
+	    .def(
+	        "run_datasink_plan",
+	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj,
+	           py::object on_execution_started_obj) -> py::dict {
+		        if (!py::isinstance<PyPhysicalPlanWrapper>(plan_obj)) {
+			        throw py::type_error("plan must be DistributedPhysicalPlan (PyPhysicalPlanWrapper)");
+		        }
+		        const auto *plan_ptr = plan_obj.cast<PyPhysicalPlanWrapper *>();
+		        if (!plan_ptr->IsInitialized()) {
+			        throw py::value_error(
+			            "DistributedPhysicalPlan is uninitialized; construct it via constructor/helper APIs");
+		        }
+
+		        auto get_client_context = [plan_ptr](py::object connection_obj,
+		                                             duckdb::distributed::python::ray::SafePyObject &keepalive)
+		            -> duckdb::shared_ptr<duckdb::ClientContext> {
+			        if (!plan_ptr->worker_connection_.is_none()) {
+				        try {
+					        auto &py_conn = ExtractPyConnectionWrapper(plan_ptr->worker_connection_);
+					        auto &db_conn = py_conn.con.GetConnection();
+					        if (db_conn.context) {
+						        keepalive =
+						            duckdb::distributed::python::ray::SafePyObject(plan_ptr->worker_connection_);
+						        return db_conn.context;
+					        }
+				        } catch (...) {
+				        }
+			        }
+			        if (plan_ptr->client_context_) {
+				        return plan_ptr->client_context_;
+			        }
+			        if (connection_obj.is_none()) {
+				        return nullptr;
+			        }
+			        py::object resolved_conn = connection_obj;
+			        if (py::hasattr(connection_obj, "c")) {
+				        resolved_conn = connection_obj.attr("c");
+			        }
+			        try {
+				        auto &py_conn = resolved_conn.cast<duckdb::DuckDBPyConnection &>();
+				        auto &db_conn = py_conn.con.GetConnection();
+				        if (!db_conn.context) {
+					        return nullptr;
+				        }
+				        keepalive = duckdb::distributed::python::ray::SafePyObject(resolved_conn);
+				        return db_conn.context;
+			        } catch (...) {
+				        return nullptr;
+			        }
+		        };
+
+		        duckdb::distributed::python::ray::SafePyObject keepalive;
+		        auto client_context = get_client_context(conn_obj, keepalive);
+		        duckdb::distributed::python::ray::SafePyObject on_execution_started;
+		        if (!on_execution_started_obj.is_none()) {
+			        on_execution_started =
+			            duckdb::distributed::python::ray::SafePyObject(std::move(on_execution_started_obj));
+		        }
+		        return self.run_datasink_plan(*plan_ptr, client_context, std::move(keepalive),
+		                                      std::move(on_execution_started));
 	        },
 	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
 	    .def(

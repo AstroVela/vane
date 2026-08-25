@@ -930,6 +930,9 @@ def test_ray_task_result_rejects_mark_summary_payload_without_validity(payload_f
                 exchange_sink_instance={payload_field: True},
             )
 
+        def ack(self):
+            return None
+
         def release_result_payload(self):
             return None
 
@@ -1022,6 +1025,7 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
             self._error = None
             self._future = None
             self.task = None
+            self.ack_calls = 0
             self.release_calls = 0
 
         def _ensure_started(self):
@@ -1045,6 +1049,9 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
                 sink_instance.to_dict(),
             )
 
+        def ack(self):
+            self.ack_calls += 1
+
         def release_result_payload(self):
             self.release_calls += 1
 
@@ -1056,6 +1063,7 @@ def test_ray_task_result_handle_uses_refreshed_worker_id_and_nested_sink_query_i
     assert result["flight_port"] == 5010
     assert result["has_exchange_sink_instance"] is True
     assert result["exchange_sink_query_id"] == "query-nested"
+    assert handle.ack_calls == 1
     assert handle.release_calls == 1
 
 
@@ -1073,6 +1081,7 @@ class _PollerTestHandle:
         self.result_error = result_error
         self.ready_after = ready_after
         self.done_calls = 0
+        self.ack_calls = 0
 
     def done(self):
         if self.done_error is not None:
@@ -1084,6 +1093,9 @@ class _PollerTestHandle:
         if self.result_error is not None:
             raise self.result_error
         return vane.ray_cxx.RayTaskResult.success([], [], None, 5010, None)
+
+    def ack(self):
+        self.ack_calls += 1
 
 
 def _poll_with_shared_ray_task_result_poller(*handles):
@@ -4352,7 +4364,11 @@ def test_ray_worker_manager_drop_fans_out_after_result_payload_release_failure(m
             self.result_handles = list(result_handles)
 
         def fte_query_status(self, _query_id):
-            return {"failed": False, "finished": False}
+            return {
+                "failed": False,
+                "finished": False,
+                "selected_attempt_task_ids": [],
+            }
 
         def pop_fte_result_handles(self, _query_id):
             handles = self.result_handles
@@ -4668,6 +4684,7 @@ def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeyp
                 "matched": False,
                 "canceled": False,
                 "registration_pending": False,
+                "selected_attempt_task_ids": [],
             }
         return {
             "failed": False,
@@ -4675,6 +4692,7 @@ def test_ray_worker_manager_scoped_wait_rejects_terminal_unmatched_scope(monkeyp
             "matched": True,
             "canceled": False,
             "registration_pending": False,
+            "selected_attempt_task_ids": [],
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)
@@ -4697,6 +4715,7 @@ def test_ray_worker_manager_scoped_wait_allows_pending_registration(monkeypatch)
             "matched": status_calls > 1,
             "canceled": False,
             "registration_pending": status_calls == 1,
+            "selected_attempt_task_ids": [],
         },
     )
     manager.register_query_owner("query-pending-scope", "query-pending-scope")
@@ -4718,6 +4737,7 @@ def test_ray_worker_manager_scoped_wait_stops_when_query_is_canceled(monkeypatch
             "canceled": True,
             "registration_pending": False,
             "message": "query registry is closing",
+            "selected_attempt_task_ids": [],
         },
     )
     manager.register_query_owner("query-canceled-scope", "query-canceled-scope")
@@ -4725,6 +4745,32 @@ def test_ray_worker_manager_scoped_wait_stops_when_query_is_canceled(monkeypatch
     try:
         with pytest.raises(Exception, match="FTE query canceled.*query registry is closing"):
             manager._wait_fte_query_scoped_for_test("query-canceled-scope")
+        assert worker_handle.status_calls == 1
+    finally:
+        manager.shutdown()
+
+
+def test_ray_worker_manager_status_does_not_stringify_unrelated_fields(monkeypatch):
+    class ExplosiveRepr:
+        def __repr__(self):
+            raise AssertionError("unrelated status fields must not be stringified")
+
+    manager, worker_handle = _ray_worker_manager_for_scoped_wait(
+        monkeypatch,
+        lambda _status_calls: {
+            "failed": False,
+            "finished": True,
+            "matched": True,
+            "canceled": False,
+            "registration_pending": False,
+            "unrelated": ExplosiveRepr(),
+            "selected_attempt_task_ids": [],
+        },
+    )
+    manager.register_query_owner("query-bounded-status", "query-bounded-status")
+
+    try:
+        manager._wait_fte_query_scoped_for_test("query-bounded-status")
         assert worker_handle.status_calls == 1
     finally:
         manager.shutdown()
@@ -4741,6 +4787,7 @@ def test_ray_worker_manager_shutdown_cancels_unbounded_scoped_wait(monkeypatch):
             "matched": status_calls >= 50,
             "canceled": False,
             "registration_pending": status_calls < 50,
+            "selected_attempt_task_ids": [],
         }
 
     manager, worker_handle = _ray_worker_manager_for_scoped_wait(monkeypatch, status_for_call)

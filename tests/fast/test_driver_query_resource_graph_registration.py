@@ -254,6 +254,7 @@ def _runner(events, coordinator):
     runner._active_udf_actors = []
     runner._active_udf_actors_by_plan = {}
     runner._active_udf_actor_by_unit = {}
+    runner._udf_actor_cleanup_diagnostics_by_plan = {}
     runner._query_udf_actor_nodes = {}
     runner._query_udf_session_configs = {}
     runner._query_udf_actor_activation_tasks = {}
