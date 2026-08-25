@@ -186,6 +186,12 @@ public:
 		return "OpenerFileSystem - " + GetFileSystem().GetName();
 	}
 
+	bool HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		VerifyNoOpener(opener);
+		VerifyCanAccessDirectory(path);
+		return GetFileSystem().HasDirectorySemantics(path, GetOpener());
+	}
+
 	void RegisterSubSystem(unique_ptr<FileSystem> sub_fs) override {
 		GetFileSystem().RegisterSubSystem(std::move(sub_fs));
 	}

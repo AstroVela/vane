@@ -844,7 +844,19 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 		}
 	}
 
-	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem)));
+	// fsspec does not expose a general capability that distinguishes concrete
+	// directories from object-store prefixes. Its LocalFileSystem hierarchy has
+	// concrete directory semantics; other hierarchical implementations can opt
+	// in explicitly without relying on protocol-name heuristics.
+	bool directory_semantics;
+	if (py::hasattr(filesystem, "vane_directory_semantics")) {
+		directory_semantics = py::bool_(filesystem.attr("vane_directory_semantics"));
+	} else {
+		auto local_filesystem = py::module::import("fsspec.implementations.local").attr("LocalFileSystem");
+		directory_semantics = py::isinstance(filesystem, local_filesystem);
+	}
+
+	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
 }
 
 py::list DuckDBPyConnection::ListFilesystems() {

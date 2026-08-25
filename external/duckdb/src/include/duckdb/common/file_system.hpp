@@ -302,6 +302,8 @@ public:
 
 	//! Whether this is a LocalFileSystem instance.
 	DUCKDB_API virtual bool IsLocalFileSystem() const;
+	//! Whether the filesystem handling this path has concrete directory entries rather than key-prefix semantics.
+	DUCKDB_API virtual bool HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener = nullptr);
 
 	//! Return the name of the filesytem. Used for forming diagnosis messages.
 	DUCKDB_API virtual std::string GetName() const = 0;
