@@ -233,7 +233,7 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
 	PythonGILWrapper gil;
 	bool nonempty = false;
 
-	for (auto item : filesystem.attr("ls")(py::str(directory))) {
+	for (auto item : filesystem.attr("ls")(py::str(directory), py::arg("detail") = true)) {
 		bool is_dir = py::cast<std::string>(item["type"]) == "directory";
 		callback(py::str(item["name"]), is_dir);
 		nonempty = true;

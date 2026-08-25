@@ -53,12 +53,13 @@ class PythonFilesystem : public FileSystem {
 private:
 	const vector<string> protocols;
 	AbstractFileSystem filesystem;
+	const bool directory_semantics;
 	std::string DecodeFlags(FileOpenFlags flags);
 	bool Exists(const string &filename, const char *func_name) const;
 
 public:
-	explicit PythonFilesystem(vector<string> protocols, AbstractFileSystem filesystem)
-	    : protocols(std::move(protocols)), filesystem(std::move(filesystem)) {
+	explicit PythonFilesystem(vector<string> protocols, AbstractFileSystem filesystem, bool directory_semantics)
+	    : protocols(std::move(protocols)), filesystem(std::move(filesystem)), directory_semantics(directory_semantics) {
 	}
 	~PythonFilesystem() override;
 
@@ -88,6 +89,9 @@ public:
 
 	bool IsManuallySet() override {
 		return true;
+	}
+	bool HasDirectorySemantics(const string &, optional_ptr<FileOpener> = nullptr) override {
+		return directory_semantics;
 	}
 
 	bool OnDiskFile(FileHandle &handle) override {

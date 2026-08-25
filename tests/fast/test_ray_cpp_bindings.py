@@ -2631,6 +2631,62 @@ def test_copy_direct_write_lifecycle_cleanup_once_uses_connection_filesystem():
     assert not filesystem.exists(data_path)
 
 
+def test_copy_direct_write_lifecycle_cleanup_preserves_registered_local_directory_error(tmp_path, monkeypatch):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    filesystem = fsspec.filesystem("file", skip_instance_cache=True)
+    base = tmp_path / "registered_local_cleanup"
+    base_path = f"file://{base.as_posix()}"
+    run_id = "run-local-directory-error"
+    run_dir = base / f"_vane_direct_write_{run_id}"
+    data_file = run_dir / "w_failed" / "part.parquet"
+    lifecycle_file = base.parent / f"{base.name}.duckdb_commit" / run_id / "lifecycle.txt"
+    data_file.parent.mkdir(parents=True)
+    data_file.write_bytes(b"stale")
+    lifecycle_file.parent.mkdir(parents=True)
+    lifecycle_file.write_text(
+        textwrap.dedent(
+            f"""\
+            version=2
+            mode=direct_write
+            base_path={base_path}
+            worker_base_path={base_path}
+            run_id={run_id}
+            created_epoch_ms=1000
+            direct_write_run_dir={base_path}/_vane_direct_write_{run_id}
+            """
+        )
+    )
+
+    original_rm = filesystem.rm
+
+    def fail_run_directory_removal(path, recursive=False, **kwargs):
+        stripped_path = filesystem._strip_protocol(path).rstrip("/")
+        if recursive and stripped_path == run_dir.as_posix():
+            raise PermissionError("injected registered-local directory removal failure")
+        return original_rm(path, recursive=recursive, **kwargs)
+
+    monkeypatch.setattr(filesystem, "rm", fail_run_directory_removal)
+    conn = vane.connect()
+    try:
+        conn.register_filesystem(filesystem)
+        result = vane.ray_cxx.cleanup_expired_copy_direct_write_runs(
+            base_path,
+            min_age_ms=5_000,
+            now_epoch_ms=10_000,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+
+    assert result["scanned_runs"] == 1
+    assert result["cleaned_runs"] == 0
+    assert result["errors"] == 1
+    assert "injected registered-local directory removal failure" in result["error_messages"][0]
+    assert not data_file.exists()
+    assert run_dir.exists()
+    assert lifecycle_file.exists()
+
+
 def test_copy_direct_write_lifecycle_cleanup_releases_gil_before_connection_lock():
     pytest.importorskip("fsspec", minversion="2022.11.0")
     script = textwrap.dedent(
