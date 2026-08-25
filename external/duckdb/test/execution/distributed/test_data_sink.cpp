@@ -35,11 +35,13 @@ ResultPartitionRef DataSinkPartition(const string &operation_id, const string &s
 
 class ReportedCountDataSinkPartition final : public ResultPartition {
 public:
-	explicit ReportedCountDataSinkPartition(size_t rows) : rows_(rows) {
+	explicit ReportedCountDataSinkPartition(size_t rows, size_t bytes = 0,
+	                                        std::shared_ptr<ColumnDataCollection> collection = nullptr)
+	    : rows_(rows), bytes_(bytes), collection_(std::move(collection)) {
 	}
 
 	DuckDBResult<size_t> size_bytes() const override {
-		return DuckDBResult<size_t>::ok(0);
+		return DuckDBResult<size_t>::ok(bytes_);
 	}
 
 	DuckDBResult<size_t> num_rows() const override {
@@ -48,7 +50,7 @@ public:
 
 	std::shared_ptr<ColumnDataCollection> to_column_data() const override {
 		materialized_ = true;
-		return nullptr;
+		return collection_;
 	}
 
 	bool materialized() const {
@@ -57,6 +59,8 @@ public:
 
 private:
 	size_t rows_;
+	size_t bytes_;
+	std::shared_ptr<ColumnDataCollection> collection_;
 	mutable bool materialized_ = false;
 };
 
@@ -114,6 +118,11 @@ TEST_CASE("DataSink worker result protocol rejects ambiguous or invalid payloads
 
 	auto bad_collection = std::make_shared<ColumnDataCollection>(Allocator::DefaultAllocator(),
 	                                                             vector<LogicalType> {LogicalType::VARCHAR});
+	DataChunk bad_chunk;
+	bad_chunk.Initialize(Allocator::DefaultAllocator(), bad_collection->Types());
+	bad_chunk.SetValue(0, 0, Value("invalid"));
+	bad_chunk.SetCardinality(1);
+	bad_collection->Append(bad_chunk);
 	vector<ResultPartitionRef> invalid_schema;
 	invalid_schema.push_back(std::make_shared<ColumnDataResultPartition>(std::move(bad_collection)));
 	auto schema_result = ParseDataSinkPartitions("operation-1", invalid_schema);
@@ -132,6 +141,10 @@ TEST_CASE("DataSink outcome diagnostics are bounded before coordinator transport
 	REQUIRE(StringUtil::StartsWith(bounded, "diagnostic-head:"));
 	REQUIRE(StringUtil::EndsWith(bounded, ":diagnostic-tail"));
 	REQUIRE(StringUtil::Contains(bounded, "..."));
+	const auto bounded_c_string = BoundDataSinkOutcomeError(oversized.c_str());
+	REQUIRE(bounded_c_string.size() == DATA_SINK_MAX_OUTCOME_ERROR_BYTES);
+	REQUIRE(StringUtil::StartsWith(bounded_c_string, "diagnostic-head:"));
+	REQUIRE(StringUtil::EndsWith(bounded_c_string, "..."));
 	REQUIRE(BoundDataSinkOutcomeError("short diagnostic") == "short diagnostic");
 }
 
@@ -150,6 +163,46 @@ TEST_CASE("DataSink result partitions are bounded while the coordinator collects
 	auto oversized_result = oversized_collector.Append(oversized_partition);
 	REQUIRE(oversized_result.is_err());
 	REQUIRE_FALSE(oversized_partition->materialized());
+	auto oversized_bytes_partition =
+	    std::make_shared<ReportedCountDataSinkPartition>(1, DATA_SINK_MAX_TOTAL_RESULT_BYTES + 1);
+	DataSinkResultCollector oversized_bytes_collector("oversized-bytes-operation");
+	auto oversized_bytes_result = oversized_bytes_collector.Append(oversized_bytes_partition);
+	REQUIRE(oversized_bytes_result.is_err());
+	REQUIRE(StringUtil::Contains(oversized_bytes_result.error().what(), "64 MiB materialization limit"));
+	REQUIRE_FALSE(oversized_bytes_partition->materialized());
+	auto first_bundle_partition =
+	    std::make_shared<ReportedCountDataSinkPartition>(1, DATA_SINK_MAX_TOTAL_RESULT_BYTES / 2 + 1);
+	auto second_bundle_partition =
+	    std::make_shared<ReportedCountDataSinkPartition>(1, DATA_SINK_MAX_TOTAL_RESULT_BYTES / 2 + 1);
+	DataSinkResultCollector oversized_bundle_collector("oversized-bundle-operation");
+	auto oversized_bundle_result = oversized_bundle_collector.Append({first_bundle_partition, second_bundle_partition});
+	REQUIRE(oversized_bundle_result.is_err());
+	REQUIRE(StringUtil::Contains(oversized_bundle_result.error().what(), "result bundle"));
+	REQUIRE_FALSE(first_bundle_partition->materialized());
+	REQUIRE_FALSE(second_bundle_partition->materialized());
+	auto zero_rows_partition = std::make_shared<ReportedCountDataSinkPartition>(0, 1);
+	DataSinkResultCollector zero_rows_collector("zero-rows-operation");
+	auto zero_rows_result = zero_rows_collector.Append(zero_rows_partition);
+	REQUIRE(zero_rows_result.is_err());
+	REQUIRE(StringUtil::Contains(zero_rows_result.error().what(), "must report at least one row"));
+	REQUIRE_FALSE(zero_rows_partition->materialized());
+	auto unknown_size_partition = std::make_shared<ReportedCountDataSinkPartition>(1, 0);
+	DataSinkResultCollector unknown_size_collector("unknown-size-operation");
+	auto unknown_size_result = unknown_size_collector.Append(unknown_size_partition);
+	REQUIRE(unknown_size_result.is_err());
+	REQUIRE(StringUtil::Contains(unknown_size_result.error().what(), "must report a positive byte size"));
+	REQUIRE_FALSE(unknown_size_partition->materialized());
+
+	auto mismatched_payload =
+	    DataSinkPartition("mismatched-count-operation", "applied", 1, Value::UBIGINT(1), 8)->to_column_data();
+	const auto mismatched_payload_size = mismatched_payload->SizeInBytes();
+	auto mismatched_count_partition =
+	    std::make_shared<ReportedCountDataSinkPartition>(2, mismatched_payload_size, std::move(mismatched_payload));
+	DataSinkResultCollector mismatched_count_collector("mismatched-count-operation");
+	auto mismatched_count_result = mismatched_count_collector.Append(mismatched_count_partition);
+	REQUIRE(mismatched_count_result.is_err());
+	REQUIRE(StringUtil::Contains(mismatched_count_result.error().what(), "row-count metadata"));
+	REQUIRE(mismatched_count_partition->materialized());
 
 	auto row_result = ValidateDataSinkResultBudget(DATA_SINK_MAX_WRITE_RESULTS, 0, 1);
 	REQUIRE(row_result.is_err());
@@ -161,6 +214,53 @@ TEST_CASE("DataSink result partitions are bounded while the coordinator collects
 
 	REQUIRE(
 	    ValidateDataSinkResultBudget(DATA_SINK_MAX_WRITE_RESULTS - 1, DATA_SINK_MAX_TOTAL_RESULT_BYTES - 1, 1).is_ok());
+}
+
+TEST_CASE("DataSink collector rolls back an entire unacknowledged output on validation failure",
+          "[distributed][datasink]") {
+	DataSinkResultCollector collector("atomic-output");
+	vector<ResultPartitionRef> partitions;
+	partitions.push_back(DataSinkPartition("atomic-output", "applied", 1, Value::UBIGINT(1), 8));
+	partitions.push_back(DataSinkPartition("different-operation", "applied", 1, Value::UBIGINT(1), 8));
+
+	auto append_result = collector.Append(partitions);
+	REQUIRE(append_result.is_err());
+	auto finalized = collector.Finalize();
+	REQUIRE(finalized.is_ok());
+	REQUIRE(finalized.value().write_results.empty());
+}
+
+TEST_CASE("DataSink streaming validation rolls back a partially invalid chunk", "[distributed][datasink]") {
+	const string operation_id = "atomic-validation";
+	vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                           LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetValue(0, 0, Value(operation_id));
+	chunk.SetValue(1, 0, Value("applied"));
+	chunk.SetValue(2, 0, Value::UBIGINT(1));
+	chunk.SetValue(3, 0, Value::UBIGINT(1));
+	chunk.SetValue(4, 0, Value::UBIGINT(8));
+	chunk.SetValue(5, 0, Value("{}"));
+	chunk.SetValue(6, 0, Value("[]"));
+	chunk.SetValue(0, 1, Value("different-operation"));
+	chunk.SetValue(1, 1, Value("applied"));
+	chunk.SetValue(2, 1, Value::UBIGINT(1));
+	chunk.SetValue(3, 1, Value::UBIGINT(1));
+	chunk.SetValue(4, 1, Value::UBIGINT(8));
+	chunk.SetValue(5, 1, Value("{}"));
+	chunk.SetValue(6, 1, Value("[]"));
+	chunk.SetCardinality(2);
+
+	DataSinkResultValidationState validation(operation_id);
+	vector<DataSinkWriteResult> retained_results;
+	auto append_result = validation.Append(chunk, &retained_results);
+
+	REQUIRE(append_result.is_err());
+	REQUIRE(validation.write_result_count() == 0);
+	REQUIRE(validation.total_result_bytes() == 0);
+	REQUIRE(validation.result_state().empty());
+	REQUIRE(retained_results.empty());
 }
 
 TEST_CASE("DataSink streaming validation rejects output before a task collector can exceed its byte budget",

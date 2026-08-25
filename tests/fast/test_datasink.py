@@ -210,6 +210,16 @@ class _BlockingCloseBound(_Bound):
         return _BlockingCloseWorker()
 
 
+class _OversizedCloseWorker(_Worker):
+    def close(self) -> None:
+        raise RuntimeError("cleanup-head:" + "x" * 100_000 + ":cleanup-tail")
+
+
+class _OversizedCloseBound(_Bound):
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _OversizedCloseWorker()
+
+
 class _FailingWorkerWithCloseMarker(DataSinkWorker):
     def __init__(self, marker_path: str) -> None:
         self._marker_path = marker_path
@@ -317,7 +327,7 @@ def test_datasink_rejects_source_explicit_transaction_before_binding():
     sink = _SchemaSink()
     connection.execute("BEGIN")
     try:
-        with pytest.raises(Exception, match="cannot participate in an explicit transaction"):
+        with pytest.raises(vane.InvalidInputException, match="cannot participate in an explicit transaction"):
             relation.write_datasink(sink, operation_id="explicit-transaction-datasink")
     finally:
         connection.execute("ROLLBACK")
@@ -415,6 +425,20 @@ def test_local_fast_datasink_close_timeout_is_cleanup_warning(monkeypatch):
     assert any("graceful shutdown timed out" in warning for warning in summary.warnings)
 
 
+def test_local_fast_datasink_bounds_native_cleanup_warning(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    summary = vane.sql("SELECT 1 AS id").write_datasink(
+        _Sink(_OversizedCloseBound()),
+        operation_id="local-fast-bounded-close-warning",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert len(summary.warnings) == 1
+    assert len(summary.warnings[0].encode("utf-8")) <= 4 * 1024
+    assert "error text exceeds 4096 bytes and was omitted" in summary.warnings[0]
+
+
 def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
     relation = vane.sql("SELECT 1 AS id WHERE false")
@@ -430,18 +454,40 @@ def test_local_fast_empty_input_does_not_open_a_worker(monkeypatch):
 def test_datasink_terminal_rejects_invalid_empty_wire_schema():
     terminal = vane.sql("SELECT 1 AS invalid_wire_column WHERE false")._mark_datasink("invalid-empty-schema")
 
-    with pytest.raises(Exception, match="DataSink worker result schema"):
+    with pytest.raises(vane.InvalidInputException, match="DataSink worker result schema"):
         terminal.to_arrow_table()
 
 
-def test_worker_close_failure_is_reported_during_actor_teardown():
+def test_worker_close_failure_retains_worker_for_cleanup_retry():
     from vane.datasink import _SinkBatchRuntime
 
-    runtime = _SinkBatchRuntime(_Bound(fail_close=True), WriteContext("close-failure"), None)
+    calls: list[str] = []
+
+    class _RetryCloseWorker(DataSinkWorker):
+        def write(self, table: pa.Table) -> WriteResult:
+            return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+        def close(self) -> None:
+            calls.append("close")
+            if len(calls) == 1:
+                raise RuntimeError("planned close failure")
+
+    class _RetryCloseBound(_Bound):
+        def open_worker(self, context: WriteContext) -> DataSinkWorker:
+            return _RetryCloseWorker()
+
+    runtime = _SinkBatchRuntime(_RetryCloseBound(), WriteContext("close-failure"), None)
     runtime(pa.table({"id": [1]}))
 
     with pytest.raises(RuntimeError, match="planned close failure"):
         runtime.close()
+    with pytest.raises(RuntimeError, match="cannot be reused"):
+        runtime(pa.table({"id": [2]}))
+
+    runtime.close()
+    runtime.close()
+
+    assert calls == ["close", "close"]
 
 
 def test_worker_abort_diagnostic_cannot_mask_original_failure():
@@ -605,7 +651,9 @@ def test_datasink_protocol_values_reject_invalid_utf8():
     [
         {"batch_size": 0},
         {"memory_bytes": -1},
+        {"batch_size": 1 << 63},
         {"cpus": float("nan")},
+        {"cpus": 1 << 1024},
         {"gpus": -0.1},
     ],
 )
@@ -620,6 +668,7 @@ def test_execution_options_reject_invalid_resource_requests(kwargs):
         {"worker_count": 0},
         {"worker_count": True},
         {"worker_count": 1.5},
+        {"worker_count": 1 << 63},
     ],
 )
 def test_execution_options_reject_invalid_worker_requests(kwargs):
@@ -628,18 +677,24 @@ def test_execution_options_reject_invalid_worker_requests(kwargs):
 
 
 def test_execution_options_map_to_actor_backends():
-    options = DataSinkExecutionOptions(worker_count=3, batch_size=20)
+    options = DataSinkExecutionOptions(worker_count=3, batch_size=20, cpus=1, gpus=0)
 
     assert options.map_batches_kwargs("ray") == {
         "batch_size": 20,
+        "cpus": 1.0,
+        "gpus": 0.0,
         "execution_backend": "ray_actor",
         "actor_number": 3,
     }
     assert options.map_batches_kwargs("local") == {
         "batch_size": 20,
+        "cpus": 1.0,
+        "gpus": 0.0,
         "execution_backend": "subprocess_actor",
         "actor_number": 3,
     }
+    assert type(options.cpus) is float
+    assert type(options.gpus) is float
     assert DataSinkExecutionOptions().worker_count == 1
     with pytest.raises(ValueError, match="unsupported DataSink runner"):
         options.map_batches_kwargs("unsupported")
@@ -713,6 +768,44 @@ def test_keyed_unique_input_is_applied(monkeypatch):
 
     assert summary.outcome is WriteOutcome.APPLIED
     assert summary.rows_received == 2
+
+
+def test_keyed_column_names_preserve_significant_whitespace(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    class _WhitespaceKeyBound(_KeyedBound):
+        @property
+        def key_columns(self) -> tuple[str, ...]:
+            return (" id ",)
+
+    relation = vane.sql("SELECT 1 AS \" id \", 'value' AS payload")
+
+    summary = relation.write_datasink(
+        _Sink(_WhitespaceKeyBound()),
+        operation_id="whitespace-key-column",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == 1
+
+
+def test_keyed_validation_projects_the_resolved_input_column_name(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+
+    class _CasefoldedKeyBound(_KeyedBound):
+        @property
+        def key_columns(self) -> tuple[str, ...]:
+            return ("SS",)
+
+    relation = vane.sql("SELECT 1 AS \"ß\", 'value' AS payload")
+
+    summary = relation.write_datasink(
+        _Sink(_CasefoldedKeyBound()),
+        operation_id="casefolded-key-column",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == 1
 
 
 def test_replayed_and_losing_attempts_converge_for_idempotent_worker():
@@ -931,6 +1024,24 @@ def test_write_result_rejects_unbounded_metadata_and_warnings():
         WriteResult(rows_received=1, warnings=(warning for warning in ("never-consumed",)))
 
 
+def test_write_result_rejects_oversized_metadata_before_encoding():
+    class _GuardedLargeText(str):
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("oversized metadata must be rejected before encoding")
+
+    with pytest.raises(ValueError, match="64 KiB"):
+        WriteResult(rows_received=1, metadata={"value": _GuardedLargeText("x" * 100_000)})
+
+
+def test_write_result_rejects_oversized_integer_before_encoding():
+    from vane import datasink as datasink_module
+
+    oversized_integer = 1 << (datasink_module._MAX_RESULT_METADATA_INTEGER_BITS + 1)
+
+    with pytest.raises(ValueError, match="64 KiB"):
+        WriteResult(rows_received=1, metadata={"value": oversized_integer})
+
+
 def test_summary_aggregates_are_bounded_by_result_count_not_uint64():
     result = WriteResult(
         rows_received=(1 << 64) - 1,
@@ -1035,6 +1146,125 @@ def test_cleanup_warnings_and_outcome_detail_are_bounded():
     assert len(error.detail.encode("utf-8")) <= 4 * 1024
     assert error.detail.startswith("detail-head:")
     assert error.detail.endswith(":provider-root-cause")
+
+
+def test_datasink_write_error_requires_boolean_retry_safety():
+    summary = vane.datasink._summary(WriteContext("strict-retry-safety"), WriteOutcome.UNKNOWN, ())
+
+    with pytest.raises(TypeError, match="safe_to_retry must be a boolean"):
+        DataSinkWriteError(summary, "unknown", safe_to_retry=1)
+
+
+def test_cleanup_warning_bounds_input_before_normalization():
+    class _GuardedLargeText(str):
+        def strip(self, *_args, **_kwargs):
+            raise AssertionError("the unbounded input must be sliced before strip")
+
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("the unbounded input must be sliced before encode")
+
+    warning = _GuardedLargeText("warning-head:" + "x" * 100_000 + ":warning-tail")
+
+    bounded = vane.datasink._bounded_warning(warning)
+
+    assert len(bounded.encode("utf-8")) <= 4 * 1024
+    assert bounded.startswith("warning-head:")
+    assert bounded.endswith(":warning-tail")
+
+
+def test_diagnostic_text_honors_the_minimum_utf8_byte_limit():
+    from vane.execution._diagnostics import bounded_utf8_text
+
+    assert bounded_utf8_text("oversized", 3) == "…"
+
+
+def test_datasink_error_summary_bounds_oversized_exception_type_name():
+    class OversizedTypeNameError(RuntimeError):
+        pass
+
+    OversizedTypeNameError.__name__ = "x" * 100_000
+
+    summary = vane.datasink._safe_error_summary(OversizedTypeNameError("planned provider failure"))
+
+    assert summary == "BaseException: planned provider failure"
+    assert len(summary.encode("utf-8")) <= 4 * 1024
+
+
+def test_datasink_error_summary_does_not_invoke_exception_string_conversion():
+    class UnprintableError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("provider exception string conversion must not run")
+
+    summary = vane.datasink._safe_error_summary(UnprintableError("safe provider detail"))
+
+    assert summary == "UnprintableError: safe provider detail"
+
+
+def test_local_cleanup_warning_batch_bounds_count_and_exception_type_name():
+    from vane.runners.local.runner import (
+        _DATASINK_CLEANUP_WARNING_LIMIT,
+        _DATASINK_CLEANUP_WARNINGS_OMITTED,
+        _datasink_cleanup_warning_batch,
+    )
+
+    class OversizedTypeNameError(RuntimeError):
+        pass
+
+    OversizedTypeNameError.__name__ = "x" * 100_000
+    errors = [OversizedTypeNameError(f"cleanup-{index}") for index in range(100)]
+
+    warnings = _datasink_cleanup_warning_batch("DataSink resource shutdown", errors)
+
+    assert len(warnings) == _DATASINK_CLEANUP_WARNING_LIMIT
+    assert warnings[0] == "DataSink resource shutdown failed: BaseException: cleanup-0"
+    assert warnings[-1] == _DATASINK_CLEANUP_WARNINGS_OMITTED
+    assert all(len(warning.encode("utf-8")) <= 4 * 1024 for warning in warnings)
+
+
+def test_write_result_rejects_oversized_warning_before_normalization():
+    class _GuardedLargeText(str):
+        def strip(self, *_args, **_kwargs):
+            raise AssertionError("oversized warnings must be rejected before strip")
+
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError("oversized warnings must be rejected before encode")
+
+    with pytest.raises(ValueError, match="at most 4 KiB"):
+        WriteResult(rows_received=0, warnings=(_GuardedLargeText("x" * 100_000),))
+
+
+def test_result_mapping_rejects_warning_count_before_copying():
+    class _GuardedWarnings(list):
+        def __iter__(self):
+            raise AssertionError("oversized warnings must be rejected before copying")
+
+    payload = {
+        "operation_id": "bounded-result-warnings",
+        "state": "applied",
+        "rows_received": 0,
+        "rows_affected": 0,
+        "bytes_received": 0,
+        "metadata": {},
+        "warnings": _GuardedWarnings(["warning"] * 5),
+    }
+
+    with pytest.raises(ValueError, match="at most four"):
+        vane.datasink._write_result_from_mapping("bounded-result-warnings", payload)
+
+
+def test_result_mapping_rejects_non_string_state():
+    payload = {
+        "operation_id": "strict-result-state",
+        "state": 1,
+        "rows_received": 0,
+        "rows_affected": 0,
+        "bytes_received": 0,
+        "metadata": {},
+        "warnings": [],
+    }
+
+    with pytest.raises(TypeError, match="state must be a string"):
+        vane.datasink._write_result_from_mapping("strict-result-state", payload)
 
 
 def test_local_fte_datasink(monkeypatch):
@@ -1145,6 +1375,39 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
 
     assert summary.outcome is WriteOutcome.APPLIED
     assert any("planned progress failure" in warning for warning in summary.warnings)
+
+
+def test_local_fte_datasink_progress_interrupt_stops_with_unknown_outcome(monkeypatch):
+    from vane import runners
+    from vane.runners.local import runner as local_runner_module
+    from vane.runners.local.runner import LocalRunner
+
+    class InterruptingProgressRenderer:
+        interval_s = 0.001
+
+        def __init__(self, snapshot_getter):
+            self.snapshot_getter = snapshot_getter
+
+        def update(self, *, force=False):
+            raise KeyboardInterrupt("planned progress interrupt")
+
+        def finish(self, *, final_state=None):
+            return None
+
+    monkeypatch.setattr(local_runner_module, "progress_enabled", lambda runner: True)
+    monkeypatch.setattr(local_runner_module, "ProgressRenderer", InterruptingProgressRenderer)
+    runner = LocalRunner(num_workers=1)
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "local")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_SlowBound()),
+            operation_id="local-progress-interrupt",
+        )
+
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "planned progress interrupt" in exc_info.value.detail
 
 
 def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):

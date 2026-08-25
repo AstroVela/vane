@@ -23,6 +23,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
+from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
@@ -36,6 +38,10 @@ _MAX_TOTAL_RESULT_BYTES = 64 * 1024 * 1024
 _MAX_WRITE_RESULT_WARNINGS = 4
 _MAX_SUMMARY_WARNINGS = 16
 _MAX_WARNING_BYTES = 4 * 1024
+_MAX_ERROR_TYPE_NAME_BYTES = 256
+_MAX_RESULT_METADATA_INTEGER_BITS = math.ceil(_MAX_RESULT_METADATA_BYTES * math.log2(10))
+_RESULT_DECODE_BATCH_ROWS = 2 * 1024
+_MAX_INT64 = (1 << 63) - 1
 _MAX_UINT64 = (1 << 64) - 1
 _WARNINGS_OMITTED = "additional DataSink warnings omitted"
 
@@ -98,17 +104,90 @@ def _plain_json_value(name: str, value: Any) -> Any:
     return value
 
 
+class _MetadataTooLargeError(ValueError):
+    pass
+
+
+def _bounded_plain_json_value(name: str, value: Any) -> Any:
+    remaining_nodes = _MAX_RESULT_METADATA_BYTES
+    active_containers: set[int] = set()
+
+    def normalize(item: Any) -> Any:
+        nonlocal remaining_nodes
+        remaining_nodes -= 1
+        if remaining_nodes < 0:
+            raise _MetadataTooLargeError
+        if isinstance(item, str):
+            # Every Unicode code point requires at least one encoded byte. Stop
+            # before JSON escaping or UTF-8 encoding can create an unbounded
+            # temporary that will inevitably exceed the wire limit.
+            if len(item) > _MAX_RESULT_METADATA_BYTES:
+                raise _MetadataTooLargeError
+            return item
+        if isinstance(item, int) and not isinstance(item, bool):
+            # JSONEncoder renders an integer into one complete decimal string
+            # before yielding it. Reject values whose representation cannot fit
+            # before that temporary can grow beyond the metadata wire budget.
+            if int.bit_length(item) > _MAX_RESULT_METADATA_INTEGER_BITS:
+                raise _MetadataTooLargeError
+            return item
+        if isinstance(item, Mapping):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise TypeError(f"{name} must contain finite JSON values")
+            active_containers.add(container_id)
+            try:
+                result: dict[str, Any] = {}
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        raise TypeError(f"{name} keys must be strings")
+                    if len(key) > _MAX_RESULT_METADATA_BYTES:
+                        raise _MetadataTooLargeError
+                    result[key] = normalize(child)
+                return result
+            finally:
+                active_containers.remove(container_id)
+        if isinstance(item, (list, tuple)):
+            container_id = id(item)
+            if container_id in active_containers:
+                raise TypeError(f"{name} must contain finite JSON values")
+            active_containers.add(container_id)
+            try:
+                return [normalize(child) for child in item]
+            finally:
+                active_containers.remove(container_id)
+        return item
+
+    return normalize(value)
+
+
 def _json_mapping(name: str, value: Mapping[str, Any] | None) -> dict[str, Any]:
-    normalized = {} if value is None else _plain_json_value(name, value)
+    try:
+        normalized = {} if value is None else _bounded_plain_json_value(name, value)
+    except _MetadataTooLargeError as error:
+        raise ValueError(f"{name} must serialize to at most 64 KiB") from error
+    except RecursionError as error:
+        raise TypeError(f"{name} must contain finite JSON values") from error
     if not isinstance(normalized, dict):
         raise TypeError(f"{name} must be a mapping")
     try:
-        encoded = json.dumps(normalized, allow_nan=False, sort_keys=True, separators=(",", ":"))
+        chunks: list[str] = []
+        encoded_bytes = 0
+        encoder = json.JSONEncoder(allow_nan=False, sort_keys=True, separators=(",", ":"))
+        for chunk in encoder.iterencode(normalized):
+            remaining_bytes = _MAX_RESULT_METADATA_BYTES - encoded_bytes
+            if len(chunk) > remaining_bytes:
+                raise _MetadataTooLargeError
+            chunk_bytes = chunk.encode("utf-8")
+            if len(chunk_bytes) > remaining_bytes:
+                raise _MetadataTooLargeError
+            chunks.append(chunk)
+            encoded_bytes += len(chunk_bytes)
+    except _MetadataTooLargeError as error:
+        raise ValueError(f"{name} must serialize to at most 64 KiB") from error
     except (TypeError, ValueError) as error:
         raise TypeError(f"{name} must contain finite JSON values") from error
-    if len(encoded.encode("utf-8")) > _MAX_RESULT_METADATA_BYTES:
-        raise ValueError(f"{name} must serialize to at most 64 KiB")
-    return json.loads(encoded)
+    return json.loads("".join(chunks))
 
 
 def _freeze_json(value: Any) -> Any:
@@ -120,13 +199,21 @@ def _freeze_json(value: Any) -> Any:
 
 
 def _safe_error_message(error: BaseException) -> str:
-    try:
-        return str(error)
-    except BaseException:
-        return "<error message unavailable>"
+    message = exception_message_from_args(error)
+    return "<error message unavailable>" if message is None else message
+
+
+def _safe_error_type_name(error: BaseException) -> str:
+    return safe_exception_type_name(error, _MAX_ERROR_TYPE_NAME_BYTES)
 
 
 def _bounded_warning(value: str) -> str:
+    # A byte cap applied only after strip()/encode() can still allocate an
+    # arbitrarily large temporary for a provider-supplied diagnostic. UTF-8 is
+    # at least one byte per code point, so retaining this many characters from
+    # each edge is sufficient to construct the exact bounded byte result.
+    if len(value) > _MAX_WARNING_BYTES:
+        value = value[:_MAX_WARNING_BYTES] + "…" + value[-_MAX_WARNING_BYTES:]
     encoded = value.strip().encode("utf-8", "replace")
     if len(encoded) <= _MAX_WARNING_BYTES:
         return encoded.decode("utf-8")
@@ -137,13 +224,18 @@ def _bounded_warning(value: str) -> str:
     return encoded[:prefix_size].decode("utf-8", "ignore") + omission + encoded[-suffix_size:].decode("utf-8", "ignore")
 
 
+def _safe_error_summary(error: BaseException) -> str:
+    message = _bounded_warning(_safe_error_message(error)) or "<empty error message>"
+    return _bounded_warning(f"{_safe_error_type_name(error)}: {message}")
+
+
 def _add_exception_note(error: BaseException, note: str) -> None:
     """Attach a diagnostic without allowing a hostile exception to mask itself."""
 
     try:
-        add_note = getattr(error, "add_note", None)
-        if callable(add_note):
-            add_note(note)
+        add_note = getattr(BaseException, "add_note", None)
+        if add_note is not None:
+            add_note(error, note)
     except BaseException:
         pass
 
@@ -214,24 +306,29 @@ class DataSinkExecutionOptions:
         worker_count = self.worker_count
         if isinstance(worker_count, bool) or not isinstance(worker_count, int):
             raise TypeError("worker_count must be a positive integer")
-        if worker_count <= 0:
-            raise ValueError("worker_count must be a positive integer")
+        if worker_count <= 0 or worker_count > _MAX_INT64:
+            raise ValueError("worker_count must be a positive signed 64-bit integer")
         for name in ("batch_size", "memory_bytes", "target_max_batch_bytes", "task_input_max_bytes"):
             value = getattr(self, name)
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be a positive integer or None")
-            if value <= 0:
-                raise ValueError(f"{name} must be a positive integer or None")
+            if value <= 0 or value > _MAX_INT64:
+                raise ValueError(f"{name} must be a positive signed 64-bit integer or None")
         for name in ("cpus", "gpus"):
             value = getattr(self, name)
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise TypeError(f"{name} must be a finite non-negative number or None")
-            if not math.isfinite(float(value)) or float(value) < 0:
+            try:
+                normalized = float(value)
+            except OverflowError as error:
+                raise ValueError(f"{name} must be a finite non-negative number or None") from error
+            if not math.isfinite(normalized) or normalized < 0:
                 raise ValueError(f"{name} must be a finite non-negative number or None")
+            object.__setattr__(self, name, normalized)
 
     def map_batches_kwargs(self, runner_type: str) -> dict[str, Any]:
         normalized_runner = str(runner_type).strip().lower()
@@ -304,12 +401,14 @@ class WriteResult:
         object.__setattr__(self, "metadata", cast(Mapping[str, Any], _freeze_json(metadata)))
         if not isinstance(cast(object, self.warnings), (list, tuple)):
             raise TypeError("WriteResult.warnings must be a sequence of strings")
-        warnings = tuple(self.warnings)
-        if len(warnings) > _MAX_WRITE_RESULT_WARNINGS:
+        if len(self.warnings) > _MAX_WRITE_RESULT_WARNINGS:
             raise ValueError("WriteResult.warnings must contain at most four values")
+        warnings = tuple(self.warnings)
         for warning in warnings:
             if not isinstance(warning, str):
                 raise TypeError("WriteResult.warnings must contain only strings")
+            if len(warning) > _MAX_WARNING_BYTES:
+                raise ValueError("each WriteResult warning must be at most 4 KiB")
             if not warning.strip():
                 raise ValueError("WriteResult.warnings must not contain empty strings")
             try:
@@ -369,9 +468,9 @@ class WriteSummary:
         object.__setattr__(self, "outcome", WriteOutcome(self.outcome))
         if not isinstance(cast(object, self.results), (list, tuple)):
             raise TypeError("WriteSummary.results must be a sequence of WriteResult values")
-        results = tuple(self.results)
-        if len(results) > _MAX_WRITE_RESULTS:
+        if len(self.results) > _MAX_WRITE_RESULTS:
             raise ValueError("WriteSummary.results must contain at most 1000000 values")
+        results = tuple(self.results)
         if any(not isinstance(result, WriteResult) for result in results):
             raise TypeError("WriteSummary.results must contain only WriteResult values")
         total_result_bytes = 0
@@ -403,13 +502,13 @@ class WriteSummary:
         )
         if not isinstance(cast(object, self.warnings), (list, tuple)):
             raise TypeError("WriteSummary.warnings must be a sequence of strings")
-        warnings = tuple(self.warnings)
-        if len(warnings) > _MAX_SUMMARY_WARNINGS:
+        if len(self.warnings) > _MAX_SUMMARY_WARNINGS:
             raise ValueError("WriteSummary.warnings must contain at most 16 values")
+        warnings = tuple(self.warnings)
         if any(not isinstance(warning, str) for warning in warnings):
             raise TypeError("WriteSummary.warnings must contain only strings")
         for warning in warnings:
-            if not warning.strip():
+            if len(warning) > _MAX_WARNING_BYTES or not warning.strip():
                 raise ValueError("WriteSummary warnings must be non-empty and at most 4 KiB each")
             try:
                 warning_bytes = warning.encode("utf-8")
@@ -446,10 +545,12 @@ class DataSinkWriteError(RuntimeError):
         self.summary = summary
         self.operation_id = summary.operation_id
         self.outcome = summary.outcome
-        self.safe_to_retry = bool(safe_to_retry)
-        try:
-            detail_text = str(detail)
-        except BaseException:
+        if type(safe_to_retry) is not bool:
+            raise TypeError("DataSinkWriteError.safe_to_retry must be a boolean")
+        self.safe_to_retry = safe_to_retry
+        if type(detail) is str:
+            detail_text = detail
+        else:
             detail_text = "<outcome detail unavailable>"
         self.detail = _bounded_warning(detail_text) or "DataSink failed without outcome detail"
         super().__init__(
@@ -479,7 +580,11 @@ class DataSinkWorker(ABC):
         """Release worker-local state after failure; this is not remote rollback."""
 
     def close(self) -> None:
-        """Release worker-local resources without publishing or flushing writes."""
+        """Release worker-local resources without publishing or flushing writes.
+
+        Cleanup may call this method again after an exception, so implementations
+        must retain and retry ownership that was not released successfully.
+        """
 
 
 class BoundDataSink(ABC):
@@ -653,10 +758,17 @@ class _SinkBatchRuntime:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        worker, self._worker = self._worker, None
-        if worker is not None:
+        worker = self._worker
+        if worker is None:
+            self._closed = True
+            return
+        try:
             worker.close()
+        except BaseException:
+            self._failed = True
+            raise
+        self._worker = None
+        self._closed = True
 
     def _abort_after_failure(self, error: BaseException) -> None:
         if self._failed:
@@ -671,9 +783,8 @@ class _SinkBatchRuntime:
             _add_exception_note(
                 error,
                 _bounded_warning(
-                    "DataSinkWorker.abort() local cleanup also failed: "
-                    f"{type(abort_error).__name__}: {_safe_error_message(abort_error)}"
-                )
+                    f"DataSinkWorker.abort() local cleanup also failed: {_safe_error_summary(abort_error)}"
+                ),
             )
 
     def __call__(self, table: pa.Table) -> pa.Table:
@@ -757,7 +868,6 @@ def _prepare_key_validation(
     key_columns = tuple(raw_keys)
     if not key_columns or any(not isinstance(key, str) or not key.strip() for key in key_columns):
         raise ValueError("BoundKeyedUpsertSink.key_columns must be a non-empty sequence of non-empty strings")
-    key_columns = tuple(key.strip() for key in key_columns)
     if len({key.casefold() for key in key_columns}) != len(key_columns):
         raise ValueError("BoundKeyedUpsertSink.key_columns must not contain duplicates")
 
@@ -765,10 +875,13 @@ def _prepare_key_validation(
     by_name: dict[str, list[str]] = {}
     for name in original_names:
         by_name.setdefault(name.casefold(), []).append(name)
+    resolved_key_columns: list[str] = []
     for key in key_columns:
         matches = by_name.get(key.casefold(), [])
         if len(matches) != 1:
             raise ValueError(f"keyed DataSink key column {key!r} must match exactly one input column")
+        resolved_key_columns.append(matches[0])
+    key_columns = tuple(resolved_key_columns)
 
     existing = {name.casefold() for name in original_names}
     nonce = uuid.uuid4().hex
@@ -802,6 +915,11 @@ def _write_result_from_mapping(operation_id: str, payload: Mapping[str, Any]) ->
     warnings = payload.get("warnings", ())
     if isinstance(warnings, str) or not isinstance(warnings, (list, tuple)):
         raise TypeError("DataSink result warnings must be a list of strings")
+    if len(warnings) > _MAX_WRITE_RESULT_WARNINGS:
+        raise ValueError("DataSink result warnings must contain at most four values")
+    state = payload.get("state")
+    if not isinstance(state, str):
+        raise TypeError("DataSink result state must be a string")
     rows_received = cast(int, _strict_uint64("rows_received", payload.get("rows_received")))
     rows_affected = _strict_uint64("rows_affected", payload.get("rows_affected"), allow_none=True)
     bytes_received = cast(int, _strict_uint64("bytes_received", payload.get("bytes_received")))
@@ -811,7 +929,7 @@ def _write_result_from_mapping(operation_id: str, payload: Mapping[str, Any]) ->
         bytes_received=bytes_received,
         metadata=metadata,
         warnings=tuple(warnings),
-        state=WriteState(str(payload.get("state") or "")),
+        state=WriteState(state),
     )
 
 
@@ -864,34 +982,46 @@ def _results_from_arrow(operation_id: str, table: pa.Table) -> tuple[WriteResult
         raise ValueError("local-fast DataSink result exceeds the write-result limit")
     results: list[WriteResult] = []
     total_bytes = 0
-    for row in table.to_pylist():
-        metadata_json = row["metadata_json"]
-        warnings_json = row["warnings_json"]
-        if not isinstance(metadata_json, str) or len(metadata_json.encode("utf-8")) > _MAX_RESULT_METADATA_BYTES:
-            raise ValueError("DataSink result metadata must be a JSON string of at most 64 KiB")
-        if not isinstance(warnings_json, str) or len(warnings_json.encode("utf-8")) > _MAX_RESULT_WARNINGS_BYTES:
-            raise ValueError("DataSink result warnings must be a JSON string of at most 64 KiB")
-        try:
-            metadata = json.loads(metadata_json)
-            warnings = json.loads(warnings_json)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError("DataSink result contains invalid JSON") from error
-        result = _write_result_from_mapping(
-            operation_id,
-            {
-                "operation_id": row["operation_id"],
-                "state": row["state"],
-                "rows_received": row["rows_received"],
-                "rows_affected": row["rows_affected"],
-                "bytes_received": row["bytes_received"],
-                "metadata": metadata,
-                "warnings": warnings,
-            },
-        )
-        total_bytes += _result_wire_bytes(operation_id, result)
-        if total_bytes > _MAX_TOTAL_RESULT_BYTES:
-            raise ValueError("local-fast DataSink result exceeds the 64 MiB coordinator payload limit")
-        results.append(result)
+    # Converting the entire bounded Arrow table at once would still create up
+    # to one million transient Python row dictionaries. Decode a small,
+    # zero-copy Arrow batch at a time while preserving the original row order.
+    for batch in table.to_batches(max_chunksize=_RESULT_DECODE_BATCH_ROWS):
+        for row in batch.to_pylist():
+            metadata_json = row["metadata_json"]
+            warnings_json = row["warnings_json"]
+            if (
+                not isinstance(metadata_json, str)
+                or len(metadata_json) > _MAX_RESULT_METADATA_BYTES
+                or len(metadata_json.encode("utf-8")) > _MAX_RESULT_METADATA_BYTES
+            ):
+                raise ValueError("DataSink result metadata must be a JSON string of at most 64 KiB")
+            if (
+                not isinstance(warnings_json, str)
+                or len(warnings_json) > _MAX_RESULT_WARNINGS_BYTES
+                or len(warnings_json.encode("utf-8")) > _MAX_RESULT_WARNINGS_BYTES
+            ):
+                raise ValueError("DataSink result warnings must be a JSON string of at most 64 KiB")
+            try:
+                metadata = json.loads(metadata_json)
+                warnings = json.loads(warnings_json)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("DataSink result contains invalid JSON") from error
+            result = _write_result_from_mapping(
+                operation_id,
+                {
+                    "operation_id": row["operation_id"],
+                    "state": row["state"],
+                    "rows_received": row["rows_received"],
+                    "rows_affected": row["rows_affected"],
+                    "bytes_received": row["bytes_received"],
+                    "metadata": metadata,
+                    "warnings": warnings,
+                },
+            )
+            total_bytes += _result_wire_bytes(operation_id, result)
+            if total_bytes > _MAX_TOTAL_RESULT_BYTES:
+                raise ValueError("local-fast DataSink result exceeds the 64 MiB coordinator payload limit")
+            results.append(result)
     return tuple(results)
 
 
@@ -953,7 +1083,7 @@ def _unknown_error(
     error: BaseException | str,
     warnings: tuple[str, ...] = (),
 ) -> DataSinkWriteError:
-    detail = error if isinstance(error, str) else f"{type(error).__name__}: {_safe_error_message(error)}"
+    detail = error if isinstance(error, str) else _safe_error_summary(error)
     return DataSinkWriteError(
         _summary(context, WriteOutcome.UNKNOWN, results, warnings),
         detail,
@@ -1048,8 +1178,7 @@ def write_datasink(
                     # ambiguous one.
                     warnings = _append_warning(
                         warnings,
-                        "DataSink actor cleanup diagnostics failed: "
-                        f"{type(cleanup_error).__name__}: {_safe_error_message(cleanup_error)}",
+                        f"DataSink actor cleanup diagnostics failed: {_safe_error_summary(cleanup_error)}",
                         limit=_MAX_SUMMARY_WARNINGS,
                     )
             results = _results_from_arrow(context.operation_id, table)

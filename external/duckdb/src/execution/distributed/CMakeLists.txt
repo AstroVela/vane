@@ -41,6 +41,7 @@ set(DISTRIBUTED_SOURCES_COMMON
 
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
+    pipeline_node/data_sink_finish.cpp
     pipeline_node/empty_result_source.cpp
     pipeline_node/expression_scan.cpp
     pipeline_node/extension_write_sink.cpp

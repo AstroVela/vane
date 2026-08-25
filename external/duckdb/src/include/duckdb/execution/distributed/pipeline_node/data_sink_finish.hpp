@@ -4,7 +4,6 @@
 #pragma once
 
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
-#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -34,24 +33,7 @@ public:
 	std::vector<PipelineNodeRef> children() const override {
 		return {child_};
 	}
-	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override {
-		auto input_stream = child_->produce_tasks(plan_context);
-		auto self = shared_from_this();
-		auto operation_id = operation_id_;
-		return input_stream.pipeline_instruction(
-		    self,
-		    [operation_id = std::move(operation_id)](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
-			    auto &old_root = input_plan->Root();
-			    auto output_types = old_root.GetTypes();
-			    auto estimated_cardinality = old_root.estimated_cardinality;
-			    auto &sink = input_plan->Make<::duckdb::PhysicalDataSink>(std::move(output_types), operation_id,
-			                                                              estimated_cardinality);
-			    sink.children.push_back(old_root);
-			    input_plan->SetRoot(sink);
-			    return input_plan;
-		    },
-		    plan_context.client_context());
-	}
+	SubmittableTaskStream<WorkerTask> produce_tasks(PlanExecutionContext &plan_context) override;
 	const string &operation_id() const {
 		return operation_id_;
 	}

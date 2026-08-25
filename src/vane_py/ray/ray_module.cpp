@@ -7,6 +7,7 @@
 #include "worker.hpp"
 #include "worker_manager.hpp"
 #include "bounded_diagnostics.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include "safe_pyobject.hpp"
 #include "datasource_function.hpp"
 
@@ -638,8 +639,7 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 		        return output_count;
 	        },
-	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1,
-	        py::arg("throw_after") = -1)
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {

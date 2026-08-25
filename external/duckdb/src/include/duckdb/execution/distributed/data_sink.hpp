@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
@@ -39,7 +40,7 @@ DuckDBResult<void> ValidateDataSinkResultBudget(idx_t write_result_count, idx_t 
                                                 idx_t next_result_bytes);
 
 //! Stateful, streaming validation for the bounded DataSink worker-result wire
-//! protocol. PhysicalDataSink uses this before a local/task result collector can
+//! protocol. PhysicalDataSink uses this before a local result collector can
 //! materialize unbounded output, while DataSinkResultCollector reuses it for the
 //! coordinator-wide aggregate limit.
 class DataSinkResultValidationState {
@@ -76,9 +77,14 @@ public:
 	explicit DataSinkResultCollector(string operation_id);
 
 	DuckDBResult<void> Append(const ResultPartitionRef &partition);
+	DuckDBResult<void> Append(const std::vector<ResultPartitionRef> &partitions);
 	DuckDBResult<DistributedDataSinkResult> Finalize();
 
 private:
+	DuckDBResult<void> AppendUnlocked(const ResultPartitionRef &partition, idx_t partition_count,
+	                                  idx_t reported_partition_bytes, idx_t &materialized_output_bytes);
+
+	mutex lock_;
 	DistributedDataSinkResult result_;
 	DataSinkResultValidationState validation_state_;
 	bool finalized_ = false;
@@ -87,6 +93,7 @@ private:
 DuckDBResult<DistributedDataSinkResult> ParseDataSinkPartitions(const string &operation_id,
                                                                 const vector<ResultPartitionRef> &partitions);
 string BoundDataSinkOutcomeError(const string &error);
+string BoundDataSinkOutcomeError(const char *error);
 
 } // namespace distributed
 } // namespace duckdb

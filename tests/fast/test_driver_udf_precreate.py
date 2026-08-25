@@ -256,7 +256,8 @@ def test_driver_actor_runtime_shutdown_cancels_unbounded_datasink_cleanup_retry(
     runner._driver_shutdown_started = False
     runner._driver_shutdown_complete = False
     runner._datasink_cleanup_tasks = {}
-    runner.plan_runner = None
+    events = []
+    runner.plan_runner = SimpleNamespace(shutdown=lambda: events.append("plan-runner-shutdown"))
     attempts = 0
 
     async def stop_maintenance():
@@ -284,6 +285,7 @@ def test_driver_actor_runtime_shutdown_cancels_unbounded_datasink_cleanup_retry(
 
     assert attempts == 1
     assert cleanup_task.done()
+    assert events == ["plan-runner-shutdown"]
     assert runner._driver_shutdown_complete is True
 
 
@@ -1074,6 +1076,51 @@ def test_actor_pool_opens_after_first_ray_core_actor_becomes_ready(monkeypatch):
     assert pool._confirmed_ready == {1}
     assert wait_calls[0][1:] == (1, None)
     assert wait_calls[1][1:] == (2, 0)
+
+
+def test_actor_pool_first_readiness_failure_diagnostics_are_bounded(monkeypatch):
+    import vane.execution.udf_ray as udf_ray
+
+    class _Ref:
+        def __init__(self, actor_index):
+            self.actor_index = actor_index
+
+        def future(self):
+            actor_index = self.actor_index
+
+            class _Future:
+                def result(self, timeout=None):
+                    raise RuntimeError(f"planned actor-{actor_index} initialization failure")
+
+            return _Future()
+
+    refs = [_Ref(actor_index) for actor_index in range(20)]
+    killed = []
+    fake_ray = types.SimpleNamespace(
+        wait=lambda pending, **_kwargs: (list(pending), []),
+        kill=lambda actor, no_restart=True: killed.append((actor, no_restart)),
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("VANE_RAY_ACTOR_INIT_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("VANE_RAY_OBJECT_GET_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("VANE_QUERY_DEADLINE_EPOCH_S", raising=False)
+    pool = SimpleNamespace(
+        actors=[f"actor-{actor_index}" for actor_index in range(20)],
+        actor_node_ids=[""] * 20,
+        _init_refs=refs,
+        _confirmed_ready=set(),
+        _owns_actors=True,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        udf_ray.wait_for_first_actor_pool_ready(pool)
+
+    assert "all 20 UDF actors failed during initialization" in str(exc_info.value)
+    assert "actor-0 initialization failure" in str(exc_info.value)
+    assert "actor-2 initialization failure" in str(exc_info.value)
+    assert "actor-3 initialization failure" not in str(exc_info.value)
+    assert pool.actors == []
+    assert len(killed) == 20
 
 
 def test_driver_publishes_later_actor_slots_as_ray_core_schedules_them():
@@ -2232,11 +2279,15 @@ def test_udf_actor_pool_shutdown_accepts_query_owned_kill_flag(monkeypatch):
     pool = actor_pool_mod.UDFActorPoolBase.__new__(actor_pool_mod.UDFActorPoolBase)
     pool._owns_actors = True
     pool.actors = ["actor-0"]
+    pool._init_refs = ["init-ref-0"]
+    pool._payload_ref = "payload-ref"
 
     pool.shutdown(kill=True)
 
     assert killed == [{"actor": "actor-0", "no_restart": True}]
     assert pool.actors == []
+    assert pool._init_refs == []
+    assert pool._payload_ref is None
 
 
 def test_udf_actor_cleanup_diagnostic_handles_unprintable_failure():
@@ -2249,6 +2300,25 @@ def test_udf_actor_cleanup_diagnostic_handles_unprintable_failure():
     diagnostic = actor_pool_mod._actor_cleanup_failure("close", 7, _UnprintableError())
 
     assert diagnostic == "actor-7 close: _UnprintableError: <cleanup error message unavailable>"
+
+    exact_args_diagnostic = actor_pool_mod._actor_cleanup_failure(
+        "close",
+        7,
+        _UnprintableError("safe actor cleanup detail"),
+    )
+    assert exact_args_diagnostic == "actor-7 close: _UnprintableError: safe actor cleanup detail"
+
+    class _OversizedTypeNameError(RuntimeError):
+        pass
+
+    _OversizedTypeNameError.__name__ = "x" * 100_000
+    oversized_type_diagnostic = actor_pool_mod._actor_cleanup_failure(
+        "kill",
+        8,
+        _OversizedTypeNameError("planned actor cleanup failure"),
+    )
+
+    assert oversized_type_diagnostic == "actor-8 kill: BaseException: planned actor cleanup failure"
 
 
 def test_udf_actor_pool_constructor_cleans_partial_actor_creation(monkeypatch):

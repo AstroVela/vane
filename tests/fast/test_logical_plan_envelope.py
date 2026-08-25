@@ -83,9 +83,9 @@ def test_datasink_plan_factory_requires_exact_terminal_relation():
     relation = connection.sql("SELECT 42 AS value")
     terminal = relation._mark_datasink("datasink-terminal")
 
-    with pytest.raises(Exception, match="does not accept terminal write relations"):
+    with pytest.raises(ValueError, match="does not accept terminal write relations"):
         ray_cxx.PyLogicalPlan.from_duckdb_relation(terminal, "datasink-passed-to-read-path")
-    with pytest.raises(Exception, match="requires a DataSink relation"):
+    with pytest.raises(ValueError, match="requires a DataSink relation"):
         ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(relation, "read-passed-to-datasink-path")
 
 
@@ -95,7 +95,7 @@ def test_datasink_plan_factory_rechecks_transaction_at_serialization_boundary():
     terminal = connection.sql("SELECT 42 AS value")._mark_datasink("datasink-before-transaction")
     connection.execute("BEGIN")
     try:
-        with pytest.raises(Exception, match="cannot participate in an explicit transaction"):
+        with pytest.raises(ValueError, match="cannot participate in an explicit transaction"):
             ray_cxx.PyLogicalPlan.from_duckdb_datasink_relation(
                 terminal,
                 "explicit-transaction-datasink-plan",

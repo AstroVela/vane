@@ -32,6 +32,7 @@ from vane.execution._common import (
     load_udf_from_payload,
     load_udf_from_payload_cached,
 )
+from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
@@ -42,17 +43,27 @@ BATCH_SIZE = 2048
 DEFAULT_TARGET_MAX_BATCH_BYTES = 128 * 1024 * 1024
 TARGET_MAX_BATCH_BYTES_ENV = "VANE_UDF_TARGET_MAX_BATCH_BYTES"
 MAX_CLOSE_ERROR_BYTES = 4096
+MAX_ERROR_TYPE_NAME_BYTES = 256
+
+
+def _safe_close_error_type_name(error: BaseException) -> str:
+    return safe_exception_type_name(error, MAX_ERROR_TYPE_NAME_BYTES)
 
 
 def _bounded_close_error(error: BaseException) -> str:
-    try:
-        detail = str(error)
-    except BaseException:
-        return f"{type(error).__name__} (error text unavailable)"
+    error_type = _safe_close_error_type_name(error)
+    detail = exception_message_from_args(error)
+    if detail is None:
+        return f"{error_type} (error text unavailable)"
+    if len(detail) > MAX_CLOSE_ERROR_BYTES:
+        return f"{error_type} (error text exceeds {MAX_CLOSE_ERROR_BYTES} bytes and was omitted)"
     encoded = detail.encode("utf-8", errors="replace")
     if len(encoded) > MAX_CLOSE_ERROR_BYTES:
-        return f"{type(error).__name__} (error text exceeds {MAX_CLOSE_ERROR_BYTES} bytes and was omitted)"
-    return f"{type(error).__name__}: {encoded.decode('utf-8')}"
+        return f"{error_type} (error text exceeds {MAX_CLOSE_ERROR_BYTES} bytes and was omitted)"
+    summary = f"{error_type}: {encoded.decode('utf-8')}"
+    if len(summary.encode("utf-8")) > MAX_CLOSE_ERROR_BYTES:
+        return f"{error_type} (error text exceeds {MAX_CLOSE_ERROR_BYTES} bytes and was omitted)"
+    return summary
 
 
 def _load_runtime_callable(
@@ -452,6 +463,7 @@ class UDFExecutor:
         self._queue: deque[pa.Table] = deque()
         self._finished_submitting = False
         self._closed = False
+        self._close_started = False
         self._async_runtime: AsyncRuntime | None = None
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
@@ -871,6 +883,8 @@ class UDFExecutor:
         self._queue.append(pa.table({self._scalar_output_name: outputs}))
 
     def submit(self, args: pa.Table) -> None:
+        if self._closed or self._close_started:
+            raise RuntimeError("UDF executor is closing or closed")
         args = _ensure_table(args)
         if args.num_rows == 0:
             return
@@ -910,36 +924,47 @@ class UDFExecutor:
         """
         if self._closed:
             return
+        self._close_started = True
         close_errors: list[tuple[str, BaseException]] = []
         try:
             self.finished_submitting()
         except BaseException as error:
             close_errors.append(("finished_submitting", error))
-        finally:
-            self._closed = True
-            map_fn, self._map_fn = self._map_fn, None
-            runtime, self._async_runtime = self._async_runtime, None
+        if not close_errors:
+            map_fn = self._map_fn
             try:
                 vane_close_fn = getattr(map_fn, "_vane_close", None)
                 if callable(vane_close_fn):
                     vane_close_fn()
-                elif runtime is not None:
+                elif self._async_runtime is not None:
                     close_fn = getattr(map_fn, "close", None)
                     if callable(close_fn):
                         close_fn()
             except BaseException as error:
                 close_errors.append(("callable", error))
-            finally:
-                if runtime is not None:
-                    try:
-                        runtime.close()
-                    except BaseException as error:
-                        close_errors.append(("async_runtime", error))
-        if len(close_errors) == 1:
-            raise close_errors[0][1]
+            else:
+                self._map_fn = None
+        if not close_errors:
+            runtime = self._async_runtime
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except BaseException as error:
+                    close_errors.append(("async_runtime", error))
+                else:
+                    self._async_runtime = None
         if close_errors:
             details = "; ".join(f"{stage}={_bounded_close_error(error)}" for stage, error in close_errors)
-            raise RuntimeError(f"UDF executor close failed: {details}") from close_errors[0][1]
+            message = bounded_utf8_text(
+                f"UDF executor close failed: {details}",
+                MAX_CLOSE_ERROR_BYTES,
+                strip=False,
+            )
+            # Do not retain a provider exception as the cause or context. Ray
+            # serializes the complete exception graph before the driver can
+            # apply its own diagnostic bounds.
+            raise RuntimeError(message)
+        self._closed = True
 
     def all_tasks_finished(self) -> bool:
         return self._finished_submitting and not self._queue

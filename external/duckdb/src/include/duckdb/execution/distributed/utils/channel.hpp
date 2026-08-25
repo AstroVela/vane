@@ -391,26 +391,26 @@ public:
 	/// Disconnect the receiver and release queued values that can no longer be consumed.
 	void disconnect_receiver() noexcept {
 		ReadyCallback ready_callback;
+		std::unique_ptr<std::queue<T>> abandoned;
 		try {
-			std::queue<T> abandoned;
+			abandoned.reset(new std::queue<T>());
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
-				queue_.swap(abandoned);
+				queue_.swap(*abandoned);
 				ready_callback = std::move(ready_callback_);
 			}
 		} catch (...) {
 			// Receiver cleanup runs from noexcept move/destruction paths. If allocating
-			// the temporary queue fails, close and drain in place as a best effort.
+			// the temporary queue fails, close the state but leave queued values owned
+			// by it. Destroying them under the channel mutex can deadlock with a value
+			// finalizer that waits for a producer awakened by this close.
 			try {
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
 				ready_callback = std::move(ready_callback_);
-				while (!queue_.empty()) {
-					queue_.pop();
-				}
 			} catch (...) {
-				// No safe cleanup remains if locking or in-place destruction also fails.
+				// No safe cleanup remains if locking the state also fails.
 			}
 		}
 		not_empty_.notify_all();
@@ -423,6 +423,10 @@ public:
 			// Receiver destruction is noexcept. A readiness callback must not
 			// make an abandoned receiver terminate the process.
 		}
+		// Destroy abandoned values only after blocked producers and readiness
+		// waiters have observed closure. A value destructor may itself wait for
+		// work owned by one of those threads.
+		abandoned.reset();
 	}
 
 	/// Install one callback for the next readable or terminal transition.

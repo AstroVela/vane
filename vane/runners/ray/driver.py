@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from vane._ray_cxx import require_ray_cxx_attr
 from vane._ray_errors import restore_remote_ray_exception
+from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 
 RayResultPartitionRef = require_ray_cxx_attr(
     "RayResultPartitionRef",
@@ -78,10 +79,14 @@ _TASK_COMPLETION_CLEANUP_RETRY_MIN_S = 0.01
 _TASK_COMPLETION_CLEANUP_RETRY_MAX_S = 1.0
 _DATASINK_CLEANUP_RETRY_MIN_S = 0.01
 _DATASINK_CLEANUP_RETRY_MAX_S = 1.0
+_DATASINK_CLEANUP_SHUTDOWN_TIMEOUT_S = 5.0
 _CLEANUP_WARNING_MAX_BYTES = 4 * 1024
-_DATASINK_CLEANUP_WARNING_LIMIT = 16
+_ERROR_TYPE_NAME_MAX_BYTES = 256
+_CLEANUP_DIAGNOSTIC_LIMIT = 16
+_DATASINK_CLEANUP_WARNING_LIMIT = _CLEANUP_DIAGNOSTIC_LIMIT
 _DATASINK_CLEANUP_WARNINGS_OMITTED = "additional DataSink cleanup warnings omitted"
 _UDF_ACTOR_CLEANUP_DIAGNOSTICS_OMITTED = "additional UDF actor cleanup diagnostics omitted"
+_QUERY_CLEANUP_ERRORS_OMITTED = "additional query cleanup errors omitted"
 _EXCEPTION_ATTRIBUTE_UNAVAILABLE = object()
 _QUERY_ADMISSION_BATCH_SIZE = 64
 # Whole-query consumers must not share a pool with the producer/control work
@@ -98,6 +103,9 @@ _FTE_STATUS_EXECUTOR = ThreadPoolExecutor(
 
 
 def _bounded_diagnostic_text(value: str) -> str:
+    if len(value) > _CLEANUP_WARNING_MAX_BYTES:
+        value = value[:_CLEANUP_WARNING_MAX_BYTES] + "…" + value[-_CLEANUP_WARNING_MAX_BYTES:]
+    value = value.strip()
     encoded = value.encode("utf-8", "replace")
     if len(encoded) <= _CLEANUP_WARNING_MAX_BYTES:
         return encoded.decode("utf-8")
@@ -113,14 +121,11 @@ def _bounded_diagnostic_text(value: str) -> str:
 
 
 def _safe_exception_summary(error: BaseException) -> str:
-    try:
-        error_type = type(error).__name__
-    except BaseException:
-        error_type = "BaseException"
-    try:
-        message = str(error)
-    except BaseException:
+    error_type = safe_exception_type_name(error, _ERROR_TYPE_NAME_MAX_BYTES)
+    message = exception_message_from_args(error)
+    if message is None:
         message = "<error message unavailable>"
+    message = _bounded_diagnostic_text(message)
     return _bounded_diagnostic_text(f"{error_type}: {message}")
 
 
@@ -230,9 +235,12 @@ class QueryExecutionCleanupError(RuntimeError):
         primary_error: BaseException | None = None,
         cleanup_errors: tuple[BaseException, ...] = (),
     ) -> None:
-        super().__init__(str(message))
+        super().__init__(_bounded_diagnostic_text(str(message)))
         self.primary_error = primary_error
-        self.cleanup_errors = tuple(cleanup_errors)
+        retained_cleanup_errors = tuple(cleanup_errors[:_CLEANUP_DIAGNOSTIC_LIMIT])
+        if len(cleanup_errors) > _CLEANUP_DIAGNOSTIC_LIMIT:
+            retained_cleanup_errors = retained_cleanup_errors[:-1] + (RuntimeError(_QUERY_CLEANUP_ERRORS_OMITTED),)
+        self.cleanup_errors = retained_cleanup_errors
 
     @classmethod
     def from_errors(
@@ -241,17 +249,15 @@ class QueryExecutionCleanupError(RuntimeError):
         primary_error: BaseException,
         cleanup_errors: list[BaseException] | tuple[BaseException, ...],
     ) -> QueryExecutionCleanupError:
-        cleanup = tuple(cleanup_errors)
-        if not cleanup:
+        cleanup_count = len(cleanup_errors)
+        if cleanup_count == 0:
             raise ValueError("QueryExecutionCleanupError requires at least one cleanup error")
+        cleanup = tuple(cleanup_errors[:_CLEANUP_DIAGNOSTIC_LIMIT])
+        if cleanup_count > _CLEANUP_DIAGNOSTIC_LIMIT:
+            cleanup = cleanup[:-1] + (RuntimeError(_QUERY_CLEANUP_ERRORS_OMITTED),)
         message = _bounded_diagnostic_text(
             f"{context}: primary={_safe_exception_summary(primary_error)}; cleanup="
-            + "; ".join(_safe_exception_summary(error) for error in cleanup[:_DATASINK_CLEANUP_WARNING_LIMIT])
-            + (
-                "; additional cleanup errors omitted"
-                if len(cleanup) > _DATASINK_CLEANUP_WARNING_LIMIT
-                else ""
-            )
+            + "; ".join(_safe_exception_summary(error) for error in cleanup)
         )
         return cls(
             message,
@@ -264,8 +270,11 @@ class _QueryCleanupDiagnostic(RuntimeError):
     """Report cleanup diagnostics after all query ownership was released."""
 
     def __init__(self, message: str, diagnostics: tuple[BaseException, ...]) -> None:
-        super().__init__(message)
-        self.diagnostics = diagnostics
+        super().__init__(_bounded_diagnostic_text(str(message)))
+        retained_diagnostics = tuple(diagnostics[:_CLEANUP_DIAGNOSTIC_LIMIT])
+        if len(diagnostics) > _CLEANUP_DIAGNOSTIC_LIMIT:
+            retained_diagnostics = retained_diagnostics[:-1] + (RuntimeError(_UDF_ACTOR_CLEANUP_DIAGNOSTICS_OMITTED),)
+        self.diagnostics = retained_diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +475,7 @@ class _PlanLifecycle:
 
     plan_id: str
     session_id: str
+    plan_kind: Literal["query", "datasink", "copy"]
     _condition: threading.Condition = field(default_factory=threading.Condition)
     _state: Literal["preparing", "starting", "running", "closing", "closed"] = "preparing"
     _startup_owner: Literal["caller", "worker", "cancelled"] = "caller"
@@ -844,11 +854,10 @@ def _safe_exception_attribute(value: object, name: str) -> Any:
 def _add_exception_note(error: BaseException, note: str) -> None:
     """Attach a cleanup diagnostic without replacing the primary failure."""
 
-    add_note = _safe_exception_attribute(error, "add_note")
-    if add_note is _EXCEPTION_ATTRIBUTE_UNAVAILABLE or not callable(add_note):
-        return
     try:
-        add_note(note)
+        add_note = getattr(BaseException, "add_note", None)
+        if add_note is not None:
+            add_note(error, note)
     except BaseException:
         pass
 
@@ -866,28 +875,41 @@ def _safe_remote_error_message(exc: BaseException) -> str:
         if cause is not _EXCEPTION_ATTRIBUTE_UNAVAILABLE and cause is not None:
             args = _safe_exception_attribute(cause, "args")
             if isinstance(args, tuple):
-                for arg in args:
-                    if isinstance(arg, str) and arg.strip():
-                        return arg.strip()
+                for arg in args[:_CLEANUP_DIAGNOSTIC_LIMIT]:
+                    if isinstance(arg, str):
+                        message = _bounded_diagnostic_text(arg)
+                        if message:
+                            return message
 
         traceback_str = _safe_exception_attribute(exc, "traceback_str")
-        if isinstance(traceback_str, str) and traceback_str.strip():
-            lines = [line.strip() for line in traceback_str.splitlines() if line.strip()]
-            if lines:
-                return lines[-1]
+        if isinstance(traceback_str, str):
+            final_line_start = traceback_str.rfind("\n") + 1
+            final_line_length = len(traceback_str) - final_line_start
+            if final_line_length > _CLEANUP_WARNING_MAX_BYTES:
+                final_line = (
+                    traceback_str[final_line_start : final_line_start + _CLEANUP_WARNING_MAX_BYTES]
+                    + "…"
+                    + traceback_str[-_CLEANUP_WARNING_MAX_BYTES:]
+                )
+            elif final_line_start == 0:
+                final_line = traceback_str
+            else:
+                final_line = traceback_str[final_line_start:]
+            message = _bounded_diagnostic_text(final_line)
+            if message:
+                return message
 
         args = _safe_exception_attribute(exc, "args")
         if isinstance(args, tuple):
-            for arg in args:
-                if isinstance(arg, str) and arg.strip():
-                    return arg.strip()
+            for arg in args[:_CLEANUP_DIAGNOSTIC_LIMIT]:
+                if isinstance(arg, str):
+                    message = _bounded_diagnostic_text(arg)
+                    if message:
+                        return message
     except BaseException:
         pass
-    try:
-        error_type = type(exc).__name__
-    except BaseException:
-        error_type = "remote error"
-    return f"{error_type} from remote Ray task"
+    error_type = safe_exception_type_name(exc, _ERROR_TYPE_NAME_MAX_BYTES)
+    return _bounded_diagnostic_text(f"{error_type} from remote Ray task")
 
 
 def _cleanup_warning(stage: str, error: BaseException) -> str:
@@ -895,15 +917,13 @@ def _cleanup_warning(stage: str, error: BaseException) -> str:
 
 
 def _bounded_datasink_cleanup_warning(value: object) -> str:
-    try:
-        text = str(value).strip()
-    except BaseException:
-        text = "<cleanup warning unavailable>"
+    text = value if type(value) is str else "<cleanup warning unavailable>"
     return _bounded_diagnostic_text(text)
 
 
 def _append_datasink_cleanup_warning(result: dict[str, Any], warning: str) -> None:
     raw_warnings = result.get("data_sink_cleanup_warnings", ())
+    raw_items: list[Any] | tuple[Any, ...]
     if isinstance(raw_warnings, str):
         raw_items = (raw_warnings,) if raw_warnings else ()
     elif isinstance(raw_warnings, (list, tuple)):
@@ -929,10 +949,17 @@ def _append_datasink_cleanup_warning(result: dict[str, Any], warning: str) -> No
 
 
 def _append_udf_actor_cleanup_diagnostic(diagnostics: list[BaseException], error: BaseException) -> None:
-    if len(diagnostics) < _DATASINK_CLEANUP_WARNING_LIMIT:
+    if len(diagnostics) < _CLEANUP_DIAGNOSTIC_LIMIT:
         diagnostics.append(error)
     else:
         diagnostics[-1] = RuntimeError(_UDF_ACTOR_CLEANUP_DIAGNOSTICS_OMITTED)
+
+
+def _append_query_cleanup_error(errors: list[BaseException], error: BaseException) -> None:
+    if len(errors) < _CLEANUP_DIAGNOSTIC_LIMIT:
+        errors.append(error)
+    else:
+        errors[-1] = RuntimeError(_QUERY_CLEANUP_ERRORS_OMITTED)
 
 
 def _ray_progress_snapshot_or_none(
@@ -1296,14 +1323,14 @@ class FteWorkerTaskHandle:
                 exc,
                 failure_kind=failure_kind,
             )
-        except Exception as cleanup_exc:
+        except BaseException as cleanup_exc:
             cleanup_errors.append(f"worker failure publication failed: {_safe_failure_message(cleanup_exc)}")
         try:
             await _run_in_executor(
                 _FTE_STATUS_EXECUTOR,
                 self._record_fte_task_terminal,
             )
-        except Exception as cleanup_exc:
+        except BaseException as cleanup_exc:
             cleanup_errors.append(f"terminal record failed: {_safe_failure_message(cleanup_exc)}")
         message = _safe_failure_message(exc)
         if cleanup_errors:
@@ -1333,12 +1360,14 @@ class FteWorkerTaskHandle:
             if completed is not None:
                 try:
                     self._result = completed.result()
-                except Exception as exc:
-                    self._error = exc
+                except BaseException as exc:
+                    self._error = exc if isinstance(exc, Exception) else RuntimeError(_safe_exception_summary(exc))
                 self._is_done = True
             return self._is_done
 
     def get_result_sync(self) -> Any:
+        """Return the adopted payload without acknowledging its ownership."""
+
         with self._lifecycle_lock:
             if not self.done():
                 raise RuntimeError("FTE task result not ready")
@@ -1346,18 +1375,17 @@ class FteWorkerTaskHandle:
                 raise self._error
             if self._result is None:
                 raise RuntimeError("FTE task completed without result")
-            self.ack()
             return self._result
 
     async def get_result(self) -> Any:
+        """Await the adopted payload; the drain must acknowledge it explicitly."""
+
         with self._lifecycle_lock:
             self._ensure_started()
             future = self._future
         if future is None:
             return self.get_result_sync()
-        result = await asyncio.wrap_future(future)
-        self.ack()
-        return result
+        return await asyncio.wrap_future(future)
 
     def cancel(self) -> None:
         terminal_error: Exception | None = None
@@ -1367,17 +1395,17 @@ class FteWorkerTaskHandle:
             errors: list[str] = []
             try:
                 self.worker_handle.fte_cancel_task(self._attempt_id().to_dict())
-            except Exception as exc:
-                errors.append(f"cancel failed: {exc}")
+            except BaseException as exc:
+                errors.append(f"cancel failed: {_safe_exception_summary(exc)}")
             try:
                 self.release_result_payload()
-            except Exception as exc:
-                errors.append(f"result release failed: {exc}")
+            except BaseException as exc:
+                errors.append(f"result release failed: {_safe_exception_summary(exc)}")
             self._acked = True
             try:
                 self._record_fte_task_terminal()
-            except Exception as exc:
-                errors.append(f"terminal record failed: {exc}")
+            except BaseException as exc:
+                errors.append(f"terminal record failed: {_safe_exception_summary(exc)}")
             if errors:
                 terminal_error = RuntimeError(f"failed to cancel FTE task {self.task_id}: " + "; ".join(errors))
                 self._error = terminal_error
@@ -1398,18 +1426,42 @@ class FteWorkerTaskHandle:
             self._terminal_recorded_task_id = task_key
 
     def ack(self) -> None:
+        """Acknowledge a payload only after its downstream handoff succeeds."""
+
         with self._lifecycle_lock:
             if self._acked:
                 return
             self.worker_handle.enqueue_fte_ack_task_result(self._attempt_id().to_dict())
             self._acked = True
+            self._unacked_output_owners.clear()
 
     def release_result_payload(self) -> None:
         with self._lifecycle_lock:
-            if self._released:
-                return
-            self.worker_handle.enqueue_fte_release_task_result(self._attempt_id().to_dict())
-            self._released = True
+            cleanup_errors: list[str] = []
+            if not self._released:
+                try:
+                    self.worker_handle.enqueue_fte_release_task_result(self._attempt_id().to_dict())
+                except BaseException as exc:
+                    cleanup_errors.append(f"remote result release failed: {_safe_exception_summary(exc)}")
+                else:
+                    self._released = True
+
+            retry_owners: list[Any] = []
+            omitted_owner_errors = 0
+            for owner in self._unacked_output_owners:
+                try:
+                    owner.release()
+                except BaseException as exc:
+                    retry_owners.append(owner)
+                    if len(cleanup_errors) < _CLEANUP_DIAGNOSTIC_LIMIT:
+                        cleanup_errors.append(f"output owner release failed: {_safe_exception_summary(exc)}")
+                    else:
+                        omitted_owner_errors += 1
+            if omitted_owner_errors:
+                cleanup_errors.append(_QUERY_CLEANUP_ERRORS_OMITTED)
+            self._unacked_output_owners = retry_owners
+            if cleanup_errors:
+                raise RuntimeError(_bounded_diagnostic_text("; ".join(cleanup_errors)))
 
     def _apply_status(self, status: dict[str, Any]) -> Exception | None:
         with self._lifecycle_lock:
@@ -1417,12 +1469,12 @@ class FteWorkerTaskHandle:
                 return None
             try:
                 self._apply_status_locked(status)
-            except Exception as exc:
+            except BaseException as exc:
                 prior_error = self._error
                 cleanup_errors = self._discard_unacked_finished_result()
-                message = f"failed to apply FTE task status for {self.task_id}: {exc}"
+                message = f"failed to apply FTE task status for {self.task_id}: {_safe_exception_summary(exc)}"
                 if prior_error is not None:
-                    message = f"{prior_error}; {message}"
+                    message = f"{_safe_exception_summary(prior_error)}; {message}"
                 if cleanup_errors:
                     message += "; cleanup also failed: " + "; ".join(cleanup_errors)
                 self._result = None
@@ -1436,6 +1488,14 @@ class FteWorkerTaskHandle:
             self._last_status_version = max(self._last_status_version, int(version))
         state = self._state_from_status(status)
         if state == FteTaskState.FINISHED:
+            if self._released:
+                # Result release is terminal ownership transfer in the other
+                # direction. A late status watcher must not re-adopt payloads
+                # after a loser/abort cleanup already released them.
+                self._result = RayTaskResult.no_output()
+                self._record_fte_task_terminal()
+                self._is_done = True
+                return
             # The scheduler's FteAttemptStatusWatcher is the single owner of
             # attempt selection.  A result handle only adopts the immutable
             # terminal payload; selected-attempt filtering happens after the
@@ -1456,9 +1516,9 @@ class FteWorkerTaskHandle:
             if raw_result is not None:
                 try:
                     self._result = self._normalize_raw_result(raw_result)
-                except Exception as exc:
+                except BaseException as exc:
                     cleanup_errors = self._discard_unacked_finished_result()
-                    message = f"failed to adopt FTE task result for {self.task_id}: {exc}"
+                    message = f"failed to adopt FTE task result for {self.task_id}: {_safe_exception_summary(exc)}"
                     if cleanup_errors:
                         message += "; cleanup also failed: " + "; ".join(cleanup_errors)
                     self._error = RuntimeError(message)
@@ -1475,17 +1535,6 @@ class FteWorkerTaskHandle:
                     (self.task_context_info or {}).get("exchange_sink_instance"),
                 )
             self._record_fte_task_terminal()
-            try:
-                self.ack()
-            except Exception as exc:
-                cleanup_errors = self._discard_unacked_finished_result()
-                message = f"failed to ack FTE task result for {self.task_id}: {exc}"
-                if cleanup_errors:
-                    message += "; cleanup also failed: " + "; ".join(cleanup_errors)
-                self._error = RuntimeError(message)
-                self._is_done = True
-                return
-            self._unacked_output_owners.clear()
             self._is_done = True
             return
         if state in (FteTaskState.FAILED, FteTaskState.CANCELED, FteTaskState.ABORTED):
@@ -1543,26 +1592,25 @@ class FteWorkerTaskHandle:
         for owner in owners:
             try:
                 owner.release()
-            except Exception as exc:
-                rollback_errors.append(str(exc))
+            except BaseException as exc:
+                rollback_errors.append(_safe_exception_summary(exc))
         return rollback_errors
 
     @classmethod
-    def _rollback_output_owners(cls, owners: list[Any], *, cause: Exception) -> None:
+    def _rollback_output_owners(cls, owners: list[Any], *, cause: BaseException) -> None:
         rollback_errors = cls._release_output_owners(owners)
         if rollback_errors:
             raise RuntimeError(
-                f"{cause}; output ownership rollback also failed: " + "; ".join(rollback_errors)
+                f"{_safe_exception_summary(cause)}; output ownership rollback also failed: "
+                + "; ".join(rollback_errors)
             ) from cause
 
     def _discard_unacked_finished_result(self) -> list[str]:
-        owners = self._unacked_output_owners
-        self._unacked_output_owners = []
-        cleanup_errors = self._release_output_owners(owners)
+        cleanup_errors: list[str] = []
         try:
             self.release_result_payload()
-        except Exception as exc:
-            cleanup_errors.append(str(exc))
+        except BaseException as exc:
+            cleanup_errors.append(_safe_exception_summary(exc))
         self._result = None
         return cleanup_errors
 
@@ -1620,7 +1668,7 @@ class FteWorkerTaskHandle:
                 for _, _, _, previous_owner in normalized_parts:
                     if previous_owner is not None:
                         previous_owner.release()
-            except Exception as exc:
+            except BaseException as exc:
                 self._unacked_output_owners = []
                 self._rollback_output_owners(lease_owners, cause=exc)
                 raise
@@ -1919,7 +1967,7 @@ class RayQueryDriverActor:
             self._driver_session_executor = executor
         return executor
 
-    def _shutdown_driver_executors(self) -> None:
+    def _shutdown_driver_executors(self, *, wait: bool = True) -> None:
         if getattr(self, "_driver_executors_shutdown", False):
             return
         self._driver_executors_shutdown = True
@@ -1935,7 +1983,7 @@ class RayQueryDriverActor:
         self._driver_session_executor = None
         for executor in executors:
             if executor is not None:
-                executor.shutdown(wait=True)
+                executor.shutdown(wait=wait, cancel_futures=not wait)
 
     def _drop_query_fragments_sync(self, query_id: str) -> None:
         self._drop_query_fragments_after_admission_fence_sync(
@@ -2459,19 +2507,36 @@ class RayQueryDriverActor:
                 with self._plan_runner_lifecycle_lock:
                     self._driver_shutdown_started = True
                     plan_runner = self.plan_runner
-                cleanup_tasks = tuple(self._datasink_cleanup_tasks.values())
+                cleanup_entries = tuple(self._datasink_cleanup_tasks.items())
+            cleanup_tasks = tuple(task for _, task in cleanup_entries)
             for cleanup_task in cleanup_tasks:
                 cleanup_task.cancel()
             await self.stop_client_lease_maintenance()
             await self.stop_query_resource_maintenance()
+            pending_cleanup_tasks: set[asyncio.Task[None]] = set()
             if cleanup_tasks:
-                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+                done_cleanup_tasks, pending_cleanup_tasks = await asyncio.wait(
+                    cleanup_tasks,
+                    timeout=_DATASINK_CLEANUP_SHUTDOWN_TIMEOUT_S,
+                )
+                for cleanup_task in done_cleanup_tasks:
+                    try:
+                        cleanup_task.result()
+                    except BaseException:
+                        pass
+                with self._session_lock:
+                    for cleanup_key, cleanup_task in cleanup_entries:
+                        if self._datasink_cleanup_tasks.get(cleanup_key) is cleanup_task:
+                            self._datasink_cleanup_tasks.pop(cleanup_key, None)
             if plan_runner is not None:
+                # Cleanup retries can occupy every lifecycle worker. Use the
+                # independently drained session executor for the broader
+                # native shutdown that can unblock those attempts.
                 await _run_in_executor_with_owned_side_effects(
-                    self._get_driver_lifecycle_executor(),
+                    self._get_driver_session_executor(),
                     plan_runner.shutdown,
                 )
-            self._shutdown_driver_executors()
+            self._shutdown_driver_executors(wait=not pending_cleanup_tasks)
             self._driver_shutdown_complete = True
 
     def _client_detach_lock_for(self, owner_key: str) -> asyncio.Lock:
@@ -6137,7 +6202,12 @@ class RayQueryDriverActor:
             self._active_vllm_actors_by_plan[plan_id] = list(created)
         return created
 
-    def _cleanup_udf_actor_pools(self, plan_id: str) -> list[BaseException]:
+    def _cleanup_udf_actor_pools(
+        self,
+        plan_id: str,
+        *,
+        force: bool = False,
+    ) -> list[BaseException]:
         plan_key = str(plan_id)
         lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
         with lifecycle_lock:
@@ -6147,6 +6217,7 @@ class RayQueryDriverActor:
                 return []
             errors: list[BaseException] = []
             diagnostics: list[BaseException] = []
+            failed_pool_count = 0
 
             def release_pool_ownership(pool: Any) -> None:
                 with self._session_lock:
@@ -6171,12 +6242,16 @@ class RayQueryDriverActor:
                 with self._session_lock:
                     pool._vane_retired = True
                 try:
-                    pool.shutdown()
+                    if force:
+                        pool.shutdown(kill=True)
+                    else:
+                        pool.shutdown()
                 except BaseException as exc:
                     if _udf_actor_pool_terminated(pool):
                         _append_udf_actor_cleanup_diagnostic(diagnostics, exc)
                         release_pool_ownership(pool)
                     else:
+                        failed_pool_count += 1
                         _append_udf_actor_cleanup_diagnostic(errors, exc)
                 else:
                     release_pool_ownership(pool)
@@ -6185,7 +6260,7 @@ class RayQueryDriverActor:
                 details.extend(_safe_exception_summary(exc) for exc in diagnostics)
                 raise RuntimeError(
                     _bounded_diagnostic_text(
-                        f"failed to shut down {len(errors)} query-owned UDF actor pool(s): " + "; ".join(details)
+                        f"failed to shut down {failed_pool_count} query-owned UDF actor pool(s): " + "; ".join(details)
                     )
                 ) from errors[0]
             return diagnostics
@@ -6195,13 +6270,15 @@ class RayQueryDriverActor:
         pools = list(self._active_vllm_actors_by_plan.get(plan_key, ()))
         if not pools:
             return
-        errors: list[str] = []
+        errors: list[BaseException] = []
+        failed_pool_count = 0
         remaining_pools: list[Any] = []
         for pool in pools:
             try:
                 pool.shutdown()
             except BaseException as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
+                failed_pool_count += 1
+                _append_query_cleanup_error(errors, exc)
                 remaining_pools.append(pool)
             else:
                 try:
@@ -6214,7 +6291,10 @@ class RayQueryDriverActor:
             self._active_vllm_actors_by_plan.pop(plan_key, None)
         if errors:
             raise RuntimeError(
-                f"failed to shut down {len(errors)} query-owned vLLM actor pool(s): " + "; ".join(errors)
+                _bounded_diagnostic_text(
+                    f"failed to shut down {failed_pool_count} query-owned vLLM actor pool(s): "
+                    + "; ".join(_safe_exception_summary(error) for error in errors)
+                )
             )
 
     def _register_plan_lifecycle(
@@ -6222,12 +6302,18 @@ class RayQueryDriverActor:
         session_id: str,
         session: _DriverSession,
         plan_id: str,
+        *,
+        plan_kind: Literal["query", "datasink", "copy"],
     ) -> _PlanLifecycle:
         plan_key = str(plan_id).strip()
         session_key = str(session_id).strip()
         if not plan_key:
             raise ValueError("query plan identity must not be empty")
-        lifecycle = _PlanLifecycle(plan_id=plan_key, session_id=session_key)
+        lifecycle = _PlanLifecycle(
+            plan_id=plan_key,
+            session_id=session_key,
+            plan_kind=plan_kind,
+        )
         with session.condition:
             if session.closing or session.closed:
                 raise RuntimeError(f"Vane session closed during query startup: {session_key}")
@@ -6359,6 +6445,8 @@ class RayQueryDriverActor:
         self,
         plan_id: str,
         expected_lifecycle: _PlanLifecycle | None = None,
+        *,
+        force_udf_actor_cleanup: bool = False,
     ) -> None:
         plan_key = str(plan_id)
         with self._plan_teardown_condition:
@@ -6392,6 +6480,8 @@ class RayQueryDriverActor:
                 return
             if self._plan_session_ids.get(plan_key) != lifecycle.session_id:
                 raise RuntimeError(f"query plan lifecycle/session index mismatch: {plan_key}")
+            if force_udf_actor_cleanup and lifecycle.plan_kind != "datasink":
+                raise ValueError("forced query-owned UDF actor cleanup is only valid for a DataSink plan")
             lifecycle.request_close()
             self._plan_teardowns_in_progress.add(plan_key)
         try:
@@ -6406,12 +6496,21 @@ class RayQueryDriverActor:
                     raise RuntimeError(f"query plan connection identity changed before teardown: {plan_key}")
             lifecycle_lock = _query_udf_actor_lifecycle_lock(self, plan_key)
             with lifecycle_lock:
-                cleanup_diagnostics = self._teardown_plan_resources_once(
-                    lifecycle,
-                    query_id,
-                    query_connection,
-                    drop_fragments=drop_fragments,
-                )
+                if force_udf_actor_cleanup:
+                    cleanup_diagnostics = self._teardown_plan_resources_once(
+                        lifecycle,
+                        query_id,
+                        query_connection,
+                        drop_fragments=drop_fragments,
+                        force_udf_actor_cleanup=True,
+                    )
+                else:
+                    cleanup_diagnostics = self._teardown_plan_resources_once(
+                        lifecycle,
+                        query_id,
+                        query_connection,
+                        drop_fragments=drop_fragments,
+                    )
             with self._session_lock:
                 if self._plan_lifecycles.get(plan_key) is lifecycle:
                     raise RuntimeError(f"query plan teardown returned without releasing its lifecycle: {plan_key}")
@@ -6438,12 +6537,16 @@ class RayQueryDriverActor:
         query_connection: Any | None,
         *,
         drop_fragments: bool,
+        force_udf_actor_cleanup: bool = False,
     ) -> list[BaseException]:
         plan_id = lifecycle.plan_id
         errors: list[BaseException] = []
         with self._session_lock:
-            cleanup_diagnostics = list(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
-        execution_owner_errors: list[BaseException] = []
+            stored_cleanup_diagnostics = tuple(self._udf_actor_cleanup_diagnostics_by_plan.get(str(plan_id), ()))
+        cleanup_diagnostics: list[BaseException] = []
+        for diagnostic in stored_cleanup_diagnostics:
+            _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
+        execution_owner_failed = False
         self.curr_plans.pop(plan_id, None)
         self.curr_streams.pop(plan_id, None)
         async_streams = getattr(self, "_async_result_streams", None)
@@ -6458,8 +6561,8 @@ class RayQueryDriverActor:
                 try:
                     output_lease_owner.release()
                 except BaseException as exc:
-                    errors.append(exc)
-                    execution_owner_errors.append(exc)
+                    _append_query_cleanup_error(errors, exc)
+                    execution_owner_failed = True
                 else:
                     with self._plan_teardown_condition:
                         current_refs = self._leased_result_partition_refs.get(str(plan_id))
@@ -6475,20 +6578,28 @@ class RayQueryDriverActor:
                 if counters is not None:
                     counters.pop(str(plan_id), None)
         try:
-            cleanup_diagnostics.extend(self._cleanup_udf_actor_pools(str(plan_id)))
+            if force_udf_actor_cleanup:
+                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(
+                    str(plan_id),
+                    force=True,
+                )
+            else:
+                actor_cleanup_diagnostics = self._cleanup_udf_actor_pools(str(plan_id))
+            for diagnostic in actor_cleanup_diagnostics:
+                _append_udf_actor_cleanup_diagnostic(cleanup_diagnostics, diagnostic)
         except BaseException as exc:
-            errors.append(exc)
-            execution_owner_errors.append(exc)
+            _append_query_cleanup_error(errors, exc)
+            execution_owner_failed = True
         try:
             self._cleanup_vllm_actor_pools(str(plan_id))
         except BaseException as exc:
-            errors.append(exc)
-            execution_owner_errors.append(exc)
+            _append_query_cleanup_error(errors, exc)
+            execution_owner_failed = True
         query_key = str(query_id or "").strip()
         if query_key:
             try:
                 if drop_fragments:
-                    if execution_owner_errors:
+                    if execution_owner_failed:
                         # Quiesce independently owned fragments, but keep the
                         # QRM/coordinator allocation intact while an output or
                         # actor owner failed to terminate.
@@ -6498,14 +6609,14 @@ class RayQueryDriverActor:
                         )
                     else:
                         self._drop_query_fragments_sync(query_key)
-                elif not execution_owner_errors:
+                elif not execution_owner_failed:
                     self._release_query_resources(
                         query_key,
                         reason="query_ended_before_fragment_start",
                         execution_quiesced=True,
                     )
             except BaseException as exc:
-                errors.append(exc)
+                _append_query_cleanup_error(errors, exc)
         if errors:
             error_details = [_safe_exception_summary(exc) for exc in errors]
             error_details.extend(
@@ -6531,13 +6642,50 @@ class RayQueryDriverActor:
         return cleanup_diagnostics
 
     def _cleanup_finished_plan(self, plan_id: str) -> None:
+        plan_key = str(plan_id)
+        with self._session_lock:
+            expected_lifecycle = self._plan_lifecycles.get(plan_key)
         try:
-            self._teardown_plan_resources(plan_id)
+            if expected_lifecycle is not None and expected_lifecycle.plan_kind == "datasink":
+                self._teardown_plan_resources(plan_key, expected_lifecycle)
+            else:
+                self._teardown_plan_resources(plan_key)
         except _QueryCleanupDiagnostic as cleanup_diagnostic:
             try:
                 warnings.warn(str(cleanup_diagnostic), RuntimeWarning, stacklevel=2)
             except BaseException:
                 pass
+        except BaseException as graceful_error:
+            if expected_lifecycle is None or expected_lifecycle.plan_kind != "datasink":
+                raise
+            with self._session_lock:
+                lifecycle = self._plan_lifecycles.get(plan_key)
+            if lifecycle is not expected_lifecycle:
+                return
+            # DataSink execution already attempted graceful actor shutdown and
+            # returned that failure as a cleanup warning. Give terminal plan or
+            # session close one real retry, then remove the actor process so a
+            # permanently failing provider close hook cannot pin the session.
+            try:
+                self._teardown_plan_resources(
+                    plan_key,
+                    expected_lifecycle,
+                    force_udf_actor_cleanup=True,
+                )
+            except _QueryCleanupDiagnostic as cleanup_diagnostic:
+                try:
+                    warnings.warn(str(cleanup_diagnostic), RuntimeWarning, stacklevel=2)
+                except BaseException:
+                    pass
+            except BaseException as force_error:
+                _add_exception_note(
+                    force_error,
+                    _bounded_diagnostic_text(
+                        "graceful DataSink teardown also failed before forced actor cleanup: "
+                        f"{_safe_exception_summary(graceful_error)}"
+                    ),
+                )
+                raise
 
     def _finish_terminal_query(self, plan_id: str, query_id: str) -> None:
         reason = str(getattr(self, "_query_terminal_errors", {}).get(str(query_id), ""))
@@ -6691,7 +6839,12 @@ class RayQueryDriverActor:
         plan_id = str(plan.idx())
         self._begin_session_operation(session, session_id)
         try:
-            lifecycle = self._register_plan_lifecycle(session_id, session, plan_id)
+            lifecycle = self._register_plan_lifecycle(
+                session_id,
+                session,
+                plan_id,
+                plan_kind="query",
+            )
             startup: asyncio.Future[Any] | None = None
             startup_decision: asyncio.Future[bool] | None = None
             setup_finished = False
@@ -7447,7 +7600,9 @@ class RayQueryDriverActor:
                 return
             except BaseException:
                 with self._session_lock:
-                    if self._driver_shutdown_started:
+                    # Re-read the state after the awaited teardown attempt;
+                    # another thread may have started shutdown in between.
+                    if bool(getattr(self, "_driver_shutdown_started")):
                         return
                 await asyncio.sleep(retry_delay_s)
                 retry_delay_s = min(
@@ -7494,7 +7649,12 @@ class RayQueryDriverActor:
         plan_id = str(logical_plan.idx())
         plan_execution: asyncio.Future[Any] | None = None
         startup_decision: asyncio.Future[bool] | None = None
-        lifecycle = self._register_plan_lifecycle(session_id, session, plan_id)
+        lifecycle = self._register_plan_lifecycle(
+            session_id,
+            session,
+            plan_id,
+            plan_kind="datasink",
+        )
         setup_finished = False
         execution_started = False
 
@@ -7592,6 +7752,7 @@ class RayQueryDriverActor:
                     self._get_driver_lifecycle_executor(),
                     self._teardown_plan_resources,
                     plan_id,
+                    lifecycle,
                 )
             except asyncio.CancelledError:
                 pass
@@ -7647,6 +7808,7 @@ class RayQueryDriverActor:
                 self._get_driver_lifecycle_executor(),
                 self._teardown_plan_resources,
                 plan_id,
+                lifecycle,
             )
         except asyncio.CancelledError:
             pass
@@ -7668,7 +7830,12 @@ class RayQueryDriverActor:
         graph = None
         plan_execution: asyncio.Future[Any] | None = None
         startup_decision: asyncio.Future[bool] | None = None
-        lifecycle = self._register_plan_lifecycle(session_id, session, plan_id)
+        lifecycle = self._register_plan_lifecycle(
+            session_id,
+            session,
+            plan_id,
+            plan_kind="copy",
+        )
         setup_finished = False
         try:
             plan, query_connection = await _run_in_executor_with_owned_side_effects(

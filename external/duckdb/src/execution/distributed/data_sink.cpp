@@ -9,13 +9,15 @@
 namespace duckdb {
 namespace distributed {
 
-string BoundDataSinkOutcomeError(const string &error) {
-	string normalized = error;
-	if (!Utf8Proc::IsValid(normalized.c_str(), normalized.size())) {
-		normalized = Utf8Proc::RemoveInvalid(normalized.c_str(), normalized.size());
+static string BoundDataSinkOutcomeError(const char *error, idx_t error_size) {
+	if (!error) {
+		return "unknown error";
 	}
-	if (normalized.size() <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES) {
-		return normalized;
+	if (error_size <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES) {
+		if (Utf8Proc::IsValid(error, error_size)) {
+			return string(error, error_size);
+		}
+		return Utf8Proc::RemoveInvalid(error, error_size);
 	}
 
 	const string omission = "...";
@@ -23,9 +25,36 @@ string BoundDataSinkOutcomeError(const string &error) {
 	const auto remaining = DATA_SINK_MAX_OUTCOME_ERROR_BYTES - omission.size();
 	const auto prefix_bytes = remaining / 2;
 	const auto suffix_bytes = remaining - prefix_bytes;
-	auto prefix = Utf8Proc::RemoveInvalid(normalized.c_str(), prefix_bytes);
-	auto suffix = Utf8Proc::RemoveInvalid(normalized.c_str() + normalized.size() - suffix_bytes, suffix_bytes);
+	// Sanitize only the bytes that can survive the bound. Copying or repairing
+	// the complete provider diagnostic first would create an unbounded
+	// coordinator allocation solely to discard its middle.
+	auto prefix = Utf8Proc::RemoveInvalid(error, prefix_bytes);
+	auto suffix = Utf8Proc::RemoveInvalid(error + error_size - suffix_bytes, suffix_bytes);
 	return prefix + omission + suffix;
+}
+
+string BoundDataSinkOutcomeError(const string &error) {
+	return BoundDataSinkOutcomeError(error.c_str(), error.size());
+}
+
+string BoundDataSinkOutcomeError(const char *error) {
+	if (!error) {
+		return "unknown error";
+	}
+	idx_t bounded_size = 0;
+	while (bounded_size <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES && error[bounded_size] != '\0') {
+		bounded_size++;
+	}
+	if (bounded_size <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES) {
+		return BoundDataSinkOutcomeError(error, bounded_size);
+	}
+
+	// A raw C string does not expose its allocation length. Scan only the bytes
+	// that can survive the diagnostic bound instead of traversing an arbitrarily
+	// large provider message just to preserve its tail.
+	const string omission = "...";
+	const auto prefix_bytes = DATA_SINK_MAX_OUTCOME_ERROR_BYTES - omission.size();
+	return Utf8Proc::RemoveInvalid(error, prefix_bytes) + omission;
 }
 
 DuckDBResult<void> ValidateDataSinkResultBudget(idx_t write_result_count, idx_t total_result_bytes,
@@ -75,17 +104,24 @@ DuckDBResult<void> DataSinkResultValidationState::ValidateAdditionalResultCount(
 
 DuckDBResult<void> DataSinkResultValidationState::Append(const DataChunk &chunk,
                                                          vector<DataSinkWriteResult> *retained_results) {
-	auto operation_res = ValidateOperationId();
+	// Validate into an isolated state so one invalid row cannot leave the shared
+	// parallel operator budget or state discriminator partially advanced.
+	auto next_state = *this;
+	auto operation_res = next_state.ValidateOperationId();
 	if (operation_res.is_err()) {
 		return operation_res;
 	}
-	auto schema_res = ValidateSchema(chunk.GetTypes());
+	auto schema_res = next_state.ValidateSchema(chunk.GetTypes());
 	if (schema_res.is_err()) {
 		return schema_res;
 	}
-	auto count_res = ValidateAdditionalResultCount(chunk.size());
+	auto count_res = next_state.ValidateAdditionalResultCount(chunk.size());
 	if (count_res.is_err()) {
 		return count_res;
+	}
+	vector<DataSinkWriteResult> staged_results;
+	if (retained_results) {
+		staged_results.reserve(chunk.size());
 	}
 	for (idx_t row = 0; row < chunk.size(); row++) {
 		auto operation_value = chunk.GetValue(0, row);
@@ -111,7 +147,7 @@ DuckDBResult<void> DataSinkResultValidationState::Append(const DataChunk &chunk,
 			return DuckDBResult<void>::err(
 			    DuckDBError::value_error("DataSink worker result state must be applied or aborted"));
 		}
-		if (!result_state_.empty() && result_state_ != write_result.state) {
+		if (!next_state.result_state_.empty() && next_state.result_state_ != write_result.state) {
 			return DuckDBResult<void>::err(
 			    DuckDBError::invalid_state_error("DataSink worker results must not mix applied and aborted states"));
 		}
@@ -134,19 +170,33 @@ DuckDBResult<void> DataSinkResultValidationState::Append(const DataChunk &chunk,
 		}
 		const auto result_bytes = write_result.operation_id.size() + write_result.state.size() + 3 * sizeof(uint64_t) +
 		                          write_result.metadata_json.size() + write_result.warnings_json.size();
-		auto budget_res = ValidateDataSinkResultBudget(write_result_count_, total_result_bytes_, result_bytes);
+		auto budget_res =
+		    ValidateDataSinkResultBudget(next_state.write_result_count_, next_state.total_result_bytes_, result_bytes);
 		if (budget_res.is_err()) {
 			return budget_res;
 		}
-		if (result_state_.empty()) {
-			result_state_ = write_result.state;
+		if (next_state.result_state_.empty()) {
+			next_state.result_state_ = write_result.state;
 		}
-		write_result_count_++;
-		total_result_bytes_ += result_bytes;
+		next_state.write_result_count_++;
+		next_state.total_result_bytes_ += result_bytes;
 		if (retained_results) {
-			retained_results->push_back(std::move(write_result));
+			staged_results.push_back(std::move(write_result));
 		}
 	}
+	if (retained_results) {
+		const auto retained_checkpoint = retained_results->size();
+		try {
+			retained_results->reserve(retained_checkpoint + staged_results.size());
+			for (auto &write_result : staged_results) {
+				retained_results->push_back(std::move(write_result));
+			}
+		} catch (...) {
+			retained_results->resize(retained_checkpoint);
+			throw;
+		}
+	}
+	*this = std::move(next_state);
 	return DuckDBResult<void>::ok();
 }
 
@@ -155,6 +205,11 @@ DataSinkResultCollector::DataSinkResultCollector(string operation_id) : validati
 }
 
 DuckDBResult<void> DataSinkResultCollector::Append(const ResultPartitionRef &partition) {
+	return Append(std::vector<ResultPartitionRef> {partition});
+}
+
+DuckDBResult<void> DataSinkResultCollector::Append(const std::vector<ResultPartitionRef> &partitions) {
+	lock_guard<mutex> guard(lock_);
 	if (finalized_) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("DataSink result collection is finalized"));
 	}
@@ -162,24 +217,109 @@ DuckDBResult<void> DataSinkResultCollector::Append(const ResultPartitionRef &par
 	if (operation_res.is_err()) {
 		return operation_res;
 	}
-	if (!partition) {
-		return DuckDBResult<void>::err(DuckDBError("DataSink expects tabular worker results"));
+	// A selected task may return a RefBundle containing several result
+	// partitions. Preflight the complete bundle before materializing any of its
+	// refs so a one-item coordinator queue still has a bounded payload owner.
+	auto minimum_count_res = validation_state_.ValidateAdditionalResultCount(partitions.size());
+	if (minimum_count_res.is_err()) {
+		return minimum_count_res;
 	}
-	auto row_count_res = partition->num_rows();
-	if (row_count_res.is_err()) {
-		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
-		    "DataSink worker result row count is unavailable: " + string(row_count_res.error().what())));
+	vector<std::pair<idx_t, idx_t>> partition_metadata;
+	partition_metadata.reserve(partitions.size());
+	idx_t output_row_count = 0;
+	idx_t reported_output_bytes = 0;
+	for (const auto &partition : partitions) {
+		if (!partition) {
+			return DuckDBResult<void>::err(DuckDBError("DataSink expects tabular worker results"));
+		}
+		auto row_count_res = partition->num_rows();
+		if (row_count_res.is_err()) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("DataSink worker result row count is unavailable: " +
+			                                     BoundDataSinkOutcomeError(row_count_res.error().what())));
+		}
+		const auto partition_count = static_cast<idx_t>(row_count_res.value());
+		if (partition_count == 0) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("DataSink result partitions must report at least one row"));
+		}
+		if (output_row_count > DATA_SINK_MAX_WRITE_RESULTS ||
+		    partition_count > DATA_SINK_MAX_WRITE_RESULTS - output_row_count) {
+			return DuckDBResult<void>::err(DuckDBError::value_error("DataSink exceeds the 1000000 write-result limit"));
+		}
+		output_row_count += partition_count;
+		auto count_res = validation_state_.ValidateAdditionalResultCount(output_row_count);
+		if (count_res.is_err()) {
+			return count_res;
+		}
+
+		auto size_res = partition->size_bytes();
+		if (size_res.is_err()) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("DataSink worker result byte size is unavailable: " +
+			                                     BoundDataSinkOutcomeError(size_res.error().what())));
+		}
+		const auto partition_bytes = static_cast<idx_t>(size_res.value());
+		if (partition_bytes == 0) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::invalid_state_error("DataSink result partitions must report a positive byte size"));
+		}
+		if (reported_output_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES ||
+		    partition_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES - reported_output_bytes) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::value_error("DataSink result bundle exceeds the 64 MiB materialization limit"));
+		}
+		reported_output_bytes += partition_bytes;
+		partition_metadata.emplace_back(partition_count, partition_bytes);
 	}
-	const auto partition_count = static_cast<idx_t>(row_count_res.value());
-	auto count_res = validation_state_.ValidateAdditionalResultCount(partition_count);
-	if (count_res.is_err()) {
-		return count_res;
+	auto validation_checkpoint = validation_state_;
+	const auto result_count_checkpoint = result_.write_results.size();
+	auto rollback = [&]() {
+		validation_state_ = validation_checkpoint;
+		result_.write_results.resize(result_count_checkpoint);
+	};
+	try {
+		idx_t materialized_output_bytes = 0;
+		for (idx_t partition_index = 0; partition_index < partitions.size(); partition_index++) {
+			const auto &metadata = partition_metadata[partition_index];
+			auto append_res =
+			    AppendUnlocked(partitions[partition_index], metadata.first, metadata.second, materialized_output_bytes);
+			if (append_res.is_err()) {
+				rollback();
+				return append_res;
+			}
+		}
+	} catch (...) {
+		rollback();
+		throw;
+	}
+	return DuckDBResult<void>::ok();
+}
+
+DuckDBResult<void> DataSinkResultCollector::AppendUnlocked(const ResultPartitionRef &partition, idx_t partition_count,
+                                                           idx_t reported_partition_bytes,
+                                                           idx_t &materialized_output_bytes) {
+	if (materialized_output_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES ||
+	    reported_partition_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES - materialized_output_bytes) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::value_error("DataSink result bundle exceeds the 64 MiB materialization limit"));
 	}
 	auto collection_ref = partition->to_column_data();
 	if (!collection_ref) {
 		return DuckDBResult<void>::err(DuckDBError("DataSink expects tabular worker results"));
 	}
 	auto &collection = *collection_ref;
+	if (collection.Count() != partition_count) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+		    "DataSink result partition row-count metadata does not match its materialized payload"));
+	}
+	const auto materialized_partition_bytes = collection.SizeInBytes();
+	if (materialized_output_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES ||
+	    materialized_partition_bytes > DATA_SINK_MAX_TOTAL_RESULT_BYTES - materialized_output_bytes) {
+		return DuckDBResult<void>::err(
+		    DuckDBError::value_error("DataSink result bundle exceeds the 64 MiB materialization limit"));
+	}
+	materialized_output_bytes += materialized_partition_bytes;
 	auto schema_res = validation_state_.ValidateSchema(collection.Types());
 	if (schema_res.is_err()) {
 		return schema_res;
@@ -199,6 +339,7 @@ DuckDBResult<void> DataSinkResultCollector::Append(const ResultPartitionRef &par
 }
 
 DuckDBResult<DistributedDataSinkResult> DataSinkResultCollector::Finalize() {
+	lock_guard<mutex> guard(lock_);
 	if (finalized_) {
 		return DuckDBResult<DistributedDataSinkResult>::err(
 		    DuckDBError::invalid_state_error("DataSink result collection is already finalized"));

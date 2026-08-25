@@ -1070,6 +1070,29 @@ void RayTaskResultHandle::AckPollResult() {
 	if (!poll_result_cache_) {
 		return;
 	}
+	bool should_ack = false;
+	{
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		if (!acked_) {
+			acked_ = true;
+			should_ack = true;
+		}
+	}
+	if (!should_ack) {
+		return;
+	}
+	try {
+		PythonGILWrapper gil;
+		if (!poll_state_ || !poll_state_->handle.has_value()) {
+			throw duckdb::InternalException("RayTaskResultHandle missing handle for ack");
+		}
+		py::object handle_obj = poll_state_->handle.get();
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
+	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	poll_result_cache_->result.reset();
 }
@@ -1176,8 +1199,8 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 	} catch (const std::exception &e) {
 		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
 	} catch (...) {
-		terminal_result = ResultType::err(
-		    duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));
+		terminal_result =
+		    ResultType::err(duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));
 	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	if (!poll_result_cache_->result.has_value()) {
@@ -1193,7 +1216,6 @@ void PythonTaskResultHandle::AckPollResult() {
 	bool should_ack = false;
 	{
 		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
-		poll_result_cache_->result.reset();
 		if (!acked_) {
 			acked_ = true;
 			should_ack = true;
@@ -1205,15 +1227,17 @@ void PythonTaskResultHandle::AckPollResult() {
 	try {
 		PythonGILWrapper gil;
 		if (!handle_.has_value()) {
-			return;
+			throw duckdb::InternalException("PythonTaskResultHandle missing handle for ack");
 		}
 		py::object handle_obj = handle_.get();
-		if (py::hasattr(handle_obj, "ack")) {
-			handle_obj.attr("ack")();
-		}
-	} catch (const py::error_already_set &) {
-	} catch (const std::exception &) {
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
 	}
+	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+	poll_result_cache_->result.reset();
 }
 
 void PythonTaskResultHandle::ReleasePollResult() {

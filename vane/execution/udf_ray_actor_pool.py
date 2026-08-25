@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 from vane.execution.udf_ray_config import (
     MAX_ACTOR_RESTARTS,
     MAX_ACTOR_TASK_RETRIES,
@@ -37,14 +38,15 @@ from vane.runners.ray.safe_get import (
 _ACTOR_CLOSE_TIMEOUT_S = 5.0
 _ACTOR_CLEANUP_ERROR_LIMIT = 16
 _ACTOR_CLEANUP_ERROR_MAX_BYTES = 4 * 1024
+_ACTOR_ERROR_TYPE_NAME_MAX_BYTES = 256
 _ACTOR_CLEANUP_ERRORS_OMITTED = "additional UDF actor cleanup errors omitted"
 
 
 def _bounded_actor_cleanup_text(value: object) -> str:
-    try:
-        text = str(value).strip()
-    except BaseException:
-        text = "<cleanup error message unavailable>"
+    text = value if type(value) is str else "<cleanup error message unavailable>"
+    if len(text) > _ACTOR_CLEANUP_ERROR_MAX_BYTES:
+        text = text[:_ACTOR_CLEANUP_ERROR_MAX_BYTES] + "…" + text[-_ACTOR_CLEANUP_ERROR_MAX_BYTES:]
+    text = text.strip()
     encoded = text.encode("utf-8", "replace")
     if len(encoded) <= _ACTOR_CLEANUP_ERROR_MAX_BYTES:
         return encoded.decode("utf-8")
@@ -68,14 +70,22 @@ def _append_actor_cleanup_error(errors: list[str], value: object) -> None:
 
 
 def _actor_exception_summary(error: BaseException) -> str:
+    diagnostic_error = error
     try:
-        error_type = type(error).__name__
+        import ray
+
+        if isinstance(error, ray.exceptions.RayTaskError):
+            attributes = BaseException.__getattribute__(error, "__dict__")
+            cause = attributes.get("cause") if type(attributes) is dict else None
+            if isinstance(cause, BaseException) and cause is not error:
+                diagnostic_error = cause
     except BaseException:
-        error_type = "BaseException"
-    try:
-        message = str(error)
-    except BaseException:
+        pass
+    error_type = safe_exception_type_name(diagnostic_error, _ACTOR_ERROR_TYPE_NAME_MAX_BYTES)
+    message = exception_message_from_args(diagnostic_error)
+    if message is None:
         message = "<cleanup error message unavailable>"
+    message = _bounded_actor_cleanup_text(message)
     return _bounded_actor_cleanup_text(f"{error_type}: {message}")
 
 
@@ -93,7 +103,7 @@ class _OwnedUDFActorPoolsError(RuntimeError):
         owned_actor_pools: list[Any],
         creation_error: BaseException,
     ) -> None:
-        super().__init__(message)
+        super().__init__(_bounded_actor_cleanup_text(message))
         self.owned_actor_pools = list(owned_actor_pools)
         self.creation_error = creation_error
 
@@ -257,12 +267,14 @@ class UDFActorPoolBase:
 
         close_errors: list[str] = []
         actors = list(self.actors)
+        close_failed_indices: set[int] = set()
         if not kill and actors:
             close_refs: list[tuple[int, Any]] = []
             for actor_index, actor in enumerate(actors):
                 try:
                     close_refs.append((actor_index, actor.close_executor.remote()))
                 except BaseException as exc:
+                    close_failed_indices.add(actor_index)
                     _append_actor_cleanup_error(
                         close_errors,
                         _actor_cleanup_failure("close submission", actor_index, exc),
@@ -281,6 +293,7 @@ class UDFActorPoolBase:
                             honor_object_get_timeout=False,
                         )
                     except BaseException as exc:
+                        close_failed_indices.add(actor_index)
                         _append_actor_cleanup_error(
                             close_errors,
                             _actor_cleanup_failure("close", actor_index, exc),
@@ -289,6 +302,9 @@ class UDFActorPoolBase:
         kill_errors: list[str] = []
         remaining_actors: list[Any] = []
         for actor_index, actor in enumerate(actors):
+            if actor_index in close_failed_indices:
+                remaining_actors.append(actor)
+                continue
             try:
                 ray.kill(actor, no_restart=True)
             except BaseException as exc:
@@ -298,20 +314,24 @@ class UDFActorPoolBase:
                 )
                 remaining_actors.append(actor)
         self.actors = remaining_actors
+        if not remaining_actors:
+            self._init_refs = []
+            self._payload_ref = None
         if kill_errors:
             details: list[str] = []
             for error in (*kill_errors, *close_errors):
                 _append_actor_cleanup_error(details, error)
-            raise RuntimeError(
-                _bounded_actor_cleanup_text("failed to shut down UDF actor pool: " + "; ".join(details))
-            )
+            raise RuntimeError(_bounded_actor_cleanup_text("failed to shut down UDF actor pool: " + "; ".join(details)))
         if close_errors:
             raise RuntimeError(
                 _bounded_actor_cleanup_text(
-                    "Ray UDF actors were terminated after graceful callable cleanup failed: "
+                    "Ray UDF actor callable cleanup failed; failed actors were retained for retry: "
                     + "; ".join(close_errors)
                 )
             )
+
+    def cleanup_pending(self) -> bool:
+        return bool(self._owns_actors and self.actors)
 
 
 def apply_actor_node_options(
@@ -350,7 +370,10 @@ def _actor_init_timeout_s() -> float | None:
 def _is_timeout_error(exc: BaseException) -> bool:
     if isinstance(exc, TimeoutError):
         return True
-    return type(exc).__name__ in {"GetTimeoutError", "TimeoutError"}
+    return safe_exception_type_name(exc, _ACTOR_ERROR_TYPE_NAME_MAX_BYTES) in {
+        "GetTimeoutError",
+        "TimeoutError",
+    }
 
 
 def _shutdown_owned_actors(ray: Any, actors_obj: Any) -> None:
@@ -363,11 +386,14 @@ def _shutdown_owned_actors(ray: Any, actors_obj: Any) -> None:
         try:
             ray.kill(actor, no_restart=True)
         except BaseException as exc:
-            errors.append(f"actor-{actor_index}: {type(exc).__name__}: {exc}")
+            _append_actor_cleanup_error(
+                errors,
+                _actor_cleanup_failure("kill", actor_index, exc),
+            )
             remaining_actors.append(actor)
     actors_obj.actors = remaining_actors
     if errors:
-        raise RuntimeError("failed to shut down UDF actor pool: " + "; ".join(errors))
+        raise RuntimeError(_bounded_actor_cleanup_text("failed to shut down UDF actor pool: " + "; ".join(errors)))
 
 
 def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
@@ -398,13 +424,18 @@ def _resolve_actor_pool_init_refs(ray: Any, actors_obj: Any) -> None:
                 f"after {timeout_desc} while waiting for {len(refs)} actor init refs"
             )
         else:
-            readiness_error = RuntimeError(f"UDF actor pool initialization failed: {type(exc).__name__}: {exc}")
+            readiness_error = RuntimeError(
+                _bounded_actor_cleanup_text("UDF actor pool initialization failed: " + _actor_exception_summary(exc))
+            )
         try:
             _shutdown_owned_actors(ray, actors_obj)
         except BaseException as cleanup_error:
             raise _OwnedUDFActorPoolsError(
-                "UDF actor pool initialization failed and actor cleanup also failed: "
-                f"initialization={readiness_error}; cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                _bounded_actor_cleanup_text(
+                    "UDF actor pool initialization failed and actor cleanup also failed: "
+                    f"initialization={_actor_exception_summary(readiness_error)}; "
+                    f"cleanup={_actor_exception_summary(cleanup_error)}"
+                ),
                 owned_actor_pools=[actors_obj],
                 creation_error=readiness_error,
             ) from exc
@@ -433,7 +464,9 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
     actor_index_by_ref = {ref: actor_index for actor_index, ref in enumerate(refs)}
     timeout_s = _actor_init_timeout_s()
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
-    failures: list[BaseException] = []
+    first_failure: BaseException | None = None
+    failure_count = 0
+    failure_details: list[str] = []
     try:
         while pending:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -464,26 +497,34 @@ def wait_for_first_actor_pool_ready(actors_obj: UDFActorPoolBase) -> dict[int, s
                     if not node_id:
                         raise RuntimeError("UDF actor initialization returned an empty Ray node_id")
                 except BaseException as exc:
-                    failures.append(exc)
+                    failure_count += 1
+                    if first_failure is None:
+                        first_failure = exc
+                    if len(failure_details) < 3:
+                        failure_details.append(_actor_exception_summary(exc))
                     continue
                 actors_obj.actor_node_ids[actor_index] = node_id
                 actors_obj._confirmed_ready.add(actor_index)
                 ready_nodes[actor_index] = node_id
             if ready_nodes:
                 return ready_nodes
-        if failures:
+        if first_failure is not None:
             raise RuntimeError(
-                "all UDF actors failed during initialization: "
-                + "; ".join(f"{type(exc).__name__}: {exc}" for exc in failures[:3])
-            ) from failures[0]
+                _bounded_actor_cleanup_text(
+                    f"all {failure_count} UDF actors failed during initialization: " + "; ".join(failure_details)
+                )
+            ) from first_failure
         raise RuntimeError("all UDF actors finished initialization without becoming ready")
     except BaseException as readiness_error:
         try:
             _shutdown_owned_actors(ray, actors_obj)
         except BaseException as cleanup_error:
             raise _OwnedUDFActorPoolsError(
-                "UDF actor pool initialization failed and actor cleanup also failed: "
-                f"initialization={readiness_error}; cleanup={type(cleanup_error).__name__}: {cleanup_error}",
+                _bounded_actor_cleanup_text(
+                    "UDF actor pool initialization failed and actor cleanup also failed: "
+                    f"initialization={_actor_exception_summary(readiness_error)}; "
+                    f"cleanup={_actor_exception_summary(cleanup_error)}"
+                ),
                 owned_actor_pools=[actors_obj],
                 creation_error=readiness_error,
             ) from readiness_error
@@ -744,20 +785,19 @@ def _create_actor_pools_for_nodes(
         for actors_obj in getattr(execution_error, "owned_actor_pools", ()):
             if actors_obj not in created:
                 created.append(actors_obj)
-        cleanup_errors: list[BaseException] = []
+        cleanup_errors: list[str] = []
         remaining_owned: list[UDFActorPoolBase] = []
         for actors_obj in reversed(created):
             try:
                 actors_obj.shutdown()
             except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+                _append_actor_cleanup_error(cleanup_errors, _actor_exception_summary(cleanup_error))
                 if not _actor_pool_terminated(actors_obj):
                     remaining_owned.append(actors_obj)
         if cleanup_errors:
             creation_error = getattr(execution_error, "creation_error", execution_error)
             raise _OwnedUDFActorPoolsError(
-                "UDF actor pool creation failed and cleanup also failed: "
-                f"{_actor_exception_summary(cleanup_errors[0])}",
+                "UDF actor pool creation failed and cleanup also failed: " + "; ".join(cleanup_errors),
                 owned_actor_pools=list(reversed(remaining_owned)),
                 creation_error=creation_error,
             ) from execution_error

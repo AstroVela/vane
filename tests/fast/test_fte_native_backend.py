@@ -1841,6 +1841,30 @@ def test_cxx_python_task_result_handle_polls_native_handle_without_ray_driver():
         worker.shutdown()
 
 
+def test_cxx_python_task_result_handle_requires_ack_contract():
+    class MissingAckHandle:
+        worker_id = "worker-missing-ack"
+        task_id = FteTaskAttemptId.coerce(_task_id(9))
+        task_context_info = {
+            "query_idx": 2,
+            "last_node_id": 4,
+            "task_id": 9,
+            "node_ids": [4],
+        }
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.success([], [], None, 55)
+
+        def release_result_payload(self):
+            return None
+
+    with pytest.raises(Exception, match="ack"):
+        vane.ray_cxx.python_task_result_handle_for_test(MissingAckHandle())
+
+
 def test_cxx_distributed_runner_accepts_python_backend_without_ray_worker_startup():
     class Backend(_QueryLifecycleBackend):
         def __init__(self):
@@ -2466,6 +2490,442 @@ def test_cxx_distributed_runner_sends_planrunner_tasks_to_python_backend():
     assert backend.status_calls[-1] == query_id
     assert all(handle.acked for handle in backend.handles)
     assert all(handle.released for handle in backend.handles)
+
+
+def test_cxx_python_backend_uses_later_nonempty_failed_partition_detail():
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-failed-detail",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": True,
+                "finished": False,
+                "message": "  ",
+                "scheduler_failure": "\t",
+                "selected_attempt_task_ids": [],
+                "failed_partitions": [
+                    {"latest_failure": None},
+                    {
+                        "latest_failure": {
+                            "message": "\n",
+                            "failure_reason": "provider TimeoutError: request timed out",
+                        }
+                    },
+                ],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-failed-detail-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="provider TimeoutError: request timed out"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize(
+    "middle",
+    ["x" * 16_384, "界" * 2_048],
+    ids=["character-limit", "utf8-byte-limit"],
+)
+def test_cxx_python_backend_bounds_failed_partition_detail_without_losing_edges(middle):
+    prefix = "provider TimeoutError: request timed out"
+    suffix = "terminal provider cause"
+
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-bounded-failed-detail",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "failed": True,
+                "finished": False,
+                "selected_attempt_task_ids": [],
+                "failed_partitions": [
+                    {"latest_failure": f"{prefix}:{middle}:{suffix}"},
+                ],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-bounded-failed-detail-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            collect_result_stream(runner.run_plan(plan, con))
+        detail = str(exc_info.value)
+        assert prefix in detail
+        assert suffix in detail
+        assert len(detail.encode("utf-8")) < 8 * 1024
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_rejects_empty_selected_attempt_task_id():
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-empty-selected-id",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [""],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-empty-selected-id-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="entries must be non-empty"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+@pytest.mark.parametrize("selected_attempt_task_ids", [["selected.0", "selected.0"], ["selected.0"]])
+def test_cxx_python_backend_rejects_invalid_selected_attempt_handle_coverage(selected_attempt_task_ids):
+    class Backend(_QueryLifecycleBackend):
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-invalid-selected-coverage",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, _tasks):
+            return []
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": selected_attempt_task_ids,
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-invalid-selected-coverage-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    expected = "entries must be unique" if len(selected_attempt_task_ids) == 2 else "result-handle validation"
+    try:
+        with pytest.raises(RuntimeError, match=expected):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_rejects_duplicate_handles_for_selected_attempt():
+    class DuplicateHandle:
+        def __init__(self, task):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, 0), 0)
+            self.worker_id = "native-worker-duplicate-selected-handle"
+
+        def done(self):
+            raise AssertionError("duplicate selected handles must be rejected before polling")
+
+        def get_result_sync(self):
+            raise AssertionError("duplicate selected handles must not be materialized")
+
+        def ack(self):
+            pass
+
+        def release_result_payload(self):
+            pass
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-duplicate-selected-handle",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            handles = []
+            for task in tasks:
+                handle = DuplicateHandle(task)
+                handles.extend((handle, DuplicateHandle(task)))
+            self.handles.extend(handles)
+            return handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [str(self.handles[0].task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-duplicate-selected-handle-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(Backend())
+    try:
+        with pytest.raises(RuntimeError, match="multiple result handles for one selected attempt"):
+            collect_result_stream(runner.run_plan(plan, con))
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_releases_batch_when_later_result_handle_is_malformed():
+    class Handle:
+        def __init__(self, task, *, malformed=False):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            if not malformed:
+                self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, 0), 0)
+            self.worker_id = "native-worker-partial-handle-batch"
+            self.release_calls = 0
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-partial-handle-batch",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handles:
+                return []
+            self.handles = [Handle(tasks[0]), Handle(tasks[0], malformed=True)]
+            return self.handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-partial-handle-batch-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        with pytest.raises(RuntimeError, match="FTE result handle must provide task_id"):
+            collect_result_stream(runner.run_plan(plan, con))
+        assert [handle.release_calls for handle in backend.handles] == [1, 1]
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
+
+
+def test_cxx_python_backend_drains_but_does_not_publish_handles_when_selection_is_empty():
+    class UnselectedHandle:
+        def __init__(self, task, partition_id):
+            context = task.context()
+            self.task_context_info = task.task_context()
+            self.task_id = FteTaskAttemptId(FteTaskId(context["query_id"], 0, partition_id), 0)
+            self.worker_id = "native-worker-unselected-empty"
+            self.get_result_calls = 0
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            self.get_result_calls += 1
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handles = []
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-unselected-empty",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            new_handles = [UnselectedHandle(task, len(self.handles) + index) for index, task in enumerate(tasks)]
+            self.handles.extend(new_handles)
+            return new_handles
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            return {
+                "finished": True,
+                "failed": False,
+                "selected_attempt_task_ids": [],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-unselected-empty-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+    try:
+        assert collect_result_stream(runner.run_plan(plan, con)) == []
+        assert backend.handles
+        assert all(handle.get_result_calls == 1 for handle in backend.handles)
+        assert all(handle.ack_calls == 0 for handle in backend.handles)
+        assert all(handle.release_calls == 1 for handle in backend.handles)
+    finally:
+        runner.drop_query_fragments(query_id)
+        runner.shutdown()
+        con.close()
 
 
 def test_cxx_python_backend_releases_submit_handle_returned_after_query_drop():
@@ -3809,6 +4269,170 @@ def test_cxx_python_backend_poll_error_retains_result_handle_until_drop():
     con.close()
 
 
+def test_cxx_python_backend_ack_error_retains_result_handle_until_drop():
+    class ErrorHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-ack-error"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.ack_calls = 0
+            self.release_calls = 0
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            self.ack_calls += 1
+            raise RuntimeError("planned Python backend ack failure")
+
+        def release_result_payload(self):
+            self.release_calls += 1
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-ack-error",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = ErrorHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = f"python-backend-ack-error-{uuid.uuid4()}"
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(Exception, match="planned Python backend ack failure"):
+        collect_result_stream(runner.run_plan(plan, con))
+
+    assert backend.handle is not None
+    assert backend.handle.ack_calls == 1
+    assert backend.handle.release_calls == 0
+    runner.drop_query_fragments(query_id)
+    assert backend.handle.release_calls == 1
+    con.close()
+
+
+def test_cxx_python_backend_cleanup_preserves_utf8_when_bounding_query_id():
+    class ErrorHandle:
+        def __init__(self, request):
+            self.task_id = FteTaskAttemptId.coerce(request["task_id"])
+            self.task_context_info = dict(request["task_context_info"])
+            self.worker_id = "native-worker-unicode-cleanup"
+            self.exchange_node_id = _flight_exchange_node_id_from_env()
+            self.release_enabled = False
+
+        def done(self):
+            return True
+
+        def get_result_sync(self):
+            return vane.ray_cxx.RayTaskResult.no_output()
+
+        def ack(self):
+            raise RuntimeError("planned Unicode cleanup ack failure")
+
+        def release_result_payload(self):
+            if not self.release_enabled:
+                raise RuntimeError("planned Unicode cleanup release failure")
+
+    class Backend(_QueryLifecycleBackend):
+        def __init__(self):
+            self.handle = None
+
+        def worker_snapshots(self):
+            return [
+                {
+                    "worker_id": "native-worker-unicode-cleanup",
+                    "num_cpus": 1.0,
+                    "num_gpus": 0.0,
+                    "total_memory_bytes": 1024 * 1024 * 1024,
+                }
+            ]
+
+        def submit_tasks(self, tasks):
+            if self.handle is not None:
+                return []
+            request = NativeFteWorkerManagerBackend._request_from_task(tasks[0])
+            self.handle = ErrorHandle(request)
+            return [self.handle]
+
+        def task_input_stream_exhausted(self, _query_id, _source_node_ids):
+            return []
+
+        def fte_query_status(self, _query_id):
+            assert self.handle is not None
+            return {
+                "failed": False,
+                "finished": True,
+                "selected_attempt_task_ids": [str(self.handle.task_id)],
+            }
+
+        def drop_query(self, _query_id):
+            pass
+
+        def shutdown(self):
+            pass
+
+    con = vane.connect()
+    query_id = "界" * 100
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        con.sql("SELECT 1 AS i"),
+        query_id,
+    ).to_physical_plan(con)
+    backend = Backend()
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner(backend)
+
+    with pytest.raises(Exception, match="planned Unicode cleanup ack failure"):
+        collect_result_stream(runner.run_plan(plan, con))
+
+    with pytest.raises(Exception) as cleanup_error:
+        runner.drop_query_fragments(query_id)
+    assert "planned Unicode cleanup release failure" in str(cleanup_error.value)
+    assert "..." in str(cleanup_error.value)
+
+    assert backend.handle is not None
+    backend.handle.release_enabled = True
+    runner.drop_query_fragments(query_id)
+    con.close()
+
+
 def test_cxx_python_backend_finished_query_respects_exhausted_drain_timeout(monkeypatch):
     class PendingHandle:
         def __init__(self, request):
@@ -3888,16 +4512,19 @@ def test_cxx_python_backend_finished_query_respects_exhausted_drain_timeout(monk
     try:
         thread.join(timeout=1.0)
         if thread.is_alive():
+            assert backend.handle is not None
             backend.handle.ready.set()
             thread.join(timeout=2.0)
         assert not thread.is_alive()
         assert len(outcome) == 1
         assert "timed out draining Python backend FTE result handles" in str(outcome[0])
+        assert backend.handle is not None
         assert backend.handle.release_calls == 0
         runner.drop_query_fragments(query_id)
         assert backend.handle.release_calls == 1
     finally:
-        backend.handle.ready.set()
+        if backend.handle is not None:
+            backend.handle.ready.set()
         if thread.is_alive():
             thread.join(timeout=2.0)
         con.close()
@@ -4816,7 +5443,8 @@ def test_native_cxx_run_copy_plan_selected_attempt_ignores_duplicate_copy_output
         assert con.sql(f"select list(x order by x) from read_parquet('{dst}')").fetchone()[0] == [101]
         assert backend.handles[0].get_result_calls == 1
         assert backend.handles[1].get_result_calls == 0
-        assert all(handle.acked for handle in backend.handles)
+        assert backend.handles[0].acked is True
+        assert backend.handles[1].acked is False
         assert all(handle.released for handle in backend.handles)
         assert backend.duplicate_file is not None
         assert not backend.duplicate_file.exists()
