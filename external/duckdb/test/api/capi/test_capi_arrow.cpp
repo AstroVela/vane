@@ -376,11 +376,11 @@ TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 
 	SECTION("DuckDB-to-Arrow conversion validates FILE values") {
 		duckdb_result result;
-		REQUIRE(duckdb_query(tester.connection, "SELECT NULL::FILE AS value", &result) == DuckDBSuccess);
-		auto file_type = duckdb_column_logical_type(&result, 0);
-		auto chunk = duckdb_create_data_chunk(&file_type, 1);
+		REQUIRE(duckdb_query(tester.connection, "SELECT file('valid', NULL, NULL, NULL, NULL) AS value", &result) ==
+		        DuckDBSuccess);
+		auto chunk = duckdb_result_get_chunk(result, 0);
 		REQUIRE(chunk != nullptr);
-		duckdb_data_chunk_set_size(chunk, 1);
+		auto file_type = duckdb_column_logical_type(&result, 0);
 
 		auto file_vector = duckdb_data_chunk_get_vector(chunk, 0);
 		auto url_vector = duckdb_struct_vector_get_child(file_vector, FileLogicalType::URL);
@@ -395,6 +395,14 @@ TEST_CASE("Test C-API Arrow conversion functions", "[capi][arrow]") {
 		REQUIRE(error != nullptr);
 		REQUIRE(StringUtil::Contains(duckdb_error_data_message(error), "Arrow FILE url cannot be NULL"));
 		REQUIRE(arrow_array.release == nullptr);
+
+		ArrowArray legacy_arrow_array;
+		legacy_arrow_array.Init();
+		auto legacy_arrow_array_handle = reinterpret_cast<duckdb_arrow_array>(&legacy_arrow_array);
+		duckdb_result_arrow_array(result, chunk, &legacy_arrow_array_handle);
+		REQUIRE(legacy_arrow_array.release == nullptr);
+		REQUIRE(duckdb_result_error(&result) != nullptr);
+		REQUIRE(StringUtil::Contains(duckdb_result_error(&result), "Arrow FILE url cannot be NULL"));
 
 		duckdb_destroy_error_data(&error);
 		duckdb_destroy_arrow_options(&arrow_options);

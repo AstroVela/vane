@@ -25,6 +25,9 @@ namespace duckdb {
 void ArrowConverter::ToArrowArray(
     DataChunk &input, ArrowArray *out_array, ClientProperties options,
     const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &extension_type_cast) {
+	for (idx_t column_index = 0; column_index < input.ColumnCount(); column_index++) {
+		FileLogicalType::Validate(input.data[column_index], input.size(), "Arrow FILE");
+	}
 	ArrowAppender appender(input.GetTypes(), input.size(), std::move(options), extension_type_cast);
 	appender.Append(input, 0, input.size(), input.size());
 	*out_array = appender.Finalize();

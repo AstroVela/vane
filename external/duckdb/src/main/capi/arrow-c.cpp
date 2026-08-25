@@ -58,9 +58,6 @@ duckdb_error_data duckdb_data_chunk_to_arrow(duckdb_arrow_options arrow_options,
 	    *arrow_options_wrapper->properties.client_context, dchunk->GetTypes());
 
 	try {
-		for (idx_t column_index = 0; column_index < dchunk->ColumnCount(); column_index++) {
-			duckdb::FileLogicalType::Validate(dchunk->data[column_index], dchunk->size(), "Arrow FILE");
-		}
 		ArrowConverter::ToArrowArray(*dchunk, out_arrow_array, arrow_options_wrapper->properties, extension_type_cast);
 	} catch (const duckdb::Exception &ex) {
 		return duckdb_create_error_data(DUCKDB_ERROR_INVALID_INPUT, ex.what());
@@ -244,8 +241,16 @@ duckdb_state duckdb_query_arrow_array(duckdb_arrow result, duckdb_arrow_array *o
 	}
 	auto extension_type_cast = duckdb::ArrowTypeExtensionData::GetExtensionTypes(
 	    *wrapper->result->client_properties.client_context, wrapper->result->types);
-	ArrowConverter::ToArrowArray(*wrapper->current_chunk, reinterpret_cast<ArrowArray *>(*out_array),
-	                             wrapper->result->client_properties, extension_type_cast);
+	try {
+		ArrowConverter::ToArrowArray(*wrapper->current_chunk, reinterpret_cast<ArrowArray *>(*out_array),
+		                             wrapper->result->client_properties, extension_type_cast);
+	} catch (const std::exception &ex) {
+		wrapper->result->SetError(duckdb::ErrorData(ex));
+		return DuckDBError;
+	} catch (...) { // LCOV_EXCL_START
+		wrapper->result->SetError(duckdb::ErrorData("Unknown error occurred during conversion"));
+		return DuckDBError;
+	} // LCOV_EXCL_STOP
 	return DuckDBSuccess;
 }
 
@@ -258,8 +263,14 @@ void duckdb_result_arrow_array(duckdb_result result, duckdb_data_chunk chunk, du
 	auto extension_type_cast = duckdb::ArrowTypeExtensionData::GetExtensionTypes(
 	    *result_data.result->client_properties.client_context, result_data.result->types);
 
-	ArrowConverter::ToArrowArray(*dchunk, reinterpret_cast<ArrowArray *>(*out_array),
-	                             result_data.result->client_properties, extension_type_cast);
+	try {
+		ArrowConverter::ToArrowArray(*dchunk, reinterpret_cast<ArrowArray *>(*out_array),
+		                             result_data.result->client_properties, extension_type_cast);
+	} catch (const std::exception &ex) {
+		result_data.result->SetError(duckdb::ErrorData(ex));
+	} catch (...) { // LCOV_EXCL_START
+		result_data.result->SetError(duckdb::ErrorData("Unknown error occurred during conversion"));
+	} // LCOV_EXCL_STOP
 }
 
 idx_t duckdb_arrow_row_count(duckdb_arrow result) {
