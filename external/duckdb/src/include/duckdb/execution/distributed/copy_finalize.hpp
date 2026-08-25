@@ -1241,7 +1241,7 @@ inline bool DistributedCopyMayUseDirectTargetLayout(FileSystem &fs, const std::s
 inline DuckDBResult<DistributedCopyPrefixCleanupResult>
 CleanupDistributedCopyPrefix(FileSystem &fs, const std::string &prefix,
                              const std::string &remove_last = std::string()) {
-	const bool has_directory_semantics = !FileSystem::IsRemoteFile(prefix);
+	const bool has_directory_semantics = fs.HasDirectorySemantics(prefix);
 	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, prefix);
 	if (files_res.is_err()) {
 		return DuckDBResult<DistributedCopyPrefixCleanupResult>::err(files_res.error());
