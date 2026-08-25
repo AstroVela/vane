@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
+import hashlib
 import os
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,24 +23,38 @@ from vane.extensions import (
 
 
 class _Result:
-    def __init__(self, row):
-        self._row = row
+    def __init__(self, rows):
+        self._rows = rows
 
     def fetchone(self):
-        return self._row
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
 
 
 class RecordingConnection:
-    def __init__(self, platform):
+    def __init__(self, platform, *, loaded_names=(), before_load=None):
         self.platform = platform
         self.loaded_paths = []
+        self.loaded_payloads = []
+        self.loaded_names = set(loaded_names)
+        self.before_load = before_load
 
     def execute(self, query):
-        assert query == "SELECT platform FROM pragma_platform()"
-        return _Result((self.platform,))
+        if query == "SELECT platform FROM pragma_platform()":
+            return _Result([(self.platform,)])
+        if query == "SELECT extension_name FROM duckdb_extensions() WHERE loaded ORDER BY extension_name":
+            return _Result([(name,) for name in sorted(self.loaded_names)])
+        raise AssertionError(f"unexpected query: {query}")
 
     def load_extension(self, extension):
-        self.loaded_paths.append(Path(extension))
+        path = Path(extension)
+        if self.before_load is not None:
+            self.before_load(path)
+        self.loaded_paths.append(path)
+        self.loaded_payloads.append(path.read_bytes())
+        self.loaded_names.add(path.name.removesuffix(".duckdb_extension"))
 
 
 def _runtime_platform():
@@ -134,7 +151,8 @@ def test_resolver_loads_dependencies_before_root_and_caches_digest(tmp_path):
     resolver.load(connection, root)
 
     assert loaded.identity == root.identity
-    assert connection.loaded_paths == [dependency_path, root_path]
+    assert [path.name for path in connection.loaded_paths] == [dependency_path.name, root_path.name]
+    assert all(path != source for path, source in zip(connection.loaded_paths, [dependency_path, root_path]))
     assert resolver.loaded_identities(connection) == (dependency.identity, root.identity)
 
 
@@ -153,8 +171,8 @@ def test_resolver_cache_is_scoped_to_the_connection(tmp_path):
     resolver.load(first_connection, descriptor)
     resolver.load(second_connection, descriptor)
 
-    assert first_connection.loaded_paths == [artifact_path]
-    assert second_connection.loaded_paths == [artifact_path]
+    assert [path.name for path in first_connection.loaded_paths] == [artifact_path.name]
+    assert [path.name for path in second_connection.loaded_paths] == [artifact_path.name]
 
 
 def test_resolver_rejects_a_different_digest_for_an_already_loaded_extension_name(tmp_path):
@@ -180,7 +198,160 @@ def test_resolver_rejects_a_different_digest_for_an_already_loaded_extension_nam
     with pytest.raises(DynamicExtensionError, match="LOADED_NAME_CONFLICT"):
         resolver.load(connection, second, artifact=second_path)
 
-    assert connection.loaded_paths == [first_path]
+    assert [path.name for path in connection.loaded_paths] == [first_path.name]
+
+
+def test_resolver_rejects_an_extension_loaded_outside_its_cache(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = DynamicExtensionResolver(trusted_identities={"local-tests"})
+    connection = RecordingConnection(platform, loaded_names={"root"})
+
+    with pytest.raises(DynamicExtensionError, match="LOADED_OUTSIDE_RESOLVER"):
+        resolver.load(connection, descriptor, artifact=artifact_path)
+
+    assert connection.loaded_paths == []
+
+
+def test_resolver_loads_the_verified_snapshot_if_the_provider_path_is_replaced(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    verified_payload = artifact_path.read_bytes()
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = DynamicExtensionResolver(trusted_identities={"local-tests"})
+
+    def replace_provider_path(_snapshot_path):
+        artifact_path.write_bytes(b"replacement after verification")
+
+    connection = RecordingConnection(platform, before_load=replace_provider_path)
+
+    loaded = resolver.load(connection, descriptor, artifact=artifact_path)
+
+    assert loaded.path != artifact_path
+    assert connection.loaded_payloads == [verified_payload]
+    assert hashlib.sha256(connection.loaded_payloads[0]).hexdigest() == descriptor.sha256
+    assert artifact_path.read_bytes() != verified_payload
+
+
+def test_resolver_cache_does_not_keep_connections_alive(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = DynamicExtensionResolver(trusted_identities={"local-tests"})
+    connection = RecordingConnection(platform)
+    connection_reference = weakref.ref(connection)
+
+    resolver.load(connection, descriptor, artifact=artifact_path)
+    assert len(resolver._loaded_by_connection) == 1
+
+    del connection
+    # The pytest timing plugin can retain the most recently returned Python
+    # frames while output capture is active. Advance it past load()/resolve()
+    # before checking that the resolver cache itself does not retain the key.
+    resolver.loaded_identities(RecordingConnection(platform))
+    gc.collect()
+
+    assert connection_reference() is None
+    assert len(resolver._loaded_by_connection) == 0
+
+
+def test_resolver_rejects_a_requested_descriptor_that_differs_from_the_provider(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    provider_descriptor = _descriptor(artifact_path, name="root")
+    requested_descriptor = replace(
+        provider_descriptor,
+        dependencies=(
+            DynamicExtensionDependency(
+                name="injected",
+                extension_version="injected-version",
+                sha256="1" * 64,
+            ),
+        ),
+    )
+    resolver = _resolver(LocalExtensionArtifact(provider_descriptor, artifact_path))
+    connection = RecordingConnection(platform)
+
+    with pytest.raises(DynamicExtensionError, match="PROVIDER_DESCRIPTOR_MISMATCH"):
+        resolver.load(connection, requested_descriptor)
+
+    assert connection.loaded_paths == []
+
+
+def test_resolver_rejects_conflicting_dependency_names_before_loading_anything(tmp_path):
+    platform = _runtime_platform()
+    first_path = _write_extension_artifact(
+        tmp_path / "first" / "shared.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+        extension_version="first-version",
+    )
+    second_path = _write_extension_artifact(
+        tmp_path / "second" / "shared.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+        extension_version="second-version",
+    )
+    root_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    first = _descriptor(first_path, name="shared")
+    second = _descriptor(second_path, name="shared")
+    root = replace(
+        _descriptor(root_path, name="root"),
+        dependencies=(
+            DynamicExtensionDependency(first.name, first.extension_version, first.sha256),
+            DynamicExtensionDependency(second.name, second.extension_version, second.sha256),
+        ),
+    )
+    resolver = _resolver(
+        LocalExtensionArtifact(first, first_path),
+        LocalExtensionArtifact(second, second_path),
+        LocalExtensionArtifact(root, root_path),
+    )
+    connection = RecordingConnection(platform)
+
+    with pytest.raises(DynamicExtensionError, match="RESOLVED_NAME_CONFLICT"):
+        resolver.load(connection, root)
+
+    assert connection.loaded_paths == []
+
+
+def test_resolver_rejects_an_unsupported_c_struct_api_before_loading(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id="v999.0.0",
+        abi_type="C_STRUCT",
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = DynamicExtensionResolver(trusted_identities={"local-tests"})
+    connection = RecordingConnection(platform)
+
+    with pytest.raises(DynamicExtensionError, match="CAPI_VERSION_MISMATCH"):
+        resolver.load(connection, descriptor, artifact=artifact_path)
+
+    assert connection.loaded_paths == []
 
 
 def test_descriptor_creation_rejects_a_name_that_does_not_match_the_artifact(tmp_path):

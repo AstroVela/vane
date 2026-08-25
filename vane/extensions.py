@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+import threading
+import weakref
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +31,7 @@ _HEX_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9_]+$")
 _TRUST_IDENTITY_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+_CAPI_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 class DynamicExtensionError(RuntimeError):
@@ -95,6 +100,14 @@ def _validate_extension_version(value: object) -> str:
     return _require_string(value, "extension_version")
 
 
+def _parse_capi_version(value: object, field_name: str) -> tuple[int, int, int]:
+    capi_version = _require_string(value, field_name)
+    match = _CAPI_VERSION_RE.fullmatch(capi_version)
+    if match is None:
+        _fail("DESCRIPTOR_INVALID", f"{field_name} must use v<major>.<minor>.<patch> syntax")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 def _runtime_identity() -> tuple[str, str]:
     # Import lazily so this module can be imported from vane.__init__ while that
     # package is still being initialized.
@@ -103,6 +116,21 @@ def _runtime_identity() -> tuple[str, str]:
     source_id = _validate_source_id(getattr(vane, "__git_revision__", ""), "runtime DuckDB SourceID")
     vane_version = _require_string(getattr(vane, "__version__", ""), "runtime Vane version")
     return source_id, vane_version
+
+
+def _runtime_capi_version() -> str:
+    # Keep this value tied to the native runtime rather than duplicating the
+    # vendored DuckDB header's version in Python.
+    from vane import _native
+
+    capi_version = getattr(_native, "__duckdb_extension_api_version__", "")
+    try:
+        _parse_capi_version(capi_version, "runtime DuckDB extension C API version")
+    except DynamicExtensionError as exception:
+        raise DynamicExtensionError(
+            "RUNTIME_IDENTITY_UNAVAILABLE", "native runtime did not expose a valid DuckDB extension C API version"
+        ) from exception
+    return capi_version
 
 
 @dataclass(frozen=True)
@@ -186,7 +214,7 @@ class DynamicExtensionDescriptor:
         object.__setattr__(self, "dependencies", dependencies)
 
         if abi_type == "C_STRUCT":
-            _require_string(self.duckdb_capi_version, "duckdb_capi_version")
+            _parse_capi_version(self.duckdb_capi_version, "duckdb_capi_version")
         elif self.duckdb_capi_version is not None:
             _fail("DESCRIPTOR_INVALID", "duckdb_capi_version is valid only for C_STRUCT extensions")
 
@@ -371,9 +399,16 @@ class DynamicExtensionResolver:
             _fail("DESCRIPTOR_INVALID", "trusted_identities must not be empty")
         self._trusted_identities = trusted
         self._providers = tuple(providers)
-        # Keep the connection beside its id. A bare id() cache can be reused by
-        # a later connection after the original object is collected.
-        self._loaded_by_connection: dict[int, tuple[_ExtensionConnection, dict[str, ResolvedDynamicExtension]]] = {}
+        self._loaded_by_connection: weakref.WeakKeyDictionary[
+            _ExtensionConnection, dict[str, ResolvedDynamicExtension]
+        ] = weakref.WeakKeyDictionary()
+        self._lock = threading.RLock()
+        # DuckDB re-opens an extension by path. Load a private copy of the exact
+        # bytes we verified so replacing the provider path cannot change what is
+        # handed to the native loader.
+        self._snapshot_directory = tempfile.TemporaryDirectory(
+            prefix="vane-dynamic-extensions-", ignore_cleanup_errors=True
+        )
 
     def resolve(
         self,
@@ -397,8 +432,14 @@ class DynamicExtensionResolver:
             visiting.add(candidate.identity)
             try:
                 if candidate_path is None:
-                    candidate_path = self._provider_artifact(candidate.identity).path
-                self._verify_artifact(
+                    provider_artifact = self._provider_artifact(candidate.identity)
+                    if provider_artifact.descriptor != candidate:
+                        _fail(
+                            "PROVIDER_DESCRIPTOR_MISMATCH",
+                            f"provider descriptor for {candidate.identity} does not match the requested descriptor",
+                        )
+                    candidate_path = provider_artifact.path
+                verified_path = self._verify_artifact(
                     candidate,
                     candidate_path,
                     current_source_id=current_source_id,
@@ -410,13 +451,14 @@ class DynamicExtensionResolver:
                     if dependency_artifact.descriptor.identity != dependency.identity:
                         _fail("DEPENDENCY_NOT_FOUND", f"provider identity does not match {dependency.identity}")
                     visit(dependency_artifact.descriptor, dependency_artifact.path)
-                resolved.append(ResolvedDynamicExtension(candidate, candidate_path))
+                resolved.append(ResolvedDynamicExtension(candidate, verified_path))
                 resolved_identities.add(candidate.identity)
             finally:
                 visiting.discard(candidate.identity)
 
         explicit_artifact = Path(artifact).expanduser().resolve() if artifact is not None else None
         visit(descriptor, explicit_artifact)
+        self._validate_resolved_names(resolved)
         return tuple(resolved)
 
     def load(
@@ -427,48 +469,88 @@ class DynamicExtensionResolver:
         artifact: str | Path | None = None,
     ) -> ResolvedDynamicExtension:
         """Resolve and load dependencies before the requested extension."""
-        resolved = self.resolve(connection, descriptor, artifact=artifact)
-        loaded = self._loaded_for_connection(connection)
-        for candidate in resolved:
-            existing = loaded.get(candidate.descriptor.sha256)
-            if existing is not None:
-                if existing.identity != candidate.identity:
-                    _fail(
-                        "LOADED_IDENTITY_CONFLICT",
-                        f"digest {candidate.descriptor.sha256} is already cached as {existing.identity}",
-                    )
-                continue
-            for loaded_candidate in loaded.values():
-                if loaded_candidate.descriptor.name == candidate.descriptor.name:
-                    _fail(
-                        "LOADED_NAME_CONFLICT",
-                        f"{candidate.descriptor.name} is already loaded as {loaded_candidate.identity}",
-                    )
-            try:
-                connection.load_extension(str(candidate.path))
-            except Exception as exception:
-                raise DynamicExtensionError(
-                    "LOAD_FAILED",
-                    f"failed to load {candidate.identity} from {candidate.path.name}: {exception}",
-                ) from exception
-            loaded[candidate.descriptor.sha256] = candidate
-        return resolved[-1]
+        with self._lock:
+            resolved = self.resolve(connection, descriptor, artifact=artifact)
+            loaded = self._loaded_for_connection(connection)
+            database_loaded_names = _database_loaded_extension_names(connection)
+            self._validate_load_plan(resolved, loaded, database_loaded_names)
+            for candidate in resolved:
+                if candidate.descriptor.sha256 in loaded:
+                    continue
+                try:
+                    connection.load_extension(str(candidate.path))
+                except Exception as exception:
+                    raise DynamicExtensionError(
+                        "LOAD_FAILED",
+                        f"failed to load {candidate.identity} from {candidate.path.name}: {exception}",
+                    ) from exception
+                loaded[candidate.descriptor.sha256] = candidate
+            return resolved[-1]
 
     def loaded_identities(self, connection: _ExtensionConnection) -> tuple[str, ...]:
         """Return cached artifact identities for one connection in load order."""
-        cached = self._loaded_by_connection.get(id(connection))
-        if cached is None or cached[0] is not connection:
-            return ()
-        return tuple(candidate.identity for candidate in cached[1].values())
+        with self._lock:
+            try:
+                cached = self._loaded_by_connection.get(connection)
+            except TypeError:
+                return ()
+            if cached is None:
+                return ()
+            return tuple(candidate.identity for candidate in cached.values())
 
     def _loaded_for_connection(self, connection: _ExtensionConnection) -> dict[str, ResolvedDynamicExtension]:
-        connection_id = id(connection)
-        cached = self._loaded_by_connection.get(connection_id)
-        if cached is not None and cached[0] is connection:
-            return cached[1]
-        loaded: dict[str, ResolvedDynamicExtension] = {}
-        self._loaded_by_connection[connection_id] = (connection, loaded)
-        return loaded
+        try:
+            cached = self._loaded_by_connection.get(connection)
+            if cached is not None:
+                return cached
+            loaded: dict[str, ResolvedDynamicExtension] = {}
+            self._loaded_by_connection[connection] = loaded
+            return loaded
+        except TypeError as exception:
+            raise DynamicExtensionError(
+                "CONNECTION_UNSUPPORTED", "connection objects must support weak references and identity hashing"
+            ) from exception
+
+    @staticmethod
+    def _validate_resolved_names(resolved: Iterable[ResolvedDynamicExtension]) -> None:
+        by_name: dict[str, ResolvedDynamicExtension] = {}
+        for candidate in resolved:
+            existing = by_name.get(candidate.descriptor.name)
+            if existing is not None and existing.identity != candidate.identity:
+                _fail(
+                    "RESOLVED_NAME_CONFLICT",
+                    f"dependency graph resolves {candidate.descriptor.name} as both "
+                    f"{existing.identity} and {candidate.identity}",
+                )
+            by_name[candidate.descriptor.name] = candidate
+
+    @staticmethod
+    def _validate_load_plan(
+        resolved: Iterable[ResolvedDynamicExtension],
+        loaded: Mapping[str, ResolvedDynamicExtension],
+        database_loaded_names: frozenset[str],
+    ) -> None:
+        loaded_by_name = {candidate.descriptor.name: candidate for candidate in loaded.values()}
+        for candidate in resolved:
+            existing_digest = loaded.get(candidate.descriptor.sha256)
+            if existing_digest is not None:
+                if existing_digest.identity != candidate.identity:
+                    _fail(
+                        "LOADED_IDENTITY_CONFLICT",
+                        f"digest {candidate.descriptor.sha256} is already cached as {existing_digest.identity}",
+                    )
+                continue
+            existing_name = loaded_by_name.get(candidate.descriptor.name)
+            if existing_name is not None:
+                _fail(
+                    "LOADED_NAME_CONFLICT",
+                    f"{candidate.descriptor.name} is already loaded as {existing_name.identity}",
+                )
+            if candidate.descriptor.name in database_loaded_names:
+                _fail(
+                    "LOADED_OUTSIDE_RESOLVER",
+                    f"{candidate.descriptor.name} is already loaded but its artifact identity is not resolver-cached",
+                )
 
     def _provider_artifact(self, identity: str) -> LocalExtensionArtifact:
         candidates = [artifact for provider in self._providers if (artifact := provider.find(identity)) is not None]
@@ -486,7 +568,7 @@ class DynamicExtensionResolver:
         current_source_id: str,
         current_vane_version: str,
         current_platform: str,
-    ) -> None:
+    ) -> Path:
         if descriptor.trust_identity not in self._trusted_identities:
             _fail("TRUST_IDENTITY_UNTRUSTED", f"{descriptor.trust_identity} is not in trusted_identities")
         if descriptor.duckdb_source_id != current_source_id:
@@ -509,13 +591,13 @@ class DynamicExtensionResolver:
             _fail("NAME_MISMATCH", f"{descriptor.identity} must use artifact filename {expected_filename}")
         if not artifact_path.is_file():
             _fail("ARTIFACT_NOT_FOUND", f"artifact does not exist: {artifact_path}")
-        actual_digest = _sha256_file(artifact_path)
+        snapshot_path, actual_digest, footer_bytes = self._snapshot_artifact(artifact_path)
         if actual_digest != descriptor.sha256:
             _fail(
                 "DIGEST_MISMATCH",
                 f"{descriptor.identity} expected SHA-256 {descriptor.sha256}, got {actual_digest}",
             )
-        footer = _parse_extension_footer(artifact_path)
+        footer = _parse_extension_footer(footer_bytes, artifact_path.name)
         if footer.abi_type != descriptor.abi_type:
             _fail(
                 "ABI_MISMATCH",
@@ -538,11 +620,31 @@ class DynamicExtensionResolver:
                     f"{descriptor.identity} requires C API {descriptor.duckdb_capi_version}, "
                     f"artifact footer has {footer.engine_identity}",
                 )
+            runtime_capi_version = _runtime_capi_version()
+            if not _is_supported_capi_version(descriptor.duckdb_capi_version, runtime_capi_version):
+                _fail(
+                    "CAPI_VERSION_MISMATCH",
+                    f"{descriptor.identity} requires C API {descriptor.duckdb_capi_version}, "
+                    f"runtime supports up through {runtime_capi_version}",
+                )
         elif footer.engine_identity != descriptor.duckdb_source_id:
             _fail(
                 "SOURCE_ID_MISMATCH",
                 f"{descriptor.identity} footer SourceID is {footer.engine_identity}",
             )
+        return snapshot_path
+
+    def _snapshot_artifact(self, artifact_path: Path) -> tuple[Path, str, bytes]:
+        snapshot_parent = Path(tempfile.mkdtemp(prefix="artifact-", dir=self._snapshot_directory.name))
+        snapshot_path = snapshot_parent / artifact_path.name
+        digest, footer_bytes = _inspect_extension_artifact(artifact_path, snapshot_path=snapshot_path)
+        try:
+            snapshot_path.chmod(0o400)
+        except OSError as exception:
+            raise DynamicExtensionError(
+                "ARTIFACT_SNAPSHOT_FAILED", f"could not make verified artifact snapshot read-only: {artifact_path}"
+            ) from exception
+        return snapshot_path, digest, footer_bytes
 
 
 def create_dynamic_extension_descriptor(
@@ -559,7 +661,8 @@ def create_dynamic_extension_descriptor(
     expected_filename = f"{validated_name}.duckdb_extension"
     if artifact_path.name != expected_filename:
         _fail("NAME_MISMATCH", f"descriptor name {validated_name} requires artifact filename {expected_filename}")
-    footer = _parse_extension_footer(artifact_path)
+    artifact_digest, footer_bytes = _inspect_extension_artifact(artifact_path)
+    footer = _parse_extension_footer(footer_bytes, artifact_path.name)
     source_id, runtime_vane_version = _runtime_identity()
     descriptor_vane_version = (
         runtime_vane_version if vane_version is None else _require_string(vane_version, "vane_version")
@@ -572,7 +675,7 @@ def create_dynamic_extension_descriptor(
             duckdb_source_id=source_id,
             vane_version=descriptor_vane_version,
             platform=footer.platform,
-            sha256=_sha256_file(artifact_path),
+            sha256=artifact_digest,
             trust_identity=trust_identity,
             dependencies=tuple(dependencies),
             duckdb_capi_version=footer.engine_identity,
@@ -584,7 +687,7 @@ def create_dynamic_extension_descriptor(
         duckdb_source_id=_validate_source_id(footer.engine_identity, "artifact footer SourceID"),
         vane_version=descriptor_vane_version,
         platform=footer.platform,
-        sha256=_sha256_file(artifact_path),
+        sha256=artifact_digest,
         trust_identity=trust_identity,
         dependencies=tuple(dependencies),
     )
@@ -602,29 +705,60 @@ def _connection_platform(connection: _ExtensionConnection) -> str:
     return _validate_platform(row[0])
 
 
-def _sha256_file(path: Path) -> str:
+def _database_loaded_extension_names(connection: _ExtensionConnection) -> frozenset[str]:
+    try:
+        rows = connection.execute(
+            "SELECT extension_name FROM duckdb_extensions() WHERE loaded ORDER BY extension_name"
+        ).fetchall()
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "LOADED_STATE_UNAVAILABLE", "could not query the database's loaded extension state"
+        ) from exception
+    if not isinstance(rows, list) or any(
+        not isinstance(row, tuple) or len(row) != 1 or not isinstance(row[0], str) for row in rows
+    ):
+        _fail("LOADED_STATE_UNAVAILABLE", "duckdb_extensions() returned an invalid loaded extension result")
+    return frozenset(row[0] for row in rows)
+
+
+def _is_supported_capi_version(required: str | None, runtime: str) -> bool:
+    required_major, required_minor, required_patch = _parse_capi_version(required, "duckdb_capi_version")
+    runtime_major, runtime_minor, runtime_patch = _parse_capi_version(runtime, "runtime DuckDB extension C API version")
+    if required_major != runtime_major:
+        return False
+    if required_minor != runtime_minor:
+        return required_minor < runtime_minor
+    return required_patch <= runtime_patch
+
+
+def _inspect_extension_artifact(path: Path, *, snapshot_path: Path | None = None) -> tuple[str, bytes]:
     digest = hashlib.sha256()
+    footer = bytearray()
     try:
         with path.open("rb") as artifact_file:
-            for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
-                digest.update(chunk)
+            if snapshot_path is None:
+                for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    footer.extend(chunk)
+                    del footer[:-_EXTENSION_FOOTER_SIZE]
+            else:
+                with snapshot_path.open("xb") as snapshot_file:
+                    for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        footer.extend(chunk)
+                        del footer[:-_EXTENSION_FOOTER_SIZE]
+                        snapshot_file.write(chunk)
+                    snapshot_file.flush()
+                    os.fsync(snapshot_file.fileno())
     except OSError as exception:
-        raise DynamicExtensionError("ARTIFACT_NOT_FOUND", f"could not read artifact: {path}") from exception
-    return digest.hexdigest()
+        code = "ARTIFACT_NOT_FOUND" if snapshot_path is None else "ARTIFACT_SNAPSHOT_FAILED"
+        raise DynamicExtensionError(code, f"could not read and snapshot artifact: {path}") from exception
+    return digest.hexdigest(), bytes(footer)
 
 
-def _parse_extension_footer(path: Path) -> _ExtensionFooter:
-    try:
-        with path.open("rb") as artifact_file:
-            artifact_file.seek(0, 2)
-            if artifact_file.tell() < _EXTENSION_FOOTER_SIZE:
-                _fail("FOOTER_INVALID", f"artifact is smaller than {_EXTENSION_FOOTER_SIZE} bytes: {path.name}")
-            artifact_file.seek(-_EXTENSION_FOOTER_SIZE, 2)
-            footer = artifact_file.read(_EXTENSION_FOOTER_SIZE)
-    except OSError as exception:
-        raise DynamicExtensionError("ARTIFACT_NOT_FOUND", f"could not read artifact: {path}") from exception
+def _parse_extension_footer(footer: bytes, artifact_name: str) -> _ExtensionFooter:
     if len(footer) != _EXTENSION_FOOTER_SIZE:
-        _fail("FOOTER_INVALID", f"could not read a complete extension footer from {path.name}")
+        _fail("FOOTER_INVALID", f"artifact is smaller than {_EXTENSION_FOOTER_SIZE} bytes: {artifact_name}")
 
     fields = []
     for field_index in range(_EXTENSION_FOOTER_FIELD_COUNT):
@@ -641,7 +775,7 @@ def _parse_extension_footer(path: Path) -> _ExtensionFooter:
         fields.append(field)
 
     if fields[7] != "4":
-        _fail("FOOTER_INVALID", f"artifact footer magic is invalid: {path.name}")
+        _fail("FOOTER_INVALID", f"artifact footer magic is invalid: {artifact_name}")
     abi_type = fields[3] or "CPP"
     if abi_type not in _VALID_ABI_TYPES:
         _fail("FOOTER_INVALID", f"artifact footer has unsupported ABI {abi_type!r}")
