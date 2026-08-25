@@ -1,0 +1,131 @@
+# name: test/sql/types/alias/test_file_alias.test
+# description: Test the lightweight FILE struct alias and its pure constructor
+# group: [file]
+
+statement ok
+PRAGMA enable_verification
+
+query TTTIIT
+SELECT typeof(value), value.url, value.content_type, value.position, value.size, value.checksum
+FROM (
+	SELECT file(
+		's3://bucket/missing.bin',
+		'application/octet-stream',
+		10,
+		20,
+		'sha256:abcdef'
+	) AS value
+)
+----
+FILE	s3://bucket/missing.bin	application/octet-stream	10	20	sha256:abcdef
+
+query TII rowsort
+SELECT value.url, value.position, value.size
+FROM (
+	SELECT file('object-' || i, NULL, i, i + 1, NULL) AS value
+	FROM range(3) AS input(i)
+)
+----
+object-0	0	1
+object-1	1	2
+object-2	2	3
+
+statement error
+SELECT file(NULL, NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*url cannot be NULL.*
+
+statement error
+SELECT file('x', NULL, 0, NULL, NULL)
+----
+<REGEX>:.*position and size must either both be NULL or both be non-NULL.*
+
+statement error
+SELECT file('x', NULL, NULL, 0, NULL)
+----
+<REGEX>:.*position and size must either both be NULL or both be non-NULL.*
+
+statement error
+SELECT file('x', NULL, -1, 0, NULL)
+----
+<REGEX>:.*position and size must be non-negative.*
+
+statement error
+SELECT file('x', NULL, 9223372036854775807, 1, NULL)
+----
+<REGEX>:.*byte range exceeds BIGINT.*
+
+statement error
+SELECT file('x', NULL, NULL, NULL, 'sha256')
+----
+<REGEX>:.*checksum must have the form <algorithm>:<digest>.*
+
+query I
+SELECT file('x', NULL, 0, 0, NULL).size
+----
+0
+
+query IIIIIIII
+SELECT
+	complete = complete,
+	complete != complete,
+	partial = partial,
+	partial != partial,
+	partial = other,
+	partial != other,
+	NULL::FILE = complete,
+	NULL::FILE != complete
+FROM (
+	SELECT
+		file('x', 'application/octet-stream', 10, 20, 'sha256:abcdef') AS complete,
+		file('x', NULL, NULL, NULL, NULL) AS partial,
+		file('other', NULL, NULL, NULL, NULL) AS other
+)
+----
+true	false	NULL	NULL	false	true	NULL	NULL
+
+query IIIII
+SELECT
+	value = file('other', 'application/octet-stream', 10, 20, 'sha256:abcdef'),
+	value = file('x', 'text/plain', 10, 20, 'sha256:abcdef'),
+	value = file('x', 'application/octet-stream', 11, 20, 'sha256:abcdef'),
+	value = file('x', 'application/octet-stream', 10, 21, 'sha256:abcdef'),
+	value = file('x', 'application/octet-stream', 10, 20, 'sha256:fedcba')
+FROM (
+	SELECT file('x', 'application/octet-stream', 10, 20, 'sha256:abcdef') AS value
+)
+----
+false	false	false	false	false
+
+statement error
+SELECT file('x', NULL, NULL, NULL, NULL) < file('x', NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*Cannot compare values of type FILE.*
+
+statement error
+SELECT file('x', NULL, NULL, NULL, NULL) = ROW('x', NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*Cannot compare values of type FILE.*
+
+# Generic nested operations intentionally use the underlying STRUCT behavior.
+query II
+SELECT list_contains([value], value), hash(value) IS NOT NULL
+FROM (SELECT file('x', 'text/plain', 0, 1, 'sha256:a') AS value)
+----
+true	true
+
+statement ok
+CREATE TABLE file_values(value FILE)
+
+statement ok
+INSERT INTO file_values VALUES
+	(file('stored', 'text/plain', 0, 0, 'sha256:a')),
+	(NULL)
+
+query TT
+SELECT typeof(value), value.url
+FROM file_values
+ORDER BY value IS NULL
+----
+FILE	stored
+FILE	NULL
