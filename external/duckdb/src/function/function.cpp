@@ -9,7 +9,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/function/built_in_functions.hpp"
-#include "duckdb/function/scalar/file_functions.hpp"
 #include "duckdb/function/scalar/string_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table/datasource_scan.hpp"
@@ -18,7 +17,6 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/main/extension_entries.hpp"
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
-#include "duckdb/parser/parsed_data/create_type_info.hpp"
 
 namespace duckdb {
 
@@ -103,14 +101,6 @@ string BaseScalarFunction::ToString() const {
 
 // add your initializer for new functions here
 void BuiltinFunctions::Initialize() {
-	CreateTypeInfo file_type_info(FileLogicalType::TYPE_NAME, FileLogicalType::Create());
-	file_type_info.internal = true;
-	file_type_info.temporary = true;
-	catalog.CreateType(transaction, file_type_info);
-	for (auto &function : FileFunctions::GetFunctions()) {
-		AddFunction(std::move(function));
-	}
-
 	RegisterTableScanFunctions();
 	RegisterSQLiteFunctions();
 	RegisterReadFunctions();

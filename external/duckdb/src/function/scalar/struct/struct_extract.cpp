@@ -1,9 +1,3 @@
-// SPDX-FileCopyrightText: 2018-2025 Stichting DuckDB Foundation
-// SPDX-FileCopyrightText: 2026 Vane contributors
-// SPDX-License-Identifier: MIT
-//
-// Modified by Vane contributors.
-
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/struct_functions.hpp"
@@ -173,9 +167,6 @@ ScalarFunctionSet StructExtractFun::GetFunctions() {
 	ScalarFunctionSet struct_extract_set("struct_extract");
 	struct_extract_set.AddFunction(GetKeyExtractFunction());
 	struct_extract_set.AddFunction(GetIndexExtractFunction());
-	auto file_key_extract = GetKeyExtractFunction();
-	file_key_extract.arguments[0] = FileLogicalType::Create();
-	struct_extract_set.AddFunction(std::move(file_key_extract));
 	return struct_extract_set;
 }
 
