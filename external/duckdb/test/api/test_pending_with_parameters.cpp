@@ -229,6 +229,30 @@ TEST_CASE("FILE query parameters are validated before storage", "[api][file]") {
 	}
 }
 
+TEST_CASE("FILE constants from relation APIs are validated before storage", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE files(value FILE)"));
+	auto names = duckdb::vector<duckdb::string> {"value"};
+
+	auto invalid_file = Value::STRUCT(FileLogicalType::Create(), {Value(), Value(), Value(), Value(), Value()});
+	auto invalid_values = duckdb::vector<duckdb::vector<Value>> {{std::move(invalid_file)}};
+	REQUIRE_THROWS_WITH(con.Values(invalid_values, names)->Insert("files"),
+	                    Catch::Matchers::Contains("Constant FILE url cannot be NULL"));
+	auto count = con.Query("SELECT count(*) FROM files");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+
+	auto valid_file =
+	    Value::STRUCT(FileLogicalType::Create(), {Value("object"), Value("application/octet-stream"), Value::BIGINT(0),
+	                                              Value::BIGINT(1), Value("sha256:digest")});
+	auto valid_values = duckdb::vector<duckdb::vector<Value>> {{std::move(valid_file)}};
+	REQUIRE_NOTHROW(con.Values(valid_values, names)->Insert("files"));
+	auto result = con.Query("SELECT value.url, value.position, value.size FROM files");
+	REQUIRE(CHECK_COLUMN(result, 0, {"object"}));
+	REQUIRE(CHECK_COLUMN(result, 1, {0}));
+	REQUIRE(CHECK_COLUMN(result, 2, {1}));
+}
+
 TEST_CASE("Native scalar UDF FILE signatures are rejected", "[api][file]") {
 	DuckDB db(nullptr);
 	Connection con(db);
