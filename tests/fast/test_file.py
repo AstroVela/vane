@@ -250,6 +250,41 @@ def test_file_values_cross_explicit_python_boundaries(duckdb_cursor):
     assert nested == [value, None]
 
 
+@pytest.mark.parametrize(
+    ("value", "dtype", "expected_value"),
+    [
+        pytest.param(None, vane.list_type(vane.file_type()), None, id="null-list"),
+        pytest.param([], vane.list_type(vane.file_type()), [], id="empty-list"),
+        pytest.param([None], vane.list_type(vane.file_type()), [None], id="null-only-list"),
+        pytest.param([None], vane.array_type(vane.file_type(), 1), (None,), id="null-only-array"),
+        pytest.param(
+            {"file": None},
+            vane.struct_type({"file": vane.file_type()}),
+            {"file": None},
+            id="null-only-struct",
+        ),
+        pytest.param({}, vane.map_type(vane.sqltypes.VARCHAR, vane.file_type()), {}, id="empty-map"),
+        pytest.param(
+            {"key": ["one"], "value": [None]},
+            vane.map_type(vane.sqltypes.VARCHAR, vane.file_type()),
+            {"one": None},
+            id="null-only-map-values",
+        ),
+        pytest.param(
+            [[]],
+            vane.list_type(vane.list_type(vane.file_type())),
+            [[]],
+            id="nested-empty-list",
+        ),
+    ],
+)
+def test_explicit_nested_file_types_survive_null_only_values(duckdb_cursor, value, dtype, expected_value):
+    actual_type, actual_value = duckdb_cursor.execute("SELECT typeof($1), $1", [vane.Value(value, dtype)]).fetchone()
+
+    assert actual_type == str(dtype)
+    assert actual_value == expected_value
+
+
 def test_pandas_file_columns_preserve_file_identity(duckdb_cursor):
     values = [vane.File("memory://first"), float("nan"), vane.File("memory://second", "text/plain"), None]
     relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))
@@ -275,6 +310,8 @@ def test_pandas_file_columns_preserve_file_identity(duckdb_cursor):
 def test_python_file_conversion_rejects_fallbacks(fallback):
     with pytest.raises(vane.InvalidInputException, match="Only vane.File or NULL"):
         vane.ConstantExpression(vane.Value(fallback, vane.file_type()))
+    with pytest.raises(vane.InvalidInputException, match="Only vane.File or NULL"):
+        vane.ConstantExpression(vane.Value([fallback], vane.list_type(vane.file_type())))
 
 
 def test_python_file_conversion_rejects_plain_struct_targets():

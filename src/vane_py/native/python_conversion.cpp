@@ -448,6 +448,10 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 	}
 }
 
+static bool ContainsFileType(const LogicalType &type) {
+	return TypeVisitor::Contains(type, FileLogicalType::IsFile);
+}
+
 // DuckDB prefers aliases while inferring sequence types. Reject only overlapping paths where that would turn a
 // non-FILE Python value into FILE; NULLs and fields missing from one STRUCT remain valid.
 static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &right) {
@@ -461,10 +465,7 @@ static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &r
 		return left_is_file != right_is_file;
 	}
 
-	auto contains_file = [](const LogicalType &type) {
-		return TypeVisitor::Contains(type, FileLogicalType::IsFile);
-	};
-	if (!contains_file(left) && !contains_file(right)) {
+	if (!ContainsFileType(left) && !ContainsFileType(right)) {
 		return false;
 	}
 	if (left.id() != right.id()) {
@@ -676,19 +677,20 @@ struct PythonValueConversion {
 			}
 			auto &internal_logical_type = internal_type->Type();
 			auto converted = TransformPythonValue(object, internal_logical_type);
-			if (converted.IsNull() && FileLogicalType::IsFile(internal_logical_type)) {
-				// Keep the declared logical identity for an explicitly typed FILE NULL.
-				converted = Value(internal_logical_type);
-			}
-			if (target_type.id() != LogicalTypeId::UNKNOWN) {
-				auto target_is_file = FileLogicalType::IsFile(target_type);
-				auto converted_is_file = FileLogicalType::IsFile(converted.type());
-				if (target_is_file && !converted.IsNull() && !converted_is_file) {
+			if (ContainsFileType(internal_logical_type)) {
+				if (FileTypeLayoutMismatch(internal_logical_type, converted.type())) {
 					throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
 				}
-				if (!target_is_file && converted_is_file) {
-					throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+				// Nested constructors infer their physical type from the observed values. Restore the declared type so
+				// empty and NULL-only containers retain FILE aliases at every level.
+				converted = converted.IsNull() ? Value(internal_logical_type)
+				                               : CastToTarget(std::move(converted), internal_logical_type);
+			}
+			if (target_type.id() != LogicalTypeId::UNKNOWN && FileTypeLayoutMismatch(target_type, converted.type())) {
+				if (ContainsFileType(target_type)) {
+					throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
 				}
+				throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
 			}
 			return converted;
 		}
