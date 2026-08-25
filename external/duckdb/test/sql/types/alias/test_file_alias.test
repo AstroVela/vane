@@ -1,6 +1,6 @@
 # name: test/sql/types/alias/test_file_alias.test
 # description: Test the lightweight FILE struct alias and its pure constructor
-# group: [file]
+# group: [alias]
 
 statement ok
 PRAGMA enable_verification
