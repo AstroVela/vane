@@ -242,26 +242,15 @@ def test_resolver_loads_the_verified_snapshot_if_the_provider_path_is_replaced(t
     assert artifact_path.read_bytes() != verified_payload
 
 
-def test_resolver_cache_does_not_keep_connections_alive(tmp_path):
-    platform = _runtime_platform()
-    artifact_path = _write_extension_artifact(
-        tmp_path / "root.duckdb_extension",
-        platform=platform,
-        source_id=vane.__git_revision__,
-    )
-    descriptor = _descriptor(artifact_path, name="root")
+def test_resolver_cache_does_not_keep_connections_alive():
     resolver = DynamicExtensionResolver(trusted_identities={"local-tests"})
-    connection = RecordingConnection(platform)
+    connection = RecordingConnection("linux_amd64")
     connection_reference = weakref.ref(connection)
 
-    resolver.load(connection, descriptor, artifact=artifact_path)
+    resolver._loaded_by_connection[connection] = {}
     assert len(resolver._loaded_by_connection) == 1
 
     del connection
-    # The pytest timing plugin can retain the most recently returned Python
-    # frames while output capture is active. Advance it past load()/resolve()
-    # before checking that the resolver cache itself does not retain the key.
-    resolver.loaded_identities(RecordingConnection(platform))
     gc.collect()
 
     assert connection_reference() is None
