@@ -454,6 +454,18 @@ def test_file_union_members_reject_plain_struct_fallbacks():
         )
 
 
+def test_file_map_keys_materialize_as_hashable_file_dictionaries(duckdb_cursor):
+    key = vane.File("memory://map-key", "text/plain", 0, 3, "sha256:key")
+    dtype = vane.map_type(vane.file_type(), vane.sqltypes.BIGINT)
+    value = vane.Value({key: 42}, dtype)
+
+    fetched = duckdb_cursor.execute("SELECT $1 AS value", [value]).fetchone()[0]
+    columnar = duckdb_cursor.execute("SELECT $1 AS value", [value]).df()["value"].iloc[0]
+
+    assert fetched == {key: 42}
+    assert columnar == {key: 42}
+
+
 def test_pandas_file_columns_preserve_file_identity(duckdb_cursor):
     values = [vane.File("memory://first"), float("nan"), vane.File("memory://second", "text/plain"), None]
     relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))

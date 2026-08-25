@@ -423,6 +423,9 @@ py::object PythonObject::FromStruct(const Value &val, const LogicalType &type,
 }
 
 static bool KeyIsHashable(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return true;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
 	case LogicalTypeId::TINYINT:
