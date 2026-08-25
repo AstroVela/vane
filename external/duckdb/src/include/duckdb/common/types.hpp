@@ -30,6 +30,7 @@ class Vector;
 class ClientContext;
 class ParsedExpression;
 class CoordinateReferenceSystem;
+class DataChunk;
 
 struct string_t; // NOLINT: mimic std casing
 
@@ -532,6 +533,9 @@ struct FileLogicalType {
 	DUCKDB_API static bool IsFile(const LogicalType &type);
 	DUCKDB_API static void Validate(const Value &value, const string &source);
 	DUCKDB_API static void Validate(Vector &value, idx_t count, const string &source);
+	DUCKDB_API static void Validate(Vector &value, const LogicalType &declared_type, idx_t count,
+	                                const string &source);
+	DUCKDB_API static void Validate(DataChunk &value, const vector<LogicalType> &declared_types, const string &source);
 };
 
 struct MapType {

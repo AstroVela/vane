@@ -1,4 +1,3 @@
-#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -196,13 +195,7 @@ void ExpressionExecutor::Execute(const BoundFunctionExpression &expr, Expression
 	if (!execute_function_state.TryExecuteDictionaryExpression(expr, arguments, *state, result)) {
 		expr.function.GetFunctionCallback()(arguments, *state, result);
 	}
-	if (TypeVisitor::Contains(expr.return_type, FileLogicalType::IsFile)) {
-		if (result.GetType() != expr.return_type) {
-			throw InvalidInputException("Scalar function FILE result has type %s, expected %s", result.GetType(),
-			                            expr.return_type);
-		}
-		FileLogicalType::Validate(result, count, "Scalar function FILE");
-	}
+	FileLogicalType::Validate(result, expr.return_type, count, "Scalar function FILE");
 
 	VerifyNullHandling(expr, arguments, result);
 	D_ASSERT(result.GetType() == expr.return_type);

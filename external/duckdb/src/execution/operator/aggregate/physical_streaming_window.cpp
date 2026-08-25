@@ -627,6 +627,7 @@ void PhysicalStreamingWindow::ExecuteFunctions(ExecutionContext &context, DataCh
 		default:
 			throw NotImplementedException("%s for StreamingWindow", ExpressionTypeToString(expr.GetExpressionType()));
 		}
+		FileLogicalType::Validate(result, wexpr.return_type, count, "Window function FILE");
 	}
 	gstate.row_number += NumericCast<int64_t>(count);
 }

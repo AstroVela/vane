@@ -191,6 +191,7 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 		// inconsistencies
 		ValidateAsyncStrategyResult(execution_strategy, input_execution_mode, data.results_execution_mode,
 		                            initial_async_result, output_async_result, chunk.size());
+		FileLogicalType::Validate(chunk, types, "Table function FILE");
 
 		// Handle results
 		switch (output_async_result) {
@@ -222,8 +223,11 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 
 	if (g_state.in_out_final) {
 		function.in_out_function_final(context, data, chunk);
+		FileLogicalType::Validate(chunk, types, "Table function FILE");
 	}
-	switch (function.in_out_function(context, data, g_state.input_chunk, chunk)) {
+	auto in_out_result = function.in_out_function(context, data, g_state.input_chunk, chunk);
+	FileLogicalType::Validate(chunk, types, "Table function FILE");
+	switch (in_out_result) {
 	case OperatorResultType::BLOCKED: {
 		auto guard = g_state.Lock();
 		return g_state.BlockSource(guard, input.interrupt_state);
@@ -236,6 +240,7 @@ SourceResultType PhysicalTableScan::GetDataInternal(ExecutionContext &context, D
 
 	if (chunk.size() == 0 && function.in_out_function_final) {
 		function.in_out_function_final(context, data, chunk);
+		FileLogicalType::Validate(chunk, types, "Table function FILE");
 		g_state.in_out_final = true;
 	}
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;

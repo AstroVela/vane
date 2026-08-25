@@ -17,6 +17,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/string_type.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -1887,6 +1888,40 @@ void FileLogicalType::Validate(Vector &value, idx_t count, const string &source)
 		}
 		ValidateFileFields(url_data.validity.RowIsValid(url_index), position_is_valid, position, size_is_valid, size,
 		                   checksum_ptr, source);
+	}
+}
+
+void FileLogicalType::Validate(Vector &value, const LogicalType &declared_type, idx_t count, const string &source) {
+	if (!TypeVisitor::Contains(declared_type, IsFile)) {
+		return;
+	}
+	if (value.GetType() != declared_type) {
+		throw InvalidInputException("%s result has type %s, expected %s", source, value.GetType(), declared_type);
+	}
+	Validate(value, count, source);
+}
+
+void FileLogicalType::Validate(DataChunk &value, const vector<LogicalType> &declared_types, const string &source) {
+	bool contains_file = false;
+	for (auto &declared_type : declared_types) {
+		if (TypeVisitor::Contains(declared_type, IsFile)) {
+			contains_file = true;
+			break;
+		}
+	}
+	if (!contains_file) {
+		return;
+	}
+	if (value.ColumnCount() != declared_types.size()) {
+		throw InvalidInputException("%s result has %llu columns, expected %llu", source, value.ColumnCount(),
+		                            declared_types.size());
+	}
+	for (idx_t column_index = 0; column_index < declared_types.size(); column_index++) {
+		auto &declared_type = declared_types[column_index];
+		if (!TypeVisitor::Contains(declared_type, IsFile)) {
+			continue;
+		}
+		Validate(value.data[column_index], declared_type, value.size(), source);
 	}
 }
 

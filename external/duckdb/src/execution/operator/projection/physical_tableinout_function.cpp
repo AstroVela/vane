@@ -8,10 +8,34 @@
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/function_serialization.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
 namespace duckdb {
+
+static void ValidateTableFunctionFileBatch(ExecutionBatch &batch, const vector<LogicalType> &types) {
+	bool contains_file = false;
+	for (auto &type : types) {
+		if (TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+			contains_file = true;
+			break;
+		}
+	}
+	if (!contains_file) {
+		return;
+	}
+	if (batch.kind != ExecutionBatchKind::MATERIALIZED_CHUNK) {
+		throw InvalidInputException("Table function FILE batch output must be materialized");
+	}
+	if (!batch.materialized) {
+		if (batch.rows > 0) {
+			throw InvalidInputException("Table function FILE batch output has rows but no materialized payload");
+		}
+		return;
+	}
+	FileLogicalType::Validate(*batch.materialized, types, "Table function FILE");
+}
 
 static void ReferenceOrCast(ExecutionContext &context, Vector &target, Vector &source, idx_t position, idx_t count) {
 	if (target.GetType() == source.GetType()) {
@@ -122,6 +146,7 @@ OperatorResultType PhysicalTableInOutFunction::Execute(ExecutionContext &context
 			SetOrdinality(chunk, this->ordinality_idx, state.current_ordinality_idx, ordinality);
 			state.current_ordinality_idx += ordinality;
 		}
+		FileLogicalType::Validate(chunk, types, "Table function FILE");
 		return result;
 	}
 	// when project_input is set we execute the input function row-by-row
@@ -159,6 +184,7 @@ OperatorResultType PhysicalTableInOutFunction::Execute(ExecutionContext &context
 		SetOrdinality(chunk, this->ordinality_idx, state.current_ordinality_idx, ordinality);
 		state.current_ordinality_idx += ordinality;
 	}
+	FileLogicalType::Validate(chunk, types, "Table function FILE");
 	if (result == OperatorResultType::FINISHED) {
 		return result;
 	}
@@ -181,7 +207,9 @@ OperatorResultType PhysicalTableInOutFunction::ExecuteBatch(ExecutionContext &co
 	auto &gstate = gstate_p.Cast<TableInOutGlobalState>();
 	auto &state = state_p.Cast<TableInOutLocalState>();
 	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
-	return function.in_out_function_batch(context, data, input, output);
+	auto result = function.in_out_function_batch(context, data, input, output);
+	ValidateTableFunctionFileBatch(output, types);
+	return result;
 }
 
 ExecutionBatchRequirement PhysicalTableInOutFunction::GetExecutionBatchRequirement(PipelineOperatorRole role) const {
@@ -239,6 +267,7 @@ OperatorFinalizeResultType PhysicalTableInOutFunction::FinalExecute(ExecutionCon
 	}
 	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
 	auto result = function.in_out_function_final(context, data, chunk);
+	FileLogicalType::Validate(chunk, types, "Table function FILE");
 	return result;
 }
 
@@ -252,7 +281,9 @@ OperatorFinalizeResultType PhysicalTableInOutFunction::FinalExecuteBatch(Executi
 	auto &gstate = gstate_p.Cast<TableInOutGlobalState>();
 	auto &state = state_p.Cast<TableInOutLocalState>();
 	TableFunctionInput data(bind_data.get(), state.local_state.get(), gstate.global_state.get());
-	return function.in_out_function_final_batch(context, data, batch);
+	auto result = function.in_out_function_final_batch(context, data, batch);
+	ValidateTableFunctionFileBatch(batch, types);
+	return result;
 }
 
 } // namespace duckdb

@@ -1012,6 +1012,8 @@ SourceResultType RadixPartitionedHashTable::GetData(ExecutionContext &context, D
 				if (aggr.function.HasStateDestructorCallback()) {
 					aggr.function.GetStateDestructorCallback()(state_vector, aggr_input_data, 1);
 				}
+				FileLogicalType::Validate(chunk.data[null_groups.size() + i], aggr.return_type, 1,
+				                          "Aggregate function FILE");
 			}
 			// Place the grouping values (all the groups of the grouping_set condensed into a single value)
 			// Behind the null groups + aggregates

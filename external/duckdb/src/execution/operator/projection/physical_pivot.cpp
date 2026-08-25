@@ -30,6 +30,7 @@ static void InitializePivotDataForPhysicalPivot(PhysicalPivot &pivot, PhysicalPl
 		Vector result_vector(aggr_expr->return_type);
 		AggregateInputData aggr_input_data(aggr.bind_info.get(), physical_plan.ArenaRef());
 		aggr.function.GetStateFinalizeCallback()(state_vector, aggr_input_data, result_vector, 1, 0);
+		FileLogicalType::Validate(result_vector, aggr.return_type, 1, "Aggregate function FILE");
 		pivot.empty_aggregates.push_back(result_vector.GetValue(0));
 	}
 }

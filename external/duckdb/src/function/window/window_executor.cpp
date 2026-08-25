@@ -53,6 +53,7 @@ void WindowExecutor::Evaluate(ExecutionContext &context, idx_t row_idx, DataChun
 
 	const auto count = eval_chunk.size();
 	EvaluateInternal(context, eval_chunk, result, count, row_idx, sink);
+	FileLogicalType::Validate(result, wexpr.return_type, count, "Window function FILE");
 
 	result.Verify(count);
 }

@@ -264,3 +264,99 @@ TEST_CASE("Extension scalar FILE results are validated", "[api][file]") {
 	auto count = con.Query("SELECT count(*) FROM files");
 	REQUIRE(CHECK_COLUMN(count, 0, {0}));
 }
+
+static duckdb::unique_ptr<duckdb::FunctionData>
+InvalidExtensionFileTableBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
+                              duckdb::vector<duckdb::LogicalType> &return_types,
+                              duckdb::vector<duckdb::string> &names) {
+	return_types.push_back(FileLogicalType::Create());
+	names.push_back("value");
+	return nullptr;
+}
+
+static void InvalidExtensionFileTableFunction(ClientContext &, TableFunctionInput &, DataChunk &output) {
+	output.SetValue(0, 0, Value::STRUCT(FileLogicalType::Create(), {Value(), Value(), Value(), Value(), Value()}));
+	output.SetCardinality(1);
+}
+
+TEST_CASE("Extension table FILE results are validated", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ExtensionLoader loader(*db.instance, "test_file_extension");
+	loader.RegisterFunction(
+	    TableFunction("invalid_extension_files", {}, InvalidExtensionFileTableFunction, InvalidExtensionFileTableBind));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE files(value FILE)"));
+	auto result = con.Query("INSERT INTO files SELECT * FROM invalid_extension_files()");
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "Table function FILE url cannot be NULL"));
+	auto count = con.Query("SELECT count(*) FROM files");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}
+
+static idx_t InvalidExtensionFileAggregateStateSize(const AggregateFunction &) {
+	return sizeof(uint8_t);
+}
+
+static void InvalidExtensionFileAggregateInitialize(const AggregateFunction &, data_ptr_t state) {
+	*state = 0;
+}
+
+static void InvalidExtensionFileAggregateUpdate(Vector[], AggregateInputData &, idx_t, Vector &, idx_t) {
+}
+
+static void InvalidExtensionFileAggregateCombine(Vector &, Vector &, AggregateInputData &, idx_t) {
+}
+
+static void InvalidExtensionFileAggregateFinalize(Vector &, AggregateInputData &, Vector &result, idx_t count,
+                                                  idx_t offset) {
+	auto invalid_file = Value::STRUCT(FileLogicalType::Create(), {Value(), Value(), Value(), Value(), Value()});
+	for (idx_t row = 0; row < count; row++) {
+		result.SetValue(offset + row, invalid_file);
+	}
+}
+
+TEST_CASE("Extension aggregate FILE results are validated", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ExtensionLoader loader(*db.instance, "test_file_extension");
+	loader.RegisterFunction(
+	    AggregateFunction("invalid_extension_file_aggregate", {LogicalType::BIGINT}, FileLogicalType::Create(),
+	                      InvalidExtensionFileAggregateStateSize, InvalidExtensionFileAggregateInitialize,
+	                      InvalidExtensionFileAggregateUpdate, InvalidExtensionFileAggregateCombine,
+	                      InvalidExtensionFileAggregateFinalize, FunctionNullHandling::SPECIAL_HANDLING));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE files(value FILE)"));
+
+	SECTION("ungrouped aggregate output") {
+		auto result =
+		    con.Query("INSERT INTO files SELECT invalid_extension_file_aggregate(i) FROM range(1) AS input(i)");
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Aggregate function FILE url cannot be NULL"));
+	}
+
+	SECTION("grouped aggregate output") {
+		auto result = con.Query(
+		    "INSERT INTO files SELECT invalid_extension_file_aggregate(i) FROM range(1) AS input(i) GROUP BY i");
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Aggregate function FILE url cannot be NULL"));
+	}
+
+	SECTION("window aggregate output") {
+		auto result =
+		    con.Query("INSERT INTO files SELECT invalid_extension_file_aggregate(i) OVER () FROM range(1) AS input(i)");
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Window function FILE url cannot be NULL"));
+	}
+
+	SECTION("streaming window aggregate output") {
+		auto result = con.Query(
+		    "INSERT INTO files SELECT invalid_extension_file_aggregate(i) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND "
+		    "CURRENT ROW) FROM range(1) AS input(i)");
+		REQUIRE(result->HasError());
+		REQUIRE(StringUtil::Contains(result->GetError(), "Window function FILE url cannot be NULL"));
+	}
+
+	auto count = con.Query("SELECT count(*) FROM files");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
+}

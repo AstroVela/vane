@@ -673,6 +673,8 @@ void GlobalUngroupedAggregateState::Finalize(DataChunk &result, idx_t column_off
 		AggregateInputData aggr_input_data(aggregate.bind_info.get(), allocator);
 		aggregate.function.GetStateFinalizeCallback()(state_vector, aggr_input_data,
 		                                              result.data[column_offset + aggr_idx], 1, 0);
+		FileLogicalType::Validate(result.data[column_offset + aggr_idx], aggregate.return_type, 1,
+		                          "Aggregate function FILE");
 	}
 }
 

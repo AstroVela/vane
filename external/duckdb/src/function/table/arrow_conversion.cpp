@@ -138,7 +138,7 @@ static ArrowListOffsetData ConvertArrowListOffsetsTemplated(Vector &vector, Arro
 
 template <class BUFFER_TYPE>
 static ArrowListOffsetData ConvertArrowListViewOffsetsTemplated(Vector &vector, ArrowArray &array, idx_t size,
-                                                                idx_t effective_offset) {
+                                                                idx_t effective_offset, const ValidityMask &list_mask) {
 	ArrowListOffsetData result;
 	auto &start_offset = result.start_offset;
 	auto &list_size = result.list_size;
@@ -157,6 +157,11 @@ static ArrowListOffsetData ConvertArrowListViewOffsetsTemplated(Vector &vector, 
 	auto list_data = FlatVector::GetData<list_entry_t>(vector);
 	for (idx_t i = 0; i < size; i++) {
 		auto &le = list_data[i];
+		if (!list_mask.RowIsValid(i)) {
+			le.offset = 0;
+			le.length = 0;
+			continue;
+		}
 		le.offset = NumericCast<idx_t>(offsets[i]);
 		le.length = NumericCast<idx_t>(sizes[i]);
 		if (le.length == 0) {
@@ -194,15 +199,16 @@ static ArrowListOffsetData ConvertArrowListViewOffsetsTemplated(Vector &vector, 
 }
 
 static ArrowListOffsetData ConvertArrowListOffsets(Vector &vector, ArrowArray &array, idx_t size,
-                                                   const ArrowType &arrow_type, idx_t effective_offset) {
+                                                   const ArrowType &arrow_type, idx_t effective_offset,
+                                                   const ValidityMask &list_mask) {
 	auto &list_info = arrow_type.GetTypeInfo<ArrowListInfo>();
 	auto size_type = list_info.GetSizeType();
 	if (list_info.IsView()) {
 		if (size_type == ArrowVariableSizeType::NORMAL) {
-			return ConvertArrowListViewOffsetsTemplated<uint32_t>(vector, array, size, effective_offset);
+			return ConvertArrowListViewOffsetsTemplated<uint32_t>(vector, array, size, effective_offset, list_mask);
 		} else {
 			D_ASSERT(size_type == ArrowVariableSizeType::SUPER_SIZE);
-			return ConvertArrowListViewOffsetsTemplated<uint64_t>(vector, array, size, effective_offset);
+			return ConvertArrowListViewOffsetsTemplated<uint64_t>(vector, array, size, effective_offset, list_mask);
 		}
 	} else {
 		if (size_type == ArrowVariableSizeType::NORMAL) {
@@ -219,9 +225,18 @@ static void ArrowToDuckDBList(Vector &vector, ArrowArray &array, idx_t chunk_off
                               const ValidityMask *parent_mask, int64_t parent_offset) {
 	auto &list_info = arrow_type.GetTypeInfo<ArrowListInfo>();
 	ArrowToDuckDBConversion::SetValidityMask(vector, array, chunk_offset, size, parent_offset, nested_offset);
+	auto &list_mask = FlatVector::Validity(vector);
+	if (parent_mask && !parent_mask->AllValid()) {
+		//! Since this List is owned by a struct we must guarantee their validity map matches on Null
+		for (idx_t i = 0; i < size; i++) {
+			if (!parent_mask->RowIsValid(i)) {
+				list_mask.SetInvalid(i);
+			}
+		}
+	}
 
 	auto effective_offset = GetEffectiveOffset(array, parent_offset, chunk_offset, nested_offset);
-	auto list_data = ConvertArrowListOffsets(vector, array, size, arrow_type, effective_offset);
+	auto list_data = ConvertArrowListOffsets(vector, array, size, arrow_type, effective_offset, list_mask);
 	auto &start_offset = list_data.start_offset;
 	auto &list_size = list_data.list_size;
 
@@ -230,17 +245,6 @@ static void ArrowToDuckDBList(Vector &vector, ArrowArray &array, idx_t chunk_off
 	auto &child_vector = ListVector::GetEntry(vector);
 	ArrowToDuckDBConversion::SetValidityMask(child_vector, *array.children[0], chunk_offset, list_size, array.offset,
 	                                         NumericCast<int64_t>(start_offset));
-	auto &list_mask = FlatVector::Validity(vector);
-	if (parent_mask) {
-		//! Since this List is owned by a struct we must guarantee their validity map matches on Null
-		if (!parent_mask->AllValid()) {
-			for (idx_t i = 0; i < size; i++) {
-				if (!parent_mask->RowIsValid(i)) {
-					list_mask.SetInvalid(i);
-				}
-			}
-		}
-	}
 	auto &child_state = array_state.GetChild(0);
 	auto &child_array = *array.children[0];
 	auto &child_type = list_info.GetChild();
