@@ -13,7 +13,7 @@ SubmittableTaskStream<WorkerTask> DataSinkFinishNode::produce_tasks(PlanExecutio
 	auto input_stream = child_->produce_tasks(plan_context);
 	auto self = shared_from_this();
 	auto operation_id = operation_id_;
-	return input_stream.pipeline_instruction(
+	auto sink_stream = input_stream.pipeline_instruction(
 	    self,
 	    [operation_id = std::move(operation_id)](DuckPhysicalPlanRef input_plan) -> DuckPhysicalPlanRef {
 		    auto &old_root = input_plan->Root();
@@ -26,6 +26,14 @@ SubmittableTaskStream<WorkerTask> DataSinkFinishNode::produce_tasks(PlanExecutio
 		    return input_plan;
 	    },
 	    plan_context.client_context());
+	return sink_stream.map_tasks([](SubmittableTask<WorkerTask> submittable_task) {
+		auto task = std::move(submittable_task).take_task();
+		auto context = task.context();
+		context[DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY] = "1";
+		WorkerTask marked_task(task.task_context(), task.plan(), task.config(), std::move(context), task.name(),
+		                       task.inputs());
+		return SubmittableTask<WorkerTask>(std::move(marked_task));
+	});
 }
 
 } // namespace distributed

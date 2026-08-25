@@ -763,26 +763,43 @@ def test_ensure_actor_pools_for_plan_creates_anonymous_handles_without_pool_name
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected_task_retries"),
     [
-        {
-            "udf_name": "replicated_transform",
-            "execution_backend": "ray_actor",
-            "actor_number": 2,
-            "query_id": _TEST_QUERY_ID,
-            "resource_unit_id": "resource:test:retry-policy",
-        },
-        {
-            "udf_name": "ai_prompt",
-            "execution_backend": "ray_actor",
-            "ai_operation": "prompt",
-            "query_id": _TEST_QUERY_ID,
-            "resource_unit_id": "resource:test:retry-policy",
-        },
+        (
+            {
+                "udf_name": "replicated_transform",
+                "execution_backend": "ray_actor",
+                "actor_number": 2,
+                "query_id": _TEST_QUERY_ID,
+                "resource_unit_id": "resource:test:retry-policy",
+            },
+            None,
+        ),
+        (
+            {
+                "udf_name": "ai_prompt",
+                "execution_backend": "ray_actor",
+                "ai_operation": "prompt",
+                "query_id": _TEST_QUERY_ID,
+                "resource_unit_id": "resource:test:retry-policy",
+            },
+            None,
+        ),
+        (
+            {
+                "udf_name": "datasink_batch",
+                "execution_backend": "ray_actor",
+                "actor_number": 1,
+                "max_task_retries": 0,
+                "query_id": _TEST_QUERY_ID,
+                "resource_unit_id": "resource:test:retry-policy",
+            },
+            0,
+        ),
     ],
-    ids=["class-udf", "ai"],
+    ids=["class-udf-default", "ai-default", "datasink-disabled"],
 )
-def test_ensure_actor_pools_for_plan_keeps_default_retry_policy(monkeypatch, payload):
+def test_ensure_actor_pools_for_plan_respects_payload_retry_policy(monkeypatch, payload, expected_task_retries):
     import vane.execution.udf_ray as udf_ray
     from vane.execution.udf_ray_config import MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES
 
@@ -831,7 +848,16 @@ def test_ensure_actor_pools_for_plan_keeps_default_retry_policy(monkeypatch, pay
     )
 
     assert len(created) == 1
-    assert calls == [(MAX_ACTOR_RESTARTS, MAX_ACTOR_TASK_RETRIES)]
+    expected = MAX_ACTOR_TASK_RETRIES if expected_task_retries is None else expected_task_retries
+    assert calls == [(MAX_ACTOR_RESTARTS, expected)]
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.0, "0"])
+def test_actor_pool_payload_rejects_invalid_task_retry_override(value):
+    from vane.execution.udf_ray_config import payload_max_task_retries
+
+    with pytest.raises(ValueError, match="max_task_retries"):
+        payload_max_task_retries({"max_task_retries": value})
 
 
 def test_ensure_actor_pools_for_nodes_injects_with_callback(monkeypatch):

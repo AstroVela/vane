@@ -2426,6 +2426,13 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MapBatches(
 	if (!resolved_ray_actor_thread_policy.empty()) {
 		new_children.emplace_back("ray_actor_thread_policy", Value(resolved_ray_actor_thread_policy));
 	}
+	if (py::hasattr(fun, "_vane_datasink_no_task_retries")) {
+		auto no_task_retries = py::getattr(fun, "_vane_datasink_no_task_retries");
+		if (!PyBool_Check(no_task_retries.ptr()) || no_task_retries.ptr() != Py_True) {
+			throw InvalidInputException("UDF _vane_datasink_no_task_retries must be true");
+		}
+		new_children.emplace_back("max_task_retries", Value::BIGINT(0));
+	}
 	vector<Value> input_name_values;
 	for (auto &col : rel->Columns()) {
 		input_name_values.emplace_back(Value(col.Name()));

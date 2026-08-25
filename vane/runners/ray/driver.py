@@ -7384,7 +7384,7 @@ class RayQueryDriverActor:
         session_id: str,
         plan: Any,
     ) -> dict[str, Any]:
-        """Run one immediate, idempotent Python DataSink plan."""
+        """Run one Python DataSink attempt."""
 
         session = self._require_session(owner_id, session_id)
         self._validate_plan_session(session_id, plan, session)
@@ -9116,7 +9116,7 @@ class RayQueryDriverClient:
             progress.finish(final_state="FINISHED" if completed else None)
 
     def run_datasink_plan(self, plan: Any) -> dict[str, Any]:
-        """Execute an immediate, idempotent Python DataSink plan."""
+        """Execute one Python DataSink attempt."""
 
         import time as _time
 
