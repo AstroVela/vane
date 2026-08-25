@@ -18,12 +18,14 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.udf_lifecycle import ExecutionCancelledError
 
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -268,9 +270,10 @@ class EnvironmentSecret:
 class DataSinkExecutionOptions:
     """Execution requests for the internal Arrow operator.
 
-    ``max_retries`` is the number of full-operation retries after an UNKNOWN
-    outcome. It defaults to zero. Each retry re-executes the complete input
-    with the same operation ID, so the sink owns deduplication and all delivery
+    ``max_retries`` is the number of full-operation retries after a retryable
+    UNKNOWN outcome. It defaults to zero. Cancellation-derived UNKNOWN
+    outcomes are terminal. Each retry re-executes the complete input with the
+    same operation ID, so the sink owns deduplication and all delivery
     guarantees.
     """
 
@@ -542,6 +545,10 @@ class DataSinkWriteError(RuntimeError):
 
     def __reduce__(self) -> tuple[Any, tuple[WriteSummary, str]]:
         return (_restore_datasink_write_error, (self.summary, self.detail))
+
+
+class _InterruptedDataSinkWriteError(DataSinkWriteError):
+    """Internal marker for an UNKNOWN outcome that must not be retried."""
 
 
 def _restore_datasink_write_error(
@@ -1071,6 +1078,25 @@ def _unknown_error(
     return DataSinkWriteError(_summary(context, WriteOutcome.UNKNOWN, results, warnings), detail)
 
 
+def _interrupted_error(
+    context: WriteContext,
+    results: tuple[WriteResult, ...],
+    error: BaseException,
+    warnings: tuple[str, ...] = (),
+) -> _InterruptedDataSinkWriteError:
+    return _InterruptedDataSinkWriteError(
+        _summary(context, WriteOutcome.UNKNOWN, results, warnings),
+        _safe_error_summary(error),
+    )
+
+
+def _is_execution_interruption(error: BaseException) -> bool:
+    return not isinstance(error, Exception) or isinstance(
+        error,
+        (FutureCancelledError, ExecutionCancelledError),
+    )
+
+
 def _aborted_error(
     context: WriteContext,
     results: tuple[WriteResult, ...],
@@ -1188,6 +1214,8 @@ def _execute_datasink_once(
     except DataSinkWriteError:
         raise
     except BaseException as error:
+        if _is_execution_interruption(error):
+            raise _interrupted_error(context, results, error, warnings) from error
         raise _unknown_error(context, results, error, warnings) from error
     finally:
         del terminal
@@ -1203,9 +1231,10 @@ def write_datasink(
     """Execute a relation using delivery semantics defined by the sink.
 
     The default does not retry. When ``execution_options.max_retries`` is
-    positive, only UNKNOWN outcomes are retried, the complete input is
-    re-executed, and every attempt uses the same operation ID. Vane does not
-    deduplicate external writes or provide exactly-once delivery or rollback.
+    positive, retryable UNKNOWN outcomes re-execute the complete input and use
+    the same operation ID. Cancellation-derived UNKNOWN outcomes are terminal.
+    Vane does not deduplicate external writes or provide exactly-once delivery
+    or rollback.
     """
 
     import cloudpickle
@@ -1256,10 +1285,22 @@ def write_datasink(
                     runner_type,
                 )
             except DataSinkWriteError as error:
-                if error.outcome is WriteOutcome.UNKNOWN and retries_performed < options.max_retries:
+                interrupted = isinstance(error, _InterruptedDataSinkWriteError)
+                if (
+                    not interrupted
+                    and error.outcome is WriteOutcome.UNKNOWN
+                    and retries_performed < options.max_retries
+                ):
                     retries_performed += 1
                     last_unknown_error = error
                     continue
+                if interrupted:
+                    terminal_error = (
+                        _error_after_retries(error, retries_performed)
+                        if retries_performed
+                        else DataSinkWriteError(error.summary, error.detail)
+                    )
+                    raise terminal_error from error.__cause__
                 if retries_performed:
                     raise _error_after_retries(error, retries_performed) from error
                 raise

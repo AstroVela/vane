@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelledError
 from pathlib import Path
 
 import cloudpickle
@@ -26,6 +28,7 @@ from vane.datasink import (
     WriteResult,
     WriteState,
 )
+from vane.execution.udf_lifecycle import ExecutionCancelledError
 
 
 class _Worker(DataSinkWorker):
@@ -160,6 +163,26 @@ class _SlowWorker(_Worker):
 class _SlowBound(_Bound):
     def open_worker(self, context: WriteContext) -> DataSinkWorker:
         return _SlowWorker()
+
+
+class _AppendThenSleepWorker(DataSinkWorker):
+    def __init__(self, append_path: str) -> None:
+        self._append_path = append_path
+
+    def write(self, table: pa.Table) -> WriteResult:
+        with Path(self._append_path).open("a", encoding="utf-8") as output:
+            output.write(f"{table.num_rows}\n")
+        time.sleep(0.05)
+        return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+
+class _AppendThenSleepBound(_Bound):
+    def __init__(self, append_path: Path) -> None:
+        super().__init__(options=DataSinkExecutionOptions(batch_size=1, max_retries=1))
+        self._append_path = str(append_path)
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _AppendThenSleepWorker(self._append_path)
 
 
 class _TimeoutWorker(DataSinkWorker):
@@ -1049,6 +1072,45 @@ def test_mock_distributed_retry_budget_is_exact(monkeypatch):
     assert exc_info.value.summary.warnings[0].startswith("DataSink made 2 framework retry attempts")
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+        asyncio.CancelledError,
+        FutureCancelledError,
+        ExecutionCancelledError,
+    ],
+)
+def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, error_type):
+    from vane import runners
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            raise error_type("planned execution interruption")
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id="interruption-no-retry",
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "planned execution interruption" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
 def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
     from vane import runners
 
@@ -1537,19 +1599,24 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
     assert any("planned progress failure" in warning for warning in summary.warnings)
 
 
-def test_local_fte_datasink_progress_interrupt_stops_with_unknown_outcome(monkeypatch):
+def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, tmp_path):
     from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
+
+    append_path = tmp_path / "interrupt-appends.txt"
+    attempts_started: list[int] = []
 
     class InterruptingProgressRenderer:
         interval_s = 0.001
 
         def __init__(self, snapshot_getter):
             self.snapshot_getter = snapshot_getter
+            attempts_started.append(1)
 
         def update(self, *, force=False):
-            raise KeyboardInterrupt("planned progress interrupt")
+            if append_path.exists():
+                raise KeyboardInterrupt("planned progress interrupt")
 
         def finish(self, *, final_state=None):
             return None
@@ -1562,12 +1629,15 @@ def test_local_fte_datasink_progress_interrupt_stops_with_unknown_outcome(monkey
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_SlowBound()),
+            _Sink(_AppendThenSleepBound(append_path)),
             operation_id="local-progress-interrupt",
         )
 
+    assert attempts_started == [1]
+    assert append_path.read_text(encoding="utf-8").splitlines() == ["1"]
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert "planned progress interrupt" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
 
 
 def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):
