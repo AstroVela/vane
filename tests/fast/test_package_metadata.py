@@ -392,7 +392,7 @@ def test_release_runtime_is_self_contained_by_default():
         ).fetchall()
     }
 
-    expected_extensions = {"core_functions", "httpfs", "icu", "json", "parquet"}
+    expected_extensions = {"core_functions", "file", "httpfs", "icu", "json", "parquet"}
 
     assert settings == {
         "allow_unsigned_extensions": "false",

@@ -141,7 +141,7 @@ exclude = [
 ]
 
 [tool.scikit-build.cmake.define]
-BUILD_EXTENSIONS = "core_functions;json;parquet;icu;httpfs"
+BUILD_EXTENSIONS = "core_functions;file;json;parquet;icu;httpfs"
 
 # Override: if COVERAGE is set then:
 # - we create a RelWithDebInfo build
@@ -288,6 +288,7 @@ include = [
     "external/duckdb/extension/generated_extension_loader.cpp.in",
     "external/duckdb/extension/loader/**",
     "external/duckdb/extension/core_functions/**",
+    "external/duckdb/extension/file/**",
     "external/duckdb/extension/icu/**",
     "external/duckdb/third_party/jemalloc/**",
     "external/duckdb/extension/json/**",

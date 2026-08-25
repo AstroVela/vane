@@ -1,6 +1,15 @@
-# name: test/sql/types/alias/test_file_alias.test
-# description: Test the lightweight FILE struct alias and its pure constructor
-# group: [alias]
+# name: test/sql/file/test_file_alias.test
+# description: Test the extension-owned FILE struct alias and its pure constructor
+# group: [file]
+
+require file
+
+load __TEST_DIR__/file.db
+
+query I
+SELECT count(*) FROM duckdb_extensions() WHERE extension_name = 'file' AND loaded
+----
+1
 
 statement ok
 PRAGMA enable_verification
@@ -121,6 +130,16 @@ statement ok
 INSERT INTO file_values VALUES
 	(file('stored', 'text/plain', 0, 0, 'sha256:a')),
 	(NULL)
+
+query TT
+SELECT typeof(value), value.url
+FROM file_values
+ORDER BY value IS NULL
+----
+FILE	stored
+FILE	NULL
+
+restart
 
 query TT
 SELECT typeof(value), value.url
