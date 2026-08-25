@@ -285,6 +285,70 @@ def test_explicit_nested_file_types_survive_null_only_values(duckdb_cursor, valu
     assert actual_value == expected_value
 
 
+def test_file_values_select_direct_file_union_members(duckdb_cursor):
+    struct_type = vane.struct_type(
+        {
+            "url": vane.sqltypes.VARCHAR,
+            "content_type": vane.sqltypes.VARCHAR,
+            "position": vane.sqltypes.BIGINT,
+            "size": vane.sqltypes.BIGINT,
+            "checksum": vane.sqltypes.VARCHAR,
+        }
+    )
+    union_type = vane.union_type(
+        {
+            "struct": struct_type,
+            "file": vane.file_type(),
+            "text": vane.sqltypes.VARCHAR,
+        }
+    )
+    value = vane.File("memory://union")
+
+    actual_type, actual_tag, actual_value = duckdb_cursor.execute(
+        "SELECT typeof($1), union_tag($1), $1", [vane.Value(value, union_type)]
+    ).fetchone()
+    assert actual_type == str(union_type)
+    assert actual_tag == "file"
+    assert actual_value == value
+
+    cases = [
+        (None, union_type, None),
+        ("hello", union_type, "hello"),
+        ([value, None, "hello"], vane.list_type(union_type), [value, None, "hello"]),
+        ([value], vane.array_type(union_type, 1), (value,)),
+        ({"item": value}, vane.struct_type({"item": union_type}), {"item": value}),
+        ({"item": value}, vane.map_type(vane.sqltypes.VARCHAR, union_type), {"item": value}),
+        (vane.Value(value, vane.file_type()), union_type, value),
+    ]
+    for input_value, dtype, expected_value in cases:
+        actual_type, actual_value = duckdb_cursor.execute(
+            "SELECT typeof($1), $1", [vane.Value(input_value, dtype)]
+        ).fetchone()
+
+        assert actual_type == str(dtype)
+        assert actual_value == expected_value
+
+
+def test_file_values_reject_unions_without_a_direct_file_member():
+    struct_type = vane.struct_type(
+        {
+            "url": vane.sqltypes.VARCHAR,
+            "content_type": vane.sqltypes.VARCHAR,
+            "position": vane.sqltypes.BIGINT,
+            "size": vane.sqltypes.BIGINT,
+            "checksum": vane.sqltypes.VARCHAR,
+        }
+    )
+    targets = [
+        vane.union_type({"struct": struct_type, "text": vane.sqltypes.VARCHAR}),
+        vane.union_type({"files": vane.list_type(vane.file_type()), "text": vane.sqltypes.VARCHAR}),
+    ]
+
+    for target in targets:
+        with pytest.raises(vane.InvalidInputException, match="can only be converted to FILE"):
+            vane.ConstantExpression(vane.Value(vane.File("memory://union"), target))
+
+
 def test_pandas_file_columns_preserve_file_identity(duckdb_cursor):
     values = [vane.File("memory://first"), float("nan"), vane.File("memory://second", "text/plain"), None]
     relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))

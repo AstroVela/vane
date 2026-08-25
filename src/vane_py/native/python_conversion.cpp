@@ -452,6 +452,18 @@ static bool ContainsFileType(const LogicalType &type) {
 	return TypeVisitor::Contains(type, FileLogicalType::IsFile);
 }
 
+static bool UnionHasFileMember(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::UNION) {
+		return false;
+	}
+	for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
+		if (FileLogicalType::IsFile(UnionType::GetMemberType(type, index))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // DuckDB prefers aliases while inferring sequence types. Reject only overlapping paths where that would turn a
 // non-FILE Python value into FILE; NULLs and fields missing from one STRUCT remain valid.
 static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &right) {
@@ -649,10 +661,14 @@ struct PythonValueConversion {
 		}
 		case PythonObjectType::File: {
 			auto file = py::cast<PythonFile>(ele);
-			if (target_type.id() != LogicalTypeId::UNKNOWN && !FileLogicalType::IsFile(target_type)) {
-				throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+			auto converted = file.ToValue();
+			if (target_type.id() == LogicalTypeId::UNKNOWN || FileLogicalType::IsFile(target_type)) {
+				return converted;
 			}
-			return file.ToValue();
+			if (UnionHasFileMember(target_type)) {
+				return CastToTarget(std::move(converted), target_type);
+			}
+			throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
 		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
@@ -683,8 +699,15 @@ struct PythonValueConversion {
 				}
 				// Nested constructors infer their physical type from the observed values. Restore the declared type so
 				// empty and NULL-only containers retain FILE aliases at every level.
-				converted = converted.IsNull() ? Value(internal_logical_type)
-				                               : CastToTarget(std::move(converted), internal_logical_type);
+				if (converted.IsNull()) {
+					converted = Value(internal_logical_type);
+				} else if (converted.type() != internal_logical_type) {
+					converted = CastToTarget(std::move(converted), internal_logical_type);
+				}
+			}
+			if (target_type.id() != LogicalTypeId::UNKNOWN && UnionHasFileMember(target_type) &&
+			    FileLogicalType::IsFile(converted.type())) {
+				converted = CastToTarget(std::move(converted), target_type);
 			}
 			if (target_type.id() != LogicalTypeId::UNKNOWN && FileTypeLayoutMismatch(target_type, converted.type())) {
 				if (ContainsFileType(target_type)) {
