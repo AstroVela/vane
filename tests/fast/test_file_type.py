@@ -69,6 +69,13 @@ def test_file_extract_overloads_preserve_untyped_null_binding(connection):
     assert row == (None, None, None, None)
 
 
+def test_file_null_extract_overload_does_not_shadow_string_extract(connection):
+    assert connection.execute("SELECT array_extract('1234', '2')").fetchone() == ("2",)
+
+    with pytest.raises(vane.ConversionException, match="Could not convert string 'c' to INT64"):
+        connection.execute("SELECT array_extract('1234', 'c')").fetchone()
+
+
 @pytest.mark.parametrize(
     ("expression", "message"),
     [

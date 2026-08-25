@@ -363,6 +363,10 @@ int64_t CastRules::ImplicitCast(const LogicalType &from, const LogicalType &to) 
 		// NULL expression can be cast to anything
 		return TargetTypeCost(to);
 	}
+	if (to.id() == LogicalTypeId::SQLNULL) {
+		// SQLNULL function arguments are exact overloads for untyped NULL, not implicit cast targets.
+		return -1;
+	}
 	if (from.id() == LogicalTypeId::ANY && to.IsTemplated()) {
 		// This can happen when changing a function from using ANY to using TEMPLATE.
 		return TargetTypeCost(to);
