@@ -196,6 +196,13 @@ void ExpressionExecutor::Execute(const BoundFunctionExpression &expr, Expression
 	if (!execute_function_state.TryExecuteDictionaryExpression(expr, arguments, *state, result)) {
 		expr.function.GetFunctionCallback()(arguments, *state, result);
 	}
+	if (TypeVisitor::Contains(expr.return_type, FileLogicalType::IsFile)) {
+		if (result.GetType() != expr.return_type) {
+			throw InvalidInputException("Scalar function FILE result has type %s, expected %s", result.GetType(),
+			                            expr.return_type);
+		}
+		FileLogicalType::Validate(result, count, "Scalar function FILE");
+	}
 
 	VerifyNullHandling(expr, arguments, result);
 	D_ASSERT(result.GetType() == expr.return_type);

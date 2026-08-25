@@ -77,18 +77,9 @@ static unique_ptr<FunctionData> StructValuesBind(ClientContext &context, ScalarF
 	return nullptr;
 }
 
-static ScalarFunction GetStructValuesFunction() {
+ScalarFunction StructValuesFun::GetFunction() {
 	ScalarFunction func({LogicalTypeId::STRUCT}, LogicalTypeId::STRUCT, StructValuesFunction, StructValuesBind);
 	return func;
-}
-
-ScalarFunctionSet StructValuesFun::GetFunctions() {
-	ScalarFunctionSet struct_values_set("struct_values");
-	struct_values_set.AddFunction(GetStructValuesFunction());
-	auto file_values = GetStructValuesFunction();
-	file_values.arguments[0] = FileLogicalType::Create();
-	struct_values_set.AddFunction(std::move(file_values));
-	return struct_values_set;
 }
 
 } // namespace duckdb

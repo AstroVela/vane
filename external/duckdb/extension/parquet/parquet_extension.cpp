@@ -403,6 +403,11 @@ static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
+	for (idx_t column_index = 0; column_index < input.ColumnCount(); column_index++) {
+		if (TypeVisitor::Contains(input.data[column_index].GetType(), FileLogicalType::IsFile)) {
+			FileLogicalType::Validate(input.data[column_index], input.size(), "Parquet FILE");
+		}
+	}
 
 	// append data to the local (buffered) chunk collection
 	local_state.buffer.Append(local_state.append_state, input);

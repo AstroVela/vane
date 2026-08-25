@@ -20,6 +20,23 @@ using duckdb_parquet::SchemaElement;
 
 using duckdb_parquet::FileMetaData;
 struct ParquetOptions;
+struct ParquetColumnSchema;
+
+enum class ParquetFileTypeMetadataKind : uint8_t { FILE, UNION };
+
+struct ParquetFileTypeMetadataEntry {
+	ParquetFileTypeMetadataKind kind;
+	vector<idx_t> path;
+};
+
+struct ParquetFileTypeMetadata {
+	static constexpr const char *KEY = "vane.file.paths";
+
+	static string Serialize(const vector<ParquetFileTypeMetadataEntry> &entries);
+	static vector<ParquetFileTypeMetadataEntry> Deserialize(const string &metadata, const string &file_path);
+	static void Apply(ParquetColumnSchema &root, const vector<ParquetFileTypeMetadataEntry> &entries,
+	                  const string &file_path);
+};
 
 enum class ParquetColumnSchemaType { COLUMN, FILE_ROW_NUMBER, EXPRESSION, VARIANT, GEOMETRY };
 

@@ -55,6 +55,20 @@ def test_file_supports_all_struct_extraction_forms(connection):
     assert rows == [(url, url, url, url, url, url, url), (None, None, None, None, None, None, None)]
 
 
+def test_file_extract_overloads_preserve_untyped_null_binding(connection):
+    row = connection.execute(
+        """
+        SELECT
+            struct_extract(NULL, 'url'),
+            struct_extract(NULL, 1),
+            struct_extract_at(NULL, 1),
+            array_extract(NULL, 'url')
+        """
+    ).fetchone()
+
+    assert row == (None, None, None, None)
+
+
 @pytest.mark.parametrize(
     ("expression", "message"),
     [
@@ -735,12 +749,18 @@ def test_file_rejects_struct_remapping_bypasses(connection, expression):
         (f"struct_insert({FILE}, extra := 1)", "struct_insert"),
         (f"struct_concat({FILE}, struct_pack(extra := 1))", "struct_concat"),
         (f"struct_concat(struct_pack(extra := 1), {FILE})", "struct_concat"),
-        (f"struct_values({FILE})", "struct_values"),
     ],
 )
 def test_file_rejects_struct_alias_stripping_bypasses(connection, expression, function_name):
     with pytest.raises(vane.BinderException, match=rf"{function_name} does not support FILE values"):
         connection.execute(f"SELECT {expression}").fetchone()
+
+
+def test_file_does_not_shadow_struct_values_null_binding(connection):
+    with pytest.raises(vane.BinderException):
+        connection.execute(f"SELECT struct_values({FILE})").fetchone()
+
+    assert connection.execute("SELECT struct_values(NULL)").fetchone() == (None,)
 
 
 @pytest.mark.parametrize(
@@ -1359,3 +1379,131 @@ def test_file_type_round_trips_through_storage(tmp_path: Path):
         rows = connection.execute("SELECT typeof(value), value.url FROM files ORDER BY value IS NULL").fetchall()
 
     assert rows == [("FILE", "s3://bucket/missing.bin"), ("FILE", None)]
+
+
+def test_file_type_round_trips_through_parquet(connection, tmp_path: Path):
+    parquet_path = tmp_path / "files.parquet"
+    connection.execute(
+        f"""
+        COPY (
+            SELECT
+                {FILE} AS direct,
+                struct_pack(value := {FILE}) AS nested,
+                struct_pack(file_values := [{FILE}]) AS deeply_nested,
+                [{FILE}] AS files,
+                array_value({FILE}) AS fixed_files,
+                MAP {{'value': {FILE}}} AS file_map,
+                {{
+                    'url': 'ordinary',
+                    'content_type': NULL::VARCHAR,
+                    'position': NULL::BIGINT,
+                    'size': NULL::BIGINT,
+                    'checksum': NULL::VARCHAR
+                }} AS ordinary,
+                CAST(union_value(f := {FILE}) AS UNION(f FILE, n BIGINT)) AS choice
+        ) TO '{parquet_path}' (FORMAT PARQUET)
+        """
+    )
+
+    row = connection.execute(
+        f"""
+        SELECT
+            typeof(direct),
+            typeof(nested.value),
+            typeof(deeply_nested.file_values[1]),
+            typeof(files[1]),
+            typeof(fixed_files[1]),
+            typeof(map_extract_value(file_map, 'value')),
+            typeof(ordinary) <> 'FILE',
+            union_tag(choice),
+            typeof(choice.f),
+            direct.url,
+            (deeply_nested.file_values[1]).url,
+            (map_extract_value(file_map, 'value')).url,
+            choice.f.url
+        FROM read_parquet('{parquet_path}')
+        """
+    ).fetchone()
+
+    assert row == (
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        True,
+        "f",
+        "FILE",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+    )
+
+
+def test_file_type_survives_parquet_database_export_import(connection, tmp_path: Path):
+    export_path = tmp_path / "file_export"
+    connection.execute(
+        """
+        CREATE TABLE exported_files(
+            id INTEGER,
+            direct FILE,
+            nested STRUCT(value FILE),
+            deeply_nested STRUCT(file_values FILE[]),
+            files FILE[],
+            fixed_files FILE[1],
+            file_map MAP(VARCHAR, FILE),
+            choice UNION(f FILE, n BIGINT)
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO exported_files VALUES (
+            1,
+            {FILE},
+            struct_pack(value := {FILE}),
+            struct_pack(file_values := [{FILE}]),
+            [{FILE}],
+            array_value({FILE}),
+            MAP {{'value': {FILE}}},
+            CAST(union_value(f := {FILE}) AS UNION(f FILE, n BIGINT))
+        )
+        """
+    )
+
+    connection.execute(f"EXPORT DATABASE '{export_path}' (FORMAT PARQUET)")
+    connection.execute("DROP TABLE exported_files")
+    connection.execute(f"IMPORT DATABASE '{export_path}'")
+
+    row = connection.execute(
+        """
+        SELECT
+            typeof(direct),
+            typeof(nested.value),
+            typeof(deeply_nested.file_values[1]),
+            typeof(files[1]),
+            typeof(fixed_files[1]),
+            typeof(map_extract_value(file_map, 'value')),
+            typeof(choice.f),
+            direct.url,
+            (deeply_nested.file_values[1]).url,
+            (map_extract_value(file_map, 'value')).url,
+            choice.f.url
+        FROM exported_files
+        """
+    ).fetchone()
+    assert row == (
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "FILE",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+        "s3://bucket/missing.bin",
+    )

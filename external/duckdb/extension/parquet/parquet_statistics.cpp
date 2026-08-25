@@ -418,8 +418,8 @@ unique_ptr<BaseStatistics> ParquetStatisticsUtils::TransformColumnStatistics(con
 		row_group_stats = list_stats.ToUnique();
 		return row_group_stats;
 	}
-	// Structs are handled differently (they dont have stats)
-	if (type.id() == LogicalTypeId::STRUCT) {
+	// Structs and unions are handled differently (they dont have stats)
+	if (type.id() == LogicalTypeId::STRUCT || type.id() == LogicalTypeId::UNION) {
 		auto struct_stats = StructStats::CreateUnknown(type);
 		// Recurse into child readers
 		for (idx_t i = 0; i < schema.children.size(); i++) {

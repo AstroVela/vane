@@ -20,6 +20,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
@@ -444,6 +445,7 @@ unique_ptr<ColumnReader> ParquetReader::CreateReaderRecursive(ClientContext &con
 			D_ASSERT(children.size() == 1);
 			return make_uniq<ListColumnReader>(*this, schema, std::move(children[0]));
 		case LogicalTypeId::STRUCT:
+		case LogicalTypeId::UNION:
 			return make_uniq<StructColumnReader>(*this, schema, std::move(children));
 		default:
 			throw InternalException("Unsupported schema type for schema with children");
@@ -762,6 +764,25 @@ unique_ptr<ParquetColumnSchema> ParquetReader::ParseSchema(ClientContext &contex
 	if (!file_meta_data->row_groups.empty() && next_file_idx != file_meta_data->row_groups[0].columns.size()) {
 		throw InvalidInputException("Failed to read Parquet file \"%s\": row group does not have enough columns",
 		                            file.path);
+	}
+	const string *file_type_metadata = nullptr;
+	for (auto &kv : file_meta_data->key_value_metadata) {
+		if (kv.key != ParquetFileTypeMetadata::KEY) {
+			continue;
+		}
+		if (file_type_metadata) {
+			throw InvalidInputException("Failed to read Parquet file \"%s\": duplicate %s metadata", file.path,
+			                            ParquetFileTypeMetadata::KEY);
+		}
+		if (!kv.__isset.value) {
+			throw InvalidInputException("Failed to read Parquet file \"%s\": %s metadata has no value", file.path,
+			                            ParquetFileTypeMetadata::KEY);
+		}
+		file_type_metadata = &kv.value;
+	}
+	if (file_type_metadata) {
+		auto entries = ParquetFileTypeMetadata::Deserialize(*file_type_metadata, file.path);
+		ParquetFileTypeMetadata::Apply(root, entries, file.path);
 	}
 	if (parquet_options.file_row_number) {
 		for (auto &column : root.children) {
@@ -1606,6 +1627,11 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 
 	rows_read += scan_count;
 	state.offset_in_group += scan_count;
+	for (idx_t column_index = 0; column_index < result.ColumnCount(); column_index++) {
+		if (TypeVisitor::Contains(result.data[column_index].GetType(), FileLogicalType::IsFile)) {
+			FileLogicalType::Validate(result.data[column_index], result.size(), "Parquet FILE");
+		}
+	}
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

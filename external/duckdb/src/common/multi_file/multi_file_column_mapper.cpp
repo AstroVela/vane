@@ -208,6 +208,12 @@ bool IsTriviallyMappable(const MultiFileColumnDefinition &global_column,
 	if (local_column.type != global_column.type) {
 		return false;
 	}
+	if (global_column.children.empty()) {
+		// The global schema did not request nested remapping. Local readers may still expose physical children for
+		// the same logical type (for example, Parquet LIST/MAP/UNION columns), but the complete value can be
+		// forwarded directly when the logical types and parent position already match.
+		return true;
+	}
 	if (local_column.children.size() != global_column.children.size()) {
 		// child count difference - cannot map trivially
 		return false;

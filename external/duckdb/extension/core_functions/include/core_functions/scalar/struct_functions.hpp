@@ -52,7 +52,7 @@ struct StructValuesFun {
 	static constexpr const char *Example = "struct_values({'a': 1, 'b': 'world'})";
 	static constexpr const char *Categories = "";
 
-	static ScalarFunctionSet GetFunctions();
+	static ScalarFunction GetFunction();
 };
 
 } // namespace duckdb

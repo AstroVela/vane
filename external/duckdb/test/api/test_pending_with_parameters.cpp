@@ -1,4 +1,5 @@
 #include "catch.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "test_helpers.hpp"
 
 using namespace duckdb;
@@ -243,4 +244,23 @@ TEST_CASE("Native scalar UDF FILE signatures are rejected", "[api][file]") {
 	    Catch::Matchers::Contains("FILE inputs and outputs are not supported by scalar UDFs yet"));
 	REQUIRE_THROWS_WITH(con.CreateVectorizedFunction("file_varargs_udf", {}, LogicalType::BOOLEAN, function, file_type),
 	                    Catch::Matchers::Contains("FILE inputs and outputs are not supported by scalar UDFs yet"));
+}
+
+static void InvalidExtensionFileFunction(DataChunk &, ExpressionState &, Vector &result) {
+	result.Reference(Value::STRUCT(FileLogicalType::Create(), {Value(), Value(), Value(), Value(), Value()}));
+}
+
+TEST_CASE("Extension scalar FILE results are validated", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ExtensionLoader loader(*db.instance, "test_file_extension");
+	loader.RegisterFunction(
+	    ScalarFunction("invalid_extension_file", {}, FileLogicalType::Create(), InvalidExtensionFileFunction));
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE files(value FILE)"));
+	auto result = con.Query("INSERT INTO files SELECT invalid_extension_file()");
+	REQUIRE(result->HasError());
+	REQUIRE(StringUtil::Contains(result->GetError(), "Scalar function FILE url cannot be NULL"));
+	auto count = con.Query("SELECT count(*) FROM files");
+	REQUIRE(CHECK_COLUMN(count, 0, {0}));
 }

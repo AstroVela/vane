@@ -214,6 +214,12 @@ ScalarFunctionSet StructExtractFun::GetFunctions() {
 	ScalarFunctionSet struct_extract_set("struct_extract");
 	struct_extract_set.AddFunction(GetKeyExtractFunction());
 	struct_extract_set.AddFunction(GetIndexExtractFunction());
+	auto null_key_extract = GetKeyExtractFunction();
+	null_key_extract.arguments[0] = LogicalType::SQLNULL;
+	struct_extract_set.AddFunction(std::move(null_key_extract));
+	auto null_index_extract = GetIndexExtractFunction();
+	null_index_extract.arguments[0] = LogicalType::SQLNULL;
+	struct_extract_set.AddFunction(std::move(null_index_extract));
 	auto file_key_extract = GetKeyExtractFunction();
 	file_key_extract.arguments[0] = FileLogicalType::Create();
 	struct_extract_set.AddFunction(std::move(file_key_extract));
@@ -226,6 +232,9 @@ ScalarFunctionSet StructExtractFun::GetFunctions() {
 ScalarFunctionSet StructExtractAtFun::GetFunctions() {
 	ScalarFunctionSet struct_extract_at_set("struct_extract_at");
 	struct_extract_at_set.AddFunction(GetExtractAtFunction());
+	auto null_extract_at = GetExtractAtFunction();
+	null_extract_at.arguments[0] = LogicalType::SQLNULL;
+	struct_extract_at_set.AddFunction(std::move(null_extract_at));
 	auto file_extract_at = GetExtractAtFunction();
 	file_extract_at.arguments[0] = FileLogicalType::Create();
 	struct_extract_at_set.AddFunction(std::move(file_extract_at));

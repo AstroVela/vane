@@ -178,6 +178,9 @@ ScalarFunctionSet ArrayExtractFun::GetFunctions() {
 	array_extract_set.AddFunction(sfun);
 	array_extract_set.AddFunction(GetKeyExtractFunction());
 	array_extract_set.AddFunction(GetIndexExtractFunction());
+	auto null_key_extract = GetKeyExtractFunction();
+	null_key_extract.arguments[0] = LogicalType::SQLNULL;
+	array_extract_set.AddFunction(std::move(null_key_extract));
 	auto file_key_extract = GetKeyExtractFunction();
 	file_key_extract.arguments[0] = FileLogicalType::Create();
 	array_extract_set.AddFunction(std::move(file_key_extract));

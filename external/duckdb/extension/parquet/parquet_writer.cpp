@@ -14,6 +14,7 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/write_stream.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -377,6 +378,25 @@ ColumnDataCollection &ParquetWriteTransformData::ApplyTransform(ColumnDataCollec
 	return buffer;
 }
 
+static void CollectParquetFileTypeMetadata(const ColumnWriter &writer, vector<idx_t> &path,
+                                           vector<ParquetFileTypeMetadataEntry> &entries) {
+	auto &type = writer.Type();
+	if (type.id() == LogicalTypeId::UNION && TypeVisitor::Contains(type, FileLogicalType::IsFile)) {
+		entries.push_back({ParquetFileTypeMetadataKind::UNION, path});
+	}
+	if (FileLogicalType::IsFile(type)) {
+		entries.push_back({ParquetFileTypeMetadataKind::FILE, path});
+		return;
+	}
+
+	auto &children = writer.ChildWriters();
+	for (idx_t child_index = 0; child_index < children.size(); child_index++) {
+		path.push_back(child_index);
+		CollectParquetFileTypeMetadata(*children[child_index], path, entries);
+		path.pop_back();
+	}
+}
+
 ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file_name_p, vector<LogicalType> types_p,
                              vector<string> names_p, CompressionCodec::type codec, ChildFieldIDs field_ids_p,
                              ShreddingType shredding_types_p, const vector<pair<string, string>> &kv_metadata,
@@ -393,6 +413,12 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file
       enable_bloom_filters(enable_bloom_filters_p),
       bloom_filter_false_positive_ratio(bloom_filter_false_positive_ratio_p), compression_level(compression_level_p),
       parquet_version(parquet_version), geoparquet_version(geoparquet_version), total_written(0), num_row_groups(0) {
+	for (auto &kv_pair : kv_metadata) {
+		if (kv_pair.first == ParquetFileTypeMetadata::KEY) {
+			throw InvalidInputException("Parquet metadata key \"%s\" is reserved", ParquetFileTypeMetadata::KEY);
+		}
+	}
+
 	// initialize the file writer
 	writer = make_uniq<BufferedFileWriter>(fs, file_name.c_str(),
 	                                       FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
@@ -440,6 +466,19 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file
 		column_writers.push_back(ColumnWriter::CreateWriterRecursive(context, *this, path_in_schema, sql_types[i],
 		                                                             unique_names[i], allow_geometry, &field_ids,
 		                                                             &shredding_types));
+	}
+
+	vector<ParquetFileTypeMetadataEntry> file_type_entries;
+	for (idx_t column_index = 0; column_index < column_writers.size(); column_index++) {
+		vector<idx_t> path {column_index};
+		CollectParquetFileTypeMetadata(*column_writers[column_index], path, file_type_entries);
+	}
+	if (!file_type_entries.empty()) {
+		duckdb_parquet::KeyValue kv;
+		kv.__set_key(ParquetFileTypeMetadata::KEY);
+		kv.__set_value(ParquetFileTypeMetadata::Serialize(file_type_entries));
+		file_meta_data.key_value_metadata.push_back(std::move(kv));
+		file_meta_data.__isset.key_value_metadata = true;
 	}
 }
 
