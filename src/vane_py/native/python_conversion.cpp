@@ -22,9 +22,13 @@
 
 namespace duckdb {
 
+static bool ContainsFileType(const LogicalType &type);
+static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &right);
+static bool FileUnionMemberLayoutMismatch(const LogicalType &member_type, const Value &source);
+
 // Like DefaultCastAs, but handles UNION targets by finding the first compatible member. DefaultCastAs raises a
 // Conversion Error when multiple UNION members have the same type (e.g. UNION(u1 DOUBLE, u2 DOUBLE)), so for UNION
-// targets we resolve the member ourselves.
+// targets we resolve the member ourselves. FILE-bearing values only consider members with compatible alias layouts.
 static Value CastToTarget(Value val, const LogicalType &target_type) {
 	if (target_type.id() != LogicalTypeId::UNION) {
 		return val.DefaultCastAs(target_type);
@@ -32,6 +36,7 @@ static Value CastToTarget(Value val, const LogicalType &target_type) {
 
 	auto member_count = UnionType::GetMemberCount(target_type);
 	auto &source_type = val.type();
+	auto validate_file_layout = ContainsFileType(target_type) || ContainsFileType(source_type);
 
 	// First pass: if there's an exact type match we use that
 	for (idx_t i = 0; i < member_count; i++) {
@@ -43,6 +48,9 @@ static Value CastToTarget(Value val, const LogicalType &target_type) {
 	// Second pass: if there's a type we can implicitly cast to, we do that
 	for (idx_t i = 0; i < member_count; i++) {
 		auto member_type = UnionType::GetMemberType(target_type, i);
+		if (validate_file_layout && FileUnionMemberLayoutMismatch(member_type, val)) {
+			continue;
+		}
 		Value candidate = val;
 		if (candidate.DefaultTryCastAs(member_type)) {
 			return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(i), std::move(candidate));
@@ -527,6 +535,26 @@ static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &r
 	}
 }
 
+static bool FileUnionMemberLayoutMismatch(const LogicalType &member_type, const Value &source) {
+	if (source.IsNull()) {
+		return false;
+	}
+	if (member_type.id() == LogicalTypeId::SQLNULL) {
+		return true;
+	}
+	return FileTypeLayoutMismatch(member_type, source.type());
+}
+
+static bool UnionHasFileLayoutCompatibleMember(const LogicalType &type, const Value &source) {
+	D_ASSERT(type.id() == LogicalTypeId::UNION);
+	for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
+		if (!FileUnionMemberLayoutMismatch(UnionType::GetMemberType(type, index), source)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 struct PythonValueConversion {
 	static const LogicalType &ConversionTarget(Value &result, const LogicalType &target_type) {
 		return target_type;
@@ -705,8 +733,9 @@ struct PythonValueConversion {
 					converted = CastToTarget(std::move(converted), internal_logical_type);
 				}
 			}
-			if (target_type.id() != LogicalTypeId::UNKNOWN && UnionHasFileMember(target_type) &&
-			    FileLogicalType::IsFile(converted.type())) {
+			if (target_type.id() == LogicalTypeId::UNION && converted.type() != target_type &&
+			    (ContainsFileType(target_type) || ContainsFileType(converted.type())) &&
+			    UnionHasFileLayoutCompatibleMember(target_type, converted)) {
 				converted = CastToTarget(std::move(converted), target_type);
 			}
 			if (target_type.id() != LogicalTypeId::UNKNOWN && FileTypeLayoutMismatch(target_type, converted.type())) {
@@ -1186,6 +1215,16 @@ void TransformPythonObject(py::handle ele, Vector &vector, idx_t result_offset, 
 Value TransformPythonValue(py::handle ele, const LogicalType &target_type, bool nan_as_null) {
 	Value result;
 	TransformPythonObjectInternal<PythonValueConversion>(ele, result, target_type, nan_as_null);
+	if (!result.IsNull() && target_type.id() == LogicalTypeId::UNION && result.type() != target_type &&
+	    (ContainsFileType(target_type) || ContainsFileType(result.type()))) {
+		if (!UnionHasFileLayoutCompatibleMember(target_type, result)) {
+			if (ContainsFileType(target_type)) {
+				throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
+			}
+			throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+		}
+		result = CastToTarget(std::move(result), target_type);
+	}
 	return result;
 }
 

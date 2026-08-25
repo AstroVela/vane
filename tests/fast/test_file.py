@@ -329,6 +329,95 @@ def test_file_values_select_direct_file_union_members(duckdb_cursor):
         assert actual_value == expected_value
 
 
+def test_file_unions_select_compatible_composite_members(duckdb_cursor):
+    struct_type = vane.struct_type(
+        {
+            "url": vane.sqltypes.VARCHAR,
+            "content_type": vane.sqltypes.VARCHAR,
+            "position": vane.sqltypes.BIGINT,
+            "size": vane.sqltypes.BIGINT,
+            "checksum": vane.sqltypes.VARCHAR,
+        }
+    )
+    files_type = vane.list_type(vane.file_type())
+    union_type = vane.union_type(
+        {
+            "struct": struct_type,
+            "file": vane.file_type(),
+            "files": files_type,
+            "text": vane.sqltypes.VARCHAR,
+        }
+    )
+    struct_value = {
+        "url": "memory://struct",
+        "content_type": None,
+        "position": None,
+        "size": None,
+        "checksum": None,
+    }
+    file_value = vane.File("memory://list")
+    cases = [
+        (struct_value, "struct", struct_value),
+        ([file_value, None], "files", [file_value, None]),
+        ([], "files", []),
+        (vane.Value(struct_value, struct_type), "struct", struct_value),
+        (vane.Value([file_value], files_type), "files", [file_value]),
+    ]
+
+    for input_value, expected_tag, expected_value in cases:
+        actual_type, actual_tag, actual_value = duckdb_cursor.execute(
+            "SELECT typeof($1), union_tag($1), $1", [vane.Value(input_value, union_type)]
+        ).fetchone()
+
+        assert actual_type == str(union_type)
+        assert actual_tag == expected_tag
+        assert actual_value == expected_value
+
+    nullable_union_type = vane.union_type(
+        {
+            "null": vane.sqltypes.SQLNULL,
+            "struct": struct_type,
+            "file": vane.file_type(),
+            "files": files_type,
+        }
+    )
+    for input_value, expected_tag, expected_value in [
+        (struct_value, "struct", struct_value),
+        ([], "files", []),
+    ]:
+        actual_tag, actual_value = duckdb_cursor.execute(
+            "SELECT union_tag($1), $1", [vane.Value(input_value, nullable_union_type)]
+        ).fetchone()
+
+        assert actual_tag == expected_tag
+        assert actual_value == expected_value
+
+    nested_cases = [
+        (
+            [struct_value, [file_value]],
+            vane.list_type(union_type),
+            [struct_value, [file_value]],
+        ),
+        (
+            {"item": struct_value},
+            vane.struct_type({"item": union_type}),
+            {"item": struct_value},
+        ),
+        (
+            {"item": [file_value]},
+            vane.map_type(vane.sqltypes.VARCHAR, union_type),
+            {"item": [file_value]},
+        ),
+    ]
+    for input_value, dtype, expected_value in nested_cases:
+        actual_type, actual_value = duckdb_cursor.execute(
+            "SELECT typeof($1), $1", [vane.Value(input_value, dtype)]
+        ).fetchone()
+
+        assert actual_type == str(dtype)
+        assert actual_value == expected_value
+
+
 def test_file_values_reject_unions_without_a_direct_file_member():
     struct_type = vane.struct_type(
         {
@@ -347,6 +436,22 @@ def test_file_values_reject_unions_without_a_direct_file_member():
     for target in targets:
         with pytest.raises(vane.InvalidInputException, match="can only be converted to FILE"):
             vane.ConstantExpression(vane.Value(vane.File("memory://union"), target))
+
+
+def test_file_union_members_reject_plain_struct_fallbacks():
+    with pytest.raises(vane.InvalidInputException, match="Only vane.File or NULL"):
+        vane.ConstantExpression(
+            vane.Value(
+                {
+                    "url": "memory://struct",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                },
+                vane.union_type({"file": vane.file_type()}),
+            )
+        )
 
 
 def test_pandas_file_columns_preserve_file_identity(duckdb_cursor):
