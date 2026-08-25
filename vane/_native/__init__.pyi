@@ -1560,6 +1560,7 @@ def write_csv(
 ) -> None: ...
 
 __formatted_python_version__: str
+__duckdb_extension_api_version__: str
 __git_revision__: str
 __interactive__: bool
 __jupyter__: bool

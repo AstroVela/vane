@@ -9,6 +9,7 @@
 
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/main/capi/extension_api.hpp"
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
@@ -1141,6 +1142,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	m.attr("__version__") = std::string(DuckDB::LibraryVersion()).substr(1);
 	m.attr("__standard_vector_size__") = DuckDB::StandardVectorSize();
 	m.attr("__git_revision__") = DuckDB::SourceID();
+	m.attr("__duckdb_extension_api_version__") = DUCKDB_EXTENSION_API_VERSION_STRING;
 	m.attr("__interactive__") = DuckDBPyConnection::DetectAndGetEnvironment();
 	m.attr("__jupyter__") = DuckDBPyConnection::IsJupyter();
 	m.attr("__formatted_python_version__") = DuckDBPyConnection::FormattedPythonVersion();
