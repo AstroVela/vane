@@ -551,7 +551,10 @@ static string DistributedCSVSplitId(const DistributedCSVSplitPayload &payload) {
 }
 
 static const MultiFileBindData &GetCSVDistributedBind(const TableFunctionDistributedScanInput &input) {
-	auto &bind_data = input.bind_data.Cast<MultiFileBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("Distributed CSV scan requires bind data");
+	}
+	auto &bind_data = input.bind_data->Cast<MultiFileBindData>();
 	if (!bind_data.bind_data || !bind_data.file_list || !bind_data.multi_file_reader || !bind_data.interface) {
 		throw InvalidInputException("Distributed CSV scan requires complete multi-file bind data");
 	}
@@ -832,8 +835,12 @@ static unique_ptr<FunctionData> CreateDistributedCSVWorkerBind(const TableFuncti
 	return std::move(result);
 }
 
-static void ApplyDistributedCSVSplits(FunctionData &worker_bind_data, const vector<DistributedScanSplit> &splits) {
-	auto &worker = worker_bind_data.Cast<MultiFileBindData>();
+static void ApplyDistributedCSVSplits(optional_ptr<FunctionData> worker_bind_data,
+                                      const vector<DistributedScanSplit> &splits) {
+	if (!worker_bind_data) {
+		throw InvalidInputException("Distributed CSV splits require worker bind data");
+	}
+	auto &worker = worker_bind_data->Cast<MultiFileBindData>();
 	if (!worker.bind_data || !worker.file_list || !worker.multi_file_reader || !worker.interface) {
 		throw InvalidInputException("Distributed CSV splits require complete worker bind data");
 	}

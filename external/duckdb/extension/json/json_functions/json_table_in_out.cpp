@@ -379,6 +379,13 @@ virtual_column_map_t GetJSONTableInOutVirtualColumns(ClientContext &, optional_p
 	return result;
 }
 
+static void JSONTableInOutSerialize(Serializer &, const optional_ptr<FunctionData>, const TableFunction &) {
+}
+
+static unique_ptr<FunctionData> JSONTableInOutDeserialize(Deserializer &, TableFunction &) {
+	return nullptr;
+}
+
 template <JSONTableInOutType TYPE>
 TableFunction GetJSONTableInOutFunction(const LogicalType &input_type, const bool &has_path_param) {
 	vector<LogicalType> arguments = {input_type};
@@ -388,6 +395,10 @@ TableFunction GetJSONTableInOutFunction(const LogicalType &input_type, const boo
 	TableFunction function(arguments, nullptr, JSONTableInOutBind, JSONTableInOutInitGlobal, JSONTableInOutInitLocal);
 	function.in_out_function = JSONTableInOutFunction<TYPE>;
 	function.get_virtual_columns = GetJSONTableInOutVirtualColumns;
+	function.serialize = JSONTableInOutSerialize;
+	function.deserialize = JSONTableInOutDeserialize;
+	function.SetDistributedScanCallbacks(
+	    MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode::OPTIONAL));
 	function.projection_pushdown = true;
 	return function;
 }

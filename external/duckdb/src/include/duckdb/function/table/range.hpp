@@ -30,14 +30,17 @@ struct RangeTableFunction {
 };
 
 struct RepeatTableFunction {
+	static TableFunction GetFunction();
 	static void RegisterFunction(BuiltinFunctions &set);
 };
 
 struct RepeatRowTableFunction {
+	static TableFunction GetFunction();
 	static void RegisterFunction(BuiltinFunctions &set);
 };
 
 struct UnnestTableFunction {
+	static TableFunction GetFunction();
 	static void RegisterFunction(BuiltinFunctions &set);
 };
 

@@ -118,11 +118,12 @@ static vector<DistributedScanSplit> DistributedOverloadPlan(const TableFunctionD
 }
 
 static unique_ptr<FunctionData> DistributedOverloadCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
-	input.bind_data.Cast<DistributedOverloadBindData>();
+	REQUIRE(input.bind_data);
+	input.bind_data->Cast<DistributedOverloadBindData>();
 	return make_uniq<DistributedOverloadBindData>();
 }
 
-static void DistributedOverloadApply(FunctionData &, const vector<DistributedScanSplit> &) {
+static void DistributedOverloadApply(optional_ptr<FunctionData>, const vector<DistributedScanSplit> &) {
 }
 
 static void DistributedOverloadSerialize(Serializer &serializer, const optional_ptr<FunctionData>,

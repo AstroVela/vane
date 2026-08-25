@@ -600,6 +600,83 @@ def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monk
             raise AssertionError(f"{case_label}: distributed execution failed") from exc
 
 
+def test_ray_repeat_sources_use_exact_sequence_splits(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    cases = [
+        (
+            "SELECT value FROM repeat(NULL::INTEGER, 17) AS t(value)",
+            "test_ray_e2e: distributed repeat source",
+        ),
+        (
+            """
+                SELECT id, label, payload
+                FROM repeat_row(
+                    42,
+                    NULL::VARCHAR,
+                    [1, NULL, 3],
+                    num_rows=11
+                ) AS t(id, label, payload)
+            """,
+            "test_ray_e2e: distributed repeat_row source",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts is not None and num_parts >= 4
+        _run_query_case(duckdb_conn, ray_runner, sql, label)
+
+    empty_sql = "SELECT value FROM repeat('unused', 0) AS t(value)"
+    empty_parts = _run_iter_tables(ray_runner, duckdb_conn.sql(empty_sql), "test_ray_e2e: empty repeat source")
+    assert empty_parts == []
+
+
+def test_ray_singleton_table_inout_sources_run_exactly_once(ray_runner, duckdb_conn):
+    duckdb_conn.execute("LOAD json")
+    cases = [
+        (
+            "SELECT value, ordinality FROM unnest([10, NULL, 30]) WITH ORDINALITY AS t(value, ordinality)",
+            "test_ray_e2e: singleton unnest source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            'FROM json_each(\'{"a": 1, "b": [2, null]}\')',
+            "test_ray_e2e: singleton json_each source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            "FROM json_tree('{\"a\": 1, \"b\": [2, null]}', '$.b')",
+            "test_ray_e2e: singleton json_tree source with path",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts == 1
+        _run_query_case(duckdb_conn, ray_runner, sql, label, ordered=True)
+
+    empty_sql = "SELECT * FROM unnest([]::INTEGER[])"
+    empty_relation = duckdb_conn.sql(empty_sql)
+    _, num_parts = _get_distributed_plan_info(empty_relation, "test_ray_e2e: empty singleton unnest")
+    assert num_parts == 1
+    assert _run_iter_tables(ray_runner, empty_relation, "test_ray_e2e: empty singleton unnest") == []
+
+
+def test_ray_correlated_unnest_remains_input_driven(ray_runner, duckdb_conn):
+    sql = """
+        SELECT id, value
+        FROM (VALUES (1, [10, 11]), (2, [20])) AS input(id, values),
+             LATERAL unnest(values) AS expanded(value)
+    """
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: correlated unnest remains input driven",
+        require_any=["UNNEST", "INOUT_FUNCTION", "DELIM_JOIN"],
+    )
+
+
 @pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument

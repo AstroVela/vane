@@ -34,7 +34,10 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 
 static vector<DistributedScanSplit>
 DataSourcePlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput &input) {
-	auto &bind_data = input.bind_data.Cast<DataSourceScanBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed datasource scan requires bind data");
+	}
+	auto &bind_data = input.bind_data->Cast<DataSourceScanBindData>();
 	vector<DistributedScanSplit> splits;
 	splits.reserve(bind_data.pickled_tasks.size());
 	for (idx_t task_index = 0; task_index < bind_data.pickled_tasks.size(); task_index++) {
@@ -47,7 +50,10 @@ DataSourcePlanDistributedScanSplits(const TableFunctionDistributedScanPlanningIn
 }
 
 static unique_ptr<FunctionData> DataSourceCreateDistributedWorkerBind(const TableFunctionDistributedScanInput &input) {
-	auto &source_bind = input.bind_data.Cast<DataSourceScanBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed datasource scan requires bind data");
+	}
+	auto &source_bind = input.bind_data->Cast<DataSourceScanBindData>();
 	auto worker_bind = make_uniq<DataSourceScanBindData>();
 	worker_bind->pickled_source = source_bind.pickled_source;
 	worker_bind->query_id = source_bind.query_id;
@@ -67,9 +73,12 @@ static bool IsCanonicalDataSourceSplitId(const string &split_id) {
 	return true;
 }
 
-static void DataSourceApplyDistributedSplits(FunctionData &worker_bind_data,
+static void DataSourceApplyDistributedSplits(optional_ptr<FunctionData> worker_bind_data,
                                              const vector<DistributedScanSplit> &splits) {
-	auto &bind_data = worker_bind_data.Cast<DataSourceScanBindData>();
+	if (!worker_bind_data) {
+		throw InvalidInputException("distributed datasource scan requires worker bind data");
+	}
+	auto &bind_data = worker_bind_data->Cast<DataSourceScanBindData>();
 	vector<string> validated_tasks;
 	validated_tasks.reserve(splits.size());
 	for (const auto &split : splits) {

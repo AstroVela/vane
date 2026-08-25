@@ -39,6 +39,9 @@ DUCKDB_API vector<DistributedScanSplit> PlanDistributedSequenceSplits(idx_t card
 DUCKDB_API vector<DistributedSequenceSplit> DecodeDistributedSequenceSplits(const vector<DistributedScanSplit> &splits,
                                                                             idx_t cardinality, bool exact_count);
 
+DUCKDB_API bool DistributedSequenceSplitsEqual(const vector<DistributedSequenceSplit> &left,
+                                               const vector<DistributedSequenceSplit> &right);
+
 //! Exact arithmetic shared by indexable BIGINT and TIMESTAMP sequences.
 DUCKDB_API idx_t ComputeDistributedSequenceCardinality(int64_t start, int64_t end, int64_t increment, bool inclusive);
 DUCKDB_API int64_t GetDistributedSequenceValue(int64_t start, int64_t increment, idx_t row_offset);
