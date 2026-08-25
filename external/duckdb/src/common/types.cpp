@@ -1683,6 +1683,37 @@ LogicalType LogicalType::STRUCT(child_list_t<LogicalType> children) {
 	return LogicalType(LogicalTypeId::STRUCT, std::move(info));
 }
 
+LogicalType FileLogicalType::Create() {
+	child_list_t<LogicalType> children;
+	children.reserve(FIELD_COUNT);
+	children.emplace_back("url", LogicalType::VARCHAR);
+	children.emplace_back("content_type", LogicalType::VARCHAR);
+	children.emplace_back("position", LogicalType::BIGINT);
+	children.emplace_back("size", LogicalType::BIGINT);
+	children.emplace_back("checksum", LogicalType::VARCHAR);
+
+	auto result = LogicalType::STRUCT(std::move(children));
+	result.SetAlias(TYPE_NAME);
+	return result;
+}
+
+bool FileLogicalType::IsFile(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
+	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
+	    type.GetAlias() != TYPE_NAME) {
+		return false;
+	}
+	auto &children = StructType::GetChildTypes(type);
+	if (children.size() != FIELD_COUNT) {
+		return false;
+	}
+	return children[URL].first == "url" && children[URL].second == LogicalType::VARCHAR &&
+	       children[CONTENT_TYPE].first == "content_type" && children[CONTENT_TYPE].second == LogicalType::VARCHAR &&
+	       children[POSITION].first == "position" && children[POSITION].second == LogicalType::BIGINT &&
+	       children[SIZE].first == "size" && children[SIZE].second == LogicalType::BIGINT &&
+	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
+}
+
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
 	auto info = make_shared_ptr<AggregateStateTypeInfo>(std::move(state_type));
 	return LogicalType(LogicalTypeId::AGGREGATE_STATE, std::move(info));
