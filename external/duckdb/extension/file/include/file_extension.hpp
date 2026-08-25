@@ -4,18 +4,21 @@
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
-// duckdb/function/scalar/file_functions.hpp
+// file_extension.hpp
 //
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
-#include "duckdb/function/scalar_function.hpp"
+#include "duckdb.hpp"
 
 namespace duckdb {
 
-struct FileFunctions {
-	static vector<ScalarFunction> GetFunctions();
+class FileExtension : public Extension {
+public:
+	void Load(ExtensionLoader &loader) override;
+	std::string Name() override;
+	std::string Version() const override;
 };
 
 } // namespace duckdb

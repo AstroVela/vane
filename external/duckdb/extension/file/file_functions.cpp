@@ -4,11 +4,11 @@
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
-// duckdb/function/scalar/file.cpp
+// file_functions.cpp
 //
 //===----------------------------------------------------------------------===//
 
-#include "duckdb/function/scalar/file_functions.hpp"
+#include "file_functions.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
