@@ -175,7 +175,8 @@ private:
 
 class MappedRemoteFileSystem : public LocalFileSystem {
 public:
-	explicit MappedRemoteFileSystem(string local_root) : local_root(std::move(local_root)) {
+	explicit MappedRemoteFileSystem(string local_root, string remote_prefix = "s3://bucket")
+	    : local_root(std::move(local_root)), remote_prefix(std::move(remote_prefix)) {
 	}
 
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
@@ -223,6 +224,14 @@ public:
 		return backing_fs.TryRemoveFile(MapPath(path), opener);
 	}
 
+	bool CanHandleFile(const string &path) override {
+		return StringUtil::StartsWith(path, remote_prefix);
+	}
+
+	bool IsLocalFileSystem() const override {
+		return false;
+	}
+
 	void FailRemovalOf(string path) {
 		failed_removal_path = std::move(path);
 		fail_removal = true;
@@ -236,9 +245,14 @@ public:
 		return "MappedRemoteFileSystem";
 	}
 
+protected:
+	bool ListFilesExtended(const string &path, const std::function<void(OpenFileInfo &info)> &callback,
+	                       optional_ptr<FileOpener> opener) override {
+		return backing_fs.ListFiles(MapPath(path), callback, opener);
+	}
+
 private:
 	string MapPath(const string &path) const {
-		const string remote_prefix = "s3://bucket";
 		if (!StringUtil::StartsWith(path, remote_prefix)) {
 			throw InternalException("unexpected mapped remote path: " + path);
 		}
@@ -247,8 +261,34 @@ private:
 
 	LocalFileSystem backing_fs;
 	string local_root;
+	string remote_prefix;
 	string failed_removal_path;
 	bool fail_removal = false;
+};
+
+class PhantomRemoteDirectoryFileSystem : public MappedRemoteFileSystem {
+public:
+	PhantomRemoteDirectoryFileSystem(string local_root, string remote_prefix, string phantom_directory)
+	    : MappedRemoteFileSystem(std::move(local_root), std::move(remote_prefix)),
+	      phantom_directory(std::move(phantom_directory)) {
+	}
+
+	bool DirectoryExists(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return true;
+		}
+		return MappedRemoteFileSystem::DirectoryExists(path, opener);
+	}
+
+	void RemoveDirectory(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		if (path == phantom_directory) {
+			return;
+		}
+		MappedRemoteFileSystem::RemoveDirectory(path, opener);
+	}
+
+private:
+	string phantom_directory;
 };
 
 class WindowsPathFileSystem : public LocalFileSystem {
@@ -1019,6 +1059,34 @@ TEST_CASE("Expired direct-target cleanup accepts a missing legacy run prefix",
 	REQUIRE_FALSE(local_fs.FileExists(data_file));
 	auto paths = BuildDistributedCopyFinalizeCommitPaths(local_fs, base_path, run_id);
 	REQUIRE_FALSE(local_fs.FileExists(paths.lifecycle_path));
+}
+
+TEST_CASE("Direct-target cleanup ignores phantom remote directories",
+          "[distributed][copy][lifecycle][object-storage]") {
+	CopyFinalizeTestDirectory test_dir("copy_finalize_phantom_remote_directory");
+	const string remote_prefix = "custom-object://bucket";
+	const string base_path = remote_prefix + "/out";
+	const string run_id = "run-direct-target";
+	auto run_prefix = BuildCopyDirectWriteRunDirectory(base_path, run_id, "/");
+	VirtualFileSystem fs;
+	fs.RegisterSubSystem(make_uniq<PhantomRemoteDirectoryFileSystem>(test_dir.fs.JoinPath(test_dir.path, "remote"),
+	                                                                 remote_prefix, run_prefix));
+	REQUIRE_FALSE(FileSystem::IsRemoteFile(base_path));
+	REQUIRE_FALSE(fs.HasDirectorySemantics(run_prefix));
+
+	REQUIRE(WriteDistributedCopyDirectWriteLifecycle(fs, base_path, run_id, 1).is_ok());
+	auto data_file = BuildCopyDirectTargetFilePath(base_path, run_id, "w_failed", "part.parquet");
+	WriteTestFile(fs, data_file, "stale");
+	REQUIRE(fs.DirectoryExists(run_prefix, nullptr));
+
+	auto cleanup_res = CleanupDistributedCopyUncommittedDirectWriteRun(fs, base_path, run_id);
+
+	auto cleanup_error = cleanup_res.is_err() ? cleanup_res.error().what() : string();
+	INFO(cleanup_error);
+	REQUIRE(cleanup_res.is_ok());
+	REQUIRE_FALSE(fs.FileExists(data_file, nullptr));
+	auto paths = BuildDistributedCopyFinalizeCommitPaths(fs, base_path, run_id);
+	REQUIRE_FALSE(fs.FileExists(paths.lifecycle_path, nullptr));
 }
 
 TEST_CASE("Direct-write cleanup keeps lifecycle registration until metadata cleanup finishes",

@@ -24,28 +24,76 @@ PartitionStatistics::PartitionStatistics() : row_start(0), count(0), count_type(
 TableFunctionInfo::~TableFunctionInfo() {
 }
 
-void DistributedScanTask::Validate() const {
-	if (task_id.empty()) {
-		throw SerializationException("distributed extension scan task has an empty task_id");
+void DistributedScanSplit::Validate() const {
+	if (split_id.empty()) {
+		throw SerializationException("distributed extension scan split has an empty split_id");
 	}
 }
 
-void DistributedScanTask::Serialize(Serializer &serializer) const {
+void DistributedScanSplit::Serialize(Serializer &serializer) const {
 	Validate();
-	serializer.WriteProperty(1, "task_id", task_id);
+	serializer.WriteProperty(1, "split_id", split_id);
 	serializer.WriteProperty(2, "payload", payload);
 	serializer.WriteProperty(3, "estimated_cardinality", estimated_cardinality);
 	serializer.WriteProperty(4, "estimated_bytes", estimated_bytes);
 }
 
-DistributedScanTask DistributedScanTask::Deserialize(Deserializer &deserializer) {
-	DistributedScanTask result;
-	result.task_id = deserializer.ReadProperty<string>(1, "task_id");
+DistributedScanSplit DistributedScanSplit::Deserialize(Deserializer &deserializer) {
+	DistributedScanSplit result;
+	result.split_id = deserializer.ReadProperty<string>(1, "split_id");
 	result.payload = deserializer.ReadProperty<string>(2, "payload");
 	result.estimated_cardinality = deserializer.ReadProperty<optional_idx>(3, "estimated_cardinality");
 	result.estimated_bytes = deserializer.ReadProperty<optional_idx>(4, "estimated_bytes");
 	result.Validate();
 	return result;
+}
+
+namespace {
+
+vector<DistributedScanSplit> PlanDistributedSingletonSource(const TableFunctionDistributedScanPlanningInput &input) {
+	DistributedScanSplit split;
+	split.split_id = "0";
+	if (input.estimated_cardinality != DConstants::INVALID_INDEX) {
+		split.estimated_cardinality = optional_idx(input.estimated_cardinality);
+	}
+	split.Validate();
+	return {std::move(split)};
+}
+
+unique_ptr<FunctionData> CreateDistributedSingletonWorkerBind(const TableFunctionDistributedScanInput &input) {
+	if (!input.bind_data) {
+		return nullptr;
+	}
+	return input.bind_data->Copy();
+}
+
+void ApplyDistributedSingletonSource(optional_ptr<FunctionData>, const vector<DistributedScanSplit> &splits) {
+	if (splits.empty()) {
+		return;
+	}
+	if (splits.size() != 1) {
+		throw InvalidInputException("distributed singleton source requires exactly one assigned split");
+	}
+	const auto &split = splits[0];
+	split.Validate();
+	if (split.split_id != "0" || !split.payload.empty()) {
+		throw InvalidInputException("distributed singleton source received an invalid split");
+	}
+}
+
+} // namespace
+
+TableFunctionDistributedScanCallbacks
+MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode bind_data_mode) {
+	TableFunctionDistributedScanCallbacks callbacks;
+	callbacks.protocol_version = DISTRIBUTED_SINGLETON_SOURCE_PROTOCOL_VERSION;
+	callbacks.split_codec = {DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC,
+	                         DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC_VERSION};
+	callbacks.bind_data_mode = bind_data_mode;
+	callbacks.plan_splits = PlanDistributedSingletonSource;
+	callbacks.create_worker_bind = CreateDistributedSingletonWorkerBind;
+	callbacks.apply_splits = ApplyDistributedSingletonSource;
+	return callbacks;
 }
 
 TableFunction::TableFunction(string name, const vector<LogicalType> &arguments, table_function_t function_,
@@ -117,49 +165,68 @@ bool TableFunction::operator==(const TableFunction &rhs) const {
 	       global_initialization == rhs.global_initialization;
 }
 
+string GetDistributedTableFunctionSignature(const string &function_name, const vector<LogicalType> &arguments,
+                                            const LogicalType &varargs) {
+	return Function::CallToString(string(), string(), function_name, arguments, varargs);
+}
+
 void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &function_name) const {
-	if (!plan || !create_worker_bind || !apply_tasks) {
-		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan, "
-		                            "create_worker_bind, and apply_tasks",
+	if (!plan_splits || !create_worker_bind || !apply_splits) {
+		throw InvalidInputException("Distributed scan callbacks for table function '%s' must define plan_splits, "
+		                            "create_worker_bind, and apply_splits",
 		                            function_name);
 	}
 	if (protocol_version == 0) {
 		throw InvalidInputException(
 		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
-	task_codec.Validate("Distributed scan task codec for table function '" + function_name + "'");
+	switch (bind_data_mode) {
+	case TableFunctionDistributedBindDataMode::REQUIRED:
+	case TableFunctionDistributedBindDataMode::OPTIONAL:
+		break;
+	default:
+		throw InvalidInputException("Distributed scan callbacks for table function '%s' have an invalid bind-data mode",
+		                            function_name);
+	}
+	split_codec.Validate("Distributed scan split codec for table function '" + function_name + "'");
 }
 
-void TableFunctionDistributedScanCallbacks::Validate(const string &function_name) const {
-	ValidateDefinition(function_name);
+void TableFunctionDistributedScanCallbacks::Validate(const TableFunction &function) const {
+	ValidateDefinition(function.name);
 	if (capability.extension_name.empty()) {
 		throw InvalidInputException("Distributed scan capability for table function '%s' was not bound by its loader",
-		                            function_name);
+		                            function.name);
 	}
 	if (capability.capability.kind != DistributedExtensionCapabilityKind::TABLE_FUNCTION) {
 		throw InvalidInputException("Distributed scan capability for table function '%s' must have kind table_function",
-		                            function_name);
+		                            function.name);
 	}
-	if (capability.capability.name != function_name) {
+	if (capability.capability.name != function.name) {
 		throw InvalidInputException("Distributed scan capability name '%s' does not match table function '%s'",
-		                            capability.capability.name, function_name);
+		                            capability.capability.name, function.name);
 	}
+	// BindCapability freezes the declared catalog overload. Bind callbacks may
+	// subsequently specialize or erase arguments, so the runtime function shape
+	// must not be used to recompute this wire identity.
 	capability.Validate();
 }
 
-void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name, const string &function_name) {
-	ValidateDefinition(function_name);
+void TableFunctionDistributedScanCallbacks::BindCapability(const string &extension_name,
+                                                           const TableFunction &function) {
+	ValidateDefinition(function.name);
 	DistributedExtensionCapabilityReference bound_capability;
 	bound_capability.extension_name = extension_name;
 	bound_capability.capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	bound_capability.capability.name = function_name;
+	bound_capability.capability.name = function.name;
 	bound_capability.capability.protocol_version = protocol_version;
+	bound_capability.capability.function_signature =
+	    GetDistributedTableFunctionSignature(function.name, function.arguments, function.varargs);
 	if (!capability.extension_name.empty() && capability != bound_capability) {
 		throw InvalidInputException("Distributed scan capability for table function '%s' is already bound to '%s'",
-		                            function_name, capability.CanonicalIdentity());
+		                            function.name, capability.CanonicalIdentity());
 	}
 	capability = std::move(bound_capability);
-	Validate(function_name);
+	Validate(function);
 }
 
 const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallbacks::GetCapability() const {
@@ -171,8 +238,9 @@ const DistributedExtensionCapabilityReference &TableFunctionDistributedScanCallb
 
 bool TableFunctionDistributedScanCallbacks::operator==(const TableFunctionDistributedScanCallbacks &other) const {
 	return protocol_version == other.protocol_version && capability == other.capability &&
-	       task_codec == other.task_codec && plan == other.plan && create_worker_bind == other.create_worker_bind &&
-	       apply_tasks == other.apply_tasks;
+	       split_codec == other.split_codec && bind_data_mode == other.bind_data_mode &&
+	       plan_splits == other.plan_splits && create_worker_bind == other.create_worker_bind &&
+	       apply_splits == other.apply_splits;
 }
 
 void TableFunction::SetDistributedScanCallbacks(TableFunctionDistributedScanCallbacks callbacks) {
@@ -185,7 +253,7 @@ void TableFunction::BindDistributedScanCapability(const string &extension_name) 
 		throw InternalException("Table function '%s' has no distributed scan callbacks", name);
 	}
 	auto callbacks = *distributed_scan;
-	callbacks.BindCapability(extension_name, name);
+	callbacks.BindCapability(extension_name, *this);
 	distributed_scan = make_shared_ptr<const TableFunctionDistributedScanCallbacks>(std::move(callbacks));
 }
 

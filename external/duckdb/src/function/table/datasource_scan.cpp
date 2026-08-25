@@ -14,7 +14,7 @@
 
 namespace duckdb {
 
-static const string DATASOURCE_TASK_CODEC = "vane.datasource-task.python-pickle";
+static const string DATASOURCE_SPLIT_CODEC = "vane.datasource-split.python-pickle";
 
 // Global produce_stream callback — set once from Python module init,
 // used to restore the callback on workers after deserialization.
@@ -32,21 +32,28 @@ static datasource_produce_stream_t RequireProduceStream(datasource_produce_strea
 	return callback;
 }
 
-static vector<DistributedScanTask> DataSourcePlanDistributedScan(const TableFunctionDistributedScanInput &input) {
-	auto &bind_data = input.bind_data.Cast<DataSourceScanBindData>();
-	vector<DistributedScanTask> tasks;
-	tasks.reserve(bind_data.pickled_tasks.size());
-	for (idx_t task_index = 0; task_index < bind_data.pickled_tasks.size(); task_index++) {
-		DistributedScanTask task;
-		task.task_id = std::to_string(task_index);
-		task.payload = bind_data.pickled_tasks[task_index];
-		tasks.push_back(std::move(task));
+static vector<DistributedScanSplit>
+DataSourcePlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput &input) {
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed datasource scan requires bind data");
 	}
-	return tasks;
+	auto &bind_data = input.bind_data->Cast<DataSourceScanBindData>();
+	vector<DistributedScanSplit> splits;
+	splits.reserve(bind_data.pickled_tasks.size());
+	for (idx_t task_index = 0; task_index < bind_data.pickled_tasks.size(); task_index++) {
+		DistributedScanSplit split;
+		split.split_id = std::to_string(task_index);
+		split.payload = bind_data.pickled_tasks[task_index];
+		splits.push_back(std::move(split));
+	}
+	return splits;
 }
 
 static unique_ptr<FunctionData> DataSourceCreateDistributedWorkerBind(const TableFunctionDistributedScanInput &input) {
-	auto &source_bind = input.bind_data.Cast<DataSourceScanBindData>();
+	if (!input.bind_data) {
+		throw InvalidInputException("distributed datasource scan requires bind data");
+	}
+	auto &source_bind = input.bind_data->Cast<DataSourceScanBindData>();
 	auto worker_bind = make_uniq<DataSourceScanBindData>();
 	worker_bind->pickled_source = source_bind.pickled_source;
 	worker_bind->query_id = source_bind.query_id;
@@ -54,11 +61,11 @@ static unique_ptr<FunctionData> DataSourceCreateDistributedWorkerBind(const Tabl
 	return std::move(worker_bind);
 }
 
-static bool IsCanonicalDataSourceTaskId(const string &task_id) {
-	if (task_id.empty() || (task_id.size() > 1 && task_id[0] == '0')) {
+static bool IsCanonicalDataSourceSplitId(const string &split_id) {
+	if (split_id.empty() || (split_id.size() > 1 && split_id[0] == '0')) {
 		return false;
 	}
-	for (auto character : task_id) {
+	for (auto character : split_id) {
 		if (character < '0' || character > '9') {
 			return false;
 		}
@@ -66,15 +73,19 @@ static bool IsCanonicalDataSourceTaskId(const string &task_id) {
 	return true;
 }
 
-static void DataSourceApplyDistributedTasks(FunctionData &worker_bind_data, const vector<DistributedScanTask> &tasks) {
-	auto &bind_data = worker_bind_data.Cast<DataSourceScanBindData>();
+static void DataSourceApplyDistributedSplits(optional_ptr<FunctionData> worker_bind_data,
+                                             const vector<DistributedScanSplit> &splits) {
+	if (!worker_bind_data) {
+		throw InvalidInputException("distributed datasource scan requires worker bind data");
+	}
+	auto &bind_data = worker_bind_data->Cast<DataSourceScanBindData>();
 	vector<string> validated_tasks;
-	validated_tasks.reserve(tasks.size());
-	for (const auto &task : tasks) {
-		if (!IsCanonicalDataSourceTaskId(task.task_id) || task.payload.empty()) {
-			throw InvalidInputException("invalid distributed DataSource task '%s'", task.task_id);
+	validated_tasks.reserve(splits.size());
+	for (const auto &split : splits) {
+		if (!IsCanonicalDataSourceSplitId(split.split_id) || split.payload.empty()) {
+			throw InvalidInputException("invalid distributed DataSource split '%s'", split.split_id);
 		}
-		validated_tasks.push_back(task.payload);
+		validated_tasks.push_back(split.payload);
 	}
 	bind_data.pickled_tasks = std::move(validated_tasks);
 }
@@ -302,10 +313,10 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	func.deserialize = DataSourceScanDeserialize;
 	TableFunctionDistributedScanCallbacks distributed_scan;
 	distributed_scan.protocol_version = 1;
-	distributed_scan.task_codec = {DATASOURCE_TASK_CODEC, 1};
-	distributed_scan.plan = DataSourcePlanDistributedScan;
+	distributed_scan.split_codec = {DATASOURCE_SPLIT_CODEC, 1};
+	distributed_scan.plan_splits = DataSourcePlanDistributedScanSplits;
 	distributed_scan.create_worker_bind = DataSourceCreateDistributedWorkerBind;
-	distributed_scan.apply_tasks = DataSourceApplyDistributedTasks;
+	distributed_scan.apply_splits = DataSourceApplyDistributedSplits;
 	func.SetDistributedScanCallbacks(std::move(distributed_scan));
 	func.BindDistributedScanCapability("vane_core");
 	func.projection_pushdown = false;

@@ -123,7 +123,7 @@ void MiniZStreamWrapper::Initialize(QueryContext context, CompressedFile &file, 
 		total_size = 0;
 
 		MiniZStream::InitializeGZIPHeader(gzip_hdr);
-		file.child_handle->Write(context, gzip_hdr, GZIP_HEADER_MINSIZE);
+		file.WriteCompressedData(context, gzip_hdr, GZIP_HEADER_MINSIZE);
 
 		auto ret = mz_deflateInit2(mz_stream_ptr.get(), duckdb_miniz::MZ_DEFAULT_LEVEL, MZ_DEFLATED,
 		                           -MZ_DEFAULT_WINDOW_BITS, 1, 0);
@@ -254,7 +254,7 @@ void MiniZStreamWrapper::Write(CompressedFile &file, StreamData &sd, data_ptr_t 
 		sd.out_buff_start += output_remaining - mz_stream_ptr->avail_out;
 		if (mz_stream_ptr->avail_out == 0) {
 			// no more output buffer available: flush
-			file.child_handle->Write(sd.out_buff.get(),
+			file.WriteCompressedData(sd.out_buff.get(),
 			                         UnsafeNumericCast<idx_t>(sd.out_buff_start - sd.out_buff.get()));
 			sd.out_buff_start = sd.out_buff.get();
 		}
@@ -276,7 +276,7 @@ void MiniZStreamWrapper::FlushStream() const {
 		auto res = mz_deflate(mz_stream_ptr.get(), duckdb_miniz::MZ_FINISH);
 		sd.out_buff_start += (output_remaining - mz_stream_ptr->avail_out);
 		if (sd.out_buff_start > sd.out_buff.get()) {
-			file->child_handle->Write(sd.out_buff.get(),
+			file->WriteCompressedData(sd.out_buff.get(),
 			                          UnsafeNumericCast<idx_t>(sd.out_buff_start - sd.out_buff.get()));
 			sd.out_buff_start = sd.out_buff.get();
 		}
@@ -300,7 +300,7 @@ void MiniZStreamWrapper::Close() {
 		// write the footer
 		unsigned char gzip_footer[MiniZStream::GZIP_FOOTER_SIZE];
 		MiniZStream::InitializeGZIPFooter(gzip_footer, crc, total_size);
-		file->child_handle->Write(gzip_footer, MiniZStream::GZIP_FOOTER_SIZE);
+		file->WriteCompressedData(gzip_footer, MiniZStream::GZIP_FOOTER_SIZE);
 
 		duckdb_miniz::mz_deflateEnd(mz_stream_ptr.get());
 	} else {

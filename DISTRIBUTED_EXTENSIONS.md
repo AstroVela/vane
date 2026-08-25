@@ -27,9 +27,9 @@ when it runs through DuckDB's native runner.
   Vane release artifact.
 - The coordinator resolves catalog state and selects immutable work before
   worker execution starts.
-- Workers receive portable task data and restore extension state through the
+- Workers receive portable split data and restore extension state through the
   extension's normal DuckDB `serialize`/`deserialize` callbacks.
-- The scheduler treats extension task payloads as opaque.
+- The scheduler treats extension split payloads as opaque.
 - Workers may produce immutable files, but only the coordinator may mutate an
   extension catalog transaction.
 - Invalid or incomplete distributed contracts fail before distributed side
@@ -47,10 +47,10 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
     auto scan_functions = GetIcebergScanFunction(loader);
     TableFunctionDistributedScanCallbacks scan_callbacks;
     scan_callbacks.protocol_version = 1;
-    scan_callbacks.task_codec = {"iceberg.scan-task", 1};
-    scan_callbacks.plan = IcebergPlanScanTasks;
+    scan_callbacks.split_codec = {"iceberg.scan-split", 1};
+    scan_callbacks.plan_splits = IcebergPlanScanSplits;
     scan_callbacks.create_worker_bind = IcebergCreateWorkerBind;
-    scan_callbacks.apply_tasks = IcebergApplyScanTasks;
+    scan_callbacks.apply_splits = IcebergApplyScanSplits;
     scan_functions.SetDistributedScanCallbacks(std::move(scan_callbacks));
     // This remains the ordinary DuckDB catalog registration. The loader
     // derives and stages the table-function capability from the callbacks.
@@ -66,20 +66,23 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
 }
 ```
 
-Each concrete capability owns a protocol version so scan and write contracts
-can evolve independently. Names and versions are stable wire identities, not
-display labels. The current registry accepts only implemented hook kinds:
-distributed table scans and distributed write operators. It has no public
-placeholder API for hypothetical aggregate, COPY, storage, or context
-protocols.
+Each table-function overload with callbacks owns a capability and protocol
+version, identified by its canonical catalog signature (for example,
+`range(BIGINT, BIGINT)`). Different overloads of one function may evolve
+independently, and distributed and native-only overloads may coexist. Write
+contracts remain identified by operator name. These signatures, names, and
+versions are stable wire identities, not display labels. The current registry
+accepts only implemented hook kinds: distributed table scans and distributed
+write operators. It has no public placeholder API for hypothetical aggregate,
+COPY, storage, or context protocols.
 
 Ordinary DuckDB registrations remain available on every statically linked
 worker:
 
 - ordinary worker-safe scalar functions, types, casts, and collations use their
   normal DuckDB registrations after the exact extension is loaded;
-- table sources that require distributed partitioning add portable task
-  enumeration, explicit worker-bind construction, and worker task application;
+- table sources that require distributed partitioning add portable split
+  enumeration, explicit worker-bind construction, and worker split application;
 - custom write roots add either the fixed file adapter or a worker fragment
   sink plus coordinator commit behavior;
 - replacement scans and parser, planner, and optimizer hooks normally run on
@@ -88,12 +91,12 @@ worker:
 
 `ExtensionLoader` automatically stages a table-function capability when the
 normally registered `TableFunction` carries distributed scan callbacks. The
-extension name, function name, and capability kind are derived rather than
-repeated by the extension author. A write hook similarly receives its extension
-identity from the loader. The loader stages every concrete contract and
-publishes the manifest and write implementations atomically only when loading
-finalizes successfully. Duplicate identities, zero protocol versions, mixed
-distributed/native-only overloads, incomplete callbacks, and non-canonical
+extension name, canonical overload signature, and capability kind are derived
+rather than repeated by the extension author. A write hook similarly receives
+its extension identity from the loader. The loader stages every concrete
+overload contract and publishes the manifest and write implementations
+atomically only when loading finalizes successfully. Duplicate overload
+identities, zero protocol versions, incomplete callbacks, and non-canonical
 names are rejected.
 
 `DistributedWriteOperatorExtension` is a hook type, not another loadable
@@ -149,7 +152,7 @@ as far as the isolated coordinator planning connection.
 An extension scan must implement both of DuckDB's normal table-function
 `serialize` and `deserialize` callbacks. Its distributed `create_worker_bind`
 callback constructs a new bind by explicitly selecting only state required by
-worker execution. It must not retain coordinator task collections, catalog or
+worker execution. It must not retain coordinator split collections, catalog or
 client-context pointers, or other mutable process-local state. The returned
 bind is serialized normally when the worker physical plan is transported.
 `FunctionData::Copy()` keeps its ordinary DuckDB meaning and is not used to
@@ -174,53 +177,121 @@ DuckDB table function from its catalog and calls its `deserialize` callback.
 The worker never invokes the original bind callback and never repeats catalog or
 metadata planning. Missing or incomplete bind serde is a hard error.
 
-### Extension-owned tasks
+### Extension-owned splits
 
 `TableFunctionDistributedScanCallbacks` is attached directly to the registered
 DuckDB `TableFunction`. It provides the table-function capability protocol
-version, a task codec identity, and three operations:
+version, a split codec identity, and three operations:
 
-1. `plan` expands coordinator bind state into elementary opaque task envelopes.
-2. `create_worker_bind` constructs the minimal task-free worker bind.
-3. `apply_tasks` decodes and installs an assigned subset after worker bind
+1. `plan_splits` expands coordinator bind state into independently assignable
+   opaque split envelopes.
+2. `create_worker_bind` constructs the minimal split-free worker bind.
+3. `apply_splits` decodes and installs the splits assigned to one worker task
+   after worker bind
    deserialization.
 
 The ordinary `loader.RegisterFunction(...)` call binds the complete
 `DistributedExtensionCapabilityReference` from the loader's extension identity
-and the table function's catalog name. No second table-function registration is
-required, and native DuckDB continues to execute the original bind/init/scan
+and the table function overload's canonical catalog signature. No second
+table-function registration is required, native-only overloads remain
+unaffected, and native DuckDB continues to execute the original bind/init/scan
 callbacks.
 
-Each envelope contains a stable task ID, one opaque payload, and optional
-cardinality/byte estimates. The task codec describes the complete extension
+Each envelope contains a stable `split_id`, one opaque payload, and optional
+cardinality/byte estimates. The split codec describes the complete extension
 payload. An adapter that needs paths, delete vectors, credentials, partition
-metadata, or other fat task state serializes all of it inside that payload.
+metadata, or other fat split state serializes all of it inside that payload.
 Vane serializes the outer envelope with DuckDB's binary serializer but never
-interprets the payload. File-backed and non-file extensions use the same
-envelope; `OpenFileInfo` is reserved for the engine-owned MultiFile path.
+interprets the payload. A `split_id` is an exact opaque identity and is never
+trimmed or otherwise normalized. File-backed and non-file extensions use the
+same envelope; `OpenFileInfo` is reserved for the engine-owned MultiFile path.
 
-Extensions may return per-task byte and cardinality estimates for balancing.
+`plan_splits` receives `TableFunctionDistributedScanPlanningInput`, whose
+`target_split_count` is a granularity hint derived from available worker slots
+and `VANE_RAY_SCAN_SPLIT_MIN_COUNT`. It is not a task count. An extension may
+return more or fewer splits, but every returned split must remain independently
+executable and have an ID unique within that logical scan source.
+
+The planning input also borrows the coordinator `FileSystem` for the duration
+of the callback. File-backed implementations may use it to inspect the
+already-selected files and produce size estimates or safe byte boundaries.
+They must not retain the filesystem or any connection-level resource in worker
+bind data.
+
+Extensions may return per-split byte and cardinality estimates for balancing.
 Vane never opens or parses an extension payload to infer those estimates, even
-when the payload encodes a URI; task interpretation remains extension-owned.
+when the payload encodes a URI; split interpretation remains extension-owned.
 The byte estimate describes logical scan input, not serialized envelope size.
 
-Vane groups these tasks into existing `ScanTaskDescriptor` objects and
-transports them through normal and fault-tolerant execution. Descriptors carry
-the exact extension capability and codec version, and only matching descriptors
-may be merged or applied. Every worker extension scan must receive an explicit
-assignment before executor initialization. When planning yields no elementary
-tasks, the coordinator emits one explicit descriptor containing zero opaque
-envelopes. That descriptor is the only representation of an empty scan, whether
-assigned statically or delivered through an FTE queue. Extension state is never
-replaced with an engine-owned file list.
+Source planning emits one engine `ScanSplit` for each extension envelope and
+wraps it in a singleton `ScanSplitBatch` only to reuse the typed transport. The
+FTE scheduler is the only layer that may merge multiple singleton batches into
+the batch assigned to one source in one task attempt. A batch is never a second
+planning or scheduling unit. Batches carry the exact extension capability and
+codec version, and only compatible batches with distinct split IDs may be
+merged. This gives each split an independent scheduling, retry, and
+observability identity while still allowing one task to consume multiple
+splits.
+
+Every worker extension scan must receive an explicit assignment before executor
+initialization. When planning yields no splits, the coordinator emits one
+explicit empty split. That marker is the only representation of an empty scan,
+whether assigned statically or delivered through an FTE queue. Extension state
+is never replaced with an engine-owned file list.
 
 Engine-owned MultiFile scans use the same strict assignment boundary. Their
-worker bind copy contains an empty `SimpleMultiFileList`; static descriptors or
-an FTE queue replace it before executor initialization. A zero-file MultiFile
-scan is represented by one explicit empty file descriptor. The coordinator's
-original file list is never retained as a worker fallback.
+worker bind copy contains an empty `SimpleMultiFileList`; static batches or
+an FTE queue replace it before executor initialization. Planning emits one
+`ScanSplit` per `OpenFileInfo`, including a stable ordinal identity for repeated
+occurrences of the same path. A zero-file MultiFile scan is represented by one
+explicit empty file split. The coordinator's original file list is never
+retained as a worker fallback.
+
+Vane's built-in CSV reader uses the extension-owned contract because a single
+seekable CSV file can be split below file granularity. A multi-file scan emits
+one split per bound file. A single uncompressed UTF-8 file may emit explicit
+byte ranges, with overlap used only to finish the record that starts inside a
+range. The worker bind serializes the bound schema, projection-facing column
+metadata, reader options, union-by-name per-file state, and complete
+`OpenFileInfo` options. It is detached until an assignment is applied, and an
+explicit empty assignment remains a zero-row scan. Compressed, non-seekable,
+non-UTF-8, `skip_rows`, and leading-row header detection cannot be byte-range
+split, so a single replayable input in one of those modes produces one explicit
+whole-file split even when the target granularity hint is larger. Pipe inputs
+are rejected at every granularity because they cannot provide retryable tasks.
+Rejects-table scans are not distributed. CSV itself has no snapshot identifier,
+so referenced files must remain immutable for the lifetime of the query and its
+retries; a same-size replacement cannot be detected by this protocol.
 
 ## Distributed writes
+
+### Ordinary COPY-format file writes
+
+Python relations can route any registered DuckDB COPY format through the
+distributed file-artifact path with
+`relation.write_file(path, format="format_name")`. This constructs a normal
+`CopyStatement`; it does not register an extension write operator or add
+format-specific behavior to Vane. The `write_csv` and `write_parquet`
+convenience methods construct the same format-neutral relation while retaining
+their format-specific option surfaces. The named `CopyFunction` must provide:
+
+- owned `FunctionData::Copy()` state;
+- matching `serialize` and `deserialize` callbacks;
+- `copy_to_get_written_statistics` with exact row and file byte counts.
+
+The coordinator binds the source and COPY format once. Each selected source
+task receives a cloned physical COPY sink and a unique run-scoped worker output
+path. Retries create a different immutable output path, and finalization uses
+only the selected attempts when it publishes the manifest. An empty source is
+still scheduled as an explicit empty input and must produce a valid zero-row
+artifact when the format's `write_empty_file` behavior is enabled.
+
+The output filesystem remains part of the format contract. Every worker and the
+coordinator must resolve the output namespace consistently; Vane does not turn
+a local-only writer into an object-store writer or copy node-local artifacts
+between hosts.
+
+### Extension-owned write roots
 
 `ExtensionWriteTaskProvider` is the coordinator-side contract exposed by the
 extension's ordinary physical root. That root is never serialized or run on a
@@ -357,16 +428,16 @@ For distributed table-function scan callbacks:
 
 - declare one non-zero capability protocol version on the callbacks and let the
   ordinary `RegisterFunction` call derive the complete capability identity;
-- emit deterministic task payloads without process-local pointers;
+- emit deterministic split IDs and payloads without process-local pointers;
 - implement complete DuckDB bind `serialize`/`deserialize` callbacks and make
-  the deserializer accept a task-free worker bind;
+  the deserializer accept a split-free worker bind;
 - construct the worker bind by explicitly copying only required portable state;
-  do not retain coordinator tasks, catalog/context pointers, or mutable caches;
+  do not retain coordinator splits, catalog/context pointers, or mutable caches;
 - make subset application idempotent and valid before global scan state starts;
-- keep coordinator task enumeration free of logical query side effects;
+- keep coordinator split enumeration free of logical query side effects;
 - preserve schema, projection, filters, partitions, and delete semantics after
-  bind deserialization and task application;
-- provide task byte or cardinality metadata when available for balancing.
+  bind deserialization and split application;
+- provide split byte or cardinality metadata when available for balancing.
 
 For every distributed write provider:
 
@@ -410,18 +481,18 @@ distributed tests before an extension is enabled in release builds.
 - DuckDB source, static extension version, and distributed contract mismatches
   are rejected before planning or scheduling.
 - A callback/provider whose capability identity was not registered is rejected
-  before task enumeration or write validation.
+  before split enumeration or write validation.
 - Worker rebind is not supported for distributed table functions.
 - A scan function with distributed callbacks must expose both DuckDB
   serialization callbacks.
-- A worker extension scan without an explicit task descriptor is rejected,
-  including a sealed but descriptor-free FTE queue; an explicit empty envelope
+- A worker extension scan without an explicit split assignment is rejected,
+  including a sealed but batch-free FTE queue; an explicit empty split
   remains a valid empty scan.
-- A source node cannot receive both a static descriptor and an FTE split queue.
-- Extension-owned tasks are never merged with engine-discovered file tasks; the
+- A source node cannot receive both a static split batch and an FTE split queue.
+- Extension-owned splits are never merged with engine-discovered file splits; the
   extension remains responsible for validating the opaque payloads it emits and
   receives.
-- An empty task assignment produces an empty scan.
+- An explicit empty split produces an empty scan.
 - An extension physical operator without `ExtensionWriteTaskProvider` is
   rejected before its child can run.
 - A file-artifact write must have exactly one COPY sink; a callback write must
@@ -433,13 +504,14 @@ distributed tests before an extension is enabled in release builds.
 
 ## Framework test matrix
 
-The engine-level suite covers scan callback discovery, opaque fat-task payload
-serialization, explicit worker bind serde, task subset application,
-empty assignments, schema validation, file and callback write translation,
-write callback execution, binary fragment and artifact envelopes, runtime
-query/task-attempt identity, pre-write validation, selected-result propagation,
-row-count validation, transaction ordering, pre-finalize abort behavior, and
-terminal unknown outcomes after finalization starts.
+The engine-level suite covers scan callback discovery, opaque fat-split payload
+serialization, explicit worker bind serde, split subset application,
+empty assignments, schema validation, generic COPY-format relation binding,
+file and callback write translation, write callback execution, binary fragment
+and artifact envelopes, runtime query/task-attempt identity, pre-write
+validation, selected-result propagation, row-count validation, transaction
+ordering, pre-finalize abort behavior, and terminal unknown outcomes after
+finalization starts.
 
-Each concrete extension adds its own adapter tests for catalog pinning, task
+Each concrete extension adds its own adapter tests for catalog pinning, split
 semantics, object storage, commit behavior, and failure boundaries.

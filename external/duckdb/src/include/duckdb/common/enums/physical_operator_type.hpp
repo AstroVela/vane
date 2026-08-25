@@ -144,6 +144,7 @@ enum class PhysicalOperatorType : uint8_t {
 	GROUPING_SET_EXPAND,
 	DISTRIBUTED_RESERVOIR_SAMPLE,
 	DISTRIBUTED_EXTENSION_WRITE,
+	DATA_SINK,
 };
 
 string PhysicalOperatorToString(PhysicalOperatorType type);

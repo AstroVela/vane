@@ -66,6 +66,8 @@ public:
 	unique_ptr<DuckDBPyRelation> Limit(int64_t n, int64_t offset = 0);
 	unique_ptr<DuckDBPyRelation> Repartition(const py::args &args, const py::kwargs &kwargs);
 	unique_ptr<DuckDBPyRelation> LocalExchange(const py::object &num_partitions);
+	void ValidateDataSinkTransaction();
+	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);
 
@@ -204,6 +206,9 @@ public:
 	duckdb::pyarrow::Table ToArrowTable(idx_t batch_size);
 
 	duckdb::pyarrow::Table ToArrowTableInternal(idx_t batch_size, bool to_polars);
+	vector<string> TakeUDFActorCleanupWarnings();
+
+	py::object GetArrowSchema();
 
 	PolarsDataFrame ToPolars(idx_t batch_size, bool lazy);
 
@@ -257,6 +262,7 @@ public:
 	           const py::object &overwrite = py::none(), const py::object &per_thread_output = py::none(),
 	           const py::object &use_tmp_file = py::none(), const py::object &partition_by = py::none(),
 	           const py::object &write_partition_columns = py::none());
+	void ToFile(const string &filename, const string &format);
 
 	// should this return a rel with the new view?
 	unique_ptr<DuckDBPyRelation> CreateView(const string &view_name, bool replace = true);
@@ -275,7 +281,7 @@ public:
 	void Update(const py::object &set, const py::object &where = py::none());
 	void Delete(const py::object &where = py::none());
 
-	void Create(const string &table);
+	void Create(const string &table, const py::object &properties, const py::object &partition_by);
 
 	py::str Type();
 	py::list Columns();
@@ -335,6 +341,7 @@ private:
 	vector<LogicalType> types;
 	vector<string> names;
 	shared_ptr<DuckDBPyResult> result;
+	vector<string> udf_actor_cleanup_warnings;
 	std::string rendered_result;
 };
 

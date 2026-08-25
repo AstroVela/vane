@@ -73,18 +73,6 @@ py::object GetLoadedRayModuleOrNone() {
 	return ray_mod;
 }
 
-const duckdb::PhysicalRemoteExchangeSink *FindRemoteExchangeSink(const duckdb::PhysicalOperator &op) {
-	if (op.type == duckdb::PhysicalOperatorType::EXCHANGE_SINK) {
-		return dynamic_cast<const duckdb::PhysicalRemoteExchangeSink *>(&op);
-	}
-	for (auto &child : op.children) {
-		if (auto *sink = FindRemoteExchangeSink(child.get())) {
-			return sink;
-		}
-	}
-	return nullptr;
-}
-
 bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::ExchangeSinkInstanceHandle &out) {
 	if (obj.is_none()) {
 		return false;
@@ -119,9 +107,6 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	}
 	if (d.contains("attempt_id")) {
 		out.attempt_id = py::int_(d["attempt_id"]).cast<duckdb::idx_t>();
-	}
-	if (d.contains("fte_task_identity")) {
-		out.fte_task_identity = py::bool_(d["fte_task_identity"]).cast<bool>();
 	}
 	if (d.contains("output_partition_count")) {
 		out.output_partition_count = py::int_(d["output_partition_count"]).cast<duckdb::idx_t>();
@@ -381,7 +366,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::size_bytes()
 		return duckdb::distributed::DuckDBResult<size_t>::ok(size_bytes_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->SizeInBytes() : 0);
 }
 
@@ -390,7 +375,7 @@ duckdb::distributed::DuckDBResult<size_t> RayBackedResultPartition::num_rows() c
 		return duckdb::distributed::DuckDBResult<size_t>::ok(num_rows_);
 	}
 
-	auto collection = materialized_collection_.load();
+	auto collection = std::atomic_load(&materialized_collection_);
 	return duckdb::distributed::DuckDBResult<size_t>::ok(collection ? collection->Count() : 0);
 }
 
@@ -412,7 +397,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 			duckdb::PythonGILWrapper gil;
 			try {
 				auto object_ref = object_ref_.get();
-				materialized_collection_.store(MaterializePyPayloadToCollection(object_ref, nullptr));
+				std::atomic_store(&materialized_collection_, MaterializePyPayloadToCollection(object_ref, nullptr));
 			} catch (const py::error_already_set &ex) {
 				throw duckdb::InvalidInputException("Failed to materialize Ray result partition: %s", ex.what());
 			}
@@ -424,7 +409,7 @@ std::shared_ptr<duckdb::ColumnDataCollection> RayBackedResultPartition::to_colum
 	if (materialize_error_) {
 		std::rethrow_exception(materialize_error_);
 	}
-	return materialized_collection_.load();
+	return std::atomic_load(&materialized_collection_);
 }
 
 py::object duckdb::distributed::python::ray::ResultPartitionToPyObject(
@@ -1085,6 +1070,29 @@ void RayTaskResultHandle::AckPollResult() {
 	if (!poll_result_cache_) {
 		return;
 	}
+	bool should_ack = false;
+	{
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		if (!acked_) {
+			acked_ = true;
+			should_ack = true;
+		}
+	}
+	if (!should_ack) {
+		return;
+	}
+	try {
+		PythonGILWrapper gil;
+		if (!poll_state_ || !poll_state_->handle.has_value()) {
+			throw duckdb::InternalException("RayTaskResultHandle missing handle for ack");
+		}
+		py::object handle_obj = poll_state_->handle.get();
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
+	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	poll_result_cache_->result.reset();
 }
@@ -1190,6 +1198,9 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
 	} catch (const std::exception &e) {
 		terminal_result = ResultType::err(duckdb::distributed::DuckDBError(e.what()));
+	} catch (...) {
+		terminal_result =
+		    ResultType::err(duckdb::distributed::DuckDBError("unknown error while polling Python task result handle"));
 	}
 	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
 	if (!poll_result_cache_->result.has_value()) {
@@ -1205,7 +1216,6 @@ void PythonTaskResultHandle::AckPollResult() {
 	bool should_ack = false;
 	{
 		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
-		poll_result_cache_->result.reset();
 		if (!acked_) {
 			acked_ = true;
 			should_ack = true;
@@ -1217,15 +1227,17 @@ void PythonTaskResultHandle::AckPollResult() {
 	try {
 		PythonGILWrapper gil;
 		if (!handle_.has_value()) {
-			return;
+			throw duckdb::InternalException("PythonTaskResultHandle missing handle for ack");
 		}
 		py::object handle_obj = handle_.get();
-		if (py::hasattr(handle_obj, "ack")) {
-			handle_obj.attr("ack")();
-		}
-	} catch (const py::error_already_set &) {
-	} catch (const std::exception &) {
+		handle_obj.attr("ack")();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+		acked_ = false;
+		throw;
 	}
+	std::lock_guard<std::mutex> guard(poll_result_cache_->mutex);
+	poll_result_cache_->result.reset();
 }
 
 void PythonTaskResultHandle::ReleasePollResult() {
@@ -1339,11 +1351,11 @@ py::dict RayWorkerTask::Inputs() const {
 	py::dict result;
 	for (const auto &kv : task_.inputs()) {
 		py::dict entry;
-		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanTask) {
-			entry["kind"] = "scan_task";
-			// scan_task_bytes is raw binary data — use py::bytes, NOT py::str
+		if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ScanSplitBatch) {
+			entry["kind"] = "scan_split_batch";
+			// scan_split_batch_bytes is raw binary data — use py::bytes, NOT py::str
 			// (py::str would trigger UTF-8 decode and fail on arbitrary bytes)
-			entry["data"] = py::bytes(kv.second.scan_task_bytes);
+			entry["data"] = py::bytes(kv.second.scan_split_batch_bytes);
 		} else if (kv.second.kind == duckdb::distributed::TaskInput::Kind::ExchangeSourceTask) {
 			entry["kind"] = "exchange_source_task";
 			entry["data"] = py::bytes(kv.second.exchange_source_task_bytes);
@@ -1353,48 +1365,23 @@ py::dict RayWorkerTask::Inputs() const {
 	return result;
 }
 
-py::object RayWorkerTask::ExchangeSinkInstance() const {
+py::object RayWorkerTask::ExchangeSinkConfig() const {
 	duckdb::PythonGILWrapper gil;
 	auto plan_ref = task_.plan();
 	if (!plan_ref || !plan_ref->HasRoot()) {
 		return py::none();
 	}
-	auto *sink = FindRemoteExchangeSink(plan_ref->Root());
+	const duckdb::PhysicalRemoteExchangeSink *sink = nullptr;
+	std::string error;
+	if (!duckdb::distributed::TryGetUniqueRemoteExchangeSink(plan_ref->Root(), sink, &error)) {
+		throw duckdb::InvalidInputException("Invalid worker exchange sink plan: %s", error);
+	}
 	if (!sink) {
 		return py::none();
 	}
-	const auto &instance = sink->SinkHandle();
-	if (!instance.mark_join_build_summary.IsConsistent()) {
-		throw py::value_error("exchange_sink_instance has an invalid MARK join build summary");
-	}
-	py::dict sink_handle;
-	sink_handle["task_partition_id"] = instance.sink_handle.task_partition_id;
-	sink_handle["partition_id"] = instance.sink_handle.task_partition_id;
-
 	py::dict result;
-	result["sink_handle"] = sink_handle;
-	result["task_partition_id"] = instance.sink_handle.task_partition_id;
-	result["partition_id"] = instance.sink_handle.task_partition_id;
-	result["attempt_id"] = instance.attempt_id;
-	result["output_partition_count"] = instance.output_partition_count;
-	result["query_id"] = instance.query_id;
-	if (instance.fte_task_identity) {
-		result["fte_task_identity"] = true;
-	}
-	if (!instance.flight_server_epoch.empty()) {
-		result["flight_server_epoch"] = instance.flight_server_epoch;
-	}
-	if (!instance.flight_host.empty()) {
-		result["flight_host"] = instance.flight_host;
-	}
-	if (!instance.output_location.empty()) {
-		result["output_location"] = instance.output_location;
-		result["attempt_path"] = instance.output_location;
-	}
-	if (instance.mark_join_build_summary.valid) {
-		result["mark_join_build_summary_valid"] = true;
-		result["mark_join_build_has_rows"] = instance.mark_join_build_summary.has_rows;
-		result["mark_join_build_has_null"] = instance.mark_join_build_summary.has_null;
-	}
+	result["output_partition_count"] = sink->NumPartitions();
+	result["query_id"] = sink->SinkQueryId();
+	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();
 	return result;
 }

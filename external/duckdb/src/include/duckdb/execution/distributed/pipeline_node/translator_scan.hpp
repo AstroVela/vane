@@ -6,7 +6,7 @@
 #include <memory>
 #include "duckdb/execution/distributed/common_types.hpp"
 #include "duckdb/execution/distributed/plan/plan_config.hpp"
-#include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
@@ -17,13 +17,8 @@ namespace distributed {
 
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan);
 
-struct TableScanTaskSet {
-	vector<ScanTaskDescriptor> tasks;
-	bool known_empty;
-};
-
-TableScanTaskSet MakeTableScanTasks(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                    const shared_ptr<DatabaseInstance> &db);
+vector<ScanSplit> MakeTableScanSplits(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
+                                      const shared_ptr<DatabaseInstance> &db);
 
 SchemaRef MakeTableScanSchema(const PhysicalTableScan &scan, const vector<LogicalType> &output_types);
 

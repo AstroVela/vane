@@ -277,25 +277,25 @@ OperatorDetailsCounterMax(const duckdb::vector<duckdb::InsertionOrderPreservingM
 }
 
 static idx_t
-ScanTaskInputRows(const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map) {
+ScanSplitInputRows(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
 	idx_t rows = 0;
-	if (!scan_task_map) {
+	if (!scan_split_batch_map) {
 		return rows;
 	}
-	for (const auto &entry : *scan_task_map) {
-		rows = SaturatingAddIdx(rows, entry.second.estimated_cardinality);
+	for (const auto &entry : *scan_split_batch_map) {
+		rows = SaturatingAddIdx(rows, entry.second.EstimatedCardinality());
 	}
 	return rows;
 }
 
 static idx_t
-ScanTaskInputBytes(const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map) {
+ScanSplitInputBytes(const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map) {
 	idx_t bytes = 0;
-	if (!scan_task_map) {
+	if (!scan_split_batch_map) {
 		return bytes;
 	}
-	for (const auto &entry : *scan_task_map) {
-		bytes = SaturatingAddIdx(bytes, entry.second.estimated_bytes);
+	for (const auto &entry : *scan_split_batch_map) {
+		bytes = SaturatingAddIdx(bytes, entry.second.EstimatedBytes());
 	}
 	return bytes;
 }
@@ -436,15 +436,15 @@ static void AppendFteQueueProgressStats(
 
 static py::dict BuildNativeTaskStatsDict(
     const duckdb::vector<duckdb::PipelineProgressSnapshot> &snapshots,
-    const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map,
+    const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map,
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_scan_source_queue_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_exchange_source_queue_map,
     bool hide_remote_exchange_result_collector = false) {
 	idx_t scan_rows =
-	    SaturatingAddIdx(ScanTaskInputRows(scan_task_map), FteQueueConsumedRows(fte_scan_source_queue_map));
+	    SaturatingAddIdx(ScanSplitInputRows(scan_split_batch_map), FteQueueConsumedRows(fte_scan_source_queue_map));
 	idx_t scan_bytes =
-	    SaturatingAddIdx(ScanTaskInputBytes(scan_task_map), FteQueueConsumedBytes(fte_scan_source_queue_map));
+	    SaturatingAddIdx(ScanSplitInputBytes(scan_split_batch_map), FteQueueConsumedBytes(fte_scan_source_queue_map));
 	idx_t exchange_rows = SaturatingAddIdx(ExchangeSourceInputRows(exchange_source_task_map),
 	                                       FteQueueConsumedRows(fte_exchange_source_queue_map));
 	idx_t exchange_bytes = SaturatingAddIdx(ExchangeSourceInputBytes(exchange_source_task_map),
@@ -694,7 +694,7 @@ static bool ExtractCopyResultProgressStats(duckdb::MaterializedQueryResult &resu
 
 static py::dict BuildMaterializedInputTaskStats(
     const duckdb::PhysicalOperator &root_op,
-    const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map,
+    const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map,
     const std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> *exchange_source_task_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_scan_source_queue_map,
     const std::unordered_map<idx_t, std::shared_ptr<duckdb::distributed::FteSplitQueue>> *fte_exchange_source_queue_map,
@@ -704,9 +704,9 @@ static py::dict BuildMaterializedInputTaskStats(
 	CollectPrimaryPipelineOperators(root_op, progress_operators, &progress_operator_details);
 
 	idx_t physical_rows =
-	    SaturatingAddIdx(ScanTaskInputRows(scan_task_map), FteQueueConsumedRows(fte_scan_source_queue_map));
+	    SaturatingAddIdx(ScanSplitInputRows(scan_split_batch_map), FteQueueConsumedRows(fte_scan_source_queue_map));
 	idx_t physical_bytes =
-	    SaturatingAddIdx(ScanTaskInputBytes(scan_task_map), FteQueueConsumedBytes(fte_scan_source_queue_map));
+	    SaturatingAddIdx(ScanSplitInputBytes(scan_split_batch_map), FteQueueConsumedBytes(fte_scan_source_queue_map));
 	idx_t network_rows = SaturatingAddIdx(ExchangeSourceInputRows(exchange_source_task_map),
 	                                      FteQueueConsumedRows(fte_exchange_source_queue_map));
 	idx_t network_bytes = SaturatingAddIdx(ExchangeSourceInputBytes(exchange_source_task_map),
@@ -949,9 +949,9 @@ static py::dict FteSplitQueueResultToDict(const duckdb::distributed::FteSplitQue
 	out["state"] = duckdb::distributed::FteSplitQueueGetResultName(result.state);
 	if (result.HasSplit()) {
 		switch (result.input.kind) {
-		case duckdb::distributed::TaskInput::Kind::ScanTask:
-			out["kind"] = "scan_task";
-			out["data"] = py::bytes(result.input.scan_task_bytes);
+		case duckdb::distributed::TaskInput::Kind::ScanSplitBatch:
+			out["kind"] = "scan_split_batch";
+			out["data"] = py::bytes(result.input.scan_split_batch_bytes);
 			break;
 		case duckdb::distributed::TaskInput::Kind::ExchangeSourceTask:
 			out["kind"] = "exchange_source_task";
@@ -995,7 +995,8 @@ struct CopyOutputInfo {
 
 /// Worker-side: generate a unique output directory and set copy.file_path.
 /// Called once per task execution. Each call generates a fresh UUID-based dir
-/// so merged tasks (multiple scan files) still produce a unique output location.
+/// so task attempts assigned multiple scan splits still produce one unique
+/// output location.
 static void ApplyTaskLocalCopyOutput(duckdb::PhysicalPlan &plan, const CopyOutputInfo *info,
                                      duckdb::ClientContext *client_context) {
 	if (!plan.HasRoot()) {

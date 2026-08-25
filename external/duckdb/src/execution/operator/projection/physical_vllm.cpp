@@ -219,9 +219,10 @@ struct VLLMGlobalOperatorState : public GlobalOperatorState {
 		if (executor) {
 			return;
 		}
-		auto factory = GetVLLMExecutorFactory();
+		auto engine = GetInferenceEngineName(options);
+		auto factory = GetEngineExecutorFactory(engine);
 		if (!factory) {
-			throw InvalidInputException("vllm executor is not available in this build");
+			throw InvalidInputException("no executor factory registered for inference engine '" + engine + "'");
 		}
 		auto exec = factory(context.client, model, options, config);
 		if (!exec) {

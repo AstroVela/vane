@@ -21,13 +21,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from vane._native import ray_cxx
+from vane.runners.exchange_sink import bind_exchange_sink_instance, normalize_exchange_sink_config
 from vane.runners.fte.backend import TaskResultPoll, TaskResultState
 from vane.runners.fte.dynamic_inputs import (
     prepare_fte_dynamic_inputs,
+    split_scan_split_batch,
     strip_fte_dynamic_context,
 )
 from vane.runners.fte.fte_config import FTE_WORKER_RUNTIME, FteWorkerAdmissionConfig
-from vane.runners.fte.fte_exchange import derive_exchange_sink_instance_for_attempt
 from vane.runners.fte.fte_failures import _failure_payload, _normalize_failure_payload
 from vane.runners.fte.fte_state import FteTaskState
 from vane.runners.fte.fte_types import (
@@ -55,20 +56,6 @@ _FRAGMENT_STAT_KEYS = (
 
 _NATIVE_STABLE_TASK_IDENTITY_KEY = "_native_stable_task_identity_key"
 _NATIVE_STABLE_TASK_IDENTITY_MASK = (1 << 63) - 1
-
-
-def _stable_json_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return {"bytes": bytes(value).hex()}
-    if isinstance(value, Mapping):
-        return {
-            str(key): _stable_json_value(item) for key, item in sorted(value.items(), key=lambda entry: str(entry[0]))
-        }
-    if isinstance(value, Sequence):
-        return [_stable_json_value(item) for item in value]
-    raise TypeError(f"unsupported stable native FTE identity value: {type(value).__name__}")
 
 
 def _exchange_source_logical_identity(value: Any) -> dict[str, Any]:
@@ -120,28 +107,15 @@ def _stable_native_fte_task_identity(
             raise TypeError("native FTE task inputs must be mappings")
         kind = str(raw_entry.get("kind") or "")
         data = raw_entry.get("data")
-        if kind == "scan_task":
-            if isinstance(data, (bytes, bytearray, memoryview)):
-                import vane
-
-                source_task_partition_id = int(vane.ray_cxx.scan_task_source_partition_id(bytes(data)))
-                scan_descriptor_identity = hashlib.blake2b(bytes(data), digest_size=32).hexdigest()
-            elif isinstance(data, Mapping):
-                raw_source_task_partition_id = data.get("source_task_partition_id")
-                if raw_source_task_partition_id is None:
-                    raise ValueError("scan task is missing its stable source task partition identity")
-                source_task_partition_id = int(raw_source_task_partition_id)
-                scan_descriptor_identity = _stable_json_value(data)
-            else:
-                raise TypeError("native FTE scan task data must be serialized bytes or a mapping")
+        if kind == "scan_split_batch":
+            split_ids = sorted(split_id for split_id, _, _ in split_scan_split_batch(data))
+            if not split_ids:
+                raise ValueError("native FTE scan split batch contains no splits")
             logical_inputs.append(
                 [
                     str(node_id),
                     kind,
-                    {
-                        "source_task_partition_id": source_task_partition_id,
-                        "descriptor": scan_descriptor_identity,
-                    },
+                    {"split_ids": split_ids},
                 ]
             )
         elif kind == "exchange_source_task":
@@ -159,14 +133,14 @@ def _stable_native_fte_task_identity(
             stable_partition_id = task_context_info.get("task_id")
         lineage["source_free_task_id"] = int(stable_partition_id or 0)
     identity_key = json.dumps(
-        ["native-fte-logical-task-v1", lineage, logical_inputs],
+        ["native-fte-logical-task-v2", lineage, logical_inputs],
         sort_keys=True,
         separators=(",", ":"),
     )
     digest = hashlib.blake2b(
         identity_key.encode("utf-8"),
         digest_size=8,
-        person=b"vane-fte-task-v1",
+        person=b"vane-fte-task-v2",
     ).digest()
     identity = int.from_bytes(digest, "big") & _NATIVE_STABLE_TASK_IDENTITY_MASK
     return identity, identity_key
@@ -294,7 +268,7 @@ def _native_pending_status_fields(
             "request_source_node_ids": request.get("source_node_ids"),
             "request_dynamic_scan_source_node_ids": request.get("dynamic_scan_source_node_ids"),
             "request_dynamic_exchange_source_node_ids": request.get("dynamic_exchange_source_node_ids"),
-            "context_scan_task_nodes": _debug_context_field(request, "scan_task_nodes"),
+            "context_scan_split_batch_nodes": _debug_context_field(request, "scan_split_batch_nodes"),
             "context_exchange_source_task_nodes": _debug_context_field(request, "exchange_source_task_nodes"),
             "no_more_splits": status.get("no_more_splits"),
             "submitted_split_count_by_source": _debug_status_field(status, "submitted_split_count_by_source"),
@@ -1137,12 +1111,12 @@ class _NativeFteProgressRegistry:
         source_ids = set(fragment.source_node_ids)
         source_ids.update(dynamic_scan_sources)
         source_ids.update(dynamic_exchange_sources)
-        source_ids.update(NativeFteWorkerManagerBackend._context_source_ids(request, "scan_task_nodes"))
+        source_ids.update(NativeFteWorkerManagerBackend._context_source_ids(request, "scan_split_batch_nodes"))
         source_ids.update(NativeFteWorkerManagerBackend._context_source_ids(request, "exchange_source_task_nodes"))
         fragment.source_node_ids = source_ids
         fragment.dynamic_scan_source_node_ids.update(dynamic_scan_sources)
         fragment.dynamic_scan_source_node_ids.update(
-            NativeFteWorkerManagerBackend._context_source_ids(request, "scan_task_nodes")
+            NativeFteWorkerManagerBackend._context_source_ids(request, "scan_split_batch_nodes")
         )
         fragment.dynamic_exchange_source_node_ids.update(dynamic_exchange_sources)
         fragment.dynamic_exchange_source_node_ids.update(
@@ -2216,8 +2190,8 @@ class NativeFteWorkerManagerBackend:
             source_node_id = str(node_id)
             kind = str(entry.get("kind") or "")
             data = entry.get("data")
-            if kind == "scan_task":
-                context[f"scan_task:{source_node_id}"] = data
+            if kind == "scan_split_batch":
+                context[f"scan_split_batch:{source_node_id}"] = data
             elif kind == "exchange_source_task":
                 context[f"exchange_source_task:{source_node_id}"] = data
             else:
@@ -2225,48 +2199,19 @@ class NativeFteWorkerManagerBackend:
 
         exchange_sink_instance = None
         stable_task_identity_key = None
-        exchange_sink_instance_fn = getattr(task, "exchange_sink_instance", None)
-        if callable(exchange_sink_instance_fn):
-            exchange_sink_instance = exchange_sink_instance_fn()
-            if exchange_sink_instance is not None:
-                try:
-                    exchange_sink_instance = dict(exchange_sink_instance)
-                except (TypeError, ValueError):
-                    pass
-                preserve_plan_sink_partition = str(
-                    context.get("preserve_plan_exchange_sink_instance") or ""
-                ).strip().lower() not in ("", "0", "false", "no", "off")
-                if preserve_plan_sink_partition and isinstance(exchange_sink_instance, Mapping):
-                    exchange_sink_instance = dict(exchange_sink_instance)
-                    # The inherited context can describe an upstream plan sink.
-                    # An appended materialized-coordinator sink carries its own
-                    # explicit FTE-derived identity policy.
-                    if not bool(exchange_sink_instance.get("fte_task_identity")):
-                        exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
-                stable_task_identity = None
-                runtime_task_partition_id = partition_id
-                preserve_plan_sink_identity = isinstance(exchange_sink_instance, Mapping) and bool(
-                    exchange_sink_instance.get("preserve_plan_exchange_sink_instance")
-                )
-                if isinstance(exchange_sink_instance, Mapping) and not preserve_plan_sink_identity:
-                    stable_task_identity, stable_task_identity_key = _stable_native_fte_task_identity(
-                        task_inputs,
-                        task_context_info,
-                        context,
-                    )
-                    runtime_task_partition_id = stable_task_identity
-                exchange_sink_instance = derive_exchange_sink_instance_for_attempt(
-                    exchange_sink_instance,
-                    attempt_id,
-                    task_partition_id=runtime_task_partition_id,
-                    fragment_execution_id=fragment_execution_id,
-                    stable_task_identity=(
-                        stable_task_identity
-                        if isinstance(exchange_sink_instance, Mapping)
-                        and bool(exchange_sink_instance.get("fte_task_identity"))
-                        else None
-                    ),
-                )
+        exchange_sink_config = task.exchange_sink_config()
+        if exchange_sink_config is not None:
+            exchange_sink_config = normalize_exchange_sink_config(exchange_sink_config)
+            scheduler_task_partition_id, stable_task_identity_key = _stable_native_fte_task_identity(
+                task_inputs,
+                task_context_info,
+                context,
+            )
+            exchange_sink_instance = bind_exchange_sink_instance(
+                exchange_sink_config,
+                attempt_id=attempt_id,
+                task_partition_id=scheduler_task_partition_id,
+            )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")
         node_id = str(context.get("node_id") or task_context_info.get("last_node_id") or partition_id)
@@ -2328,7 +2273,10 @@ class NativeFteWorkerManagerBackend:
             exchange_sink_instance = request.get("exchange_sink_instance")
             if not isinstance(exchange_sink_instance, Mapping):
                 raise ValueError("stable native FTE task identity requires an exchange sink instance")
-            stable_identity = exchange_sink_instance.get("task_partition_id")
+            sink_handle = exchange_sink_instance.get("sink_handle")
+            if not isinstance(sink_handle, Mapping):
+                raise ValueError("stable native FTE task identity requires an exchange sink handle")
+            stable_identity = sink_handle.get("task_partition_id")
             if stable_identity is None:
                 raise ValueError("stable native FTE task identity was not bound to the exchange sink")
             pending.append((query_id, int(stable_identity), str(identity_key)))
@@ -2350,12 +2298,12 @@ class NativeFteWorkerManagerBackend:
 
     @staticmethod
     def materialize_task_context(
-        request: Mapping[str, Any], *, merge_scan_task_descriptors: Callable[[list[Any]], Any]
+        request: Mapping[str, Any], *, merge_scan_split_batches: Callable[[list[Any]], Any]
     ) -> dict[str, Any]:
         return materialize_task_inputs(
             request.get("context"),
             request.get("initial_splits"),
-            merge_scan_task_descriptors=merge_scan_task_descriptors,
+            merge_scan_split_batches=merge_scan_split_batches,
         )
 
     @staticmethod

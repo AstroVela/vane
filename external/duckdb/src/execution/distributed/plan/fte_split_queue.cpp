@@ -12,7 +12,7 @@
 
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/distributed/plan/exchange_source_task.hpp"
-#include "duckdb/execution/distributed/plan/scan_task.hpp"
+#include "duckdb/execution/distributed/plan/scan_split.hpp"
 #include "duckdb/execution/physical_plan.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/parallel/interrupt.hpp"
@@ -53,8 +53,8 @@ idx_t SaturatingMicroseconds(std::chrono::steady_clock::duration duration) {
 
 idx_t TaskInputBufferedBytes(const TaskInput &input) {
 	switch (input.kind) {
-	case TaskInput::Kind::ScanTask:
-		return input.scan_task_bytes.size();
+	case TaskInput::Kind::ScanSplitBatch:
+		return input.scan_split_batch_bytes.size();
 	case TaskInput::Kind::ExchangeSourceTask:
 		return input.exchange_source_task_bytes.size();
 	default:
@@ -66,10 +66,10 @@ TaskInputProgressStats TaskInputProgress(const TaskInput &input) {
 	TaskInputProgressStats stats;
 	try {
 		switch (input.kind) {
-		case TaskInput::Kind::ScanTask: {
-			auto descriptor = ScanTaskDescriptor::DeserializeFromBytes(input.scan_task_bytes);
-			stats.rows = descriptor.estimated_cardinality;
-			stats.bytes = descriptor.estimated_bytes;
+		case TaskInput::Kind::ScanSplitBatch: {
+			auto batch = ScanSplitBatch::DeserializeFromBytes(input.scan_split_batch_bytes);
+			stats.rows = batch.EstimatedCardinality();
+			stats.bytes = batch.EstimatedBytes();
 			break;
 		}
 		case TaskInput::Kind::ExchangeSourceTask: {

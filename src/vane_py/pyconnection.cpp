@@ -32,6 +32,7 @@
 #include "duckdb/main/relation/read_json_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/view_relation.hpp"
+#include "duckdb/planner/operator/logical_data_sink.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
@@ -844,7 +845,19 @@ void DuckDBPyConnection::RegisterFilesystem(AbstractFileSystem filesystem) {
 		}
 	}
 
-	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem)));
+	// fsspec does not expose a general capability that distinguishes concrete
+	// directories from object-store prefixes. Its LocalFileSystem hierarchy has
+	// concrete directory semantics; other hierarchical implementations can opt
+	// in explicitly without relying on protocol-name heuristics.
+	bool directory_semantics;
+	if (py::hasattr(filesystem, "vane_directory_semantics")) {
+		directory_semantics = py::bool_(filesystem.attr("vane_directory_semantics"));
+	} else {
+		auto local_filesystem = py::module::import("fsspec.implementations.local").attr("LocalFileSystem");
+		directory_semantics = py::isinstance(filesystem, local_filesystem);
+	}
+
+	fs.RegisterSubSystem(make_uniq<PythonFilesystem>(std::move(protocols), std::move(filesystem), directory_semantics));
 }
 
 py::list DuckDBPyConnection::ListFilesystems() {
@@ -3124,6 +3137,7 @@ static shared_ptr<DuckDBPyConnection> ConnectInternal(const py::object &database
 	}
 
 	DBConfig config(read_only);
+	OperatorExtension::Register(config, make_shared_ptr<DataSinkOperatorExtension>());
 	config.AddExtensionOption("pandas_analyze_sample",
 	                          "The maximum number of rows to sample when analyzing a pandas object column.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(1000));

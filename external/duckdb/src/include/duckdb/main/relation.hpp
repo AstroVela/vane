@@ -192,10 +192,14 @@ public:
 	//! Create a table and insert the data from this relation into that table
 	DUCKDB_API shared_ptr<Relation> CreateRel(const string &schema_name, const string &table_name,
 	                                          bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
+	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
+	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
 	DUCKDB_API shared_ptr<Relation> CreateRel(const string &catalog_name, const string &schema_name,
 	                                          const string &table_name, bool temporary = false,
-	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
+	                                          OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT,
+	                                          case_insensitive_map_t<unique_ptr<ParsedExpression>> options = {},
+	                                          vector<unique_ptr<ParsedExpression>> partition_keys = {});
 	DUCKDB_API void Create(const string &table_name, bool temporary = false,
 	                       OnCreateConflict on_conflict = OnCreateConflict::ERROR_ON_CONFLICT);
 	DUCKDB_API void Create(const string &schema_name, const string &table_name, bool temporary = false,
@@ -216,6 +220,12 @@ public:
 	DUCKDB_API void
 	WriteParquet(const string &parquet_file,
 	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	//! Write a relation through any registered COPY TO format
+	DUCKDB_API shared_ptr<Relation>
+	WriteFileRel(const string &file_path, const string &format,
+	             case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
+	DUCKDB_API void WriteFile(const string &file_path, const string &format,
+	                          case_insensitive_map_t<vector<Value>> options = case_insensitive_map_t<vector<Value>>());
 
 	//! Update a table, can only be used on a TableRelation
 	DUCKDB_API virtual void Update(const string &update, const string &condition = string());
@@ -302,6 +312,7 @@ protected:
 	}
 
 private:
+	friend class Binder;
 	friend class ClientContext;
 	friend class DuckDBPyRelation;
 	friend class RelationStatement;

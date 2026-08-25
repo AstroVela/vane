@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "worker_manager.hpp"
+#include "bounded_diagnostics.hpp"
 #include <pybind11/pybind11.h>
 #include <algorithm>
 #include <cmath>
@@ -23,7 +24,7 @@ static constexpr auto REFRESH_INTERVAL = std::chrono::seconds(5);
 
 RayWorkerManager::RayWorkerManager(QueryCleanup query_cleanup)
     : manager_instance_id_(duckdb::UUID::ToString(duckdb::UUID::GenerateRandomUUID())),
-      query_cleanup_(std::move(query_cleanup)) {
+      query_cleanup_(std::move(query_cleanup)), query_lifecycles_("Ray worker manager") {
 }
 
 static std::vector<std::string> AbortWorkers(const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers) {
@@ -43,17 +44,14 @@ static std::vector<std::string> AbortWorkers(const std::vector<std::shared_ptr<R
 	return errors;
 }
 
-static bool IsUnselectedFteHandle(const RayWorkerRuntime::TaskResultHandleType &handle,
-                                  const RayWorkerRuntime::QueryStatus *finished_status) {
-	if (!finished_status || finished_status->selected_attempt_task_ids.empty()) {
-		return false;
+static std::string ExceptionMessage(const std::exception_ptr &error) {
+	try {
+		std::rethrow_exception(error);
+	} catch (const std::exception &ex) {
+		return ex.what();
+	} catch (...) {
+		return "unknown exception";
 	}
-	const auto &fte_task_id = handle.GetFteTaskId();
-	if (fte_task_id.empty()) {
-		return false;
-	}
-	return finished_status->selected_attempt_task_ids.find(fte_task_id) ==
-	       finished_status->selected_attempt_task_ids.end();
 }
 
 bool RayWorkerManager::BeginOperation() const {
@@ -74,60 +72,13 @@ void RayWorkerManager::EndOperation() const {
 	shutdown_cv_.notify_all();
 }
 
-std::optional<std::string> RayWorkerManager::BeginQueryOperation(const string &query_id,
-                                                                 const string &requested_owner_query_id) {
-	if (query_id.empty()) {
-		throw std::invalid_argument("FTE query operation requires non-empty query_id");
-	}
-	lock_guard<mutex> guard(mutex_);
-	if (state_.shutdown_started) {
-		return std::nullopt;
-	}
-	auto existing_owner = state_.query_owner_by_query.find(query_id);
-	if (existing_owner == state_.query_owner_by_query.end() && requested_owner_query_id.empty()) {
-		return std::nullopt;
-	}
-	const auto owner_query_id = requested_owner_query_id.empty() ? existing_owner->second : requested_owner_query_id;
-	if (owner_query_id.empty()) {
-		throw std::invalid_argument("FTE query operation requires non-empty resource_query_id");
-	}
-	if (existing_owner != state_.query_owner_by_query.end() && existing_owner->second != owner_query_id) {
-		throw std::runtime_error("FTE query owner changed while active: query=" + query_id +
-		                         " existing=" + existing_owner->second + " requested=" + owner_query_id);
-	}
-	auto owner_entry = state_.query_owner_by_query.find(owner_query_id);
-	if (owner_entry != state_.query_owner_by_query.end() && owner_entry->second != owner_query_id) {
-		throw std::runtime_error("FTE resource query is already owned by another query: " + owner_query_id);
-	}
-	if (state_.closed_query_owners.find(owner_query_id) != state_.closed_query_owners.end() ||
-	    state_.quiescing_query_owners.find(owner_query_id) != state_.quiescing_query_owners.end()) {
-		return std::nullopt;
-	}
-	state_.query_owner_by_query[owner_query_id] = owner_query_id;
-	state_.query_owner_by_query[query_id] = owner_query_id;
-	state_.active_query_operations_by_owner[owner_query_id]++;
-	return owner_query_id;
+std::optional<QueryLifecycleCoordinator::Operation>
+RayWorkerManager::BeginQueryOperation(const string &query_id, const string &requested_owner_query_id) {
+	return query_lifecycles_.BeginOperation(query_id, requested_owner_query_id, !requested_owner_query_id.empty());
 }
 
-void RayWorkerManager::EndQueryOperation(const string &owner_query_id) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto active = state_.active_query_operations_by_owner.find(owner_query_id);
-		D_ASSERT(active != state_.active_query_operations_by_owner.end());
-		D_ASSERT(active->second > 0);
-		if (--active->second == 0) {
-			state_.active_query_operations_by_owner.erase(active);
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-void RayWorkerManager::CloseQueryOwnerIngress(const string &owner_query_id) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		state_.closed_query_owners.insert(owner_query_id);
-	}
-	shutdown_cv_.notify_all();
+void RayWorkerManager::EndQueryOperation(const QueryLifecycleCoordinator::Operation &operation) {
+	query_lifecycles_.EndOperation(operation);
 }
 
 void RayWorkerManager::register_query_owner(const string &query_id, const string &owner_query_id) {
@@ -135,27 +86,16 @@ void RayWorkerManager::register_query_owner(const string &query_id, const string
 	if (!operation) {
 		throw std::runtime_error("cannot register FTE query ownership after Ray worker manager shutdown");
 	}
-	QueryOperationGuard query_operation(*this, query_id, owner_query_id);
-	if (!query_operation) {
-		throw std::runtime_error("cannot register closing FTE query lifecycle: " + query_id);
-	}
+	query_lifecycles_.RegisterImmediate(query_id, owner_query_id);
 }
 
-void RayWorkerManager::WaitForQueryOperationsWithoutGIL(const string &owner_query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	shutdown_cv_.wait(guard, [&]() {
-		return state_.active_query_operations_by_owner.find(owner_query_id) ==
-		       state_.active_query_operations_by_owner.end();
-	});
-}
-
-void RayWorkerManager::WaitForQueryOperations(const string &owner_query_id) {
+void RayWorkerManager::WaitForQueryOperations(const QueryLifecycleCoordinator::LifecycleRef &lifecycle) {
 	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 		py::gil_scoped_release release;
-		WaitForQueryOperationsWithoutGIL(owner_query_id);
+		query_lifecycles_.WaitForOperations(lifecycle);
 		return;
 	}
-	WaitForQueryOperationsWithoutGIL(owner_query_id);
+	query_lifecycles_.WaitForOperations(lifecycle);
 }
 
 void RayWorkerManager::RecordQueryWorkers(const string &owner_query_id,
@@ -169,66 +109,34 @@ void RayWorkerManager::RecordQueryWorkers(const string &owner_query_id,
 		owned_workers.push_back(worker);
 	}
 }
+std::optional<QueryLifecycleCoordinator::Abort> RayWorkerManager::BeginQueryAbort(const string &query_id) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginAbort(query_id);
+	}
+	return query_lifecycles_.BeginAbort(query_id);
+}
 
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbortWithoutGIL(const string &query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	auto mapped_owner = state_.query_owner_by_query.find(query_id);
-	if (mapped_owner == state_.query_owner_by_query.end()) {
-		return std::nullopt;
+std::optional<QueryLifecycleCoordinator::Abort>
+RayWorkerManager::BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginAbort(teardown);
 	}
-	const auto owner_query_id = mapped_owner->second;
-	while (true) {
-		auto active_abort = state_.quiescing_query_owners.find(owner_query_id);
-		if (active_abort == state_.quiescing_query_owners.end()) {
-			break;
-		}
-		const auto active_token = active_abort->second;
-		state_.quiesce_waiters_by_owner[owner_query_id]++;
-		shutdown_cv_.wait(guard, [&]() {
-			auto current = state_.quiescing_query_owners.find(owner_query_id);
-			return current == state_.quiescing_query_owners.end() || current->second != active_token;
-		});
-		auto waiter = state_.quiesce_waiters_by_owner.find(owner_query_id);
-		D_ASSERT(waiter != state_.quiesce_waiters_by_owner.end());
-		D_ASSERT(waiter->second > 0);
-		if (--waiter->second == 0) {
-			state_.quiesce_waiters_by_owner.erase(waiter);
-		}
-		shutdown_cv_.notify_all();
-		if (state_.quiesced_query_owners.find(owner_query_id) != state_.quiesced_query_owners.end()) {
-			return std::nullopt;
-		}
-	}
-	if (state_.quiesced_query_owners.find(owner_query_id) != state_.quiesced_query_owners.end()) {
-		return std::nullopt;
-	}
-	if (state_.shutdown_started) {
-		throw std::runtime_error("cannot abort FTE query while Ray worker manager is shutting down: " + query_id);
-	}
-	state_.closed_query_owners.insert(owner_query_id);
-	const auto token = state_.next_query_quiesce_token++;
-	if (state_.next_query_quiesce_token == 0) {
-		state_.next_query_quiesce_token = 1;
-	}
-	state_.quiescing_query_owners[owner_query_id] = token;
-	const bool had_active_operations =
-	    state_.active_query_operations_by_owner.find(owner_query_id) != state_.active_query_operations_by_owner.end();
+	return query_lifecycles_.BeginAbort(teardown);
+}
 
-	std::unordered_set<string> query_ids {owner_query_id};
-	for (const auto &entry : state_.query_owner_by_query) {
-		if (entry.second == owner_query_id) {
-			query_ids.insert(entry.first);
-		}
+std::optional<QueryLifecycleCoordinator::Teardown> RayWorkerManager::BeginQueryTeardown(const string &query_id) {
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		return query_lifecycles_.BeginTeardown(query_id);
 	}
-	std::vector<string> ordered_query_ids(query_ids.begin(), query_ids.end());
-	std::sort(ordered_query_ids.begin(), ordered_query_ids.end(), [&](const string &lhs, const string &rhs) {
-		if ((lhs == owner_query_id) != (rhs == owner_query_id)) {
-			return lhs != owner_query_id;
-		}
-		return lhs < rhs;
-	});
+	return query_lifecycles_.BeginTeardown(query_id);
+}
 
+std::vector<std::shared_ptr<RayWorkerRuntime>> RayWorkerManager::QueryWorkers(const string &owner_query_id) const {
 	std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
+	lock_guard<mutex> guard(mutex_);
 	auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
 		if (worker && std::find(workers.begin(), workers.end(), worker) == workers.end()) {
 			workers.push_back(worker);
@@ -243,145 +151,7 @@ std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbortWit
 	for (const auto &entry : state_.ray_workers) {
 		add_worker(entry.second);
 	}
-	return QueryAbort {owner_query_id, std::move(ordered_query_ids), std::move(workers), token, had_active_operations};
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryAbort(const string &query_id) {
-	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
-		py::gil_scoped_release release;
-		return BeginQueryAbortWithoutGIL(query_id);
-	}
-	return BeginQueryAbortWithoutGIL(query_id);
-}
-
-void RayWorkerManager::EndQueryAbort(const string &owner_query_id, uint64_t token, bool succeeded) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto current = state_.quiescing_query_owners.find(owner_query_id);
-		if (current != state_.quiescing_query_owners.end() && current->second == token) {
-			state_.quiescing_query_owners.erase(current);
-			if (succeeded) {
-				state_.quiesced_query_owners.insert(owner_query_id);
-			}
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryDropWithoutGIL(const string &query_id) {
-	std::unique_lock<mutex> guard(mutex_);
-	while (true) {
-		auto mapped_owner = state_.query_owner_by_query.find(query_id);
-		if (mapped_owner == state_.query_owner_by_query.end()) {
-			return std::nullopt;
-		}
-		const auto owner_query_id = mapped_owner->second;
-		shutdown_cv_.wait(guard, [&]() {
-			return state_.quiesce_waiters_by_owner.find(owner_query_id) == state_.quiesce_waiters_by_owner.end();
-		});
-		auto active_drop = state_.dropping_query_owners.find(owner_query_id);
-		if (active_drop != state_.dropping_query_owners.end()) {
-			const auto active_token = active_drop->second;
-			shutdown_cv_.wait(guard, [&]() {
-				auto current = state_.dropping_query_owners.find(owner_query_id);
-				return current == state_.dropping_query_owners.end() || current->second != active_token;
-			});
-			continue;
-		}
-		if (state_.shutdown_started) {
-			throw std::runtime_error("cannot drop FTE query while Ray worker manager is shutting down: " + query_id);
-		}
-		if (state_.quiesced_query_owners.find(owner_query_id) == state_.quiesced_query_owners.end()) {
-			throw std::runtime_error("cannot drop FTE query before its abort barrier: " + query_id);
-		}
-		const auto token = state_.next_query_drop_token++;
-		if (state_.next_query_drop_token == 0) {
-			state_.next_query_drop_token = 1;
-		}
-		state_.dropping_query_owners[owner_query_id] = token;
-
-		std::unordered_set<string> query_ids {owner_query_id};
-		for (const auto &entry : state_.query_owner_by_query) {
-			if (entry.second == owner_query_id) {
-				query_ids.insert(entry.first);
-			}
-		}
-		std::vector<string> ordered_query_ids(query_ids.begin(), query_ids.end());
-		std::sort(ordered_query_ids.begin(), ordered_query_ids.end(), [&](const string &lhs, const string &rhs) {
-			if ((lhs == owner_query_id) != (rhs == owner_query_id)) {
-				return lhs != owner_query_id;
-			}
-			return lhs < rhs;
-		});
-
-		std::vector<std::shared_ptr<RayWorkerRuntime>> workers;
-		auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
-			if (worker && std::find(workers.begin(), workers.end(), worker) == workers.end()) {
-				workers.push_back(worker);
-			}
-		};
-		auto owned_workers = state_.workers_by_query_owner.find(owner_query_id);
-		if (owned_workers != state_.workers_by_query_owner.end()) {
-			for (const auto &worker : owned_workers->second) {
-				add_worker(worker);
-			}
-		}
-		for (const auto &entry : state_.ray_workers) {
-			add_worker(entry.second);
-		}
-		return QueryAbort {owner_query_id, std::move(ordered_query_ids), std::move(workers), token, false};
-	}
-}
-
-std::optional<RayWorkerManager::QueryAbort> RayWorkerManager::BeginQueryDrop(const string &query_id) {
-	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
-		py::gil_scoped_release release;
-		return BeginQueryDropWithoutGIL(query_id);
-	}
-	return BeginQueryDropWithoutGIL(query_id);
-}
-
-void RayWorkerManager::EndQueryDrop(const string &owner_query_id, uint64_t token) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto current = state_.dropping_query_owners.find(owner_query_id);
-		if (current != state_.dropping_query_owners.end() && current->second == token) {
-			state_.dropping_query_owners.erase(current);
-		}
-	}
-	shutdown_cv_.notify_all();
-}
-
-void RayWorkerManager::FinishQueryLifecycle(const string &owner_query_id, uint64_t drop_token) {
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto active_drop = state_.dropping_query_owners.find(owner_query_id);
-		if (active_drop == state_.dropping_query_owners.end() || active_drop->second != drop_token) {
-			throw std::runtime_error("cannot finish stale FTE query drop: " + owner_query_id);
-		}
-		if (state_.active_query_operations_by_owner.find(owner_query_id) !=
-		    state_.active_query_operations_by_owner.end()) {
-			throw std::runtime_error("cannot finish active FTE query lifecycle: " + owner_query_id);
-		}
-		if (state_.quiesced_query_owners.find(owner_query_id) == state_.quiesced_query_owners.end()) {
-			throw std::runtime_error("cannot finish FTE query lifecycle before quiescence: " + owner_query_id);
-		}
-		if (state_.quiesce_waiters_by_owner.find(owner_query_id) != state_.quiesce_waiters_by_owner.end()) {
-			throw std::runtime_error("cannot finish FTE query lifecycle with active abort waiters: " + owner_query_id);
-		}
-		for (auto entry = state_.query_owner_by_query.begin(); entry != state_.query_owner_by_query.end();) {
-			if (entry->second == owner_query_id) {
-				entry = state_.query_owner_by_query.erase(entry);
-			} else {
-				++entry;
-			}
-		}
-		state_.workers_by_query_owner.erase(owner_query_id);
-		state_.closed_query_owners.erase(owner_query_id);
-		state_.quiesced_query_owners.erase(owner_query_id);
-		state_.dropping_query_owners.erase(active_drop);
-	}
-	shutdown_cv_.notify_all();
+	return workers;
 }
 
 bool RayWorkerManager::ShutdownStarted() const {
@@ -457,10 +227,20 @@ void RayWorkerManager::StoreFteResultHandles(
 	if (query_id.empty() || handles.empty()) {
 		return;
 	}
+	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> live_handles;
+	live_handles.reserve(handles.size());
+	for (auto &handle : handles) {
+		if (handle) {
+			live_handles.push_back(std::move(handle));
+		}
+	}
+	if (live_handles.empty()) {
+		return;
+	}
 	lock_guard<mutex> guard(mutex_);
 	auto &stored = state_.fte_result_handles_by_query[query_id];
-	stored.reserve(stored.size() + handles.size());
-	for (auto &handle : handles) {
+	stored.reserve(stored.size() + live_handles.size());
+	for (auto &handle : live_handles) {
 		stored.push_back(std::move(handle));
 	}
 }
@@ -497,17 +277,17 @@ void RayWorkerManager::ClearFteResultHandles(const string &query_id) {
 			state_.retained_fte_result_handles_by_query.erase(retained_it);
 		}
 	}
-	std::vector<std::string> errors;
+	vane::BoundedErrorDetails errors;
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retry_handles;
 	auto release_all = [&](auto &owned_handles, const char *kind) {
 		for (size_t index = 0; index < owned_handles.size(); index++) {
 			try {
 				owned_handles[index]->ReleasePollResult();
 			} catch (const std::exception &ex) {
-				errors.push_back(std::string(kind) + "[" + std::to_string(index) + "]: " + ex.what());
+				errors.Add(std::string(kind) + "[" + std::to_string(index) + "]", ex.what());
 				retry_handles.push_back(std::move(owned_handles[index]));
 			} catch (...) {
-				errors.push_back(std::string(kind) + "[" + std::to_string(index) + "]: unknown release error");
+				errors.Add(std::string(kind) + "[" + std::to_string(index) + "]", "unknown release error");
 				retry_handles.push_back(std::move(owned_handles[index]));
 			}
 		}
@@ -515,12 +295,9 @@ void RayWorkerManager::ClearFteResultHandles(const string &query_id) {
 	release_all(handles, "pending");
 	release_all(retained_handles, "retained");
 	StoreFteResultHandles(query_id, std::move(retry_handles));
-	if (!errors.empty()) {
-		std::string message = "failed to release " + std::to_string(errors.size()) + " FTE result handle(s)";
-		for (const auto &error : errors) {
-			message += "; " + error;
-		}
-		throw std::runtime_error(message);
+	if (errors) {
+		throw std::runtime_error(
+		    errors.AppendTo("failed to release " + std::to_string(errors.Count()) + " FTE result handle(s)"));
 	}
 }
 
@@ -541,11 +318,53 @@ DuckDBResult<void> RayWorkerManager::CollectFteResultHandles(const string &query
 			for (auto &handle : handles) {
 				wrapped.push_back(make_uniq<RayWorkerRuntime::TaskResultHandleType>(std::move(handle)));
 			}
+			{
+				lock_guard<mutex> guard(mutex_);
+				auto &counts = state_.fte_result_handle_counts_by_query[query_id];
+				for (const auto &handle : wrapped) {
+					auto &count = counts[handle->GetFteTaskId()];
+					if (count < 2) {
+						count++;
+					}
+				}
+			}
 			StoreFteResultHandles(query_id, std::move(wrapped));
 		}
 	} catch (const std::exception &e) {
-		return DuckDBResult<void>::err(
-		    DuckDBError(string("Python error while collecting FTE result handles: ") + e.what()));
+		return DuckDBResult<void>::err(DuckDBError(
+		    vane::BoundedErrorDetails::FormatDetail("Python error while collecting FTE result handles", e.what())));
+	}
+	return DuckDBResult<void>::ok();
+}
+
+DuckDBResult<void>
+RayWorkerManager::ValidateFteResultHandleCoverage(const string &query_id,
+                                                  const std::unordered_set<string> &selected_attempt_task_ids) const {
+	size_t missing = 0;
+	size_t duplicate = 0;
+	{
+		lock_guard<mutex> guard(mutex_);
+		auto query_it = state_.fte_result_handle_counts_by_query.find(query_id);
+		for (const auto &task_id : selected_attempt_task_ids) {
+			size_t count = 0;
+			if (query_it != state_.fte_result_handle_counts_by_query.end()) {
+				auto task_it = query_it->second.find(task_id);
+				if (task_it != query_it->second.end()) {
+					count = task_it->second;
+				}
+			}
+			missing += count == 0 ? 1 : 0;
+			duplicate += count > 1 ? 1 : 0;
+		}
+	}
+	if (duplicate > 0) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+		    "FTE query returned multiple result handles for one selected attempt; duplicate selected attempt count=" +
+		    std::to_string(duplicate)));
+	}
+	if (missing > 0) {
+		return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
+		    "FTE query returned no result handle for " + std::to_string(missing) + " selected attempt(s)"));
 	}
 	return DuckDBResult<void>::ok();
 }
@@ -554,7 +373,7 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
     const string &query_id, double timeout_s, const RayWorkerRuntime::QueryStatus *finished_status,
     const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash>
         *task_context_filter,
-    bool release_payloads) {
+    bool release_payloads, duckdb::distributed::MaterializedOutputCallback on_output, bool selected_only) {
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> handles;
 	{
 		lock_guard<mutex> guard(mutex_);
@@ -585,6 +404,24 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 		}
 	}
+	if (selected_only) {
+		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> selected_handles;
+		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> pending_handles;
+		const auto *selected_attempts = finished_status ? &finished_status->selected_attempt_task_ids : nullptr;
+		selected_handles.reserve(handles.size());
+		pending_handles.reserve(handles.size());
+		for (auto &handle : handles) {
+			const auto &fte_task_id = handle->GetFteTaskId();
+			if (selected_attempts && !fte_task_id.empty() &&
+			    selected_attempts->find(fte_task_id) != selected_attempts->end()) {
+				selected_handles.push_back(std::move(handle));
+			} else {
+				pending_handles.push_back(std::move(handle));
+			}
+		}
+		StoreFteResultHandles(query_id, std::move(pending_handles));
+		handles = std::move(selected_handles);
+	}
 
 	struct DrainedOutput {
 		duckdb::distributed::TaskContext task_context;
@@ -597,33 +434,25 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	if (handles.empty()) {
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 	}
-	std::vector<bool> retain_payload_until_query_cleanup(handles.size(), false);
-	bool has_duplicate_task_context = false;
-	if (finished_status && !finished_status->selected_attempt_task_ids.empty()) {
-		std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> seen_contexts;
-		for (auto &handle : handles) {
-			if (!seen_contexts.insert(handle->GetTaskContext()).second) {
-				has_duplicate_task_context = true;
-				break;
-			}
-		}
-	}
-	if (has_duplicate_task_context && finished_status && !finished_status->selected_attempt_task_ids.empty()) {
+	if (!selected_only && finished_status && !finished_status->selected_attempt_task_ids.empty()) {
 		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> selected_handles;
 		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retry_handles;
-		std::vector<std::string> release_errors;
+		vane::BoundedErrorDetails release_errors;
 		selected_handles.reserve(handles.size());
 		for (size_t index = 0; index < handles.size(); index++) {
 			auto &handle = handles[index];
-			if (IsUnselectedFteHandle(*handle, finished_status)) {
+			const auto &fte_task_id = handle->GetFteTaskId();
+			if (finished_status->selected_attempt_task_ids.find(fte_task_id) ==
+			    finished_status->selected_attempt_task_ids.end()) {
 				try {
-					handle->AckPollResult();
+					// ACK transfers output-lease ownership to the consumer. A losing
+					// attempt has no consumer, so release its lease-owning handle directly.
 					handle->ReleasePollResult();
 				} catch (const std::exception &ex) {
-					release_errors.push_back("unselected[" + std::to_string(index) + "]: " + ex.what());
+					release_errors.Add("unselected[" + std::to_string(index) + "]", ex.what());
 					retry_handles.push_back(std::move(handle));
 				} catch (...) {
-					release_errors.push_back("unselected[" + std::to_string(index) + "]: unknown release error");
+					release_errors.Add("unselected[" + std::to_string(index) + "]", "unknown release error");
 					retry_handles.push_back(std::move(handle));
 				}
 				continue;
@@ -632,22 +461,56 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 		}
 		handles = std::move(selected_handles);
 		StoreFteResultHandles(query_id, std::move(retry_handles));
-		if (!release_errors.empty()) {
+		if (release_errors) {
 			StoreFteResultHandles(query_id, std::move(handles));
-			std::string message = "failed to release unselected FTE result handle(s)";
-			for (const auto &error : release_errors) {
-				message += "; " + error;
-			}
-			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-			    DuckDBError::external_error(message));
+			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(DuckDBError::external_error(
+			    release_errors.AppendTo("failed to release unselected FTE result handle(s)")));
 		}
 		if (handles.empty()) {
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 		}
 	}
+	const bool discard_unselected_outputs =
+	    !selected_only && finished_status && finished_status->selected_attempt_task_ids.empty();
+	if (on_output) {
+		std::stable_sort(handles.begin(), handles.end(), [](const auto &lhs, const auto &rhs) {
+			const auto lhs_context = lhs->GetTaskContext();
+			const auto rhs_context = rhs->GetTaskContext();
+			if (lhs_context.query_idx() != rhs_context.query_idx()) {
+				return lhs_context.query_idx() < rhs_context.query_idx();
+			}
+			if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
+				return lhs_context.last_node_id() < rhs_context.last_node_id();
+			}
+			if (lhs_context.task_id() != rhs_context.task_id()) {
+				return lhs_context.task_id() < rhs_context.task_id();
+			}
+			return lhs->GetFteTaskId() < rhs->GetFteTaskId();
+		});
+	}
 
+	std::vector<bool> retain_payload_until_query_cleanup(handles.size(), false);
 	std::vector<bool> finished(handles.size(), false);
 	size_t remaining = handles.size();
+	auto retain_finished_stream_handles = [&]() {
+		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> delivered_handles;
+		std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> pending_handles;
+		for (size_t index = 0; index < handles.size(); index++) {
+			if (!handles[index]) {
+				continue;
+			}
+			if (finished[index]) {
+				delivered_handles.push_back(std::move(handles[index]));
+			} else {
+				pending_handles.push_back(std::move(handles[index]));
+			}
+		}
+		// Once publication was attempted, retrying this wait must not invoke the
+		// callback again: validation or channel send may already have had effects.
+		// Keep finished handles cleanup-only while preserving later work normally.
+		RetainFteResultHandles(query_id, std::move(delivered_handles));
+		StoreFteResultHandles(query_id, std::move(pending_handles));
+	};
 	// Internal helper convention: negative timeout means no deadline; zero means poll once then time out.
 	const auto deadline = timeout_s >= 0.0 ? std::chrono::steady_clock::now() +
 	                                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -662,6 +525,9 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 			auto poll_res = handles[i]->poll();
 			if (!poll_res.first) {
+				if (on_output) {
+					break;
+				}
 				continue;
 			}
 
@@ -671,20 +537,58 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			auto task_context = handles[i]->GetTaskContext();
 			auto task_result = std::move(poll_res.second);
 			if (task_result.is_err()) {
-				if (IsUnselectedFteHandle(*handles[i], finished_status)) {
-					continue;
-				}
 				auto error = task_result.error();
 				StoreFteResultHandles(query_id, std::move(handles));
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(error);
 			}
 
 			auto maybe_output = std::move(task_result.value());
-			if (maybe_output.first) {
-				if (!release_payloads && !maybe_output.second.has_exchange_sink_instance()) {
+			if (maybe_output.first && !discard_unselected_outputs) {
+				if (!on_output && !release_payloads && !maybe_output.second.has_exchange_sink_instance()) {
 					retain_payload_until_query_cleanup[i] = true;
 				}
-				drained_outputs.push_back({task_context, output_ordinal++, std::move(maybe_output.second)});
+				if (on_output) {
+					try {
+						auto callback_res = on_output(maybe_output.second);
+						if (callback_res.is_err()) {
+							retain_finished_stream_handles();
+							return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+							    callback_res.error());
+						}
+					} catch (const std::exception &ex) {
+						retain_finished_stream_handles();
+						return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+						    DuckDBError::external_error(vane::BoundedErrorDetails::FormatDetail(
+						        "streaming FTE output callback threw", ex.what())));
+					} catch (...) {
+						retain_finished_stream_handles();
+						return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+						    DuckDBError::external_error("streaming FTE output callback threw an unknown exception"));
+					}
+				}
+				if (!on_output) {
+					drained_outputs.push_back({task_context, output_ordinal++, std::move(maybe_output.second)});
+				}
+			}
+			if (on_output && release_payloads) {
+				try {
+					// An empty final selection makes every drained handle a loser.
+					if (!discard_unselected_outputs) {
+						handles[i]->AckPollResult();
+					}
+					handles[i]->ReleasePollResult();
+					handles[i].reset();
+				} catch (const std::exception &ex) {
+					retain_finished_stream_handles();
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+					    DuckDBError::external_error(vane::BoundedErrorDetails::FormatDetail(
+					        "failed to finalize streamed FTE result handle[" + std::to_string(i) + "]", ex.what())));
+				} catch (...) {
+					retain_finished_stream_handles();
+					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+					    DuckDBError::external_error("failed to finalize streamed FTE result handle[" +
+					                                std::to_string(i) + "]: unknown error"));
+				}
 			}
 		}
 		if (remaining == 0) {
@@ -706,18 +610,24 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	}
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retained_handles;
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retry_handles;
-	std::vector<std::string> release_errors;
+	vane::BoundedErrorDetails release_errors;
 	for (size_t idx = 0; idx < handles.size(); idx++) {
+		if (!handles[idx]) {
+			continue;
+		}
 		auto &handle = handles[idx];
 		bool handle_failed = false;
-		try {
-			handle->AckPollResult();
-		} catch (const std::exception &ex) {
-			handle_failed = true;
-			release_errors.push_back("ack[" + std::to_string(idx) + "]: " + ex.what());
-		} catch (...) {
-			handle_failed = true;
-			release_errors.push_back("ack[" + std::to_string(idx) + "]: unknown error");
+		// Only selected results were handed downstream and may be acknowledged.
+		if (!discard_unselected_outputs) {
+			try {
+				handle->AckPollResult();
+			} catch (const std::exception &ex) {
+				handle_failed = true;
+				release_errors.Add("ack[" + std::to_string(idx) + "]", ex.what());
+			} catch (...) {
+				handle_failed = true;
+				release_errors.Add("ack[" + std::to_string(idx) + "]", "unknown error");
+			}
 		}
 		if (retain_payload_until_query_cleanup[idx]) {
 			if (handle_failed) {
@@ -730,10 +640,10 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 				handle->ReleasePollResult();
 			} catch (const std::exception &ex) {
 				handle_failed = true;
-				release_errors.push_back("release[" + std::to_string(idx) + "]: " + ex.what());
+				release_errors.Add("release[" + std::to_string(idx) + "]", ex.what());
 			} catch (...) {
 				handle_failed = true;
-				release_errors.push_back("release[" + std::to_string(idx) + "]: unknown error");
+				release_errors.Add("release[" + std::to_string(idx) + "]", "unknown error");
 			}
 			if (handle_failed) {
 				retry_handles.push_back(std::move(handle));
@@ -742,13 +652,9 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	}
 	RetainFteResultHandles(query_id, std::move(retained_handles));
 	StoreFteResultHandles(query_id, std::move(retry_handles));
-	if (!release_errors.empty()) {
-		std::string message = "failed to finalize FTE result handle(s)";
-		for (const auto &error : release_errors) {
-			message += "; " + error;
-		}
+	if (release_errors) {
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-		    DuckDBError::external_error(message));
+		    DuckDBError::external_error(release_errors.AppendTo("failed to finalize FTE result handle(s)")));
 	}
 	std::sort(drained_outputs.begin(), drained_outputs.end(), [](const DrainedOutput &lhs, const DrainedOutput &rhs) {
 		if (lhs.task_context.query_idx() != rhs.task_context.query_idx()) {
@@ -792,7 +698,7 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 		}
 		try {
 			auto fail_submission = [&](const DuckDBError &error) {
-				CloseQueryOwnerIngress(query_operation.owner_query_id());
+				query_lifecycles_.Close(query_operation.lifecycle());
 				return DuckDBResult<void>::err(error);
 			};
 			auto collect_workers = [&]() {
@@ -837,12 +743,12 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 		} catch (const py::error_already_set &e) {
 			// Publish the Python exception before the query operation is allowed
 			// to quiesce or shutdown to discard its owner state.
-			CloseQueryOwnerIngress(query_operation.owner_query_id());
+			query_lifecycles_.Close(query_operation.lifecycle());
 			submission_errors_.Store(query_operation.owner_query_id(), e);
 			return DuckDBResult<void>::err(
 			    DuckDBError(string("Python error during submit_fte_task_events: ") + e.what()));
 		} catch (const std::exception &e) {
-			CloseQueryOwnerIngress(query_operation.owner_query_id());
+			query_lifecycles_.Close(query_operation.lifecycle());
 			return DuckDBResult<void>::err(DuckDBError(string("submit_fte_task_events failed: ") + e.what()));
 		}
 	} catch (const py::error_already_set &e) {
@@ -853,14 +759,7 @@ DuckDBResult<void> RayWorkerManager::submit_fte_task_events(std::vector<duckdb::
 }
 
 void RayWorkerManager::rethrow_submission_error(const string &query_id, const string &details) {
-	string owner_query_id = query_id;
-	{
-		lock_guard<mutex> guard(mutex_);
-		auto owner = state_.query_owner_by_query.find(query_id);
-		if (owner != state_.query_owner_by_query.end()) {
-			owner_query_id = owner->second;
-		}
-	}
+	const auto owner_query_id = query_lifecycles_.OwnerForQuery(query_id);
 	auto message = string("distributed worker task submission failed for query_id=") + query_id;
 	if (!details.empty()) {
 		message += "; execution error: " + details;
@@ -1131,6 +1030,15 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 			return DuckDBResult<void>::ok();
 		}
 		state_.shutdown_started = true;
+	}
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		query_lifecycles_.BeginShutdown();
+	} else {
+		query_lifecycles_.BeginShutdown();
+	}
+	{
+		lock_guard<mutex> guard(mutex_);
 		workers.reserve(state_.ray_workers.size());
 		for (auto &kv : state_.ray_workers) {
 			workers.push_back(kv.second);
@@ -1178,26 +1086,23 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 	decltype(state_.fte_result_handles_by_query) result_handles;
 	decltype(state_.retained_fte_result_handles_by_query) retained_result_handles;
 	decltype(state_.workers_by_query_owner) query_workers;
-	std::unordered_set<string> owner_query_ids;
 	{
 		std::unique_lock<mutex> guard(mutex_);
 		shutdown_cv_.wait(guard, [&]() { return state_.active_operations == 0; });
-		for (const auto &entry : state_.query_owner_by_query) {
-			owner_query_ids.insert(entry.second);
-		}
 		state_.ray_workers.clear();
 		result_handles = std::move(state_.fte_result_handles_by_query);
 		retained_result_handles = std::move(state_.retained_fte_result_handles_by_query);
+		state_.fte_result_handle_counts_by_query.clear();
 		query_workers = std::move(state_.workers_by_query_owner);
-		state_.query_owner_by_query.clear();
-		state_.active_query_operations_by_owner.clear();
-		state_.closed_query_owners.clear();
-		state_.quiesced_query_owners.clear();
-		state_.quiescing_query_owners.clear();
-		state_.quiesce_waiters_by_owner.clear();
-		state_.dropping_query_owners.clear();
 		state_.last_refresh = {};
 	}
+	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
+		py::gil_scoped_release release;
+		query_lifecycles_.WaitForAllOperations();
+	} else {
+		query_lifecycles_.WaitForAllOperations();
+	}
+	const auto owner_query_ids = query_lifecycles_.OwnerQueryIds();
 	result_handles.clear();
 	retained_result_handles.clear();
 	query_workers.clear();
@@ -1212,6 +1117,27 @@ DuckDBResult<void> RayWorkerManager::shutdown() {
 			}
 		}
 		submission_errors_.Discard(owner_query_id);
+	}
+	try {
+		query_lifecycles_.FinishShutdown(true);
+	} catch (const std::exception &ex) {
+		errors.push_back(string("query lifecycle shutdown: ") + ex.what());
+		try {
+			query_lifecycles_.FinishShutdown(false);
+		} catch (const std::exception &finish_ex) {
+			errors.push_back(string("query lifecycle shutdown recovery: ") + finish_ex.what());
+		} catch (...) {
+			errors.push_back("query lifecycle shutdown recovery: unknown error");
+		}
+	} catch (...) {
+		errors.push_back("query lifecycle shutdown: unknown error");
+		try {
+			query_lifecycles_.FinishShutdown(false);
+		} catch (const std::exception &finish_ex) {
+			errors.push_back(string("query lifecycle shutdown recovery: ") + finish_ex.what());
+		} catch (...) {
+			errors.push_back("query lifecycle shutdown recovery: unknown error");
+		}
 	}
 	std::string error_message;
 	if (!errors.empty()) {
@@ -1269,6 +1195,68 @@ DuckDBResult<void> RayWorkerManager::close_session(const string &session_id) {
 	return DuckDBResult<void>::ok();
 }
 
+DuckDBResult<void> RayWorkerManager::ExecuteQueryAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort) {
+	if (!active_abort) {
+		return DuckDBResult<void>::ok();
+	}
+
+	std::optional<string> failure;
+	try {
+		std::vector<string> errors;
+		auto prepare_workers = [&]() {
+			const auto workers = QueryWorkers(active_abort->lifecycle.owner_query_id);
+			for (const auto &execution_query_id : active_abort->execution_query_ids) {
+				for (const auto &worker : workers) {
+					const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
+					try {
+						worker->PrepareDropQuery(execution_query_id);
+					} catch (const std::exception &ex) {
+						errors.push_back(execution_query_id + "@" + worker_id + ": " + ex.what());
+					} catch (...) {
+						errors.push_back(execution_query_id + "@" + worker_id + ": unknown abort error");
+					}
+				}
+			}
+		};
+		prepare_workers();
+		if (errors.empty()) {
+			WaitForQueryOperations(active_abort->lifecycle);
+			if (active_abort->had_active_operations) {
+				prepare_workers();
+			}
+		}
+		if (!errors.empty()) {
+			failure = "resource query abort barrier failed with " + std::to_string(errors.size()) + " error(s)";
+			for (const auto &error : errors) {
+				*failure += "; " + error;
+			}
+		}
+	} catch (const std::exception &ex) {
+		failure = string("resource query abort orchestration failed: ") + ex.what();
+	} catch (...) {
+		failure = "resource query abort orchestration failed: unknown error";
+	}
+	try {
+		query_lifecycles_.CompleteAbort(*active_abort, failure);
+	} catch (const std::exception &ex) {
+		if (failure) {
+			*failure += "; lifecycle completion: " + string(ex.what());
+		} else {
+			failure = string("resource query abort lifecycle completion failed: ") + ex.what();
+		}
+	} catch (...) {
+		if (failure) {
+			*failure += "; lifecycle completion: unknown error";
+		} else {
+			failure = "resource query abort lifecycle completion failed: unknown error";
+		}
+	}
+	if (failure) {
+		return DuckDBResult<void>::err(DuckDBError::external_error(std::move(*failure)));
+	}
+	return DuckDBResult<void>::ok();
+}
+
 DuckDBResult<void> RayWorkerManager::abort_and_quiesce_query(const string &query_id) {
 	if (query_id.empty()) {
 		return DuckDBResult<void>::err(DuckDBError::value_error("FTE query abort requires non-empty query_id"));
@@ -1277,84 +1265,13 @@ DuckDBResult<void> RayWorkerManager::abort_and_quiesce_query(const string &query
 	if (!operation) {
 		return DuckDBResult<void>::err(DuckDBError::invalid_state_error("Ray worker manager is shut down"));
 	}
-	std::optional<QueryAbort> active_abort;
 	try {
-		active_abort = BeginQueryAbort(query_id);
+		return ExecuteQueryAbort(BeginQueryAbort(query_id));
 	} catch (const std::exception &ex) {
 		return DuckDBResult<void>::err(DuckDBError::external_error(ex.what()));
 	} catch (...) {
 		return DuckDBResult<void>::err(
 		    DuckDBError::external_error("unknown error while starting resource query abort"));
-	}
-	if (!active_abort) {
-		return DuckDBResult<void>::ok();
-	}
-
-	try {
-		std::vector<string> errors;
-		auto prepare_workers = [&]() {
-			try {
-				for (const auto &execution_query_id : active_abort->execution_query_ids) {
-					for (const auto &worker : active_abort->workers) {
-						const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
-						try {
-							worker->PrepareDropQuery(execution_query_id);
-						} catch (const std::exception &ex) {
-							errors.push_back(execution_query_id + "@" + worker_id + ": " + ex.what());
-						} catch (...) {
-							errors.push_back(execution_query_id + "@" + worker_id + ": unknown abort error");
-						}
-					}
-				}
-			} catch (const std::exception &ex) {
-				errors.push_back(string("abort orchestration: ") + ex.what());
-			} catch (...) {
-				errors.push_back("abort orchestration: unknown error");
-			}
-		};
-		prepare_workers();
-		if (errors.empty()) {
-			WaitForQueryOperations(active_abort->owner_query_id);
-			if (active_abort->had_active_operations) {
-				{
-					lock_guard<mutex> guard(mutex_);
-					auto add_worker = [&](const std::shared_ptr<RayWorkerRuntime> &worker) {
-						if (worker && std::find(active_abort->workers.begin(), active_abort->workers.end(), worker) ==
-						                  active_abort->workers.end()) {
-							active_abort->workers.push_back(worker);
-						}
-					};
-					auto owned_workers = state_.workers_by_query_owner.find(active_abort->owner_query_id);
-					if (owned_workers != state_.workers_by_query_owner.end()) {
-						for (const auto &worker : owned_workers->second) {
-							add_worker(worker);
-						}
-					}
-					for (const auto &entry : state_.ray_workers) {
-						add_worker(entry.second);
-					}
-				}
-				prepare_workers();
-			}
-		}
-		const bool succeeded = errors.empty();
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, succeeded);
-		if (!succeeded) {
-			string message = "resource query abort barrier failed with " + std::to_string(errors.size()) + " error(s)";
-			for (const auto &error : errors) {
-				message += "; " + error;
-			}
-			return DuckDBResult<void>::err(DuckDBError::external_error(std::move(message)));
-		}
-		return DuckDBResult<void>::ok();
-	} catch (const std::exception &ex) {
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, false);
-		return DuckDBResult<void>::err(
-		    DuckDBError::external_error(string("resource query abort orchestration failed: ") + ex.what()));
-	} catch (...) {
-		EndQueryAbort(active_abort->owner_query_id, active_abort->token, false);
-		return DuckDBResult<void>::err(
-		    DuckDBError::external_error("resource query abort orchestration failed: unknown error"));
 	}
 }
 
@@ -1366,18 +1283,20 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 	if (!operation) {
 		throw std::runtime_error("Ray worker manager is shut down");
 	}
-	auto abort_res = abort_and_quiesce_query(query_id);
-	if (abort_res.is_err()) {
-		throw std::runtime_error(abort_res.error().what());
-	}
-	auto active_drop = BeginQueryDrop(query_id);
-	if (!active_drop) {
+	auto teardown = BeginQueryTeardown(query_id);
+	if (!teardown) {
 		return;
 	}
 	try {
+		auto abort_res = ExecuteQueryAbort(BeginQueryAbort(*teardown));
+		if (abort_res.is_err()) {
+			throw std::runtime_error(abort_res.error().what());
+		}
+		query_lifecycles_.MarkDropping(*teardown);
+		const auto workers = QueryWorkers(teardown->lifecycle.owner_query_id);
 		std::vector<string> errors;
-		for (const auto &execution_query_id : active_drop->execution_query_ids) {
-			for (const auto &worker : active_drop->workers) {
+		for (const auto &execution_query_id : teardown->execution_query_ids) {
+			for (const auto &worker : workers) {
 				const auto worker_id = worker && worker->Id() ? *worker->Id() : string("<unknown>");
 				try {
 					worker->CleanupQuery(execution_query_id);
@@ -1397,7 +1316,7 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 			throw std::runtime_error(std::move(message));
 		}
 
-		for (const auto &execution_query_id : active_drop->execution_query_ids) {
+		for (const auto &execution_query_id : teardown->execution_query_ids) {
 			try {
 				ClearFteResultHandles(execution_query_id);
 			} catch (const std::exception &ex) {
@@ -1413,14 +1332,31 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 			}
 			throw std::runtime_error(std::move(message));
 		}
-		if (query_cleanup_) {
-			query_cleanup_(active_drop->owner_query_id);
+		{
+			lock_guard<mutex> guard(mutex_);
+			for (const auto &execution_query_id : teardown->execution_query_ids) {
+				state_.fte_result_handle_counts_by_query.erase(execution_query_id);
+			}
 		}
-		submission_errors_.Discard(active_drop->owner_query_id);
-		FinishQueryLifecycle(active_drop->owner_query_id, active_drop->token);
+		if (query_cleanup_) {
+			query_cleanup_(teardown->lifecycle.owner_query_id);
+		}
+		submission_errors_.Discard(teardown->lifecycle.owner_query_id);
+		{
+			lock_guard<mutex> guard(mutex_);
+			state_.workers_by_query_owner.erase(teardown->lifecycle.owner_query_id);
+		}
+		query_lifecycles_.CompleteTeardown(*teardown, std::nullopt);
 	} catch (...) {
-		EndQueryDrop(active_drop->owner_query_id, active_drop->token);
-		throw;
+		auto failure = ExceptionMessage(std::current_exception());
+		try {
+			query_lifecycles_.CompleteTeardown(*teardown, failure);
+		} catch (const std::exception &ex) {
+			failure += "; lifecycle completion: " + string(ex.what());
+		} catch (...) {
+			failure += "; lifecycle completion: unknown error";
+		}
+		throw std::runtime_error(std::move(failure));
 	}
 }
 
@@ -1530,9 +1466,27 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
     const string &query_id, double timeout_s,
     const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
     duckdb::distributed::MaterializedOutputCallback on_output) {
+	return WaitFteQuery(query_id, timeout_s, task_contexts, std::move(on_output), false);
+}
+
+DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>
+RayWorkerManager::wait_fte_query_streaming(const string &query_id, double timeout_s,
+                                           duckdb::distributed::MaterializedOutputCallback on_output) {
+	const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> empty_contexts;
+	return WaitFteQuery(query_id, timeout_s, empty_contexts, std::move(on_output), true);
+}
+
+DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerManager::WaitFteQuery(
+    const string &query_id, double timeout_s,
+    const std::unordered_set<duckdb::distributed::TaskContext, duckdb::distributed::TaskContextHash> &task_contexts,
+    duckdb::distributed::MaterializedOutputCallback on_output, bool stream_outputs) {
 	if (query_id.empty()) {
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 		    DuckDBError::value_error("query_id must be non-empty"));
+	}
+	if (stream_outputs && !on_output) {
+		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+		    DuckDBError::value_error("streaming FTE result drain requires an output callback"));
 	}
 	OperationGuard operation(*this);
 	if (!operation) {
@@ -1553,6 +1507,19 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	                                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 	                                             std::chrono::duration<double>(timeout_s))
 	                                   : std::chrono::steady_clock::time_point::max();
+	auto fail_after_result_cleanup = [&](const string &stage, const char *detail) {
+		vane::BoundedErrorDetails errors;
+		errors.Add(stage, detail);
+		try {
+			ClearFteResultHandles(query_id);
+		} catch (const std::exception &cleanup_error) {
+			errors.Add("FTE result cleanup", cleanup_error.what());
+		} catch (...) {
+			errors.Add("FTE result cleanup", "unknown error");
+		}
+		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
+		    DuckDBError(errors.AppendTo("FTE query wait failed")));
+	};
 
 	try {
 		while (true) {
@@ -1563,24 +1530,36 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
 			auto status_res = FteQueryStatus(query_id, task_context_filter);
 			if (status_res.is_err()) {
-				ClearFteResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(status_res.error());
+				return fail_after_result_cleanup("FTE query status", status_res.error().what());
 			}
 			const auto &status = status_res.value();
 			if (status.failed) {
-				ClearFteResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("FTE query failed: " + status.message));
+				return fail_after_result_cleanup("FTE query failed", status.message.c_str());
 			}
 			if (status.canceled) {
-				ClearFteResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("FTE query canceled: " + status.message));
+				return fail_after_result_cleanup("FTE query canceled", status.message.c_str());
 			}
 			auto collect_res = CollectFteResultHandles(query_id);
 			if (collect_res.is_err()) {
-				ClearFteResultHandles(query_id);
-				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(collect_res.error());
+				return fail_after_result_cleanup("FTE result handle collection", collect_res.error().what());
+			}
+			if (stream_outputs && !status.selected_attempt_task_ids.empty()) {
+				auto coverage_res = ValidateFteResultHandleCoverage(query_id, status.selected_attempt_task_ids);
+				if (coverage_res.is_err()) {
+					return fail_after_result_cleanup("FTE selected-attempt/result-handle validation",
+					                                 coverage_res.error().what());
+				}
+				const double remaining_timeout_s =
+				    has_deadline
+				        ? std::max(0.0,
+				                   std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
+				        : -1.0;
+				const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
+				auto stream_res = DrainFteResultHandles(query_id, remaining_timeout_s, &status, task_context_filter,
+				                                        true, on_output, true);
+				if (stream_res.is_err()) {
+					return stream_res;
+				}
 			}
 			// Registry operations fence every ingress path that can publish a
 			// fragment. Once no such operation remains, an unmatched materializer
@@ -1588,8 +1567,8 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			if (task_context_filter && !status.matched) {
 				if (!status.registration_pending) {
 					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-					    DuckDBError::external_error("FTE query scope did not match any registered fragment: " +
-					                                status.message));
+					    DuckDBError::external_error(vane::BoundedErrorDetails::FormatDetail(
+					        "FTE query scope did not match any registered fragment", status.message.c_str())));
 				}
 			} else if (status.finished) {
 				finished_status = status;
@@ -1598,43 +1577,46 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 			}
 			if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
 				return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-				    DuckDBError::external_error("timed out waiting for FTE query: " + status.message));
+				    DuckDBError::external_error(vane::BoundedErrorDetails::FormatDetail(
+				        "timed out waiting for FTE query", status.message.c_str())));
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 
 		auto collect_res = CollectFteResultHandles(query_id);
 		if (collect_res.is_err()) {
-			ClearFteResultHandles(query_id);
-			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(collect_res.error());
+			return fail_after_result_cleanup("FTE result handle collection", collect_res.error().what());
+		}
+		auto coverage_res = ValidateFteResultHandleCoverage(query_id, finished_status.selected_attempt_task_ids);
+		if (coverage_res.is_err()) {
+			return fail_after_result_cleanup("FTE selected-attempt/result-handle validation",
+			                                 coverage_res.error().what());
 		}
 		const double remaining_timeout_s =
 		    has_deadline
 		        ? std::max(0.0, std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count())
 		        : -1.0;
 		const auto *task_context_filter = task_contexts.empty() ? nullptr : &task_contexts;
-		auto drain_res =
-		    DrainFteResultHandles(query_id, remaining_timeout_s, has_finished_status ? &finished_status : nullptr,
-		                          task_context_filter, false);
+		auto drain_res = DrainFteResultHandles(
+		    query_id, remaining_timeout_s, has_finished_status ? &finished_status : nullptr, task_context_filter,
+		    stream_outputs, stream_outputs ? on_output : duckdb::distributed::MaterializedOutputCallback {}, false);
 		if (drain_res.is_err()) {
 			return drain_res;
 		}
 		for (auto &output : drain_res.value()) {
-			if (on_output) {
+			if (!stream_outputs && on_output) {
 				auto callback_res = on_output(output);
 				if (callback_res.is_err()) {
-					ClearFteResultHandles(query_id);
-					return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-					    callback_res.error());
+					return fail_after_result_cleanup("FTE output callback", callback_res.error().what());
 				}
 			}
 			outputs.push_back(std::move(output));
 		}
 		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::ok(std::move(outputs));
 	} catch (const std::exception &e) {
-		ClearFteResultHandles(query_id);
-		return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
-		    DuckDBError(string("Python error during wait_fte_query: ") + e.what()));
+		return fail_after_result_cleanup("Python error during wait_fte_query", e.what());
+	} catch (...) {
+		return fail_after_result_cleanup("wait_fte_query", "unknown error");
 	}
 }
 

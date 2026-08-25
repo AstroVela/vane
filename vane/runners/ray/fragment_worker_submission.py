@@ -10,6 +10,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from vane._ray_cxx import require_ray_cxx_attr
+from vane.runners.exchange_sink import normalize_exchange_sink_config
 from vane.runners.fte import (
     AssignmentResult,
     FteFragmentExecution,
@@ -20,6 +21,7 @@ from vane.runners.fte import (
 from vane.runners.fte.dynamic_inputs import (
     split_exchange_source_task_by_partition as _split_exchange_source_task_by_partition,
 )
+from vane.runners.fte.dynamic_inputs import split_scan_split_batch as _split_scan_split_batch
 from vane.runners.fte.dynamic_inputs import (
     splits_from_pending_task,
 )
@@ -150,15 +152,6 @@ def _fte_submission_debug_log(event: str, **fields: Any) -> None:
     print("[vane-fte-submit] " + " ".join(parts), file=sys.stderr, flush=True)
 
 
-def _truthy_context_flag(context: dict[str, Any], key: str) -> bool:
-    value = context.get(key)
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() not in ("", "0", "false", "no", "off")
-    return bool(value)
-
-
 class FteWorkerSubmissionMixin:
     if TYPE_CHECKING:
         # Supplied by the other mixins on the composed Ray worker handle.
@@ -233,7 +226,7 @@ class FteWorkerSubmissionMixin:
         def merge_existing(existing: FteFragmentExecution) -> FteFragmentExecution:
             existing.merge_submission_metadata(
                 task_context_info=item.get("task_context_info"),
-                exchange_sink_instance=item.get("exchange_sink_instance"),
+                exchange_sink_config=item.get("exchange_sink_config"),
                 dynamic_scan_sources=dynamic_scan_sources,
                 dynamic_exchange_sources=dynamic_exchange_sources,
             )
@@ -370,14 +363,8 @@ class FteWorkerSubmissionMixin:
             context=fragment_execution_context,
             fragment_plan=item.get("fragment_plan"),
             fragment_registration_result=fragment_registration_result,
-            task_context_info={
-                **dict(item.get("task_context_info") or {}),
-                **(
-                    {"exchange_sink_instance": item.get("exchange_sink_instance")}
-                    if item.get("exchange_sink_instance") is not None
-                    else {}
-                ),
-            },
+            task_context_info=dict(item.get("task_context_info") or {}),
+            exchange_sink_config=item.get("exchange_sink_config"),
             source_node_ids=dynamic_scan_sources | dynamic_exchange_sources,
             dynamic_scan_source_node_ids=dynamic_scan_sources,
             dynamic_exchange_source_node_ids=dynamic_exchange_sources,
@@ -621,6 +608,7 @@ class FteWorkerSubmissionMixin:
             ) = splits_from_pending_task(
                 item,
                 next_split_sequence=self._next_fte_split_sequence,
+                split_scan_split_batch_fn=_split_scan_split_batch,
                 split_exchange_source_task_by_partition_fn=_split_exchange_source_task_by_partition,
             )
             item["context"] = _strip_fte_dynamic_context(
@@ -914,20 +902,12 @@ class FteWorkerSubmissionMixin:
                 raise ValueError("FTE task requires non-empty query_id")
             task_context_info = dict(task.task_context() or {})
             context = extract_task_inputs(task, context)
-            exchange_sink_instance = task.exchange_sink_instance()
+            exchange_sink_config = task.exchange_sink_config()
+            if exchange_sink_config is not None:
+                exchange_sink_config = normalize_exchange_sink_config(exchange_sink_config)
             resource_query_id, resource_unit_id = resource_identity_from_context(context)
 
             query_id, fragment_id = fragment_id_for_task(context, task_name)
-            if (
-                _truthy_context_flag(context, "preserve_plan_exchange_sink_instance")
-                and exchange_sink_instance is not None
-            ):
-                exchange_sink_instance = dict(exchange_sink_instance)
-                # The context flag belongs to the plan that originally created
-                # the task. A downstream materialized coordinator can append a
-                # new sink with an explicit FTE-derived identity policy.
-                if not bool(exchange_sink_instance.get("fte_task_identity")):
-                    exchange_sink_instance["preserve_plan_exchange_sink_instance"] = True
             plan = None
             fragment_plan = None
             with self._fragment_registration_lock:
@@ -962,7 +942,7 @@ class FteWorkerSubmissionMixin:
                     "resource_query_id": resource_query_id,
                     "resource_unit_id": resource_unit_id,
                     "task_context_info": task_context_info,
-                    "exchange_sink_instance": exchange_sink_instance,
+                    "exchange_sink_config": exchange_sink_config,
                 }
             )
 

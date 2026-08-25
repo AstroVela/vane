@@ -3825,19 +3825,20 @@ const StringUtil::EnumStringLiteral *GetPhysicalOperatorTypeValues() {
 		{ static_cast<uint32_t>(PhysicalOperatorType::GROUPING_SET_EXPAND), "GROUPING_SET_EXPAND" },
 		{ static_cast<uint32_t>(PhysicalOperatorType::DISTRIBUTED_RESERVOIR_SAMPLE),
 		  "DISTRIBUTED_RESERVOIR_SAMPLE" },
-		{ static_cast<uint32_t>(PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE), "DISTRIBUTED_EXTENSION_WRITE" }
+		{ static_cast<uint32_t>(PhysicalOperatorType::DISTRIBUTED_EXTENSION_WRITE), "DISTRIBUTED_EXTENSION_WRITE" },
+		{ static_cast<uint32_t>(PhysicalOperatorType::DATA_SINK), "DATA_SINK" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<PhysicalOperatorType>(PhysicalOperatorType value) {
-	return StringUtil::EnumToString(GetPhysicalOperatorTypeValues(), 91, "PhysicalOperatorType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetPhysicalOperatorTypeValues(), 92, "PhysicalOperatorType", static_cast<uint32_t>(value));
 }
 
 template<>
 PhysicalOperatorType EnumUtil::FromString<PhysicalOperatorType>(const char *value) {
-	return static_cast<PhysicalOperatorType>(StringUtil::StringToEnum(GetPhysicalOperatorTypeValues(), 91, "PhysicalOperatorType", value));
+	return static_cast<PhysicalOperatorType>(StringUtil::StringToEnum(GetPhysicalOperatorTypeValues(), 92, "PhysicalOperatorType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetPhysicalTableScanExecutionStrategyValues() {
@@ -4203,6 +4204,7 @@ const StringUtil::EnumStringLiteral *GetRelationTypeValues() {
 		{ static_cast<uint32_t>(RelationType::DELIM_JOIN_RELATION), "DELIM_JOIN_RELATION" },
 		{ static_cast<uint32_t>(RelationType::DELIM_GET_RELATION), "DELIM_GET_RELATION" },
 		{ static_cast<uint32_t>(RelationType::UNNEST_RELATION), "UNNEST_RELATION" },
+		{ static_cast<uint32_t>(RelationType::WRITE_FILE_RELATION), "WRITE_FILE_RELATION" },
 		{ static_cast<uint32_t>(RelationType::EXTENSION_RELATION), "EXTENSION_RELATION" }
 	};
 	return values;
@@ -4210,12 +4212,12 @@ const StringUtil::EnumStringLiteral *GetRelationTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<RelationType>(RelationType value) {
-	return StringUtil::EnumToString(GetRelationTypeValues(), 32, "RelationType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetRelationTypeValues(), 33, "RelationType", static_cast<uint32_t>(value));
 }
 
 template<>
 RelationType EnumUtil::FromString<RelationType>(const char *value) {
-	return static_cast<RelationType>(StringUtil::StringToEnum(GetRelationTypeValues(), 32, "RelationType", value));
+	return static_cast<RelationType>(StringUtil::StringToEnum(GetRelationTypeValues(), 33, "RelationType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetRenderModeValues() {

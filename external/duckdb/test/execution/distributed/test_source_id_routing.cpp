@@ -102,7 +102,7 @@ static WorkerTask MakeWorkerTaskWithInput(NodeID node_id, const std::string &nod
                                           const std::string &input_bytes) {
 	WorkerTask task(TaskContext::from_node_context(1, node_id, static_cast<TaskID>(node_id)), MakeScanPlanWithRoot(),
 	                DuckDBExecutionConfigRef(), PipelineNodeContext(1, "join-query", node_id, node_name).to_hashmap());
-	task.mutable_inputs()[source_node_id] = TaskInput::make_scan_task(input_bytes);
+	task.mutable_inputs()[source_node_id] = TaskInput::make_scan_split_batch(input_bytes);
 	return task;
 }
 
@@ -235,11 +235,11 @@ static void RequireHashJoinFanInPreservesInputs(idx_t left_count, idx_t right_co
 		REQUIRE(inputs.size() <= 2);
 		auto left_entry = inputs.find(10);
 		if (left_entry != inputs.end()) {
-			actual_left_inputs.push_back(left_entry->second.scan_task_bytes);
+			actual_left_inputs.push_back(left_entry->second.scan_split_batch_bytes);
 		}
 		auto right_entry = inputs.find(20);
 		if (right_entry != inputs.end()) {
-			actual_right_inputs.push_back(right_entry->second.scan_task_bytes);
+			actual_right_inputs.push_back(right_entry->second.scan_split_batch_bytes);
 		}
 	}
 	REQUIRE(actual_left_inputs == left_inputs);
@@ -250,26 +250,26 @@ static void RequireHashJoinFanInPreservesInputs(idx_t left_count, idx_t right_co
 // TaskInput type tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("TaskInput: make_scan_task factory", "[distributed][source_id]") {
-	auto input = TaskInput::make_scan_task("dGVzdA=="); // base64 for "test"
+TEST_CASE("TaskInput: make_scan_split_batch factory", "[distributed][source_id]") {
+	auto input = TaskInput::make_scan_split_batch("dGVzdA=="); // base64 for "test"
 
-	REQUIRE(input.kind == TaskInput::Kind::ScanTask);
-	REQUIRE(input.scan_task_bytes == "dGVzdA==");
+	REQUIRE(input.kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(input.scan_split_batch_bytes == "dGVzdA==");
 }
 
 TEST_CASE("TaskInputs: map insertion and lookup", "[distributed][source_id]") {
 	TaskInputs inputs;
 
-	inputs[1] = TaskInput::make_scan_task("scan_data_1");
-	inputs[5] = TaskInput::make_scan_task("scan_data_5");
+	inputs[1] = TaskInput::make_scan_split_batch("scan_data_1");
+	inputs[5] = TaskInput::make_scan_split_batch("scan_data_5");
 
 	REQUIRE(inputs.size() == 2);
 	REQUIRE(inputs.count(1) == 1);
 	REQUIRE(inputs.count(5) == 1);
 	REQUIRE(inputs.count(99) == 0);
 
-	REQUIRE(inputs[1].kind == TaskInput::Kind::ScanTask);
-	REQUIRE(inputs[1].scan_task_bytes == "scan_data_1");
+	REQUIRE(inputs[1].kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(inputs[1].scan_split_batch_bytes == "scan_data_1");
 }
 
 //===----------------------------------------------------------------------===//
@@ -393,11 +393,11 @@ TEST_CASE("WorkerTask: inputs can be populated via mutable_inputs", "[distribute
 	WorkerTask task(tctx, plan, ExecutionConfigRef(), {});
 
 	// Populate via mutable_inputs()
-	task.mutable_inputs()[5] = TaskInput::make_scan_task("test_base64");
+	task.mutable_inputs()[5] = TaskInput::make_scan_split_batch("test_base64");
 
 	REQUIRE(task.inputs().size() == 1);
-	REQUIRE(task.inputs().at(5).kind == TaskInput::Kind::ScanTask);
-	REQUIRE(task.inputs().at(5).scan_task_bytes == "test_base64");
+	REQUIRE(task.inputs().at(5).kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(task.inputs().at(5).scan_split_batch_bytes == "test_base64");
 }
 
 TEST_CASE("WorkerTask: inputs passed via constructor", "[distributed][source_id]") {
@@ -411,13 +411,13 @@ TEST_CASE("WorkerTask: inputs passed via constructor", "[distributed][source_id]
 
 	// Create inputs before constructing task
 	TaskInputs inputs;
-	inputs[7] = TaskInput::make_scan_task("from_ctor");
+	inputs[7] = TaskInput::make_scan_split_batch("from_ctor");
 
 	TaskContext tctx(0, 0, 1, {});
 	WorkerTask task(tctx, plan, ExecutionConfigRef(), {}, "TestTask", std::move(inputs));
 
 	REQUIRE(task.inputs().size() == 1);
-	REQUIRE(task.inputs().at(7).scan_task_bytes == "from_ctor");
+	REQUIRE(task.inputs().at(7).scan_split_batch_bytes == "from_ctor");
 }
 
 TEST_CASE("WorkerTask: clone preserves inputs", "[distributed][source_id]") {
@@ -430,15 +430,15 @@ TEST_CASE("WorkerTask: clone preserves inputs", "[distributed][source_id]") {
 	plan->SetRoot(scan);
 
 	TaskInputs inputs;
-	inputs[42] = TaskInput::make_scan_task("clone_me");
+	inputs[42] = TaskInput::make_scan_split_batch("clone_me");
 
 	TaskContext tctx(0, 0, 1, {});
 	WorkerTask task(tctx, plan, ExecutionConfigRef(), {}, "TestTask", std::move(inputs));
 
 	auto cloned = task.clone();
 	REQUIRE(cloned->inputs().size() == 1);
-	REQUIRE(cloned->inputs().at(42).kind == TaskInput::Kind::ScanTask);
-	REQUIRE(cloned->inputs().at(42).scan_task_bytes == "clone_me");
+	REQUIRE(cloned->inputs().at(42).kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(cloned->inputs().at(42).scan_split_batch_bytes == "clone_me");
 }
 
 TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distributed][source_id][join]") {
@@ -457,10 +457,10 @@ TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distrib
 	auto joined_task = node.BuildHashJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
 
 	REQUIRE(joined_task.task()->inputs().size() == 2);
-	REQUIRE(joined_task.task()->inputs().at(10).kind == TaskInput::Kind::ScanTask);
-	REQUIRE(joined_task.task()->inputs().at(10).scan_task_bytes == "left_scan");
-	REQUIRE(joined_task.task()->inputs().at(20).kind == TaskInput::Kind::ScanTask);
-	REQUIRE(joined_task.task()->inputs().at(20).scan_task_bytes == "right_scan");
+	REQUIRE(joined_task.task()->inputs().at(10).kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(joined_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
+	REQUIRE(joined_task.task()->inputs().at(20).kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(joined_task.task()->inputs().at(20).scan_split_batch_bytes == "right_scan");
 
 	// BuildHashJoinTask has returned and the temporary right-side plan has been
 	// destroyed. Re-cloning forces a full tree serialization and verifies that
@@ -639,8 +639,8 @@ TEST_CASE("BroadcastJoinNode: replacement task preserves receiver inputs", "[dis
 	auto joined_task = node.BuildBroadcastHashJoinTask(std::move(receiver_task), broadcast_plan, nullptr);
 
 	REQUIRE(joined_task.task()->inputs().size() == 1);
-	REQUIRE(joined_task.task()->inputs().at(30).kind == TaskInput::Kind::ScanTask);
-	REQUIRE(joined_task.task()->inputs().at(30).scan_task_bytes == "receiver_scan");
+	REQUIRE(joined_task.task()->inputs().at(30).kind == TaskInput::Kind::ScanSplitBatch);
+	REQUIRE(joined_task.task()->inputs().at(30).scan_split_batch_bytes == "receiver_scan");
 }
 
 TEST_CASE("HashJoinNode: invalid child plan throws instead of passing through", "[distributed][source_id][join]") {

@@ -216,6 +216,15 @@ def _load_vllm(name: str | None = None) -> Provider:
     return VLLMProvider(name)
 
 
+def _load_sglang(name: str | None = None) -> Provider:
+    try:
+        from vane.ai.providers.sglang import SGLangProvider
+
+        return SGLangProvider(name)
+    except ImportError as e:
+        raise ProviderImportError("sglang") from e
+
+
 def _load_anthropic(name: str | None = None) -> Provider:
     from vane.ai.providers.anthropic import AnthropicProvider
 
@@ -232,6 +241,7 @@ PROVIDERS: dict[str, Callable[..., Provider]] = {
     "transformers": _load_transformers,
     "openai": _load_openai,
     "vllm": _load_vllm,
+    "sglang": _load_sglang,
     "anthropic": _load_anthropic,
     "google": _load_google,
 }

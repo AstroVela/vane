@@ -36,9 +36,10 @@ from vane.ai.options import (
     _require_prompt_number,
     normalize_prompt_options,
 )
-from vane.ai.protocols import NativePrompterPlan
+from vane.ai.protocols import NativeInferencePlan
 from vane.ai.provider import Provider
 from vane.execution._vllm_options_protocol import (
+    _NATIVE_OPTIONS_ENGINE_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
     _NATIVE_OPTIONS_PUBLIC_KEY,
     _NATIVE_OPTIONS_RESERVED_KEYS,
@@ -241,7 +242,7 @@ def _split_native_vllm_secrets(value: Any, secrets: list[Any], path: str = "opti
     return value
 
 
-def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> dict[str, Any]:
+def _build_native_vllm_options_argument(options: Mapping[str, Any], *, engine: str = "vllm") -> dict[str, Any]:
     """Encode native options in the single versioned STRUCT wire format.
 
     Public options remain JSON while sealed plaintext values are confined to an
@@ -270,6 +271,7 @@ def _build_native_vllm_options_argument(options: Mapping[str, Any]) -> dict[str,
         _NATIVE_OPTIONS_VERSION_KEY: _NATIVE_OPTIONS_PAYLOAD_VERSION,
         _NATIVE_OPTIONS_PUBLIC_KEY: public_options_json,
         _NATIVE_OPTIONS_SECRET_KEY: secret_payload,
+        _NATIVE_OPTIONS_ENGINE_KEY: engine,
     }
 
 
@@ -311,7 +313,7 @@ class VLLMProvider(Provider):
 
 
 @dataclass
-class NativeVLLMPromptPlan(NativePrompterPlan):
+class NativeVLLMPromptPlan(NativeInferencePlan):
     """Serializable configuration for native vLLM query planning.
 
     High-level prompt APIs consume this plan while binding the native
@@ -340,6 +342,9 @@ class NativeVLLMPromptPlan(NativePrompterPlan):
 
     def get_options(self) -> Options:
         return dict(self.vllm_options)
+
+    def get_engine(self) -> str:
+        return "vllm"
 
     def build_physical_vllm_options(self) -> dict[str, Any]:
         """Build options for the native ``PhysicalVLLM`` operator.

@@ -10,14 +10,60 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/main/relation/explain_relation.hpp"
+#include "duckdb/main/relation/create_table_relation.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "iostream"
 #include "test_helpers.hpp"
 #include "duckdb/main/relation/materialized_relation.hpp"
 
 using namespace duckdb;
 using namespace std;
+
+namespace {
+
+class NoBindRelationContextWrapper final : public duckdb::RelationContextWrapper {
+public:
+	explicit NoBindRelationContextWrapper(const duckdb::shared_ptr<duckdb::ClientContext> &context)
+	    : duckdb::RelationContextWrapper(context) {
+	}
+
+	void TryBindRelation(duckdb::Relation &, duckdb::vector<duckdb::ColumnDefinition> &) override {
+	}
+};
+
+} // namespace
+
+TEST_CASE("Create table relations preserve structured options and partition expressions", "[relation_api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto context = make_shared_ptr<NoBindRelationContextWrapper>(con.context);
+	duckdb::vector<duckdb::vector<Value>> values;
+	values.push_back({Value::INTEGER(1), Value("north")});
+	auto source = make_shared_ptr<ValueRelation>(context, values, duckdb::vector<duckdb::string> {"id", "region"},
+	                                             "create_source");
+	case_insensitive_map_t<duckdb::unique_ptr<ParsedExpression>> options;
+	options.emplace("location", make_uniq<ConstantExpression>(Value("s3://warehouse/table")));
+	options.emplace("format-version", make_uniq<ConstantExpression>(Value::INTEGER(2)));
+	auto partition_keys = Parser::ParseExpressionList("bucket(16, id), region");
+
+	auto relation =
+	    source->CreateRel("catalog_name", "schema_name", "table_name", false, OnCreateConflict::ERROR_ON_CONFLICT,
+	                      std::move(options), std::move(partition_keys));
+	REQUIRE(relation->type == RelationType::CREATE_TABLE_RELATION);
+	auto &create = relation->Cast<CreateTableRelation>();
+	REQUIRE(create.catalog_name == "catalog_name");
+	REQUIRE(create.schema_name == "schema_name");
+	REQUIRE(create.table_name == "table_name");
+	REQUIRE(create.table_options.size() == 2);
+	REQUIRE(create.table_options.at("LOCATION")->ToString() == "'s3://warehouse/table'");
+	REQUIRE(create.table_options.at("FORMAT-VERSION")->ToString() == "2");
+	REQUIRE(create.partition_keys.size() == 2);
+	REQUIRE(create.partition_keys[0]->ToString() == "bucket(16, id)");
+	REQUIRE(create.partition_keys[1]->ToString() == "region");
+}
 
 TEST_CASE("Test simple relation API", "[relation_api]") {
 	DuckDB db(nullptr);
@@ -1522,4 +1568,23 @@ TEST_CASE("Distinct removes virtual columns from inherited relation bindings", "
 	auto named_rowid = con.Table("named_rowid")->Distinct()->Project("rowid")->Order("rowid");
 	REQUIRE_NOTHROW(result = named_rowid->Execute());
 	REQUIRE(CHECK_COLUMN(result, 0, {10, 20}));
+}
+
+TEST_CASE("Generic file relation uses a registered COPY format", "[relation_api][copy]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto output_path = TestCreatePath("generic_write_file_relation.csv");
+	auto source = con.RelationFromQuery("SELECT 1 AS value UNION ALL SELECT 2 AS value", "source");
+	case_insensitive_map_t<duckdb::vector<Value>> options;
+	options["header"] = {Value::BOOLEAN(true)};
+
+	auto write = source->WriteFileRel(output_path, "csv", std::move(options));
+	REQUIRE(write->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE(write->ToString(0).find("Write To CSV") != string::npos);
+	REQUIRE(source->WriteCSVRel(output_path + ".alias.csv")->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE(source->WriteParquetRel(output_path + ".alias.parquet")->type == RelationType::WRITE_FILE_RELATION);
+	REQUIRE_NO_FAIL(write->Execute());
+
+	auto result = con.Query("SELECT value FROM read_csv_auto('" + output_path + "') ORDER BY value");
+	REQUIRE(CHECK_COLUMN(result, 0, {1, 2}));
 }

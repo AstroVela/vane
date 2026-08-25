@@ -17,7 +17,7 @@ from vane.runners.ray.ray_env import (
     session_environment_overrides,
 )
 from vane.runners.ray.runner import (
-    _configure_scan_task_backlog_env,
+    _configure_scan_split_backlog_env,
 )
 
 
@@ -25,7 +25,7 @@ def test_ray_runner_does_not_inject_udf_stage_count_env(monkeypatch):
     monkeypatch.delenv("VANE_UDF_RAY_TASK_AUTO_STAGE_COUNT", raising=False)
     monkeypatch.delenv("VANE_UDF_RAY_TASK_OUTSTANDING_SCALE", raising=False)
 
-    _configure_scan_task_backlog_env(None)
+    _configure_scan_split_backlog_env(None)
 
     assert "VANE_UDF_RAY_TASK_AUTO_STAGE_COUNT" not in os.environ
     assert "VANE_UDF_RAY_TASK_OUTSTANDING_SCALE" not in os.environ

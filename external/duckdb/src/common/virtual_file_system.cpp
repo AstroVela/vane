@@ -332,6 +332,10 @@ std::string VirtualFileSystem::GetName() const {
 	return "VirtualFileSystem";
 }
 
+bool VirtualFileSystem::HasDirectorySemantics(const string &path, optional_ptr<FileOpener> opener) {
+	return FindFileSystem(path, opener).HasDirectorySemantics(path, opener);
+}
+
 bool VirtualFileSystem::SubSystemIsDisabled(const string &name) {
 	auto registry = file_system_registry.atomic_load();
 	auto &disabled_file_systems = registry->disabled_file_systems;

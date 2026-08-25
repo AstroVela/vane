@@ -28,18 +28,21 @@ endif()
 
 # Source files for the distributed module
 set(DISTRIBUTED_SOURCES_COMMON
+    data_sink.cpp
     extension_write.cpp
     plan/distributed_physical_plan.cpp
     plan/exchange_sink_instance_task.cpp
     plan/exchange_source_task.cpp
     plan/fte_split_queue.cpp
-    plan/scan_task.cpp
+    plan/scan_split.cpp
     ${DISTRIBUTED_SOURCES_EXCHANGE}
     # python-related sources are optional and appended below when enabled
 )
 
 set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/aggregate.cpp
+    pipeline_node/data_sink_finish.cpp
+    pipeline_node/empty_result_source.cpp
     pipeline_node/expression_scan.cpp
     pipeline_node/extension_write_sink.cpp
     pipeline_node/grouping_set_expand.cpp
@@ -51,16 +54,19 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/translate.cpp
     pipeline_node/translator_aggregate.cpp
     pipeline_node/translator_copy.cpp
+    pipeline_node/translator_data_sink.cpp
     pipeline_node/translator_join.cpp
     pipeline_node/translator_misc_unary.cpp
     pipeline_node/translator_order_limit.cpp
     pipeline_node/translator_scan.cpp
     pipeline_node/translator_source.cpp
+    pipeline_node/translator_union.cpp
     pipeline_node/translator_unary.cpp
     pipeline_node/scan_source.cpp
     pipeline_node/sample.cpp
     pipeline_node/pivot.cpp
     pipeline_node/unnest.cpp
+    pipeline_node/union.cpp
     pipeline_node/shuffles/repartition.cpp
     pipeline_node/sink.cpp
     pipeline_node/sort.cpp

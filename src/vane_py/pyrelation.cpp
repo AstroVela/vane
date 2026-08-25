@@ -32,11 +32,13 @@
 #include "duckdb/main/relation/table_relation.hpp"
 #include "duckdb/main/relation/unnest_relation.hpp"
 #include "duckdb/main/relation/update_relation.hpp"
+#include "duckdb/main/relation/data_sink_relation.hpp"
 #include "vane_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
 #include "vane_python/python_udf_utils.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
+#include "vane_python/python_conversion.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -304,6 +306,23 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::LocalExchange(const py::object &n
 		num_partitions = num_partitions_obj.cast<idx_t>();
 	}
 	return DeriveRelation(rel->LocalExchange(num_partitions));
+}
+
+void DuckDBPyRelation::ValidateDataSinkTransaction() {
+	AssertRelation();
+	if (!rel->context) {
+		throw InternalException("Cannot validate DataSink transaction: relation has no context");
+	}
+	auto context = rel->context->GetContext();
+	if (!context->transaction.IsAutoCommit()) {
+		throw InvalidInputException(
+		    "DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
+	}
+}
+
+unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {
+	ValidateDataSinkTransaction();
+	return DeriveRelation(make_shared_ptr<DataSinkRelation>(rel, operation_id));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Order(const string &expr) {
@@ -1179,21 +1198,45 @@ static bool TryDispatchToRunner(const shared_ptr<Relation> &write_rel, const py:
 	return true;
 }
 
-static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false) {
+static unique_ptr<QueryResult> PyExecuteRelation(const shared_ptr<Relation> &rel, bool stream_result = false,
+                                                 vector<string> *cleanup_warnings = nullptr) {
+	if (cleanup_warnings) {
+		cleanup_warnings->clear();
+	}
 	if (!rel) {
 		return nullptr;
 	}
 	auto context = rel->context->GetContext();
 	D_ASSERT(py::gil_check());
 	ScopedPythonUDFActorResourcePreparation udf_actor_resources(*context);
-	py::gil_scoped_release release;
-	auto pending_query = context->PendingQuery(rel, stream_result);
-	return DuckDBPyConnection::CompletePendingQuery(*pending_query);
+	try {
+		unique_ptr<QueryResult> result;
+		{
+			py::gil_scoped_release release;
+			auto pending_query = context->PendingQuery(rel, stream_result);
+			result = DuckDBPyConnection::CompletePendingQuery(*pending_query);
+		}
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		return result;
+	} catch (...) {
+		if (cleanup_warnings) {
+			*cleanup_warnings = udf_actor_resources.TakeCleanupWarnings();
+		}
+		throw;
+	}
 }
 
 unique_ptr<QueryResult> DuckDBPyRelation::ExecuteInternal(bool stream_result) {
 	this->executed = true;
-	return PyExecuteRelation(rel, stream_result);
+	return PyExecuteRelation(rel, stream_result, &udf_actor_cleanup_warnings);
+}
+
+vector<string> DuckDBPyRelation::TakeUDFActorCleanupWarnings() {
+	vector<string> result;
+	result.swap(udf_actor_cleanup_warnings);
+	return result;
 }
 
 void DuckDBPyRelation::ExecuteOrThrow(bool stream_result) {
@@ -1412,6 +1455,20 @@ duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, 
 
 duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTable(idx_t batch_size) {
 	return ToArrowTableInternal(batch_size, false);
+}
+
+py::object DuckDBPyRelation::GetArrowSchema() {
+	ClientProperties client_properties;
+	if (rel) {
+		client_properties = rel->context->GetContext()->GetClientProperties();
+	} else if (result) {
+		client_properties = result->GetClientProperties();
+	} else {
+		throw InternalException("DuckDBPyRelation must have a relation or result to export its Arrow schema");
+	}
+	py::list batches;
+	auto empty_table = pyarrow::ToArrowTable(types, names, std::move(batches), client_properties);
+	return empty_table.attr("schema");
 }
 
 py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) {
@@ -1967,6 +2024,17 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 	PyExecuteRelation(write_csv);
 }
 
+void DuckDBPyRelation::ToFile(const string &filename, const string &format) {
+	if (format.empty()) {
+		throw InvalidInputException("write_file requires a non-empty format");
+	}
+	auto write_file = rel->WriteFileRel(filename, format);
+	if (TryDispatchToRunner(write_file, connection_owner)) {
+		return;
+	}
+	PyExecuteRelation(write_file);
+}
+
 // should this return a rel with the new view?
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::CreateView(const string &view_name, bool replace) {
 	rel->CreateView(view_name, replace);
@@ -2136,10 +2204,78 @@ void DuckDBPyRelation::Insert(const py::object &params) const {
 	PyExecuteRelation(insert);
 }
 
-void DuckDBPyRelation::Create(const string &table) {
+static unique_ptr<ParsedExpression> TransformCreateTablePropertyValue(const py::handle &value) {
+	if (py::isinstance<DuckDBPyExpression>(value)) {
+		auto expression = py::cast<shared_ptr<DuckDBPyExpression>>(value);
+		return expression->GetExpression().Copy();
+	}
+	return make_uniq<ConstantExpression>(TransformPythonValue(value, LogicalType::UNKNOWN, false));
+}
+
+static case_insensitive_map_t<unique_ptr<ParsedExpression>>
+TransformCreateTableProperties(const py::object &properties) {
+	case_insensitive_map_t<unique_ptr<ParsedExpression>> result;
+	if (properties.is_none()) {
+		return result;
+	}
+	if (!py::is_dict_like(properties)) {
+		throw InvalidInputException("create only accepts 'properties' as a mapping of string keys to values");
+	}
+
+	for (auto item : py::dict(properties)) {
+		if (!py::isinstance<py::str>(item.first)) {
+			throw InvalidInputException("create property names must be strings");
+		}
+		auto name = py::cast<string>(item.first);
+		if (name.empty()) {
+			throw InvalidInputException("create property names must not be empty");
+		}
+		if (result.find(name) != result.end()) {
+			throw InvalidInputException("create property names must be unique case-insensitively: '%s'", name);
+		}
+		result.emplace(std::move(name), TransformCreateTablePropertyValue(item.second));
+	}
+	return result;
+}
+
+static vector<unique_ptr<ParsedExpression>> TransformCreateTablePartitionKeys(ClientContext &context,
+                                                                              const py::object &partition_by) {
+	vector<unique_ptr<ParsedExpression>> result;
+	if (partition_by.is_none()) {
+		return result;
+	}
+	if (py::isinstance<py::str>(partition_by) || !py::isinstance<py::sequence>(partition_by)) {
+		throw InvalidInputException("create only accepts 'partition_by' as a sequence of Expression or str values");
+	}
+
+	for (auto item : py::list(partition_by)) {
+		if (py::isinstance<py::str>(item)) {
+			auto expressions = Parser::ParseExpressionList(py::cast<string>(item), context.GetParserOptions());
+			if (expressions.size() != 1) {
+				throw InvalidInputException("create partition expressions must contain exactly one expression");
+			}
+			result.push_back(std::move(expressions[0]));
+			continue;
+		}
+		if (!py::isinstance<DuckDBPyExpression>(item)) {
+			string actual_type = py::str(py::type::of(item));
+			throw InvalidInputException("create partition expressions must be Expression or str values, not '%s'",
+			                            actual_type);
+		}
+		auto expression = py::cast<shared_ptr<DuckDBPyExpression>>(item);
+		result.push_back(expression->GetExpression().Copy());
+	}
+	return result;
+}
+
+void DuckDBPyRelation::Create(const string &table, const py::object &properties, const py::object &partition_by) {
 	AssertRelation();
 	auto parsed_info = QualifiedName::Parse(table);
-	auto create = rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false);
+	auto table_options = TransformCreateTableProperties(properties);
+	auto partition_keys = TransformCreateTablePartitionKeys(*rel->context->GetContext(), partition_by);
+	auto create =
+	    rel->CreateRel(parsed_info.catalog, parsed_info.schema, parsed_info.name, false,
+	                   OnCreateConflict::ERROR_ON_CONFLICT, std::move(table_options), std::move(partition_keys));
 	if (TryDispatchToRunner(create, connection_owner, "CTAS")) {
 		return;
 	}

@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""SGLang inference backend executor.
+
+This module is the SGLang sibling of :mod:`vane.execution.vllm`. It implements
+the engine-agnostic :class:`LLMExecutor` contract using SGLang's offline
+``Engine`` to run generations. All submission/batching/wakeup/distributed
+machinery lives in :class:`LocalEngineExecutor`; this module supplies only the
+SGLang engine hooks.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from typing import Any
+
+from vane.ai.provider import (
+    _SafeProviderError,
+    _translate_missing_provider_dependency,
+)
+from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor, RayActorExecutorMixin
+from vane.execution._vllm_options_protocol import _unpack_native_options_envelope
+from vane.runners.ray.ray_env import install_explicit_session_runtime_env
+
+
+class SGLangExecutor(LLMExecutor):
+    """Base class for SGLang-backed executors.
+
+    The engine-agnostic contract lives in :class:`LLMExecutor`; this class is
+    the SGLang backend seam for concrete SGLang executors.
+    """
+
+
+class SGLangLocalExecutor(SGLangExecutor, LocalEngineExecutor):
+    """SGLang backend executor: local async engine.
+
+    Submission, batching, wakeup, and distributed routing live in
+    :class:`LocalEngineExecutor`; this class supplies only the SGLang engine
+    hooks.
+    """
+
+    _engine_name = "sglang"
+
+    def _materialize_sampling_params(self, generate_args: dict[str, Any]) -> dict[str, Any]:
+        sampling_params = generate_args.pop("sampling_params", None)
+        if sampling_params is None:
+            return {}
+        if isinstance(sampling_params, str):
+            try:
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("sglang sampling_params JSON could not be parsed") from exc
+        if isinstance(sampling_params, Mapping):
+            materialized = dict(sampling_params)
+            max_tokens = materialized.pop("max_tokens", None)
+            if max_tokens is not None:
+                materialized.setdefault("max_new_tokens", max_tokens)
+            return materialized
+        raise TypeError("sglang sampling_params must be a mapping or JSON object")
+
+    def _create_engine(self) -> None:
+        with _translate_missing_provider_dependency("sglang", "sglang"):
+            from sglang import Engine  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+        self.llm = Engine(model_path=self.model, **self.engine_args)
+
+    async def _run_generate(self, prompt: str, request_id: str) -> str:
+        del request_id  # SGLang's offline Engine does not require Vane's request id.
+        output = await self.llm.async_generate(
+            prompt=prompt,
+            sampling_params=self.sampling_params,
+            **self.generate_args,
+        )
+        if output is None:
+            raise _SafeProviderError("sglang returned no outputs")
+        return self._extract_output_text(output)
+
+    def _shutdown_engine(self) -> None:
+        # SGLang's offline Engine owns scheduler/detokenizer subprocesses and a
+        # GPU context that must be released explicitly.
+        llm = self.llm
+        if llm is None:
+            return
+        shutdown = getattr(llm, "shutdown", None)
+        try:
+            if shutdown is not None:
+                shutdown()
+        finally:
+            self.llm = None
+
+    @staticmethod
+    def _extract_output_text(output: Any) -> str:
+        if isinstance(output, dict):
+            return str(output["text"])
+        return str(getattr(output, "text"))
+
+
+class SGLangRayLocalExecutor(RayActorExecutorMixin, SGLangLocalExecutor):  # type: ignore[misc]
+    """SGLang backend executor for Ray actor pools.
+
+    Reuses the engine hooks from :class:`SGLangLocalExecutor` and the async
+    Ray-actor machinery from :class:`RayActorExecutorMixin`.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        engine_args: dict[str, Any],
+        generate_args: dict[str, Any],
+        on_error: str = "raise",
+        use_threading: bool = True,
+        engine_init_timeout_s: float | None = None,
+        force_background_thread: bool = False,
+        *,
+        _install_session_runtime_env: bool = False,
+    ):
+        if _install_session_runtime_env:
+            install_explicit_session_runtime_env()
+        super().__init__(
+            model,
+            engine_args,
+            generate_args,
+            on_error=on_error,
+            use_threading=use_threading,
+            engine_init_timeout_s=engine_init_timeout_s,
+            force_background_thread=force_background_thread,
+        )
+
+
+class _NormalizedSGLangOptions(dict[str, Any]):
+    """Marker subclass so :func:`normalize_options` is idempotent."""
+
+
+_SGLANG_DEFAULTS: dict[str, Any] = {
+    "concurrency": 1,
+    "gpus_per_actor": 1,
+    "do_prefix_routing": False,  # SGLang's RadixAttention needs no explicit bucketing.
+    "max_buffer_size": 5000,
+    "min_bucket_size": 16,
+    "prefix_match_threshold": 0.0,
+    "load_balance_threshold": 32,
+    "batch_size": 128,
+    "on_error": "raise",
+    "engine_args": {},
+    "generate_args": {},
+    "use_ray": False,
+    "use_threading": True,
+    "inflight_limit": 128,
+    "engine_init_timeout_s": None,
+}
+
+
+def normalize_options(options: Any | None) -> dict[str, Any]:
+    """Normalize a native SGLang options envelope into backend options.
+
+    Returns the same shape the C++ executor factory reads (batch/backpressure
+    controls plus engine/generate args); ``do_prefix_routing`` is forced off.
+    """
+    if isinstance(options, _NormalizedSGLangOptions):
+        return options
+    if options is None or isinstance(options, str):
+        raise ValueError("sglang options must use the versioned envelope; bare JSON is not supported")
+    if not isinstance(options, dict):
+        try:
+            options = dict(options)
+        except Exception as exc:
+            raise TypeError("sglang options must use the versioned envelope") from exc
+    options = _unpack_native_options_envelope(options)
+    merged = _NormalizedSGLangOptions(_SGLANG_DEFAULTS)
+    merged.update(options)
+    merged["engine_args"] = dict(merged.get("engine_args") or {})
+    merged["generate_args"] = dict(merged.get("generate_args") or {})
+    if "model_path" in merged["engine_args"]:
+        raise ValueError("sglang engine_args.model_path is not supported; use the top-level model argument")
+    if "stream" in merged["generate_args"]:
+        stream = merged["generate_args"]["stream"]
+        if not isinstance(stream, bool):
+            raise TypeError("sglang generate_args.stream must be a bool")
+        if stream:
+            raise ValueError("sglang generate_args.stream=True is not supported")
+    merged["on_error"] = str(merged.get("on_error") or "raise").lower()
+    if merged["on_error"] not in ("raise", "log", "null"):
+        raise ValueError("sglang on_error must be one of: raise, log, null")
+    return merged
+
+
+def build_executor(model: str, options: Any | None) -> LLMExecutor:
+    from vane.execution.vllm import _restore_native_vllm_secrets
+
+    opts = normalize_options(options)
+    if opts.get("use_ray"):
+        import ray
+
+        if not ray.is_initialized():
+            raise RuntimeError("Ray SGLang execution requires an initialized RayRunner runtime")
+        pool_name = opts.get("ray_actor_pool_name")
+        if pool_name:
+            from vane.execution.vllm import LLMActors
+
+            llm_actors = LLMActors.lookup_named(concurrency=opts["concurrency"], name_prefix=pool_name)
+        else:
+            from vane.execution.vllm import LLMActors
+
+            opts = _restore_native_vllm_secrets(opts)
+            llm_actors = LLMActors(
+                model=model,
+                engine_args=opts["engine_args"],
+                generate_args=opts["generate_args"],
+                on_error=opts["on_error"],
+                gpus_per_actor=opts["gpus_per_actor"],
+                concurrency=opts["concurrency"],
+                load_balance_threshold=opts["load_balance_threshold"],
+                engine_init_timeout_s=opts.get("engine_init_timeout_s"),
+                actor_cls=SGLangRayLocalExecutor,
+            )
+        from vane.execution.vllm import RemoteVLLMExecutor, _attach_vllm_cleanup_failure
+
+        try:
+            return RemoteVLLMExecutor(llm_actors, pool_name=pool_name)
+        except BaseException as construction_error:
+            try:
+                llm_actors.shutdown()
+            except BaseException as cleanup_error:
+                _attach_vllm_cleanup_failure(
+                    construction_error,
+                    "sglang actor pool construction rollback",
+                    cleanup_error,
+                )
+            raise
+
+    opts = _restore_native_vllm_secrets(opts)
+    return SGLangLocalExecutor(
+        model,
+        opts["engine_args"],
+        opts["generate_args"],
+        on_error=opts["on_error"],
+        use_threading=opts["use_threading"],
+        engine_init_timeout_s=opts.get("engine_init_timeout_s"),
+        force_background_thread=opts.get("_force_background_thread", False),
+    )

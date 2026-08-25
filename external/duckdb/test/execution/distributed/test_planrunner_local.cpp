@@ -15,16 +15,21 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/execution/distributed/pipeline_node/copy_finish.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator.hpp"
 #include "duckdb/execution/distributed/plan/runner.hpp"
 #include "duckdb/execution/distributed/plan/distributed_physical_plan.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "test_helpers.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 using namespace duckdb;
@@ -279,6 +284,236 @@ private:
 	vector<TaskContext> task_contexts;
 };
 
+class InvalidDataSinkResultWorkerManager final : public WorkerManager {
+public:
+	DuckDBResult<std::vector<WorkerSnapshot>> worker_snapshots() const override {
+		std::vector<WorkerSnapshot> snapshots;
+		snapshots.emplace_back(make_worker_id("datasink-w1"), 1, 0);
+		return DuckDBResult<std::vector<WorkerSnapshot>>::ok(std::move(snapshots));
+	}
+
+	DuckDBResult<void> try_autoscale(const std::vector<TaskResourceRequest> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> shutdown() override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) override {
+		for (const auto &task : tasks) {
+			task_contexts.push_back(task.task_context());
+		}
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> task_input_stream_exhausted_for_query(const string &,
+	                                                         const std::unordered_set<SourceNodeId> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> materialization_barrier_completed(const string &, NodeID) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query(const string &, double) override {
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("DataSink must use streaming result validation"));
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>>
+	wait_fte_query_streaming(const string &, double, MaterializedOutputCallback on_output) override {
+		if (task_contexts.empty() || task_contexts.front().node_ids().empty()) {
+			return DuckDBResult<std::vector<MaterializedOutput>>::err(
+			    DuckDBError::invalid_state_error("DataSink test task has no pipeline node identity"));
+		}
+		vector<LogicalType> invalid_types {LogicalType::VARCHAR};
+		auto collection = std::make_shared<ColumnDataCollection>(Allocator::DefaultAllocator(), invalid_types);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), invalid_types);
+		chunk.SetValue(0, 0, Value("invalid-result"));
+		chunk.SetCardinality(1);
+		collection->Append(chunk);
+		vector<ResultPartitionRef> partitions;
+		partitions.push_back(std::make_shared<ColumnDataResultPartition>(std::move(collection)));
+		MaterializedOutput output(std::move(partitions), make_worker_id("datasink-w1"),
+		                          task_contexts.front().node_ids());
+		auto callback_result = on_output(output);
+		if (callback_result.is_err()) {
+			return DuckDBResult<std::vector<MaterializedOutput>>::err(callback_result.error());
+		}
+		handle_released = true;
+		std::vector<MaterializedOutput> outputs;
+		return DuckDBResult<std::vector<MaterializedOutput>>::ok(std::move(outputs));
+	}
+
+	DuckDBResult<void> abort_and_quiesce_query(const string &) override {
+		abort_calls++;
+		return DuckDBResult<void>::ok();
+	}
+
+	bool handle_released = false;
+	idx_t abort_calls = 0;
+
+private:
+	vector<TaskContext> task_contexts;
+};
+
+class BackpressuredDataSinkWorkerManager final : public WorkerManager {
+public:
+	explicit BackpressuredDataSinkWorkerManager(string operation_id_p) : operation_id(std::move(operation_id_p)) {
+	}
+
+	DuckDBResult<std::vector<WorkerSnapshot>> worker_snapshots() const override {
+		std::vector<WorkerSnapshot> snapshots;
+		snapshots.emplace_back(make_worker_id("datasink-backpressure-w1"), 1, 0);
+		return DuckDBResult<std::vector<WorkerSnapshot>>::ok(std::move(snapshots));
+	}
+
+	DuckDBResult<void> try_autoscale(const std::vector<TaskResourceRequest> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> shutdown() override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask> tasks) override {
+		for (const auto &task : tasks) {
+			task_contexts.push_back(task.task_context());
+		}
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> task_input_stream_exhausted_for_query(const string &,
+	                                                         const std::unordered_set<SourceNodeId> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> materialization_barrier_completed(const string &, NodeID) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query(const string &, double) override {
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::invalid_state_error("DataSink must use streaming result validation"));
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>>
+	wait_fte_query_streaming(const string &, double, MaterializedOutputCallback on_output) override {
+		if (task_contexts.empty() || task_contexts.front().node_ids().empty()) {
+			return DuckDBResult<std::vector<MaterializedOutput>>::err(
+			    DuckDBError::invalid_state_error("DataSink test task has no pipeline node identity"));
+		}
+		auto first_result = on_output(MakeOutput());
+		if (first_result.is_err()) {
+			return DuckDBResult<std::vector<MaterializedOutput>>::err(first_result.error());
+		}
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			second_publish_started = true;
+		}
+		condition.notify_all();
+		auto second_result = on_output(MakeOutput());
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			second_publish_completed = true;
+		}
+		condition.notify_all();
+		if (second_result.is_err()) {
+			return DuckDBResult<std::vector<MaterializedOutput>>::err(second_result.error());
+		}
+		std::vector<MaterializedOutput> outputs;
+		return DuckDBResult<std::vector<MaterializedOutput>>::ok(std::move(outputs));
+	}
+
+	DuckDBResult<void> abort_and_quiesce_query(const string &) override {
+		abort_calls++;
+		std::unique_lock<std::mutex> guard(lock);
+		abort_observed_completed =
+		    condition.wait_for(guard, std::chrono::seconds(5), [&]() { return second_publish_completed; });
+		if (!abort_observed_completed) {
+			return DuckDBResult<void>::err(
+			    DuckDBError::external_error("timed out waiting for blocked DataSink result publication"));
+		}
+		return DuckDBResult<void>::ok();
+	}
+
+	bool WaitForSecondPublish() {
+		std::unique_lock<std::mutex> guard(lock);
+		return condition.wait_for(guard, std::chrono::seconds(5), [&]() { return second_publish_started; });
+	}
+
+	idx_t abort_calls = 0;
+	bool abort_observed_completed = false;
+	bool second_publish_completed = false;
+
+private:
+	MaterializedOutput MakeOutput() const {
+		vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+		                           LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR,
+		                           LogicalType::VARCHAR};
+		auto collection = std::make_shared<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), types);
+		chunk.SetValue(0, 0, Value(operation_id));
+		chunk.SetValue(1, 0, Value("applied"));
+		chunk.SetValue(2, 0, Value::UBIGINT(1));
+		chunk.SetValue(3, 0, Value::UBIGINT(1));
+		chunk.SetValue(4, 0, Value::UBIGINT(sizeof(uint64_t)));
+		chunk.SetValue(5, 0, Value("{}"));
+		chunk.SetValue(6, 0, Value("[]"));
+		chunk.SetCardinality(1);
+		collection->Append(chunk);
+		vector<ResultPartitionRef> partitions;
+		partitions.push_back(std::make_shared<ColumnDataResultPartition>(std::move(collection)));
+		return MaterializedOutput(std::move(partitions), make_worker_id("datasink-backpressure-w1"),
+		                          task_contexts.front().node_ids());
+	}
+
+	string operation_id;
+	vector<TaskContext> task_contexts;
+	std::mutex lock;
+	std::condition_variable condition;
+	bool second_publish_started = false;
+};
+
+class OversizedDataSinkErrorWorkerManager final : public WorkerManager {
+public:
+	DuckDBResult<std::vector<WorkerSnapshot>> worker_snapshots() const override {
+		std::vector<WorkerSnapshot> snapshots;
+		snapshots.emplace_back(make_worker_id("datasink-error-w1"), 1, 0);
+		return DuckDBResult<std::vector<WorkerSnapshot>>::ok(std::move(snapshots));
+	}
+
+	DuckDBResult<void> try_autoscale(const std::vector<TaskResourceRequest> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> shutdown() override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> submit_fte_task_events(std::vector<WorkerTask>) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<void> task_input_stream_exhausted_for_query(const string &,
+	                                                         const std::unordered_set<SourceNodeId> &) override {
+		return DuckDBResult<void>::ok();
+	}
+
+	DuckDBResult<std::vector<MaterializedOutput>> wait_fte_query_streaming(const string &, double,
+	                                                                       MaterializedOutputCallback) override {
+		return DuckDBResult<std::vector<MaterializedOutput>>::err(
+		    DuckDBError::external_error("oversized-worker-error:" + string(100000, 'x')));
+	}
+
+	DuckDBResult<void> abort_and_quiesce_query(const string &) override {
+		return DuckDBResult<void>::ok();
+	}
+};
+
 class PlanRunnerTestExtensionWriteOperator final : public PhysicalOperator, public ExtensionWriteTaskProvider {
 public:
 	PlanRunnerTestExtensionWriteOperator(PhysicalPlan &physical_plan, vector<LogicalType> types,
@@ -392,6 +627,127 @@ TEST_CASE("PlanRunner instantiation", "[distributed][plan][local]") {
 	auto runner = std::make_shared<PlanRunner>(worker_mgr, con.context);
 
 	REQUIRE(runner != nullptr);
+}
+
+TEST_CASE("PlanRunner validates DataSink output before acknowledging its selected handle",
+          "[distributed][plan][datasink]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> result_types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+	                                  LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR,
+	                                  LogicalType::VARCHAR};
+	auto &child = physical_plan->Make<PhysicalDummyScan>(result_types, 1);
+	auto &sink = physical_plan->Make<PhysicalDataSink>(std::move(result_types), "validate-before-ack", 1);
+	sink.children.push_back(child);
+	physical_plan->SetRoot(sink);
+
+	auto worker_manager = std::make_shared<InvalidDataSinkResultWorkerManager>();
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(26, "planrunner-datasink-validate-before-ack",
+	                                                                  physical_plan, std::move(execution_config));
+
+	auto result = runner->run_plan(std::move(distributed_plan));
+
+	REQUIRE(result.is_ok());
+	REQUIRE(result.value().tag == PlanRunner::PlanResult::DATA_SINK);
+	REQUIRE(result.value().data_sink_result.outcome_unknown);
+	REQUIRE_FALSE(worker_manager->handle_released);
+	REQUIRE(worker_manager->abort_calls == 1);
+}
+
+TEST_CASE("PlanRunner disconnects DataSink backpressure before aborting after a startup callback failure",
+          "[distributed][plan][datasink]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const string operation_id = "startup-callback-backpressure";
+	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> result_types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+	                                  LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR,
+	                                  LogicalType::VARCHAR};
+	auto &child = physical_plan->Make<PhysicalDummyScan>(result_types, 1);
+	auto &sink = physical_plan->Make<PhysicalDataSink>(std::move(result_types), operation_id, 1);
+	sink.children.push_back(child);
+	physical_plan->SetRoot(sink);
+
+	auto worker_manager = std::make_shared<BackpressuredDataSinkWorkerManager>(operation_id);
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(27, "planrunner-datasink-startup-callback",
+	                                                                  physical_plan, std::move(execution_config));
+
+	auto result = runner->run_plan(std::move(distributed_plan), {}, [&]() {
+		if (!worker_manager->WaitForSecondPublish()) {
+			throw std::runtime_error("DataSink worker did not reach its backpressured publication");
+		}
+		throw std::runtime_error("planned DataSink startup callback failure");
+	});
+
+	REQUIRE(result.is_ok());
+	REQUIRE(result.value().tag == PlanRunner::PlanResult::DATA_SINK);
+	REQUIRE(result.value().data_sink_result.outcome_unknown);
+	REQUIRE(StringUtil::Contains(result.value().data_sink_result.outcome_error,
+	                             "planned DataSink startup callback failure"));
+	REQUIRE(worker_manager->abort_calls == 1);
+	REQUIRE(worker_manager->abort_observed_completed);
+	REQUIRE(worker_manager->second_publish_completed);
+}
+
+TEST_CASE("PlanRunner bounds direct DataSink execution errors before retaining them", "[distributed][plan][datasink]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto physical_plan = std::make_shared<PhysicalPlan>(Allocator::DefaultAllocator());
+	vector<LogicalType> result_types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+	                                  LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::VARCHAR,
+	                                  LogicalType::VARCHAR};
+	auto &child = physical_plan->Make<PhysicalDummyScan>(result_types, 1);
+	auto &sink = physical_plan->Make<PhysicalDataSink>(std::move(result_types), "bounded-execution-error", 1);
+	sink.children.push_back(child);
+	physical_plan->SetRoot(sink);
+
+	PlanConfig config;
+	config.query_id = "planrunner-datasink-bounded-execution-error";
+	config.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto translated = physical_plan_to_pipeline_node(config, physical_plan, con.context.get());
+	REQUIRE(translated.is_ok());
+
+	auto worker_manager = std::make_shared<OversizedDataSinkErrorWorkerManager>();
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto task_executor = std::make_shared<PlanTaskExecutor>(con.context);
+	auto output_channel = create_unbounded_channel<MaterializedOutput>();
+	auto execution_result = runner->execute_plan(translated.value(), task_executor, std::move(output_channel.first), {},
+	                                             [](const MaterializedOutput &) { return DuckDBResult<void>::ok(); });
+
+	REQUIRE(execution_result.is_err());
+	const string retained_error = execution_result.error().what();
+	REQUIRE(retained_error.size() <= DATA_SINK_MAX_OUTCOME_ERROR_BYTES + 128);
+	REQUIRE(StringUtil::Contains(retained_error, "oversized-worker-error:"));
+}
+
+TEST_CASE("PlanRunner finishes an empty-result plan without submitting worker tasks", "[distributed][plan][local]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto logical_plan = con.ExtractPlan("SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE");
+	REQUIRE(logical_plan != nullptr);
+
+	PhysicalPlanGenerator generator(*con.context);
+	auto generated_plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(generated_plan != nullptr);
+	REQUIRE(generated_plan->Root().type == PhysicalOperatorType::EMPTY_RESULT);
+	auto physical_plan = DuckPhysicalPlanRef(generated_plan.release());
+
+	auto workers = setup_workers({{make_worker_id("empty-result-w1"), 1}});
+	auto worker_manager = std::make_shared<MockWorkerManager>(std::move(workers));
+	auto runner = std::make_shared<PlanRunner>(worker_manager, con.context);
+	auto execution_config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
+	auto distributed_plan = std::make_shared<DistributedPhysicalPlan>(17, "planrunner-empty-result", physical_plan,
+	                                                                  std::move(execution_config));
+
+	auto result = runner->run_plan(std::move(distributed_plan));
+	REQUIRE(result.is_ok());
+	REQUIRE(result.value().tag == PlanRunner::PlanResult::STREAMING);
+	REQUIRE_FALSE(result.value().stream.next().first);
 }
 
 TEST_CASE("PlanRunner rejects an unregistered extension write capability",

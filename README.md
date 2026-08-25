@@ -92,10 +92,31 @@ ADBC facade.
 Optional features are provided as extras:
 
 ```bash
-pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers / vllm likewise)
+pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transformers likewise)
+pip install 'vane-ai[vllm]'     # Native vLLM inference on Linux x86-64
+pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
 ```
+
+The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
+CUDA-specific wheel index for the host. For a CUDA 12.9 environment, install the extra and then apply SGLang's cu129
+wheel overrides before running Vane:
+
+```bash
+uv pip install 'vane-ai[sglang]'
+uv pip install --force-reinstall torch==2.11.0 torchaudio==2.11.0 torchvision \
+  --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel==0.4.5 \
+  --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm==0.1.5.post1 \
+  --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
+This CUDA 12.9 installation path was smoke-tested on NVIDIA Ada (compute capability 8.9) with driver 570.207,
+PyTorch 2.11.0+cu129, `sglang-kernel` 0.4.5+cu129, and Ray 2.58.0. This is a validated reference configuration, not an
+exhaustive hardware compatibility list. Do not run a later unconstrained dependency sync after the overrides, because
+it can replace the cu129 packages with SGLang's default CUDA 13 variants.
 
 The `video` extra installs `decord` on Linux x86-64, Vane's currently supported native platform. decord itself publishes no wheels for modern Python on macOS or for any ARM platform; if Vane adds Windows support later, decord's existing `win_amd64` wheel can be enabled explicitly.
 
@@ -126,6 +147,29 @@ A worker lazily starts one process-owned plaintext `grpc://` Flight service when
 Workers advertise their Ray private address by default. `VANE_FLIGHT_BIND_HOST` may select a different local bind address, including `0.0.0.0` in a container with appropriate network policy, while `VANE_FLIGHT_ADVERTISE_HOST` must always be a routable non-wildcard address. The advertised-host override is worker-local: set it in each worker node's environment rather than on the driver or in a Ray Job/actor runtime environment. `DUCKDB_FLIGHT_PORT` selects a fixed worker-local port; the default `0` lets the operating system allocate one. See [SECURITY.md](SECURITY.md) for the complete trust boundary.
 
 Each cross-worker partition read has a five-minute deadline covering its complete Flight DoGet stream. Override it with `VANE_FLIGHT_CALL_TIMEOUT_S`, or set it to `0` to disable the deadline. The deadline is not reset when a schema or record batch arrives. Query interruption independently cancels an in-flight Flight call, so interrupted consumers release the producer-side stream and its shuffle-file read lease.
+
+### Catalog-backed table creation
+
+Relations can create catalog-backed tables with storage-format-neutral table properties and partition expressions:
+
+```python
+import vane
+
+relation = vane.sql("SELECT id, event_date FROM source_table")
+relation.create(
+    "catalog.schema.table",
+    properties={
+        "format-version": "2",
+        "write.data.path": "s3://bucket/table/data",
+    },
+    partition_by=["bucket(16, id)", vane.ColumnExpression("event_date")],
+)
+```
+
+The target catalog defines which properties and partition expressions it supports. With the Ray runner, CTAS is
+submitted as a distributed write and any planning or execution error is returned directly; it is never retried in
+local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckDB backend. An unset or empty
+`VANE_RUNNER` selects Ray.
 
 ### More Resources
 

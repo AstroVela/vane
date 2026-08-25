@@ -443,6 +443,240 @@ def test_ray_scan_filter_projection(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) LIMIT 0",
+    ],
+)
+def test_ray_empty_result_plan_returns_no_partitions(ray_runner, duckdb_conn, sql):
+    label = "test_ray_e2e: empty result"
+    explain_text = _explain_text(duckdb_conn, sql)
+    _assert_explain_contains(explain_text, require_all=["EMPTY_RESULT"], label=label)
+
+    relation = duckdb_conn.sql(sql)
+    assert relation.columns == ["x"]
+    parts = _run_iter_tables(ray_runner, relation, label)
+    assert parts == []
+
+    arrow_result = duckdb_conn.sql(sql).to_arrow_table()
+    assert arrow_result.schema.names == ["x"]
+    assert arrow_result.num_rows == 0
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 AS x UNION ALL SELECT 2 AS x UNION ALL SELECT 3 AS x",
+        "SELECT * FROM (VALUES (1), (2), (2)) AS left_input(x) UNION SELECT * FROM (VALUES (2), (3)) AS right_input(x)",
+        "SELECT * FROM (VALUES (1), (2)) AS input(x) WHERE FALSE UNION ALL SELECT * FROM (VALUES (3), (4)) AS input(x)",
+    ],
+)
+def test_ray_union_value_branches(ray_runner, duckdb_conn, sql):
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: union value branches",
+        require_all=["UNION"],
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "LIMIT 1",
+        "LIMIT 1 OFFSET 2",
+    ],
+)
+def test_ray_union_limit_and_offset_preserve_branch_order(ray_runner, duckdb_conn, suffix):
+    label = "test_ray_e2e: union limit preserves branch order"
+    duckdb_conn.execute("SET preserve_insertion_order=true")
+    sql = f"""
+        SELECT x
+        FROM (
+            SELECT * FROM (VALUES (3), (4)) AS first_branch(x)
+            UNION ALL
+            SELECT * FROM (VALUES (1), (2)) AS second_branch(x)
+        )
+        {suffix}
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper()
+    assert "ORDER: BRANCH ORDER" in plan_text.upper(), plan_text
+    parts = _run_iter_tables(ray_runner, relation, label)
+    _assert_results_match(duckdb_conn, sql, parts, label, ordered=True)
+
+
+def test_ray_union_parquet_branches_preserve_independent_scan_splits(ray_runner, duckdb_conn, parquet_path):
+    sql = f"""
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a < 600
+        UNION ALL
+        SELECT a, b FROM read_parquet('{parquet_path}') WHERE a >= 400
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, "test_ray_e2e: union parquet branches")
+    assert plan_text and "UNION" in plan_text.upper()
+    assert num_parts is not None and num_parts >= 2
+    parts = _run_iter_tables(ray_runner, relation, "test_ray_e2e: union parquet branches")
+    _assert_results_match(duckdb_conn, sql, parts, "test_ray_e2e: union parquet branches")
+
+
+def test_ray_union_branches_feed_distributed_order_by(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: union feeds distributed order by"
+    sql = """
+        SELECT x
+        FROM (SELECT 3 AS x UNION ALL SELECT 1 AS x UNION ALL SELECT 2 AS x)
+        ORDER BY x
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "ORDERBY" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "ORDER_BY"],
+        ordered=True,
+    )
+
+
+def test_ray_union_branches_feed_broadcast_join(ray_runner, duckdb_conn, monkeypatch):
+    label = "test_ray_e2e: union feeds broadcast join"
+    monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "broadcast_right")
+    sql = """
+        SELECT probe.k, build.v
+        FROM range(1, 5) AS probe(k)
+        JOIN (
+            SELECT 1 AS k, 10 AS v
+            UNION ALL
+            SELECT 3 AS k, 30 AS v
+        ) AS build
+          ON probe.k = build.k
+    """
+    relation = duckdb_conn.sql(sql)
+    plan_text, _ = _get_distributed_plan_info(relation, label)
+    assert plan_text and "UNION" in plan_text.upper() and "BROADCAST JOIN" in plan_text.upper()
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["UNION", "HASH_JOIN"],
+    )
+
+
+def test_ray_range_and_generate_series_distributed(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    label = "test_ray_e2e: distributed range source"
+    sql = "SELECT i FROM range(0, 8193) AS t(i)"
+    relation = duckdb_conn.sql(sql)
+    _, num_parts = _get_distributed_plan_info(relation, label)
+    assert num_parts is not None and num_parts >= 4
+    parts = _run_iter_tables(ray_runner, relation, label, timeout_s=30.0)
+    _assert_results_match(duckdb_conn, sql, parts, label)
+
+    cases = [
+        (
+            "SELECT i FROM generate_series(5, -5, -2) AS t(i)",
+            "test_ray_e2e: distributed negative generate_series",
+        ),
+        (
+            "SELECT ts FROM range(TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-08', INTERVAL 1 DAY) AS t(ts)",
+            "test_ray_e2e: distributed fixed timestamp range",
+        ),
+        (
+            "SELECT ts FROM generate_series(TIMESTAMP '2026-01-31', TIMESTAMP '2026-05-31', INTERVAL 1 MONTH) AS t(ts)",
+            "test_ray_e2e: distributed calendar timestamp generate_series",
+        ),
+    ]
+    for case_sql, case_label in cases:
+        try:
+            _run_query_case(duckdb_conn, ray_runner, case_sql, case_label, timeout_s=30.0)
+        except Exception as exc:
+            raise AssertionError(f"{case_label}: distributed execution failed") from exc
+
+
+def test_ray_repeat_sources_use_exact_sequence_splits(ray_runner, duckdb_conn, monkeypatch):
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    cases = [
+        (
+            "SELECT value FROM repeat(NULL::INTEGER, 17) AS t(value)",
+            "test_ray_e2e: distributed repeat source",
+        ),
+        (
+            """
+                SELECT id, label, payload
+                FROM repeat_row(
+                    42,
+                    NULL::VARCHAR,
+                    [1, NULL, 3],
+                    num_rows=11
+                ) AS t(id, label, payload)
+            """,
+            "test_ray_e2e: distributed repeat_row source",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts is not None and num_parts >= 4
+        _run_query_case(duckdb_conn, ray_runner, sql, label)
+
+    empty_sql = "SELECT value FROM repeat('unused', 0) AS t(value)"
+    empty_parts = _run_iter_tables(ray_runner, duckdb_conn.sql(empty_sql), "test_ray_e2e: empty repeat source")
+    assert empty_parts == []
+
+
+def test_ray_singleton_table_inout_sources_run_exactly_once(ray_runner, duckdb_conn):
+    duckdb_conn.execute("LOAD json")
+    cases = [
+        (
+            "SELECT value, ordinality FROM unnest([10, NULL, 30]) WITH ORDINALITY AS t(value, ordinality)",
+            "test_ray_e2e: singleton unnest source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            'FROM json_each(\'{"a": 1, "b": [2, null]}\')',
+            "test_ray_e2e: singleton json_each source",
+        ),
+        (
+            "SELECT key, value, type, atom, id, parent, fullkey, path, rowid, json, root "
+            "FROM json_tree('{\"a\": 1, \"b\": [2, null]}', '$.b')",
+            "test_ray_e2e: singleton json_tree source with path",
+        ),
+    ]
+    for sql, label in cases:
+        relation = duckdb_conn.sql(sql)
+        _, num_parts = _get_distributed_plan_info(relation, label)
+        assert num_parts == 1
+        _run_query_case(duckdb_conn, ray_runner, sql, label, ordered=True)
+
+    empty_sql = "SELECT * FROM unnest([]::INTEGER[])"
+    empty_relation = duckdb_conn.sql(empty_sql)
+    _, num_parts = _get_distributed_plan_info(empty_relation, "test_ray_e2e: empty singleton unnest")
+    assert num_parts == 1
+    assert _run_iter_tables(ray_runner, empty_relation, "test_ray_e2e: empty singleton unnest") == []
+
+
+def test_ray_correlated_unnest_remains_input_driven(ray_runner, duckdb_conn):
+    sql = """
+        SELECT id, value
+        FROM (VALUES (1, [10, 11]), (2, [20])) AS input(id, values),
+             LATERAL unnest(values) AS expanded(value)
+    """
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        "test_ray_e2e: correlated unnest remains input driven",
+        require_any=["UNNEST", "INOUT_FUNCTION", "DELIM_JOIN"],
+    )
+
+
 @pytest.mark.gpu
 def test_ray_vllm_distributed(ray_runner, duckdb_conn):
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
@@ -2796,8 +3030,6 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
     input_path = tmp_path / "row_preserving_udf_limit"
     shuffle_dir = tmp_path / "row_preserving_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2822,8 +3054,8 @@ def test_ray_row_preserving_batch_udf_limit_preserves_output_schema(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert distributed_plan.num_partitions() == 4
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
@@ -2852,8 +3084,6 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
     input_path = tmp_path / "streaming_struct_udf_limit"
     shuffle_dir = tmp_path / "streaming_struct_udf_limit_shuffle"
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -2886,8 +3116,8 @@ def test_ray_streaming_batch_udf_limit_preserves_single_struct_column(
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert distributed_plan.num_partitions() == 4
     plan_text = distributed_plan.repr_ascii(False).upper()
     assert "STREAMINGUDF" in plan_text
@@ -3050,7 +3280,7 @@ def test_ray_task_map_batches_worker_process(ray_runner, duckdb_conn, tmp_path):
     assert os.getpid() not in pids
 
 
-def test_ray_task_map_batches_worker_parquet_scan_filter_projection(
+def test_ray_split_batches_worker_parquet_scan_filter_projection(
     ray_runner,
     duckdb_conn,
     partitioned_parquet_path,
@@ -3155,8 +3385,6 @@ def test_ray_fixed_row_reservoir_sample_merges_task_states(ray_runner, duckdb_co
     shuffle_dir = tmp_path / "reservoir_sample_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     monkeypatch.setenv("VANE_ORDER_BY_SOURCE_TASKS", "4")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
@@ -3226,8 +3454,6 @@ def test_ray_fixed_row_reservoir_sample_preserves_hash_join_continuations(
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET disabled_optimizers = 'late_materialization'")
     duckdb_conn.execute("SET threads = 4")
@@ -3342,14 +3568,12 @@ def test_ray_group_by_multi_partition_plan(ray_runner, duckdb_conn, parquet_path
     )
 
 
-def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: grouping sets span multiple scan tasks"
+def test_ray_grouping_sets_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: grouping sets span multiple scan splits"
     input_path = tmp_path / "grouping_sets_multi_task"
     shuffle_dir = tmp_path / "grouping_sets_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
     duckdb_conn.execute("SET perfect_ht_threshold=0")
     duckdb_conn.execute(f"""
@@ -3375,8 +3599,8 @@ def test_ray_grouping_sets_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = [len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in distributed_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     normalized_plan = plan_text.upper()
     assert plan_text and "GROUPINGSETEXPAND" in normalized_plan and "REPARTITION" in normalized_plan, (
@@ -3674,8 +3898,6 @@ def test_ray_join_auto_broadcast_keeps_preserved_side_as_receiver(ray_runner, du
     monkeypatch.delenv("VANE_DISTRIBUTED_JOIN_STRATEGY", raising=False)
     monkeypatch.delenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", raising=False)
     monkeypatch.setenv("VANE_DISTRIBUTED_BROADCAST_JOIN_RECEIVER_REPARTITION", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3875,8 +4097,6 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
     monkeypatch.setenv("VANE_DISTRIBUTED_JOIN_STRATEGY", "hash")
     monkeypatch.setenv("VANE_DISTRIBUTED_AUTO_BROADCAST_THRESHOLD_BYTES", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "8")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -3908,8 +4128,8 @@ def test_ray_hash_join_drains_unequal_repartition_event_streams(ray_runner, duck
         pytest.skip("vane.ray_cxx.PyLogicalPlan not available in this environment")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"{label}-plan")
     distributed_plan = logical_plan.to_physical_plan(duckdb_conn)
-    descriptor_counts = sorted(len(descriptors) for descriptors in distributed_plan.scan_task_descriptor_map().values())
-    assert descriptor_counts == [2, 8], f"{label}: expected unequal scan task streams, got {descriptor_counts}"
+    split_counts = sorted(len(batches) for batches in distributed_plan.scan_split_batch_map().values())
+    assert split_counts == [2, 8], f"{label}: expected unequal scan split streams, got {split_counts}"
     plan_text = distributed_plan.repr_ascii(False)
     assert "REPARTITION" in plan_text.upper(), f"{label}: expected repartitioned hash join, got:\n{plan_text}"
     assert "HASH JOIN" in plan_text.upper(), f"{label}: expected hash join, got:\n{plan_text}"
@@ -3939,9 +4159,6 @@ def test_ray_group_by_flight_shuffle_exchange_minio_durable(ray_runner, duckdb_c
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", shuffle_uri)
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "8")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_BYTES", "1GB")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MAX_BYTES", "2GB")
 
     _configure_conn_for_s3(duckdb_conn, endpoint, access_key, secret_key, region)
     duckdb_conn.execute("SET perfect_ht_threshold=0")
@@ -4113,15 +4330,13 @@ def test_ray_window(ray_runner, duckdb_conn, parquet_path):
     )
 
 
-def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path, monkeypatch):
-    label = "test_ray_e2e: windows span multiple scan tasks"
+def test_ray_windows_span_multiple_scan_splits(ray_runner, duckdb_conn, tmp_path, monkeypatch):
+    label = "test_ray_e2e: windows span multiple scan splits"
     window_path = tmp_path / "window_multi_task"
     shuffle_dir = tmp_path / "window_multi_task_shuffle"
 
     monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
     monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", str(shuffle_dir))
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_SIZE_GROUPING", "0")
-    monkeypatch.setenv("VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM", "4")
     monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
 
     duckdb_conn.execute(f"""
@@ -4148,8 +4363,8 @@ def test_ray_windows_span_multiple_scan_tasks(ray_runner, duckdb_conn, tmp_path,
         return logical_plan.to_physical_plan(duckdb_conn)
 
     global_plan = distributed_plan(global_sql, "global")
-    descriptor_counts = [len(descriptors) for descriptors in global_plan.scan_task_descriptor_map().values()]
-    assert descriptor_counts == [4], f"{label}: expected four scan tasks, got {descriptor_counts}"
+    split_counts = [len(batches) for batches in global_plan.scan_split_batch_map().values()]
+    assert split_counts == [4], f"{label}: expected four scan splits, got {split_counts}"
     assert global_plan.num_partitions() == 1
     assert "REPARTITION" in global_plan.repr_ascii(False).upper()
 

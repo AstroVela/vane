@@ -73,12 +73,18 @@ public:
 	DUCKDB_API void Initialize(QueryContext context, bool write);
 	DUCKDB_API int64_t ReadData(void *buffer, int64_t nr_bytes);
 	DUCKDB_API int64_t WriteData(data_ptr_t buffer, int64_t nr_bytes);
+	DUCKDB_API void WriteCompressedData(QueryContext context, data_ptr_t buffer, idx_t nr_bytes);
+	DUCKDB_API void WriteCompressedData(data_ptr_t buffer, idx_t nr_bytes);
 	DUCKDB_API void Close() override;
 
 private:
+	friend class CompressedFileSystem;
+
 	void Clear(); // for Initialize re-use to support FS.Reset()
 
 	idx_t current_position = 0;
+	idx_t physical_bytes_written = 0;
+	optional_idx finalized_file_size;
 	unique_ptr<StreamWrapper> stream_wrapper;
 };
 

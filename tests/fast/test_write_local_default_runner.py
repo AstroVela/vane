@@ -46,7 +46,13 @@ def _new_mutation_connection(vane):
     return connection
 
 
-def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("method_name", "extension"),
+    [("write_csv", "csv"), ("write_parquet", "parquet")],
+)
+def test_format_convenience_write_with_unset_runner_uses_generic_copy_relation(
+    tmp_path, monkeypatch, method_name, extension
+):
     monkeypatch.delenv("VANE_RUNNER", raising=False)
     import vane
 
@@ -61,10 +67,75 @@ def test_write_parquet_with_unset_runner_dispatches_ray(tmp_path, monkeypatch):
     runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
     monkeypatch.setitem(sys.modules, "vane.runners", runners)
 
-    target = tmp_path / "distributed.parquet"
-    vane.connect().sql("select 1 as x").write_parquet(str(target))
+    target = tmp_path / f"distributed.{extension}"
+    relation = vane.connect().sql("select 1 as x")
+    getattr(relation, method_name)(str(target))
 
     assert len(calls) == 1
+    assert calls[0].type == "WRITE_FILE_RELATION"
+    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+        calls[0],
+        f"generic-copy-{extension}-convenience",
+    )
+    assert logical_plan is not None
+    assert not target.exists()
+
+
+def test_write_file_with_unset_runner_dispatches_generic_copy_relation(tmp_path, monkeypatch):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    import vane
+
+    captured = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            captured.append(relation)
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    target = tmp_path / "distributed.csv"
+    connection = vane.connect()
+    connection.sql("select 1 as x").write_file(str(target), format="csv")
+
+    assert len(captured) == 1
+    assert captured[0].type == "WRITE_FILE_RELATION"
+    logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+        captured[0],
+        "generic-copy-relation",
+    )
+    assert logical_plan is not None
+    assert not target.exists()
+
+
+def test_write_file_json_with_unset_runner_builds_distributed_plan(tmp_path, monkeypatch):
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    import vane
+
+    logical_plans = []
+
+    class FakeRayRunner:
+        def run_write(self, relation):
+            logical_plans.append(
+                vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+                    relation,
+                    "generic-json-copy-relation",
+                )
+            )
+            return {"ok": True}
+
+    runners = types.ModuleType("vane.runners")
+    runners.set_runner_ray = lambda *_args, **_kwargs: FakeRayRunner()
+    monkeypatch.setitem(sys.modules, "vane.runners", runners)
+
+    target = tmp_path / "distributed.json"
+    connection = vane.connect()
+    connection.sql("select 1 as id, 'alpha' as label").write_file(str(target), format="json")
+
+    assert len(logical_plans) == 1
+    assert logical_plans[0] is not None
     assert not target.exists()
 
 
@@ -152,7 +223,7 @@ def test_nested_ray_mutation_does_not_reuse_cached_local_runner(tmp_path, monkey
     connection.execute("CREATE TABLE target (value INTEGER)")
     connection.sql("SELECT 1 AS value").write_parquet(str(tmp_path / "nested.parquet"))
 
-    assert local_calls == ["WRITE_PARQUET_RELATION"]
+    assert local_calls == ["WRITE_FILE_RELATION"]
     assert ray_calls == ["INSERT_RELATION"]
     assert connection.execute("SELECT count(*) FROM target").fetchone() == (0,)
 
@@ -350,6 +421,45 @@ def test_write_csv_with_local_fast_runner(tmp_path, monkeypatch):
     conn.sql("select 1 as x").write_csv(str(target))
 
     assert conn.sql(f"select * from read_csv('{target}')").fetchall() == [(1,)]
+
+
+def test_write_file_with_local_fast_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    conn = vane.connect()
+    target = tmp_path / "out.csv"
+    conn.sql("select 1 as x union all select 2 as x").write_file(str(target), format="csv")
+
+    assert conn.sql(f"select * from read_csv('{target}') order by 1").fetchall() == [(1,), (2,)]
+
+
+def test_write_file_json_with_local_fast_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    conn = vane.connect()
+    target = tmp_path / "out.json"
+    conn.sql("select 1 as id, 'alpha' as label union all select 2 as id, 'beta' as label").write_file(
+        str(target), format="json"
+    )
+
+    assert conn.sql(f"select id, label from read_json_auto('{target}') order by id").fetchall() == [
+        (1, "alpha"),
+        (2, "beta"),
+    ]
+
+
+def test_write_file_rejects_unknown_explicit_format_before_creating_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    import vane
+
+    conn = vane.connect()
+    target = tmp_path / "unknown.out"
+    with pytest.raises(Exception, match="(?i)copy function.*jsno"):
+        conn.sql("select 1 as value").write_file(str(target), format="jsno")
+
+    assert not target.exists()
 
 
 def test_invalid_runner_env_raises_clear_error(monkeypatch):

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import json
 import math
 import os
@@ -12,22 +10,20 @@ import threading
 import time
 import uuid
 import warnings
-from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from collections.abc import Mapping
 from decimal import Decimal
 from numbers import Integral, Real
-from typing import Any, Callable, overload
+from typing import Any, Callable
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
-from vane.ai.functions import _log_substituted_failure
 from vane.ai.provider import (
-    _safe_provider_execution_error,
     _SafeProviderError,
     _translate_missing_provider_dependency,
 )
+from vane.execution._llm_executor import LLMExecutor, LocalEngineExecutor, RayActorExecutorMixin
 from vane.execution._vllm_options_protocol import (
     _NATIVE_OPTIONS_NORMALIZED_SECRET_KEY,
     _NATIVE_OPTIONS_PAYLOAD_VERSION,
@@ -139,83 +135,13 @@ def _attach_vllm_cleanup_failure(
         pass
 
 
-class VLLMExecutor(ABC):
-    """Common execution contract shared by local and Ray-backed vLLM executors.
+class VLLMExecutor(LLMExecutor):
+    """Base class for vLLM-backed executors.
 
-    Besides the submit/result lifecycle, the base class owns a one-shot wakeup
-    protocol used by DuckDB's native scheduler.  A scheduler callback is armed
-    only while no result or terminal state is ready, then consumed by the next
-    relevant state change so a blocked pipeline task can be scheduled again.
+    The engine-agnostic submit/result contract and one-shot wakeup protocol
+    live in :class:`LLMExecutor`. This class is the vLLM backend seam: the
+    concrete local, Ray-local, and remote vLLM executors subclass it.
     """
-
-    def _ensure_wakeup_state(self) -> None:
-        """Lazily initialize callback state for subclasses and test doubles."""
-        if not hasattr(self, "_wakeup_lock"):
-            self._wakeup_lock = threading.Lock()
-        if not hasattr(self, "_wakeup_callbacks"):
-            self._wakeup_callbacks: list[Callable[[], None]] = []
-
-    def _wakeup_ready(self) -> bool:
-        """Return whether the native scheduler should resume without arming."""
-        return False
-
-    def register_wakeup_callback(self, callback: Callable[[], None]) -> bool:
-        """Arm a one-shot native wakeup unless work is already actionable.
-
-        True means the callback is stored and the scheduler may safely block;
-        False means it must immediately recheck results or terminal state.
-        """
-        if not callable(callback):
-            raise TypeError("vllm wakeup callback must be callable")
-        self._ensure_wakeup_state()
-        with self._wakeup_lock:
-            if self._wakeup_ready():
-                return False
-            self._wakeup_callbacks.append(callback)
-            return True
-
-    def _notify_state_change(self, *, force: bool = False) -> None:
-        """Wake condition waiters and consume actionable native callbacks.
-
-        Condition waiters are always notified.  Native callbacks are one-shot
-        and run only when `_wakeup_ready()` is true, unless `force` requests an
-        unconditional scheduler recheck after a state transition.
-        """
-        self._ensure_wakeup_state()
-        callbacks: list[Callable[[], None]] = []
-        with self._wakeup_lock:
-            if force or self._wakeup_ready():
-                callbacks = self._wakeup_callbacks
-                self._wakeup_callbacks = []
-        result_cv = getattr(self, "_result_cv", None)
-        if result_cv is not None:
-            with result_cv:
-                result_cv.notify_all()
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                pass
-
-    @abstractmethod
-    def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
-        pass
-
-    @abstractmethod
-    def take_ready_result(self) -> tuple[list[str | None], pa.Table] | None:
-        pass
-
-    @abstractmethod
-    def finished_submitting(self) -> None:
-        pass
-
-    @abstractmethod
-    def all_tasks_finished(self) -> bool:
-        pass
-
-    @abstractmethod
-    def shutdown(self) -> None:
-        pass
 
 
 def _ensure_table(rows: Any) -> pa.Table:
@@ -236,626 +162,72 @@ def _concat_tables(tables: list[pa.Table]) -> pa.Table:
     return pa.concat_tables(tables)
 
 
-class LocalVLLMExecutor(VLLMExecutor):
-    def __init__(
-        self,
-        model: str,
-        engine_args: dict[str, Any],
-        generate_args: dict[str, Any],
-        on_error: str = "raise",
-        use_threading: bool = True,
-        engine_init_timeout_s: float | None = None,
-        force_background_thread: bool = False,
-    ):
+class LocalVLLMExecutor(VLLMExecutor, LocalEngineExecutor):
+    """vLLM backend executor: local or Ray-backed async engine.
+
+    Submission, batching, wakeup, and distributed routing live in
+    :class:`LocalEngineExecutor`; this class supplies only the vLLM engine
+    hooks.
+    """
+
+    _engine_name = "vllm"
+
+    def _materialize_sampling_params(self, generate_args: dict[str, Any]) -> Any:
         with _translate_missing_provider_dependency("vllm", "vllm"):
             from vllm import SamplingParams  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
-        self.model = model
-        self.engine_args = dict(engine_args)
-        self.llm: Any = None
-        self.engine_ready = threading.Event()
-        self.engine_error_message: str | None = None
-        self.engine_init_timeout_s = _vllm_engine_init_timeout_s(engine_init_timeout_s)
-
         sampling_params = generate_args.pop("sampling_params", None)
         if sampling_params is None:
-            self.sampling_params = SamplingParams()
-        elif isinstance(sampling_params, SamplingParams):
-            self.sampling_params = sampling_params
-        else:
-            if isinstance(sampling_params, str):
-                try:
-                    sampling_params = json.loads(sampling_params)
-                except json.JSONDecodeError as exc:
-                    raise ValueError("vllm sampling_params JSON could not be parsed") from exc
-            if isinstance(sampling_params, dict):
-                structured_outputs = sampling_params.get("structured_outputs")
-                if isinstance(structured_outputs, Mapping):
-                    with _translate_missing_provider_dependency("vllm", "vllm"):
-                        from vllm.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                            StructuredOutputsParams,
-                        )
-
-                    sampling_params = dict(sampling_params)
-                    sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
-                self.sampling_params = SamplingParams(**sampling_params)
-            else:
-                raise TypeError("vllm sampling_params must be a dict, JSON string, or SamplingParams instance")
-        self.generate_args = generate_args
-
-        self.counter = 0
-        self.counter_lock = threading.Lock()
-
-        self.running_task_count = 0
-        self.task_count_lock = threading.Lock()
-
-        self.completed_tasks: deque[tuple[str | None, pa.Table]] = deque()
-        self.error_message: str | None = None
-        self.error_lock = threading.Lock()
-        self.on_error = on_error
-
-        # Condition variable for WaitForResult(): C++ blocks here until a
-        # result is available.
-        self._result_cv = threading.Condition(threading.RLock())
-        self._ensure_wakeup_state()
-
-        # Dedicated async Ray actors use their actor loop. Synchronous wrappers
-        # hosted inside a generic Ray actor need their own background loop.
-        self._ray_actor_mode = self._detect_ray_actor() and not force_background_thread
-
-        self.use_threading = use_threading
-        if self._ray_actor_mode:
-            self._init_engine_sync()
-        elif self.use_threading:
-            self.loop_ready = threading.Event()
-            self.loop_thread = threading.Thread(target=self._run_event_loop, daemon=True)
-            self.loop_thread.start()
-            if not self.loop_ready.wait(_bounded_query_timeout_s(self.engine_init_timeout_s)):
-                raise RuntimeError(f"vllm event loop did not start before {self._engine_init_deadline_description()}")
-
-        self._finished_submitting = False
-        self._shutdown_called = False
-        # Per-executor result deques: distributed executors submit/read with
-        # a unique executor_id so results are never stolen across tasks.
-        self._per_executor_deques: dict[str, deque[tuple[Any, ...]]] = {}
-        self._per_executor_running_task_count: dict[str, int] = {}
-        self._per_executor_finished: set[str] = set()
-        self._per_executor_request_ids: dict[str, set[str]] = {}
-        self._per_executor_tasks: dict[str, set[Any]] = {}
-        self._per_executor_errors: dict[str, str] = {}
-        self._per_executor_aborted: set[str] = set()
-        self._per_executor_waiters: dict[str, int] = {}
-        # A Ray async actor may execute abort/release before an earlier wait RPC
-        # starts. Tokens distinguish that not-yet-started wait from a previously
-        # completed wait for the same executor.
-        self._per_executor_wait_tokens_observed: dict[str, str] = {}
-        self._per_executor_abort_wait_tokens: dict[str, str] = {}
-        self._async_waiter_lock = threading.Lock()
-        self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
-
-    @staticmethod
-    def _detect_ray_actor() -> bool:
-        try:
-            import ray
-
-            if not ray.is_initialized():
-                return False
-            ctx = ray.get_runtime_context()
-            return ctx.get_actor_id() is not None
-        except Exception:
-            return False
-
-    def _init_engine_sync(self) -> None:
-        """Synchronous engine init — blocks until engine is ready.
-
-        Used in Ray actor mode so that the actor's __init__ doesn't return
-        until the engine is fully initialized.
-        """
-        try:
-            with _translate_missing_provider_dependency("vllm", "vllm"):
-                from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                    AsyncEngineArgs,
-                    AsyncLLMEngine,
-                )
-
-            args = AsyncEngineArgs(model=self.model, **self.engine_args)
-            self.llm = AsyncLLMEngine.from_engine_args(args)
-        except Exception as exc:
-            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
-            if self.on_error == "raise":
-                with self.error_lock:
-                    if self.error_message is None:
-                        self.error_message = error_message
-            self.engine_error_message = error_message
-        finally:
-            self.engine_ready.set()
-
-    async def _init_engine(self) -> None:
-        try:
-            with _translate_missing_provider_dependency("vllm", "vllm"):
-                from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
-                    AsyncEngineArgs,
-                    AsyncLLMEngine,
-                )
-
-            args = AsyncEngineArgs(model=self.model, **self.engine_args)
-            self.llm = AsyncLLMEngine.from_engine_args(args)
-        except Exception as exc:
-            error_message = str(_safe_provider_execution_error("vllm", self.model, "engine initialization", exc))
-            if self.on_error == "raise":
-                with self.error_lock:
-                    if self.error_message is None:
-                        self.error_message = error_message
-            self.engine_error_message = error_message
-        finally:
-            self.engine_ready.set()
-
-    def _run_event_loop(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.create_task(self._init_engine())
-        self.loop_ready.set()
-        try:
-            self.loop.run_forever()
-        finally:
-            pending = [task for task in asyncio.all_tasks(self.loop) if not task.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            self.loop.close()
-            asyncio.set_event_loop(None)
-
-    async def _generate(
-        self,
-        prompt: str,
-        row: pa.Table,
-        executor_id: str | None = None,
-        reservation_id: str | None = None,
-    ) -> None:
-        request_id: str | None = None
-        try:
-            if not self._ray_actor_mode and not self.engine_ready.is_set():
-                await self._wait_for_engine_ready_async()
-            if self.engine_error_message is not None:
-                raise _SafeProviderError(f"vllm engine init failed: {self.engine_error_message}")
-            if self.llm is None:
-                raise _SafeProviderError("vllm engine not initialized")
-            with self.counter_lock:
-                request_id = str(self.counter)
-                self.counter += 1
-            if executor_id:
-                with self.task_count_lock:
-                    self._per_executor_request_ids.setdefault(executor_id, set()).add(request_id)
-
-            final_output = None
-            async for output in self.llm.generate(prompt, self.sampling_params, request_id, **self.generate_args):
-                final_output = output
-
-            if final_output is None or not final_output.outputs:
-                raise _SafeProviderError("vllm returned no outputs")
-
-            output_text: str = final_output.outputs[0].text
-            if executor_id:
-                self._per_executor_deques.setdefault(executor_id, deque()).append((output_text, row, reservation_id))
-            else:
-                self.completed_tasks.append((output_text, row))
-            self._notify_state_change()
-        except Exception as exc:
-            if self.on_error == "raise":
-                error_message = str(_safe_provider_execution_error("vllm", self.model, "generation", exc))
-                if executor_id:
-                    with self.task_count_lock:
-                        self._per_executor_errors.setdefault(executor_id, error_message)
-                else:
-                    with self.error_lock:
-                        if self.error_message is None:
-                            self.error_message = error_message
-                self._notify_state_change(force=True)
-            else:
-                self._log_null_substitution(exc)
-                if executor_id:
-                    self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
-                else:
-                    self.completed_tasks.append((None, row))
-                self._notify_state_change()
-        finally:
-            with self.task_count_lock:
-                self.running_task_count -= 1
-                if executor_id:
-                    if request_id is not None:
-                        self._per_executor_request_ids.get(executor_id, set()).discard(request_id)
-                    remaining = self._per_executor_running_task_count.get(executor_id, 0) - 1
-                    self._per_executor_running_task_count[executor_id] = max(0, remaining)
-            self._notify_state_change()
-
-    def _log_null_substitution(self, exc: Exception) -> None:
-        """Emit the bounded substitution warning under the native NULL policy.
-
-        The native "null" policy is the lowered form of the public
-        on_error="ignore" (vane/ai/providers/vllm.py); this is the one place
-        that maps the executor's policy back to the public mode, so raise-mode
-        callers can never log a substitution that is not happening.
-        """
-        _log_substituted_failure(exc, on_error="raise" if self.on_error == "raise" else "ignore")
-
-    def _append_error_rows(
-        self,
-        rows: pa.Table,
-        executor_id: str | None = None,
-        reservation_id: str | None = None,
-    ) -> None:
-        rows = _ensure_table(rows)
-        # One warning per substituted batch, not per row: every caller routes
-        # the same already-sanitized engine-init failure here.
-        self._log_null_substitution(_SafeProviderError(f"vllm engine init failed: {self.engine_error_message}"))
-        for i in range(rows.num_rows):
-            row = rows.slice(i, 1)
-            if executor_id:
-                self._per_executor_deques.setdefault(executor_id, deque()).append((None, row, reservation_id))
-            else:
-                self.completed_tasks.append((None, row))
-        self._notify_state_change()
-
-    def submit(self, _prefix: str | None, prompts: list[str], rows: pa.Table) -> None:
-        rows = _ensure_table(rows)
-        if len(prompts) != rows.num_rows:
-            raise ValueError("Number of prompts and rows must match")
-
-        if not self.use_threading:
-            raise ValueError("Synchronous mode not supported when use_threading is False")
-
-        self._wait_for_engine_ready_blocking()
-        if self.engine_error_message is not None:
-            if self.on_error == "raise":
-                raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
-            self._append_error_rows(rows)
-            return
-        with self.task_count_lock:
-            self.running_task_count += len(prompts)
-
-        for i, prompt in enumerate(prompts):
-            row = rows.slice(i, 1)
-            asyncio.run_coroutine_threadsafe(self._generate(prompt, row), self.loop)
-        self._notify_state_change(force=True)
-
-    async def submit_async(
-        self,
-        prompts: list[str],
-        rows: pa.Table,
-        executor_id: str | None = None,
-        reservation_id: str | None = None,
-    ) -> None:
-        rows = _ensure_table(rows)
-        if len(prompts) != rows.num_rows:
-            raise ValueError("Number of prompts and rows must match")
-
-        # Check terminal state before creating any per-executor containers so a
-        # submit that arrives after abort cannot recreate state behind the
-        # tombstone.
-        if executor_id:
-            with self.task_count_lock:
-                if (
-                    executor_id in self._per_executor_finished
-                    or executor_id in self._per_executor_aborted
-                    or executor_id in self._per_executor_errors
-                ):
-                    raise RuntimeError(f"vllm executor {executor_id} is already finished")
-                if executor_id not in self._per_executor_deques:
-                    self._per_executor_deques[executor_id] = deque()
-                    self._per_executor_request_ids[executor_id] = set()
-                    self._per_executor_tasks[executor_id] = set()
-
-        if self._ray_actor_mode:
-            # Engine is already ready from sync __init__; skip wait.
-            if self.engine_error_message is not None:
-                if self.on_error == "raise":
-                    raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
-                self._append_error_rows(rows, executor_id, reservation_id)
-                return
-
-            with self.task_count_lock:
-                self.running_task_count += len(prompts)
-                if executor_id:
-                    self._per_executor_running_task_count[executor_id] = self._per_executor_running_task_count.get(
-                        executor_id, 0
-                    ) + len(prompts)
-
-            for i, prompt in enumerate(prompts):
-                row = rows.slice(i, 1)
-                # Run _generate on Ray's actor event loop (same loop as
-                # vLLM engine's async IPC — avoids cross-thread scheduling).
-                asyncio_task = asyncio.create_task(self._generate(prompt, row, executor_id, reservation_id))
-                self._track_executor_task(executor_id, asyncio_task)
-        else:
-            # Background-thread mode for non-Ray use.
-            if not self.engine_ready.is_set():
-                await self._wait_for_engine_ready_async()
-            if executor_id:
-                with self.task_count_lock:
-                    if (
-                        executor_id in self._per_executor_finished
-                        or executor_id in self._per_executor_aborted
-                        or executor_id in self._per_executor_errors
-                    ):
-                        raise RuntimeError(f"vllm executor {executor_id} is already finished")
-            if self.engine_error_message is not None:
-                if self.on_error == "raise":
-                    raise RuntimeError(f"vllm engine init failed: {self.engine_error_message}")
-                self._append_error_rows(rows, executor_id, reservation_id)
-                return
-
-            with self.task_count_lock:
-                self.running_task_count += len(prompts)
-                if executor_id:
-                    self._per_executor_running_task_count[executor_id] = self._per_executor_running_task_count.get(
-                        executor_id, 0
-                    ) + len(prompts)
-
-            for i, prompt in enumerate(prompts):
-                row = rows.slice(i, 1)
-                # Must schedule in self.loop (where vLLM engine lives), NOT the
-                # current event loop (Ray's).  asyncio.Event is not thread-safe;
-                # _generate() awaits vLLM's internal Events that are set() by the
-                # output_handler running in self.loop.
-                thread_future = asyncio.run_coroutine_threadsafe(
-                    self._generate(prompt, row, executor_id, reservation_id), self.loop
-                )
-                self._track_executor_task(executor_id, thread_future)
-        self._notify_state_change(force=True)
-
-    def _track_executor_task(self, executor_id: str | None, task: Any) -> None:
-        """Retain an executor task until its completion callback runs."""
-        if not executor_id:
-            return
-        tasks = self._per_executor_tasks.setdefault(executor_id, set())
-        tasks.add(task)
-
-        def discard(done: Any) -> None:
-            tasks.discard(done)
-
-        task.add_done_callback(discard)
-
-    def _raise_if_task_failed(self, executor_id: str | None = None) -> None:
-        if self.on_error != "raise":
-            return
-        error_message = self._per_executor_errors.get(executor_id) if executor_id else self.error_message
-        if error_message is not None:
-            raise RuntimeError(f"vllm task failed: {error_message}")
-
-    @overload
-    def take_ready_result(self, executor_id: None = None) -> tuple[list[str | None], pa.Table] | None: ...
-
-    @overload
-    def take_ready_result(
-        self, executor_id: str
-    ) -> tuple[list[str | None], pa.Table, list[tuple[str, int]]] | None: ...
-
-    def take_ready_result(self, executor_id: str | None = None) -> tuple[Any, ...] | None:
-        self._raise_if_task_failed(executor_id)
-
-        source_deque = (
-            self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
-        )
-        if not source_deque:
-            return None
-        if not executor_id:
-            output, row = source_deque.popleft()
-            self._notify_state_change()
-            return [output], row
-
-        outputs: list[str | None] = []
-        row_tables: list[pa.Table] = []
-        reservation_counts: OrderedDict[str, int] = OrderedDict()
-        while source_deque and len(outputs) < DUCKDB_STANDARD_VECTOR_SIZE:
-            output, row, *extra = source_deque.popleft()
-            if len(extra) != 1 or not isinstance(extra[0], str) or not extra[0]:
-                raise RuntimeError("vllm per-executor result must include a non-empty reservation_id")
-            row = _ensure_table(row)
-            if row.num_rows != 1:
-                raise RuntimeError("vllm per-executor result row must contain exactly one row")
-            reservation_id = extra[0]
-            outputs.append(output)
-            row_tables.append(row)
-            reservation_counts[reservation_id] = reservation_counts.get(reservation_id, 0) + 1
-
-        self._notify_state_change()
-        return outputs, _concat_tables(row_tables), list(reservation_counts.items())
-
-    def finished_submitting(self) -> None:
-        self._finished_submitting = True
-        self._notify_state_change(force=True)
-
-    def _engine_ready_wait_timeout_s(self) -> float | None:
-        return _bounded_query_timeout_s(self.engine_init_timeout_s)
-
-    def _engine_init_deadline_message(self) -> str:
-        return f"vllm engine init did not finish before {self._engine_init_deadline_description()}"
-
-    def _engine_init_deadline_description(self) -> str:
-        timeout_s = self.engine_init_timeout_s
-        if timeout_s is None:
-            return "query deadline"
-        return f"deadline ({timeout_s:.3f}s)"
-
-    def _wait_for_engine_ready_blocking(self) -> None:
-        if self.engine_ready.is_set():
-            return
-        timeout_s = self._engine_ready_wait_timeout_s()
-        if timeout_s is None:
-            self.engine_ready.wait()
-            return
-        if not self.engine_ready.wait(timeout_s):
-            raise RuntimeError(self._engine_init_deadline_message())
-
-    async def _wait_for_engine_ready_async(self) -> None:
-        if self.engine_ready.is_set():
-            return
-        timeout_s = self._engine_ready_wait_timeout_s()
-        if timeout_s is None:
-            await asyncio.to_thread(self.engine_ready.wait)
-            return
-        ready = await asyncio.to_thread(self.engine_ready.wait, timeout_s)
-        if not ready:
-            raise RuntimeError(self._engine_init_deadline_message())
-
-    def finished_executor(self, executor_id: str) -> None:
-        self._per_executor_finished.add(executor_id)
-        self._notify_state_change(force=True)
-
-    def release_executor(self, executor_id: str) -> bool:
-        """Drop terminal state after an executor drained or aborted."""
-        with self.task_count_lock:
-            if self._per_executor_waiters.get(executor_id, 0) > 0:
-                return False
-            expected_wait_token = self._per_executor_abort_wait_tokens.get(executor_id)
-            if (
-                expected_wait_token is not None
-                and self._per_executor_wait_tokens_observed.get(executor_id) != expected_wait_token
-            ):
-                return False
-            if self._per_executor_deques.get(executor_id):
-                return False
-            if self._per_executor_running_task_count.get(executor_id, 0) > 0:
-                return False
-            if self._per_executor_request_ids.get(executor_id):
-                return False
-            if self._per_executor_tasks.get(executor_id):
-                return False
-            self._per_executor_deques.pop(executor_id, None)
-            self._per_executor_running_task_count.pop(executor_id, None)
-            self._per_executor_request_ids.pop(executor_id, None)
-            self._per_executor_tasks.pop(executor_id, None)
-            self._per_executor_errors.pop(executor_id, None)
-            self._per_executor_aborted.discard(executor_id)
-            self._per_executor_waiters.pop(executor_id, None)
-            self._per_executor_wait_tokens_observed.pop(executor_id, None)
-            self._per_executor_abort_wait_tokens.pop(executor_id, None)
-            self._per_executor_finished.discard(executor_id)
-        self._notify_state_change(force=True)
-        return True
-
-    async def abort_executor(self, executor_id: str, wait_token: str | None = None) -> None:
-        """Abort requests and discard state owned by one remote executor."""
-        if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
-            raise ValueError("vllm abort wait_token must be a non-empty string")
-        # Install the terminal tombstone before the first await. Ray async
-        # actors may start another method while this abort is suspended, and a
-        # late submit must be rejected instead of escaping the snapshots below.
-        with self.task_count_lock:
-            self._per_executor_aborted.add(executor_id)
-            self._per_executor_finished.discard(executor_id)
-            if wait_token is not None:
-                self._per_executor_abort_wait_tokens[executor_id] = wait_token
-            request_ids = set(self._per_executor_request_ids.get(executor_id, ()))
-            tasks = set(self._per_executor_tasks.get(executor_id, ()))
-        abort = getattr(getattr(self, "llm", None), "abort", None) or getattr(
-            getattr(self, "llm", None), "abort_request", None
-        )
-        errors: list[BaseException] = []
-        if abort is not None:
-            for request_id in request_ids:
-                try:
-                    result = abort(request_id)
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception as exc:
-                    errors.append(exc)
-        for task in tasks:
+            return SamplingParams()
+        if isinstance(sampling_params, SamplingParams):
+            return sampling_params
+        if isinstance(sampling_params, str):
             try:
-                task.cancel()
-            except Exception as exc:
-                errors.append(exc)
-        async_tasks = [task for task in tasks if isinstance(task, asyncio.Future)]
-        if async_tasks:
-            results = await asyncio.gather(*async_tasks, return_exceptions=True)
-            errors.extend(
-                result
-                for result in results
-                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-            )
-        if errors:
-            raise RuntimeError(
-                f"vllm executor {executor_id} abort failed: "
-                + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
-            ) from errors[0]
-        with self.task_count_lock:
-            remaining = self._per_executor_running_task_count.pop(executor_id, 0)
-            if remaining:
-                self.running_task_count = max(0, self.running_task_count - remaining)
-            self._per_executor_deques.pop(executor_id, None)
-            self._per_executor_request_ids.pop(executor_id, None)
-            self._per_executor_tasks.pop(executor_id, None)
-            self._per_executor_errors.pop(executor_id, None)
-        self._notify_state_change(force=True)
-        if wait_token is not None:
-            deadline = time.monotonic() + _vllm_control_rpc_timeout_s()
-            while True:
-                with self.task_count_lock:
-                    acknowledged = (
-                        self._per_executor_waiters.get(executor_id, 0) == 0
-                        and self._per_executor_wait_tokens_observed.get(executor_id) == wait_token
+                sampling_params = json.loads(sampling_params)
+            except json.JSONDecodeError as exc:
+                raise ValueError("vllm sampling_params JSON could not be parsed") from exc
+        if isinstance(sampling_params, dict):
+            structured_outputs = sampling_params.get("structured_outputs")
+            if isinstance(structured_outputs, Mapping):
+                with _translate_missing_provider_dependency("vllm", "vllm"):
+                    from vllm.sampling_params import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                        StructuredOutputsParams,
                     )
-                if acknowledged:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        f"vllm executor {executor_id} abort waiter {wait_token} did not acknowledge termination"
-                    )
-                await asyncio.sleep(0.01)
 
-    def all_tasks_finished(self) -> bool:
-        with self.task_count_lock:
-            return self._finished_submitting and self.running_task_count == 0 and len(self.completed_tasks) == 0
+                sampling_params = dict(sampling_params)
+                sampling_params["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
+            return SamplingParams(**sampling_params)
+        raise TypeError("vllm sampling_params must be a dict, JSON string, or SamplingParams instance")
 
-    def _wakeup_ready(self) -> bool:
-        if self._shutdown_called or self.error_message is not None:
-            return True
-        if self.completed_tasks or any(bool(results) for results in self._per_executor_deques.values()):
-            return True
-        if self._per_executor_errors or self._per_executor_aborted:
-            return True
-        return self._finished_submitting and self.running_task_count == 0
-
-    def _wait_for_result_blocking(self, executor_id: str | None = None) -> bool:
-        with self._result_cv:
-            self._result_cv.wait_for(lambda: any(self._wait_for_result_state(executor_id)))
-            return self._wait_for_result_state(executor_id)[0]
-
-    def _wait_for_result_state(self, executor_id: str | None) -> tuple[bool, bool]:
-        source_deque = (
-            self._per_executor_deques.setdefault(executor_id, deque()) if executor_id else self.completed_tasks
-        )
-        has_result = bool(source_deque)
-        if executor_id:
-            terminal = (
-                executor_id in self._per_executor_errors
-                or executor_id in self._per_executor_aborted
-                or (
-                    executor_id in self._per_executor_finished
-                    and self._per_executor_running_task_count.get(executor_id, 0) == 0
-                )
+    def _create_engine(self) -> None:
+        with _translate_missing_provider_dependency("vllm", "vllm"):
+            from vllm import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                AsyncEngineArgs,
+                AsyncLLMEngine,
             )
-        else:
-            terminal = self.error_message is not None or (self._finished_submitting and self.running_task_count == 0)
-        return has_result, terminal
 
-    def wait_for_result(self, executor_id: str | None = None) -> bool:
-        """Block until at least one result is available or all tasks are done."""
-        return self._wait_for_result_blocking(executor_id)
+        args = AsyncEngineArgs(model=self.model, **self.engine_args)
+        self.llm = AsyncLLMEngine.from_engine_args(args)
 
-    def shutdown(self) -> None:
-        if self._shutdown_called:
+    def _shutdown_engine(self) -> None:
+        llm = self.llm
+        if llm is None:
             return
-        self._shutdown_called = True
-        self._finished_submitting = True
-        self._notify_state_change(force=True)
-        loop = getattr(self, "loop", None)
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
+        try:
+            llm.shutdown()
+        finally:
+            self.llm = None
+
+    async def _run_generate(self, prompt: str, request_id: str) -> str:
+        final_output = None
+        async for output in self.llm.generate(prompt, self.sampling_params, request_id, **self.generate_args):
+            final_output = output
+        if final_output is None or not final_output.outputs:
+            raise _SafeProviderError("vllm returned no outputs")
+        return final_output.outputs[0].text
 
 
-class RayLocalVLLMExecutor(LocalVLLMExecutor):
+class RayLocalVLLMExecutor(RayActorExecutorMixin, LocalVLLMExecutor):  # type: ignore[misc]
     def __init__(
         self,
         model: str,
@@ -879,74 +251,6 @@ class RayLocalVLLMExecutor(LocalVLLMExecutor):
             engine_init_timeout_s=engine_init_timeout_s,
             force_background_thread=force_background_thread,
         )
-
-    def _ensure_async_waiter_state(self) -> None:
-        if not hasattr(self, "_async_waiter_lock"):
-            self._async_waiter_lock = threading.Lock()
-        if not hasattr(self, "_async_waiters"):
-            self._async_waiters: dict[str, list[tuple[Any, asyncio.Event]]] = {}
-
-    def _notify_state_change(self, *, force: bool = False) -> None:
-        super()._notify_state_change(force=force)
-        self._ensure_async_waiter_state()
-        with self._async_waiter_lock:
-            waiters = [waiter for executor_waiters in self._async_waiters.values() for waiter in executor_waiters]
-        for loop, event in waiters:
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:
-                # The waiter removes itself during normal loop shutdown.
-                continue
-
-    # Ray actor calls are awaitable, while the in-process executor exposes a blocking method.
-    async def wait_for_result(  # type: ignore[override]
-        self,
-        executor_id: str | None = None,
-        wait_token: str | None = None,
-    ) -> bool:
-        if executor_id is None:
-            if wait_token is not None:
-                raise ValueError("vllm global wait does not accept a wait_token")
-            return await asyncio.to_thread(self._wait_for_result_blocking, None)
-        if wait_token is not None and (not isinstance(wait_token, str) or not wait_token):
-            raise ValueError("vllm wait_token must be a non-empty string")
-        self._ensure_async_waiter_state()
-        loop = asyncio.get_running_loop()
-        state_changed = asyncio.Event()
-        waiter = (loop, state_changed)
-        with self._async_waiter_lock:
-            self._async_waiters.setdefault(executor_id, []).append(waiter)
-        with self.task_count_lock:
-            self._per_executor_waiters[executor_id] = self._per_executor_waiters.get(executor_id, 0) + 1
-        try:
-            while True:
-                has_result, terminal = self._wait_for_result_state(executor_id)
-                if has_result or terminal:
-                    self._raise_if_task_failed(executor_id)
-                    return has_result
-                state_changed.clear()
-                has_result, terminal = self._wait_for_result_state(executor_id)
-                if has_result or terminal:
-                    continue
-                await state_changed.wait()
-        finally:
-            with self._async_waiter_lock:
-                executor_waiters = self._async_waiters.get(executor_id, [])
-                try:
-                    executor_waiters.remove(waiter)
-                except ValueError:
-                    pass
-                if not executor_waiters:
-                    self._async_waiters.pop(executor_id, None)
-            with self.task_count_lock:
-                remaining = self._per_executor_waiters.get(executor_id, 0) - 1
-                if remaining > 0:
-                    self._per_executor_waiters[executor_id] = remaining
-                else:
-                    self._per_executor_waiters.pop(executor_id, None)
-                if wait_token is not None:
-                    self._per_executor_wait_tokens_observed[executor_id] = wait_token
-            self._notify_state_change(force=True)
 
 
 class RemoteVLLMExecutor(VLLMExecutor):
@@ -2063,12 +1367,13 @@ class LLMActors:
         name_prefix: str | None = None,
         engine_init_timeout_s: float | None = None,
         session_config: Mapping[str, Any] | None = None,
+        actor_cls: type = RayLocalVLLMExecutor,
     ):
         import ray
 
         self.owned = True
         self._shutdown_complete = False
-        LocalVLLMExecutorActor = ray.remote(num_gpus=gpus_per_actor, max_restarts=4)(RayLocalVLLMExecutor)
+        LocalVLLMExecutorActor = ray.remote(num_gpus=gpus_per_actor, max_restarts=4)(actor_cls)
         PrefixRouterActor = ray.remote(PrefixRouter)
         normalized_session_config = (
             None if session_config is None else {str(key): str(value) for key, value in session_config.items()}
@@ -2202,6 +1507,7 @@ class LLMActors:
         name_prefix: str,
         engine_init_timeout_s: float | None = None,
         session_config: Mapping[str, Any] | None = None,
+        actor_cls: type = RayLocalVLLMExecutor,
     ) -> LLMActors:
         import ray
 
@@ -2251,6 +1557,7 @@ class LLMActors:
             name_prefix=name_prefix,
             engine_init_timeout_s=engine_init_timeout_s,
             session_config=session_config,
+            actor_cls=actor_cls,
         )
 
     @classmethod
@@ -2509,17 +1816,32 @@ def ensure_named_vllm_pools_for_plan(
             pool_name = str(node["pool_name"])
             model = str(node.get("model", ""))
 
-            # Parse options through normalize_options to get clean defaults.
+            # Parse options through the matching backend's normalize_options.
             raw_opts = node.get("options")
-            opts = _restore_native_vllm_secrets(normalize_options(raw_opts))
+            engine = raw_opts.get("engine") if isinstance(raw_opts, dict) else None
+            if engine not in ("vllm", "sglang"):
+                raise ValueError("distributed inference node options are missing a valid 'engine' field")
 
-            engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
-            generate_args = dict(opts.get("generate_args") or {})
+            if engine == "sglang":
+                from vane.execution.sglang import SGLangRayLocalExecutor
+                from vane.execution.sglang import normalize_options as normalize_sglang_options
+
+                opts = _restore_native_vllm_secrets(normalize_sglang_options(raw_opts))
+                actor_cls: type = SGLangRayLocalExecutor
+                engine_args = dict(opts.get("engine_args") or {})
+                generate_args = dict(opts.get("generate_args") or {})
+                engine_init_timeout_s = opts.get("engine_init_timeout_s")
+            else:
+                opts = _restore_native_vllm_secrets(normalize_options(raw_opts))
+                actor_cls = RayLocalVLLMExecutor
+                engine_args = _apply_engine_defaults(dict(opts.get("engine_args") or {}))
+                generate_args = dict(opts.get("generate_args") or {})
+                engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
+
             on_error = str(opts.get("on_error", "raise"))
             gpus_per_actor = opts["gpus_per_actor"]
             concurrency = max(1, int(opts.get("concurrency", 1)))
             load_balance_threshold = max(0, int(opts.get("load_balance_threshold", 32)))
-            engine_init_timeout_s = _vllm_engine_init_timeout_s(opts.get("engine_init_timeout_s"))
 
             actors_obj = LLMActors.get_or_create_named(
                 model=model,
@@ -2532,6 +1854,7 @@ def ensure_named_vllm_pools_for_plan(
                 name_prefix=pool_name,
                 engine_init_timeout_s=engine_init_timeout_s,
                 session_config=normalized_session_config,
+                actor_cls=actor_cls,
             )
             created.append(actors_obj)
     except BaseException as execution_error:
@@ -2576,7 +1899,7 @@ def _apply_engine_defaults(engine_args: dict[str, Any]) -> dict[str, Any]:
     return engine_args
 
 
-def build_executor(model: str, options: Any | None) -> VLLMExecutor:
+def build_executor(model: str, options: Any | None) -> LLMExecutor:
     opts = normalize_options(options)
     pool_name = opts.get("ray_actor_pool_name")
     require_ray_worker = opts.get("require_ray_worker", False) or opts.get("ray_worker_only", False)

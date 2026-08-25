@@ -159,7 +159,7 @@ private:
 	size_t num_rows_;
 	size_t size_bytes_;
 	mutable std::once_flag materialize_once_;
-	mutable std::atomic<std::shared_ptr<duckdb::ColumnDataCollection>> materialized_collection_;
+	mutable std::shared_ptr<duckdb::ColumnDataCollection> materialized_collection_;
 	mutable std::exception_ptr materialize_error_;
 };
 
@@ -202,6 +202,7 @@ private:
 	std::string fte_task_id_;
 	std::shared_ptr<RayTaskPollState> poll_state_;
 	std::shared_ptr<PollResultCache> poll_result_cache_;
+	bool acked_ = false;
 	bool released_ = false;
 };
 
@@ -258,11 +259,11 @@ public:
 	py::object Plan() const;
 
 	// Return task inputs keyed by source node id. Each value contains a
-	// typed payload such as scan-task bytes or exchange-source-task bytes.
+	// typed payload such as scan-split-batch bytes or exchange-source-task bytes.
 	py::dict Inputs() const;
 
-	// Return the task-local remote exchange sink instance, if the plan has one.
-	py::object ExchangeSinkInstance() const;
+	// Return the static remote exchange sink configuration, if present.
+	py::object ExchangeSinkConfig() const;
 
 private:
 	duckdb::distributed::WorkerTask task_;

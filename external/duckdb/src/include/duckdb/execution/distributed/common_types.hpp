@@ -429,17 +429,17 @@ using SourceNodeId = int;
 /// Worker-side data input type (analogous to Vane's Input enum).
 /// Each variant carries the data needed by a specific source node.
 struct TaskInput {
-	enum Kind { ScanTask, ExchangeSourceTask };
-	Kind kind = ScanTask;
-	/// For Kind::ScanTask — raw serialized ScanTaskDescriptor bytes
-	std::string scan_task_bytes;
+	enum Kind { ScanSplitBatch, ExchangeSourceTask };
+	Kind kind = ScanSplitBatch;
+	/// For Kind::ScanSplitBatch — raw serialized ScanSplitBatch bytes
+	std::string scan_split_batch_bytes;
 	/// For Kind::ExchangeSourceTask — raw serialized ExchangeSourceTaskDescriptor bytes
 	std::string exchange_source_task_bytes;
 
-	static TaskInput make_scan_task(std::string bytes) {
+	static TaskInput make_scan_split_batch(std::string bytes) {
 		TaskInput input;
-		input.kind = Kind::ScanTask;
-		input.scan_task_bytes = std::move(bytes);
+		input.kind = Kind::ScanSplitBatch;
+		input.scan_split_batch_bytes = std::move(bytes);
 		return input;
 	}
 
@@ -664,33 +664,23 @@ class DuckDBExecutionConfig {
 private:
 	std::string shuffle_algorithm_;
 	int min_cpu_per_task_;
-	bool scan_task_size_grouping_enabled_;
-	uint64_t scan_task_min_bytes_;
-	uint64_t scan_task_max_bytes_;
-	uint64_t scan_task_open_cost_bytes_;
-	size_t scan_task_min_partition_num_;
+	size_t scan_split_min_count_;
 	size_t distributed_node_count_;
 	size_t distributed_worker_slots_;
-	size_t scan_task_backlog_;
+	size_t scan_split_backlog_;
 
 	// Environment variable names
 	static constexpr const char *ENV_VANE_SHUFFLE_ALGORITHM = "VANE_SHUFFLE_ALGORITHM";
 	static constexpr const char *ENV_VANE_MIN_CPU_PER_TASK = "VANE_MIN_CPU_PER_TASK";
-	static constexpr const char *ENV_SCAN_TASK_SIZE_GROUPING = "VANE_RAY_SCAN_TASK_SIZE_GROUPING";
-	static constexpr const char *ENV_SCAN_TASK_MIN_BYTES = "VANE_RAY_SCAN_TASK_MIN_BYTES";
-	static constexpr const char *ENV_SCAN_TASK_MAX_BYTES = "VANE_RAY_SCAN_TASK_MAX_BYTES";
 	static constexpr const char *ENV_DISTRIBUTED_NODE_COUNT = "VANE_DISTRIBUTED_NODE_COUNT";
 	static constexpr const char *ENV_DISTRIBUTED_WORKER_SLOTS = "VANE_DISTRIBUTED_WORKER_SLOTS";
-	static constexpr const char *ENV_SCAN_TASK_BACKLOG = "VANE_RAY_MAX_TASK_BACKLOG";
-	static constexpr const char *ENV_SCAN_TASK_OPEN_COST_BYTES = "VANE_RAY_SCAN_TASK_OPEN_COST_BYTES";
-	static constexpr const char *ENV_SCAN_TASK_MIN_PARTITION_NUM = "VANE_RAY_SCAN_TASK_MIN_PARTITION_NUM";
+	static constexpr const char *ENV_SCAN_SPLIT_BACKLOG = "VANE_RAY_MAX_TASK_BACKLOG";
+	static constexpr const char *ENV_SCAN_SPLIT_MIN_COUNT = "VANE_RAY_SCAN_SPLIT_MIN_COUNT";
 
 public:
 	DuckDBExecutionConfig()
-	    : shuffle_algorithm_(""), min_cpu_per_task_(1), scan_task_size_grouping_enabled_(true),
-	      scan_task_min_bytes_(96ULL * 1024 * 1024), scan_task_max_bytes_(384ULL * 1024 * 1024),
-	      scan_task_open_cost_bytes_(4ULL * 1024 * 1024), scan_task_min_partition_num_(0), distributed_node_count_(0),
-	      distributed_worker_slots_(0), scan_task_backlog_(0) {
+	    : shuffle_algorithm_(""), min_cpu_per_task_(1), scan_split_min_count_(0), distributed_node_count_(0),
+	      distributed_worker_slots_(0), scan_split_backlog_(0) {
 	}
 
 	static DuckDBExecutionConfig from_env() {
@@ -711,34 +701,9 @@ public:
 		}
 
 		{
-			auto val = parse_bool_from_env(ENV_SCAN_TASK_SIZE_GROUPING);
-			if (val.first) {
-				cfg.scan_task_size_grouping_enabled_ = val.second;
-			}
-		}
-
-		{
-			auto val = parse_bytes_from_env(ENV_SCAN_TASK_MIN_BYTES);
-			if (val.first) {
-				cfg.scan_task_min_bytes_ = val.second;
-			}
-		}
-		{
-			auto val = parse_bytes_from_env(ENV_SCAN_TASK_MAX_BYTES);
-			if (val.first) {
-				cfg.scan_task_max_bytes_ = val.second;
-			}
-		}
-		{
-			auto val = parse_bytes_from_env(ENV_SCAN_TASK_OPEN_COST_BYTES);
-			if (val.first) {
-				cfg.scan_task_open_cost_bytes_ = val.second;
-			}
-		}
-		{
-			auto val = parse_int_from_env(ENV_SCAN_TASK_MIN_PARTITION_NUM);
+			auto val = parse_int_from_env(ENV_SCAN_SPLIT_MIN_COUNT);
 			if (val.first && val.second > 0) {
-				cfg.scan_task_min_partition_num_ = static_cast<size_t>(val.second);
+				cfg.scan_split_min_count_ = static_cast<size_t>(val.second);
 			}
 		}
 		{
@@ -754,9 +719,9 @@ public:
 			}
 		}
 		{
-			auto val = parse_int_from_env(ENV_SCAN_TASK_BACKLOG);
+			auto val = parse_int_from_env(ENV_SCAN_SPLIT_BACKLOG);
 			if (val.first && val.second > 0) {
-				cfg.scan_task_backlog_ = static_cast<size_t>(val.second);
+				cfg.scan_split_backlog_ = static_cast<size_t>(val.second);
 			}
 		}
 
@@ -772,20 +737,8 @@ public:
 	int min_cpu_per_task() const {
 		return min_cpu_per_task_;
 	}
-	bool scan_task_size_grouping_enabled() const {
-		return scan_task_size_grouping_enabled_;
-	}
-	uint64_t scan_task_min_bytes() const {
-		return scan_task_min_bytes_;
-	}
-	uint64_t scan_task_max_bytes() const {
-		return scan_task_max_bytes_;
-	}
-	uint64_t scan_task_open_cost_bytes() const {
-		return scan_task_open_cost_bytes_;
-	}
-	size_t scan_task_min_partition_num() const {
-		return scan_task_min_partition_num_;
+	size_t scan_split_min_count() const {
+		return scan_split_min_count_;
 	}
 	size_t distributed_node_count() const {
 		return distributed_node_count_;
@@ -799,8 +752,8 @@ public:
 	void set_distributed_worker_slots(size_t value) {
 		distributed_worker_slots_ = value;
 	}
-	size_t scan_task_backlog() const {
-		return scan_task_backlog_;
+	size_t scan_split_backlog() const {
+		return scan_split_backlog_;
 	}
 
 private:
@@ -819,24 +772,6 @@ private:
 		return std::make_pair(true, result);
 	}
 
-	static std::pair<bool, bool> parse_bool_from_env(const char *env_name) {
-		const char *val = std::getenv(env_name);
-		if (val == nullptr) {
-			return std::make_pair(false, false);
-		}
-
-		std::string str_val(val);
-		std::transform(str_val.begin(), str_val.end(), str_val.begin(), ::tolower);
-
-		if (str_val == "1" || str_val == "true" || str_val == "yes" || str_val == "on") {
-			return std::make_pair(true, true);
-		} else if (str_val == "0" || str_val == "false" || str_val == "no" || str_val == "off") {
-			return std::make_pair(true, false);
-		}
-
-		return std::make_pair(false, false);
-	}
-
 	static std::pair<bool, int> parse_int_from_env(const char *env_name) {
 		const char *val = std::getenv(env_name);
 		if (val == nullptr) {
@@ -853,91 +788,6 @@ private:
 		}
 
 		return std::make_pair(false, 0);
-	}
-
-	static std::pair<bool, uint64_t> parse_bytes_from_env(const char *env_name) {
-		const char *val = std::getenv(env_name);
-		if (val == nullptr) {
-			return std::make_pair(false, uint64_t(0));
-		}
-
-		std::string str_val(val);
-		str_val.erase(0, str_val.find_first_not_of(" \t\n\r\f\v"));
-		if (str_val.empty()) {
-			return std::make_pair(false, uint64_t(0));
-		}
-		str_val.erase(str_val.find_last_not_of(" \t\n\r\f\v") + 1);
-
-		std::string lower = str_val;
-		std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-		if (lower == "auto") {
-			return std::make_pair(true, uint64_t(0));
-		}
-
-		uint64_t multiplier = 1;
-		if (lower.size() >= 2 && lower.back() == 'b') {
-			char unit = lower[lower.size() - 2];
-			if (unit == 'k' || unit == 'm' || unit == 'g' || unit == 't') {
-				lower.resize(lower.size() - 2);
-			} else {
-				unit = '\0';
-			}
-			switch (unit) {
-			case 'k':
-				multiplier = 1024ULL;
-				break;
-			case 'm':
-				multiplier = 1024ULL * 1024ULL;
-				break;
-			case 'g':
-				multiplier = 1024ULL * 1024ULL * 1024ULL;
-				break;
-			case 't':
-				multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
-				break;
-			default:
-				break;
-			}
-		} else {
-			char unit = lower.back();
-			if (unit == 'k' || unit == 'm' || unit == 'g' || unit == 't') {
-				lower.pop_back();
-				switch (unit) {
-				case 'k':
-					multiplier = 1024ULL;
-					break;
-				case 'm':
-					multiplier = 1024ULL * 1024ULL;
-					break;
-				case 'g':
-					multiplier = 1024ULL * 1024ULL * 1024ULL;
-					break;
-				case 't':
-					multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
-					break;
-				default:
-					break;
-				}
-			}
-		}
-
-		if (lower.empty()) {
-			return std::make_pair(false, uint64_t(0));
-		}
-
-		try {
-			size_t pos;
-			auto base = std::stoull(lower, &pos);
-			if (pos != lower.size()) {
-				return std::make_pair(false, uint64_t(0));
-			}
-			if (multiplier != 0 && base > std::numeric_limits<uint64_t>::max() / multiplier) {
-				return std::make_pair(false, uint64_t(0));
-			}
-			return std::make_pair(true, base * multiplier);
-		} catch (const std::exception &) {
-			return std::make_pair(false, uint64_t(0));
-		}
 	}
 };
 

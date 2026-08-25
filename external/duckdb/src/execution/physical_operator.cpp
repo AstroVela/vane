@@ -30,6 +30,7 @@
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/operator/projection/physical_unnest.hpp"
 #include "duckdb/execution/operator/helper/physical_distributed_reservoir_sample.hpp"
+#include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/helper/physical_reservoir_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
@@ -48,6 +49,7 @@
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -837,6 +839,11 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		}
 		return std::move(result);
 	}
+	case PhysicalOperatorType::DATA_SINK: {
+		auto operation_id = deserializer.ReadProperty<string>(103, "operation_id");
+		return make_uniq<PhysicalDataSink>(physical_plan, std::move(types), std::move(operation_id),
+		                                   estimated_cardinality);
+	}
 	case PhysicalOperatorType::STREAMING_SAMPLE: {
 		auto options = deserializer.ReadProperty<unique_ptr<SampleOptions>>(103, "sample_options");
 		return make_uniq<PhysicalStreamingSample>(physical_plan, std::move(types), std::move(options),
@@ -888,6 +895,9 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	}
 	case PhysicalOperatorType::DUMMY_SCAN: {
 		return make_uniq<PhysicalDummyScan>(physical_plan, std::move(types), estimated_cardinality);
+	}
+	case PhysicalOperatorType::EMPTY_RESULT: {
+		return make_uniq<PhysicalEmptyResult>(physical_plan, std::move(types), estimated_cardinality);
 	}
 	case PhysicalOperatorType::EXPRESSION_SCAN: {
 		auto expressions = deserializer.ReadProperty<vector<vector<unique_ptr<Expression>>>>(103, "expressions");
@@ -1200,25 +1210,14 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto partition_by = deserializer.ReadProperty<vector<unique_ptr<Expression>>>(107, "partition_by");
 		auto local_dirs = deserializer.ReadProperty<vector<string>>(108, "local_dirs");
 		auto repartition_type = static_cast<RepartitionSpec::Type>(repartition_type_raw);
-		// Create sink handle for this exchange
-		distributed::ExchangeSinkInstanceHandle sink_handle;
-		sink_handle.sink_handle.task_partition_id =
-		    deserializer.ReadPropertyWithDefault<idx_t>(109, "sink_task_partition_id");
-		sink_handle.attempt_id = deserializer.ReadPropertyWithDefault<idx_t>(110, "sink_attempt_id");
-		sink_handle.output_partition_count = num_partitions;
-		sink_handle.output_location =
-		    deserializer.ReadPropertyWithExplicitDefault<string>(111, "sink_output_location", exchange_id);
-		auto range_boundaries =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(112, "range_boundaries", {});
-		auto range_order_modifiers =
-		    deserializer.ReadPropertyWithExplicitDefault<vector<string>>(113, "range_order_modifiers", {});
-		sink_handle.flight_server_epoch = deserializer.ReadProperty<string>(114, "flight_server_epoch");
-		sink_handle.query_id = deserializer.ReadProperty<string>(115, "query_id");
-		sink_handle.fte_task_identity = deserializer.ReadPropertyWithDefault<bool>(116, "fte_task_identity");
+		auto sink_output_location_prefix = deserializer.ReadProperty<string>(109, "sink_output_location_prefix");
+		auto range_boundaries = deserializer.ReadProperty<vector<string>>(110, "range_boundaries");
+		auto range_order_modifiers = deserializer.ReadProperty<vector<string>>(111, "range_order_modifiers");
+		auto sink_query_id = deserializer.ReadProperty<string>(112, "sink_query_id");
 		auto collect_mark_join_build_summary =
-		    deserializer.ReadPropertyWithDefault<bool>(117, "collect_mark_join_build_summary");
+		    deserializer.ReadPropertyWithDefault<bool>(113, "collect_mark_join_build_summary");
 		auto mark_join_build_expressions =
-		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(118, "mark_join_build_expressions");
+		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(114, "mark_join_build_expressions");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1226,8 +1225,8 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
 		auto result = make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
-		    repartition_type, std::move(partition_by), std::move(sink_handle), std::move(exchange_mgr),
-		    std::move(range_boundaries), std::move(range_order_modifiers));
+		    repartition_type, std::move(partition_by), std::move(sink_query_id), std::move(sink_output_location_prefix),
+		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers));
 		if (collect_mark_join_build_summary) {
 			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 		}

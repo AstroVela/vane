@@ -6,10 +6,12 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/distributed/pipeline_node/empty_result_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/translator_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
@@ -30,6 +32,14 @@ DuckPhysicalPlanRef MakeDummyScanPlan(const duckdb::PhysicalDummyScan &scan) {
 	auto plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
 	auto &dummy = plan->Make<duckdb::PhysicalDummyScan>(scan.GetTypes(), scan.estimated_cardinality);
 	plan->SetRoot(dummy);
+	return plan;
+}
+
+DuckPhysicalPlanRef MakeEmptyResultPlan(const duckdb::PhysicalEmptyResult &empty_result) {
+	Allocator &alloc = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
+	auto &empty = plan->Make<duckdb::PhysicalEmptyResult>(empty_result.GetTypes(), empty_result.estimated_cardinality);
+	plan->SetRoot(empty);
 	return plan;
 }
 
@@ -69,12 +79,12 @@ SchemaRef MakeSchemaFromTypes(const duckdb::vector<LogicalType> &types) {
 	return MakeSchemaRef(types);
 }
 
-std::shared_ptr<DistributedPipelineNode>
-MakeScanSourceNode(PipelineNodeContext context, DuckPhysicalPlanRef scan_plan,
-                   std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks, SchemaRef schema,
-                   DuckDBExecutionConfigRef exec_cfg, bool require_scan_tasks) {
-	auto scan_node = std::make_shared<ScanSourceNode>(std::move(context), std::move(scan_plan), std::move(scan_tasks),
-	                                                  std::move(schema), std::move(exec_cfg), require_scan_tasks);
+std::shared_ptr<DistributedPipelineNode> MakeScanSourceNode(PipelineNodeContext context, DuckPhysicalPlanRef scan_plan,
+                                                            std::vector<duckdb::distributed::ScanSplit> scan_splits,
+                                                            SchemaRef schema, DuckDBExecutionConfigRef exec_cfg,
+                                                            bool require_scan_splits) {
+	auto scan_node = std::make_shared<ScanSourceNode>(std::move(context), std::move(scan_plan), std::move(scan_splits),
+	                                                  std::move(schema), std::move(exec_cfg), require_scan_splits);
 	return std::make_shared<DistributedPipelineNode>(scan_node);
 }
 
@@ -91,23 +101,35 @@ PhysicalPlanToPipelineNodeTranslator::TranslateCTESource(PhysicalOperator &op) {
 		scan_plan->SetRoot(op);
 	}
 
-	std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks;
+	std::vector<duckdb::distributed::ScanSplit> scan_splits;
 	auto schema = MakeSchemaFromTypes(op.GetTypes());
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
 	                                                  get_next_pipeline_node_id(), "ScanSource"),
-	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
+	                          std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, false);
 }
 
 std::shared_ptr<DistributedPipelineNode>
 PhysicalPlanToPipelineNodeTranslator::TranslateDummyScanSource(const PhysicalDummyScan &op) {
 	auto scan_plan = MakeDummyScanPlan(op);
-	std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks;
+	std::vector<duckdb::distributed::ScanSplit> scan_splits;
 	auto schema = MakeSchemaFromTypes(op.GetTypes());
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 	return MakeScanSourceNode(MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id,
 	                                                  get_next_pipeline_node_id(), "ScanSource"),
-	                          std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
+	                          std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, false);
+}
+
+std::shared_ptr<DistributedPipelineNode>
+PhysicalPlanToPipelineNodeTranslator::TranslateEmptyResultSource(const PhysicalEmptyResult &op) {
+	auto empty_plan = MakeEmptyResultPlan(op);
+	auto schema = MakeSchemaFromTypes(op.GetTypes());
+	auto exec_cfg = ResolveExecutionConfig(plan_config_);
+	auto empty_result = std::make_shared<EmptyResultSourceNode>(
+	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, get_next_pipeline_node_id(),
+	                            "EmptyResultSource"),
+	    std::move(empty_plan), std::move(schema), std::move(exec_cfg));
+	return std::make_shared<DistributedPipelineNode>(std::move(empty_result));
 }
 
 std::shared_ptr<DistributedPipelineNode>
@@ -117,7 +139,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateColumnDataScanSource(const Physic
 	}
 
 	auto scan_plan = MakeColumnDataScanPlan(op);
-	std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks;
+	std::vector<duckdb::distributed::ScanSplit> scan_splits;
 	auto schema = MakeSchemaFromTypes(op.GetTypes());
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 
@@ -133,7 +155,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateColumnDataScanSource(const Physic
 
 	return MakeScanSourceNode(
 	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"),
-	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, false);
+	    std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, false);
 }
 
 std::shared_ptr<DistributedPipelineNode>
@@ -141,8 +163,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	auto exec_cfg = ResolveExecutionConfig(plan_config_);
 	auto scan_node_id = get_next_pipeline_node_id();
 	DuckPhysicalPlanRef scan_plan;
-	std::vector<duckdb::distributed::ScanTaskDescriptor> scan_tasks;
-	bool require_scan_tasks;
+	std::vector<duckdb::distributed::ScanSplit> scan_splits;
 
 	if (op.extra_info.scan_node_id.IsValid()) {
 		scan_node_id = static_cast<int>(op.extra_info.scan_node_id.GetIndex());
@@ -157,9 +178,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	}
 
 	scan_plan = MakeTableScanPlan(op);
-	auto scan_task_set = MakeTableScanTasks(op, *exec_cfg, plan_config_.db);
-	require_scan_tasks = !scan_task_set.known_empty;
-	scan_tasks = std::move(scan_task_set.tasks);
+	scan_splits = MakeTableScanSplits(op, *exec_cfg, plan_config_.db);
 	if (!scan_plan || !scan_plan->HasRoot()) {
 		throw std::runtime_error(
 		    "[translate.cpp] TABLE_SCAN: MakeTableScanPlan returned null/empty plan for function " + op.function.name);
@@ -176,7 +195,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	auto schema = MakeTableScanSchema(op, op.GetTypes());
 	return MakeScanSourceNode(
 	    MakePipelineNodeContext(plan_config_.query_idx, plan_config_.query_id, scan_node_id, "ScanSource"),
-	    std::move(scan_plan), std::move(scan_tasks), schema, exec_cfg, require_scan_tasks);
+	    std::move(scan_plan), std::move(scan_splits), schema, exec_cfg, true);
 }
 
 } // namespace distributed

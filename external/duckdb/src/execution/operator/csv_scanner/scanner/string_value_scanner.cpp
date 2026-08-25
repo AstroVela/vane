@@ -1220,6 +1220,16 @@ void StringValueScanner::Initialize() {
 	} else {
 		start_pos = iterator.GetGlobalCurrentPos();
 	}
+	if (has_scan_range_end) {
+		const auto current_buffer_idx = iterator.GetBufferIdx();
+		const bool starts_at_or_after_end =
+		    current_buffer_idx > scan_range_end_buffer_idx ||
+		    (current_buffer_idx == scan_range_end_buffer_idx && iterator.pos.buffer_pos >= scan_range_end_pos);
+		iterator.SetEnd(scan_range_end_pos);
+		if (starts_at_or_after_end) {
+			iterator.done = true;
+		}
+	}
 
 	result.last_position = {iterator.pos.buffer_idx, iterator.pos.buffer_pos, cur_buffer_handle->actual_size};
 	result.current_line_position.begin = result.last_position;
@@ -2011,6 +2021,12 @@ void StringValueScanner::FinalizeChunkProcess() {
 
 ValidatorLine StringValueScanner::GetValidationLine() {
 	return {start_pos, result.iterator.GetGlobalCurrentPos()};
+}
+
+void StringValueScanner::SetScanRangeEnd(const idx_t buffer_idx, const idx_t buffer_pos) {
+	has_scan_range_end = true;
+	scan_range_end_buffer_idx = buffer_idx;
+	scan_range_end_pos = buffer_pos;
 }
 
 } // namespace duckdb

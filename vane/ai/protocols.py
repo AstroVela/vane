@@ -89,3 +89,25 @@ class NativePrompterPlan(ABC):
     def get_options(self) -> dict[str, Any]:
         """Return the provider-specific native planning options."""
         ...
+
+
+class NativeInferencePlan(NativePrompterPlan):
+    """Common base for native inference-backend plans (vLLM, SGLang, ...).
+
+    Native inference plans lower into the shared native operator; the engine
+    field selects which executor factory runs at execution time.
+    """
+
+    model_name: str
+    system_message: str | None
+    on_error: str
+
+    @abstractmethod
+    def get_engine(self) -> str:
+        """Return the inference engine name ("vllm" | "sglang")."""
+        ...
+
+    @abstractmethod
+    def build_physical_vllm_options(self) -> dict[str, Any]:
+        """Build options for the native PhysicalVLLM operator."""
+        ...

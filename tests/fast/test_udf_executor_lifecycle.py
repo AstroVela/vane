@@ -697,6 +697,7 @@ def test_local_vllm_submit_fails_fast_when_engine_init_deadline_expires():
 
     ready = FakeReady()
     executor = vllm.LocalVLLMExecutor.__new__(vllm.LocalVLLMExecutor)
+    executor._shutdown_called = False
     executor.use_threading = True
     executor.engine_ready = ready
     executor.engine_error_message = None
@@ -1415,11 +1416,11 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
     actors.actors = ["actor-0", "actor-1"]
 
     with pytest.raises(RuntimeError, match="transient kill failure"):
-        actors.shutdown()
+        actors.shutdown(kill=True)
 
     assert actors.actors == ["actor-0"]
 
-    actors.shutdown()
+    actors.shutdown(kill=True)
 
     assert actors.actors == []
     assert fake_ray.attempts == [
@@ -1427,6 +1428,174 @@ def test_udf_actor_shutdown_retains_failed_handles_for_retry(monkeypatch):
         ("actor-1", True),
         ("actor-0", True),
     ]
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_udf_actor_shutdown_closes_executors_before_killing_actors(monkeypatch, close_fails):
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    events = []
+
+    class Ref:
+        def __init__(self) -> None:
+            self._future = Future()
+            if close_fails:
+                self._future.set_exception(RuntimeError("planned actor close failure"))
+            else:
+                self._future.set_result(None)
+
+        def future(self):
+            return self._future
+
+    class CloseExecutor:
+        def __init__(self, actor_name):
+            self._actor_name = actor_name
+
+        def remote(self):
+            events.append(f"close:{self._actor_name}")
+            return Ref()
+
+    class Actor:
+        def __init__(self, name):
+            self.name = name
+            self.close_executor = CloseExecutor(name)
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+
+        def kill(self, actor, *, no_restart):
+            assert no_restart is True
+            events.append(f"kill:{actor.name}")
+
+    monkeypatch.setitem(sys.modules, "ray", FakeRay())
+    actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    actors._owns_actors = True
+    actors.actors = [Actor("actor-0"), Actor("actor-1")]
+
+    if close_fails:
+        with pytest.raises(RuntimeError, match="planned actor close failure"):
+            actors.shutdown()
+        assert actors.cleanup_pending()
+        actors.shutdown(kill=True)
+    else:
+        actors.shutdown()
+
+    expected = ["close:actor-0", "close:actor-1"]
+    expected.extend(["kill:actor-0", "kill:actor-1"])
+    assert events == expected
+    assert actors.actors == []
+
+
+def test_udf_actor_shutdown_settles_every_submitted_close_after_one_fails(monkeypatch):
+    from vane.execution.udf_ray_actor_pool import UDFActorPoolBase
+
+    events = []
+
+    class TrackingFuture(Future):
+        def __init__(self, actor_name, *, error=None):
+            super().__init__()
+            self.actor_name = actor_name
+            if error is None:
+                self.set_result(None)
+            else:
+                self.set_exception(error)
+
+        def result(self, timeout=None):
+            events.append(f"settle:{self.actor_name}")
+            return super().result(timeout=timeout)
+
+    class CloseExecutor:
+        def __init__(self, actor_name, *, error=None):
+            self.actor_name = actor_name
+            self.error = error
+
+        def remote(self):
+            events.append(f"close:{self.actor_name}")
+            return types.SimpleNamespace(future=lambda: TrackingFuture(self.actor_name, error=self.error))
+
+    class Actor:
+        def __init__(self, name, *, close_error=None):
+            self.name = name
+            self.close_executor = CloseExecutor(name, error=close_error)
+
+    class FakeRay(types.ModuleType):
+        def __init__(self):
+            super().__init__("ray")
+
+        def kill(self, actor, *, no_restart):
+            assert no_restart is True
+            events.append(f"kill:{actor.name}")
+
+    monkeypatch.setitem(sys.modules, "ray", FakeRay())
+    actors = UDFActorPoolBase.__new__(UDFActorPoolBase)
+    actors._owns_actors = True
+    actors.actors = [
+        Actor("actor-0", close_error=RuntimeError("planned first close failure")),
+        Actor("actor-1"),
+    ]
+
+    with pytest.raises(RuntimeError, match="planned first close failure"):
+        actors.shutdown()
+
+    assert events == [
+        "close:actor-0",
+        "close:actor-1",
+        "settle:actor-0",
+        "settle:actor-1",
+        "kill:actor-1",
+    ]
+    assert len(actors.actors) == 1
+    assert actors.actors[0].name == "actor-0"
+
+    actors.shutdown(kill=True)
+
+    assert events[-1] == "kill:actor-0"
+    assert actors.actors == []
+
+
+def test_udf_actor_cleanup_summary_uses_bounded_ray_task_root_cause():
+    import ray
+
+    from vane.execution.udf_ray_actor_pool import (
+        _ACTOR_CLEANUP_ERROR_MAX_BYTES,
+        _actor_exception_summary,
+    )
+
+    root_error = RuntimeError("planned provider close failure")
+    wrapped_error = ray.exceptions.RayTaskError(
+        "close_executor",
+        "remote traceback",
+        root_error,
+    ).as_instanceof_cause()
+
+    summary = _actor_exception_summary(wrapped_error)
+
+    assert summary == "RuntimeError: planned provider close failure"
+    assert len(summary.encode("utf-8")) <= _ACTOR_CLEANUP_ERROR_MAX_BYTES
+
+
+def test_udf_actor_readiness_cleanup_does_not_retain_terminated_pool(monkeypatch):
+    import vane.execution.udf_ray_actor_pool as actor_pool_mod
+
+    readiness_error = RuntimeError("planned readiness failure")
+    pool = types.SimpleNamespace(actors=["actor-0"])
+
+    def fail_readiness(_ray, _pool):
+        raise readiness_error
+
+    def shutdown():
+        pool.actors = []
+        raise RuntimeError("planned callable close failure")
+
+    pool.shutdown = shutdown
+    monkeypatch.setattr(actor_pool_mod, "_resolve_actor_pool_init_refs", fail_readiness)
+
+    with pytest.raises(RuntimeError, match="planned callable close failure") as exc_info:
+        actor_pool_mod.wait_for_actor_pools_ready([pool])
+
+    assert exc_info.value.owned_actor_pools == []
+    assert exc_info.value.creation_error is readiness_error
 
 
 def test_ray_task_session_environment_is_reinstalled_for_reused_worker(monkeypatch):
@@ -2427,6 +2596,182 @@ def test_udf_runtime_close_flushes_compute_tail_before_releasing_callable():
     assert output.column("x").to_pylist() == list(range(2048))
     assert set(output.column("batch_rows").to_pylist()) == {2048}
     assert executor._map_fn is None
+
+
+def test_udf_runtime_invokes_internal_callable_close_hook_once():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class InternallyManagedActor:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __call__(self, table):
+            return table
+
+        def _vane_close(self) -> None:
+            self.close_calls += 1
+
+    executor = UDFExecutor(
+        _subprocess_map_payload(
+            InternallyManagedActor,
+            execution_backend="subprocess_actor",
+            actor_number=1,
+        )
+    )
+    actor = executor._map_fn
+
+    executor.close()
+    executor.close()
+
+    assert actor.close_calls == 1
+
+
+def test_udf_runtime_retries_callable_and_async_runtime_close_failures():
+    from vane.execution._udf_runtime import MAX_CLOSE_ERROR_BYTES, UDFExecutor
+
+    class TransientActor:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def _vane_close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("planned callable close failure")
+
+    class TransientRuntime:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("planned async runtime close failure")
+
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._closed = False
+    executor._close_started = False
+    executor._finished_submitting = True
+    actor = TransientActor()
+    runtime = TransientRuntime()
+    executor._map_fn = actor
+    executor._async_runtime = runtime
+
+    with pytest.raises(RuntimeError, match="planned callable close failure") as exc_info:
+        executor.close()
+
+    assert len(str(exc_info.value).encode("utf-8")) <= MAX_CLOSE_ERROR_BYTES
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert executor._closed is False
+    assert executor._map_fn is actor
+    assert executor._async_runtime is runtime
+    assert actor.close_calls == 1
+    assert runtime.close_calls == 0
+
+    with pytest.raises(RuntimeError, match="planned async runtime close failure"):
+        executor.close()
+
+    assert executor._map_fn is None
+    assert executor._async_runtime is runtime
+    assert actor.close_calls == 2
+    assert runtime.close_calls == 1
+
+    executor.close()
+
+    assert executor._closed is True
+    assert executor._async_runtime is None
+    assert runtime.close_calls == 2
+
+
+def test_udf_runtime_close_does_not_transport_raw_oversized_provider_failure():
+    from vane.execution._udf_runtime import MAX_CLOSE_ERROR_BYTES, UDFExecutor
+
+    class ProviderCloseError(RuntimeError):
+        pass
+
+    class FailingActor:
+        def _vane_close(self) -> None:
+            raise ProviderCloseError("x" * (MAX_CLOSE_ERROR_BYTES * 100))
+
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._closed = False
+    executor._close_started = False
+    executor._finished_submitting = True
+    executor._map_fn = FailingActor()
+    executor._async_runtime = None
+
+    with pytest.raises(RuntimeError, match="error text exceeds") as exc_info:
+        executor.close()
+
+    assert type(exc_info.value) is RuntimeError
+    assert len(str(exc_info.value).encode("utf-8")) <= MAX_CLOSE_ERROR_BYTES
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+
+def test_udf_runtime_close_handles_unprintable_cleanup_failure():
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class UnprintableError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("planned error formatting failure")
+
+    class FailingActor:
+        def _vane_close(self) -> None:
+            raise UnprintableError()
+
+    executor = UDFExecutor.__new__(UDFExecutor)
+    executor._closed = False
+    executor._close_started = False
+    executor._finished_submitting = True
+    executor._map_fn = FailingActor()
+    executor._async_runtime = None
+
+    with pytest.raises(RuntimeError, match="error text unavailable"):
+        executor.close()
+
+    assert executor._closed is False
+    assert executor._map_fn is not None
+
+
+def test_udf_runtime_close_handles_unreadable_exception_type_name():
+    from vane.execution._udf_runtime import _bounded_close_error
+
+    class _OpaqueExceptionType(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise RuntimeError("planned type-name failure")
+            return super().__getattribute__(name)
+
+    class _OpaqueError(RuntimeError, metaclass=_OpaqueExceptionType):
+        def __str__(self):
+            raise RuntimeError("planned error formatting failure")
+
+    assert _bounded_close_error(_OpaqueError()) == "_OpaqueError (error text unavailable)"
+
+
+def test_udf_runtime_close_does_not_invoke_exception_string_conversion():
+    from vane.execution._udf_runtime import _bounded_close_error
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("provider exception string conversion must not run")
+
+    assert _bounded_close_error(_UnprintableError("safe detail")) == "_UnprintableError: safe detail"
+
+
+def test_udf_runtime_close_bounds_oversized_exception_type_name():
+    from vane.execution._udf_runtime import MAX_CLOSE_ERROR_BYTES, _bounded_close_error
+
+    class OversizedTypeNameError(RuntimeError):
+        pass
+
+    OversizedTypeNameError.__name__ = "x" * 100_000
+
+    summary = _bounded_close_error(OversizedTypeNameError("planned cleanup failure"))
+
+    assert len(summary.encode("utf-8")) <= MAX_CLOSE_ERROR_BYTES
+    assert summary == "BaseException: planned cleanup failure"
 
 
 def test_udf_runtime_actor_backend_does_not_buffer_input_across_submits():
@@ -4186,14 +4531,18 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     class FakeWorker:
         def __init__(self, name: str):
             self.name = name
+            self._cleanup_finished = False
+            self.close_count = 0
 
         def close(self, *, kill: bool = False) -> None:
+            self.close_count += 1
             events.append(f"close:{self.name}:{kill}")
             if self.name == "replacement":
                 replacement_close_entered.set()
                 assert allow_replacement_close.wait(timeout=5.0)
-                if cleanup_fails:
+                if cleanup_fails and self.close_count == 1:
                     raise RuntimeError("planned replacement cleanup failure")
+            self._cleanup_finished = True
 
     class FakeExecutor:
         def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
@@ -4288,13 +4637,17 @@ def test_local_subprocess_actor_pool_shutdown_joins_in_progress_replacement_clea
     assert follower_shutdown_errors == []
     assert pool._replacing_workers == set()
     assert pool._replacement_cleanup_errors == []
-    assert events == [
+    expected_events = [
         "close:failed:True",
         "admission-close",
         "close:replacement:True",
         "shutdown:False:True",
         f"close:failed:{kill}",
     ]
+    if cleanup_fails:
+        expected_events.append("close:replacement:True")
+    assert events == expected_events
+    assert not pool.cleanup_pending()
 
 
 @pytest.mark.parametrize("kill", [False, True])
@@ -4484,17 +4837,400 @@ def test_local_subprocess_actor_pool_shutdown_continues_after_abort_failure():
     ):
         pool.shutdown(kill=True)
 
+    assert events[0] == "admission-close"
+    assert sorted(events[1:3]) == ["close:w0:True", "close:w1:True"]
+    assert events[3] == "shutdown:False:True"
+    assert sorted(events[4:]) == ["close:w0:True", "close:w1:True"]
+    assert pool._workers == []
+    assert pool._executor is None
+    assert pool._shutdown_finished
+
+
+def test_local_subprocess_actor_pool_shutdown_continues_after_scope_cancel_failure():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    events: list[str] = []
+
+    class FailingScope:
+        def cancel(self, reason):
+            events.append(f"cancel:{reason}")
+            raise RuntimeError("planned scope cancellation failure")
+
+    class FakeWorker:
+        def close(self, *, kill):
+            events.append(f"close:{kill}")
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            events.append(f"shutdown:{wait}:{cancel_futures}")
+
+    class FakeAdmissionSlots:
+        def close(self):
+            events.append("admission-close")
+
+    scope = FailingScope()
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 1
+    pool.name = "scope-cancel-failure"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {0: scope}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = [FakeWorker()]
+    pool._executor = FakeExecutor()
+    pool.admission_slots = FakeAdmissionSlots()
+
+    with pytest.raises(RuntimeError, match="planned scope cancellation failure"):
+        pool.shutdown(kill=False)
+
     assert events == [
         "admission-close",
-        "close:w0:True",
-        "close:w1:True",
+        "cancel:local subprocess actor pool closed",
         "shutdown:False:True",
-        "close:w0:True",
-        "close:w1:True",
+        "close:False",
     ]
     assert pool._workers == []
     assert pool._executor is None
     assert pool._shutdown_finished
+
+
+def test_local_subprocess_actor_pool_reports_graceful_quiescence_timeout(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    close_calls = []
+    scope = subprocess_exec.ExecutionCancellationScope("test-executor", 1)
+
+    class FakeWorker:
+        def close(self, *, kill):
+            close_calls.append(bool(kill))
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            assert (wait, cancel_futures) == (False, True)
+
+    class FakeAdmissionSlots:
+        def close(self):
+            return None
+
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 1
+    pool.name = "graceful-quiescence-timeout"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 1
+    pool._terminal_error = None
+    pool._active_scopes = {0: scope}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = [FakeWorker()]
+    pool._executor = FakeExecutor()
+    pool.admission_slots = FakeAdmissionSlots()
+    monkeypatch.setattr(subprocess_exec, "_subprocess_shutdown_grace_s", lambda: 0.001)
+
+    with pytest.raises(RuntimeError, match="graceful shutdown did not quiesce active work"):
+        pool.shutdown(kill=False)
+
+    assert scope.is_set()
+    assert close_calls == [True, True]
+    assert pool._workers == []
+    assert pool._shutdown_finished
+
+
+def test_local_subprocess_actor_pool_bounds_replacement_cleanup_errors():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._closed = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._replacement_cleanup_errors = []
+
+    for index in range(100):
+        pool._record_replacement_cleanup_error(index, "worker", RuntimeError(f"failure-{index}"))
+
+    assert len(pool._replacement_cleanup_errors) == subprocess_exec._SUBPROCESS_CLEANUP_ERROR_LIMIT
+    assert str(pool._replacement_cleanup_errors[-1]) == subprocess_exec._SUBPROCESS_CLEANUP_ERRORS_OMITTED
+
+
+def test_local_subprocess_actor_pool_closes_idle_workers_concurrently():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    close_barrier = threading.Barrier(2)
+    close_calls: list[tuple[str, bool]] = []
+
+    class FakeWorker:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self, *, kill):
+            close_calls.append((self.name, bool(kill)))
+            close_barrier.wait(timeout=1.0)
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            assert (wait, cancel_futures) == (False, True)
+
+    class FakeAdmissionSlots:
+        def close(self):
+            return None
+
+    workers = [FakeWorker("w0"), FakeWorker("w1")]
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 2
+    pool.name = "concurrent-graceful-close"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0, 0]
+    pool._replacing_workers = set()
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = workers
+    pool._executor = FakeExecutor()
+    pool.admission_slots = FakeAdmissionSlots()
+
+    pool.shutdown(kill=False)
+
+    assert sorted(close_calls) == [("w0", False), ("w1", False)]
+    assert pool._workers == []
+    assert pool._shutdown_finished
+
+
+def test_local_subprocess_actor_pool_retries_retained_worker_cleanup():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    close_calls = []
+
+    class FakeWorker:
+        def close(self, *, kill):
+            close_calls.append(bool(kill))
+            if len(close_calls) == 1:
+                raise RuntimeError("planned first close failure")
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            assert (wait, cancel_futures) == (False, True)
+
+    class FakeAdmissionSlots:
+        def close(self):
+            return None
+
+    worker = FakeWorker()
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 1
+    pool.name = "retry-retained-cleanup"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = [worker]
+    pool._cleanup_pending_workers = []
+    pool._executor = FakeExecutor()
+    pool.admission_slots = FakeAdmissionSlots()
+
+    with pytest.raises(RuntimeError, match="planned first close failure"):
+        pool.shutdown(kill=False)
+
+    assert pool.cleanup_pending()
+    assert pool._workers == []
+    assert pool._cleanup_pending_workers == [worker]
+
+    pool.shutdown(kill=True)
+
+    assert close_calls == [False, True]
+    assert not pool.cleanup_pending()
+    assert pool._cleanup_pending_workers == []
+
+
+def test_local_subprocess_actor_pool_retains_failed_provisional_replacement_until_first_shutdown():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    close_calls = []
+
+    class FakeWorker:
+        def __init__(self, name):
+            self.name = name
+            self._cleanup_finished = name == "failed"
+
+        def close(self, *, kill):
+            close_calls.append((self.name, bool(kill)))
+            self._cleanup_finished = True
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            assert (wait, cancel_futures) == (False, True)
+
+    class FakeAdmissionSlots:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    failed_worker = FakeWorker("failed")
+    provisional_worker = FakeWorker("provisional")
+    admission_slots = FakeAdmissionSlots()
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 1
+    pool.name = "failed-provisional-replacement"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = {0}
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = [failed_worker]
+    pool._cleanup_pending_workers = []
+    pool._executor = FakeExecutor()
+    pool._cleanup_pending_executor = None
+    pool.admission_slots = admission_slots
+
+    def fail_spawn(worker_idx):
+        pool._track_replacing_executor(worker_idx, provisional_worker)
+        raise subprocess_exec._SubprocessStartupCleanupError("planned provisional cleanup failure")
+
+    pool._spawn_worker = fail_spawn
+
+    pool._replace_worker(0, 0, failed_worker)
+
+    assert pool._replacing_workers == set()
+    assert pool._replacing_executors == {}
+    assert pool._cleanup_pending_workers == [provisional_worker]
+    assert pool._terminal_error is not None
+
+    pool.shutdown(kill=True)
+
+    assert sorted(close_calls) == [("failed", True), ("failed", True), ("provisional", True)]
+    assert not pool.cleanup_pending()
+    assert admission_slots.close_calls == 2
+
+
+def test_local_subprocess_actor_pool_retries_retained_executor_cleanup():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    shutdown_calls = []
+
+    class FakeExecutor:
+        def shutdown(self, *, wait, cancel_futures):
+            shutdown_calls.append((wait, cancel_futures))
+            if len(shutdown_calls) == 1:
+                raise RuntimeError("planned executor shutdown failure")
+
+    class FakeAdmissionSlots:
+        def close(self):
+            return None
+
+    executor = FakeExecutor()
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool.payload = {}
+    pool.pool_size = 1
+    pool.name = "retry-retained-executor"
+    pool._closed = False
+    pool._shutdown_finished = True
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active = 0
+    pool._terminal_error = None
+    pool._active_scopes = {}
+    pool._worker_generations = [0]
+    pool._replacing_workers = set()
+    pool._replacing_executors = {}
+    pool._replacement_startup_cancel_requested = False
+    pool._replacement_cleanup_errors = []
+    pool._aborting_workers = set()
+    pool._idle_workers = deque()
+    pool._workers = []
+    pool._cleanup_pending_workers = []
+    pool._executor = executor
+    pool._cleanup_pending_executor = None
+    pool.admission_slots = FakeAdmissionSlots()
+
+    with pytest.raises(RuntimeError, match="planned executor shutdown failure"):
+        pool.shutdown(kill=False)
+
+    assert pool.cleanup_pending()
+    assert pool._executor is None
+    assert pool._cleanup_pending_executor is executor
+
+    pool.shutdown(kill=True)
+
+    assert shutdown_calls == [(False, True), (False, True)]
+    assert not pool.cleanup_pending()
+    assert pool._cleanup_pending_executor is None
+
+
+def test_local_subprocess_actor_pool_aborts_active_workers_concurrently():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    close_barrier = threading.Barrier(2)
+    scopes = [
+        subprocess_exec.ExecutionCancellationScope("executor", 1),
+        subprocess_exec.ExecutionCancellationScope("executor", 2),
+    ]
+
+    class FakeWorker:
+        def close(self, *, kill):
+            assert kill
+            close_barrier.wait(timeout=1.0)
+
+    pool = subprocess_exec.LocalSubprocessActorPool.__new__(subprocess_exec.LocalSubprocessActorPool)
+    pool._lock = threading.RLock()
+    pool._cond = threading.Condition(pool._lock)
+    pool._active_scopes = {0: scopes[0], 1: scopes[1]}
+    pool._worker_generations = [0, 0]
+    pool._aborting_workers = set()
+    pool._workers = [FakeWorker(), FakeWorker()]
+
+    pool.abort_scopes(set(scopes))
+
+    assert pool._aborting_workers == {(0, 0), (1, 0)}
 
 
 def test_local_subprocess_actor_pool_replaces_lost_instance_for_later_calls():
@@ -4577,11 +5313,13 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_worker_init_f
 
     created: list[FakeWorker] = []
 
-    def fake_worker(payload, *, worker_env=None, session_config=None):
+    def fake_worker(payload, *, worker_env=None, session_config=None, startup_observer=None):
         assert session_config is None
         if len(created) == 1:
             raise RuntimeError("worker init failed")
         worker = FakeWorker(f"w{len(created)}")
+        if startup_observer is not None:
+            startup_observer(worker)
         created.append(worker)
         return worker
 
@@ -4613,10 +5351,12 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
     class FakeWorker:
         _proc = None
 
-        def __init__(self, payload, *, worker_env=None, session_config=None):
+        def __init__(self, payload, *, worker_env=None, session_config=None, startup_observer=None):
             assert session_config is None
             self.name = f"w{len(created)}"
             created.append(self.name)
+            if startup_observer is not None:
+                startup_observer(self)
 
         def close(self, *, kill: bool = False) -> None:
             events.append(f"close:{self.name}:{kill}")
@@ -4638,6 +5378,106 @@ def test_local_subprocess_actor_pool_rolls_back_created_workers_on_thread_pool_i
         )
 
     assert events == ["close:w1:True", "close:w0:True"]
+
+
+def test_local_subprocess_actor_pool_init_cleanup_failure_carries_retry_owner(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    workers = []
+
+    class FakeWorker:
+        _proc = None
+
+        def __init__(self, name):
+            self.name = name
+            self.close_calls = 0
+            self._cleanup_finished = False
+
+        def close(self, *, kill=False):
+            assert kill is True
+            self.close_calls += 1
+            if self.name == "created" and self.close_calls == 1:
+                raise RuntimeError("planned initial cleanup failure")
+            self._cleanup_finished = True
+
+    def fake_worker(payload, *, worker_env=None, session_config=None, startup_observer=None):
+        worker = FakeWorker("created" if not workers else "failed-startup")
+        workers.append(worker)
+        assert startup_observer is not None
+        startup_observer(worker)
+        if worker.name == "failed-startup":
+            raise RuntimeError("planned worker startup failure")
+        return worker
+
+    monkeypatch.setattr(subprocess_exec, "_SingleSubprocessExecutor", fake_worker)
+
+    with pytest.raises(subprocess_exec._OwnedLocalSubprocessActorPoolsError) as exc_info:
+        subprocess_exec.LocalSubprocessActorPool(
+            _subprocess_map_payload(
+                lambda table: table,
+                execution_backend="subprocess_actor",
+                actor_number=2,
+            ),
+            2,
+        )
+
+    assert isinstance(exc_info.value.creation_error, RuntimeError)
+    assert "planned worker startup failure" in str(exc_info.value.creation_error)
+    assert len(exc_info.value.owned_actor_pools) == 1
+    pool = exc_info.value.owned_actor_pools[0]
+    assert pool.cleanup_pending()
+    assert [worker.close_calls for worker in workers] == [1, 1]
+
+    pool.shutdown(kill=True)
+
+    assert not pool.cleanup_pending()
+    assert [worker.close_calls for worker in workers] == [2, 1]
+
+
+def test_local_subprocess_actor_pool_rollback_preserves_owned_constructor_failure(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class PendingPool:
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self, *, kill=False):
+            assert kill is True
+            self.shutdown_calls += 1
+            raise RuntimeError("planned persistent cleanup failure")
+
+        def cleanup_pending(self):
+            return True
+
+    pending_pool = PendingPool()
+    creation_error = RuntimeError("planned constructor failure")
+
+    def fail_pool_creation(*_args, **_kwargs):
+        raise subprocess_exec._OwnedLocalSubprocessActorPoolsError(
+            "planned constructor cleanup failure",
+            owned_actor_pools=[pending_pool],
+            creation_error=creation_error,
+        )
+
+    monkeypatch.setattr(subprocess_exec, "LocalSubprocessActorPool", fail_pool_creation)
+    nodes = [
+        {
+            "node_id": 4,
+            "payload": {
+                "execution_backend": "subprocess_actor",
+                "actor_number": 1,
+                "function_pickle": b"unused",
+                "call_mode": "map_batches",
+            },
+        }
+    ]
+
+    with pytest.raises(subprocess_exec._OwnedLocalSubprocessActorPoolsError) as exc_info:
+        subprocess_exec.ensure_local_subprocess_actor_pools_for_nodes(nodes)
+
+    assert exc_info.value.creation_error is creation_error
+    assert exc_info.value.owned_actor_pools == [pending_pool]
+    assert pending_pool.shutdown_calls == 1
 
 
 def test_global_subprocess_task_runtime_close_without_kill_does_not_wait_for_executor():
@@ -7407,6 +8247,7 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
     executor._closed = False
     executor._broken_error = None
+    executor._actor_lost = False
     executor._execution_scope_lock = threading.Lock()
     executor._active_execution_scope = None
     executor._worker_lifetime_scope = subprocess_exec.ExecutionCancellationScope("shutdown-worker", 1)
@@ -7420,6 +8261,219 @@ def _bare_shutdown_executor(subprocess_exec, sock, proc):
     executor._sock = sock
     executor._proc = proc
     return executor
+
+
+def test_single_subprocess_reported_submit_error_closes_worker_gracefully():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    error = b"planned write failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
+        + error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    with pytest.raises(RuntimeError, match="planned write failure"):
+        executor._recv_submit_result()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert executor._closed
+    assert executor._broken_error == "planned write failure"
+    assert not executor._actor_lost
+    assert proc.kill_calls == 0
+    assert sock.closed
+
+
+def test_single_subprocess_reported_submit_error_preserves_close_failure():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    submit_error = b"planned write failure"
+    close_error = b"planned close failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(submit_error))
+        + submit_error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(close_error))
+        + close_error
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+
+    with pytest.raises(
+        RuntimeError,
+        match="planned write failure.*graceful broken-worker cleanup failed.*planned close failure",
+    ):
+        executor._recv_submit_result()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [(subprocess_exec._MSG_CLOSE, b"")]
+    assert executor._closed
+    assert executor._broken_error == "planned write failure"
+    assert proc.kill_calls == 0
+    assert sock.closed
+
+
+def test_single_subprocess_reported_finish_error_closes_worker_gracefully():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    error = b"planned finish failure"
+    responses = (
+        subprocess_exec._HEADER.pack(subprocess_exec._MSG_ERROR, len(error))
+        + error
+        + subprocess_exec._HEADER.pack(subprocess_exec._MSG_ACK, 0)
+    )
+    sock = _GracefulShutdownSocket(responses)
+    proc = _FakeShutdownProcess(exits_on_wait=True)
+    executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
+    executor._finished_submitting = False
+
+    with pytest.raises(RuntimeError, match="planned finish failure"):
+        executor.finished_submitting()
+
+    messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
+    assert messages == [
+        (subprocess_exec._MSG_FINISHED, b""),
+        (subprocess_exec._MSG_CLOSE, b""),
+    ]
+    assert executor._closed
+    assert executor._broken_error == "planned finish failure"
+    assert not executor._actor_lost
+    assert proc.kill_calls == 0
+    assert sock.closed
+
+
+def test_single_subprocess_reported_error_survives_unprintable_cleanup_failure(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class _UnprintableCleanupError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned str failure")
+
+        def __repr__(self):
+            raise RuntimeError("planned repr failure")
+
+    executor = object.__new__(subprocess_exec._SingleSubprocessExecutor)
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise _UnprintableCleanupError()
+
+    monkeypatch.setattr(executor, "_mark_broken", fail_cleanup)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        executor._mark_reported_error("planned provider failure")
+
+    assert "planned provider failure" in str(exc_info.value)
+    assert "_UnprintableCleanupError (error text unavailable)" in str(exc_info.value)
+
+
+def test_subprocess_worker_bounds_formatted_provider_error():
+    from vane.execution.udf_subprocess_worker import _format_exception
+
+    try:
+        raise RuntimeError("provider-head:" + "x" * 100_000 + ":provider-tail")
+    except RuntimeError as caught:
+        error = caught
+
+    formatted = _format_exception(error)
+
+    assert len(formatted.encode("utf-8")) <= 4 * 1024
+    assert "provider-head:" in formatted
+    assert ":provider-tail" in formatted
+
+
+def test_subprocess_worker_preserves_bounded_exception_chain():
+    import vane.execution.udf_subprocess_worker as worker
+
+    current: BaseException = ValueError("root-provider-failure")
+    for index in range(worker._MAX_FORMATTED_EXCEPTION_CHAIN + 3):
+        next_error = RuntimeError(f"provider-layer-{index}")
+        next_error.__cause__ = current
+        current = next_error
+
+    formatted = worker._format_exception(current)
+
+    assert len(formatted.encode("utf-8")) <= worker._MAX_FORMATTED_EXCEPTION_BYTES
+    assert "earlier exceptions omitted" in formatted
+    assert "direct cause" in formatted
+    assert f"provider-layer-{worker._MAX_FORMATTED_EXCEPTION_CHAIN + 2}" in formatted
+
+
+def test_subprocess_worker_bounds_traceback_traversal():
+    import vane.execution.udf_subprocess_worker as worker
+
+    def fail_at_depth(depth):
+        if depth == 0:
+            raise RuntimeError("deep-provider-failure")
+        fail_at_depth(depth - 1)
+
+    try:
+        fail_at_depth(worker._MAX_FORMATTED_EXCEPTION_TRACEBACK_STEPS + 10)
+    except RuntimeError as caught:
+        error = caught
+
+    formatted = worker._format_exception(error)
+
+    assert len(formatted.encode("utf-8")) <= worker._MAX_FORMATTED_EXCEPTION_BYTES
+    assert "additional traceback frames omitted" in formatted
+    assert "deep-provider-failure" in formatted
+
+
+def test_subprocess_worker_bounds_cyclic_exception_chain():
+    import vane.execution.udf_subprocess_worker as worker
+
+    first = RuntimeError("first-provider-failure")
+    second = RuntimeError("second-provider-failure")
+    first.__cause__ = second
+    second.__cause__ = first
+
+    formatted = worker._format_exception(first)
+
+    assert len(formatted.encode("utf-8")) <= worker._MAX_FORMATTED_EXCEPTION_BYTES
+    assert "cyclic exception chain omitted" in formatted
+    assert "first-provider-failure" in formatted
+    assert "second-provider-failure" in formatted
+
+
+def test_subprocess_worker_retries_transient_executor_close():
+    import vane.execution.udf_subprocess_worker as worker
+
+    class TransientExecutor:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("planned transient close failure")
+
+    executor = TransientExecutor()
+
+    assert worker._close_executor_with_retry(executor) is None
+    assert executor.close_calls == worker._EXECUTOR_CLOSE_ATTEMPTS
+
+
+def test_subprocess_worker_bounds_persistent_executor_close_retries():
+    import vane.execution.udf_subprocess_worker as worker
+
+    class FailingExecutor:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise RuntimeError(f"planned close failure {self.close_calls}")
+
+    executor = FailingExecutor()
+
+    error = worker._close_executor_with_retry(executor)
+
+    assert isinstance(error, RuntimeError)
+    assert str(error) == f"planned close failure {worker._EXECUTOR_CLOSE_ATTEMPTS}"
+    assert executor.close_calls == worker._EXECUTOR_CLOSE_ATTEMPTS
 
 
 def test_single_subprocess_graceful_close_waits_for_ack_and_exit_without_kill():
@@ -7467,7 +8521,8 @@ def test_single_subprocess_graceful_close_honors_timeout_before_kill(monkeypatch
     executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
 
     started = time.monotonic()
-    executor.close(kill=False)
+    with pytest.raises(RuntimeError, match="graceful shutdown timed out or disconnected"):
+        executor.close(kill=False)
     elapsed = time.monotonic() - started
 
     messages = _decode_control_messages(bytes(sock.sent), subprocess_exec._HEADER)
@@ -7488,7 +8543,8 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
     executor = _bare_shutdown_executor(subprocess_exec, sock, proc)
 
     started = time.monotonic()
-    executor.close(kill=False)
+    with pytest.raises(RuntimeError, match="graceful shutdown timed out or disconnected"):
+        executor.close(kill=False)
     elapsed = time.monotonic() - started
 
     assert elapsed >= 0.015
@@ -7497,6 +8553,45 @@ def test_single_subprocess_graceful_close_waits_after_control_disconnect(monkeyp
     assert proc.wait_timeouts[0] is not None
     assert 0.0 < proc.wait_timeouts[0] <= 0.02
     assert sock.closed
+
+
+def test_single_subprocess_close_retains_process_owner_until_kill_retry_succeeds():
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    class RetryableShutdownProcess:
+        def __init__(self):
+            self.running = True
+            self.kill_calls = 0
+
+        def poll(self):
+            return None if self.running else 0
+
+        def kill(self):
+            self.kill_calls += 1
+            if self.kill_calls == 1:
+                raise RuntimeError("planned first kill failure")
+            self.running = False
+
+        def wait(self, timeout=None):
+            if self.running:
+                raise TimeoutError("process still running")
+            return 0
+
+    proc = RetryableShutdownProcess()
+    executor = _bare_shutdown_executor(subprocess_exec, _FakeControlSocket(), proc)
+
+    with pytest.raises(RuntimeError, match="planned first kill failure"):
+        executor.close(kill=True)
+
+    assert executor._closed
+    assert not executor._cleanup_finished
+    assert executor._proc is proc
+
+    executor.close(kill=True)
+
+    assert proc.kill_calls == 2
+    assert executor._cleanup_finished
+    assert executor._proc is None
 
 
 def test_single_subprocess_close_releases_active_output_grants(monkeypatch):
@@ -7543,6 +8638,7 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
     import vane.execution.udf_subprocess as subprocess_exec
 
     events: list[str] = []
+    failed_once: set[str] = set()
     sock = _FakeControlSocket()
     executor = _bare_shutdown_executor(subprocess_exec, sock, None)
     scope = executor._worker_lifetime_scope
@@ -7558,19 +8654,23 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
 
     def cancel_input_lease(lease_id, *, name):
         events.append(f"lease:{lease_id}:{name}")
-        if lease_id == 1:
+        if lease_id == 1 and "lease" not in failed_once:
+            failed_once.add("lease")
             raise RuntimeError("planned input lease failure")
         return 0
 
     def release_output_grant(grant_id, *, name):
         events.append(f"grant:{grant_id}:{name}")
-        if grant_id == 3:
+        if grant_id == 3 and "grant" not in failed_once:
+            failed_once.add("grant")
             raise RuntimeError("planned output grant failure")
         return 0
 
     def wake_budget():
         events.append("wake")
-        raise RuntimeError("planned budget wakeup failure")
+        if "wake" not in failed_once:
+            failed_once.add("wake")
+            raise RuntimeError("planned budget wakeup failure")
 
     monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
     monkeypatch.setattr(subprocess_exec, "release_local_shm_output_grant", release_output_grant)
@@ -7586,14 +8686,24 @@ def test_single_subprocess_close_attempts_all_scope_and_worker_cleanup_after_fai
         "lease:1:udf-input-close",
         "grant:3:udf-output-cancel",
         "wake",
+        "lease:1:udf-input-close",
         "lease:2:udf-input-close",
+        "grant:3:udf-output-close",
         "grant:4:udf-output-close",
     ]
     assert executor._active_input_leases == {}
     assert executor._active_output_grants == {}
+    assert executor._cleanup_finished
     assert sock.closed
     assert executor._sock is None
     assert executor._proc is None
+
+    executor.close(kill=True)
+
+    assert len(events) == 7
+    assert executor._active_input_leases == {}
+    assert executor._active_output_grants == {}
+    assert executor._cleanup_finished
 
 
 def test_single_subprocess_execution_scope_is_cleared_after_cleanup_failure():
@@ -7711,6 +8821,7 @@ def test_single_subprocess_submit_transport_failure_breaks_worker_before_fallibl
     sock = _FakeControlSocket()
     executor = _bare_shutdown_executor(subprocess_exec, sock, None)
     executor._actor_lost = False
+    scope = executor._worker_lifetime_scope
 
     def fail_send(_sock, _msg_type, _payload=b""):
         raise OSError("planned transport failure")
@@ -7731,8 +8842,15 @@ def test_single_subprocess_submit_transport_failure_breaks_worker_before_fallibl
     assert executor._closed
     assert executor._actor_lost
     assert executor._broken_error == "UDF subprocess ref-bundle submit failed: planned transport failure"
-    assert executor._active_input_leases == {}
+    assert executor._active_input_leases == {7: scope}
+    assert not executor._cleanup_finished
     assert sock.closed
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", lambda _lease_id, *, name: 0)
+    executor.close(kill=True)
+
+    assert executor._active_input_leases == {}
+    assert executor._cleanup_finished
 
 
 def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypatch):
@@ -7741,10 +8859,11 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
     sock = _FakeControlSocket()
     executor = _bare_shutdown_executor(subprocess_exec, sock, None)
     executor._actor_lost = False
+    scope = executor._worker_lifetime_scope
     executor._recv_submit_result = lambda: (_ for _ in ()).throw(RuntimeError("planned receive failure"))
 
     def fail_lease_cleanup(_lease_id, *, name):
-        assert name == "udf-input"
+        assert name in {"udf-input", "udf-input-close"}
         raise RuntimeError("planned lease cleanup failure")
 
     monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", fail_lease_cleanup)
@@ -7757,8 +8876,15 @@ def test_single_subprocess_result_cleanup_failure_prevents_worker_reuse(monkeypa
 
     assert executor._closed
     assert not executor.is_reusable()
-    assert executor._active_input_leases == {}
+    assert executor._active_input_leases == {8: scope}
+    assert not executor._cleanup_finished
     assert sock.closed
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", lambda _lease_id, *, name: 0)
+    executor.close(kill=True)
+
+    assert executor._active_input_leases == {}
+    assert executor._cleanup_finished
 
 
 def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(monkeypatch):
@@ -7796,6 +8922,19 @@ def test_subprocess_worker_releases_output_grant_when_descriptor_creation_fails(
     assert [msg_type for msg_type, _ in messages] == [worker._MSG_OUTPUT_GRANT_REQUEST, release_type]
     release_payload = vane_pickle.loads(messages[1][1])
     assert release_payload == {"grant_id": 99}
+
+
+def test_subprocess_worker_formats_fully_unprintable_exception():
+    import vane.execution.udf_subprocess_worker as worker
+
+    class _UnprintableError(RuntimeError):
+        def __str__(self):
+            raise RuntimeError("planned worker error str failure")
+
+        def __repr__(self):
+            raise RuntimeError("planned worker error repr failure")
+
+    assert worker._format_exception(_UnprintableError()) == "<unprintable _UnprintableError>"
 
 
 def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(monkeypatch):
@@ -8109,10 +9248,13 @@ def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_fail
     import vane.execution.udf_subprocess as subprocess_exec
 
     calls: list[tuple[int, str]] = []
+    failed_once = False
 
     def cancel_input_lease(lease_id, *, name):
+        nonlocal failed_once
         calls.append((lease_id, name))
-        if lease_id == 17:
+        if lease_id == 17 and not failed_once:
+            failed_once = True
             raise RuntimeError("planned input lease cleanup failure")
         return 0
 
@@ -8129,6 +9271,59 @@ def test_subprocess_executor_input_lease_cleanup_attempts_every_lease_after_fail
         (17, "udf-input-close"),
         (23, "udf-input-close"),
     }
+    assert executor._active_input_leases == {17}
+
+    executor._cancel_active_input_leases()
+
+    assert calls.count((17, "udf-input-close")) == 2
+    assert calls.count((23, "udf-input-close")) == 1
+    assert executor._active_input_leases == set()
+
+
+def test_subprocess_executor_close_retries_retained_input_lease_cleanup(monkeypatch):
+    import vane.execution.udf_subprocess as subprocess_exec
+
+    calls: list[tuple[int, str]] = []
+
+    def cancel_input_lease(lease_id, *, name):
+        calls.append((lease_id, name))
+        if len(calls) == 1:
+            raise RuntimeError("planned input lease cleanup failure")
+        return 0
+
+    monkeypatch.setattr(subprocess_exec, "cancel_local_shm_input_lease", cancel_input_lease)
+
+    executor = object.__new__(subprocess_exec.UDFExecutor)
+    executor._closed = False
+    executor._lifecycle_lock = threading.RLock()
+    executor._admission_authority = None
+    executor._queue = deque()
+    executor._result_admissions = deque()
+    executor._queue_lock = threading.Lock()
+    executor._budget_wakeup_unregister = None
+    executor._execution_scopes_lock = threading.Lock()
+    executor._execution_scopes = set()
+    executor._active_input_leases = {17}
+    executor._active_input_leases_lock = threading.Lock()
+    executor._task_futures_cv = threading.Condition()
+    executor._task_futures = set()
+    executor._actor_pool = None
+    executor._task_pool = None
+    executor._executor = None
+    executor._workers = []
+
+    with pytest.raises(RuntimeError, match="planned input lease cleanup failure"):
+        executor.close(kill=True)
+
+    assert executor._closed
+    assert executor._active_input_leases == {17}
+
+    executor.close(kill=True)
+
+    assert calls == [
+        (17, "udf-input-close"),
+        (17, "udf-input-close"),
+    ]
     assert executor._active_input_leases == set()
 
 

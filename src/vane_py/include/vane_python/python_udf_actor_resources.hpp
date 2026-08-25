@@ -4,6 +4,8 @@
 #pragma once
 
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/vector.hpp"
 
 namespace duckdb {
 
@@ -15,6 +17,7 @@ class ScopedPythonUDFActorResourcePreparation {
 public:
 	explicit ScopedPythonUDFActorResourcePreparation(ClientContext &context);
 	~ScopedPythonUDFActorResourcePreparation();
+	vector<string> TakeCleanupWarnings();
 
 	ScopedPythonUDFActorResourcePreparation(const ScopedPythonUDFActorResourcePreparation &) = delete;
 	ScopedPythonUDFActorResourcePreparation &operator=(const ScopedPythonUDFActorResourcePreparation &) = delete;

@@ -40,6 +40,8 @@ class PromptOptions(TypedDict, total=False):
 
     # Anthropic keeps its native output-token name.
     max_tokens: int | None
+    # SGLang keeps its native output-token name.
+    max_new_tokens: int | None
     top_k: int | None
 
     # Native vLLM provider options.
@@ -288,6 +290,19 @@ _PROMPT_PROVIDER_OPTIONS = {
             "engine_init_timeout_s",
         }
     ),
+    "sglang": frozenset(
+        {
+            "max_tokens",
+            "max_new_tokens",
+            "gpus_per_actor",
+            "engine_args",
+            "generate_args",
+            "max_buffer_size",
+            "inflight_limit",
+            "load_balance_threshold",
+            "engine_init_timeout_s",
+        }
+    ),
 }
 
 
@@ -373,9 +388,9 @@ def normalize_prompt_options(
         | _PROMPT_BASE_EXECUTION_OPTIONS
         | _PROMPT_PROVIDER_OPTIONS.get(family, frozenset())
     )
-    if family != "vllm":
+    if family not in {"vllm", "sglang"}:
         allowed |= _PROMPT_REMOTE_EXECUTION_OPTIONS
-    if relation and family != "vllm":
+    if relation and family not in {"vllm", "sglang"}:
         allowed |= _PROMPT_RELATION_EXECUTION_OPTIONS
     unknown = sorted(set(copied) - allowed)
     if unknown:
@@ -397,7 +412,7 @@ def normalize_prompt_options(
         if "actor_number" in copied and backend in {"subprocess_task", "ray_task"}:
             raise ValueError("Prompt option 'actor_number' requires an actor execution backend")
 
-    if family == "vllm" and copied.get("max_retries", 0) != 0:
-        raise ValueError("native vLLM prompting only accepts max_retries=0")
+    if family in {"vllm", "sglang"} and copied.get("max_retries", 0) != 0:
+        raise ValueError("native prompting only accepts max_retries=0")
 
     return copied

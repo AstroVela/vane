@@ -740,6 +740,10 @@ bool FileSystem::IsLocalFileSystem() const {
 	return false;
 }
 
+bool FileSystem::HasDirectorySemantics(const string &, optional_ptr<FileOpener>) {
+	return IsLocalFileSystem();
+}
+
 bool FileSystem::OnDiskFile(FileHandle &handle) {
 	throw NotImplementedException("%s: OnDiskFile is not implemented!", GetName());
 }

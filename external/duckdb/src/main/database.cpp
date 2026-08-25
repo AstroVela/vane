@@ -38,6 +38,10 @@
 #include "duckdb/main/result_set_manager.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/distributed_extension_manager.hpp"
+#include "duckdb/function/distributed_table_function.hpp"
+#include "duckdb/function/table/datasource_scan.hpp"
+#include "duckdb/function/table/range.hpp"
+#include "duckdb/function/table/read_csv.hpp"
 
 #ifndef DUCKDB_NO_THREADS
 #include "duckdb/common/thread.hpp"
@@ -344,7 +348,26 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 	distributed_extension_manager = make_uniq<DistributedExtensionManager>(*this);
 	DistributedExtensionManifest core_manifest;
 	core_manifest.extension_name = "vane_core";
-	core_manifest.capabilities.push_back({DistributedExtensionCapabilityKind::TABLE_FUNCTION, "datasource_scan", 1});
+	auto add_core_table_function = [&](const TableFunction &function) {
+		const auto &callbacks = function.GetDistributedScanCallbacks();
+		callbacks.Validate(function);
+		const auto &capability = callbacks.GetCapability();
+		if (capability.extension_name != core_manifest.extension_name) {
+			throw InternalException("Core table function '%s' bound distributed capability to '%s'", function.name,
+			                        capability.extension_name);
+		}
+		core_manifest.capabilities.push_back(capability.capability);
+	};
+	add_core_table_function(DataSourceScanFunction::GetFunction());
+	for (const auto &function : RangeTableFunction::GetFunctions()) {
+		add_core_table_function(function);
+	}
+	for (const auto &function : ReadCSVTableFunction::GetFunctions()) {
+		add_core_table_function(function);
+	}
+	add_core_table_function(RepeatTableFunction::GetFunction());
+	add_core_table_function(RepeatRowTableFunction::GetFunction());
+	add_core_table_function(UnnestTableFunction::GetFunction());
 	distributed_extension_manager->RegisterExtension(core_manifest);
 
 	// initialize the secret manager

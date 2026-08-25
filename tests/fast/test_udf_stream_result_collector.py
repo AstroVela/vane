@@ -3211,6 +3211,43 @@ def test_explicit_remote_error_pair_preserves_cause_without_output_lease():
         collector.shutdown()
 
 
+def test_remote_error_pair_does_not_invoke_exception_stringification():
+    from vane.execution.udf_ray_stream_protocol import make_stream_error_pair
+
+    class UnprintableError(RuntimeError):
+        def __str__(self):
+            raise AssertionError("exception formatting must not invoke provider code")
+
+    payload = {
+        "query_id": "query",
+        "resource_unit_id": "resource:query:node:1:udf",
+        "task_lease_id": "lease",
+        "attempt_id": "attempt",
+    }
+
+    _, metadata = make_stream_error_pair(payload, UnprintableError())
+
+    assert metadata["exception_type"] == "UnprintableError"
+    assert metadata["exception_message"] == "<error message unavailable>"
+
+
+def test_remote_error_pair_bounds_exact_exception_argument_before_encoding():
+    from vane.execution import udf_ray_stream_protocol as stream_protocol
+
+    payload = {
+        "query_id": "query",
+        "resource_unit_id": "resource:query:node:1:udf",
+        "task_lease_id": "lease",
+        "attempt_id": "attempt",
+    }
+    oversized = "x" * 1_048_576
+
+    _, metadata = stream_protocol.make_stream_error_pair(payload, RuntimeError(oversized))
+
+    suffix = "…<truncated>"
+    assert metadata["exception_message"] == oversized[: stream_protocol._MAX_ERROR_TEXT_CHARS] + suffix
+
+
 @pytest.mark.parametrize(
     ("provider", "expected_provider"),
     [

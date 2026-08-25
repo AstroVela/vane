@@ -61,8 +61,14 @@ def require_ray_cxx_attr(
 
 @overload
 def require_ray_cxx_attr(
-    name: Literal["merge_scan_task_descriptors"], *, hint: str | None = None
+    name: Literal["merge_scan_split_batches"], *, hint: str | None = None
 ) -> Callable[[list[bytes]], bytes]: ...
+
+
+@overload
+def require_ray_cxx_attr(
+    name: Literal["split_scan_split_batch"], *, hint: str | None = None
+) -> Callable[[bytes], list[tuple[str, bytes, int | None]]]: ...
 
 
 @overload

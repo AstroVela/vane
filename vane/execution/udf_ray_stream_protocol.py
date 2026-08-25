@@ -10,6 +10,7 @@ import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ig
 
 from vane._native import __standard_vector_size__ as DUCKDB_STANDARD_VECTOR_SIZE
 from vane.execution._common import ensure_table, estimate_table_bytes
+from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 
 RAY_UDF_STREAM_PROTOCOL_VERSION = 1
 RAY_UDF_STREAM_OBJECTS_PER_BLOCK = 2
@@ -235,8 +236,10 @@ def make_stream_error_pair(
 ) -> tuple[pa.Table, dict[str, Any]]:
     """Encode an application failure as one bounded block/control pair."""
     query_id, resource_unit_id, task_lease_id, attempt_id = _stream_identity(payload)
-    exception_type = type(exc).__name__[:256] or "Exception"
-    exception_message = str(exc)
+    exception_type = safe_exception_type_name(exc) or "BaseException"
+    exception_message = exception_message_from_args(exc)
+    if exception_message is None:
+        exception_message = "<error message unavailable>"
     if len(exception_message) > _MAX_ERROR_TEXT_CHARS:
         exception_message = exception_message[:_MAX_ERROR_TEXT_CHARS] + _ERROR_TEXT_TRUNCATION_SUFFIX
     exception_details = None

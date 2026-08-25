@@ -35,6 +35,17 @@ static void InitializeReadOnlyProperties(py::class_<DuckDBPyRelation> &m) {
 static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	m.def("execute", &DuckDBPyRelation::Execute, "Transform the relation into a result set")
 	    .def("close", &DuckDBPyRelation::Close, "Closes the result");
+	m.def(
+	    "write_datasink",
+	    [](py::object self, py::object sink, py::object operation_id) {
+		    auto write_datasink = py::module_::import("vane.datasink").attr("write_datasink");
+		    if (operation_id.is_none()) {
+			    return write_datasink(self, sink);
+		    }
+		    return write_datasink(self, sink, py::arg("operation_id") = operation_id);
+	    },
+	    "Execute the relation into a Python DataSink and return its WriteSummary", py::arg("sink"), py::kw_only(),
+	    py::arg("operation_id") = py::none());
 
 	DefineMethod({"to_parquet", "write_parquet"}, m, &DuckDBPyRelation::ToParquet,
 	             "Write the relation object to a Parquet file in 'file_name'", py::arg("file_name"), py::kw_only(),
@@ -53,6 +64,10 @@ static void InitializeConsumers(py::class_<DuckDBPyRelation> &m) {
 	    py::arg("encoding") = py::none(), py::arg("compression") = py::none(), py::arg("overwrite") = py::none(),
 	    py::arg("per_thread_output") = py::none(), py::arg("use_tmp_file") = py::none(),
 	    py::arg("partition_by") = py::none(), py::arg("write_partition_columns") = py::none());
+
+	DefineMethod({"to_file", "write_file"}, m, &DuckDBPyRelation::ToFile,
+	             "Write the relation object with a registered DuckDB COPY format", py::arg("file_name"), py::kw_only(),
+	             py::arg("format"));
 
 	m.def("fetchone", &DuckDBPyRelation::FetchOne, "Execute and fetch a single row as a tuple")
 	    .def("fetchmany", &DuckDBPyRelation::FetchMany, "Execute and fetch the next set of rows as a list of tuples",
@@ -308,6 +323,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 
 	relation_module.def("filter", &DuckDBPyRelation::Filter, "Filter the relation object by the filter in filter_expr",
 	                    py::arg("filter_expr"));
+	relation_module.def("_arrow_schema", &DuckDBPyRelation::GetArrowSchema,
+	                    "Return the Arrow schema without executing the relation");
+	relation_module.def("_validate_datasink_transaction", &DuckDBPyRelation::ValidateDataSinkTransaction);
+	relation_module.def("_mark_datasink", &DuckDBPyRelation::MarkDataSink, py::arg("operation_id"));
+	relation_module.def("_take_udf_actor_cleanup_warnings", &DuckDBPyRelation::TakeUDFActorCleanupWarnings);
 	relation_module.def(
 	    "map_batches",
 	    [](DuckDBPyRelation &self, py::function fun, Optional<py::object> schema,
@@ -421,8 +441,11 @@ void DuckDBPyRelation::Initialize(py::handle &m) {
 	         py::arg("table_name"));
 
 	DefineMethod({"create", "to_table"}, relation_module, &DuckDBPyRelation::Create,
-	             "Creates a new table named table_name with the contents of the relation object",
-	             py::arg("table_name"));
+	             "Creates a new table with the contents of the relation object. Table properties are passed as "
+	             "structured expressions to the target catalog, and partition_by accepts SQL expression strings or "
+	             "Expression objects.",
+	             py::arg("table_name"), py::kw_only(), py::arg("properties") = py::none(),
+	             py::arg("partition_by") = py::none());
 
 	DefineMethod({"create_view", "to_view"}, relation_module, &DuckDBPyRelation::CreateView,
 	             "Creates a view named view_name that refers to the relation object", py::arg("view_name"),

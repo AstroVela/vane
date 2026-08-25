@@ -5,6 +5,8 @@
 Tests the core serialization functionality without requiring full execution pipeline.
 """
 
+import csv
+
 import pytest
 
 try:
@@ -105,3 +107,125 @@ def test_streaming_metadata_and_rows_full_execution(tmp_path):
         (8, 80),
         (10, 100),
     ]
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_single_csv_file_uses_explicit_byte_ranges_through_real_ray(tmp_path, monkeypatch):
+    """A single absolute CSV path is split without losing quoted or multibyte rows."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "4")
+    monkeypatch.setenv("VANE_RAY_SCAN_SPLIT_MIN_COUNT", "4")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+
+    input_path = tmp_path / "single-distributed.csv"
+    expected = []
+    with input_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file, delimiter="|", lineterminator="\r\n")
+        writer.writerow(("id", "payload", "unused"))
+        for row_id in range(5000):
+            if row_id % 7 == 0:
+                payload = f'quoted | value "{row_id}"\n继续-{row_id}'
+            elif row_id % 11 == 0:
+                payload = f"你好🙂-{row_id}"
+            else:
+                payload = f"value-{row_id}"
+            writer.writerow((row_id, payload, row_id * 10))
+            if row_id % 3 == 1:
+                expected.append((row_id, payload, 0))
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, payload, file_index
+        FROM read_csv(
+            '{input_path}',
+            delim='|',
+            header=true,
+            auto_detect=false,
+            columns={{'id': 'INTEGER', 'payload': 'VARCHAR', 'unused': 'BIGINT'}},
+            buffer_size=65536,
+            max_line_size=16384
+        )
+        WHERE id % 3 = 1
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "single-csv-byte-range-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [4]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(relation))
+    assert len(parts) == 4
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+
+    assert (
+        sorted(
+            zip(
+                result.column(0).to_pylist(),
+                result.column(1).to_pylist(),
+                result.column(2).to_pylist(),
+            )
+        )
+        == expected
+    )
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_csv_union_reader_state_survives_worker_serde(tmp_path, monkeypatch):
+    """Each assigned file retains the dialect and schema selected by union_by_name bind."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    comma_path = tmp_path / "comma.csv"
+    pipe_path = tmp_path / "pipe.csv"
+    comma_path.write_text("id,left_value\n1,alpha\n2,beta\n", encoding="utf-8")
+    pipe_path.write_text("id|right_value\n3|gamma\n4|delta\n", encoding="utf-8")
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, coalesce(left_value, right_value) AS value, file_index
+        FROM read_csv_auto(
+            ['{comma_path}', '{pipe_path}'],
+            union_by_name=true
+        )
+        WHERE id >= 2
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "multi-csv-union-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [2]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(relation))
+    assert len(parts) == 2
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+    assert sorted(
+        zip(
+            result.column(0).to_pylist(),
+            result.column(1).to_pylist(),
+            result.column(2).to_pylist(),
+        )
+    ) == [
+        (2, "beta", 0),
+        (3, "gamma", 1),
+        (4, "delta", 1),
+    ]
+    connection.close()

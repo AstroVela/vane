@@ -51,7 +51,7 @@ def notify_connection_closed(session_id: str) -> None:
         ) from errors[0]
 
 
-def _configure_scan_task_backlog_env(max_task_backlog: int | None) -> None:
+def _configure_scan_split_backlog_env(max_task_backlog: int | None) -> None:
     if max_task_backlog is None:
         return
     if max_task_backlog <= 0:
@@ -85,7 +85,7 @@ class RayRunner(Runner):
         self.ray_address = address
         self.max_task_backlog = max_task_backlog
         ensure_vane_session_dir()
-        _configure_scan_task_backlog_env(max_task_backlog)
+        _configure_scan_split_backlog_env(max_task_backlog)
 
         if not ray.is_initialized():
             ray.init(
@@ -180,6 +180,19 @@ class RayRunner(Runner):
 
         # Send PyLogicalPlan to Driver — Driver will create physical plan
         return client.run_copy_plan(logical_plan)
+
+    def run_datasink(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
+        """Execute one distributed Python DataSink query."""
+
+        PyLogicalPlan = require_ray_cxx_attr(
+            "PyLogicalPlan",
+            hint="Ensure the C++ ray extension is built and importable in worker processes.",
+        )
+        query_id = str(uuid.uuid4())
+        logical_plan = PyLogicalPlan.from_duckdb_datasink_relation(relation, query_id)
+        session_id = str(logical_plan.session_id())
+        client = self._client_for_session(session_id)
+        return client.run_datasink_plan(logical_plan)
 
     def retry_copy_cleanup(self, operation_id: str) -> dict[str, Any]:
         """Retry cleanup for a committed write without executing the write again."""

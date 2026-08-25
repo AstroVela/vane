@@ -16,6 +16,8 @@
 #include "vane_python/pybind11/gil_wrapper.hpp"
 #include "vane_python/python_objects.hpp"
 
+#include <algorithm>
+#include <exception>
 #include <pybind11/pybind11.h>
 #include <sstream>
 #include <unordered_set>
@@ -25,6 +27,87 @@ namespace duckdb {
 namespace {
 
 namespace py = pybind11;
+
+static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_LIMIT = 16;
+static constexpr idx_t UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES = 4 * 1024;
+static constexpr const char *UDF_ACTOR_CLEANUP_WARNINGS_OMITTED = "additional UDF actor cleanup warnings omitted";
+
+static bool IsUTF8ContinuationByte(char byte) {
+	return (static_cast<unsigned char>(byte) & 0xC0U) == 0x80U;
+}
+
+static string BoundCleanupWarning(string warning) {
+	StringUtil::Trim(warning);
+	if (warning.size() <= UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES) {
+		return warning;
+	}
+	static constexpr const char *OMISSION = "...";
+	static constexpr idx_t OMISSION_BYTES = 3;
+	const auto remaining = UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES - OMISSION_BYTES;
+	idx_t prefix_end = remaining / 2;
+	while (prefix_end > 0 && IsUTF8ContinuationByte(warning[prefix_end])) {
+		prefix_end--;
+	}
+	idx_t suffix_start = warning.size() - (remaining - remaining / 2);
+	while (suffix_start < warning.size() && IsUTF8ContinuationByte(warning[suffix_start])) {
+		suffix_start++;
+	}
+	return warning.substr(0, prefix_end) + OMISSION + warning.substr(suffix_start);
+}
+
+static string BoundedPythonErrorDetail(const py::handle &value) {
+#if PY_VERSION_HEX >= 0x030C0000
+	auto *args_ptr = PyException_GetArgs(value.ptr());
+#else
+	// PyException_GetArgs was added in Python 3.12. The project also builds
+	// against 3.10 and 3.11, where BaseException's public C layout is the only
+	// way to read args without dispatching a provider-defined __getattribute__.
+	auto *args_ptr = reinterpret_cast<PyBaseExceptionObject *>(value.ptr())->args;
+	Py_XINCREF(args_ptr);
+#endif
+	if (!args_ptr) {
+		if (PyErr_Occurred()) {
+			throw py::error_already_set();
+		}
+		return "<cleanup error message unavailable>";
+	}
+	auto args_obj = py::reinterpret_steal<py::object>(args_ptr);
+	if (!PyTuple_CheckExact(args_obj.ptr())) {
+		return "<cleanup error message unavailable>";
+	}
+	auto args = py::reinterpret_borrow<py::tuple>(args_obj);
+	if (args.size() != 1) {
+		return "<cleanup error message unavailable>";
+	}
+	auto text = py::reinterpret_borrow<py::object>(args[0]);
+	if (!PyUnicode_CheckExact(text.ptr())) {
+		return "<cleanup error message unavailable>";
+	}
+	const auto character_count = PyUnicode_GetLength(text.ptr());
+	if (character_count < 0) {
+		throw py::error_already_set();
+	}
+	if (character_count > static_cast<Py_ssize_t>(UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES)) {
+		return "cleanup error message exceeds 4096 characters and was omitted";
+	}
+	auto detail = text.cast<string>();
+	if (detail.size() > UDF_ACTOR_CLEANUP_WARNING_MAX_BYTES) {
+		return "cleanup error message exceeds 4096 bytes and was omitted";
+	}
+	return detail;
+}
+
+static string CleanupWarningFromPythonError(const py::error_already_set &error) {
+	string detail;
+	try {
+		detail = BoundedPythonErrorDetail(error.value());
+	} catch (...) {
+		PyErr_Clear();
+		detail = "<cleanup error message unavailable>";
+	}
+	PyErr_Clear();
+	return BoundCleanupWarning("Python UDF actor resource cleanup failed: " + detail);
+}
 
 static shared_ptr<void> WrapPyObjectForUDFActorHandles(const py::object &obj) {
 	if (obj.is_none()) {
@@ -126,6 +209,29 @@ static void AppendCreatedResources(vector<py::object> &resources, const py::obje
 	}
 }
 
+static void AppendOwnedResourcesFromError(vector<py::object> &resources, const py::error_already_set &error) {
+	try {
+		auto value = error.value();
+		if (!py::hasattr(value, "owned_actor_pools")) {
+			return;
+		}
+		auto owned_obj = value.attr("owned_actor_pools");
+		for (auto item : py::reinterpret_borrow<py::iterable>(owned_obj)) {
+			auto resource = py::reinterpret_borrow<py::object>(item);
+			const auto duplicate = std::any_of(resources.begin(), resources.end(), [&](const py::object &existing) {
+				return existing.ptr() == resource.ptr();
+			});
+			if (!duplicate) {
+				resources.push_back(std::move(resource));
+			}
+		}
+	} catch (...) {
+		// Ownership extraction is best effort only for malformed third-party
+		// exceptions. Preserve the original preparation failure.
+		PyErr_Clear();
+	}
+}
+
 static void ApplyHandlesMap(const vector<UDFFunctionData *> &bind_nodes, const py::object &handles_obj) {
 	if (handles_obj.is_none()) {
 		return;
@@ -157,6 +263,10 @@ static string DirectPlanIdentity(PreparedStatementData &prepared) {
 class PythonUDFActorResourceState : public ClientContextState {
 public:
 	void BeginScope() {
+		if (scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+		}
 		scope_depth++;
 	}
 
@@ -164,6 +274,16 @@ public:
 		if (scope_depth > 0) {
 			scope_depth--;
 		}
+		if (scope_depth == 0) {
+			cleanup_warnings.clear();
+			capture_cleanup_warnings = false;
+		}
+	}
+
+	vector<string> TakeCleanupWarnings() {
+		vector<string> result;
+		result.swap(cleanup_warnings);
+		return result;
 	}
 
 	bool CanRequestRebind() override {
@@ -190,6 +310,8 @@ public:
 
 	void QueryEnd(ClientContext &, optional_ptr<ErrorData>) override {
 		prepared_statements.clear();
+		const auto capture_errors = capture_cleanup_warnings;
+		capture_cleanup_warnings = false;
 		if (resources.empty()) {
 			return;
 		}
@@ -198,7 +320,11 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources();
+		// ClientContext drains every executor task before invoking QueryEnd. The
+		// actor callables can therefore release provider state even when the
+		// query itself failed; forced termination is reserved for setup rollback
+		// and context destruction where quiescence is not established here.
+		ShutdownResources(false, capture_errors);
 	}
 
 	~PythonUDFActorResourceState() override {
@@ -210,7 +336,21 @@ public:
 			return;
 		}
 		PythonGILWrapper gil;
-		ShutdownResources();
+		ShutdownResources(true, false);
+		if (!resources.empty()) {
+			// ShutdownResources retains every owner whose forced cleanup raised.
+			// Give transient failures one bounded retry before this state loses its
+			// last opportunity to release them during ClientContext destruction.
+			ShutdownResources(true, false);
+		}
+		if (!resources.empty()) {
+			// The GIL guard is a local and is destroyed before this state's members.
+			// Never let a still-retained py::object reach member destruction after
+			// the GIL has been released. Cleanup has already exhausted its bounded
+			// retries, so perform the final DECREF while Python is still usable;
+			// the Python owners' destructors retain their own last-chance cleanup.
+			resources.clear();
+		}
 	}
 
 private:
@@ -224,6 +364,10 @@ private:
 		}
 		Prepare(context, prepared);
 		prepared_statements.insert(&prepared);
+		// PendingQuery may first close an older streaming query on this
+		// connection. Arm warning capture only after preparing the plan that
+		// belongs to the active execution scope.
+		capture_cleanup_warnings = true;
 	}
 
 	void Prepare(ClientContext &context, PreparedStatementData &prepared) {
@@ -271,26 +415,70 @@ private:
 				AppendCreatedResources(resources, created);
 				ApplyHandlesMap(bind_nodes, handles_map);
 			}
+		} catch (const pybind11::error_already_set &error) {
+			// The Python helper carries pools whose rollback is incomplete on its
+			// exception. Retain them in the ClientContext state before retrying;
+			// otherwise unwinding the exception would discard the last explicit
+			// process/shared-memory owner.
+			AppendOwnedResourcesFromError(resources, error);
+			ShutdownResources(true, false);
+			throw;
 		} catch (...) {
-			ShutdownResources();
+			ShutdownResources(true, false);
 			throw;
 		}
 	}
 
-	void ShutdownResources() {
+	void ShutdownResources(bool kill, bool capture_errors) {
 		if (resources.empty()) {
 			return;
 		}
+		vector<pybind11::object> retry_resources;
 		for (auto it = resources.rbegin(); it != resources.rend(); ++it) {
 			try {
 				if (pybind11::hasattr(*it, "shutdown")) {
-					it->attr("shutdown")(pybind11::arg("kill") = true);
+					it->attr("shutdown")(pybind11::arg("kill") = kill);
 				}
-			} catch (const pybind11::error_already_set &) {
+			} catch (const pybind11::error_already_set &error) {
+				retry_resources.push_back(std::move(*it));
+				if (!capture_errors) {
+					PyErr_Clear();
+					continue;
+				}
+				if (cleanup_warnings.size() < UDF_ACTOR_CLEANUP_WARNING_LIMIT) {
+					cleanup_warnings.push_back(CleanupWarningFromPythonError(error));
+				} else {
+					PyErr_Clear();
+					cleanup_warnings.back() = UDF_ACTOR_CLEANUP_WARNINGS_OMITTED;
+				}
+			} catch (const std::exception &) {
+				retry_resources.push_back(std::move(*it));
 				PyErr_Clear();
+				if (capture_errors) {
+					AppendNonPythonCleanupWarning();
+				}
+			} catch (...) {
+				retry_resources.push_back(std::move(*it));
+				PyErr_Clear();
+				if (capture_errors) {
+					AppendNonPythonCleanupWarning();
+				}
 			}
 		}
-		resources.clear();
+		// LocalSubprocessActorPool keeps failed process owners so shutdown can
+		// be retried. Preserve those Python objects in creation order; otherwise
+		// clearing this vector would defeat that ownership contract and leak the
+		// retained worker after a transient close/kill failure.
+		std::reverse(retry_resources.begin(), retry_resources.end());
+		resources = std::move(retry_resources);
+	}
+
+	void AppendNonPythonCleanupWarning() {
+		if (cleanup_warnings.size() < UDF_ACTOR_CLEANUP_WARNING_LIMIT) {
+			cleanup_warnings.push_back("Python UDF actor resource cleanup failed: non-Python cleanup exception");
+		} else {
+			cleanup_warnings.back() = UDF_ACTOR_CLEANUP_WARNINGS_OMITTED;
+		}
 	}
 
 	void ReleaseResourcesWithoutPython() {
@@ -301,8 +489,10 @@ private:
 	}
 
 	idx_t scope_depth = 0;
+	bool capture_cleanup_warnings = false;
 	unordered_set<PreparedStatementData *> prepared_statements;
 	vector<pybind11::object> resources;
+	vector<string> cleanup_warnings;
 };
 
 ScopedPythonUDFActorResourcePreparation::ScopedPythonUDFActorResourcePreparation(ClientContext &context) {
@@ -314,6 +504,13 @@ ScopedPythonUDFActorResourcePreparation::~ScopedPythonUDFActorResourcePreparatio
 	if (state) {
 		state->EndScope();
 	}
+}
+
+vector<string> ScopedPythonUDFActorResourcePreparation::TakeCleanupWarnings() {
+	if (!state) {
+		return {};
+	}
+	return state->TakeCleanupWarnings();
 }
 
 } // namespace duckdb

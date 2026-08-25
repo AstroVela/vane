@@ -978,20 +978,20 @@ def _copy_output_info_from_context(context: dict[str, Any] | None) -> dict[str, 
 def _extract_native_task_maps_from_context(
     context: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    scan_task_map: dict[str, Any] = {}
+    scan_split_batch_map: dict[str, Any] = {}
     exchange_source_task_map: dict[str, Any] = {}
     if not context:
-        return scan_task_map, exchange_source_task_map
+        return scan_split_batch_map, exchange_source_task_map
     for key, value in context.items():
-        if key.startswith("scan_task:"):
+        if key.startswith("scan_split_batch:"):
             node_id = key.split(":", 1)[1]
             if node_id:
-                scan_task_map[node_id] = value
+                scan_split_batch_map[node_id] = value
         elif key.startswith("exchange_source_task:"):
             node_id = key.split(":", 1)[1]
             if node_id:
                 exchange_source_task_map[node_id] = value
-    return scan_task_map, exchange_source_task_map
+    return scan_split_batch_map, exchange_source_task_map
 
 
 class WorkerTaskMetadata(NamedTuple):
@@ -1301,7 +1301,7 @@ class RayWorkerActor:
         context = materialize_task_inputs(
             request.get("context"),
             request.get("initial_splits"),
-            merge_scan_task_descriptors=vane.ray_cxx.merge_scan_task_descriptors,
+            merge_scan_split_batches=vane.ray_cxx.merge_scan_split_batches,
         )
 
         task_id = FteTaskAttemptId.coerce(request.get("task_id"))
@@ -2530,7 +2530,7 @@ class RayWorkerActor:
     def _execute_native_task(
         self,
         plan: Any,
-        scan_task_map: dict[str, str] | None,
+        scan_split_batch_map: dict[str, Any] | None,
         copy_output_info: dict[str, str] | None = None,
         exchange_source_task_map: dict[str, Any] | None = None,
         exchange_sink_instance: dict[str, Any] | bytes | None = None,
@@ -2636,17 +2636,17 @@ class RayWorkerActor:
             _ray_worker_memory_log(
                 "native_execute_start",
                 **worker_log_context,
-                scan_task_map_count=len(scan_task_map or {}),
+                scan_split_batch_map_count=len(scan_split_batch_map or {}),
                 exchange_source_task_map_count=len(exchange_source_task_map or {}),
                 has_exchange_sink_instance=exchange_sink_instance is not None,
                 has_dynamic_filter_domains=bool(dynamic_filter_domains),
             )
             plan_runner = self._get_plan_runner()
-            scan_task_arg = scan_task_map or None
+            scan_split_batch_arg = scan_split_batch_map or None
             result = plan_runner.execute_native(
                 cursor,
                 plan,
-                scan_task_arg,
+                scan_split_batch_arg,
                 exchange_source_task_map or None,
                 copy_output_info,
                 exchange_sink_instance,
@@ -2707,7 +2707,7 @@ class RayWorkerActor:
         worker_log_context.update(_ray_worker_log_fields(self))
 
         copy_output_info = _copy_output_info_from_context(context)
-        scan_task_map, exchange_source_task_map = _extract_native_task_maps_from_context(context)
+        scan_split_batch_map, exchange_source_task_map = _extract_native_task_maps_from_context(context)
         run_start = time.monotonic()
         _ray_worker_memory_log("run_plan_return_start", **worker_log_context)
         # Native execution, shuffle publication, and actor teardown are owned by
@@ -2742,7 +2742,7 @@ class RayWorkerActor:
                     raise RuntimeError(f"native task is closing: {native_task_id}")
                 return self._execute_native_task(
                     plan,
-                    scan_task_map or None,
+                    scan_split_batch_map or None,
                     copy_output_info=copy_output_info,
                     exchange_source_task_map=exchange_source_task_map or None,
                     exchange_sink_instance=exchange_sink_instance,

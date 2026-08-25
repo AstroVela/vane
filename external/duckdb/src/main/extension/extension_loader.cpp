@@ -13,6 +13,7 @@
 #include "duckdb/parser/parsed_data/create_collation_info.hpp"
 #include "duckdb/main/extension_install_info.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/set.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/database.hpp"
@@ -137,96 +138,41 @@ void ExtensionLoader::RegisterFunction(TableFunctionSet function) {
 }
 
 unique_ptr<DistributedExtensionManifest> ExtensionLoader::BindDistributedTableFunctions(TableFunctionSet &functions) {
-	idx_t callback_count = 0;
-	idx_t protocol_version = 0;
+	set<string> overload_signatures;
 	for (const auto &function : functions.functions) {
+		auto signature = GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs);
+		if (!overload_signatures.insert(signature).second) {
+			throw InvalidInputException("Table-function overload '%s' is declared more than once in one registration",
+			                            signature);
+		}
+	}
+
+	unique_ptr<DistributedExtensionManifest> candidate_manifest;
+	for (auto &function : functions.functions) {
 		if (!function.HasDistributedScanCallbacks()) {
 			continue;
 		}
-		callback_count++;
 		const auto &callbacks = function.GetDistributedScanCallbacks();
 		callbacks.ValidateDefinition(functions.name);
 		if (!function.HasSerializationCallbacks()) {
 			throw InvalidInputException(
-			    "Distributed table function '%s' must define serialize and deserialize callbacks before registration",
-			    functions.name);
+			    "Distributed table-function overload '%s' must define serialize and deserialize callbacks before "
+			    "registration",
+			    GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs));
 		}
-		if (protocol_version == 0) {
-			protocol_version = callbacks.protocol_version;
-		} else if (protocol_version != callbacks.protocol_version) {
-			throw InvalidInputException(
-			    "Distributed table function '%s' overloads must use one capability protocol version", functions.name);
-		}
-	}
-	if (callback_count != 0 && callback_count != functions.functions.size()) {
-		throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
-		                            functions.name);
-	}
-
-	auto existing_entry = TryGetTableFunction(functions.name);
-	idx_t existing_callback_count = 0;
-	if (existing_entry) {
-		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
-			if (function.HasDistributedScanCallbacks()) {
-				existing_callback_count++;
-			}
-		}
-	}
-	if (existing_entry && existing_callback_count != 0 &&
-	    existing_callback_count != existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions.size()) {
-		throw InternalException("Distributed table function '%s' has a mixed callback registration", functions.name);
-	}
-	if (callback_count == 0) {
-		if (existing_callback_count != 0) {
-			throw InvalidInputException("Distributed table function '%s' must define callbacks for every overload",
-			                            functions.name);
-		}
-		return nullptr;
-	}
-	if (existing_entry && existing_callback_count == 0) {
-		throw InvalidInputException("Distributed table function '%s' cannot add callbacks to native-only overloads",
-		                            functions.name);
-	}
-	auto &manifest = GetOrCreateDistributedManifest();
-
-	DistributedExtensionCapability capability;
-	capability.kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
-	capability.name = functions.name;
-	capability.protocol_version = protocol_version;
-	auto candidate_manifest = make_uniq<DistributedExtensionManifest>(manifest);
-	bool capability_exists = false;
-	for (const auto &registered : candidate_manifest->capabilities) {
-		if (registered.kind != capability.kind || registered.name != capability.name) {
-			continue;
-		}
-		if (registered.protocol_version != capability.protocol_version) {
-			throw InvalidInputException(
-			    "Distributed table function '%s' protocol mismatch: callbacks use %llu, manifest uses %llu",
-			    functions.name, static_cast<unsigned long long>(capability.protocol_version),
-			    static_cast<unsigned long long>(registered.protocol_version));
-		}
-		capability_exists = true;
-	}
-	if (!capability_exists) {
-		candidate_manifest->capabilities.push_back(capability);
-	}
-	DistributedExtensionManager::ValidateManifest(*candidate_manifest);
-
-	DistributedExtensionCapabilityReference reference;
-	reference.extension_name = extension_name;
-	reference.capability = capability;
-	if (existing_entry) {
-		for (const auto &function : existing_entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
-			const auto &callbacks = function.GetDistributedScanCallbacks();
-			callbacks.Validate(function.name);
-			if (callbacks.GetCapability() != reference) {
-				throw InvalidInputException("Distributed table function '%s' is already owned by '%s'", functions.name,
-				                            callbacks.GetCapability().CanonicalIdentity());
-			}
-		}
-	}
-	for (auto &function : functions.functions) {
 		function.BindDistributedScanCapability(extension_name);
+		if (!candidate_manifest) {
+			if (distributed_manifest) {
+				candidate_manifest = make_uniq<DistributedExtensionManifest>(*distributed_manifest);
+			} else {
+				candidate_manifest = make_uniq<DistributedExtensionManifest>();
+				candidate_manifest->extension_name = extension_name;
+			}
+		}
+		candidate_manifest->capabilities.push_back(function.GetDistributedScanCallbacks().GetCapability().capability);
+	}
+	if (candidate_manifest) {
+		DistributedExtensionManager::ValidateManifest(*candidate_manifest);
 	}
 	return candidate_manifest;
 }
@@ -308,8 +254,18 @@ void ExtensionLoader::AddFunctionOverload(TableFunctionSet functions) { // NOLIN
 	for (auto &function : functions.functions) {
 		function.name = functions.name;
 	}
-	auto candidate_manifest = BindDistributedTableFunctions(functions);
 	auto &table_function = GetTableFunction(functions.name);
+	for (const auto &function : functions.functions) {
+		for (const auto &existing_function : table_function.functions.functions) {
+			if (!function.Equal(existing_function)) {
+				continue;
+			}
+			throw InvalidInputException(
+			    "Table-function overload '%s' is already registered",
+			    GetDistributedTableFunctionSignature(functions.name, function.arguments, function.varargs));
+		}
+	}
+	auto candidate_manifest = BindDistributedTableFunctions(functions);
 	for (auto &function : functions.functions) {
 		table_function.functions.AddFunction(std::move(function));
 	}

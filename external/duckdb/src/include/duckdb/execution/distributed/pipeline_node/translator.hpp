@@ -3,8 +3,9 @@
 
 #pragma once
 #include <memory>
-#include <vector>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
@@ -16,6 +17,7 @@ namespace duckdb {
 class RepartitionSpec;
 class PhysicalBatchCopyToFile;
 class PhysicalCopyToFile;
+class PhysicalDataSink;
 class PhysicalOperator;
 class PhysicalDelimJoin;
 class PhysicalHashJoin;
@@ -23,6 +25,7 @@ class PhysicalNestedLoopJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
 class PhysicalDummyScan;
+class PhysicalEmptyResult;
 class PhysicalExpressionScan;
 class PhysicalFilter;
 class PhysicalLimit;
@@ -44,6 +47,7 @@ class PhysicalTableScan;
 class PhysicalTopN;
 class PhysicalUngroupedAggregate;
 class PhysicalUnnest;
+class PhysicalUnion;
 class PhysicalVLLM;
 class PhysicalWindow;
 } // namespace duckdb
@@ -63,10 +67,14 @@ private:
 	ClientContext *client_context_;
 	optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info_;
 	std::shared_ptr<ExchangeManager> exchange_mgr_;
+	std::unordered_set<const PhysicalUnion *> ordered_unions_;
 
 	int get_next_pipeline_node_id() {
 		return ++pipeline_node_id_counter_;
 	}
+
+	void CollectUnionOrderRequirements(const PhysicalOperator &op, bool output_order_required);
+	bool UnionAllowsOutOfOrder(const PhysicalUnion &op) const;
 
 public:
 	//! resolved_extension_write_info is borrowed only during translation and
@@ -156,6 +164,8 @@ private:
 
 	std::shared_ptr<DistributedPipelineNode> TranslateDummyScanSource(const PhysicalDummyScan &op);
 
+	std::shared_ptr<DistributedPipelineNode> TranslateEmptyResultSource(const PhysicalEmptyResult &op);
+
 	std::shared_ptr<DistributedPipelineNode> TranslateColumnDataScanSource(const PhysicalColumnDataScan &op);
 
 	std::shared_ptr<DistributedPipelineNode> TranslateTableScanSource(PhysicalTableScan &op);
@@ -212,10 +222,17 @@ private:
 	                         const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
+	TranslateDataSink(const PhysicalDataSink &op,
+	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
 	TranslatePivot(const PhysicalPivot &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateUnnest(const PhysicalUnnest &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateUnion(const PhysicalUnion &op, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateTableInOut(const PhysicalTableInOutFunction &op,

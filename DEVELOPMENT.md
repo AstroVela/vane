@@ -49,16 +49,20 @@ non-editable package so the test environment receives them. Changes below
 `VANE_LOADABLE_EXTENSIONS` builds selected DuckDB extensions as self-contained
 `.duckdb_extension` artifacts without linking them into `vane._native`. The
 default is empty, so base Vane builds and wheels do not contain staged optional
-extensions. For example, build and exercise the in-tree `tpch` artifact:
+extensions. DuckDB's pinned source configuration is preserved for external
+extensions such as `httpfs`. For example, build and exercise both the in-tree
+`tpch` artifact and the externally sourced `httpfs` artifact:
 
 ```bash
 export SKBUILD_BUILD_DIR="$PWD/build/python-release"
 export SKBUILD_CMAKE_BUILD_TYPE=Release
 uv pip install . --no-build-isolation \
-  -Ccmake.define.VANE_LOADABLE_EXTENSIONS=tpch
+  '-Ccmake.define.VANE_LOADABLE_EXTENSIONS=tpch;httpfs'
 cmake --build "$SKBUILD_BUILD_DIR" --target vane_loadable_extensions
 VANE_TEST_LOADABLE_EXTENSION_PATH=\
 "$SKBUILD_BUILD_DIR/vane_extensions/tpch.duckdb_extension" \
+VANE_TEST_LOADABLE_HTTPFS_EXTENSION_PATH=\
+"$SKBUILD_BUILD_DIR/vane_extensions/httpfs.duckdb_extension" \
   scripts/run_installed_pytest.sh tests/fast/test_loadable_extension_artifacts.py
 ```
 

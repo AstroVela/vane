@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 from vane import pickle as vane_pickle
 from vane.execution._common import ensure_table as _ensure_table
+from vane.execution._udf_runtime import _bounded_close_error
 from vane.execution.ref_bundle import (
     REF_BUNDLE_RESULT_MARKER,
     SUBMIT_RESULT_MARKER,
@@ -96,6 +97,9 @@ _LOCAL_SHM_TEXT_OUTPUT_ROW_BUDGET_BYTES = 4 << 10
 _LOCAL_SHM_NESTED_OUTPUT_ROW_BUDGET_BYTES = 16 << 10
 _DEFAULT_SUBPROCESS_CONTROL_TIMEOUT_S = 30.0
 _DEFAULT_SUBPROCESS_SHUTDOWN_GRACE_S = 5.0
+_SUBPROCESS_CLEANUP_ERROR_LIMIT = 16
+_SUBPROCESS_CLEANUP_MAX_WORKERS = 32
+_SUBPROCESS_CLEANUP_ERRORS_OMITTED = "additional subprocess cleanup errors omitted"
 _TENSOR_DTYPE_BYTES = {
     "BOOL": 1,
     "BOOLEAN": 1,
@@ -168,6 +172,79 @@ def _subprocess_control_timeout_s() -> float:
 
 def _subprocess_shutdown_grace_s() -> float:
     return _positive_float_env("VANE_UDF_SUBPROCESS_SHUTDOWN_GRACE_S", _DEFAULT_SUBPROCESS_SHUTDOWN_GRACE_S)
+
+
+def _append_subprocess_cleanup_error(errors: list[BaseException], error: BaseException) -> None:
+    if len(errors) < _SUBPROCESS_CLEANUP_ERROR_LIMIT:
+        errors.append(error)
+    else:
+        errors[-1] = RuntimeError(_SUBPROCESS_CLEANUP_ERRORS_OMITTED)
+
+
+def _subprocess_cleanup_error_details(errors: list[BaseException]) -> str:
+    return "; ".join(_bounded_close_error(error) for error in errors)
+
+
+def _close_subprocess_workers_concurrently(
+    workers: list[_SingleSubprocessExecutor],
+    *,
+    kill: bool,
+) -> tuple[list[BaseException], list[_SingleSubprocessExecutor]]:
+    """Close distinct actors and retain owners whose cleanup is incomplete."""
+
+    if not workers:
+        return [], []
+    cleanup_errors: list[BaseException] = []
+    pending_workers: list[_SingleSubprocessExecutor] = []
+    close_executor: ThreadPoolExecutor | None = None
+    futures: list[tuple[_SingleSubprocessExecutor, Future[Any]]] = []
+    submitted = 0
+
+    def retain_if_incomplete(worker: _SingleSubprocessExecutor, *, close_failed: bool) -> None:
+        cleanup_finished = getattr(worker, "_cleanup_finished", None)
+        if cleanup_finished is False or (cleanup_finished is None and close_failed):
+            pending_workers.append(worker)
+
+    try:
+        close_executor = ThreadPoolExecutor(
+            max_workers=min(len(workers), _SUBPROCESS_CLEANUP_MAX_WORKERS),
+            thread_name_prefix="vane-udf-subprocess-actor-close",
+        )
+        for worker in workers:
+            try:
+                futures.append((worker, close_executor.submit(worker.close, kill=kill)))
+                submitted += 1
+            except BaseException as error:
+                _append_subprocess_cleanup_error(cleanup_errors, error)
+                break
+        for worker, future in futures:
+            try:
+                future.result()
+            except BaseException as error:
+                _append_subprocess_cleanup_error(cleanup_errors, error)
+                retain_if_incomplete(worker, close_failed=True)
+            else:
+                retain_if_incomplete(worker, close_failed=False)
+    except BaseException as error:
+        _append_subprocess_cleanup_error(cleanup_errors, error)
+    finally:
+        if close_executor is not None:
+            try:
+                close_executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as error:
+                _append_subprocess_cleanup_error(cleanup_errors, error)
+
+    # Thread creation/submission itself can fail under resource pressure. The
+    # remaining workers still need a best-effort owner-side close.
+    for worker in workers[submitted:]:
+        try:
+            worker.close(kill=kill)
+        except BaseException as error:
+            _append_subprocess_cleanup_error(cleanup_errors, error)
+            retain_if_incomplete(worker, close_failed=True)
+        else:
+            retain_if_incomplete(worker, close_failed=False)
+    return cleanup_errors, pending_workers
 
 
 def _should_debug_submit(seq: int) -> bool:
@@ -313,6 +390,21 @@ class _SubprocessStartupCleanupError(RuntimeError):
     pass
 
 
+class _OwnedLocalSubprocessActorPoolsError(RuntimeError):
+    """Carry local actor pools whose failed cleanup remains retryable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        owned_actor_pools: list[Any],
+        creation_error: BaseException,
+    ) -> None:
+        super().__init__(message)
+        self.owned_actor_pools = list(owned_actor_pools)
+        self.creation_error = creation_error
+
+
 class _SingleSubprocessExecutor(BaseUDFExecutor):
     """Run Python UDFs in one long-lived worker subprocess."""
 
@@ -330,6 +422,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._queue: deque[Any] = deque()
         self._finished_submitting = False
         self._closed = False
+        self._cleanup_finished = False
         self._broken_error: str | None = None
         self._actor_lost = False
         self._pending_batches = 0
@@ -353,6 +446,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         self._payload_shm: shared_memory.SharedMemory | None = None
         self._data_shm: shared_memory.SharedMemory | None = None
         self._sock: socket.socket | None = None
+        self._startup_child_sock: socket.socket | None = None
         self._proc: subprocess.Popen[bytes] | None = None
 
         self._start_worker(payload, startup_observer=startup_observer)
@@ -371,14 +465,26 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         *,
         startup_observer: Callable[[_SingleSubprocessExecutor], None] | None = None,
     ) -> None:
-        payload_bytes = vane_pickle.dumps(payload)
-        payload_size = _IPC_HEADER.size + len(payload_bytes)
-        payload_shm = _create_shm(max(payload_size, 4096), track=False)
-        data_shm = _create_shm(_DEFAULT_SHM_SIZE, track=False)
-        parent_sock, child_sock = socket.socketpair()
-        child_fd = child_sock.fileno()
+        # Publish ownership before allocating any OS resource. A constructor
+        # exception cannot return ``self``, so the observer is the only
+        # deterministic way for an enclosing pool to retry incomplete startup
+        # cleanup rather than relying on a best-effort ``__del__``.
+        if startup_observer is not None:
+            startup_observer(self)
+        self._raise_if_startup_cancelled()
 
         try:
+            payload_bytes = vane_pickle.dumps(payload)
+            payload_size = _IPC_HEADER.size + len(payload_bytes)
+            payload_shm = _create_shm(max(payload_size, 4096), track=False)
+            self._payload_shm = payload_shm
+            data_shm = _create_shm(_DEFAULT_SHM_SIZE, track=False)
+            self._data_shm = data_shm
+            parent_sock, child_sock = socket.socketpair()
+            self._sock = parent_sock
+            self._startup_child_sock = child_sock
+            child_fd = child_sock.fileno()
+
             _write_ipc_to_shm(payload_shm, payload_bytes)
             cmd = [
                 sys.executable,
@@ -396,7 +502,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             )
             env.update(self._worker_env)
             env["PYTHONUNBUFFERED"] = "1"
-            proc = subprocess.Popen(
+            self._proc = subprocess.Popen(
                 cmd,
                 pass_fds=(child_fd,),
                 close_fds=True,
@@ -405,23 +511,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 stdout=subprocess.DEVNULL,
                 stderr=None if _subprocess_debug_enabled() else subprocess.DEVNULL,
             )
-        except Exception:
             child_sock.close()
-            parent_sock.close()
-            payload_shm.close()
-            _unlink_shm(payload_shm, track=False)
-            data_shm.close()
-            _unlink_shm(data_shm, track=False)
-            raise
-
-        child_sock.close()
-        self._payload_shm = payload_shm
-        self._data_shm = data_shm
-        self._sock = parent_sock
-        self._proc = proc
-        try:
-            if startup_observer is not None:
-                startup_observer(self)
+            self._startup_child_sock = None
             self._raise_if_startup_cancelled()
             msg_type, payload_data = self._recv_expected(
                 (_MSG_READY, _MSG_ERROR),
@@ -448,8 +539,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 self.close(kill=True)
             except BaseException as cleanup_error:
                 raise _SubprocessStartupCleanupError(
-                    f"UDF subprocess worker startup failed: {type(startup_error).__name__}: {startup_error}; "
-                    f"cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    f"UDF subprocess worker startup failed: {_bounded_close_error(startup_error)}; "
+                    f"cleanup failed: {_bounded_close_error(cleanup_error)}"
                 ) from startup_error
             if cancel_requested:
                 raise _SubprocessStartupCancelledError("UDF subprocess worker startup was cancelled") from startup_error
@@ -463,7 +554,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self.close(kill=True)
         except BaseException as exc:
             raise _SubprocessStartupCleanupError(
-                f"UDF subprocess worker startup cancellation cleanup failed: {exc}"
+                "UDF subprocess worker startup cancellation cleanup failed: " + _bounded_close_error(exc)
             ) from exc
         raise _SubprocessStartupCancelledError("UDF subprocess worker startup was cancelled")
 
@@ -602,19 +693,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
 
     def _cancel_active_input_leases(self, scope: ExecutionCancellationScope | None = None) -> None:
         with self._active_input_leases_lock:
-            lease_ids = [
-                lease_id
+            leases = [
+                (lease_id, owner_scope)
                 for lease_id, owner_scope in self._active_input_leases.items()
                 if scope is None or owner_scope is scope
             ]
-            for lease_id in lease_ids:
-                self._active_input_leases.pop(lease_id, None)
         cleanup_errors: list[BaseException] = []
-        for lease_id in lease_ids:
+        for lease_id, owner_scope in leases:
             try:
                 cancel_local_shm_input_lease(lease_id, name="udf-input-close")
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                with self._active_input_leases_lock:
+                    if self._active_input_leases.get(lease_id) is owner_scope:
+                        self._active_input_leases.pop(lease_id, None)
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF subprocess input-lease cancellation failed: {details}") from cleanup_errors[0]
@@ -639,10 +732,8 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
     def _release_output_grant(self, grant_id: int, *, name: str) -> None:
         if int(grant_id) <= 0:
             return
-        try:
-            release_local_shm_output_grant(int(grant_id), name=name)
-        finally:
-            self._untrack_output_grant(int(grant_id))
+        release_local_shm_output_grant(int(grant_id), name=name)
+        self._untrack_output_grant(int(grant_id))
 
     def _release_active_output_grants(
         self,
@@ -651,19 +742,21 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         scope: ExecutionCancellationScope | None = None,
     ) -> None:
         with self._active_output_grants_lock:
-            grant_ids = [
-                grant_id
+            grants = [
+                (grant_id, owner_scope)
                 for grant_id, owner_scope in self._active_output_grants.items()
                 if scope is None or owner_scope is scope
             ]
-            for grant_id in grant_ids:
-                self._active_output_grants.pop(grant_id, None)
         cleanup_errors: list[BaseException] = []
-        for grant_id in grant_ids:
+        for grant_id, owner_scope in grants:
             try:
                 release_local_shm_output_grant(grant_id, name=name)
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                with self._active_output_grants_lock:
+                    if self._active_output_grants.get(grant_id) is owner_scope:
+                        self._active_output_grants.pop(grant_id, None)
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF subprocess output-grant release failed: {details}") from cleanup_errors[0]
@@ -696,31 +789,58 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF subprocess scope-resource cleanup failed: {details}") from cleanup_errors[0]
 
-    def _mark_broken(self, error: str, *, actor_lost: bool = False) -> None:
+    def _mark_broken(
+        self,
+        error: str,
+        *,
+        actor_lost: bool = False,
+        graceful_close: bool = False,
+    ) -> None:
         self._actor_lost = self._actor_lost or actor_lost
         if self._broken_error is None:
             self._broken_error = error
-        self.close(kill=True)
+        self.close(kill=not graceful_close)
+
+    def _mark_reported_error(self, error: str) -> None:
+        try:
+            self._mark_broken(error, graceful_close=True)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                f"{error}; graceful broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
+            ) from cleanup_error
 
     def _mark_broken_after_cleanup_failure(self, error: BaseException) -> str:
         try:
-            self._mark_broken(f"UDF subprocess resource cleanup failed: {error}")
+            self._mark_broken(f"UDF subprocess resource cleanup failed: {_bounded_close_error(error)}")
         except BaseException as cleanup_error:
-            return f"; broken-worker cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            return f"; broken-worker cleanup failed: {_bounded_close_error(cleanup_error)}"
         return ""
 
     def _close_payload_shm(self) -> None:
-        shm = self._payload_shm
-        self._payload_shm = None
+        self._close_shared_memory("_payload_shm")
+
+    def _close_data_shm(self) -> None:
+        self._close_shared_memory("_data_shm")
+
+    def _close_shared_memory(self, attribute: str) -> None:
+        shm = getattr(self, attribute, None)
         if shm is None:
             return
+        cleanup_errors: list[BaseException] = []
         try:
             shm.close()
-        finally:
-            try:
-                _unlink_shm(shm, track=False)
-            except FileNotFoundError:
-                pass
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        try:
+            _unlink_shm(shm, track=False)
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            details = _subprocess_cleanup_error_details(cleanup_errors)
+            raise RuntimeError(f"UDF subprocess shared-memory cleanup failed: {details}") from cleanup_errors[0]
+        setattr(self, attribute, None)
 
     def _wrap_output(self, output: pa.Table) -> Any:
         if self._ref_bundle_output:
@@ -878,7 +998,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 raise RuntimeError(self._broken_error) from exc
             if msg_type == _MSG_ERROR:
                 error = payload.decode("utf-8", errors="replace")
-                self._mark_broken(error)
+                self._mark_reported_error(error)
                 raise RuntimeError(error)
             if msg_type == _MSG_TASK_CANCELLED:
                 error = payload.decode("utf-8", errors="replace") or "UDF subprocess task cancelled"
@@ -991,7 +1111,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                     cancel_local_shm_input_lease(lease_id, name="udf-input")
                 except BaseException as exc:
                     cleanup_error = exc
-                finally:
+                else:
                     self._untrack_input_lease(lease_id)
             if cleanup_error is not None:
                 broken_cleanup_details = self._mark_broken_after_cleanup_failure(cleanup_error)
@@ -1101,7 +1221,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             raise RuntimeError(self._broken_error) from exc
         if msg_type == _MSG_ERROR:
             error = payload.decode("utf-8", errors="replace")
-            self._mark_broken(error)
+            self._mark_reported_error(error)
             raise RuntimeError(error)
         self._finished_submitting = True
 
@@ -1143,8 +1263,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 proc.kill()
             except BaseException as exc:
                 cleanup_errors.append(exc)
-        sock = self._sock
-        if sock is not None:
+        for attribute in ("_sock", "_startup_child_sock"):
+            sock = getattr(self, attribute, None)
+            if sock is None:
+                continue
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -1155,8 +1277,10 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 sock.close()
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                setattr(self, attribute, None)
         if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            details = _subprocess_cleanup_error_details(cleanup_errors)
             raise RuntimeError(f"UDF subprocess startup cancellation failed: {details}") from cleanup_errors[0]
 
     def close(self, kill: bool = False) -> None:
@@ -1168,7 +1292,7 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
             self._close_locked(kill=kill)
 
     def _close_locked(self, *, kill: bool) -> None:
-        if self._closed:
+        if getattr(self, "_cleanup_finished", False):
             return
         self._closed = True
         cleanup_errors: list[BaseException] = []
@@ -1208,7 +1332,9 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                         f"UDF subprocess graceful shutdown returned unexpected message type {msg_type:#x}"
                     )
             except (socket.timeout, EOFError, OSError) as exc:
-                _subprocess_debug_log(f"worker graceful shutdown timed out or disconnected: {exc}")
+                graceful_error = RuntimeError(
+                    f"UDF subprocess graceful shutdown timed out or disconnected: {type(exc).__name__}: {exc}"
+                )
             except BaseException as exc:
                 graceful_error = exc
             if proc.poll() is None:
@@ -1216,7 +1342,11 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
                 try:
                     proc.wait(timeout=remaining)
                 except (subprocess.TimeoutExpired, TimeoutError) as exc:
-                    _subprocess_debug_log(f"worker graceful shutdown did not exit before deadline: {exc}")
+                    if graceful_error is None:
+                        graceful_error = RuntimeError(
+                            "UDF subprocess graceful shutdown did not exit before deadline: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
                 except BaseException as exc:
                     if graceful_error is None:
                         graceful_error = exc
@@ -1235,44 +1365,68 @@ class _SingleSubprocessExecutor(BaseUDFExecutor):
         if sock is not None:
             try:
                 sock.close()
-            except Exception:
-                pass
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._sock = None
+        startup_child_sock = getattr(self, "_startup_child_sock", None)
+        if startup_child_sock is not None:
+            try:
+                startup_child_sock.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                self._startup_child_sock = None
 
-        self._proc = None
-        self._sock = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    self._proc = proc
+                else:
+                    self._proc = None
+            except BaseException as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+                self._proc = proc
+        else:
+            self._proc = None
         try:
             self._close_payload_shm()
         except BaseException as exc:
             cleanup_errors.append(exc)
             finalizer_cleanup_failed = True
-        data_shm = self._data_shm
-        self._data_shm = None
-        if data_shm is not None:
-            try:
-                data_shm.close()
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-                finalizer_cleanup_failed = True
-            try:
-                _unlink_shm(data_shm, track=False)
-            except FileNotFoundError:
-                pass
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-                finalizer_cleanup_failed = True
+        try:
+            self._close_data_shm()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            finalizer_cleanup_failed = True
 
+        with self._active_input_leases_lock:
+            active_input_leases = bool(self._active_input_leases)
+        with self._active_output_grants_lock:
+            active_output_grants = bool(self._active_output_grants)
+        self._cleanup_finished = (
+            not active_input_leases
+            and not active_output_grants
+            and all(
+                getattr(self, attribute, None) is None
+                for attribute in ("_proc", "_sock", "_startup_child_sock", "_payload_shm", "_data_shm")
+            )
+        )
         finalizer = getattr(self, "_finalizer", None)
-        if finalizer is not None and finalizer.alive and shutdown_error is None and not finalizer_cleanup_failed:
+        if finalizer is not None and finalizer.alive and self._cleanup_finished and not finalizer_cleanup_failed:
             try:
                 finalizer.detach()
             except BaseException as exc:
                 cleanup_errors.append(exc)
         if shutdown_error is not None:
-            cleanup_errors.append(RuntimeError(f"UDF subprocess did not terminate cleanly: {shutdown_error}"))
+            cleanup_errors.append(
+                RuntimeError(f"UDF subprocess did not terminate cleanly: {_bounded_close_error(shutdown_error)}")
+            )
         if graceful_error is not None:
             cleanup_errors.append(graceful_error)
         if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            details = _subprocess_cleanup_error_details(cleanup_errors)
             raise RuntimeError(f"UDF subprocess close failed: {details}") from cleanup_errors[0]
 
     def __del__(self) -> None:
@@ -1931,16 +2085,29 @@ class LocalSubprocessActorPool:
         )
         self._idle_workers: deque[tuple[int, int]] = deque()
         self._workers: list[_SingleSubprocessExecutor] = []
+        self._cleanup_pending_workers: list[_SingleSubprocessExecutor] = []
         self._executor: ThreadPoolExecutor | None = None
+        self._cleanup_pending_executor: ThreadPoolExecutor | None = None
+        initializing_workers: dict[int, _SingleSubprocessExecutor] = {}
+
+        def startup_observer_for(
+            worker_idx: int,
+        ) -> Callable[[_SingleSubprocessExecutor], None]:
+            def observe_startup(executor: _SingleSubprocessExecutor) -> None:
+                initializing_workers[worker_idx] = executor
+
+            return observe_startup
+
         try:
             for worker_idx in range(self.pool_size):
-                self._workers.append(
-                    _SingleSubprocessExecutor(
-                        self.payload,
-                        worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
-                        session_config=self.session_config,
-                    )
+                worker = _SingleSubprocessExecutor(
+                    self.payload,
+                    worker_env=_worker_env_for_pool_index(self.payload, worker_idx, self.pool_size),
+                    session_config=self.session_config,
+                    startup_observer=startup_observer_for(worker_idx),
                 )
+                self._workers.append(worker)
+                initializing_workers.pop(worker_idx, None)
             self._executor = ThreadPoolExecutor(
                 max_workers=self.pool_size,
                 thread_name_prefix="vane-udf-subprocess-actor",
@@ -1954,17 +2121,27 @@ class LocalSubprocessActorPool:
                 try:
                     executor.shutdown(wait=False, cancel_futures=True)
                 except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
-            for worker in reversed(list(self._workers)):
-                try:
-                    worker.close(kill=True)
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(cleanup_error)
+                    _append_subprocess_cleanup_error(cleanup_errors, cleanup_error)
+                    self._cleanup_pending_executor = executor
+            owned_workers = list(self._workers)
+            owned_worker_ids = {id(worker) for worker in owned_workers}
+            for worker in initializing_workers.values():
+                if id(worker) not in owned_worker_ids:
+                    owned_workers.append(worker)
+                    owned_worker_ids.add(id(worker))
+            close_errors, pending_workers = _close_subprocess_workers_concurrently(
+                list(reversed(owned_workers)), kill=True
+            )
+            for close_error in close_errors:
+                _append_subprocess_cleanup_error(cleanup_errors, close_error)
+            self._cleanup_pending_workers = pending_workers
             self._workers = []
             if cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-                raise RuntimeError(
-                    f"local subprocess actor pool initialization cleanup failed: {details}"
+                details = _subprocess_cleanup_error_details(cleanup_errors)
+                raise _OwnedLocalSubprocessActorPoolsError(
+                    f"local subprocess actor pool initialization cleanup failed: {details}",
+                    owned_actor_pools=[self] if self.cleanup_pending() else [],
+                    creation_error=getattr(init_error, "creation_error", init_error),
                 ) from init_error
             raise
         for worker_idx in range(self.pool_size):
@@ -2054,7 +2231,7 @@ class LocalSubprocessActorPool:
                 else:
                     worker.close(kill=True)
             except BaseException as exc:
-                cleanup_errors.append(exc)
+                _append_subprocess_cleanup_error(cleanup_errors, exc)
         return cleanup_errors
 
     def _close_replacing_workers(
@@ -2069,20 +2246,24 @@ class LocalSubprocessActorPool:
         if deadline is None:
             deadline = time.monotonic() + _subprocess_shutdown_grace_s()
         while True:
-            cleanup_errors.extend(self._interrupt_replacing_workers(interrupted_workers))
+            for error in self._interrupt_replacing_workers(interrupted_workers):
+                _append_subprocess_cleanup_error(cleanup_errors, error)
             with self._cond:
                 if not self._replacing_workers:
-                    cleanup_errors.extend(getattr(self, "_replacement_cleanup_errors", ()))
+                    for error in getattr(self, "_replacement_cleanup_errors", ()):
+                        _append_subprocess_cleanup_error(cleanup_errors, error)
                     self._replacement_cleanup_errors = []
                     return cleanup_errors
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    cleanup_errors.append(
+                    _append_subprocess_cleanup_error(
+                        cleanup_errors,
                         TimeoutError(
                             "local subprocess actor replacement cleanup did not finish before the shutdown deadline"
-                        )
+                        ),
                     )
-                    cleanup_errors.extend(getattr(self, "_replacement_cleanup_errors", ()))
+                    for error in getattr(self, "_replacement_cleanup_errors", ()):
+                        _append_subprocess_cleanup_error(cleanup_errors, error)
                     self._replacement_cleanup_errors = []
                     return cleanup_errors
                 self._cond.wait(timeout=remaining)
@@ -2094,18 +2275,53 @@ class LocalSubprocessActorPool:
         error: BaseException,
     ) -> None:
         cleanup_error = RuntimeError(
-            f"local subprocess actor {worker_idx} {role} cleanup failed: {type(error).__name__}: {error}"
+            f"local subprocess actor {worker_idx} {role} cleanup failed: {_bounded_close_error(error)}"
         )
         with self._cond:
             errors = getattr(self, "_replacement_cleanup_errors", None)
             if errors is None:
                 errors = []
                 self._replacement_cleanup_errors = errors
-            errors.append(cleanup_error)
+            _append_subprocess_cleanup_error(errors, cleanup_error)
             pool_closed = self._closed
             self._cond.notify_all()
         if not pool_closed:
             self._set_terminal_error(cleanup_error)
+
+    def _retain_cleanup_pending_worker(self, worker: _SingleSubprocessExecutor) -> None:
+        """Keep one incompletely closed worker reachable for a later forced retry."""
+
+        if getattr(worker, "_cleanup_finished", None) is True:
+            return
+        with self._cond:
+            pending_workers = getattr(self, "_cleanup_pending_workers", None)
+            if pending_workers is None:
+                pending_workers = []
+                self._cleanup_pending_workers = pending_workers
+            if all(existing is not worker for existing in pending_workers):
+                pending_workers.append(worker)
+            self._cond.notify_all()
+
+    def _replace_attempted_cleanup_workers(
+        self,
+        attempted_workers: list[_SingleSubprocessExecutor],
+        pending_workers: list[_SingleSubprocessExecutor],
+    ) -> None:
+        """Commit one close attempt without discarding owners published concurrently."""
+
+        attempted_ids = {id(worker) for worker in attempted_workers}
+        with self._cond:
+            retained = [
+                worker for worker in getattr(self, "_cleanup_pending_workers", ()) if id(worker) not in attempted_ids
+            ]
+            retained_ids = {id(worker) for worker in retained}
+            for worker in pending_workers:
+                if id(worker) in retained_ids:
+                    continue
+                retained.append(worker)
+                retained_ids.add(id(worker))
+            self._cleanup_pending_workers = retained
+            self._cond.notify_all()
 
     def _replace_worker(
         self,
@@ -2124,7 +2340,13 @@ class LocalSubprocessActorPool:
             except BaseException as exc:
                 with self._cond:
                     pool_closed = self._closed
-                if pool_closed and isinstance(exc, _SubprocessStartupCleanupError):
+                    provisional_worker = getattr(self, "_replacing_executors", {}).get(worker_idx)
+                provisional_cleanup_pending = (
+                    provisional_worker is not None and getattr(provisional_worker, "_cleanup_finished", None) is False
+                )
+                if provisional_worker is not None and provisional_cleanup_pending:
+                    self._retain_cleanup_pending_worker(provisional_worker)
+                if pool_closed and (isinstance(exc, _SubprocessStartupCleanupError) or provisional_cleanup_pending):
                     self._record_replacement_cleanup_error(worker_idx, "replacement startup", exc)
                 elif not pool_closed:
                     self._set_terminal_error(
@@ -2150,6 +2372,7 @@ class LocalSubprocessActorPool:
                 try:
                     replacement.close(kill=True)
                 except BaseException as exc:
+                    self._retain_cleanup_pending_worker(replacement)
                     self._record_replacement_cleanup_error(worker_idx, "replacement", exc)
         finally:
             # Keep replacement ownership visible until a rejected replacement
@@ -2292,12 +2515,21 @@ class LocalSubprocessActorPool:
             try:
                 worker.cancel_output_grants()
             except BaseException as exc:
-                cleanup_errors.append(exc)
+                _append_subprocess_cleanup_error(cleanup_errors, exc)
         if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            details = _subprocess_cleanup_error_details(cleanup_errors)
             raise RuntimeError(
                 f"local subprocess actor output-grant cancellation failed: {details}"
             ) from cleanup_errors[0]
+
+    def cleanup_pending(self) -> bool:
+        with self._cond:
+            return bool(
+                getattr(self, "_cleanup_pending_workers", ())
+                or getattr(self, "_cleanup_pending_executor", None) is not None
+                or self._replacing_workers
+                or getattr(self, "_replacing_executors", {})
+            )
 
     def abort_scopes(self, scopes: set[ExecutionCancellationScope]) -> None:
         workers: list[_SingleSubprocessExecutor] = []
@@ -2309,35 +2541,84 @@ class LocalSubprocessActorPool:
                 self._aborting_workers.add((worker_idx, worker_generation))
                 workers.append(self._workers[worker_idx])
             self._cond.notify_all()
-        cleanup_errors: list[BaseException] = []
-        for worker in workers:
-            try:
-                worker.close(kill=True)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
+        cleanup_errors, _ = _close_subprocess_workers_concurrently(workers, kill=True)
         if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            details = _subprocess_cleanup_error_details(cleanup_errors)
             raise RuntimeError(f"local subprocess actor abort failed: {details}") from cleanup_errors[0]
 
     def shutdown(self, *, kill: bool = False) -> None:
+        retry_workers: list[_SingleSubprocessExecutor] = []
+        retry_executor: ThreadPoolExecutor | None = None
+        retry_cleanup = False
         with self._cond:
             if self._closed:
                 while not getattr(self, "_shutdown_finished", True):
                     self._cond.wait()
-                return
-            self._closed = True
+                retry_workers = list(getattr(self, "_cleanup_pending_workers", ()))
+                retry_executor = getattr(self, "_cleanup_pending_executor", None)
+                retry_cleanup = bool(
+                    retry_workers
+                    or retry_executor is not None
+                    or self._replacing_workers
+                    or getattr(self, "_replacing_executors", {})
+                )
+                if not retry_cleanup:
+                    return
+            else:
+                self._closed = True
             self._shutdown_finished = False
-            self._replacement_startup_cancel_requested = bool(kill)
-            active_scopes = list(self._active_scopes.values())
+            if not retry_cleanup:
+                self._replacement_startup_cancel_requested = bool(kill)
+            active_scopes = [] if retry_cleanup else list(self._active_scopes.values())
             self._cond.notify_all()
         try:
             cleanup_errors: list[BaseException] = []
+            if retry_cleanup:
+                interrupted_replacements: set[int] = set()
+                for error in self._interrupt_replacing_workers(interrupted_replacements):
+                    _append_subprocess_cleanup_error(cleanup_errors, error)
+                for error in self._close_replacing_workers(
+                    deadline=time.monotonic() + _subprocess_shutdown_grace_s(),
+                    interrupted_workers=interrupted_replacements,
+                ):
+                    _append_subprocess_cleanup_error(cleanup_errors, error)
+                if retry_executor is not None:
+                    try:
+                        retry_executor.shutdown(wait=False, cancel_futures=True)
+                    except BaseException as exc:
+                        _append_subprocess_cleanup_error(cleanup_errors, exc)
+                    else:
+                        with self._cond:
+                            if getattr(self, "_cleanup_pending_executor", None) is retry_executor:
+                                self._cleanup_pending_executor = None
+                close_errors, pending_workers = _close_subprocess_workers_concurrently(
+                    retry_workers,
+                    kill=True,
+                )
+                for error in close_errors:
+                    _append_subprocess_cleanup_error(cleanup_errors, error)
+                self._replace_attempted_cleanup_workers(retry_workers, pending_workers)
+                if self.cleanup_pending() and not cleanup_errors:
+                    _append_subprocess_cleanup_error(
+                        cleanup_errors,
+                        RuntimeError("local subprocess actor pool cleanup retry retained unfinished owners"),
+                    )
+                if cleanup_errors:
+                    details = _subprocess_cleanup_error_details(cleanup_errors)
+                    raise RuntimeError(
+                        f"local subprocess actor pool cleanup retry failed: {details}"
+                    ) from cleanup_errors[0]
+                return
+
             try:
                 self.admission_slots.close()
             except BaseException as exc:
-                cleanup_errors.append(exc)
+                _append_subprocess_cleanup_error(cleanup_errors, exc)
             for scope in active_scopes:
-                scope.cancel("local subprocess actor pool closed")
+                try:
+                    scope.cancel("local subprocess actor pool closed")
+                except BaseException as exc:
+                    _append_subprocess_cleanup_error(cleanup_errors, exc)
 
             close_kill = bool(kill)
             if not close_kill:
@@ -2347,27 +2628,35 @@ class LocalSubprocessActorPool:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             close_kill = True
+                            if self._active > 0:
+                                _append_subprocess_cleanup_error(
+                                    cleanup_errors,
+                                    TimeoutError(
+                                        "local subprocess actor pool graceful shutdown did not quiesce active work "
+                                        "before the shutdown deadline; forced termination was required"
+                                    ),
+                                )
                             self._replacement_startup_cancel_requested = True
                             self._cond.notify_all()
                             break
                         self._cond.wait(timeout=remaining)
-            interrupted_replacements: set[int] = set()
+            shutdown_interrupted_replacements: set[int] = set()
             if close_kill:
-                cleanup_errors.extend(self._interrupt_replacing_workers(interrupted_replacements))
+                for error in self._interrupt_replacing_workers(shutdown_interrupted_replacements):
+                    _append_subprocess_cleanup_error(cleanup_errors, error)
                 try:
                     self.abort_scopes(set(active_scopes))
                 except BaseException as exc:
-                    cleanup_errors.append(exc)
+                    _append_subprocess_cleanup_error(cleanup_errors, exc)
 
             # Once graceful shutdown escalates, interrupt provisional actor
             # startup instead of waiting for the longer control timeout.
             replacement_cleanup_deadline = time.monotonic() + _subprocess_shutdown_grace_s()
-            cleanup_errors.extend(
-                self._close_replacing_workers(
-                    deadline=replacement_cleanup_deadline,
-                    interrupted_workers=interrupted_replacements,
-                )
-            )
+            for error in self._close_replacing_workers(
+                deadline=replacement_cleanup_deadline,
+                interrupted_workers=shutdown_interrupted_replacements,
+            ):
+                _append_subprocess_cleanup_error(cleanup_errors, error)
 
             executor = self._executor
             self._executor = None
@@ -2375,21 +2664,47 @@ class LocalSubprocessActorPool:
                 try:
                     executor.shutdown(wait=False, cancel_futures=True)
                 except BaseException as exc:
-                    cleanup_errors.append(exc)
-            with self._lock:
+                    _append_subprocess_cleanup_error(cleanup_errors, exc)
+                    with self._cond:
+                        self._cleanup_pending_executor = executor
+                        self._cond.notify_all()
+            with self._cond:
                 workers = list(self._workers)
-            for worker in workers:
-                try:
-                    worker.close(kill=close_kill)
-                except BaseException as exc:
-                    cleanup_errors.append(exc)
+                cleanup_pending_workers = list(getattr(self, "_cleanup_pending_workers", ()))
+            forced_workers: list[_SingleSubprocessExecutor] = []
+            forced_worker_ids: set[int] = set()
+            for worker in cleanup_pending_workers:
+                if id(worker) in forced_worker_ids:
+                    continue
+                forced_workers.append(worker)
+                forced_worker_ids.add(id(worker))
+            graceful_workers = [worker for worker in workers if id(worker) not in forced_worker_ids]
+            close_errors, pending_workers = _close_subprocess_workers_concurrently(
+                graceful_workers,
+                kill=close_kill,
+            )
+            for error in close_errors:
+                _append_subprocess_cleanup_error(cleanup_errors, error)
+            forced_close_errors, forced_pending_workers = _close_subprocess_workers_concurrently(
+                forced_workers,
+                kill=True,
+            )
+            for error in forced_close_errors:
+                _append_subprocess_cleanup_error(cleanup_errors, error)
+            pending_workers.extend(forced_pending_workers)
             with self._cond:
                 self._workers = []
                 self._idle_workers.clear()
                 self._cond.notify_all()
+            self._replace_attempted_cleanup_workers(graceful_workers + forced_workers, pending_workers)
+            if self.cleanup_pending() and not cleanup_errors:
+                _append_subprocess_cleanup_error(
+                    cleanup_errors,
+                    RuntimeError("local subprocess actor pool shutdown retained unfinished owners"),
+                )
             _subprocess_debug_log(f"local_actor_pool_shutdown name={self.name!r} kill={close_kill}")
             if cleanup_errors:
-                details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
+                details = _subprocess_cleanup_error_details(cleanup_errors)
                 raise RuntimeError(f"local subprocess actor pool shutdown failed: {details}") from cleanup_errors[0]
         finally:
             with self._cond:
@@ -2520,15 +2835,32 @@ def ensure_local_subprocess_actor_pools_for_nodes(
         if actor_options_map and set_handles is not None:
             set_handles(actor_options_map)
     except BaseException as creation_error:
+        for pool in getattr(creation_error, "owned_actor_pools", ()):
+            if all(existing is not pool for existing in created):
+                created.append(pool)
         cleanup_errors: list[BaseException] = []
+        remaining_owned: list[LocalSubprocessActorPool] = []
         for pool in reversed(created):
             try:
                 pool.shutdown(kill=True)
             except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
+                _append_subprocess_cleanup_error(cleanup_errors, cleanup_error)
+                cleanup_pending = getattr(pool, "cleanup_pending", None)
+                try:
+                    if not callable(cleanup_pending) or cleanup_pending():
+                        remaining_owned.append(pool)
+                except BaseException as status_error:
+                    _append_subprocess_cleanup_error(cleanup_errors, status_error)
+                    remaining_owned.append(pool)
         if cleanup_errors:
-            details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
-            raise RuntimeError(f"local subprocess actor pool rollback failed: {details}") from creation_error
+            details = _subprocess_cleanup_error_details(cleanup_errors)
+            raise _OwnedLocalSubprocessActorPoolsError(
+                f"local subprocess actor pool rollback failed: {details}",
+                owned_actor_pools=list(reversed(remaining_owned)),
+                creation_error=getattr(creation_error, "creation_error", creation_error),
+            ) from creation_error
+        if isinstance(creation_error, _OwnedLocalSubprocessActorPoolsError):
+            raise creation_error.creation_error
         raise
 
     return created, actor_options_map
@@ -2809,13 +3141,14 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
     def _cancel_active_input_leases(self) -> None:
         with self._active_input_leases_lock:
             lease_ids = list(self._active_input_leases)
-            self._active_input_leases.clear()
         cleanup_errors: list[BaseException] = []
         for lease_id in lease_ids:
             try:
                 cancel_local_shm_input_lease(lease_id, name="udf-input-close")
             except BaseException as exc:
                 cleanup_errors.append(exc)
+            else:
+                self._untrack_input_lease(lease_id)
         if cleanup_errors:
             details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
             raise RuntimeError(f"UDF input lease cancellation failed: {details}") from cleanup_errors[0]
@@ -3047,7 +3380,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                 lease_id: int = lease_id,
             ) -> Any | None:
                 try:
-                    return worker._submit_ref_bundle_direct(payload)
+                    result = worker._submit_ref_bundle_direct(payload)
                 except BaseException as submit_error:
                     try:
                         cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
@@ -3058,9 +3391,10 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                             f"{submit_error}; input-lease cleanup failed: "
                             f"{type(cleanup_error).__name__}: {cleanup_error}{broken_cleanup_details}"
                         ) from submit_error
-                    raise
-                finally:
                     self._untrack_input_lease(lease_id)
+                    raise
+                self._untrack_input_lease(lease_id)
+                return result
 
             try:
                 admission = self._take_task_admission()
@@ -3075,7 +3409,7 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
                     cancel_local_shm_input_lease(lease_id, name=f"udf-input-{int(submit_id)}")
                 except BaseException as exc:
                     cleanup_error = exc
-                finally:
+                else:
                     self._untrack_input_lease(lease_id)
                 if cleanup_error is not None:
                     raise RuntimeError(
@@ -3194,6 +3528,13 @@ class UDFExecutor(AdmissionExecutorMixin, BaseUDFExecutor):
             self._lifecycle_lock = lifecycle_lock
         with lifecycle_lock:
             if self._closed:
+                # ``_closed`` is the submission fence, not proof that every
+                # fallible parent-side input-lease cancellation completed.
+                # The first close retains failed lease ids, so an explicit
+                # retry (and the finalizer's last attempt) must still be able
+                # to release those owners after the rest of the executor has
+                # been detached.
+                self._cancel_active_input_leases()
                 return
             self._closed = True
             self._close_after_marked_closed(kill=kill)

@@ -6,6 +6,8 @@
 #include "task.hpp"
 #include "worker.hpp"
 #include "worker_manager.hpp"
+#include "bounded_diagnostics.hpp"
+#include "python_bounded_diagnostics.hpp"
 #include "safe_pyobject.hpp"
 #include "datasource_function.hpp"
 
@@ -26,7 +28,7 @@
 #include <duckdb/execution/distributed/plan/exchange_sink_instance_task.hpp>
 #include <duckdb/execution/distributed/plan/exchange_source_task.hpp>
 #include <duckdb/execution/distributed/plan/fte_split_queue.hpp>
-#include <duckdb/execution/distributed/plan/scan_task.hpp>
+#include <duckdb/execution/distributed/plan/scan_split.hpp>
 #include <duckdb/execution/distributed/pipeline_node/pipeline_node.hpp>
 #include <duckdb/execution/distributed/pipeline_node/sink.hpp>
 #include <duckdb/execution/distributed/pipeline_node/streaming_udf_passthrough.hpp>
@@ -88,7 +90,9 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
+#include <duckdb/main/relation/data_sink_relation.hpp>
 #include <duckdb/execution/operator/helper/physical_materialized_collector.hpp>
+#include <duckdb/execution/operator/helper/physical_data_sink.hpp>
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp>
 #include <duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp>
 #include <duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp>
@@ -478,7 +482,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("task_context", &RayWorkerTask::TaskContextInfo)
 	    .def("name", &RayWorkerTask::Name)
 	    .def("plan", &RayWorkerTask::Plan)
-	    .def("exchange_sink_instance", &RayWorkerTask::ExchangeSinkInstance)
+	    .def("exchange_sink_config", &RayWorkerTask::ExchangeSinkConfig)
 	    .def("Inputs", &RayWorkerTask::Inputs);
 
 	py::class_<RayWorkerRuntime, std::shared_ptr<RayWorkerRuntime>>(m, "RayWorkerRuntime")
@@ -499,7 +503,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def(
 	        "add_scan_split",
 	        [](duckdb::distributed::FteSplitQueue &self, py::bytes bytes) {
-		        self.AddSplit(duckdb::distributed::TaskInput::make_scan_task(bytes.cast<string>()));
+		        self.AddSplit(duckdb::distributed::TaskInput::make_scan_split_batch(bytes.cast<string>()));
 	        },
 	        py::arg("bytes"))
 	    .def(
@@ -609,6 +613,33 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 	        },
 	        py::arg("query_id"), py::arg("timeout_s") = 0.0)
+	    .def(
+	        "_wait_fte_query_streaming_for_test",
+	        [](RayWorkerManager &self, const string &query_id, double timeout_s, int64_t fail_after,
+	           int64_t throw_after) {
+		        size_t output_count = 0;
+		        auto on_output = [&output_count, fail_after,
+		                          throw_after](const duckdb::distributed::MaterializedOutput &) {
+			        if (throw_after >= 0 && output_count >= static_cast<size_t>(throw_after)) {
+				        throw std::runtime_error("planned streaming callback exception");
+			        }
+			        if (fail_after >= 0 && output_count >= static_cast<size_t>(fail_after)) {
+				        return duckdb::distributed::DuckDBResult<void>::err(
+				            duckdb::distributed::DuckDBError::external_error("planned streaming callback failure"));
+			        }
+			        output_count++;
+			        return duckdb::distributed::DuckDBResult<void>::ok();
+		        };
+		        auto res = [&]() {
+			        py::gil_scoped_release release;
+			        return self.wait_fte_query_streaming(query_id, timeout_s, std::move(on_output));
+		        }();
+		        if (res.is_err()) {
+			        throw duckdb::InternalException(res.error().what());
+		        }
+		        return output_count;
+	        },
+	        py::arg("query_id"), py::arg("timeout_s") = 0.0, py::arg("fail_after") = -1, py::arg("throw_after") = -1)
 	    .def("fragment_stats",
 	         [](RayWorkerManager &self) { return BuildFragmentStatsSummary(self.fragment_stats_by_worker()); })
 	    .def("try_autoscale", [](RayWorkerManager &self, py::object bundles_obj) {
@@ -907,7 +938,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("num_partitions", &PyPhysicalPlanWrapper::num_partitions)
 	    .def("repr_ascii", &PyPhysicalPlanWrapper::repr_ascii)
 	    .def("repr_mermaid", &PyPhysicalPlanWrapper::repr_mermaid)
-	    .def("scan_task_descriptor_map", &PyPhysicalPlanWrapper::scan_task_descriptor_map)
+	    .def("scan_split_batch_map", &PyPhysicalPlanWrapper::scan_split_batch_map)
 	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
 	         py::arg("conn") = py::none())
 	    .def("collect_udf_nodes", &PyPhysicalPlanWrapper::collect_udf_nodes, py::arg("conn") = py::none())
@@ -1102,7 +1133,7 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     false);
+			                                                     DuckDBRelationPlanKind::READ);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
@@ -1115,7 +1146,20 @@ void register_ray_bindings(py::module_ &mod) {
 	                [](py::object relation_obj, py::object query_id_obj) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
-			                                                     true);
+			                                                     DuckDBRelationPlanKind::WRITE);
+		                } catch (const py::type_error &) {
+			                throw;
+		                } catch (const py::error_already_set &) {
+			                throw;
+		                } catch (const std::exception &ex) {
+			                throw py::value_error(ex.what());
+		                }
+	                })
+	    .def_static("from_duckdb_datasink_relation",
+	                [](py::object relation_obj, py::object query_id_obj) {
+		                try {
+			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
+			                                                     DuckDBRelationPlanKind::DATA_SINK);
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
@@ -1294,6 +1338,68 @@ void register_ray_bindings(py::module_ &mod) {
 	        },
 	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
 	    .def(
+	        "run_datasink_plan",
+	        [](PyPhysicalPlanWrapperRunner &self, py::object plan_obj, py::object conn_obj,
+	           py::object on_execution_started_obj) -> py::dict {
+		        if (!py::isinstance<PyPhysicalPlanWrapper>(plan_obj)) {
+			        throw py::type_error("plan must be DistributedPhysicalPlan (PyPhysicalPlanWrapper)");
+		        }
+		        const auto *plan_ptr = plan_obj.cast<PyPhysicalPlanWrapper *>();
+		        if (!plan_ptr->IsInitialized()) {
+			        throw py::value_error(
+			            "DistributedPhysicalPlan is uninitialized; construct it via constructor/helper APIs");
+		        }
+
+		        auto get_client_context = [plan_ptr](py::object connection_obj,
+		                                             duckdb::distributed::python::ray::SafePyObject &keepalive)
+		            -> duckdb::shared_ptr<duckdb::ClientContext> {
+			        if (!plan_ptr->worker_connection_.is_none()) {
+				        try {
+					        auto &py_conn = ExtractPyConnectionWrapper(plan_ptr->worker_connection_);
+					        auto &db_conn = py_conn.con.GetConnection();
+					        if (db_conn.context) {
+						        keepalive =
+						            duckdb::distributed::python::ray::SafePyObject(plan_ptr->worker_connection_);
+						        return db_conn.context;
+					        }
+				        } catch (...) {
+				        }
+			        }
+			        if (plan_ptr->client_context_) {
+				        return plan_ptr->client_context_;
+			        }
+			        if (connection_obj.is_none()) {
+				        return nullptr;
+			        }
+			        py::object resolved_conn = connection_obj;
+			        if (py::hasattr(connection_obj, "c")) {
+				        resolved_conn = connection_obj.attr("c");
+			        }
+			        try {
+				        auto &py_conn = resolved_conn.cast<duckdb::DuckDBPyConnection &>();
+				        auto &db_conn = py_conn.con.GetConnection();
+				        if (!db_conn.context) {
+					        return nullptr;
+				        }
+				        keepalive = duckdb::distributed::python::ray::SafePyObject(resolved_conn);
+				        return db_conn.context;
+			        } catch (...) {
+				        return nullptr;
+			        }
+		        };
+
+		        duckdb::distributed::python::ray::SafePyObject keepalive;
+		        auto client_context = get_client_context(conn_obj, keepalive);
+		        duckdb::distributed::python::ray::SafePyObject on_execution_started;
+		        if (!on_execution_started_obj.is_none()) {
+			        on_execution_started =
+			            duckdb::distributed::python::ray::SafePyObject(std::move(on_execution_started_obj));
+		        }
+		        return self.run_datasink_plan(*plan_ptr, client_context, std::move(keepalive),
+		                                      std::move(on_execution_started));
+	        },
+	        py::arg("plan"), py::arg("conn") = py::none(), py::arg("on_execution_started") = py::none())
+	    .def(
 	        "finalize_copy",
 	        [](PyPhysicalPlanWrapperRunner &self, py::list file_infos, py::str copy_spec_key, py::str staging_root,
 	           py::object conn_obj) -> py::object {
@@ -1346,8 +1452,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    // Use a single dispatcher for execute_native to avoid pybind11 overload resolution issues
 	    .def(
 	        "execute_native",
-	        [](PyPhysicalPlanWrapperRunner &self, py::object conn_obj, py::object plan_obj, py::object scan_task_obj,
-	           py::object exchange_source_task_obj, py::object copy_output_info_obj,
+	        [](PyPhysicalPlanWrapperRunner &self, py::object conn_obj, py::object plan_obj,
+	           py::object scan_split_batch_obj, py::object exchange_source_task_obj, py::object copy_output_info_obj,
 	           py::object exchange_sink_instance_obj, py::object fte_scan_source_queues_obj,
 	           py::object fte_exchange_source_queues_obj, py::object dynamic_filter_domains_obj,
 	           py::object native_progress_callback_obj, py::object runtime_context_obj,
@@ -1378,42 +1484,42 @@ void register_ray_bindings(py::module_ &mod) {
 				        throw py::value_error(string("Invalid ") + map_name + " node_id: " + ex.what());
 			        }
 		        };
-		        std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> scan_task_map;
-		        bool has_scan_task_map = false;
-		        if (!scan_task_obj.is_none()) {
-			        if (py::isinstance<py::dict>(scan_task_obj)) {
-				        auto dict_obj = scan_task_obj.cast<py::dict>();
+		        std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> scan_split_batch_map;
+		        bool has_scan_split_batch_map = false;
+		        if (!scan_split_batch_obj.is_none()) {
+			        if (py::isinstance<py::dict>(scan_split_batch_obj)) {
+				        auto dict_obj = scan_split_batch_obj.cast<py::dict>();
 				        for (auto item : dict_obj) {
-					        auto node_id = parse_node_id(item.first, "scan_task");
+					        auto node_id = parse_node_id(item.first, "scan_split_batch");
 					        // Values are raw bytes (py::bytes) from driver context
 					        auto val_obj = py::reinterpret_borrow<py::object>(item.second);
 					        if (!py::isinstance<py::bytes>(val_obj)) {
-						        throw py::value_error("scan_task values must be raw bytes");
+						        throw py::value_error("scan_split_batch values must be raw bytes");
 					        }
 					        auto val_bytes = val_obj.cast<string>();
 					        if (val_bytes.empty()) {
-						        throw py::value_error("scan_task descriptor must not be empty");
+						        throw py::value_error("scan_split_batch must not be empty");
 					        }
 					        try {
 						        auto inserted =
-						            scan_task_map
-						                .emplace(node_id, duckdb::distributed::ScanTaskDescriptor::DeserializeFromBytes(
-						                                      val_bytes))
+						            scan_split_batch_map
+						                .emplace(node_id,
+						                         duckdb::distributed::ScanSplitBatch::DeserializeFromBytes(val_bytes))
 						                .second;
 						        if (!inserted) {
 							        throw std::invalid_argument("duplicate normalized node_id");
 						        }
 					        } catch (const std::exception &ex) {
-						        throw py::value_error(string("Invalid scan task map entry: ") + ex.what());
+						        throw py::value_error(string("Invalid scan split batch map entry: ") + ex.what());
 					        }
 				        }
-				        has_scan_task_map = !scan_task_map.empty();
+				        has_scan_split_batch_map = !scan_split_batch_map.empty();
 			        } else {
-				        throw py::value_error("scan_task must be a dict mapping node_id to raw bytes");
+				        throw py::value_error("scan_split_batch must be a dict mapping node_id to raw bytes");
 			        }
 		        }
-		        const std::unordered_map<idx_t, duckdb::distributed::ScanTaskDescriptor> *scan_task_map_ptr =
-		            has_scan_task_map ? &scan_task_map : nullptr;
+		        const std::unordered_map<idx_t, duckdb::distributed::ScanSplitBatch> *scan_split_batch_map_ptr =
+		            has_scan_split_batch_map ? &scan_split_batch_map : nullptr;
 
 		        std::unordered_map<idx_t, duckdb::distributed::ExchangeSourceTaskDescriptor> exchange_source_task_map;
 		        bool has_exchange_source_task_map = false;
@@ -1532,12 +1638,12 @@ void register_ray_bindings(py::module_ &mod) {
 						        exchange_sink_instance_task.sink_instance.query_id =
 						            py::str(sink_handle["query_id"]).cast<string>();
 					        }
-					        if (sink_handle.contains("partition_id")) {
-						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
-						            py::int_(sink_handle["partition_id"]).cast<idx_t>();
-					        } else if (sink_handle.contains("task_partition_id")) {
+					        if (sink_handle.contains("task_partition_id")) {
 						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
 						            py::int_(sink_handle["task_partition_id"]).cast<idx_t>();
+					        } else if (sink_handle.contains("partition_id")) {
+						        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
+						            py::int_(sink_handle["partition_id"]).cast<idx_t>();
 					        }
 				        } else if (d.contains("task_partition_id")) {
 					        exchange_sink_instance_task.sink_instance.sink_handle.task_partition_id =
@@ -1550,10 +1656,6 @@ void register_ray_bindings(py::module_ &mod) {
 				        if (d.contains("attempt_id")) {
 					        exchange_sink_instance_task.sink_instance.attempt_id =
 					            py::int_(d["attempt_id"]).cast<idx_t>();
-				        }
-				        if (d.contains("fte_task_identity")) {
-					        exchange_sink_instance_task.sink_instance.fte_task_identity =
-					            py::bool_(d["fte_task_identity"]).cast<bool>();
 				        }
 				        if (d.contains("output_partition_count")) {
 					        exchange_sink_instance_task.sink_instance.output_partition_count =
@@ -1672,7 +1774,7 @@ void register_ray_bindings(py::module_ &mod) {
 				        exec_plan->apply_udf_actor_handles();
 				        auto result = self.execute_native_impl(
 				            exec_conn, exec_plan->plan_->physical_plan(), plan.idx(), plan.resource_query_id_,
-				            scan_task_map_ptr, exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
+				            scan_split_batch_map_ptr, exchange_source_task_map_ptr, exchange_sink_instance_task_ptr,
 				            fte_scan_source_queue_map_ptr, fte_exchange_source_queue_map_ptr, copy_output_info_ptr,
 				            dynamic_filter_domains_obj, native_progress_callback_obj, runtime_context_obj);
 				        return result;
@@ -1685,56 +1787,60 @@ void register_ray_bindings(py::module_ &mod) {
 		        throw py::type_error("execute_native expects PyPhysicalPlanWrapper (DistributedPhysicalPlan), got " +
 		                             plan_type_name);
 	        },
-	        py::arg("conn"), py::arg("plan"), py::arg("scan_task") = py::none(),
+	        py::arg("conn"), py::arg("plan"), py::arg("scan_split_batch") = py::none(),
 	        py::arg("exchange_source_task") = py::none(), py::arg("copy_output_info") = py::none(),
 	        py::arg("exchange_sink_instance") = py::none(), py::arg("fte_scan_source_queues") = py::none(),
 	        py::arg("fte_exchange_source_queues") = py::none(), py::arg("dynamic_filter_domains") = py::none(),
 	        py::arg("native_progress_callback") = py::none(), py::arg("runtime_context") = py::none(),
 	        py::arg("effective_session_config") = py::none(), "Execute physical plan using DuckDB's native Executor");
 
-	// Merge multiple raw-bytes ScanTaskDescriptors into one. File descriptors
-	// concatenate files; extension descriptors concatenate opaque envelopes only
-	// when their capability and codec identities match exactly.
+	// Merge the independently scheduled splits assigned to one worker attempt
+	// into its transport batch.
 	m.def(
-	    "merge_scan_task_descriptors",
+	    "merge_scan_split_batches",
 	    [](const py::list &bytes_list) -> py::bytes {
 		    using namespace duckdb::distributed;
 		    if (py::len(bytes_list) == 0) {
-			    return py::bytes("");
+			    throw py::value_error("merge_scan_split_batches requires at least one batch");
 		    }
-		    ScanTaskDescriptor merged;
-		    bool has_descriptor = false;
+		    ScanSplitBatch merged;
+		    bool has_batch = false;
 		    for (auto item : bytes_list) {
 			    py::bytes b = item.cast<py::bytes>();
 			    string raw(b);
-			    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
-			    if (!has_descriptor) {
-				    merged = std::move(desc);
-				    has_descriptor = true;
+			    auto batch = ScanSplitBatch::DeserializeFromBytes(raw);
+			    if (!has_batch) {
+				    merged = std::move(batch);
+				    has_batch = true;
 			    } else {
-				    merged.Merge(std::move(desc));
+				    merged.Merge(std::move(batch));
 			    }
-		    }
-		    if (!has_descriptor) {
-			    return py::bytes("");
 		    }
 		    auto result = merged.SerializeToBytes();
 		    return py::bytes(result);
 	    },
-	    py::arg("bytes_list"), "Merge compatible raw-bytes ScanTaskDescriptors into a single descriptor.");
+	    py::arg("bytes_list"), "Merge compatible serialized scan split batches into one worker assignment.");
 
 	m.def(
-	    "scan_task_source_partition_id",
-	    [](py::bytes bytes_obj) {
+	    "split_scan_split_batch",
+	    [](py::bytes bytes_obj) -> py::list {
 		    using namespace duckdb::distributed;
 		    string raw(bytes_obj);
-		    auto desc = ScanTaskDescriptor::DeserializeFromBytes(raw);
-		    if (desc.source_task_partition_id == DConstants::INVALID_INDEX) {
-			    throw py::value_error("scan task is missing its stable source task partition identity");
+		    auto batch = ScanSplitBatch::DeserializeFromBytes(raw);
+		    py::list result;
+		    for (auto &singleton : batch.Explode()) {
+			    const auto &split = singleton.splits[0];
+			    py::object estimated_bytes = py::none();
+			    if (split.estimated_bytes.IsValid()) {
+				    estimated_bytes = py::int_(split.estimated_bytes.GetIndex());
+			    }
+			    result.append(py::make_tuple(py::str(split.split_id), py::bytes(singleton.SerializeToBytes()),
+			                                 std::move(estimated_bytes)));
 		    }
-		    return desc.source_task_partition_id;
+		    return result;
 	    },
-	    py::arg("bytes"), "Return the stable logical source-task partition from a scan descriptor.");
+	    py::arg("bytes"),
+	    "Explode a serialized scan split batch into (split_id, singleton_batch, estimated_bytes) tuples.");
 
 	m.def(
 	    "exchange_source_task_partition_indices",

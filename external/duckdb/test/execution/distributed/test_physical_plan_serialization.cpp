@@ -28,6 +28,7 @@
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_sink.hpp"
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -244,7 +245,7 @@ string SerializeSourceDescriptorWithoutFlightHost() {
 			obj.WriteList(4, "files", 1, [&](Serializer::List &files, idx_t) {
 				files.WriteObject([&](Serializer &file_obj) {
 					file_obj.WriteProperty(1, "path", string("pre-strict-source"));
-					file_obj.WriteProperty<size_t>(2, "file_size", 0);
+					file_obj.WriteProperty<uint64_t>(2, "file_size", 0);
 					file_obj.WriteProperty<idx_t>(3, "rows", 0);
 				});
 			});
@@ -350,6 +351,30 @@ TEST_CASE("PhysicalProjection serialization roundtrip", "[serialization][physica
 	REQUIRE(proj_ptr->select_list.size() == 2);
 
 	std::cerr << "[test] PhysicalProjection serialization roundtrip PASSED" << std::endl;
+}
+
+TEST_CASE("PhysicalEmptyResult serialization roundtrip", "[serialization][physical_plan]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> types = {LogicalType::BIGINT, LogicalType::VARCHAR};
+	PhysicalEmptyResult empty_result(plan, types, 0);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	empty_result.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	auto deserialized_op = PhysicalOperator::Deserialize(deserializer, plan);
+	deserializer.End();
+
+	REQUIRE(deserialized_op != nullptr);
+	REQUIRE(deserialized_op->type == PhysicalOperatorType::EMPTY_RESULT);
+	REQUIRE(deserialized_op->GetTypes() == types);
+	REQUIRE(deserialized_op->estimated_cardinality == 0);
 }
 
 TEST_CASE("PhysicalFilter serialization roundtrip", "[serialization][physical_plan]") {
@@ -1704,22 +1729,12 @@ TEST_CASE("Distributed physical plan clone exposes client settings to native bin
 	conn.Rollback();
 }
 
-TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance metadata",
+TEST_CASE("PhysicalRemoteExchangeSink serialization preserves static sink configuration",
           "[serialization][physical_plan][exchange]") {
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
 
 	vector<LogicalType> types = {LogicalType::INTEGER};
-	distributed::ExchangeSinkInstanceHandle sink_handle;
-	sink_handle.sink_handle.task_partition_id = 7;
-	sink_handle.attempt_id = 2;
-	sink_handle.query_id = "query-session-a";
-	sink_handle.output_location = "exchange__sink_7__attempt_2";
-	sink_handle.output_partition_count = 4;
-	sink_handle.flight_host = "worker-only.internal";
-	sink_handle.flight_server_epoch = "sink-epoch";
-	sink_handle.fte_task_identity = true;
-
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	flight_config.local_dirs = {"/session-a/shuffle-0", "/session-a/shuffle-1"};
@@ -1727,7 +1742,8 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 
 	vector<unique_ptr<Expression>> partition_by;
 	auto &sink = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "exchange", 4, RepartitionSpec::Type::Random,
-	                                                   std::move(partition_by), sink_handle, exchange_mgr);
+	                                                   std::move(partition_by), "query-session-a", "exchange-instance",
+	                                                   exchange_mgr);
 	vector<unique_ptr<Expression>> mark_join_build_expressions;
 	mark_join_build_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, 0));
 	sink.Cast<PhysicalRemoteExchangeSink>().EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
@@ -1750,14 +1766,10 @@ TEST_CASE("PhysicalRemoteExchangeSink serialization preserves sink instance meta
 	REQUIRE(sink_ptr != nullptr);
 	REQUIRE(sink_ptr->ExchangeId() == "exchange");
 	REQUIRE(sink_ptr->NumPartitions() == 4);
-	REQUIRE(sink_ptr->SinkHandle().sink_handle.task_partition_id == 7);
-	REQUIRE(sink_ptr->SinkHandle().attempt_id == 2);
-	REQUIRE(sink_ptr->SinkHandle().query_id == "query-session-a");
-	REQUIRE(sink_ptr->SinkHandle().output_location == "exchange__sink_7__attempt_2");
-	REQUIRE(sink_ptr->SinkHandle().output_partition_count == 4);
-	REQUIRE(sink_ptr->SinkHandle().flight_host.empty());
-	REQUIRE(sink_ptr->SinkHandle().flight_server_epoch == "sink-epoch");
-	REQUIRE(sink_ptr->SinkHandle().fte_task_identity);
+	REQUIRE(sink_ptr->SinkQueryId() == "query-session-a");
+	REQUIRE(sink_ptr->SinkOutputLocationPrefix() == "exchange-instance");
+	REQUIRE_FALSE(sink_ptr->HasBoundSinkHandle());
+	REQUIRE_THROWS(sink_ptr->SinkHandle());
 	REQUIRE(sink_ptr->CollectsMarkJoinBuildSummary());
 	REQUIRE(sink_ptr->MarkJoinBuildExpressions().size() == 1);
 	REQUIRE(sink_ptr->MarkJoinBuildExpressions()[0]->return_type == LogicalType::INTEGER);
@@ -1774,19 +1786,12 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	Allocator allocator;
 	PhysicalPlan plan(allocator);
 
-	distributed::ExchangeSinkInstanceHandle plan_handle;
-	plan_handle.sink_handle.task_partition_id = 7;
-	plan_handle.attempt_id = 0;
-	plan_handle.query_id = "query-runtime-sink";
-	plan_handle.output_location = "opaque-exchange__sink_7__attempt_0";
-	plan_handle.output_partition_count = 4;
-
 	distributed::FlightExchangeConfig flight_config;
 	flight_config.node_id = "node-1";
 	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
-	auto &sink_op = plan.Make<PhysicalRemoteExchangeSink>(vector<LogicalType> {LogicalType::INTEGER}, 123,
-	                                                      "diagnostic-exchange", 4, RepartitionSpec::Type::Random,
-	                                                      vector<unique_ptr<Expression>> {}, plan_handle, exchange_mgr);
+	auto &sink_op = plan.Make<PhysicalRemoteExchangeSink>(
+	    vector<LogicalType> {LogicalType::INTEGER}, 123, "diagnostic-exchange", 4, RepartitionSpec::Type::Random,
+	    vector<unique_ptr<Expression>> {}, "query-runtime-sink", "opaque-exchange", exchange_mgr);
 	auto &sink = sink_op.Cast<PhysicalRemoteExchangeSink>();
 	auto sample_options = make_uniq<SampleOptions>(42);
 	sample_options->sample_size = Value::BIGINT(17);
@@ -1801,25 +1806,18 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	plan.SetRoot(sink);
 
 	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
-	descriptor.sink_instance = plan_handle;
+	descriptor.sink_instance.sink_handle.task_partition_id = 7;
 	descriptor.sink_instance.attempt_id = 2;
+	descriptor.sink_instance.query_id = "query-runtime-sink";
 	descriptor.sink_instance.output_location = "opaque-exchange__sink_7__attempt_2";
-	descriptor.sink_instance.fte_task_identity = true;
+	descriptor.sink_instance.output_partition_count = 4;
 
 	string error;
 	auto invalid = descriptor;
-	invalid.sink_instance.fte_task_identity = false;
-	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
-	REQUIRE(error.find("FTE-derived") != string::npos);
-	REQUIRE(sink.SinkHandle().attempt_id == 0);
-	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
-
-	error.clear();
-	invalid = descriptor;
 	invalid.sink_instance.sink_handle.task_partition_id = DConstants::INVALID_INDEX;
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("invalid task identity") != string::npos);
-	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE_FALSE(sink.HasBoundSinkHandle());
 	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
 
 	error.clear();
@@ -1827,7 +1825,7 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	invalid.sink_instance.query_id = "other-query";
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("query") != string::npos);
-	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE_FALSE(sink.HasBoundSinkHandle());
 	REQUIRE(local_sample.task_index == DConstants::INVALID_INDEX);
 	REQUIRE_THROWS_AS(local_sample.GetEffectiveSeed(), InternalException);
 
@@ -1836,7 +1834,7 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	invalid.sink_instance.sink_handle.task_partition_id = 8;
 	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, invalid, &error));
 	REQUIRE(error.find("output location") != string::npos);
-	REQUIRE(sink.SinkHandle().attempt_id == 0);
+	REQUIRE_FALSE(sink.HasBoundSinkHandle());
 
 	error.clear();
 	invalid = descriptor;
@@ -1881,6 +1879,44 @@ TEST_CASE("ApplyExchangeSinkInstanceToPlan validates runtime sink ownership",
 	REQUIRE(sink.SinkHandle().output_partition_count == 4);
 }
 
+TEST_CASE("Exchange sink task binding rejects worker plans with multiple sinks",
+          "[serialization][physical_plan][exchange]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	distributed::FlightExchangeConfig flight_config;
+	flight_config.node_id = "node-1";
+	auto exchange_mgr = std::make_shared<distributed::FlightExchangeManager>(std::move(flight_config));
+	vector<LogicalType> types {LogicalType::INTEGER};
+	auto &inner = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "inner-exchange", 4, RepartitionSpec::Type::Random,
+	                                                    vector<unique_ptr<Expression>> {}, "query-multiple-sinks",
+	                                                    "inner-output", exchange_mgr)
+	                  .Cast<PhysicalRemoteExchangeSink>();
+	auto &outer = plan.Make<PhysicalRemoteExchangeSink>(types, 123, "outer-exchange", 4, RepartitionSpec::Type::Random,
+	                                                    vector<unique_ptr<Expression>> {}, "query-multiple-sinks",
+	                                                    "outer-output", exchange_mgr)
+	                  .Cast<PhysicalRemoteExchangeSink>();
+	outer.children.push_back(inner);
+	plan.SetRoot(outer);
+
+	const PhysicalRemoteExchangeSink *found_sink = nullptr;
+	string error;
+	REQUIRE_FALSE(distributed::TryGetUniqueRemoteExchangeSink(plan.Root(), found_sink, &error));
+	REQUIRE(error.find("at most one") != string::npos);
+	REQUIRE(found_sink == nullptr);
+
+	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
+	descriptor.sink_instance.sink_handle.task_partition_id = 7;
+	descriptor.sink_instance.attempt_id = 2;
+	descriptor.sink_instance.query_id = "query-multiple-sinks";
+	descriptor.sink_instance.output_location = "outer-output__sink_7__attempt_2";
+	descriptor.sink_instance.output_partition_count = 4;
+	error.clear();
+	REQUIRE_FALSE(distributed::ApplyExchangeSinkInstanceToPlan(plan, descriptor, &error));
+	REQUIRE(error.find("at most one") != string::npos);
+	REQUIRE_FALSE(outer.HasBoundSinkHandle());
+	REQUIRE_FALSE(inner.HasBoundSinkHandle());
+}
+
 TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker endpoint",
           "[serialization][physical_plan][exchange]") {
 	distributed::ExchangeSinkInstanceTaskDescriptor descriptor;
@@ -1891,7 +1927,6 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	descriptor.sink_instance.output_partition_count = 4;
 	descriptor.sink_instance.flight_host = "flight-worker.internal";
 	descriptor.sink_instance.flight_server_epoch = "endpoint-epoch";
-	descriptor.sink_instance.fte_task_identity = true;
 	descriptor.sink_instance.mark_join_build_summary = MarkJoinBuildSummary::Create(true, true);
 
 	auto roundtrip =
@@ -1904,7 +1939,6 @@ TEST_CASE("ExchangeSinkInstanceTaskDescriptor serialization preserves the worker
 	REQUIRE(roundtrip.sink_instance.output_partition_count == 4);
 	REQUIRE(roundtrip.sink_instance.flight_host == "flight-worker.internal");
 	REQUIRE(roundtrip.sink_instance.flight_server_epoch == "endpoint-epoch");
-	REQUIRE(roundtrip.sink_instance.fte_task_identity);
 	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.valid);
 	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.has_rows);
 	REQUIRE(roundtrip.sink_instance.mark_join_build_summary.has_null);
@@ -2169,7 +2203,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.flight_host = "flight-node-1.internal";
 	handle0.flight_port = 5010;
 	handle0.flight_server_epoch = "epoch-1";
-	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_7", 0, 11));
+	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_7", 0, (uint64_t(1) << 40) + 123));
 	descriptor.source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -2201,7 +2235,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	REQUIRE(roundtrip.source_handles[0].flight_server_epoch == "epoch-1");
 	REQUIRE(roundtrip.source_handles[0].files.size() == 1);
 	REQUIRE(roundtrip.source_handles[0].files[0].path == "exchange__sink_0__attempt_7");
-	REQUIRE(roundtrip.source_handles[0].files[0].file_size == 11);
+	REQUIRE(roundtrip.source_handles[0].files[0].file_size == (uint64_t(1) << 40) + 123);
 	REQUIRE(roundtrip.source_handles[1].partition_id == 1);
 	REQUIRE(roundtrip.source_handles[1].source_task_partition_id == 22);
 	REQUIRE(roundtrip.source_handles[1].attempt_id == 2);
