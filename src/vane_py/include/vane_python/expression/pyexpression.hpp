@@ -72,6 +72,8 @@ public:
 	shared_ptr<DuckDBPyExpression> Cast(const DuckDBPyType &type) const;
 	shared_ptr<DuckDBPyExpression> Between(const DuckDBPyExpression &lower, const DuckDBPyExpression &upper);
 	shared_ptr<DuckDBPyExpression> Collate(const string &collation);
+	shared_ptr<DuckDBPyExpression> AsFile() const;
+	shared_ptr<DuckDBPyExpression> FileField(const string &field) const;
 
 	// AND, OR and NOT
 

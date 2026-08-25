@@ -27,6 +27,7 @@ def test_vane_public_exports_are_unique_and_resolvable():
     expected_vane_exports = {
         "Connection",
         "EnvRegistry",
+        "File",
         "Relation",
         "VaneConfig",
         "__engine_version__",
@@ -38,6 +39,8 @@ def test_vane_public_exports_are_unique_and_resolvable():
         "current_config",
         "detach_function",
         "env",
+        "file",
+        "file_type",
         "func",
         "lit",
         "sql_expr",

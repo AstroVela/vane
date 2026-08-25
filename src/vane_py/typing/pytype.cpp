@@ -342,6 +342,7 @@ void DuckDBPyType::Initialize(py::handle &m) {
 	type_module.def("__hash__", [](const DuckDBPyType &type) { return py::hash(py::str(type.ToString())); });
 	type_module.def_property_readonly("id", &DuckDBPyType::GetId);
 	type_module.def_property_readonly("children", &DuckDBPyType::Children);
+	type_module.def("is_file", &DuckDBPyType::IsFile, "Return whether this is the canonical FILE logical type");
 	type_module.def(py::init<>([](const string &type_str, shared_ptr<DuckDBPyConnection> connection = nullptr) {
 		auto ltype = FromString(type_str, std::move(connection));
 		return make_shared_ptr<DuckDBPyType>(ltype);
@@ -453,6 +454,10 @@ string DuckDBPyType::GetId() const {
 		return "tensor";
 	}
 	return StringUtil::Lower(LogicalTypeIdToString(type.id()));
+}
+
+bool DuckDBPyType::IsFile() const {
+	return FileLogicalType::IsFile(type);
 }
 
 const LogicalType &DuckDBPyType::Type() const {

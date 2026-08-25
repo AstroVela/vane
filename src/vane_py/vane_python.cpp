@@ -12,6 +12,7 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
+#include "vane_python/file.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyrelation.hpp"
@@ -232,6 +233,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
 	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
+	m.def(
+	    "file_type", []() { return make_shared_ptr<DuckDBPyType>(FileLogicalType::Create()); },
+	    "Create the canonical FILE logical type");
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {
@@ -1113,6 +1117,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	    .value("COLUMNS", duckdb::RenderMode::COLUMNS)
 	    .export_values();
 
+	PythonFile::Initialize(m);
 	DuckDBPyTyping::Initialize(m);
 	DuckDBPyFunctional::Initialize(m);
 	DuckDBPyExpression::Initialize(m);

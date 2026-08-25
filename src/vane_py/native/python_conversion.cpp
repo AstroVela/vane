@@ -5,11 +5,14 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_conversion.hpp"
+
+#include "vane_python/file.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 
 #include "vane_python/pyrelation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pyresult.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
 
@@ -436,10 +439,78 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::NdArray;
 	} else if (py::isinstance(ele, import_cache.numpy.datetime64())) {
 		return PythonObjectType::NdDatetime;
+	} else if (py::isinstance<PythonFile>(ele)) {
+		return PythonObjectType::File;
 	} else if (py::isinstance(ele, import_cache.vane.Value())) {
 		return PythonObjectType::Value;
 	} else {
 		return PythonObjectType::Other;
+	}
+}
+
+// DuckDB prefers aliases while inferring sequence types. Reject only overlapping paths where that would turn a
+// non-FILE Python value into FILE; NULLs and fields missing from one STRUCT remain valid.
+static bool FileTypeLayoutMismatch(const LogicalType &left, const LogicalType &right) {
+	if (left.id() == LogicalTypeId::SQLNULL || right.id() == LogicalTypeId::SQLNULL) {
+		return false;
+	}
+
+	auto left_is_file = FileLogicalType::IsFile(left);
+	auto right_is_file = FileLogicalType::IsFile(right);
+	if (left_is_file || right_is_file) {
+		return left_is_file != right_is_file;
+	}
+
+	auto contains_file = [](const LogicalType &type) {
+		return TypeVisitor::Contains(type, FileLogicalType::IsFile);
+	};
+	if (!contains_file(left) && !contains_file(right)) {
+		return false;
+	}
+	if (left.id() != right.id()) {
+		return true;
+	}
+
+	switch (left.id()) {
+	case LogicalTypeId::LIST:
+		return FileTypeLayoutMismatch(ListType::GetChildType(left), ListType::GetChildType(right));
+	case LogicalTypeId::ARRAY:
+		return FileTypeLayoutMismatch(ArrayType::GetChildType(left), ArrayType::GetChildType(right));
+	case LogicalTypeId::MAP:
+		return FileTypeLayoutMismatch(MapType::KeyType(left), MapType::KeyType(right)) ||
+		       FileTypeLayoutMismatch(MapType::ValueType(left), MapType::ValueType(right));
+	case LogicalTypeId::STRUCT: {
+		auto &left_children = StructType::GetChildTypes(left);
+		auto &right_children = StructType::GetChildTypes(right);
+		if (StructType::IsUnnamed(left) || StructType::IsUnnamed(right)) {
+			if (left_children.size() != right_children.size()) {
+				return true;
+			}
+			for (idx_t index = 0; index < left_children.size(); index++) {
+				if (FileTypeLayoutMismatch(left_children[index].second, right_children[index].second)) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		case_insensitive_map_t<idx_t> right_indices;
+		for (idx_t index = 0; index < right_children.size(); index++) {
+			right_indices[right_children[index].first] = index;
+		}
+		for (auto &left_child : left_children) {
+			auto right_entry = right_indices.find(left_child.first);
+			if (right_entry != right_indices.end() &&
+			    FileTypeLayoutMismatch(left_child.second, right_children[right_entry->second].second)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalTypeId::UNION:
+		return left != right;
+	default:
+		return true;
 	}
 }
 
@@ -539,6 +610,9 @@ struct PythonValueConversion {
 		LogicalType element_type = LogicalType::SQLNULL;
 		for (idx_t i = 0; i < list_size; i++) {
 			Value new_value = TransformPythonValue(ele.attr("__getitem__")(i), child_type);
+			if (FileTypeLayoutMismatch(element_type, new_value.type())) {
+				throw InvalidInputException("Cannot mix vane.File and non-FILE values in one Python sequence");
+			}
 			element_type = LogicalType::ForceMaxLogicalType(element_type, new_value.type());
 			values.push_back(std::move(new_value));
 		}
@@ -572,6 +646,13 @@ struct PythonValueConversion {
 			auto timedelta = PyTimeDelta(ele);
 			return Value::INTERVAL(timedelta.ToInterval());
 		}
+		case PythonObjectType::File: {
+			auto file = py::cast<PythonFile>(ele);
+			if (target_type.id() != LogicalTypeId::UNKNOWN && !FileLogicalType::IsFile(target_type)) {
+				throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+			}
+			return file.ToValue();
+		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
 			switch (target_type.id()) {
@@ -593,7 +674,23 @@ struct PythonValueConversion {
 				throw InvalidInputException("The 'type' of a Value should be of type DuckDBPyType, not '%s'",
 				                            actual_type);
 			}
-			return TransformPythonValue(object, internal_type->Type());
+			auto &internal_logical_type = internal_type->Type();
+			auto converted = TransformPythonValue(object, internal_logical_type);
+			if (converted.IsNull() && FileLogicalType::IsFile(internal_logical_type)) {
+				// Keep the declared logical identity for an explicitly typed FILE NULL.
+				converted = Value(internal_logical_type);
+			}
+			if (target_type.id() != LogicalTypeId::UNKNOWN) {
+				auto target_is_file = FileLogicalType::IsFile(target_type);
+				auto converted_is_file = FileLogicalType::IsFile(converted.type());
+				if (target_is_file && !converted.IsNull() && !converted_is_file) {
+					throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
+				}
+				if (!target_is_file && converted_is_file) {
+					throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+				}
+			}
+			return converted;
 		}
 		default:
 			throw InternalException("Unsupported fallback");
@@ -899,6 +996,16 @@ struct PythonVectorConversion {
 template <class OP, class A, class B>
 void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bool nan_as_null) {
 	auto object_type = GetPythonObjectType(ele);
+	auto &conversion_target = OP::ConversionTarget(result, param);
+	auto target_is_file = FileLogicalType::IsFile(conversion_target);
+	auto is_file_null = object_type == PythonObjectType::None;
+	if (target_is_file && object_type == PythonObjectType::Float && nan_as_null) {
+		is_file_null = std::isnan(PyFloat_AsDouble(ele.ptr()));
+	}
+	if (target_is_file && !is_file_null && object_type != PythonObjectType::File &&
+	    object_type != PythonObjectType::Value) {
+		throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
+	}
 
 	switch (object_type) {
 	case PythonObjectType::None:
@@ -1030,6 +1137,7 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 	case PythonObjectType::NdDatetime:
 		TransformPythonObjectInternal<OP>(ele.attr("tolist")(), result, param, nan_as_null);
 		break;
+	case PythonObjectType::File:
 	case PythonObjectType::Uuid:
 	case PythonObjectType::Timedelta:
 	case PythonObjectType::Dict:

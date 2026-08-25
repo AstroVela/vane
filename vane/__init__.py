@@ -35,6 +35,7 @@ if _typing.TYPE_CHECKING:
     from vane.runners.runner import Runner as _Runner
 else:
     _Runner = _typing.Any
+from vane._file import file
 from vane._native import (
     BinderException,
     CaseExpression,
@@ -57,6 +58,7 @@ from vane._native import (
     ExplainType,
     Expression,
     FatalException,
+    File,
     FunctionExpression,
     HTTPException,
     IntegrityError,
@@ -127,6 +129,7 @@ from vane._native import (
     fetchmany,
     fetchnumpy,
     fetchone,
+    file_type,
     filesystem_is_registered,
     filter,
     from_arrow,
@@ -357,6 +360,7 @@ __all__: list[str] = [
     "ExplainType",
     "Expression",
     "FatalException",
+    "File",
     "FloatValue",
     "FunctionExpression",
     "HTTPException",
@@ -467,6 +471,8 @@ __all__: list[str] = [
     "fetchmany",
     "fetchnumpy",
     "fetchone",
+    "file",
+    "file_type",
     "filesystem_is_registered",
     "filter",
     "from_arrow",

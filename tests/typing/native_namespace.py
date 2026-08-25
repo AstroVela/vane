@@ -107,6 +107,20 @@ assert_type(
     vane.tensor_type(public_sqltypes.FLOAT, [2, 3]).children,
     list[tuple[str, public_sqltypes.DuckDBPyType | int | list[str] | tuple[int, ...]]],
 )
+file_value = vane.File("memory://typing", content_type="text/plain", position=0, size=1, checksum="sha256:a")
+assert_type(file_value, vane.File)
+assert_type(_native.File("memory://typing"), _native.File)
+assert_type(file_value.url, str)
+assert_type(file_value.content_type, str | None)
+assert_type(file_value.position, int | None)
+assert_type(file_value.size, int | None)
+assert_type(file_value.checksum, str | None)
+assert_type(vane.file_type(), public_sqltypes.DuckDBPyType)
+assert_type(_native.file_type(), _sqltypes.DuckDBPyType)
+assert_type(vane.file_type().is_file(), bool)
+assert_type(vane.file("memory://typing"), vane.Expression)
+assert_type(vane.col("url").as_file(), vane.Expression)
+assert_type(vane.col("file").url, vane.Expression)
 
 assert_type(_native._func, types.ModuleType)
 assert_type(_native._sqltypes, types.ModuleType)
