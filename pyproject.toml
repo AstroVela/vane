@@ -64,6 +64,7 @@ Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
 
 [project.optional-dependencies]
+milvus = ["pymilvus>=2.5.18,<2.6"]
 openai = ["openai>=1.66.0", "tiktoken"] # floor adds the Responses API used by the default Prompt path
 anthropic = ["anthropic>=0.117.0"] # floor matches the Messages.create option surface validated in vane/ai/providers/anthropic.py
 google = ["google-genai>=1.22.0"] # floor adds GenerateContentConfig.response_json_schema
@@ -225,6 +226,7 @@ include = [
     "/tests/ray_test_profile.py",
     "/tests/fast/test_ai_release_contracts.py",
     "/tests/fast/test_datasink.py",
+    "/tests/fast/test_milvus_datasink.py",
     "/tests/fast/test_package_metadata.py",
     "/tests/fast/test_ray_test_profile.py",
     "/tests/fast/test_transformers_provider_security.py",

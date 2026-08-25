@@ -126,6 +126,31 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
 
+### Milvus full-row upserts
+
+Install the optional client with `pip install vane-ai[milvus]`. `MilvusSink`
+performs immediate, replay-safe full-row upserts for collections whose primary
+key is an explicit `INT64` or `VARCHAR` field; AutoID and dynamic-field
+collections are rejected. A failed distributed operation can leave batches
+visible, so it is not an atomic or exactly-once transaction.
+
+```python
+from vane import EnvironmentSecret, MilvusSink
+
+sink = MilvusSink(
+    "documents",
+    uri="https://milvus.example:19530",
+    primary_key="id",
+    token=EnvironmentSecret("MILVUS_TOKEN"),
+)
+summary = relation.write_datasink(sink)
+```
+
+Every input field must map to a collection field (use `field_mapping` when
+names differ), and all required collection fields must be included. Only
+ordinary override-mode upserts are submitted; partial updates and array
+operations are not part of this adapter.
+
 ### Execution Policy
 
 Vane uses the Ray runner by default. If no runner is configured, executing a lazy relation through consumers such as
