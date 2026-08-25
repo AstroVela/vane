@@ -264,7 +264,6 @@ class FteWorkerSubmissionMixin:
             dynamic_exchange_sources,
         )
         data_sink_max_attempts = _datasink_fte_max_attempts(fragment_execution_context)
-        fragment_retry_options = {} if data_sink_max_attempts is None else {"max_attempts": data_sink_max_attempts}
         resource_query_id = str(item["resource_query_id"])
         resource_unit_id = str(item["resource_unit_id"])
         logical_fragment_identity = _registered_fte_logical_fragment_identity(
@@ -386,7 +385,7 @@ class FteWorkerSubmissionMixin:
             # admission; the query resource graph does not synthesize a
             # per-fragment heap requirement.
             task_memory_bytes=None,
-            **fragment_retry_options,
+            max_attempts=4 if data_sink_max_attempts is None else data_sink_max_attempts,
         )
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):

@@ -275,13 +275,13 @@ class DataSinkExecutionOptions:
     """
 
     worker_count: int = 1
-    max_retries: int = 0
     batch_size: int | None = None
     cpus: float | None = None
     gpus: float | None = None
     memory_bytes: int | None = None
     target_max_batch_bytes: int | None = None
     task_input_max_bytes: int | None = None
+    max_retries: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         worker_count = self.worker_count
@@ -1086,7 +1086,7 @@ def _summary_after_retries(summary: WriteSummary, retry_count: int) -> WriteSumm
         f"{'attempt' if retry_count == 1 else 'attempts'}; attempts that reached execution re-executed the full "
         "input, and earlier UNKNOWN attempts may have applied external writes"
     )
-    warnings = (_bounded_warning(warning),)
+    warnings: tuple[str, ...] = (_bounded_warning(warning),)
     for item in summary.warnings:
         warnings = _append_warning(warnings, item, limit=_MAX_SUMMARY_WARNINGS)
     return WriteSummary(

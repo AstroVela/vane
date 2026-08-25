@@ -752,6 +752,16 @@ def test_execution_options_map_to_actor_backends():
         options.map_batches_kwargs("unsupported")
 
 
+def test_execution_options_retry_budget_is_keyword_only():
+    options = DataSinkExecutionOptions(3, 20)
+
+    assert options.worker_count == 3
+    assert options.batch_size == 20
+    assert options.max_retries == 0
+    with pytest.raises(TypeError):
+        DataSinkExecutionOptions(3, 20, None, None, None, None, None, 1)
+
+
 def test_datasink_actor_payload_disables_ray_task_replay():
     from vane import datasink as datasink_module
 
