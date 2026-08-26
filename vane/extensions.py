@@ -33,6 +33,17 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9_]+$")
 _TRUST_IDENTITY_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
 _CAPI_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+_WINDOWS_PERMISSION_MODEL = os.name == "nt"
+_WRITE_PERMISSION_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+
+
+def _snapshot_mode_is_read_only(mode: int) -> bool:
+    permissions = stat.S_IMODE(mode)
+    if _WINDOWS_PERMISSION_MODEL:
+        # Windows exposes its read-only file attribute as 0o444 through
+        # st_mode; the individual POSIX read bits are not meaningful there.
+        return permissions & _WRITE_PERMISSION_BITS == 0
+    return permissions == 0o400
 
 
 class DynamicExtensionError(RuntimeError):
@@ -397,7 +408,12 @@ class LocalExtensionProvider:
 
 
 class DynamicExtensionResolver:
-    """Resolve and load only explicitly trusted local extension artifacts."""
+    """Resolve and load only explicitly trusted local extension artifacts.
+
+    The cache isolates operating-system principals. As with DuckDB's native
+    extension loader, code running as the same operating-system identity is
+    inside the process trust boundary.
+    """
 
     def __init__(
         self,
@@ -466,6 +482,10 @@ class DynamicExtensionResolver:
         """Resolve and load dependencies before the requested extension."""
         resolved = self.resolve(connection, descriptor, artifact=artifact)
         for candidate in resolved:
+            # DuckDB retains its own read handle from footer validation through
+            # dlopen. Cache publishers never replace an existing entry; a
+            # process acting maliciously as the cache owner is inside the same
+            # trust boundary as the process it could otherwise inject into.
             loaded = _load_native_extension(candidate.path, connection)
             self._validate_loaded_provenance(candidate, loaded)
             with self._lock:
@@ -597,13 +617,13 @@ class DynamicExtensionResolver:
                     f"could not make verified artifact snapshot read-only: {artifact_path}",
                 ) from exception
             try:
-                staging_mode = stat.S_IMODE(staging_path.stat().st_mode)
+                staging_mode = staging_path.stat().st_mode
             except OSError as exception:
                 raise DynamicExtensionError(
                     "ARTIFACT_SNAPSHOT_FAILED",
                     f"could not inspect verified artifact snapshot permissions: {staging_path}",
                 ) from exception
-            if staging_mode != 0o400:
+            if not _snapshot_mode_is_read_only(staging_mode):
                 _fail(
                     "ARTIFACT_SNAPSHOT_FAILED",
                     f"verified artifact snapshot is not read-only: {staging_path}",
@@ -673,12 +693,12 @@ class DynamicExtensionResolver:
         if snapshot_path.is_symlink() or not snapshot_path.is_file():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is invalid: {snapshot_path}")
         try:
-            snapshot_mode = stat.S_IMODE(snapshot_path.stat().st_mode)
+            snapshot_mode = snapshot_path.stat().st_mode
         except OSError as exception:
             raise DynamicExtensionError(
                 "ARTIFACT_CACHE_CORRUPT", f"could not inspect verified artifact cache entry: {snapshot_path}"
             ) from exception
-        if snapshot_mode != 0o400:
+        if not _snapshot_mode_is_read_only(snapshot_mode):
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is not read-only: {snapshot_path}")
         if _sha256_file(snapshot_path) != descriptor.sha256:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache digest is invalid: {snapshot_path}")
@@ -743,7 +763,8 @@ class DynamicExtensionResolver:
     def _cache_root(self, connection: DuckDBPyConnection) -> Path:
         root = self._cache_directory
         if root is None:
-            root = _native_extension_directory(connection) / ".vane" / "verified-v1"
+            vane_directory = self._prepare_cache_directory(_native_extension_directory(connection) / ".vane")
+            root = vane_directory / "verified-v1"
         return self._prepare_cache_directory(root)
 
     @staticmethod
@@ -756,13 +777,16 @@ class DynamicExtensionResolver:
             ) from exception
         if path.is_symlink() or not path.is_dir():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is invalid: {path}")
+        if _WINDOWS_PERMISSION_MODEL:
+            _secure_native_cache_directory(path)
+            return path
         try:
-            directory_mode = stat.S_IMODE(path.stat().st_mode)
+            directory_mode = path.stat().st_mode
         except OSError as exception:
             raise DynamicExtensionError(
                 "ARTIFACT_CACHE_CORRUPT", f"could not inspect verified artifact cache directory: {path}"
             ) from exception
-        if directory_mode != 0o700:
+        if stat.S_IMODE(directory_mode) != 0o700:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is not private: {path}")
         return path
 
@@ -880,6 +904,18 @@ def _native_extension_directory(connection: DuckDBPyConnection) -> Path:
     if not isinstance(directory, str) or not directory or "\0" in directory:
         _fail("ARTIFACT_SNAPSHOT_FAILED", "DuckDB returned an invalid extension directory")
     return Path(directory).expanduser().resolve()
+
+
+def _secure_native_cache_directory(path: Path) -> None:
+    from vane import _native
+
+    try:
+        _native._secure_dynamic_extension_cache_directory(str(path))
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "ARTIFACT_CACHE_CORRUPT",
+            f"could not apply a private Windows DACL to verified artifact cache directory: {path}",
+        ) from exception
 
 
 def _inspect_native_extension(path: Path) -> _NativeExtensionMetadata:

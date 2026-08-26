@@ -5,10 +5,15 @@
 
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/windows_util.hpp"
 #include "duckdb/main/extension.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/extension_manager.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
+
+#ifdef DUCKDB_WINDOWS
+#include <aclapi.h>
+#endif
 
 namespace duckdb {
 
@@ -21,6 +26,59 @@ static ClientContext &DynamicExtensionContext(const shared_ptr<DuckDBPyConnectio
 		throw ConnectionException("Connection already closed!");
 	}
 	return *native_connection.context;
+}
+
+static void SecureDynamicExtensionCacheDirectory(const string &path) {
+#ifdef DUCKDB_WINDOWS
+	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+	HANDLE process_token = nullptr;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token)) {
+		throw IOException("Could not open process token for extension cache directory '%s' (Windows error %u)", path,
+		                  GetLastError());
+	}
+	DWORD token_user_size = 0;
+	GetTokenInformation(process_token, TokenUser, nullptr, 0, &token_user_size);
+	auto status = GetLastError();
+	if (status != ERROR_INSUFFICIENT_BUFFER || token_user_size == 0) {
+		CloseHandle(process_token);
+		throw IOException("Could not size process identity for extension cache directory '%s' (Windows error %u)", path,
+		                  status);
+	}
+	vector<uint8_t> token_user_buffer(token_user_size);
+	if (!GetTokenInformation(process_token, TokenUser, token_user_buffer.data(), token_user_size, &token_user_size)) {
+		status = GetLastError();
+		CloseHandle(process_token);
+		throw IOException("Could not read process identity for extension cache directory '%s' (Windows error %u)", path,
+		                  status);
+	}
+	CloseHandle(process_token);
+	auto token_user = reinterpret_cast<TOKEN_USER *>(token_user_buffer.data());
+
+	EXPLICIT_ACCESSW user_access {};
+	user_access.grfAccessPermissions = GENERIC_ALL;
+	user_access.grfAccessMode = SET_ACCESS;
+	user_access.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+	user_access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	user_access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+	user_access.Trustee.ptstrName = static_cast<LPWSTR>(token_user->User.Sid);
+
+	PACL private_acl = nullptr;
+	status = SetEntriesInAclW(1, &user_access, nullptr, &private_acl);
+	if (status != ERROR_SUCCESS || !private_acl) {
+		throw IOException("Could not create private ACL for extension cache directory '%s' (Windows error %u)", path,
+		                  status);
+	}
+
+	status = SetNamedSecurityInfoW(const_cast<LPWSTR>(windows_path.c_str()), SE_FILE_OBJECT,
+	                               DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr,
+	                               private_acl, nullptr);
+	LocalFree(private_acl);
+	if (status != ERROR_SUCCESS) {
+		throw IOException("Could not secure extension cache directory '%s' (Windows error %u)", path, status);
+	}
+#else
+	throw NotImplementedException("Windows DACLs are unavailable on this platform for '%s'", path);
+#endif
 }
 
 static py::dict InspectDynamicExtension(const string &path) {
@@ -86,6 +144,7 @@ void InitializeDynamicExtensionBindings(py::module_ &module) {
 		    return ExtensionHelper::ExtensionDirectory(DynamicExtensionContext(connection));
 	    },
 	    py::kw_only(), py::arg("connection").none(false));
+	module.def("_secure_dynamic_extension_cache_directory", &SecureDynamicExtensionCacheDirectory, py::arg("path"));
 	module.def("_inspect_dynamic_extension", &InspectDynamicExtension, py::arg("path"));
 	module.def("_load_dynamic_extension", &LoadDynamicExtension, py::arg("path"), py::kw_only(),
 	           py::arg("connection").none(false));

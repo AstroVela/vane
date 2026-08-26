@@ -192,7 +192,7 @@ def test_resolver_loads_dependencies_in_order_and_reuses_content_cache(tmp_path,
     assert resolver.loaded_identities(connection) == (dependency.identity, root.identity)
     assert len([path for path in cache_directory.rglob("*.duckdb_extension")]) == 2
     assert not [path for path in cache_directory.rglob(".*") if path.name.startswith((".dependency-", ".root-"))]
-    assert stat.S_IMODE(first.path.stat().st_mode) == 0o400
+    assert extension_module._snapshot_mode_is_read_only(first.path.stat().st_mode)
 
 
 def test_loaded_state_is_database_scoped_not_connection_scoped(tmp_path, fake_native_loader):
@@ -391,6 +391,8 @@ def test_default_cache_uses_duckdb_extension_directory(tmp_path, monkeypatch):
     )
 
     assert resolved[0].path.parent.parent.parent == extension_directory / ".vane" / "verified-v1"
+    if os.name != "nt":
+        assert stat.S_IMODE((extension_directory / ".vane").stat().st_mode) == 0o700
 
 
 def test_content_cache_with_writable_snapshot_fails_closed(tmp_path):
@@ -408,6 +410,20 @@ def test_content_cache_with_writable_snapshot_fails_closed(tmp_path):
 
     with pytest.raises(DynamicExtensionError, match="ARTIFACT_CACHE_CORRUPT"):
         resolver.resolve(connection, descriptor, artifact=artifact_path)
+
+
+def test_windows_permission_model_uses_private_acl_and_read_only_file_attribute(tmp_path, monkeypatch):
+    secured_directories = []
+    monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
+    monkeypatch.setattr(extension_module, "_secure_native_cache_directory", secured_directories.append)
+
+    cache_directory = tmp_path / "verified"
+    prepared_directory = DynamicExtensionResolver._prepare_cache_directory(cache_directory)
+
+    assert prepared_directory == cache_directory
+    assert secured_directories == [cache_directory]
+    assert extension_module._snapshot_mode_is_read_only(0o444)
+    assert not extension_module._snapshot_mode_is_read_only(0o666)
 
 
 def test_corrupt_content_cache_fails_closed(tmp_path):
@@ -429,6 +445,7 @@ def test_corrupt_content_cache_fails_closed(tmp_path):
         resolver.resolve(connection, descriptor, artifact=artifact_path)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows directory privacy is represented by its DACL, not st_mode")
 def test_shared_writable_content_cache_fails_closed(tmp_path):
     platform = _runtime_platform()
     artifact_path = _write_extension_artifact(
