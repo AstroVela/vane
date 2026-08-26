@@ -12,6 +12,7 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
+#include "vane_python/dynamic_extension.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyrelation.hpp"
@@ -1119,6 +1120,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	DuckDBPyStatement::Initialize(m);
 	DuckDBPyRelation::Initialize(m);
 	DuckDBPyConnection::Initialize(m);
+	InitializeDynamicExtensionBindings(m);
 	PythonObject::Initialize();
 	RegisterUDFExecutorFactory();
 	RegisterVLLMExecutorFactory();

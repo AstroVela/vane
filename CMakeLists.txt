@@ -188,6 +188,9 @@ pybind11_add_module(
   $<TARGET_OBJECTS:python_vane_runners>)
 # Add Vane's Python and engine dependencies.
 target_link_libraries(_native PRIVATE vane_python_dependencies)
+if(WIN32)
+  target_link_libraries(_native PRIVATE advapi32)
+endif()
 duckdb_link_extensions(_native)
 duckdb_stage_loadable_extensions()
 
