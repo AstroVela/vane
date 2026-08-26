@@ -78,6 +78,17 @@ RayWorkerTask = require_ray_cxx_attr(
     hint="Ensure the C++ ray extension is built and importable in the worker process.",
 )
 
+_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY = "_vane_datasink_no_internal_retry"
+
+
+def _datasink_fte_max_attempts(context: dict[str, Any]) -> int | None:
+    marker = context.get(_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY)
+    if marker is None:
+        return None
+    if marker != "1":
+        raise ValueError(f"FTE task context field {_DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY!r} must equal '1'")
+    return 1
+
 
 def _registered_fte_logical_fragment_identity(
     resource_query_id: str,
@@ -252,6 +263,7 @@ class FteWorkerSubmissionMixin:
             dynamic_scan_sources,
             dynamic_exchange_sources,
         )
+        data_sink_max_attempts = _datasink_fte_max_attempts(fragment_execution_context)
         resource_query_id = str(item["resource_query_id"])
         resource_unit_id = str(item["resource_unit_id"])
         logical_fragment_identity = _registered_fte_logical_fragment_identity(
@@ -373,6 +385,7 @@ class FteWorkerSubmissionMixin:
             # admission; the query resource graph does not synthesize a
             # per-fragment heap requirement.
             task_memory_bytes=None,
+            max_attempts=4 if data_sink_max_attempts is None else data_sink_max_attempts,
         )
         with _FTE_REGISTRY_LOCK:
             if fte_registry_query_is_closing(query_id):

@@ -16,6 +16,7 @@ from vane.execution._diagnostics import exception_message_from_args, safe_except
 from vane.execution.udf_ray_config import (
     MAX_ACTOR_RESTARTS,
     MAX_ACTOR_TASK_RETRIES,
+    payload_max_task_retries,
 )
 from vane.execution.udf_threading import (
     RAY_ACTOR_THREAD_POLICY_ENV,
@@ -758,11 +759,15 @@ def _create_actor_pools_for_nodes(
                 },
             }
 
+            actor_retry_options = {}
+            if payload.get("max_task_retries") is not None:
+                actor_retry_options["max_task_retries"] = payload_max_task_retries(payload)
             actors_obj = actor_pool_cls(
                 payload=payload,
                 concurrency=concurrency,
                 gpus_per_actor=gpus,
                 ray_options=ray_options,
+                **actor_retry_options,
             )
             actors_obj._vane_location_nonce = actor_location_nonce
             created.append(actors_obj)

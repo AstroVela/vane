@@ -8,6 +8,8 @@
 namespace duckdb {
 namespace distributed {
 
+static constexpr const char *DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY = "_vane_datasink_no_internal_retry";
+
 class DataSinkFinishNode : public PipelineNodeImpl, public std::enable_shared_from_this<DataSinkFinishNode> {
 public:
 	DataSinkFinishNode(NodeID node_id, PipelineNodeRef child, string operation_id)

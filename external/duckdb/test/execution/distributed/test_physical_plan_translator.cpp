@@ -1322,6 +1322,9 @@ TEST_CASE("PhysicalPlanTranslator: DataSink appends a validating terminal to eve
 	REQUIRE(task_root.Cast<PhysicalDataSink>().operation_id == "translator-datasink");
 	REQUIRE(task_root.children.size() == 1);
 	REQUIRE(task.second.task()->task_context().node_ids().back() == finish->node_id());
+	auto retry_marker = task.second.task()->context().find("_vane_datasink_no_internal_retry");
+	REQUIRE(retry_marker != task.second.task()->context().end());
+	REQUIRE(retry_marker->second == "1");
 	REQUIRE_FALSE(task_stream.poll_next().first);
 }
 

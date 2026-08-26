@@ -777,7 +777,7 @@ class LocalRunner(Runner):
                 raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
 
     def run_datasink(self, relation: Any) -> dict[str, Any]:
-        """Execute one immediate, idempotent DataSink with the local FTE backend."""
+        """Execute one DataSink attempt with the local FTE backend."""
 
         import vane
 

@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generic immediate, idempotent Python DataSink contracts.
+"""Generic Python DataSink contracts with sink-defined delivery semantics.
 
-A sink binds once on the driver. Its bound form is serialized into a replayable
-Arrow actor operator, and every actor lazily opens one long-lived worker for
-its batches. The first protocol intentionally supports only externally
-idempotent, immediately visible writes; Vane never reports exactly-once
-delivery or remote rollback.
+A sink binds once on the driver. Its bound form is serialized into an Arrow
+actor operator, and every actor lazily opens one long-lived worker for its
+batches. Vane does not provide exactly-once delivery, rollback, or cross-sink
+transactions. Framework retries are disabled by default; when enabled, they
+re-execute the full sink input and can duplicate external side effects.
 """
 
 from __future__ import annotations
@@ -18,12 +18,15 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
+from vane.execution.udf_lifecycle import ExecutionCancelledError
+from vane.runners.common import QueryDeadlineExceeded
 
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -39,25 +42,12 @@ _MAX_WRITE_RESULT_WARNINGS = 4
 _MAX_SUMMARY_WARNINGS = 16
 _MAX_WARNING_BYTES = 4 * 1024
 _MAX_ERROR_TYPE_NAME_BYTES = 256
+_MAX_INTERRUPTION_CAUSE_DEPTH = 16
 _MAX_RESULT_METADATA_INTEGER_BITS = math.ceil(_MAX_RESULT_METADATA_BYTES * math.log2(10))
 _RESULT_DECODE_BATCH_ROWS = 2 * 1024
 _MAX_INT64 = (1 << 63) - 1
 _MAX_UINT64 = (1 << 64) - 1
 _WARNINGS_OMITTED = "additional DataSink warnings omitted"
-
-
-class CommitProtocol(str, Enum):
-    """When writes become externally visible."""
-
-    IMMEDIATE = "immediate"
-    TWO_PHASE = "two_phase"
-
-
-class RetryMode(str, Enum):
-    """Whether replay converges on the same external state."""
-
-    IDEMPOTENT = "idempotent"
-    NEVER = "never"
 
 
 class WriteState(str, Enum):
@@ -68,7 +58,7 @@ class WriteState(str, Enum):
 
 
 class WriteOutcome(str, Enum):
-    """Driver-visible terminal knowledge about an operation."""
+    """Driver-visible knowledge derived from sink-reported worker results."""
 
     APPLIED = "applied"
     ABORTED = "aborted"
@@ -279,20 +269,16 @@ class EnvironmentSecret:
 
 
 @dataclass(frozen=True)
-class DataSinkCapabilities:
-    """Execution guarantees declared by a bound sink."""
-
-    commit_protocol: CommitProtocol
-    retry_mode: RetryMode
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "commit_protocol", CommitProtocol(self.commit_protocol))
-        object.__setattr__(self, "retry_mode", RetryMode(self.retry_mode))
-
-
-@dataclass(frozen=True)
 class DataSinkExecutionOptions:
-    """Actor-pool, resource, and batching requests for the internal Arrow operator."""
+    """Execution requests for the internal Arrow operator.
+
+    ``max_retries`` is the number of full-operation retries after a retryable
+    UNKNOWN outcome. It defaults to zero. Cancellation-derived UNKNOWN
+    outcomes are terminal. Each retry re-executes the complete input with the
+    same operation ID, so the sink owns deduplication and all delivery
+    guarantees. Retry-enabled writes reject non-materialized Arrow stream
+    inputs that may be single-use; materialize them before writing.
+    """
 
     worker_count: int = 1
     batch_size: int | None = None
@@ -301,6 +287,7 @@ class DataSinkExecutionOptions:
     memory_bytes: int | None = None
     target_max_batch_bytes: int | None = None
     task_input_max_bytes: int | None = None
+    max_retries: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         worker_count = self.worker_count
@@ -308,6 +295,11 @@ class DataSinkExecutionOptions:
             raise TypeError("worker_count must be a positive integer")
         if worker_count <= 0 or worker_count > _MAX_INT64:
             raise ValueError("worker_count must be a positive signed 64-bit integer")
+        max_retries = self.max_retries
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise TypeError("max_retries must be a non-negative integer")
+        if max_retries < 0 or max_retries > _MAX_INT64:
+            raise ValueError("max_retries must be a non-negative signed 64-bit integer")
         for name in ("batch_size", "memory_bytes", "target_max_batch_bytes", "task_input_max_bytes"):
             value = getattr(self, name)
             if value is None:
@@ -379,7 +371,7 @@ class WriteContext:
 
 @dataclass(frozen=True)
 class WriteResult:
-    """Bounded result produced by one selected worker batch."""
+    """Bounded, sink-reported result produced by one selected worker batch."""
 
     rows_received: int
     rows_affected: int | None = None
@@ -541,13 +533,10 @@ class WriteSummary:
 class DataSinkWriteError(RuntimeError):
     """A DataSink did not finish with a known applied outcome."""
 
-    def __init__(self, summary: WriteSummary, detail: str, *, safe_to_retry: bool) -> None:
+    def __init__(self, summary: WriteSummary, detail: str) -> None:
         self.summary = summary
         self.operation_id = summary.operation_id
         self.outcome = summary.outcome
-        if type(safe_to_retry) is not bool:
-            raise TypeError("DataSinkWriteError.safe_to_retry must be a boolean")
-        self.safe_to_retry = safe_to_retry
         if type(detail) is str:
             detail_text = detail
         else:
@@ -557,16 +546,19 @@ class DataSinkWriteError(RuntimeError):
             f"DataSink operation {summary.operation_id} ended with outcome {summary.outcome.value}: {self.detail}"
         )
 
-    def __reduce__(self) -> tuple[Any, tuple[WriteSummary, str, bool]]:
-        return (_restore_datasink_write_error, (self.summary, self.detail, self.safe_to_retry))
+    def __reduce__(self) -> tuple[Any, tuple[WriteSummary, str]]:
+        return (_restore_datasink_write_error, (self.summary, self.detail))
+
+
+class _InterruptedDataSinkWriteError(DataSinkWriteError):
+    """Internal marker for an UNKNOWN outcome that must not be retried."""
 
 
 def _restore_datasink_write_error(
     summary: WriteSummary,
     detail: str,
-    safe_to_retry: bool,
 ) -> DataSinkWriteError:
-    return DataSinkWriteError(summary, detail, safe_to_retry=safe_to_retry)
+    return DataSinkWriteError(summary, detail)
 
 
 class DataSinkWorker(ABC):
@@ -574,16 +566,18 @@ class DataSinkWorker(ABC):
 
     @abstractmethod
     def write(self, table: pa.Table) -> WriteResult:
-        """Apply one batch immediately and return only after its writes are visible."""
+        """Process one batch according to the sink's own delivery contract."""
 
     def abort(self, error: BaseException) -> None:
         """Release worker-local state after failure; this is not remote rollback."""
 
     def close(self) -> None:
-        """Release worker-local resources without publishing or flushing writes.
+        """Release worker-local resources after execution.
 
-        Cleanup may call this method again after an exception, so implementations
-        must retain and retry ownership that was not released successfully.
+        This is not a framework commit point: failures are diagnostic and do
+        not roll back or reclassify earlier WriteResult values. Cleanup may call
+        this method again after an exception, so implementations must retain
+        ownership that was not released successfully.
         """
 
 
@@ -591,15 +585,11 @@ class BoundDataSink(ABC):
     """Schema-bound, cloudpickle-serializable sink execution contract."""
 
     @property
-    @abstractmethod
-    def capabilities(self) -> DataSinkCapabilities: ...
-
-    @property
     def execution_options(self) -> DataSinkExecutionOptions:
         return DataSinkExecutionOptions()
 
     def prepare_input(self, relation: DuckDBPyRelation) -> DuckDBPyRelation:
-        """Optionally add deterministic, lazy input transformations."""
+        """Optionally add lazy input transformations that retries may re-execute."""
 
         return relation
 
@@ -833,6 +823,10 @@ def _make_batch_actor(
     key_validation: _KeyValidation | None,
 ) -> type[Any]:
     class DataSinkBatchActor:
+        # DataSink owns retries at the full-operation boundary. The native UDF
+        # payload consumes this private marker to disable Ray actor task replay.
+        _vane_datasink_no_task_retries = True
+
         def __init__(self) -> None:
             self._runtime = _SinkBatchRuntime(sink, context, key_validation)
 
@@ -941,8 +935,13 @@ def _results_from_native(operation_id: str, payload: Mapping[str, Any]) -> tuple
     outcome_aborted = payload.get("outcome_aborted")
     if not isinstance(outcome_aborted, bool):
         raise TypeError("native DataSink outcome_aborted must be a boolean")
+    outcome_cancelled = payload.get("outcome_cancelled")
+    if not isinstance(outcome_cancelled, bool):
+        raise TypeError("native DataSink outcome_cancelled must be a boolean")
     if outcome_unknown and outcome_aborted:
         raise RuntimeError("native DataSink result cannot be both aborted and unknown")
+    if outcome_cancelled and not outcome_unknown:
+        raise RuntimeError("cancelled DataSink outcome must be unknown")
     if native_operation_id != operation_id and not (outcome_unknown and native_operation_id == ""):
         raise RuntimeError(
             f"native DataSink operation_id mismatch: expected {operation_id!r}, got {native_operation_id!r}"
@@ -1084,11 +1083,38 @@ def _unknown_error(
     warnings: tuple[str, ...] = (),
 ) -> DataSinkWriteError:
     detail = error if isinstance(error, str) else _safe_error_summary(error)
-    return DataSinkWriteError(
+    return DataSinkWriteError(_summary(context, WriteOutcome.UNKNOWN, results, warnings), detail)
+
+
+def _interrupted_error(
+    context: WriteContext,
+    results: tuple[WriteResult, ...],
+    error: BaseException,
+    warnings: tuple[str, ...] = (),
+) -> _InterruptedDataSinkWriteError:
+    return _InterruptedDataSinkWriteError(
         _summary(context, WriteOutcome.UNKNOWN, results, warnings),
-        detail,
-        safe_to_retry=True,
+        _safe_error_summary(error),
     )
+
+
+def _is_execution_interruption(error: BaseException) -> bool:
+    candidate: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(_MAX_INTERRUPTION_CAUSE_DEPTH):
+        if candidate is None:
+            return False
+        if id(candidate) in seen:
+            return False
+        seen.add(id(candidate))
+        if not isinstance(candidate, Exception) or isinstance(
+            candidate,
+            (FutureCancelledError, ExecutionCancelledError, QueryDeadlineExceeded),
+        ):
+            return True
+        cause = candidate.__cause__
+        candidate = cause if isinstance(cause, BaseException) else None
+    return False
 
 
 def _aborted_error(
@@ -1097,63 +1123,59 @@ def _aborted_error(
     detail: str,
     warnings: tuple[str, ...] = (),
 ) -> DataSinkWriteError:
-    return DataSinkWriteError(
-        _summary(context, WriteOutcome.ABORTED, results, warnings),
-        detail,
-        safe_to_retry=True,
+    return DataSinkWriteError(_summary(context, WriteOutcome.ABORTED, results, warnings), detail)
+
+
+def _summary_after_retries(summary: WriteSummary, retry_count: int) -> WriteSummary:
+    warning = (
+        f"DataSink made {retry_count} framework retry "
+        f"{'attempt' if retry_count == 1 else 'attempts'}; attempts that reached execution re-executed the full "
+        "input, and earlier UNKNOWN attempts may have applied external writes"
+    )
+    warnings: tuple[str, ...] = (_bounded_warning(warning),)
+    for item in summary.warnings:
+        warnings = _append_warning(warnings, item, limit=_MAX_SUMMARY_WARNINGS)
+    return WriteSummary(
+        operation_id=summary.operation_id,
+        outcome=summary.outcome,
+        results=summary.results,
+        rows_received=summary.rows_received,
+        rows_affected=summary.rows_affected,
+        bytes_received=summary.bytes_received,
+        metadata=summary.metadata,
+        warnings=warnings,
     )
 
 
-def write_datasink(
-    relation: DuckDBPyRelation,
-    sink: DataSink,
-    *,
-    operation_id: str | None = None,
+def _error_after_retries(error: DataSinkWriteError, retry_count: int) -> DataSinkWriteError:
+    summary = _summary_after_retries(error.summary, retry_count)
+    detail = error.detail
+    if summary.outcome is WriteOutcome.ABORTED:
+        summary = WriteSummary(
+            operation_id=summary.operation_id,
+            outcome=WriteOutcome.UNKNOWN,
+            results=summary.results,
+            rows_received=summary.rows_received,
+            rows_affected=summary.rows_affected,
+            bytes_received=summary.bytes_received,
+            metadata=summary.metadata,
+            warnings=summary.warnings,
+        )
+        detail = f"an earlier attempt had an UNKNOWN outcome; final attempt was aborted: {detail}"
+    return DataSinkWriteError(summary, detail)
+
+
+def _execute_datasink_once(
+    prepared_relation: DuckDBPyRelation,
+    batch_actor: type[Any],
+    context: WriteContext,
+    options: DataSinkExecutionOptions,
+    runner_type: str,
 ) -> WriteSummary:
-    """Execute a relation into an immediate, idempotent Python DataSink."""
+    """Execute one attempt without any implicit task or fragment replay."""
 
-    import cloudpickle
+    from vane.runners import get_or_create_runner
 
-    from vane import DuckDBPyRelation as RuntimeDuckDBPyRelation
-    from vane.runners import get_or_create_runner, get_or_infer_runner_type
-
-    if not isinstance(relation, RuntimeDuckDBPyRelation):
-        raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
-    if not isinstance(sink, DataSink):
-        raise TypeError(f"sink must be DataSink, got {type(sink).__name__}")
-    relation._validate_datasink_transaction()
-    context = WriteContext(str(uuid.uuid4()) if operation_id is None else operation_id)
-    bound = sink.bind(_relation_arrow_schema(relation))
-    if not isinstance(bound, BoundDataSink):
-        raise TypeError(f"DataSink.bind() must return BoundDataSink, got {type(bound).__name__}")
-    capabilities = bound.capabilities
-    if not isinstance(capabilities, DataSinkCapabilities):
-        raise TypeError("BoundDataSink.capabilities must be DataSinkCapabilities")
-    if capabilities.commit_protocol is not CommitProtocol.IMMEDIATE:
-        raise ValueError("DataSink currently requires commit_protocol='immediate'")
-    if capabilities.retry_mode is not RetryMode.IDEMPOTENT:
-        raise ValueError("DataSink currently requires retry_mode='idempotent'")
-    options = bound.execution_options
-    if not isinstance(options, DataSinkExecutionOptions):
-        raise TypeError("BoundDataSink.execution_options must be DataSinkExecutionOptions")
-    try:
-        cloudpickle.dumps(bound)
-    except BaseException as error:
-        raise TypeError("bound DataSink must be cloudpickle-serializable before execution") from error
-
-    prepared_relation = bound.prepare_input(relation)
-    if not isinstance(prepared_relation, RuntimeDuckDBPyRelation):
-        raise TypeError("BoundDataSink.prepare_input() must return DuckDBPyRelation")
-    prepared_relation._validate_datasink_transaction()
-    key_validation = None
-    if isinstance(bound, BoundKeyedUpsertSink):
-        prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
-    runner_type = get_or_infer_runner_type()
-    batch_actor = _make_batch_actor(bound, context, key_validation)
-    try:
-        cloudpickle.dumps(batch_actor)
-    except BaseException as error:
-        raise TypeError("DataSink actor class must be cloudpickle-serializable before execution") from error
     mapped = prepared_relation.map_batches(
         batch_actor,
         schema=_wire_output_schema(),
@@ -1202,6 +1224,11 @@ def write_datasink(
             detail = native_result.get("outcome_error")
             if not isinstance(detail, str) or not detail:
                 detail = "distributed execution may have applied external writes"
+            if native_result["outcome_cancelled"]:
+                raise _InterruptedDataSinkWriteError(
+                    _summary(context, WriteOutcome.UNKNOWN, results, warnings),
+                    detail,
+                )
             raise _unknown_error(context, results, detail, warnings)
         if native_result["outcome_aborted"]:
             detail = native_result.get("outcome_error")
@@ -1212,24 +1239,124 @@ def write_datasink(
     except DataSinkWriteError:
         raise
     except BaseException as error:
+        if _is_execution_interruption(error):
+            raise _interrupted_error(context, results, error, warnings) from error
         raise _unknown_error(context, results, error, warnings) from error
     finally:
         del terminal
         del mapped
+
+
+def write_datasink(
+    relation: DuckDBPyRelation,
+    sink: DataSink,
+    *,
+    operation_id: str | None = None,
+) -> WriteSummary:
+    """Execute a relation using delivery semantics defined by the sink.
+
+    The default does not retry. When ``execution_options.max_retries`` is
+    positive, retryable UNKNOWN outcomes re-execute the complete input and use
+    the same operation ID. Cancellation-derived UNKNOWN outcomes are terminal.
+    Retry-enabled writes reject non-materialized Arrow stream inputs that may
+    be single-use; materialize them first.
+    Vane does not deduplicate external writes or provide exactly-once delivery
+    or rollback.
+    """
+
+    import cloudpickle
+
+    from vane import DuckDBPyRelation as RuntimeDuckDBPyRelation
+    from vane.runners import get_or_infer_runner_type
+
+    if not isinstance(relation, RuntimeDuckDBPyRelation):
+        raise TypeError(f"relation must be DuckDBPyRelation, got {type(relation).__name__}")
+    if not isinstance(sink, DataSink):
+        raise TypeError(f"sink must be DataSink, got {type(sink).__name__}")
+    relation._validate_datasink_transaction()
+    context = WriteContext(str(uuid.uuid4()) if operation_id is None else operation_id)
+    bound = sink.bind(_relation_arrow_schema(relation))
+    if not isinstance(bound, BoundDataSink):
+        raise TypeError(f"DataSink.bind() must return BoundDataSink, got {type(bound).__name__}")
+    options = bound.execution_options
+    if not isinstance(options, DataSinkExecutionOptions):
+        raise TypeError("BoundDataSink.execution_options must be DataSinkExecutionOptions")
+    try:
+        cloudpickle.dumps(bound)
+    except BaseException as error:
+        raise TypeError("bound DataSink must be cloudpickle-serializable before execution") from error
+
+    prepared_relation = bound.prepare_input(relation)
+    if not isinstance(prepared_relation, RuntimeDuckDBPyRelation):
+        raise TypeError("BoundDataSink.prepare_input() must return DuckDBPyRelation")
+    prepared_relation._validate_datasink_transaction()
+    if options.max_retries:
+        prepared_relation._validate_datasink_retry_input()
+    key_validation = None
+    if isinstance(bound, BoundKeyedUpsertSink):
+        prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)
+    runner_type = get_or_infer_runner_type()
+    batch_actor = _make_batch_actor(bound, context, key_validation)
+    try:
+        cloudpickle.dumps(batch_actor)
+    except BaseException as error:
+        raise TypeError("DataSink actor class must be cloudpickle-serializable before execution") from error
+    retries_performed = 0
+    last_unknown_error: DataSinkWriteError | None = None
+    try:
+        while True:
+            try:
+                summary = _execute_datasink_once(
+                    prepared_relation,
+                    batch_actor,
+                    context,
+                    options,
+                    runner_type,
+                )
+            except DataSinkWriteError as error:
+                interrupted = isinstance(error, _InterruptedDataSinkWriteError)
+                if (
+                    not interrupted
+                    and error.outcome is WriteOutcome.UNKNOWN
+                    and retries_performed < options.max_retries
+                ):
+                    retries_performed += 1
+                    last_unknown_error = error
+                    continue
+                if interrupted:
+                    terminal_error = (
+                        _error_after_retries(error, retries_performed)
+                        if retries_performed
+                        else DataSinkWriteError(error.summary, error.detail)
+                    )
+                    raise terminal_error from error.__cause__
+                if retries_performed:
+                    raise _error_after_retries(error, retries_performed) from error
+                raise
+            except BaseException as error:
+                if last_unknown_error is None:
+                    raise
+                carried = _error_after_retries(last_unknown_error, retries_performed)
+                detail = (
+                    f"{carried.detail}; framework retry {retries_performed} could not start: "
+                    f"{_safe_error_summary(error)}"
+                )
+                raise DataSinkWriteError(carried.summary, detail) from error
+            if retries_performed:
+                return _summary_after_retries(summary, retries_performed)
+            return summary
+    finally:
         del prepared_relation
 
 
 __all__ = [
     "BoundDataSink",
     "BoundKeyedUpsertSink",
-    "CommitProtocol",
     "DataSink",
-    "DataSinkCapabilities",
     "DataSinkExecutionOptions",
     "DataSinkWorker",
     "DataSinkWriteError",
     "EnvironmentSecret",
-    "RetryMode",
     "WriteContext",
     "WriteOutcome",
     "WriteResult",

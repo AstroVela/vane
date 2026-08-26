@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelledError
 from pathlib import Path
 
 import cloudpickle
@@ -16,19 +18,18 @@ import vane
 from vane.datasink import (
     BoundDataSink,
     BoundKeyedUpsertSink,
-    CommitProtocol,
     DataSink,
-    DataSinkCapabilities,
     DataSinkExecutionOptions,
     DataSinkWorker,
     DataSinkWriteError,
     EnvironmentSecret,
-    RetryMode,
     WriteContext,
     WriteOutcome,
     WriteResult,
     WriteState,
 )
+from vane.execution.udf_lifecycle import ExecutionCancelledError
+from vane.runners.common import QueryDeadlineExceeded
 
 
 class _Worker(DataSinkWorker):
@@ -57,20 +58,13 @@ class _Bound(BoundDataSink):
     def __init__(
         self,
         *,
-        protocol: CommitProtocol = CommitProtocol.IMMEDIATE,
-        retry: RetryMode = RetryMode.IDEMPOTENT,
         fail: bool = False,
         fail_close: bool = False,
         options: DataSinkExecutionOptions | None = None,
     ) -> None:
-        self._capabilities = DataSinkCapabilities(protocol, retry)
         self._fail = fail
         self._fail_close = fail_close
         self._options = options or DataSinkExecutionOptions(batch_size=2)
-
-    @property
-    def capabilities(self) -> DataSinkCapabilities:
-        return self._capabilities
 
     @property
     def execution_options(self) -> DataSinkExecutionOptions:
@@ -172,6 +166,26 @@ class _SlowBound(_Bound):
         return _SlowWorker()
 
 
+class _AppendThenSleepWorker(DataSinkWorker):
+    def __init__(self, append_path: str) -> None:
+        self._append_path = append_path
+
+    def write(self, table: pa.Table) -> WriteResult:
+        with Path(self._append_path).open("a", encoding="utf-8") as output:
+            output.write(f"{table.num_rows}\n")
+        time.sleep(0.05)
+        return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows)
+
+
+class _AppendThenSleepBound(_Bound):
+    def __init__(self, append_path: Path) -> None:
+        super().__init__(options=DataSinkExecutionOptions(batch_size=1, max_retries=1))
+        self._append_path = str(append_path)
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _AppendThenSleepWorker(self._append_path)
+
+
 class _TimeoutWorker(DataSinkWorker):
     def write(self, table: pa.Table) -> WriteResult:
         raise TimeoutError("planned provider timeout")
@@ -244,6 +258,39 @@ class _FailingBoundWithCloseMarker(_Bound):
         return _FailingWorkerWithCloseMarker(self._marker_path)
 
 
+class _AppendThenFailOnceWorker(DataSinkWorker):
+    def __init__(self, append_path: str, failure_marker_path: str, context: WriteContext) -> None:
+        self._append_path = append_path
+        self._failure_marker_path = failure_marker_path
+        self._operation_id = context.operation_id
+
+    def write(self, table: pa.Table) -> WriteResult:
+        with Path(self._append_path).open("a", encoding="utf-8") as output:
+            for row in table.to_pylist():
+                output.write(f"{self._operation_id}:{row['id']}\n")
+        failure_marker = Path(self._failure_marker_path)
+        if not failure_marker.exists():
+            failure_marker.write_text("failed", encoding="utf-8")
+            raise RuntimeError("planned response loss after append")
+        return WriteResult(rows_received=table.num_rows, rows_affected=table.num_rows, bytes_received=table.nbytes)
+
+
+class _AppendThenFailOnceBound(_Bound):
+    def __init__(self, append_path: Path, failure_marker_path: Path, *, max_retries: int) -> None:
+        super().__init__(
+            options=DataSinkExecutionOptions(
+                worker_count=1,
+                max_retries=max_retries,
+                batch_size=1,
+            )
+        )
+        self._append_path = str(append_path)
+        self._failure_marker_path = str(failure_marker_path)
+
+    def open_worker(self, context: WriteContext) -> DataSinkWorker:
+        return _AppendThenFailOnceWorker(self._append_path, self._failure_marker_path, context)
+
+
 class _CountingBound(_Bound):
     def __init__(self, options: DataSinkExecutionOptions) -> None:
         super().__init__(options=options)
@@ -281,12 +328,14 @@ def _native_result(
     *,
     outcome_unknown: bool = False,
     outcome_aborted: bool = False,
+    outcome_cancelled: bool = False,
 ) -> dict[str, object]:
     state = "aborted" if outcome_aborted else "applied"
     return {
         "operation_id": operation_id,
         "outcome_aborted": outcome_aborted,
         "outcome_unknown": outcome_unknown,
+        "outcome_cancelled": outcome_cancelled,
         "outcome_error": "planned unknown outcome" if outcome_unknown else "",
         "write_results": [
             {
@@ -589,30 +638,155 @@ def test_actor_input_boundary_failure_aborts_an_already_open_worker():
     assert calls == ["open", "write", "abort", "close"]
 
 
-def test_worker_failure_is_unknown_and_safe_to_retry(monkeypatch):
+def test_worker_failure_is_unknown_without_retry_safety_claim(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "local-fast")
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(_Sink(_Bound(fail=True)), operation_id="worker-failure")
 
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert exc_info.value.safe_to_retry is True
+    assert not hasattr(exc_info.value, "safe_to_retry")
     assert exc_info.value.summary.results == ()
 
 
-@pytest.mark.parametrize(
-    "bound, match",
-    [
-        (_Bound(protocol=CommitProtocol.TWO_PHASE), "commit_protocol='immediate'"),
-        (_Bound(retry=RetryMode.NEVER), "retry_mode='idempotent'"),
-    ],
-)
-def test_unsupported_protocols_fail_before_execution(monkeypatch, bound, match):
+def test_non_idempotent_append_is_not_retried_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    append_path = tmp_path / "default-no-retry.log"
+    failure_marker = tmp_path / "default-no-retry.failed"
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 7 AS id").write_datasink(
+            _Sink(_AppendThenFailOnceBound(append_path, failure_marker, max_retries=0)),
+            operation_id="append-default-no-retry",
+        )
+
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert append_path.read_text(encoding="utf-8").splitlines() == ["append-default-no-retry:7"]
+
+
+def test_configured_retry_replays_full_non_idempotent_append(monkeypatch, tmp_path):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    append_path = tmp_path / "configured-retry.log"
+    failure_marker = tmp_path / "configured-retry.failed"
+
+    summary = vane.sql("SELECT 7 AS id").write_datasink(
+        _Sink(_AppendThenFailOnceBound(append_path, failure_marker, max_retries=1)),
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert append_path.read_text(encoding="utf-8").splitlines() == [
+        f"{summary.operation_id}:7",
+        f"{summary.operation_id}:7",
+    ]
+    assert summary.warnings[0].startswith("DataSink made 1 framework retry attempt")
+    assert "may have applied external writes" in summary.warnings[0]
+
+
+def test_configured_retry_rejects_record_batch_reader_before_consuming_it():
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    relation = vane.from_arrow(reader).project("id + 1 AS id")
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-reader",
+        )
+
+    assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_default_no_retry_accepts_record_batch_reader(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+
+    summary = vane.from_arrow(reader).write_datasink(
+        _Sink(_Bound()),
+        operation_id="single-use-reader-no-retry",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == 3
+
+
+def test_configured_retry_rejects_record_batch_reader_in_join():
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    streamed = vane.from_arrow(reader).set_alias("streamed")
+    relation = vane.sql("SELECT 1 AS id").set_alias("fixed").join(streamed, "id")
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-reader-join",
+        )
+
+    assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_configured_retry_rejects_bare_arrow_stream_before_consuming_it():
+    stream = pa.table({"id": [1, 2, 3]}).__arrow_c_stream__()
+    relation = vane.from_arrow(stream)
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-capsule",
+        )
+
+    assert relation.fetchall() == [(1,), (2,), (3,)]
+
+
+def test_configured_retry_rejects_potentially_single_use_arrow_scanner():
+    import pyarrow.dataset as ds
+
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    scanner = ds.Scanner.from_batches(reader)
+    relation = vane.from_arrow(scanner)
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="potentially-single-use-scanner",
+        )
+
+    assert scanner.to_table().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_configured_retry_accepts_replayable_arrow_table(monkeypatch):
     from vane import runners
 
-    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: (_ for _ in ()).throw(AssertionError()))
-    with pytest.raises(ValueError, match=match):
-        vane.sql("SELECT 1 AS id").write_datasink(_Sink(bound))
+    operation_id = "replayable-arrow-table"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(operation_id, outcome_unknown=self.calls == 1)
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    summary = vane.from_arrow(pa.table({"id": [1, 2, 3]})).write_datasink(
+        _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+        operation_id=operation_id,
+    )
+
+    assert runner.calls == 2
+    assert summary.outcome is WriteOutcome.APPLIED
 
 
 def test_unserializable_bound_sink_fails_before_execution(monkeypatch):
@@ -637,13 +811,19 @@ def test_environment_secret_serializes_only_reference(monkeypatch):
     assert secret_value not in repr(restored.secret)
 
 
-def test_datasink_protocol_values_reject_invalid_utf8():
+def test_datasink_text_values_reject_invalid_utf8():
     with pytest.raises(ValueError, match="valid UTF-8"):
         WriteContext("operation-\ud800")
     with pytest.raises(ValueError, match="valid UTF-8"):
         WriteResult(rows_received=1, warnings=("warning-\ud800",))
     with pytest.raises(ValueError, match="valid UTF-8"):
         EnvironmentSecret("SECRET_\ud800")
+
+
+def test_datasink_has_no_framework_delivery_capability_api():
+    assert not hasattr(vane, "CommitProtocol")
+    assert not hasattr(vane, "RetryMode")
+    assert not hasattr(vane, "DataSinkCapabilities")
 
 
 @pytest.mark.parametrize(
@@ -669,9 +849,13 @@ def test_execution_options_reject_invalid_resource_requests(kwargs):
         {"worker_count": True},
         {"worker_count": 1.5},
         {"worker_count": 1 << 63},
+        {"max_retries": -1},
+        {"max_retries": True},
+        {"max_retries": 1.5},
+        {"max_retries": 1 << 63},
     ],
 )
-def test_execution_options_reject_invalid_worker_requests(kwargs):
+def test_execution_options_reject_invalid_control_requests(kwargs):
     with pytest.raises((TypeError, ValueError)):
         DataSinkExecutionOptions(**kwargs)
 
@@ -696,8 +880,38 @@ def test_execution_options_map_to_actor_backends():
     assert type(options.cpus) is float
     assert type(options.gpus) is float
     assert DataSinkExecutionOptions().worker_count == 1
+    assert DataSinkExecutionOptions().max_retries == 0
     with pytest.raises(ValueError, match="unsupported DataSink runner"):
         options.map_batches_kwargs("unsupported")
+
+
+def test_execution_options_retry_budget_is_keyword_only():
+    options = DataSinkExecutionOptions(3, 20)
+
+    assert options.worker_count == 3
+    assert options.batch_size == 20
+    assert options.max_retries == 0
+    with pytest.raises(TypeError):
+        DataSinkExecutionOptions(3, 20, None, None, None, None, None, 1)
+
+
+def test_datasink_actor_payload_disables_ray_task_replay():
+    from vane import datasink as datasink_module
+
+    connection = vane.connect()
+    options = DataSinkExecutionOptions()
+    actor_type = datasink_module._make_batch_actor(_Bound(options=options), WriteContext("payload-retries"), None)
+    assert actor_type._vane_datasink_no_task_retries is True
+    mapped = connection.sql("SELECT 1 AS id").map_batches(
+        actor_type,
+        schema=datasink_module._wire_output_schema(),
+        **options.map_batches_kwargs("ray"),
+    )
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(mapped, "datasink-payload-retries")
+    physical = logical.to_physical_plan(connection)
+    payload = physical.collect_udf_nodes(conn=connection)[0]["payload"]
+
+    assert payload["max_task_retries"] == 0
 
 
 def test_datasink_actor_reuses_and_closes_worker_after_cloudpickle_round_trip():
@@ -940,6 +1154,197 @@ def test_mock_distributed_unknown_preserves_partial_results(monkeypatch):
     assert exc_info.value.summary.batch_count == 1
 
 
+def test_mock_distributed_retry_budget_is_exact(monkeypatch):
+    from vane import runners
+
+    operation_id = "unknown-retry-budget"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(operation_id, outcome_unknown=True)
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=2))),
+            operation_id=operation_id,
+        )
+
+    assert runner.calls == 3
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert exc_info.value.summary.warnings[0].startswith("DataSink made 2 framework retry attempts")
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+        asyncio.CancelledError,
+        FutureCancelledError,
+        ExecutionCancelledError,
+        QueryDeadlineExceeded,
+    ],
+)
+def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, error_type):
+    from vane import runners
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            raise error_type("planned execution interruption")
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id="interruption-no-retry",
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "planned execution interruption" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
+def test_mock_distributed_wrapped_query_deadline_is_not_retried(monkeypatch):
+    from vane import runners
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            try:
+                raise QueryDeadlineExceeded("planned query deadline")
+            except QueryDeadlineExceeded as deadline_error:
+                raise RuntimeError("planned teardown failure") from deadline_error
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id="wrapped-deadline-no-retry",
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "planned teardown failure" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
+def test_mock_distributed_cancelled_unknown_is_not_retried(monkeypatch):
+    from vane import runners
+
+    operation_id = "cancelled-unknown-no-retry"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(
+                operation_id,
+                outcome_unknown=True,
+                outcome_cancelled=True,
+            )
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id=operation_id,
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
+def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
+    from vane import runners
+
+    operation_id = "aborted-no-retry"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(operation_id, outcome_aborted=True)
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id=operation_id,
+        )
+
+    assert runner.calls == 1
+    assert exc_info.value.outcome is WriteOutcome.ABORTED
+
+
+def test_mock_distributed_aborted_retry_after_unknown_remains_unknown(monkeypatch):
+    from vane import runners
+
+    operation_id = "unknown-before-aborted-retry"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(
+                operation_id,
+                outcome_unknown=self.calls == 1,
+                outcome_aborted=self.calls == 2,
+            )
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT * FROM range(0, 2)").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id=operation_id,
+        )
+
+    assert runner.calls == 2
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "an earlier attempt had an UNKNOWN outcome; final attempt was aborted" in exc_info.value.detail
+
+
 def test_local_wire_limit_excludes_arrow_container_overhead(monkeypatch):
     from vane import datasink as datasink_module
 
@@ -958,6 +1363,7 @@ def test_local_wire_limit_excludes_arrow_container_overhead(monkeypatch):
     [
         _native_result("outcome-mismatch", outcome_aborted=True) | {"outcome_aborted": False},
         _native_result("outcome-mismatch") | {"outcome_aborted": True},
+        _native_result("outcome-mismatch") | {"outcome_cancelled": True},
     ],
 )
 def test_mock_distributed_known_outcome_rejects_mismatched_worker_states(monkeypatch, native_result):
@@ -982,7 +1388,7 @@ def test_mock_distributed_known_outcome_rejects_mismatched_worker_states(monkeyp
 def test_result_and_error_round_trip_through_cloudpickle():
     result = WriteResult(rows_received=1, rows_affected=1, metadata={"nested": [1, 2]})
     summary = vane.datasink._summary(WriteContext("pickle"), WriteOutcome.UNKNOWN, (result,))
-    original = DataSinkWriteError(summary, "unknown", safe_to_retry=True)
+    original = DataSinkWriteError(summary, "unknown")
 
     restored = cloudpickle.loads(cloudpickle.dumps(original))
 
@@ -1142,17 +1548,10 @@ def test_cleanup_warnings_and_outcome_detail_are_bounded():
     assert literal_sentinel.warnings == ("additional DataSink warnings omitted", "later warning")
 
     summary = vane.datasink._summary(WriteContext("bounded-detail"), WriteOutcome.UNKNOWN, ())
-    error = DataSinkWriteError(summary, "detail-head:" + "x" * 10_000 + ":provider-root-cause", safe_to_retry=True)
+    error = DataSinkWriteError(summary, "detail-head:" + "x" * 10_000 + ":provider-root-cause")
     assert len(error.detail.encode("utf-8")) <= 4 * 1024
     assert error.detail.startswith("detail-head:")
     assert error.detail.endswith(":provider-root-cause")
-
-
-def test_datasink_write_error_requires_boolean_retry_safety():
-    summary = vane.datasink._summary(WriteContext("strict-retry-safety"), WriteOutcome.UNKNOWN, ())
-
-    with pytest.raises(TypeError, match="safe_to_retry must be a boolean"):
-        DataSinkWriteError(summary, "unknown", safe_to_retry=1)
 
 
 def test_cleanup_warning_bounds_input_before_normalization():
@@ -1297,7 +1696,6 @@ def test_local_fte_datasink_worker_failure_is_unknown_and_closes_after_abort(mon
         )
 
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert exc_info.value.safe_to_retry is True
     assert marker.read_text(encoding="utf-8") == "abort\nclose\n"
 
 
@@ -1377,19 +1775,24 @@ def test_local_fte_datasink_progress_failure_is_warning(monkeypatch):
     assert any("planned progress failure" in warning for warning in summary.warnings)
 
 
-def test_local_fte_datasink_progress_interrupt_stops_with_unknown_outcome(monkeypatch):
+def test_local_fte_datasink_progress_interrupt_stops_without_retry(monkeypatch, tmp_path):
     from vane import runners
     from vane.runners.local import runner as local_runner_module
     from vane.runners.local.runner import LocalRunner
+
+    append_path = tmp_path / "interrupt-appends.txt"
+    attempts_started: list[int] = []
 
     class InterruptingProgressRenderer:
         interval_s = 0.001
 
         def __init__(self, snapshot_getter):
             self.snapshot_getter = snapshot_getter
+            attempts_started.append(1)
 
         def update(self, *, force=False):
-            raise KeyboardInterrupt("planned progress interrupt")
+            if append_path.exists():
+                raise KeyboardInterrupt("planned progress interrupt")
 
         def finish(self, *, final_state=None):
             return None
@@ -1402,12 +1805,15 @@ def test_local_fte_datasink_progress_interrupt_stops_with_unknown_outcome(monkey
 
     with pytest.raises(DataSinkWriteError) as exc_info:
         vane.sql("SELECT 1 AS id").write_datasink(
-            _Sink(_SlowBound()),
+            _Sink(_AppendThenSleepBound(append_path)),
             operation_id="local-progress-interrupt",
         )
 
+    assert attempts_started == [1]
+    assert append_path.read_text(encoding="utf-8").splitlines() == ["1"]
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert "planned progress interrupt" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
 
 
 def test_local_fte_datasink_provider_timeout_is_not_a_progress_wait(monkeypatch):
@@ -1487,4 +1893,3 @@ def test_real_ray_datasink(ray_local, monkeypatch, tmp_path):
     assert duplicate_exc_info.value.outcome is WriteOutcome.ABORTED
     assert {result.state for result in duplicate_exc_info.value.summary.results} == {WriteState.ABORTED}
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
-    assert exc_info.value.safe_to_retry is True

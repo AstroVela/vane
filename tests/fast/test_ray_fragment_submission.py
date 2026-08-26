@@ -130,6 +130,16 @@ class RayWorkerActorHandle(_ProductionRayWorkerActorHandle):
 _ORIGINAL_START_FTE_ATTEMPT_STATUS_WATCHER = RayWorkerActorHandle._start_fte_attempt_status_watcher
 
 
+def test_datasink_fte_retry_marker_disables_fragment_replay():
+    key = fragment_submission_mod._DATA_SINK_NO_INTERNAL_RETRY_CONTEXT_KEY
+
+    assert key == "_vane_datasink_no_internal_retry"
+    assert fragment_submission_mod._datasink_fte_max_attempts({}) is None
+    assert fragment_submission_mod._datasink_fte_max_attempts({key: "1"}) == 1
+    with pytest.raises(ValueError, match="must equal '1'"):
+        fragment_submission_mod._datasink_fte_max_attempts({key: "2"})
+
+
 class _ImmediateFuture:
     def __init__(self, value):
         self._value = value
