@@ -24,6 +24,7 @@ release_tests=(
   "$project_root/tests/fast/test_ai_release_contracts.py"
   "$project_root/tests/fast/test_datasink.py"
   "$project_root/tests/fast/test_milvus_datasink.py"
+  "$project_root/tests/fast/test_turbopuffer_datasink.py"
   "$project_root/tests/fast/test_package_metadata.py"
   "$project_root/tests/fast/test_ray_test_profile.py"
   "$project_root/tests/fast/test_transformers_provider_security.py"

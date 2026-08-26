@@ -98,6 +98,7 @@ pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
 pip install 'vane-ai[milvus]'   # distributed full-row Milvus upserts
+pip install 'vane-ai[turbopuffer]' # distributed whole-document Turbopuffer upserts
 ```
 
 The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
@@ -165,6 +166,54 @@ batches are acknowledged and applied independently, so a failed operation can
 be partially applied. Vane does not provide an atomic transaction, rollback,
 or exactly-once delivery, and read visibility follows the consistency level
 used by Milvus readers.
+
+### Turbopuffer DataSink
+
+`TurbopufferSink` writes distributed batches with Turbopuffer's columnar
+whole-document upsert API. The sink maps one explicit relation column to the
+reserved `id` field, one to the reserved `vector` field, and only the columns
+listed in `attribute_mapping` to stored attributes. Other relation columns are
+projected away. A first successful write implicitly creates the namespace; the
+same explicit schema and distance metric accompany every batch so concurrent
+workers use one deterministic contract.
+
+IDs must be Arrow `uint64` or UTF-8 strings of at most 64 bytes. Vectors must
+be fixed-size lists of Arrow `float32` with 1 to 10,752 dimensions, and must
+not contain null or non-finite values. Attributes support Arrow booleans,
+signed and unsigned integers, `float32`/`float64`, strings, and one-dimensional
+lists of those scalar types. Attribute names may contain at most 128 UTF-8
+bytes, must not start with `$`, and cannot be `id` or `vector`.
+
+```python
+from vane import EnvironmentSecret, TurbopufferSink
+
+sink = TurbopufferSink(
+    "documents",
+    region="gcp-us-central1",
+    api_key=EnvironmentSecret("TURBOPUFFER_API_KEY"),
+    id_column="document_id",
+    vector_column="embedding",
+    distance_metric="cosine_distance",
+    attribute_mapping={"title": "title", "tags": "tags"},
+)
+summary = relation.write_datasink(sink)
+```
+
+`max_batch_rows` and `max_batch_bytes` bound each actor input batch; the latter
+measures Arrow buffers. Before making a request, the sink also measures the
+compact columnar JSON body and enforces `max_request_bytes`, which cannot
+exceed Turbopuffer's documented 512 MB write-request limit. API keys are
+resolved from the worker environment and never stored as credential values in
+the serialized sink plan. `region` is a lowercase Turbopuffer region DNS label;
+the sink constructs the public Turbopuffer endpoint explicitly and does not
+honor the SDK's ambient base-URL override.
+
+The Turbopuffer SDK is constructed with its retries disabled. The default
+`max_retries=0` also disables Vane replay; when explicitly enabled, Vane
+replays the complete input and each row overwrites the same document ID.
+Concurrent external writers can still race. Acknowledged batches are immediate
+and independent, so a later batch failure can leave earlier documents visible;
+there is no cross-batch transaction, rollback, or exactly-once guarantee.
 
 ### Execution Policy
 

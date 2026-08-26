@@ -209,6 +209,7 @@ from vane.datasink import (
     write_datasink,
 )
 from vane.datasink.milvus import MilvusSink
+from vane.datasink.turbopuffer import TurbopufferSink
 from vane.extensions import (
     DynamicExtensionDependency,
     DynamicExtensionDescriptor,
@@ -422,6 +423,7 @@ __all__: list[str] = [
     "TimestampTimeZoneValue",
     "TimestampValue",
     "TransactionException",
+    "TurbopufferSink",
     "TypeMismatchException",
     "UUIDValue",
     "UnionType",
