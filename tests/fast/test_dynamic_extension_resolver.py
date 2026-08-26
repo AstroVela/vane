@@ -445,12 +445,18 @@ def test_windows_permission_model_secures_cached_paths_and_removes_staging_direc
     descriptor = _descriptor(artifact_path, name="root")
     cache_directory = tmp_path / "verified"
     secured_paths = []
+    inspected_paths = []
 
     monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
     monkeypatch.setattr(
         extension_module,
         "_secure_native_cache_path",
         lambda path, *, directory: secured_paths.append((path, directory)),
+    )
+    monkeypatch.setattr(
+        extension_module,
+        "_native_cache_path_is_replaceable",
+        lambda path, *, volume_root: inspected_paths.append((path, volume_root)) or False,
     )
 
     resolver = _resolver(cache_directory)
@@ -467,10 +473,12 @@ def test_windows_permission_model_secures_cached_paths_and_removes_staging_direc
         (artifact_directory, True),
         (first.path, False),
     ]
+    assert inspected_paths == [(path, path.parent == path) for path in (cache_directory, *cache_directory.parents)]
     assert not [path for path in cache_directory.iterdir() if path.name.startswith(".root-")]
     assert extension_module._snapshot_mode_is_read_only(first.path.stat().st_mode)
 
     secured_paths.clear()
+    inspected_paths.clear()
     second = resolver.resolve(RecordingConnection(platform), descriptor, artifact=artifact_path)[0]
 
     assert second == first
@@ -480,8 +488,41 @@ def test_windows_permission_model_secures_cached_paths_and_removes_staging_direc
         (artifact_directory, True),
         (first.path, False),
     ]
+    assert inspected_paths == [(path, path.parent == path) for path in (cache_directory, *cache_directory.parents)]
     assert extension_module._snapshot_mode_is_read_only(0o444)
     assert not extension_module._snapshot_mode_is_read_only(0o666)
+
+
+def test_windows_cache_root_rejects_a_replaceable_ancestor(tmp_path, monkeypatch):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    shared_parent = tmp_path / "shared"
+    cache_directory = shared_parent / "verified"
+    inspected_paths = []
+
+    monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
+    monkeypatch.setattr(extension_module, "_secure_native_cache_path", lambda _path, *, directory: None)
+
+    def cache_path_is_replaceable(path, *, volume_root):
+        inspected_paths.append((path, volume_root))
+        return path == shared_parent
+
+    monkeypatch.setattr(extension_module, "_native_cache_path_is_replaceable", cache_path_is_replaceable)
+
+    with pytest.raises(DynamicExtensionError, match="replaceable ancestor") as error:
+        _resolver(cache_directory).resolve(
+            RecordingConnection(platform),
+            descriptor,
+            artifact=artifact_path,
+        )
+
+    assert str(shared_parent) in str(error.value)
+    assert inspected_paths[:2] == [(cache_directory, False), (shared_parent, False)]
 
 
 def test_resolver_rejects_a_bare_trusted_identity_string():

@@ -799,9 +799,20 @@ class DynamicExtensionResolver:
             vane_directory = self._prepare_cache_directory(_native_extension_directory(connection) / ".vane")
             root = vane_directory / "verified-v1"
         root = self._prepare_cache_directory(root)
-        if not _WINDOWS_PERMISSION_MODEL:
+        if _WINDOWS_PERMISSION_MODEL:
+            self._validate_windows_cache_ancestors(root)
+        else:
             self._validate_posix_cache_ancestors(root)
         return root
+
+    @staticmethod
+    def _validate_windows_cache_ancestors(path: Path) -> None:
+        for ancestor in (path, *path.parents):
+            if _native_cache_path_is_replaceable(ancestor, volume_root=ancestor.parent == ancestor):
+                _fail(
+                    "ARTIFACT_CACHE_CORRUPT",
+                    f"verified artifact cache has a replaceable ancestor: {ancestor}",
+                )
 
     @staticmethod
     def _validate_posix_cache_ancestors(path: Path) -> None:
@@ -1048,6 +1059,24 @@ def _secure_native_cache_path(path: Path, *, directory: bool) -> None:
             "ARTIFACT_CACHE_CORRUPT",
             f"could not apply a private Windows DACL to verified artifact cache path: {path}",
         ) from exception
+
+
+def _native_cache_path_is_replaceable(path: Path, *, volume_root: bool) -> bool:
+    from vane import _native
+
+    try:
+        replaceable = _native._dynamic_extension_cache_path_is_replaceable(
+            str(path),
+            volume_root=volume_root,
+        )
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "ARTIFACT_CACHE_CORRUPT",
+            f"could not inspect verified artifact cache ancestor: {path}",
+        ) from exception
+    if not isinstance(replaceable, bool):
+        _fail("ARTIFACT_CACHE_CORRUPT", "DuckDB returned invalid Windows cache ancestor state")
+    return replaceable
 
 
 def _cleanup_staging_directory(

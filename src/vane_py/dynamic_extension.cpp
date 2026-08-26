@@ -29,9 +29,8 @@ static ClientContext &DynamicExtensionContext(const shared_ptr<DuckDBPyConnectio
 	return *native_connection.context;
 }
 
-static void SecureDynamicExtensionCachePath(const string &path, bool directory) {
 #ifdef DUCKDB_WINDOWS
-	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+static vector<uint8_t> DynamicExtensionProcessUserSid(const string &path) {
 	HANDLE process_token = nullptr;
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &process_token)) {
 		throw IOException("Could not open process token for extension cache path '%s' (Windows error %u)", path,
@@ -53,6 +52,44 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 		                  status);
 	}
 	CloseHandle(process_token);
+	return token_user_buffer;
+}
+
+static vector<uint8_t> DynamicExtensionWellKnownSid(WELL_KNOWN_SID_TYPE type, const string &path) {
+	vector<uint8_t> sid_buffer(SECURITY_MAX_SID_SIZE);
+	DWORD sid_size = NumericCast<DWORD>(sid_buffer.size());
+	if (!CreateWellKnownSid(type, nullptr, sid_buffer.data(), &sid_size)) {
+		throw IOException("Could not create a trusted identity for extension cache path '%s' (Windows error %u)", path,
+		                  GetLastError());
+	}
+	sid_buffer.resize(sid_size);
+	return sid_buffer;
+}
+
+static bool DynamicExtensionSidEquals(PSID candidate, const vector<uint8_t> &trusted_sid) {
+	return candidate && IsValidSid(candidate) && EqualSid(candidate, const_cast<uint8_t *>(trusted_sid.data()));
+}
+
+static bool DynamicExtensionCacheTrustedSid(PSID candidate, PSID owner, PSID process_user_sid,
+                                            const vector<uint8_t> &local_system_sid,
+                                            const vector<uint8_t> &administrators_sid,
+                                            const vector<uint8_t> &creator_owner_sid,
+                                            const vector<uint8_t> &creator_owner_rights_sid) {
+	if ((candidate && process_user_sid && IsValidSid(candidate) && IsValidSid(process_user_sid) &&
+	     EqualSid(candidate, process_user_sid)) ||
+	    DynamicExtensionSidEquals(candidate, local_system_sid) ||
+	    DynamicExtensionSidEquals(candidate, administrators_sid)) {
+		return true;
+	}
+	return owner && (DynamicExtensionSidEquals(candidate, creator_owner_sid) ||
+	                 DynamicExtensionSidEquals(candidate, creator_owner_rights_sid));
+}
+#endif
+
+static void SecureDynamicExtensionCachePath(const string &path, bool directory) {
+#ifdef DUCKDB_WINDOWS
+	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+	auto token_user_buffer = DynamicExtensionProcessUserSid(path);
 	auto token_user = reinterpret_cast<TOKEN_USER *>(token_user_buffer.data());
 
 	EXPLICIT_ACCESSW user_access {};
@@ -64,7 +101,7 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 	user_access.Trustee.ptstrName = static_cast<LPWSTR>(token_user->User.Sid);
 
 	PACL private_acl = nullptr;
-	status = SetEntriesInAclW(1, &user_access, nullptr, &private_acl);
+	auto status = SetEntriesInAclW(1, &user_access, nullptr, &private_acl);
 	if (status != ERROR_SUCCESS || !private_acl) {
 		if (private_acl) {
 			LocalFree(private_acl);
@@ -83,6 +120,93 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 #else
 	(void)directory;
 	throw NotImplementedException("Windows DACLs are unavailable for extension cache path '%s'", path);
+#endif
+}
+
+static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volume_root) {
+#ifdef DUCKDB_WINDOWS
+	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+	auto attributes = GetFileAttributesW(windows_path.c_str());
+	if (attributes == INVALID_FILE_ATTRIBUTES) {
+		throw IOException("Could not inspect extension cache ancestor '%s' (Windows error %u)", path, GetLastError());
+	}
+	if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		return true;
+	}
+
+	auto process_user_buffer = DynamicExtensionProcessUserSid(path);
+	auto process_user = reinterpret_cast<TOKEN_USER *>(process_user_buffer.data());
+	auto local_system_sid = DynamicExtensionWellKnownSid(WinLocalSystemSid, path);
+	auto administrators_sid = DynamicExtensionWellKnownSid(WinBuiltinAdministratorsSid, path);
+	auto creator_owner_sid = DynamicExtensionWellKnownSid(WinCreatorOwnerSid, path);
+	auto creator_owner_rights_sid = DynamicExtensionWellKnownSid(WinCreatorOwnerRightsSid, path);
+
+	PSID owner = nullptr;
+	PACL dacl = nullptr;
+	PSECURITY_DESCRIPTOR security_descriptor = nullptr;
+	auto status = GetNamedSecurityInfoW(const_cast<LPWSTR>(windows_path.c_str()), SE_FILE_OBJECT,
+	                                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl,
+	                                    nullptr, &security_descriptor);
+	if (status != ERROR_SUCCESS) {
+		throw IOException("Could not read security information for extension cache ancestor '%s' (Windows error %u)",
+		                  path, status);
+	}
+
+	bool replaceable = !dacl;
+	auto owner_trusted =
+	    DynamicExtensionCacheTrustedSid(owner, nullptr, process_user->User.Sid, local_system_sid, administrators_sid,
+	                                    creator_owner_sid, creator_owner_rights_sid);
+	if (!volume_root && !owner_trusted) {
+		replaceable = true;
+	}
+
+	PEXPLICIT_ACCESSW entries = nullptr;
+	ULONG entry_count = 0;
+	if (!replaceable) {
+		status = GetExplicitEntriesFromAclW(dacl, &entry_count, &entries);
+		if (status != ERROR_SUCCESS) {
+			LocalFree(security_descriptor);
+			throw IOException("Could not inspect permissions for extension cache ancestor '%s' (Windows error %u)",
+			                  path, status);
+		}
+	}
+
+	GENERIC_MAPPING file_mapping {FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
+	constexpr ACCESS_MASK replacement_rights = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER;
+	for (ULONG index = 0; !replaceable && index < entry_count; index++) {
+		auto &entry = entries[index];
+		if ((entry.grfAccessMode != GRANT_ACCESS && entry.grfAccessMode != SET_ACCESS) ||
+		    (entry.grfInheritance & INHERIT_ONLY_ACE)) {
+			continue;
+		}
+		auto permissions = entry.grfAccessPermissions;
+		MapGenericMask(&permissions, &file_mapping);
+		if (!(permissions & replacement_rights)) {
+			continue;
+		}
+
+		PSID trustee_sid = nullptr;
+		if (entry.Trustee.TrusteeForm == TRUSTEE_IS_SID) {
+			trustee_sid = entry.Trustee.ptstrName;
+		} else if (entry.Trustee.TrusteeForm == TRUSTEE_IS_OBJECTS_AND_SID && entry.Trustee.ptstrName) {
+			auto objects_and_sid = reinterpret_cast<OBJECTS_AND_SID *>(entry.Trustee.ptstrName);
+			trustee_sid = objects_and_sid->pSid;
+		}
+		if (!DynamicExtensionCacheTrustedSid(trustee_sid, owner_trusted ? owner : nullptr, process_user->User.Sid,
+		                                     local_system_sid, administrators_sid, creator_owner_sid,
+		                                     creator_owner_rights_sid)) {
+			replaceable = true;
+		}
+	}
+
+	if (entries) {
+		LocalFree(entries);
+	}
+	LocalFree(security_descriptor);
+	return replaceable;
+#else
+	(void)volume_root;
+	throw NotImplementedException("Windows DACLs are unavailable for extension cache ancestor '%s'", path);
 #endif
 }
 
@@ -153,6 +277,8 @@ void InitializeDynamicExtensionBindings(py::module_ &module) {
 	module.def("_dynamic_extension_compatibility_version", &ExtensionHelper::GetVersionDirectoryName);
 	module.def("_secure_dynamic_extension_cache_path", &SecureDynamicExtensionCachePath, py::arg("path"), py::kw_only(),
 	           py::arg("directory"));
+	module.def("_dynamic_extension_cache_path_is_replaceable", &DynamicExtensionCachePathIsReplaceable, py::arg("path"),
+	           py::kw_only(), py::arg("volume_root"));
 	module.def("_inspect_dynamic_extension", &InspectDynamicExtension, py::arg("path"));
 	module.def("_load_dynamic_extension", &LoadDynamicExtension, py::arg("path"), py::kw_only(),
 	           py::arg("connection").none(false));
