@@ -6,8 +6,66 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "json_transform.hpp"
+#include "json_reader_options.hpp"
+#include "json_scan.hpp"
 
 namespace duckdb {
+
+void JSONFileSnapshot::Serialize(Serializer &serializer) const {
+	serializer.WritePropertyWithDefault<string>(100, "path", path);
+	serializer.WritePropertyWithDefault<map<string, Value>>(101, "options", options);
+	serializer.WritePropertyWithDefault<idx_t>(102, "ordinal", ordinal);
+}
+
+JSONFileSnapshot JSONFileSnapshot::Deserialize(Deserializer &deserializer) {
+	JSONFileSnapshot result;
+	deserializer.ReadPropertyWithDefault<string>(100, "path", result.path);
+	deserializer.ReadPropertyWithDefault<map<string, Value>>(101, "options", result.options);
+	deserializer.ReadPropertyWithDefault<idx_t>(102, "ordinal", result.ordinal);
+	return result;
+}
+
+void JSONReaderOptions::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<JSONScanType>(100, "type", type);
+	serializer.WriteProperty<JSONFormat>(101, "format", format);
+	serializer.WriteProperty<JSONRecordType>(102, "record_type", record_type);
+	serializer.WriteProperty<FileCompressionType>(103, "compression", compression);
+	serializer.WritePropertyWithDefault<bool>(104, "ignore_errors", ignore_errors);
+	serializer.WritePropertyWithDefault<idx_t>(105, "maximum_object_size", maximum_object_size);
+	serializer.WritePropertyWithDefault<bool>(106, "auto_detect", auto_detect);
+	serializer.WritePropertyWithDefault<idx_t>(107, "sample_size", sample_size);
+	serializer.WritePropertyWithDefault<idx_t>(108, "max_depth", max_depth);
+	serializer.WriteProperty<double>(109, "field_appearance_threshold", field_appearance_threshold);
+	serializer.WritePropertyWithDefault<idx_t>(110, "maximum_sample_files", maximum_sample_files);
+	serializer.WritePropertyWithDefault<bool>(111, "convert_strings_to_integers", convert_strings_to_integers);
+	serializer.WritePropertyWithDefault<idx_t>(112, "map_inference_threshold", map_inference_threshold);
+	serializer.WritePropertyWithDefault<vector<string>>(113, "name_list", name_list);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(114, "sql_type_list", sql_type_list);
+	serializer.WritePropertyWithDefault<string>(115, "date_format", date_format);
+	serializer.WritePropertyWithDefault<string>(116, "timestamp_format", timestamp_format);
+}
+
+JSONReaderOptions JSONReaderOptions::Deserialize(Deserializer &deserializer) {
+	JSONReaderOptions result;
+	deserializer.ReadProperty<JSONScanType>(100, "type", result.type);
+	deserializer.ReadProperty<JSONFormat>(101, "format", result.format);
+	deserializer.ReadProperty<JSONRecordType>(102, "record_type", result.record_type);
+	deserializer.ReadProperty<FileCompressionType>(103, "compression", result.compression);
+	deserializer.ReadPropertyWithDefault<bool>(104, "ignore_errors", result.ignore_errors);
+	deserializer.ReadPropertyWithDefault<idx_t>(105, "maximum_object_size", result.maximum_object_size);
+	deserializer.ReadPropertyWithDefault<bool>(106, "auto_detect", result.auto_detect);
+	deserializer.ReadPropertyWithDefault<idx_t>(107, "sample_size", result.sample_size);
+	deserializer.ReadPropertyWithDefault<idx_t>(108, "max_depth", result.max_depth);
+	deserializer.ReadProperty<double>(109, "field_appearance_threshold", result.field_appearance_threshold);
+	deserializer.ReadPropertyWithDefault<idx_t>(110, "maximum_sample_files", result.maximum_sample_files);
+	deserializer.ReadPropertyWithDefault<bool>(111, "convert_strings_to_integers", result.convert_strings_to_integers);
+	deserializer.ReadPropertyWithDefault<idx_t>(112, "map_inference_threshold", result.map_inference_threshold);
+	deserializer.ReadPropertyWithDefault<vector<string>>(113, "name_list", result.name_list);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(114, "sql_type_list", result.sql_type_list);
+	deserializer.ReadPropertyWithDefault<string>(115, "date_format", result.date_format);
+	deserializer.ReadPropertyWithDefault<string>(116, "timestamp_format", result.timestamp_format);
+	return result;
+}
 
 void JSONTransformOptions::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(100, "strict_cast", strict_cast);
@@ -24,6 +82,42 @@ JSONTransformOptions JSONTransformOptions::Deserialize(Deserializer &deserialize
 	deserializer.ReadPropertyWithDefault<bool>(102, "error_missing_key", result.error_missing_key);
 	deserializer.ReadPropertyWithDefault<bool>(103, "error_unknown_key", result.error_unknown_key);
 	deserializer.ReadPropertyWithDefault<bool>(104, "delay_error", result.delay_error);
+	return result;
+}
+
+void SerializedJSONScanData::Serialize(Serializer &serializer) const {
+	serializer.WritePropertyWithDefault<vector<JSONFileSnapshot>>(100, "files", files);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(101, "types", types);
+	serializer.WritePropertyWithDefault<vector<string>>(102, "names", names);
+	serializer.WriteProperty<MultiFileOptions>(103, "file_options", file_options);
+	serializer.WriteProperty<MultiFileReaderBindData>(104, "reader_bind", reader_bind);
+	serializer.WritePropertyWithDefault<vector<string>>(105, "table_columns", table_columns);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(106, "bind_column_ids", bind_column_ids);
+	serializer.WriteProperty<JSONReaderOptions>(107, "options", options);
+	serializer.WritePropertyWithDefault<vector<string>>(108, "key_names", key_names);
+	serializer.WritePropertyWithDefault<vector<StrpTimeFormat>>(109, "date_formats", date_formats);
+	serializer.WritePropertyWithDefault<vector<StrpTimeFormat>>(110, "timestamp_formats", timestamp_formats);
+	serializer.WriteProperty<optional_idx>(111, "max_threads", max_threads);
+	serializer.WriteProperty<optional_idx>(112, "estimated_cardinality_per_file", estimated_cardinality_per_file);
+	serializer.WritePropertyWithDefault<vector<idx_t>>(113, "reader_column_ids", reader_column_ids);
+}
+
+SerializedJSONScanData SerializedJSONScanData::Deserialize(Deserializer &deserializer) {
+	SerializedJSONScanData result;
+	deserializer.ReadPropertyWithDefault<vector<JSONFileSnapshot>>(100, "files", result.files);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(101, "types", result.types);
+	deserializer.ReadPropertyWithDefault<vector<string>>(102, "names", result.names);
+	deserializer.ReadProperty<MultiFileOptions>(103, "file_options", result.file_options);
+	deserializer.ReadProperty<MultiFileReaderBindData>(104, "reader_bind", result.reader_bind);
+	deserializer.ReadPropertyWithDefault<vector<string>>(105, "table_columns", result.table_columns);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(106, "bind_column_ids", result.bind_column_ids);
+	deserializer.ReadProperty<JSONReaderOptions>(107, "options", result.options);
+	deserializer.ReadPropertyWithDefault<vector<string>>(108, "key_names", result.key_names);
+	deserializer.ReadPropertyWithDefault<vector<StrpTimeFormat>>(109, "date_formats", result.date_formats);
+	deserializer.ReadPropertyWithDefault<vector<StrpTimeFormat>>(110, "timestamp_formats", result.timestamp_formats);
+	deserializer.ReadProperty<optional_idx>(111, "max_threads", result.max_threads);
+	deserializer.ReadProperty<optional_idx>(112, "estimated_cardinality_per_file", result.estimated_cardinality_per_file);
+	deserializer.ReadPropertyWithDefault<vector<idx_t>>(113, "reader_column_ids", result.reader_column_ids);
 	return result;
 }
 

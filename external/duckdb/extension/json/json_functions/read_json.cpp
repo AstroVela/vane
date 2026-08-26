@@ -70,12 +70,12 @@ public:
 		auto &bind_data = auto_detect_state.bind_data;
 		auto &files = auto_detect_state.files;
 		auto &json_data = bind_data.bind_data->Cast<JSONScanData>();
-		auto json_reader = make_shared_ptr<JSONReader>(context, json_data.options, files[file_idx].path);
+		auto json_reader = make_shared_ptr<JSONReader>(context, json_data.options, files[file_idx]);
 		if (bind_data.union_readers[file_idx]) {
 			throw InternalException("Union data already set");
 		}
 		auto &reader = *json_reader;
-		auto union_data = make_uniq<BaseUnionData>(files[file_idx].path);
+		auto union_data = make_uniq<BaseUnionData>(files[file_idx]);
 		union_data->reader = std::move(json_reader);
 		bind_data.union_readers[file_idx] = std::move(union_data);
 

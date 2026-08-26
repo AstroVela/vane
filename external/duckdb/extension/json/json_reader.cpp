@@ -180,6 +180,10 @@ idx_t JSONFileHandle::ReadFromCache(char *&pointer, idx_t &size, atomic<idx_t> &
 JSONReader::JSONReader(ClientContext &context, JSONReaderOptions options_p, OpenFileInfo file_p)
     : BaseFileReader(std::move(file_p)), context(context), options(std::move(options_p)), initialized(0),
       next_buffer_index(0), thrown(false) {
+	idx_t coordinator_ordinal;
+	if (JSONFileSnapshot::TryGetOrdinal(file, coordinator_ordinal)) {
+		file_list_idx = optional_idx(coordinator_ordinal);
+	}
 }
 
 void JSONReader::OpenJSONFile() {
