@@ -144,6 +144,28 @@ def test_descriptor_round_trip_preserves_ordered_dependency_identity(tmp_path):
     assert restored.to_json() == root.to_json()
 
 
+def test_descriptor_keeps_runtime_source_id_separate_from_footer_compatibility_version(tmp_path, monkeypatch):
+    platform = _runtime_platform()
+    compatibility_version = extension_module._native_extension_compatibility_version()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=compatibility_version,
+    )
+    full_source_id = "a" * 40
+    monkeypatch.setattr(extension_module, "_runtime_identity", lambda: (full_source_id, vane.__version__))
+
+    descriptor = _descriptor(artifact_path, name="root")
+    resolved = _resolver(tmp_path / "verified").resolve(
+        RecordingConnection(platform),
+        descriptor,
+        artifact=artifact_path,
+    )
+
+    assert descriptor.duckdb_source_id == full_source_id
+    assert resolved[0].descriptor == descriptor
+
+
 def test_descriptor_rejects_duckdb_aliases(tmp_path):
     artifact_path = _write_extension_artifact(
         tmp_path / "http.duckdb_extension",
@@ -392,6 +414,7 @@ def test_default_cache_uses_duckdb_extension_directory(tmp_path, monkeypatch):
 
     assert resolved[0].path.parent.parent.parent == extension_directory / ".vane" / "verified-v1"
     if os.name != "nt":
+        assert stat.S_IMODE(extension_directory.stat().st_mode) == 0o700
         assert stat.S_IMODE((extension_directory / ".vane").stat().st_mode) == 0o700
 
 
@@ -523,6 +546,30 @@ def test_shared_writable_content_cache_fails_closed(tmp_path):
             descriptor,
             artifact=artifact_path,
         )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cache isolation is represented by DACLs")
+def test_cache_root_rejects_a_replaceable_ancestor_but_allows_a_sticky_parent(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    shared_parent = tmp_path / "shared"
+    shared_parent.mkdir(mode=0o777)
+    shared_parent.chmod(0o777)
+    cache_directory = shared_parent / "verified"
+    resolver = _resolver(cache_directory)
+
+    with pytest.raises(DynamicExtensionError, match="replaceable ancestor"):
+        resolver.resolve(RecordingConnection(platform), descriptor, artifact=artifact_path)
+
+    shared_parent.chmod(0o1777)
+    resolved = resolver.resolve(RecordingConnection(platform), descriptor, artifact=artifact_path)
+
+    assert resolved[0].path.is_file()
 
 
 def test_resolver_rejects_a_requested_descriptor_that_differs_from_the_provider(tmp_path):

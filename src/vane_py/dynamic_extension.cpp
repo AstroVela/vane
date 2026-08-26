@@ -150,6 +150,7 @@ void InitializeDynamicExtensionBindings(py::module_ &module) {
 	    },
 	    py::kw_only(), py::arg("connection").none(false));
 	module.def("_dynamic_extension_platform", &DuckDB::Platform);
+	module.def("_dynamic_extension_compatibility_version", &ExtensionHelper::GetVersionDirectoryName);
 	module.def("_secure_dynamic_extension_cache_path", &SecureDynamicExtensionCachePath, py::arg("path"), py::kw_only(),
 	           py::arg("directory"));
 	module.def("_inspect_dynamic_extension", &InspectDynamicExtension, py::arg("path"));

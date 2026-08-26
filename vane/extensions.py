@@ -35,6 +35,7 @@ _TRUST_IDENTITY_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
 _CAPI_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _WINDOWS_PERMISSION_MODEL = os.name == "nt"
 _WRITE_PERMISSION_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+_SHARED_DIRECTORY_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
 
 
 def _snapshot_mode_is_read_only(mode: int) -> bool:
@@ -452,6 +453,7 @@ class DynamicExtensionResolver:
 
         current_source_id, current_vane_version = _runtime_identity()
         current_platform = _native_platform()
+        current_extension_compatibility_version = _native_extension_compatibility_version()
         for candidate, _ in load_plan:
             self._validate_runtime_compatibility(
                 candidate,
@@ -468,6 +470,7 @@ class DynamicExtensionResolver:
                     candidate_path,
                     cache_root=cache_root,
                     current_platform=current_platform,
+                    current_extension_compatibility_version=current_extension_compatibility_version,
                 ),
             )
             for candidate, candidate_path in load_plan
@@ -586,6 +589,7 @@ class DynamicExtensionResolver:
         *,
         cache_root: Path,
         current_platform: str,
+        current_extension_compatibility_version: str,
     ) -> Path:
         expected_filename = f"{descriptor.name}.duckdb_extension"
         if artifact_path.name != expected_filename:
@@ -605,6 +609,7 @@ class DynamicExtensionResolver:
                 descriptor,
                 snapshot_path,
                 current_platform=current_platform,
+                current_extension_compatibility_version=current_extension_compatibility_version,
             )
             return snapshot_path
 
@@ -635,7 +640,12 @@ class DynamicExtensionResolver:
                     f"verified artifact snapshot is not read-only: {staging_path}",
                 )
             metadata = _inspect_native_extension(staging_path)
-            self._validate_native_metadata(descriptor, metadata, current_platform=current_platform)
+            self._validate_native_metadata(
+                descriptor,
+                metadata,
+                current_platform=current_platform,
+                current_extension_compatibility_version=current_extension_compatibility_version,
+            )
             self._prepare_cache_directory(digest_directory)
             try:
                 os.rename(staging_directory, artifact_directory)
@@ -650,6 +660,7 @@ class DynamicExtensionResolver:
                     descriptor,
                     snapshot_path,
                     current_platform=current_platform,
+                    current_extension_compatibility_version=current_extension_compatibility_version,
                 )
             else:
                 self._prepare_cache_directory(artifact_directory)
@@ -699,6 +710,7 @@ class DynamicExtensionResolver:
         snapshot_path: Path,
         *,
         current_platform: str,
+        current_extension_compatibility_version: str,
     ) -> None:
         if snapshot_path.is_symlink() or not snapshot_path.is_file():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is invalid: {snapshot_path}")
@@ -715,7 +727,12 @@ class DynamicExtensionResolver:
         if _sha256_file(snapshot_path) != descriptor.sha256:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache digest is invalid: {snapshot_path}")
         metadata = _inspect_native_extension(snapshot_path)
-        self._validate_native_metadata(descriptor, metadata, current_platform=current_platform)
+        self._validate_native_metadata(
+            descriptor,
+            metadata,
+            current_platform=current_platform,
+            current_extension_compatibility_version=current_extension_compatibility_version,
+        )
 
     @staticmethod
     def _validate_native_metadata(
@@ -723,6 +740,7 @@ class DynamicExtensionResolver:
         metadata: _NativeExtensionMetadata,
         *,
         current_platform: str,
+        current_extension_compatibility_version: str,
     ) -> None:
         if metadata.canonical_name != descriptor.name:
             _fail(
@@ -756,10 +774,13 @@ class DynamicExtensionResolver:
                     f"{descriptor.identity} requires C API {descriptor.duckdb_capi_version}, "
                     f"artifact footer has {metadata.duckdb_capi_version}",
                 )
-        elif metadata.duckdb_version != descriptor.duckdb_source_id:
+        # DuckDB's CPP footer uses its native extension compatibility version,
+        # which is distinct from the full engine SourceID pinned by the descriptor.
+        elif metadata.duckdb_version != current_extension_compatibility_version:
             _fail(
                 "SOURCE_ID_MISMATCH",
-                f"{descriptor.identity} footer SourceID is {metadata.duckdb_version}",
+                f"{descriptor.identity} footer compatibility version is {metadata.duckdb_version}, "
+                f"runtime expects {current_extension_compatibility_version}",
             )
         if metadata.compatibility_error:
             if descriptor.abi_type == "C_STRUCT":
@@ -777,28 +798,101 @@ class DynamicExtensionResolver:
         if root is None:
             vane_directory = self._prepare_cache_directory(_native_extension_directory(connection) / ".vane")
             root = vane_directory / "verified-v1"
-        return self._prepare_cache_directory(root)
+        root = self._prepare_cache_directory(root)
+        if not _WINDOWS_PERMISSION_MODEL:
+            self._validate_posix_cache_ancestors(root)
+        return root
 
     @staticmethod
-    def _prepare_cache_directory(path: Path) -> Path:
+    def _validate_posix_cache_ancestors(path: Path) -> None:
+        trusted_owners = {0, os.geteuid()}
         try:
-            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            child_metadata = path.lstat()
+            if not stat.S_ISDIR(child_metadata.st_mode) or child_metadata.st_uid not in trusted_owners:
+                _fail(
+                    "ARTIFACT_CACHE_CORRUPT",
+                    f"verified artifact cache directory is invalid: {path}",
+                )
+            for ancestor in path.parents:
+                ancestor_metadata = ancestor.lstat()
+                if not stat.S_ISDIR(ancestor_metadata.st_mode):
+                    _fail(
+                        "ARTIFACT_CACHE_CORRUPT",
+                        f"verified artifact cache ancestor is invalid: {ancestor}",
+                    )
+                if ancestor_metadata.st_uid not in trusted_owners:
+                    _fail(
+                        "ARTIFACT_CACHE_CORRUPT",
+                        f"verified artifact cache has a replaceable ancestor: {ancestor}",
+                    )
+                ancestor_mode = stat.S_IMODE(ancestor_metadata.st_mode)
+                if ancestor_mode & _SHARED_DIRECTORY_WRITE_BITS and (
+                    not (ancestor_mode & stat.S_ISVTX) or child_metadata.st_uid not in trusted_owners
+                ):
+                    _fail(
+                        "ARTIFACT_CACHE_CORRUPT",
+                        f"verified artifact cache has a replaceable ancestor: {ancestor}",
+                    )
+                child_metadata = ancestor_metadata
+        except DynamicExtensionError:
+            raise
+        except OSError as exception:
+            raise DynamicExtensionError(
+                "ARTIFACT_CACHE_CORRUPT",
+                f"could not inspect verified artifact cache ancestors: {path}",
+            ) from exception
+
+    @staticmethod
+    def _create_missing_cache_directories(path: Path) -> None:
+        missing_directories: list[Path] = []
+        candidate = path
+        try:
+            while True:
+                try:
+                    candidate.lstat()
+                    break
+                except FileNotFoundError:
+                    missing_directories.append(candidate)
+                    parent = candidate.parent
+                    if parent == candidate:
+                        raise
+                    candidate = parent
+
+            for directory in reversed(missing_directories):
+                try:
+                    directory.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
+                directory_metadata = directory.lstat()
+                if not stat.S_ISDIR(directory_metadata.st_mode):
+                    _fail(
+                        "ARTIFACT_CACHE_CORRUPT",
+                        f"verified artifact cache directory is invalid: {directory}",
+                    )
+                if _WINDOWS_PERMISSION_MODEL and directory != path:
+                    _secure_native_cache_path(directory, directory=True)
         except OSError as exception:
             raise DynamicExtensionError(
                 "ARTIFACT_SNAPSHOT_FAILED", f"could not create verified artifact cache directory: {path}"
             ) from exception
-        if path.is_symlink() or not path.is_dir():
-            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is invalid: {path}")
-        if _WINDOWS_PERMISSION_MODEL:
-            _secure_native_cache_path(path, directory=True)
-            return path
+
+    @staticmethod
+    def _prepare_cache_directory(path: Path) -> Path:
+        DynamicExtensionResolver._create_missing_cache_directories(path)
         try:
-            directory_mode = path.stat().st_mode
+            directory_metadata = path.lstat()
         except OSError as exception:
             raise DynamicExtensionError(
                 "ARTIFACT_CACHE_CORRUPT", f"could not inspect verified artifact cache directory: {path}"
             ) from exception
-        if stat.S_IMODE(directory_mode) != 0o700:
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is invalid: {path}")
+        if _WINDOWS_PERMISSION_MODEL:
+            _secure_native_cache_path(path, directory=True)
+            return path
+        if directory_metadata.st_uid not in {0, os.geteuid()}:
+            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory has an untrusted owner: {path}")
+        if stat.S_IMODE(directory_metadata.st_mode) != 0o700:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is not private: {path}")
         return path
 
@@ -879,11 +973,20 @@ def create_dynamic_extension_descriptor(
             dependencies=dependency_values,
             duckdb_capi_version=metadata.duckdb_capi_version,
         )
+    # Preserve the complete runtime SourceID in the descriptor. DuckDB's native
+    # footer compatibility identity is validated independently.
+    extension_compatibility_version = _native_extension_compatibility_version()
+    if metadata.duckdb_version != extension_compatibility_version:
+        _fail(
+            "SOURCE_ID_MISMATCH",
+            f"artifact footer compatibility version is {metadata.duckdb_version}, "
+            f"runtime expects {extension_compatibility_version}",
+        )
     return DynamicExtensionDescriptor(
         name=validated_name,
         extension_version=metadata.extension_version,
         abi_type=metadata.abi_type,
-        duckdb_source_id=_validate_source_id(metadata.duckdb_version, "artifact footer SourceID"),
+        duckdb_source_id=source_id,
         vane_version=descriptor_vane_version,
         platform=metadata.platform,
         sha256=artifact_digest,
@@ -904,6 +1007,21 @@ def _native_platform() -> str:
     if not isinstance(platform, str):
         _fail("RUNTIME_IDENTITY_UNAVAILABLE", "DuckDB returned a non-string runtime platform")
     return _validate_platform(platform)
+
+
+def _native_extension_compatibility_version() -> str:
+    from vane import _native
+
+    try:
+        version = _native._dynamic_extension_compatibility_version()
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "RUNTIME_IDENTITY_UNAVAILABLE",
+            "DuckDB could not report its extension compatibility version",
+        ) from exception
+    if not isinstance(version, str):
+        _fail("RUNTIME_IDENTITY_UNAVAILABLE", "DuckDB returned a non-string extension compatibility version")
+    return _require_string(version, "runtime DuckDB extension compatibility version")
 
 
 def _native_extension_directory(connection: DuckDBPyConnection) -> Path:
