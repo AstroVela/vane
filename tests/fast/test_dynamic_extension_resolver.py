@@ -418,6 +418,54 @@ def test_default_cache_uses_duckdb_extension_directory(tmp_path, monkeypatch):
         assert stat.S_IMODE((extension_directory / ".vane").stat().st_mode) == 0o700
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows directory privacy is represented by its DACL, not umask")
+def test_new_cache_and_staging_directories_ignore_a_restrictive_umask(tmp_path, monkeypatch):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    cache_directory = tmp_path / "nested" / "verified"
+    private_directory_modes = []
+    private_file_modes = []
+    copy_and_hash_artifact = extension_module._copy_and_hash_artifact
+    inspect_native_extension = extension_module._inspect_native_extension
+
+    def record_private_directory_mode(source, destination):
+        private_directory_modes.append(stat.S_IMODE(destination.parent.stat().st_mode))
+        return copy_and_hash_artifact(source, destination)
+
+    def record_private_file_mode(path):
+        private_file_modes.append(stat.S_IMODE(path.stat().st_mode))
+        return inspect_native_extension(path)
+
+    monkeypatch.setattr(extension_module, "_copy_and_hash_artifact", record_private_directory_mode)
+    monkeypatch.setattr(extension_module, "_inspect_native_extension", record_private_file_mode)
+    previous_umask = os.umask(0o777)
+    try:
+        descriptor = _descriptor(artifact_path, name="root")
+        resolved = _resolver(cache_directory).resolve(
+            RecordingConnection(platform),
+            descriptor,
+            artifact=artifact_path,
+        )[0]
+    finally:
+        os.umask(previous_umask)
+
+    assert private_directory_modes == [0o700, 0o700]
+    assert private_file_modes == [0o400, 0o400]
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o700
+        for path in (
+            cache_directory.parent,
+            cache_directory,
+            resolved.path.parent.parent,
+            resolved.path.parent,
+        )
+    )
+
+
 def test_content_cache_with_writable_snapshot_fails_closed(tmp_path):
     platform = _runtime_platform()
     artifact_path = _write_extension_artifact(

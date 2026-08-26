@@ -59,6 +59,25 @@ def _fail(code: str, message: str) -> NoReturn:
     raise DynamicExtensionError(code, message)
 
 
+def _make_snapshot_read_only(path: Path, *, description: str) -> None:
+    try:
+        path.chmod(0o400)
+    except OSError as exception:
+        raise DynamicExtensionError(
+            "ARTIFACT_SNAPSHOT_FAILED",
+            f"could not make {description} read-only: {path}",
+        ) from exception
+    try:
+        mode = path.stat().st_mode
+    except OSError as exception:
+        raise DynamicExtensionError(
+            "ARTIFACT_SNAPSHOT_FAILED",
+            f"could not inspect {description} permissions: {path}",
+        ) from exception
+    if not _snapshot_mode_is_read_only(mode):
+        _fail("ARTIFACT_SNAPSHOT_FAILED", f"{description} is not read-only: {path}")
+
+
 def _require_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         _fail("DESCRIPTOR_INVALID", f"{field_name} must be a non-empty string")
@@ -616,29 +635,13 @@ class DynamicExtensionResolver:
         staging_directory = Path(tempfile.mkdtemp(prefix=f".{descriptor.name}-", dir=cache_root))
         staging_path = staging_directory / expected_filename
         try:
-            if _WINDOWS_PERMISSION_MODEL:
-                _secure_native_cache_path(staging_directory, directory=True)
+            self._prepare_created_private_directory(
+                staging_directory,
+                description="verified artifact staging",
+            )
             actual_digest = _copy_and_hash_artifact(artifact_path, staging_path)
             self._validate_digest(descriptor, actual_digest)
-            try:
-                staging_path.chmod(0o400)
-            except OSError as exception:
-                raise DynamicExtensionError(
-                    "ARTIFACT_SNAPSHOT_FAILED",
-                    f"could not make verified artifact snapshot read-only: {artifact_path}",
-                ) from exception
-            try:
-                staging_mode = staging_path.stat().st_mode
-            except OSError as exception:
-                raise DynamicExtensionError(
-                    "ARTIFACT_SNAPSHOT_FAILED",
-                    f"could not inspect verified artifact snapshot permissions: {staging_path}",
-                ) from exception
-            if not _snapshot_mode_is_read_only(staging_mode):
-                _fail(
-                    "ARTIFACT_SNAPSHOT_FAILED",
-                    f"verified artifact snapshot is not read-only: {staging_path}",
-                )
+            _make_snapshot_read_only(staging_path, description="verified artifact snapshot")
             metadata = _inspect_native_extension(staging_path)
             self._validate_native_metadata(
                 descriptor,
@@ -870,10 +873,14 @@ class DynamicExtensionResolver:
                     candidate = parent
 
             for directory in reversed(missing_directories):
+                created = False
                 try:
                     directory.mkdir(mode=0o700)
+                    created = True
                 except FileExistsError:
                     pass
+                if created and not _WINDOWS_PERMISSION_MODEL:
+                    directory.chmod(0o700)
                 directory_metadata = directory.lstat()
                 if not stat.S_ISDIR(directory_metadata.st_mode):
                     _fail(
@@ -906,6 +913,18 @@ class DynamicExtensionResolver:
         if stat.S_IMODE(directory_metadata.st_mode) != 0o700:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is not private: {path}")
         return path
+
+    @staticmethod
+    def _prepare_created_private_directory(path: Path, *, description: str) -> Path:
+        if not _WINDOWS_PERMISSION_MODEL:
+            try:
+                path.chmod(0o700)
+            except OSError as exception:
+                raise DynamicExtensionError(
+                    "ARTIFACT_SNAPSHOT_FAILED",
+                    f"could not normalize {description} directory: {path}",
+                ) from exception
+        return DynamicExtensionResolver._prepare_cache_directory(path)
 
     @staticmethod
     def _provenance_matches(
@@ -951,8 +970,15 @@ def create_dynamic_extension_descriptor(
     if not artifact_path.is_file():
         _fail("ARTIFACT_NOT_FOUND", f"artifact does not exist: {artifact_path}")
     with tempfile.TemporaryDirectory(prefix="vane-extension-descriptor-") as snapshot_directory:
-        snapshot_path = Path(snapshot_directory) / expected_filename
+        snapshot_root = Path(snapshot_directory)
+        DynamicExtensionResolver._prepare_created_private_directory(
+            snapshot_root,
+            description="descriptor snapshot",
+        )
+        snapshot_path = snapshot_root / expected_filename
         artifact_digest = _copy_and_hash_artifact(artifact_path, snapshot_path)
+        if not _WINDOWS_PERMISSION_MODEL:
+            _make_snapshot_read_only(snapshot_path, description="descriptor snapshot")
         metadata = _inspect_native_extension(snapshot_path)
     if metadata.canonical_name != validated_name:
         _fail("NAME_MISMATCH", f"DuckDB canonicalizes {artifact_path.name} as {metadata.canonical_name}")
