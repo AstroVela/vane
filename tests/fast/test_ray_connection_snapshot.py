@@ -9,6 +9,7 @@ import threading
 import pytest
 
 import vane
+import vane.extensions as extension_module
 
 
 def _require_ray_cxx():
@@ -187,6 +188,26 @@ def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
         planning_connection.close()
     del physical_plan
     gc.collect()
+
+
+def _dynamic_snapshot_descriptor(*, name="dynamic_test", dependencies=None):
+    connection = vane.connect()
+    try:
+        platform = connection.execute("SELECT platform FROM pragma_platform()").fetchone()[0]
+    finally:
+        connection.close()
+    return {
+        "format_version": 1,
+        "name": name,
+        "extension_version": "test-version",
+        "abi_type": "CPP",
+        "duckdb_source_id": vane.__git_revision__,
+        "vane_version": vane.__version__,
+        "platform": platform,
+        "sha256": "1" * 64,
+        "trust_identity": "local-tests",
+        "dependencies": list(dependencies or []),
+    }
 
 
 def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
@@ -676,15 +697,18 @@ def test_worker_nondefault_snapshot_reuses_database(monkeypatch):
             effective_s3_config={},
             use_session_credentials=True,
         )
+        actor_class._prepare_snapshot_database(
+            actor,
+            query_id,
+            database_identity=database_identity,
+        )
         first_cursor = actor_class._get_snapshot_execution_cursor(
             actor,
-            bootstrap_connection,
             query_id,
             database_identity=database_identity,
         )
         second_cursor = actor_class._get_snapshot_execution_cursor(
             actor,
-            bootstrap_connection,
             query_id,
             database_identity=database_identity,
         )
@@ -764,7 +788,6 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
     actor._shutdown_started = False
     actor._duckdb_memory_bytes = 256 * 1024**2
     monkeypatch.setenv("VANE_DUCKDB_THREADS", "1")
-    bootstrap_connection = vane.connect()
     first_cursor = None
     second_cursor = None
     first_query_id = "snapshot-file-identity-first"
@@ -785,15 +808,23 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
             effective_s3_config={},
             use_session_credentials=True,
         )
-        first_cursor = actor_class._get_snapshot_execution_cursor(
+        actor_class._prepare_snapshot_database(
             actor,
-            bootstrap_connection,
             first_query_id,
             database_identity=first_identity,
         )
+        first_cursor = actor_class._get_snapshot_execution_cursor(
+            actor,
+            first_query_id,
+            database_identity=first_identity,
+        )
+        actor_class._prepare_snapshot_database(
+            actor,
+            second_query_id,
+            database_identity=second_identity,
+        )
         second_cursor = actor_class._get_snapshot_execution_cursor(
             actor,
-            bootstrap_connection,
             second_query_id,
             database_identity=second_identity,
         )
@@ -825,7 +856,6 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
             snapshot_connection.close()
         ray_cxx._cleanup_query_python_replay_state(first_query_id)
         ray_cxx._cleanup_query_python_replay_state(second_query_id)
-        bootstrap_connection.close()
 
 
 def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_path):
@@ -851,11 +881,10 @@ def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_p
     del source_connection
     gc.collect()
 
-    bootstrap_connection = vane.connect()
     resolved_connection = None
     try:
         assert ray_cxx._register_query_python_replay_state(query_id, restored_plan) is True
-        resolved_connection = ray_cxx._resolve_query_snapshot_connection(bootstrap_connection, query_id)
+        resolved_connection = ray_cxx._prepare_query_snapshot_connection(query_id)
 
         assert resolved_connection.execute("SELECT current_setting('allow_persistent_secrets')").fetchone() == (False,)
         identity_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
@@ -873,7 +902,63 @@ def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_p
         ray_cxx._cleanup_query_python_replay_state(query_id)
         if resolved_connection is not None:
             resolved_connection.close()
-        bootstrap_connection.close()
+
+
+def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
+    ray_cxx = _require_ray_cxx()
+    query_id = "snapshot-worker-local-extension-locations"
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(source_connection.sql("SELECT 1"), query_id)
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    coordinator_extension_directory = tmp_path / "coordinator-extensions"
+    coordinator_home_directory = tmp_path / "coordinator-home"
+    snapshot["bootstrap"] = {
+        "database": ":memory:",
+        "read_only": False,
+        "config": {
+            "extension_directory": str(coordinator_extension_directory),
+            "extension_directories": [str(coordinator_extension_directory / "secondary")],
+            "home_directory": str(coordinator_home_directory),
+            "custom_extension_repository": "http://127.0.0.1:9/custom",
+            "autoinstall_extension_repository": "http://127.0.0.1:9/autoinstall",
+        },
+    }
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    prepared_connection = None
+    try:
+        assert ray_cxx._register_query_python_replay_state(query_id, replay_plan) is True
+        prepared_connection = ray_cxx._prepare_query_snapshot_connection(query_id)
+        settings = dict(
+            prepared_connection.execute(
+                "SELECT name, value FROM duckdb_settings() "
+                "WHERE name IN ('extension_directory', 'extension_directories', 'home_directory', "
+                "'custom_extension_repository', 'autoinstall_extension_repository')"
+            ).fetchall()
+        )
+        serialized_settings = repr(settings)
+        assert str(coordinator_extension_directory) not in serialized_settings
+        assert str(coordinator_home_directory) not in serialized_settings
+        assert "127.0.0.1:9" not in serialized_settings
+
+        identity_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            prepared_connection.sql("SELECT 1"),
+            f"{query_id}-identity",
+        )
+        identity_config = identity_plan.__getstate__()[3]["bootstrap"]["config"]
+        assert identity_config["extension_directory"] == str(coordinator_extension_directory)
+        assert identity_config["home_directory"] == str(coordinator_home_directory)
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        if prepared_connection is not None:
+            prepared_connection.close()
+        source_connection.close()
+
+    assert not coordinator_extension_directory.exists()
+    assert not coordinator_home_directory.exists()
 
 
 def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():
@@ -948,6 +1033,7 @@ def test_connection_snapshot_captures_exact_extension_contract():
     assert snapshot["duckdb_source_id"]
     assert isinstance(snapshot["extensions"], list)
     assert all(set(extension) >= {"name", "version"} for extension in snapshot["extensions"])
+    assert snapshot["dynamic_extensions"] == []
     assert snapshot["distributed_extension_contracts"] == [
         "json{table_function:json_each(JSON)@1,"
         "table_function:json_each(JSON, VARCHAR)@1,"
@@ -974,6 +1060,23 @@ def test_connection_snapshot_captures_exact_extension_contract():
         "table_function:repeat_row([ANY...])@1,"
         "table_function:unnest(ANY)@1}",
     ]
+
+
+def test_connection_snapshot_rejects_recorded_dynamic_descriptor_without_loaded_extension():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    descriptor = _dynamic_snapshot_descriptor()
+    connection._record_dynamic_extension_snapshot_entry(
+        extension_module.DynamicExtensionDescriptor.from_dict(descriptor).to_json()
+    )
+    try:
+        with pytest.raises(Exception, match="Dynamic extension identities changed while capturing"):
+            ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                connection.sql("SELECT 1"),
+                "snapshot-recorded-dynamic-without-native-load",
+            )
+    finally:
+        connection.close()
 
 
 def test_snapshot_replay_rejects_different_duckdb_source_id():
@@ -1086,6 +1189,7 @@ def test_logical_snapshot_validates_manifest_before_applying_effective_s3_config
     [
         ("duckdb_source_id", "missing duckdb_source_id"),
         ("extensions", "extensions must be a list"),
+        ("dynamic_extensions", "dynamic_extensions must be a list"),
         ("distributed_extension_contracts", "distributed_extension_contracts must be a list"),
     ],
 )
@@ -1187,6 +1291,73 @@ def test_snapshot_replay_rejects_non_static_extensions_without_installing(tmp_pa
     assert "sqlite_scanner" in message
     assert "Failed to download extension" not in message
     assert not extension_directory.exists()
+
+
+def test_worker_preparation_rejects_missing_dynamic_provider_without_downloading(tmp_path, monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    monkeypatch.setattr(extension_module, "entry_points", lambda *, group: ())
+    query_id = "snapshot-missing-dynamic-provider"
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(source_connection.sql("SELECT 1"), query_id)
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    extension_directory = tmp_path / "extensions"
+    snapshot["bootstrap"] = {
+        "database": ":memory:",
+        "read_only": False,
+        "config": {
+            "allow_unsigned_extensions": "true",
+            "autoinstall_known_extensions": "true",
+            "autoload_known_extensions": "true",
+            "custom_extension_repository": "http://127.0.0.1:9",
+            "extension_directory": str(extension_directory),
+        },
+    }
+    snapshot["dynamic_extensions"] = [_dynamic_snapshot_descriptor()]
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    try:
+        assert ray_cxx._register_query_python_replay_state(query_id, replay_plan) is True
+        with pytest.raises(Exception, match="VANE_DYNAMIC_EXTENSION_PROVIDER_NOT_FOUND"):
+            ray_cxx._prepare_query_snapshot_connection(query_id)
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        source_connection.close()
+
+    assert not extension_directory.exists()
+
+
+def test_task_admission_does_not_discover_or_load_missing_dynamic_extension(monkeypatch):
+    ray_cxx = _require_ray_cxx()
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: pytest.fail("task admission must not discover dynamic extension providers"),
+    )
+    query_id = "snapshot-task-admission-dynamic-verify-only"
+    source_connection = vane.connect()
+    logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        query_id,
+    )
+    physical_plan = logical_plan.to_physical_plan(vane.connect())
+    state = list(physical_plan.__getstate__())
+    snapshot = dict(state[6])
+    snapshot["dynamic_extensions"] = [_dynamic_snapshot_descriptor()]
+    state[6] = snapshot
+    replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+    replay_plan.__setstate__(tuple(state))
+    unprepared_connection = vane.connect()
+    try:
+        assert ray_cxx._register_query_python_replay_state(query_id, replay_plan) is True
+        with pytest.raises(Exception, match="recorded dynamic extension manifest differs"):
+            ray_cxx._validate_query_snapshot_connection(unprepared_connection.cursor(), query_id)
+    finally:
+        ray_cxx._cleanup_query_python_replay_state(query_id)
+        unprepared_connection.close()
+        source_connection.close()
 
 
 def test_snapshot_bootstrap_is_sanitized_before_connect(tmp_path):

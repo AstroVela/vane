@@ -91,8 +91,14 @@ def require_ray_cxx_attr(
 
 @overload
 def require_ray_cxx_attr(
-    name: Literal["_resolve_query_snapshot_connection"], *, hint: str | None = None
-) -> Callable[[object, str], object]: ...
+    name: Literal["_prepare_query_snapshot_connection"], *, hint: str | None = None
+) -> Callable[[str], object]: ...
+
+
+@overload
+def require_ray_cxx_attr(
+    name: Literal["_validate_query_snapshot_connection"], *, hint: str | None = None
+) -> Callable[[object, str], None]: ...
 
 
 @overload

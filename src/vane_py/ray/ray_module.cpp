@@ -302,7 +302,7 @@ static py::object ResolveFlightShuffleCleanupConnection(py::object cleanup_conne
 	snapshot_options.apply_s3_credentials = apply_snapshot_s3_credentials;
 	ValidateConnectionSnapshotExtensions(resolved_connection, connection_snapshot,
 	                                     snapshot_options.enforce_extension_security);
-	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot, "httpfs")) {
+	if (ConnectionSnapshotDeclaresExtension(connection_snapshot, "httpfs")) {
 		ApplyEffectiveVaneSessionConfig(resolved_wrapper, effective_session_config);
 	}
 	ApplyConnectionSnapshot(resolved_connection, connection_snapshot, snapshot_options);
@@ -731,17 +731,31 @@ void register_ray_bindings(py::module_ &mod) {
 	    [](const string &query_id) { return LookupQueryConnectionSnapshot(query_id); }, py::arg("query_id"));
 
 	m.def(
-	    "_resolve_query_snapshot_connection",
-	    [](py::object, const string &query_id) {
+	    "_prepare_query_snapshot_connection",
+	    [](const string &query_id) {
 		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
 		    if (snapshot.is_none()) {
 			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
 		    }
-		    // Ray workers cache this connection by the snapshot's exact engine,
-		    // extension, and replay-setting identity. Always create its
-		    // DatabaseInstance independently from the session bootstrap so
-		    // database-global state from one query cannot contaminate another.
-		    return CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true, true);
+		    // Create and fully prepare an isolated DatabaseInstance before the
+		    // worker admits any task that can deserialize this physical plan.
+		    auto connection =
+		        CreateConnectionFromBootstrapSnapshot(LookupBootstrapSnapshot(snapshot), false, true, true);
+		    PrepareConnectionSnapshotExtensions(connection, snapshot);
+		    return connection;
+	    },
+	    py::arg("query_id"));
+
+	m.def(
+	    "_validate_query_snapshot_connection",
+	    [](py::object connection, const string &query_id) {
+		    auto snapshot = LookupQueryConnectionSnapshot(query_id);
+		    if (snapshot.is_none()) {
+			    throw std::runtime_error("query connection snapshot is unavailable: " + query_id);
+		    }
+		    // Admission is verification-only for dynamic artifacts. Provider
+		    // discovery and dynamic loading are confined to preparation above.
+		    ValidateConnectionSnapshotExtensions(connection, snapshot, true);
 	    },
 	    py::arg("connection"), py::arg("query_id"));
 
@@ -1046,7 +1060,7 @@ void register_ray_bindings(py::module_ &mod) {
 				    conn_obj = conn_obj.attr("c");
 			    }
 			    auto &py_conn = conn_obj.cast<DuckDBPyConnection &>();
-			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn);
+			    result.connection_snapshot_ = CaptureConnectionSnapshot(py_conn, conn_obj);
 		    }
 		    return result;
 	    },
@@ -1736,12 +1750,12 @@ void register_ray_bindings(py::module_ &mod) {
 				        // connection and are materialized against conn_obj below.
 				        py::object exec_conn = plan.resolve_execution_connection(conn_obj);
 				        const bool apply_snapshot_session_config = effective_session_config_obj.is_none();
-				        // Establish the exact extension set before refreshed AWS
-				        // settings can load httpfs into this DatabaseInstance. Replay the
-				        // full snapshot only after the environment/profile baseline so
-				        // explicit source-connection settings retain normal precedence.
+				        // Establish the exact extension set before applying refreshed AWS
+				        // settings. Replay the full snapshot only after the
+				        // environment/profile baseline so explicit source-connection
+				        // settings retain normal precedence.
 				        ValidateConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_, true);
-				        if (ConnectionSnapshotDeclaresStaticExtension(plan.connection_snapshot_, "httpfs")) {
+				        if (ConnectionSnapshotDeclaresExtension(plan.connection_snapshot_, "httpfs")) {
 					        ApplyEffectiveVaneSessionConfig(ExtractPyConnectionWrapper(exec_conn),
 					                                        effective_session_config_obj);
 				        }

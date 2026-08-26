@@ -1055,12 +1055,15 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;
 	snapshot_options.apply_attached_databases = !shares_source_database;
-	// Validate and load the exact static extension set before refreshed AWS
-	// settings are allowed to execute LOAD httpfs. A snapshot that does not
-	// declare httpfs must leave the planning DatabaseInstance uncontaminated.
+	if (!shares_source_database && SnapshotHasDynamicExtensions(connection_snapshot_)) {
+		PrepareConnectionSnapshotExtensions(planning_conn, connection_snapshot_);
+	}
+	// Validate and load the exact extension set before refreshed AWS settings
+	// are applied. A snapshot that does not declare httpfs must leave the
+	// planning DatabaseInstance uncontaminated.
 	ValidateConnectionSnapshotExtensions(planning_conn, connection_snapshot_,
 	                                     snapshot_options.enforce_extension_security);
-	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot_, "httpfs")) {
+	if (ConnectionSnapshotDeclaresExtension(connection_snapshot_, "httpfs")) {
 		// Resolved environment/profile credentials are the session baseline.
 		// Replay the source connection below so explicit source SET values retain
 		// DuckDB's normal precedence.

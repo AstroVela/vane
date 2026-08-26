@@ -45,6 +45,26 @@ def _snapshot_database_identity(
     )
 
 
+def _dynamic_descriptor(*, name="root", sha256="1" * 64, dependencies=None):
+    connection = vane.connect()
+    try:
+        platform = connection.execute("SELECT platform FROM pragma_platform()").fetchone()[0]
+    finally:
+        connection.close()
+    return {
+        "format_version": 1,
+        "name": name,
+        "extension_version": "test-version",
+        "abi_type": "CPP",
+        "duckdb_source_id": vane.__git_revision__,
+        "vane_version": vane.__version__,
+        "platform": platform,
+        "sha256": sha256,
+        "trust_identity": "local-tests",
+        "dependencies": list(dependencies or []),
+    }
+
+
 def test_worker_shared_database_disables_persistent_secrets_at_connect(monkeypatch):
     actor_class, actor = _worker_actor()
     actor._shared_conn = None
@@ -76,12 +96,13 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         "test-source-id",
         (),
         (),
+        (),
         "",
         "",
         False,
     )
     cursors = []
-    resolve_calls = []
+    prepare_calls = []
     lifecycle = []
 
     class Cursor:
@@ -95,7 +116,6 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
             cursors.append(cursor)
             return cursor
 
-    bootstrap_connection = object()
     resolved_connection = ResolvedConnection()
     configured_connections = []
 
@@ -108,32 +128,40 @@ def test_worker_snapshot_execution_cursor_caches_nondefault_database(monkeypatch
         worker_module,
         "require_ray_cxx_attr",
         lambda name, *, hint: (
-            lambda connection, query_id: (
-                resolve_calls.append((connection, query_id)),
-                lifecycle.append("resolve"),
+            lambda query_id: (
+                prepare_calls.append(query_id),
+                lifecycle.append("prepare"),
                 resolved_connection,
             )[2]
         ),
     )
 
+    actor_class._prepare_snapshot_database(
+        actor,
+        "query-a",
+        database_identity=database_identity,
+    )
     first = actor_class._get_snapshot_execution_cursor(
         actor,
-        bootstrap_connection,
         "query-a",
+        database_identity=database_identity,
+    )
+    actor_class._prepare_snapshot_database(
+        actor,
+        "query-b",
         database_identity=database_identity,
     )
     second = actor_class._get_snapshot_execution_cursor(
         actor,
-        bootstrap_connection,
         "query-b",
         database_identity=database_identity,
     )
 
     assert first is cursors[0]
     assert second is cursors[1]
-    assert resolve_calls == [(bootstrap_connection, "query-a")]
+    assert prepare_calls == ["query-a"]
     assert configured_connections == [resolved_connection]
-    assert lifecycle == ["resolve", "configure", "cursor", "cursor"]
+    assert lifecycle == ["prepare", "configure", "cursor", "cursor"]
     assert actor._snapshot_connections == {database_identity: resolved_connection}
     assert actor._active_snapshot_cursors == {first, second}
     actor_class._close_snapshot_execution_cursor(actor, second)
@@ -160,6 +188,7 @@ def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(
     base_snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [{"name": "httpfs", "version": "test-version"}],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -213,22 +242,30 @@ def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(
         def close(self):
             self.closed = True
 
-    def resolve(_connection, _query_id):
+    def resolve(_query_id):
         connection = ResolvedConnection()
         connections.append(connection)
         return connection
 
     monkeypatch.setattr(worker_module, "require_ray_cxx_attr", lambda name, *, hint: resolve)
 
-    old_cursor = actor_class._get_snapshot_execution_cursor(
+    actor_class._prepare_snapshot_database(
         actor,
-        object(),
         "old-query",
         database_identity=old_identity,
     )
+    old_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        "old-query",
+        database_identity=old_identity,
+    )
+    actor_class._prepare_snapshot_database(
+        actor,
+        "new-query",
+        database_identity=new_identity,
+    )
     new_cursor = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
         "new-query",
         database_identity=new_identity,
     )
@@ -244,9 +281,13 @@ def test_worker_snapshot_execution_cursor_retires_rotated_s3_database(
     assert connections[1].closed is True
     assert actor._snapshot_connections == {}
 
+    actor_class._prepare_snapshot_database(
+        actor,
+        "late-cleanup",
+        database_identity=new_identity,
+    )
     late_cleanup_cursor = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
         "late-cleanup",
         database_identity=new_identity,
     )
@@ -264,6 +305,7 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
         (),
         (),
         "test-source-id",
+        (),
         (),
         (),
         "",
@@ -290,13 +332,12 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
     monkeypatch.setattr(
         worker_module,
         "require_ray_cxx_attr",
-        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
+        lambda name, *, hint: lambda _query_id: resolved_connection,
     )
 
     with pytest.raises(RuntimeError, match="snapshot configuration failed"):
-        actor_class._get_snapshot_execution_cursor(
+        actor_class._prepare_snapshot_database(
             actor,
-            object(),
             "query-a",
             database_identity=database_identity,
         )
@@ -306,11 +347,79 @@ def test_worker_snapshot_configuration_failure_closes_uncached_database(monkeypa
     assert actor._active_snapshot_execution_cursors == 0
 
 
+def test_worker_query_snapshot_preparation_retires_database_when_session_closes_during_publish(monkeypatch):
+    actor_class, actor = _worker_actor()
+    actor._session_connections_lock = threading.RLock()
+    actor._closed_session_ids = worker_module.BoundedReplayMap(capacity=16)
+    actor._session_s3_configs = {"session-a": {}}
+    session_connection = object()
+    actor._session_connections = {"session-a": ({}, session_connection)}
+    operation_lock = threading.Lock()
+    actor._get_session_operation_lock = lambda _session_id: operation_lock
+    actor._get_session_conn = lambda _session_id, _config, *, use_session_credentials: session_connection
+    actor._refresh_session_s3_config_locked = lambda _session_id, _config, _connection, *, use_session_credentials: {}
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (("httpfs", ""),),
+        (),
+        (),
+        "session-a",
+        "test-s3-identity",
+        True,
+    )
+    closed = []
+
+    class _SnapshotConnection:
+        def close(self):
+            closed.append("snapshot")
+
+    snapshot_connection = _SnapshotConnection()
+
+    def _prepare(_query_id, *, database_identity):
+        actor._snapshot_connections[database_identity] = snapshot_connection
+        actor._closed_session_ids["session-a"] = True
+
+    actor._prepare_snapshot_database = _prepare
+    monkeypatch.setattr(
+        worker_module,
+        "_query_worker_snapshot_database_identity",
+        lambda _query_id, **_kwargs: database_identity,
+    )
+
+    class _Plan:
+        @staticmethod
+        def session_id():
+            return "session-a"
+
+        @staticmethod
+        def session_config():
+            return {}
+
+        @staticmethod
+        def has_explicit_s3_credentials():
+            return False
+
+        @staticmethod
+        def resource_query_id():
+            return "resource-query"
+
+    with pytest.raises(RuntimeError, match="session closed during snapshot preparation"):
+        actor_class._prepare_query_snapshot_database(actor, _Plan())
+
+    assert closed == ["snapshot"]
+    assert actor._snapshot_connections == {}
+
+
 def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(monkeypatch):
     actor_class, actor = _worker_actor()
     base_snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -342,7 +451,7 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
         def cursor(self):
             return Cursor(self)
 
-    def resolve(_connection, query_id):
+    def resolve(query_id):
         connection = ResolvedConnection(query_id)
         created_connections.append(connection)
         return connection
@@ -353,21 +462,33 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
         lambda name, *, hint: resolve,
     )
 
-    plain_a = actor_class._get_snapshot_execution_cursor(
+    actor_class._prepare_snapshot_database(
         actor,
-        object(),
         "plain-a",
         database_identity=identities["plain-a"],
     )
-    plain_b = actor_class._get_snapshot_execution_cursor(
+    plain_a = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
+        "plain-a",
+        database_identity=identities["plain-a"],
+    )
+    actor_class._prepare_snapshot_database(
+        actor,
         "plain-b",
         database_identity=identities["plain-b"],
     )
+    plain_b = actor_class._get_snapshot_execution_cursor(
+        actor,
+        "plain-b",
+        database_identity=identities["plain-b"],
+    )
+    actor_class._prepare_snapshot_database(
+        actor,
+        "httpfs",
+        database_identity=identities["httpfs"],
+    )
     httpfs = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
         "httpfs",
         database_identity=identities["httpfs"],
     )
@@ -383,11 +504,34 @@ def test_worker_snapshot_execution_cursor_isolates_exact_extension_identities(mo
     assert actor._active_snapshot_execution_cursors == 0
 
 
+def test_worker_snapshot_database_identity_includes_exact_dynamic_manifest():
+    base_snapshot = {
+        "duckdb_source_id": "test-source-id",
+        "extensions": [],
+        "dynamic_extensions": [_dynamic_descriptor()],
+        "distributed_extension_contracts": [],
+        "settings": [],
+    }
+    first = _snapshot_database_identity(base_snapshot)
+    second = _snapshot_database_identity(
+        {
+            **base_snapshot,
+            "dynamic_extensions": [_dynamic_descriptor(sha256="2" * 64)],
+        }
+    )
+
+    assert first != second
+    assert first.dynamic_extensions[0][0] == "root"
+    assert first.has_extension("root") is True
+    assert first.has_extension("httpfs") is False
+
+
 def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch):
     actor_class, actor = _worker_actor()
     base_snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -435,7 +579,7 @@ def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch
         def cursor(self):
             return Cursor(self)
 
-    def resolve(_connection, query_id):
+    def resolve(query_id):
         connection = ResolvedConnection(query_id)
         created_connections.append(connection)
         return connection
@@ -446,15 +590,23 @@ def test_worker_snapshot_execution_cursor_isolates_replayed_settings(monkeypatch
         lambda name, *, hint: resolve,
     )
 
-    default_cursor = actor_class._get_snapshot_execution_cursor(
+    actor_class._prepare_snapshot_database(
         actor,
-        object(),
         "default",
         database_identity=identities["default"],
     )
+    default_cursor = actor_class._get_snapshot_execution_cursor(
+        actor,
+        "default",
+        database_identity=identities["default"],
+    )
+    actor_class._prepare_snapshot_database(
+        actor,
+        "proxy",
+        database_identity=identities["proxy"],
+    )
     proxy_cursor = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
         "proxy",
         database_identity=identities["proxy"],
     )
@@ -477,6 +629,7 @@ def test_worker_snapshot_database_identity_normalizes_bootstrap_config_values():
         },
         "duckdb_source_id": "test-source-id",
         "extensions": [],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -492,6 +645,7 @@ def test_worker_snapshot_database_identity_isolates_effective_s3_configuration()
     snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [{"name": "httpfs", "version": "test-version"}],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -539,6 +693,7 @@ def test_worker_snapshot_database_identity_hashes_explicit_s3_credentials():
             {
                 "duckdb_source_id": "test-source-id",
                 "extensions": [{"name": "httpfs", "version": "test-version"}],
+                "dynamic_extensions": [],
                 "distributed_extension_contracts": [],
                 "settings": [
                     {"name": "s3_access_key_id", "value": access_key, "input_type": "VARCHAR"},
@@ -563,6 +718,7 @@ def test_worker_snapshot_database_identity_omits_s3_state_without_httpfs():
     snapshot = {
         "duckdb_source_id": "test-source-id",
         "extensions": [],
+        "dynamic_extensions": [],
         "distributed_extension_contracts": [],
         "settings": [],
     }
@@ -601,6 +757,7 @@ def test_worker_snapshot_database_identity_omits_s3_state_without_httpfs():
                     {"name": "httpfs", "version": "test-version"},
                     {"name": "httpfs", "version": "test-version"},
                 ],
+                "dynamic_extensions": [],
                 "distributed_extension_contracts": [],
                 "settings": [],
             },
@@ -613,7 +770,19 @@ def test_worker_snapshot_database_identity_rejects_ambiguous_contract(snapshot, 
         _snapshot_database_identity(snapshot)
 
 
-def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(monkeypatch):
+def test_worker_snapshot_database_identity_requires_dynamic_extension_manifest():
+    with pytest.raises(TypeError, match="dynamic_extensions must be a list"):
+        _snapshot_database_identity(
+            {
+                "duckdb_source_id": "test-source-id",
+                "extensions": [],
+                "distributed_extension_contracts": [],
+                "settings": [],
+            }
+        )
+
+
+def test_worker_task_admission_rejects_unprepared_snapshot_database():
     actor_class, actor = _worker_actor()
     database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
         ":memory:",
@@ -621,6 +790,33 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
         (),
         (),
         "test-source-id",
+        (),
+        (),
+        (),
+        "",
+        "",
+        False,
+    )
+
+    with pytest.raises(RuntimeError, match="was not prepared before task admission"):
+        actor_class._get_snapshot_execution_cursor(
+            actor,
+            "query-a",
+            database_identity=database_identity,
+        )
+
+    assert actor._active_snapshot_execution_cursors == 0
+
+
+def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation():
+    actor_class, actor = _worker_actor()
+    database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
+        ":memory:",
+        False,
+        (),
+        (),
+        "test-source-id",
+        (),
         (),
         (),
         "",
@@ -638,15 +834,10 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
             return Cursor()
 
     resolved_connection = Connection()
-    monkeypatch.setattr(
-        worker_module,
-        "require_ray_cxx_attr",
-        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
-    )
+    actor._snapshot_connections[database_identity] = resolved_connection
 
     cursor = actor_class._get_snapshot_execution_cursor(
         actor,
-        object(),
         "query-a",
         database_identity=database_identity,
     )
@@ -655,7 +846,7 @@ def test_worker_snapshot_cursor_reserves_shutdown_fence_before_cursor_creation(m
     assert actor._active_snapshot_execution_cursors == 0
 
 
-def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeypatch):
+def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence():
     actor_class, actor = _worker_actor()
     database_identity = worker_module.WorkerSnapshotDatabaseIdentity(
         ":memory:",
@@ -663,6 +854,7 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
         (),
         (),
         "test-source-id",
+        (),
         (),
         (),
         "",
@@ -675,16 +867,11 @@ def test_worker_snapshot_cursor_creation_failure_releases_shutdown_fence(monkeyp
             raise RuntimeError("cursor creation failed")
 
     resolved_connection = Connection()
-    monkeypatch.setattr(
-        worker_module,
-        "require_ray_cxx_attr",
-        lambda name, *, hint: lambda _connection, _query_id: resolved_connection,
-    )
+    actor._snapshot_connections[database_identity] = resolved_connection
 
     try:
         actor_class._get_snapshot_execution_cursor(
             actor,
-            object(),
             "query-a",
             database_identity=database_identity,
         )

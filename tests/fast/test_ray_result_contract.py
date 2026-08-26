@@ -5508,6 +5508,11 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
         _env_overrides: dict[str, str] = {}
 
         @staticmethod
+        def _prepare_query_snapshot_execution(_plan):
+            events.append(("prepare", "query-native-descriptor"))
+            return object(), {}, object(), object()
+
+        @staticmethod
         def _begin_worker_native_execution(query_id, task_id=""):
             assert task_id == ""
             events.append(("worker_begin", query_id))
@@ -5559,6 +5564,7 @@ def test_run_plan_return_uses_native_completed_sink_descriptor(monkeypatch):
     assert result[4] == 31337
     assert result[5] == completed_descriptor
     assert events == [
+        ("prepare", "query-native-descriptor"),
         ("worker_begin", "query-native-descriptor"),
         ("begin", "query-native-descriptor"),
         ("execute", "query-native-descriptor"),
@@ -5595,6 +5601,11 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
 
     class DummyWorker:
         _env_overrides: dict[str, str] = {}
+
+        @staticmethod
+        def _prepare_query_snapshot_execution(_plan):
+            events.append(("prepare", "query-native-cancel"))
+            return object(), {}, object(), object()
 
         @staticmethod
         def _begin_worker_native_execution(query_id, task_id=""):
@@ -5660,12 +5671,77 @@ def test_run_plan_return_cancellation_waits_for_native_execution(monkeypatch):
     asyncio.run(run())
 
     assert events == [
+        ("prepare", "query-native-cancel"),
         ("worker_begin", "query-native-cancel"),
         ("begin", "query-native-cancel"),
         ("execute", "query-native-cancel"),
         ("write_complete", "query-native-cancel"),
         ("end", "query-native-cancel"),
         ("worker_end", "query-native-cancel"),
+    ]
+
+
+def test_run_plan_return_cancellation_during_snapshot_preparation_releases_cursor(monkeypatch):
+    from vane.runners.ray import worker as worker_module
+
+    events = []
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    prepared_cursor = object()
+
+    def fake_require(name, hint=None):
+        assert hint
+        if name in {"begin_flight_shuffle_query_execution", "end_flight_shuffle_query_execution"}:
+            return lambda query_id: events.append((name, query_id))
+        raise AssertionError(f"unexpected C++ binding lookup: {name}")
+
+    class DummyWorker:
+        _env_overrides: dict[str, str] = {}
+
+        @staticmethod
+        def _prepare_query_snapshot_execution(_plan):
+            events.append(("prepare_start", "query-preparation-cancel"))
+            preparation_started.set()
+            assert release_preparation.wait(timeout=2.0)
+            events.append(("prepare_done", "query-preparation-cancel"))
+            return object(), {}, object(), prepared_cursor
+
+        @staticmethod
+        def _close_snapshot_execution_cursor(cursor):
+            assert cursor is prepared_cursor
+            events.append(("cursor_close", "query-preparation-cancel"))
+
+        @staticmethod
+        def _begin_worker_native_execution(_query_id, _task_id=""):
+            pytest.fail("cancelled preparation must not enter native admission")
+
+    monkeypatch.setattr(worker_module, "require_ray_cxx_attr", fake_require)
+    actor_class = worker_module.RayWorkerActor.__ray_metadata__.modified_class
+    query_lease = {
+        "execution_query_id": "query-preparation-cancel",
+    }
+
+    async def run():
+        task = asyncio.create_task(
+            actor_class.run_plan_return(
+                DummyWorker(),
+                object(),
+                None,
+                query_lease,
+            )
+        )
+        assert await asyncio.to_thread(preparation_started.wait, 1.0)
+        task.cancel()
+        release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert events == [
+        ("prepare_start", "query-preparation-cancel"),
+        ("prepare_done", "query-preparation-cancel"),
+        ("cursor_close", "query-preparation-cancel"),
     ]
 
 

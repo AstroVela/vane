@@ -20,6 +20,7 @@ from vane.extensions import (
     DynamicExtensionResolver,
     LocalExtensionArtifact,
     LocalExtensionProvider,
+    ResolvedDynamicExtension,
     create_dynamic_extension_descriptor,
 )
 
@@ -46,11 +47,31 @@ class RecordingConnection:
         self.load_calls = []
         self.loaded_paths = []
         self.loaded_payloads = []
+        self._dynamic_extension_snapshot_entries = []
+        self._snapshot_lock = threading.Lock()
 
     def execute(self, query):
         if query == "SELECT platform FROM pragma_platform()":
             return _Result([(self.platform,)])
         raise AssertionError(f"unexpected query: {query}")
+
+    def _record_dynamic_extension_snapshot_entry(self, entry):
+        with self._snapshot_lock:
+            if entry not in self._dynamic_extension_snapshot_entries:
+                self._dynamic_extension_snapshot_entries.append(entry)
+
+    def _export_dynamic_extension_snapshot_entries(self):
+        with self._snapshot_lock:
+            return list(self._dynamic_extension_snapshot_entries)
+
+
+class _InstalledProviderEntryPoint:
+    def __init__(self, name, provider):
+        self.name = name
+        self._provider = provider
+
+    def load(self):
+        return lambda: self._provider
 
 
 @pytest.fixture
@@ -215,6 +236,209 @@ def test_resolver_loads_dependencies_in_order_and_reuses_content_cache(tmp_path,
     assert len([path for path in cache_directory.rglob("*.duckdb_extension")]) == 2
     assert not [path for path in cache_directory.rglob(".*") if path.name.startswith((".dependency-", ".root-"))]
     assert extension_module._snapshot_mode_is_read_only(first.path.stat().st_mode)
+    assert extension_module._capture_dynamic_extension_snapshot(connection) == [dependency.to_dict(), root.to_dict()]
+    snapshot_json = str(extension_module._capture_dynamic_extension_snapshot(connection))
+    assert str(dependency_path) not in snapshot_json
+    assert str(root_path) not in snapshot_json
+
+
+def test_vane_connection_cursors_share_dynamic_snapshot_state():
+    connection = vane.connect()
+    cursor = connection.cursor()
+    try:
+        platform = connection.execute("SELECT platform FROM pragma_platform()").fetchone()[0]
+        descriptor = DynamicExtensionDescriptor(
+            name="dynamic_test",
+            extension_version="test-version",
+            abi_type="CPP",
+            duckdb_source_id=vane.__git_revision__,
+            vane_version=vane.__version__,
+            platform=platform,
+            sha256="1" * 64,
+            trust_identity="local-tests",
+        )
+        extension_module._record_dynamic_extension_snapshot_entry(
+            cursor,
+            ResolvedDynamicExtension(descriptor, Path("/not-a-worker-artifact-path")),
+        )
+
+        assert extension_module._capture_dynamic_extension_snapshot(connection) == [descriptor.to_dict()]
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def test_worker_preparation_uses_installed_providers_and_reuses_prepared_state(
+    tmp_path,
+    fake_native_loader,
+    monkeypatch,
+):
+    platform = _runtime_platform()
+    dependency_path = _write_extension_artifact(
+        tmp_path / "provider" / "dependency.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    root_path = _write_extension_artifact(
+        tmp_path / "provider" / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+        extension_version="root-version",
+    )
+    dependency = _descriptor(dependency_path, name="dependency")
+    root = replace(
+        _descriptor(root_path, name="root"),
+        dependencies=(DynamicExtensionDependency(dependency.name, dependency.extension_version, dependency.sha256),),
+    )
+    providers = {
+        "dependency": LocalExtensionProvider(
+            "local-tests",
+            (LocalExtensionArtifact(dependency, dependency_path),),
+        ),
+        "root": LocalExtensionProvider(
+            "local-tests",
+            (LocalExtensionArtifact(root, root_path),),
+        ),
+    }
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: (
+            tuple(_InstalledProviderEntryPoint(name, provider) for name, provider in providers.items())
+            if group == "vane.dynamic_extension_providers"
+            else ()
+        ),
+    )
+    monkeypatch.setattr(extension_module, "_native_extension_directory", lambda _connection: tmp_path / "worker")
+    worker = RecordingConnection(platform)
+    manifest = [dependency.to_dict(), root.to_dict()]
+
+    extension_module._prepare_dynamic_extension_snapshot(worker, manifest)
+    extension_module._prepare_dynamic_extension_snapshot(worker, manifest)
+
+    assert [path.name for path in worker.loaded_paths] == ["dependency.duckdb_extension", "root.duckdb_extension"]
+    assert extension_module._capture_dynamic_extension_snapshot(worker) == manifest
+
+
+def test_worker_preparation_scopes_bundled_provider_to_each_named_entry_point(
+    tmp_path,
+    fake_native_loader,
+    monkeypatch,
+):
+    platform = _runtime_platform()
+    dependency_path = _write_extension_artifact(
+        tmp_path / "provider" / "dependency.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    root_path = _write_extension_artifact(
+        tmp_path / "provider" / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+        extension_version="root-version",
+    )
+    dependency = _descriptor(dependency_path, name="dependency")
+    root = replace(
+        _descriptor(root_path, name="root"),
+        dependencies=(DynamicExtensionDependency(dependency.name, dependency.extension_version, dependency.sha256),),
+    )
+    bundled_provider = LocalExtensionProvider(
+        "local-tests",
+        (
+            LocalExtensionArtifact(dependency, dependency_path),
+            LocalExtensionArtifact(root, root_path),
+        ),
+    )
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: (
+            (
+                _InstalledProviderEntryPoint("dependency", bundled_provider),
+                _InstalledProviderEntryPoint("root", bundled_provider),
+            )
+            if group == "vane.dynamic_extension_providers"
+            else ()
+        ),
+    )
+    monkeypatch.setattr(extension_module, "_native_extension_directory", lambda _connection: tmp_path / "worker")
+    worker = RecordingConnection(platform)
+    manifest = [dependency.to_dict(), root.to_dict()]
+
+    extension_module._prepare_dynamic_extension_snapshot(worker, manifest)
+
+    assert [path.name for path in worker.loaded_paths] == ["dependency.duckdb_extension", "root.duckdb_extension"]
+    assert extension_module._capture_dynamic_extension_snapshot(worker) == manifest
+
+
+def test_worker_preparation_rejects_missing_provider_before_loading(tmp_path, fake_native_loader, monkeypatch):
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=_runtime_platform(),
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    monkeypatch.setattr(extension_module, "entry_points", lambda *, group: ())
+    worker = RecordingConnection(descriptor.platform)
+
+    with pytest.raises(DynamicExtensionError, match="PROVIDER_NOT_FOUND"):
+        extension_module._prepare_dynamic_extension_snapshot(worker, [descriptor.to_dict()])
+
+    assert worker.loaded_paths == []
+
+
+def test_worker_preparation_rejects_ambiguous_named_provider_before_loading(tmp_path, monkeypatch):
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=_runtime_platform(),
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    provider = LocalExtensionProvider(
+        "local-tests",
+        (LocalExtensionArtifact(descriptor, artifact_path),),
+    )
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: (
+            (
+                _InstalledProviderEntryPoint("root", provider),
+                _InstalledProviderEntryPoint("root", provider),
+            )
+            if group == "vane.dynamic_extension_providers"
+            else ()
+        ),
+    )
+    worker = RecordingConnection(descriptor.platform)
+
+    with pytest.raises(DynamicExtensionError, match="PROVIDER_AMBIGUOUS"):
+        extension_module._prepare_dynamic_extension_snapshot(worker, [descriptor.to_dict()])
+
+    assert worker.loaded_paths == []
+
+
+def test_worker_manifest_rejects_dependency_order_before_provider_discovery(tmp_path, monkeypatch):
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=_runtime_platform(),
+        source_id=vane.__git_revision__,
+    )
+    descriptor = replace(
+        _descriptor(artifact_path, name="root"),
+        dependencies=(DynamicExtensionDependency("dependency", "test-version", "1" * 64),),
+    )
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: pytest.fail("invalid manifest must not discover providers"),
+    )
+
+    with pytest.raises(DynamicExtensionError, match="SNAPSHOT_DEPENDENCY_ORDER"):
+        extension_module._prepare_dynamic_extension_snapshot(
+            RecordingConnection(descriptor.platform),
+            [descriptor.to_dict()],
+        )
 
 
 def test_loaded_state_is_database_scoped_not_connection_scoped(tmp_path, fake_native_loader):

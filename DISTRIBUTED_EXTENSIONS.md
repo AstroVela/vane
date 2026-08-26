@@ -108,16 +108,40 @@ method, matching DuckDB's `OperatorExtension`, `ParserExtension`,
 ## Build and loading
 
 The connection snapshot records the content-derived DuckDB `SourceID`, every
-loaded static extension name and exact extension version, and a sorted list of
-canonical distributed contract identities. A worker first validates its
-`SourceID`, invokes DuckDB's generated static loader, compares the loaded
-extension identities, and then compares the registered contracts before
-deserializing a plan. Dynamically
-installed extension binaries are not accepted by distributed execution.
+loaded static extension name and exact extension version, an ordered dynamic
+extension descriptor manifest, and a sorted list of canonical distributed
+contract identities. Each dynamic descriptor carries the artifact SHA-256,
+platform and source identity, trust identity, and direct dependencies. Vane
+records it only after `DynamicExtensionResolver.load()` verifies the local
+artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
+another route makes snapshot capture fail closed.
+
+Fragment registration prepares an isolated worker DatabaseInstance before any
+task can deserialize the plan. Immediately before native admission, the worker
+refreshes the exact database identity and prepares any cache miss first, such
+as one caused by S3 credential rotation. Preparation validates the `SourceID`,
+loads the declared static extensions, resolves only the exact preinstalled
+`vane.dynamic_extension_providers` entry points, verifies the complete
+dependency graph before loading, invokes the existing resolver in manifest
+order, and compares registered distributed contracts. The manifest is part of the worker
+database/cache identity. The worker acquires a cursor from that prepared entry
+before admission; the cursor lease prevents credential rotation from retiring
+the DatabaseInstance during handoff. Execution issues no further dynamic-extension
+load and verifies the exact recorded descriptors, native loaded names, static
+identities, and contracts.
+
+No coordinator artifact path or binary payload is transported. Workers do not
+scan an implicit directory or use a repository, network download, autoinstall,
+autoload, unsigned loading, compatibility behavior, or fallback artifact.
+Worker bootstrap sanitization ignores coordinator extension/home directories
+and extension repository settings, so the resolver cache remains node-local.
+Missing or ambiguous providers, altered bytes, trust failures, platform or
+source mismatches, invalid dependency order, and worker disagreement fail
+deterministically during preparation.
 
 The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
-This validation occurs before task scheduling.
+This validation occurs before task admission and plan deserialization.
 
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning

@@ -314,6 +314,7 @@ def test_actor_shutdown_waits_for_snapshot_cursor_before_closing_database():
         "test-source-id",
         (),
         (),
+        (),
         "",
         "",
         False,

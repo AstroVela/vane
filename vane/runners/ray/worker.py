@@ -19,6 +19,7 @@ from typing import Any, NamedTuple, cast
 import ray
 
 from vane._ray_cxx import require_ray_cxx_attr
+from vane.extensions import _dynamic_extension_snapshot_cache_identity
 
 # Avoid importing C++ bindings at module import time (may not be registered yet).
 # Resolve `vane.ray_cxx` attributes lazily at use-time instead.
@@ -259,14 +260,17 @@ class WorkerSnapshotDatabaseIdentity(NamedTuple):
     settings: tuple[tuple[str, str, str], ...]
     duckdb_source_id: str
     extensions: tuple[tuple[str, str], ...]
+    dynamic_extensions: tuple[tuple[str, str], ...]
     distributed_extension_contracts: tuple[str, ...]
     s3_session_id: str
     effective_s3_config_identity: str
     use_session_credentials: bool
 
-    def has_static_extension(self, extension_name: str) -> bool:
+    def has_extension(self, extension_name: str) -> bool:
         normalized_name = str(extension_name).lower()
-        return any(name.lower() == normalized_name for name, _version in self.extensions)
+        return any(name.lower() == normalized_name for name, _version in self.extensions) or any(
+            name.lower() == normalized_name for name, _descriptor in self.dynamic_extensions
+        )
 
     def replaces_s3_identity(self, other: WorkerSnapshotDatabaseIdentity) -> bool:
         if not self.s3_session_id or self == other:
@@ -370,6 +374,20 @@ def _worker_snapshot_database_identity(
         extensions.append((name, version))
     extensions.sort()
 
+    raw_dynamic_extensions = snapshot.get("dynamic_extensions")
+    if not isinstance(raw_dynamic_extensions, list):
+        raise TypeError("query connection snapshot dynamic_extensions must be a list")
+    dynamic_extensions = _dynamic_extension_snapshot_cache_identity(raw_dynamic_extensions)
+    static_extension_names = {name.lower() for name, _version in extensions}
+    overlapping_extension_names = sorted(
+        name for name, _descriptor in dynamic_extensions if name.lower() in static_extension_names
+    )
+    if overlapping_extension_names:
+        raise ValueError(
+            "query connection snapshot declares extensions as both static and dynamic: "
+            f"{', '.join(overlapping_extension_names)}"
+        )
+
     raw_distributed_contracts = snapshot.get("distributed_extension_contracts")
     if not isinstance(raw_distributed_contracts, list):
         raise TypeError("query connection snapshot distributed_extension_contracts must be a list")
@@ -383,7 +401,9 @@ def _worker_snapshot_database_identity(
         seen_distributed_contracts.add(raw_contract)
         distributed_contracts.append(raw_contract)
     distributed_contracts.sort()
-    has_httpfs = any(name.lower() == "httpfs" for name, _version in extensions)
+    has_httpfs = any(name.lower() == "httpfs" for name, _version in extensions) or any(
+        name.lower() == "httpfs" for name, _descriptor in dynamic_extensions
+    )
     if has_httpfs:
         s3_session_id = str(session_id).strip()
         if not s3_session_id:
@@ -414,6 +434,7 @@ def _worker_snapshot_database_identity(
         tuple(settings),
         duckdb_source_id,
         tuple(extensions),
+        dynamic_extensions,
         tuple(distributed_contracts),
         s3_session_id,
         s3_config_identity,
@@ -847,11 +868,11 @@ def _configure_duckdb_s3(
     *,
     use_session_credentials: bool = True,
 ) -> dict[str, str]:
-    """Configure one DuckDB context from explicit session AWS settings.
+    """Configure a prepared DuckDB context from explicit session AWS settings.
 
     Shared driver/worker processes must not read session credentials from their
     process environment. The caller owns the immutable connection-session
-    snapshot.
+    snapshot and must establish httpfs during snapshot preparation.
     """
     from urllib.parse import urlparse
 
@@ -867,14 +888,6 @@ def _configure_duckdb_s3(
 
     if use_session_credentials and not any((endpoint_url, access_key, secret_key, session_token, region)):
         return effective_config
-
-    try:
-        conn.execute("LOAD httpfs")
-    except Exception as exc:
-        raise RuntimeError(
-            "Ray S3 configuration requires the statically linked httpfs extension; "
-            "runtime extension installation is disabled"
-        ) from exc
 
     def _q(s: str) -> str:
         return s.replace("'", "''")
@@ -1227,7 +1240,7 @@ class RayWorkerActor:
                 existing += 1
                 continue
             query_id = str(entry.get("query_id", "")).strip()
-            _register_query_python_replay_state(_plan_resource_query_id(plan), plan)
+            self._register_and_prepare_query_snapshot_database(plan)
             self._plan_fragments[fragment_id] = plan
             self._fragment_query_ids[fragment_id] = query_id
             self._query_fragments.setdefault(query_id, set()).add(fragment_id)
@@ -1606,7 +1619,7 @@ class RayWorkerActor:
             self._fragment_lookup_misses += 1
             raise ValueError(f"PlanFragment not found in actor registry: {fragment_id}")
 
-        _register_query_python_replay_state(_plan_resource_query_id(fragment_plan), fragment_plan)
+        self._register_and_prepare_query_snapshot_database(fragment_plan)
         self._plan_fragments[fragment_id] = fragment_plan
         self._fragment_query_ids[fragment_id] = resolved_query_id
         self._query_fragments.setdefault(resolved_query_id, set()).add(fragment_id)
@@ -1712,14 +1725,86 @@ class RayWorkerActor:
                     retired_identities.add(database_identity)
             self._close_retired_snapshot_databases_locked()
 
+    def _prepare_snapshot_database(
+        self,
+        connection_snapshot_query_id: str,
+        *,
+        database_identity: WorkerSnapshotDatabaseIdentity,
+    ) -> None:
+        """Create and prepare one isolated snapshot DatabaseInstance."""
+        with self._native_execution_condition:
+            if self._shutdown_started:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            self._active_snapshot_execution_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0)) + 1
+        connection = None
+        try:
+            snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+            if snapshot_connections_lock is None:
+                snapshot_connections_lock = threading.Lock()
+                self._snapshot_connections_lock = snapshot_connections_lock
+            with snapshot_connections_lock:
+                snapshot_connections = getattr(self, "_snapshot_connections", None)
+                if snapshot_connections is None:
+                    snapshot_connections = {}
+                    self._snapshot_connections = snapshot_connections
+                self._activate_snapshot_database_identity_locked(database_identity)
+                if database_identity in snapshot_connections:
+                    return
+                prepare = require_ray_cxx_attr(
+                    "_prepare_query_snapshot_connection",
+                    hint="Ensure the C++ ray extension is built with worker snapshot preparation support.",
+                )
+                connection = cast(Any, prepare(str(connection_snapshot_query_id)))
+                if connection is None:
+                    raise RuntimeError("worker snapshot preparation did not return an isolated connection")
+                try:
+                    self._configure_snapshot_conn(connection)
+                except BaseException as config_error:
+                    unpublished_connection = connection
+                    connection = None
+                    close = getattr(unpublished_connection, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except BaseException as close_error:
+                            raise RuntimeError(
+                                "worker snapshot configuration failed and its isolated "
+                                "DuckDB connection could not be closed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            ) from config_error
+                    raise
+                snapshot_connections[database_identity] = connection
+                connection = None
+        except BaseException as preparation_error:
+            if connection is not None:
+                unpublished_connection = connection
+                connection = None
+                close = getattr(unpublished_connection, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except BaseException as close_error:
+                        raise RuntimeError(
+                            "worker snapshot preparation failed and its isolated "
+                            "DuckDB connection could not be closed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        ) from preparation_error
+            raise
+        finally:
+            with self._native_execution_condition:
+                active_cursors = int(getattr(self, "_active_snapshot_execution_cursors", 0))
+                if active_cursors <= 0:
+                    raise RuntimeError("Ray worker snapshot preparation ownership underflow")
+                self._active_snapshot_execution_cursors = active_cursors - 1
+                self._native_execution_condition.notify_all()
+
     def _get_snapshot_execution_cursor(
         self,
-        bootstrap_connection: Any,
         connection_snapshot_query_id: str,
         *,
         database_identity: WorkerSnapshotDatabaseIdentity,
     ) -> Any:
-        """Return a task cursor on the snapshot's stable DatabaseInstance."""
+        """Return a task cursor only from a prepared snapshot DatabaseInstance."""
         with self._native_execution_condition:
             if self._shutdown_started:
                 raise RuntimeError("Ray worker runtime is shutting down")
@@ -1738,28 +1823,10 @@ class RayWorkerActor:
                 retire_after_use = self._activate_snapshot_database_identity_locked(database_identity)
                 connection: Any = snapshot_connections.get(database_identity)
                 if connection is None:
-                    resolve = require_ray_cxx_attr(
-                        "_resolve_query_snapshot_connection",
-                        hint="Ensure the C++ ray extension is built with worker snapshot resolution support.",
+                    raise RuntimeError(
+                        "worker snapshot database was not prepared before task admission: "
+                        f"{connection_snapshot_query_id}"
                     )
-                    connection = cast(Any, resolve(bootstrap_connection, str(connection_snapshot_query_id)))
-                    if connection is bootstrap_connection:
-                        raise RuntimeError("non-default worker snapshot unexpectedly reused the bootstrap connection")
-                    try:
-                        self._configure_snapshot_conn(connection)
-                    except BaseException as config_error:
-                        close = getattr(connection, "close", None)
-                        if callable(close):
-                            try:
-                                close()
-                            except BaseException as close_error:
-                                raise RuntimeError(
-                                    "worker snapshot configuration failed and its isolated "
-                                    "DuckDB connection could not be closed: "
-                                    f"{type(close_error).__name__}: {close_error}"
-                                ) from config_error
-                        raise
-                    snapshot_connections[database_identity] = connection
                 cursor = connection.cursor()
                 active_cursors = getattr(self, "_snapshot_connection_active_cursors", None)
                 if active_cursors is None:
@@ -1889,8 +1956,7 @@ class RayWorkerActor:
 
         connection = self._get_shared_conn().cursor()
         try:
-            effective_s3_config = _configure_duckdb_s3(
-                connection,
+            effective_s3_config = _effective_duckdb_s3_config(
                 normalized_config,
                 use_session_credentials=use_session_credentials,
             )
@@ -1976,6 +2042,134 @@ class RayWorkerActor:
                 raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
             self._session_s3_configs[session_id] = effective_s3_config
         return effective_s3_config
+
+    def _prepare_query_snapshot_database(
+        self,
+        plan: Any,
+    ) -> tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity]:
+        """Prepare the exact worker database required by one physical plan."""
+        prepared = self._prepare_query_snapshot_state(plan, acquire_execution_cursor=False)
+        return cast(tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity], prepared)
+
+    def _register_and_prepare_query_snapshot_database(self, plan: Any) -> None:
+        """Register replay metadata and roll it back if first preparation fails."""
+        connection_snapshot_query_id = _plan_resource_query_id(plan)
+        replay_state_created = _register_query_python_replay_state(connection_snapshot_query_id, plan)
+        try:
+            self._prepare_query_snapshot_database(plan)
+        except BaseException as preparation_error:
+            if replay_state_created:
+                try:
+                    _cleanup_query_python_replay_state(connection_snapshot_query_id)
+                except BaseException as cleanup_error:
+                    raise RuntimeError(
+                        "worker snapshot preparation and replay-state rollback both failed: "
+                        f"preparation={type(preparation_error).__name__}: {preparation_error}; "
+                        f"rollback={type(cleanup_error).__name__}: {cleanup_error}"
+                    ) from preparation_error
+            raise
+
+    @staticmethod
+    def _validate_query_snapshot_database(connection: Any, connection_snapshot_query_id: str) -> None:
+        validate = require_ray_cxx_attr(
+            "_validate_query_snapshot_connection",
+            hint="Ensure the C++ ray extension is built with worker snapshot admission validation support.",
+        )
+        validate(connection, str(connection_snapshot_query_id))
+
+    def _prepare_query_snapshot_execution(
+        self,
+        plan: Any,
+    ) -> tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity, Any]:
+        """Prepare and lease one task cursor before native admission."""
+        prepared = self._prepare_query_snapshot_state(plan, acquire_execution_cursor=True)
+        return cast(tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity, Any], prepared)
+
+    def _prepare_query_snapshot_state(
+        self,
+        plan: Any,
+        *,
+        acquire_execution_cursor: bool,
+    ) -> (
+        tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity]
+        | tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity, Any]
+    ):
+        session_id = str(plan.session_id()).strip()
+        session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
+        has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
+        if not callable(has_explicit_s3_credentials):
+            raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
+        use_session_credentials = not bool(has_explicit_s3_credentials())
+        connection_snapshot_query_id = _plan_resource_query_id(plan)
+        connection = self._get_session_conn(
+            session_id,
+            session_config,
+            use_session_credentials=use_session_credentials,
+        )
+        operation_lock = self._get_session_operation_lock(session_id)
+        with operation_lock:
+            effective_s3_config = self._refresh_session_s3_config_locked(
+                session_id,
+                session_config,
+                connection,
+                use_session_credentials=use_session_credentials,
+            )
+            with self._session_connections_lock:
+                if self._shutdown_started:
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_id in self._closed_session_ids:
+                    raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
+                record = self._session_connections.get(session_id)
+                if record is None or record[1] is not connection:
+                    raise RuntimeError(f"Ray worker Vane session closed during snapshot preparation: {session_id}")
+            database_identity = _query_worker_snapshot_database_identity(
+                connection_snapshot_query_id,
+                session_id=session_id,
+                effective_s3_config=effective_s3_config,
+                use_session_credentials=use_session_credentials,
+            )
+            self._prepare_snapshot_database(
+                connection_snapshot_query_id,
+                database_identity=database_identity,
+            )
+            with self._session_connections_lock:
+                runtime_stopping = self._shutdown_started
+                session_closed = session_id in self._closed_session_ids
+                record = self._session_connections.get(session_id)
+                session_changed = record is None or record[1] is not connection
+            if runtime_stopping:
+                raise RuntimeError("Ray worker runtime is shutting down")
+            if session_closed or session_changed:
+                # close_session() retires cached snapshot databases before it
+                # waits for this operation lock. Repeat retirement so a
+                # DatabaseInstance published inside that race window cannot
+                # outlive the closed session.
+                self._retire_snapshot_databases_for_session(session_id)
+                raise RuntimeError(f"Ray worker Vane session closed during snapshot preparation: {session_id}")
+            if acquire_execution_cursor:
+                cursor = self._get_snapshot_execution_cursor(
+                    connection_snapshot_query_id,
+                    database_identity=database_identity,
+                )
+                try:
+                    self._validate_query_snapshot_database(cursor, connection_snapshot_query_id)
+                except BaseException:
+                    self._close_snapshot_execution_cursor(cursor)
+                    raise
+                with self._session_connections_lock:
+                    runtime_stopping = self._shutdown_started
+                    session_closed = session_id in self._closed_session_ids
+                    record = self._session_connections.get(session_id)
+                    session_changed = record is None or record[1] is not connection
+                if runtime_stopping:
+                    self._close_snapshot_execution_cursor(cursor)
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                if session_closed or session_changed:
+                    self._close_snapshot_execution_cursor(cursor)
+                    self._retire_snapshot_databases_for_session(session_id)
+                    raise RuntimeError(f"Ray worker Vane session closed during snapshot preparation: {session_id}")
+                return connection, effective_s3_config, database_identity, cursor
+        return connection, effective_s3_config, database_identity
 
     def _register_native_query_cleanup_context(
         self,
@@ -2063,13 +2257,16 @@ class RayWorkerActor:
                 effective_s3_config=effective_s3_config,
                 use_session_credentials=cleanup_context.use_session_credentials,
             )
+            self._prepare_snapshot_database(
+                cleanup_context.connection_snapshot_query_id,
+                database_identity=database_identity,
+            )
             cleanup_cursor = self._get_snapshot_execution_cursor(
-                self._get_shared_conn(),
                 cleanup_context.connection_snapshot_query_id,
                 database_identity=database_identity,
             )
         try:
-            if database_identity.has_static_extension("httpfs"):
+            if database_identity.has_extension("httpfs"):
                 _configure_duckdb_s3(
                     cleanup_cursor,
                     effective_s3_config,
@@ -2531,6 +2728,8 @@ class RayWorkerActor:
         self,
         plan: Any,
         scan_split_batch_map: dict[str, Any] | None,
+        *,
+        prepared_snapshot: tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity, Any],
         copy_output_info: dict[str, str] | None = None,
         exchange_source_task_map: dict[str, Any] | None = None,
         exchange_sink_instance: dict[str, Any] | bytes | None = None,
@@ -2542,33 +2741,33 @@ class RayWorkerActor:
         native_query_id: str = "",
         native_task_id: str = "",
     ) -> Any:
-        native_query_id = str(native_query_id or "").strip()
-        native_task_id = str(native_task_id or "").strip()
-        debug_context = dict(debug_context or {})
-        runtime_context = dict(debug_context)
-        debug_task_id = runtime_context.pop("task_id", None)
-        if native_task_id:
-            if debug_task_id is not None and str(debug_task_id) != native_task_id:
-                raise RuntimeError(
-                    "native runtime task identity differs from debug context: "
-                    f"runtime={native_task_id} debug={debug_task_id}"
-                )
-            runtime_context["task_id"] = native_task_id
-        elif debug_task_id is not None:
-            raise RuntimeError("debug task identity requires an authoritative native runtime task identity")
-        session_id = str(plan.session_id()).strip()
-        session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
-        has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
-        if not callable(has_explicit_s3_credentials):
-            raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
-        use_session_credentials = not bool(has_explicit_s3_credentials())
-        connection_snapshot_query_id = _plan_resource_query_id(plan)
-        conn = self._get_session_conn(
-            session_id,
-            session_config,
-            use_session_credentials=use_session_credentials,
-        )
-        cursor = None
+        conn, effective_s3_config, database_identity, cursor = prepared_snapshot
+        try:
+            native_query_id = str(native_query_id or "").strip()
+            native_task_id = str(native_task_id or "").strip()
+            debug_context = dict(debug_context or {})
+            runtime_context = dict(debug_context)
+            debug_task_id = runtime_context.pop("task_id", None)
+            if native_task_id:
+                if debug_task_id is not None and str(debug_task_id) != native_task_id:
+                    raise RuntimeError(
+                        "native runtime task identity differs from debug context: "
+                        f"runtime={native_task_id} debug={debug_task_id}"
+                    )
+                runtime_context["task_id"] = native_task_id
+            elif debug_task_id is not None:
+                raise RuntimeError("debug task identity requires an authoritative native runtime task identity")
+            session_id = str(plan.session_id()).strip()
+            session_config = {str(key): str(value) for key, value in dict(plan.session_config()).items()}
+            has_explicit_s3_credentials = getattr(plan, "has_explicit_s3_credentials", None)
+            if not callable(has_explicit_s3_credentials):
+                raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
+            use_session_credentials = not bool(has_explicit_s3_credentials())
+            connection_snapshot_query_id = _plan_resource_query_id(plan)
+        except BaseException:
+            if cursor is not None:
+                self._close_snapshot_execution_cursor(cursor)
+            raise
         cursor_registered = False
         worker_log_context = dict(debug_context)
         worker_log_context.update(_ray_worker_log_fields(self))
@@ -2577,31 +2776,6 @@ class RayWorkerActor:
         try:
             operation_lock = self._get_session_operation_lock(session_id)
             with operation_lock:
-                effective_s3_config = self._refresh_session_s3_config_locked(
-                    session_id,
-                    session_config,
-                    conn,
-                    use_session_credentials=use_session_credentials,
-                )
-                with self._session_connections_lock:
-                    if self._shutdown_started:
-                        raise RuntimeError("Ray worker runtime is shutting down")
-                    if session_id in self._closed_session_ids:
-                        raise RuntimeError(f"Ray worker Vane session is closed: {session_id}")
-                    record = self._session_connections.get(session_id)
-                    if record is None or record[1] is not conn:
-                        raise RuntimeError(f"Ray worker Vane session closed during task startup: {session_id}")
-                database_identity = _query_worker_snapshot_database_identity(
-                    connection_snapshot_query_id,
-                    session_id=session_id,
-                    effective_s3_config=effective_s3_config,
-                    use_session_credentials=use_session_credentials,
-                )
-                cursor = self._get_snapshot_execution_cursor(
-                    conn,
-                    connection_snapshot_query_id,
-                    database_identity=database_identity,
-                )
                 with self._session_connections_lock:
                     if self._shutdown_started:
                         raise RuntimeError("Ray worker runtime is shutting down")
@@ -2620,7 +2794,7 @@ class RayWorkerActor:
                 if self._worker_native_query_is_closing(native_query_id):
                     raise RuntimeError(f"native query is closing: {native_query_id}")
                 raise RuntimeError(f"native task is closing: {native_task_id}")
-            if database_identity.has_static_extension("httpfs"):
+            if database_identity.has_extension("httpfs"):
                 effective_s3_config = _configure_duckdb_s3(
                     cursor,
                     effective_s3_config,
@@ -2727,22 +2901,44 @@ class RayWorkerActor:
             hint="Ensure the C++ ray extension is built with Flight shuffle query fencing support.",
         )
 
-        self._begin_worker_native_execution(query_id, native_task_id)
+        # Refresh the exact DatabaseInstance identity, perform any required
+        # extension loading, and lease its cursor before native admission.
+        preparation_future = asyncio.get_running_loop().run_in_executor(
+            None,
+            self._prepare_query_snapshot_execution,
+            plan,
+        )
         try:
-            begin_execution(query_id)
+            prepared_snapshot = await _await_future_with_owned_side_effects(preparation_future)
+        except asyncio.CancelledError:
+            if preparation_future.done() and not preparation_future.cancelled():
+                prepared_snapshot = preparation_future.result()
+                await _to_thread_with_owned_side_effects(
+                    self._close_snapshot_execution_cursor,
+                    prepared_snapshot[3],
+                )
+            raise
+
+        try:
+            self._begin_worker_native_execution(query_id, native_task_id)
+            try:
+                begin_execution(query_id)
+            except BaseException:
+                self._end_worker_native_execution(query_id, native_task_id)
+                raise
         except BaseException:
-            self._end_worker_native_execution(query_id, native_task_id)
+            await _to_thread_with_owned_side_effects(
+                self._close_snapshot_execution_cursor,
+                prepared_snapshot[3],
+            )
             raise
 
         def execute_native_task() -> Any:
             try:
-                if self._worker_native_query_is_closing(query_id):
-                    raise RuntimeError(f"native query is closing: {query_id}")
-                if self._worker_native_task_is_closing(native_task_id):
-                    raise RuntimeError(f"native task is closing: {native_task_id}")
                 return self._execute_native_task(
                     plan,
                     scan_split_batch_map or None,
+                    prepared_snapshot=prepared_snapshot,
                     copy_output_info=copy_output_info,
                     exchange_source_task_map=exchange_source_task_map or None,
                     exchange_sink_instance=exchange_sink_instance,
@@ -2766,7 +2962,13 @@ class RayWorkerActor:
             try:
                 end_execution(query_id)
             finally:
-                self._end_worker_native_execution(query_id, native_task_id)
+                try:
+                    self._end_worker_native_execution(query_id, native_task_id)
+                finally:
+                    await _to_thread_with_owned_side_effects(
+                        self._close_snapshot_execution_cursor,
+                        prepared_snapshot[3],
+                    )
             raise
         result_list = await _await_future_with_owned_side_effects(native_future)
         (
