@@ -97,6 +97,7 @@ pip install 'vane-ai[vllm]'     # Native vLLM inference on Linux x86-64
 pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
+pip install 'vane-ai[milvus]'   # distributed full-row Milvus upserts
 ```
 
 The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
@@ -125,6 +126,45 @@ For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/da
 ### Quick Start
 
 Follow the [Quickstart guide](https://vane.astrovela.ai/docs/data/quickstart/quickstart) to build and run your first Vane pipeline.
+
+### Milvus DataSink
+
+`MilvusSink` writes distributed relation batches with ordinary full-row
+override upserts. The collection must disable AutoID and dynamic fields, must
+not define collection functions, and must have one caller-assigned `INT64` or
+`VARCHAR` primary key. Every required collection field must be present; use
+`field_mapping` when relation and collection names differ. Partial updates,
+merge modes, and array append/remove operations are not exposed.
+
+Supported relation fields are Arrow booleans, signed 8/16/32/64-bit integers,
+32/64-bit floats, strings, and lists of 32-bit floats for `FLOAT_VECTOR`
+fields. `max_batch_rows` limits rows per worker call, while `max_batch_bytes`
+limits the Arrow buffer size before conversion to Milvus records.
+`uri` accepts a base HTTP(S) endpoint without embedded credentials or a
+database path; select a non-default database with `database=...`. Credential
+values must come from an `EnvironmentSecret` resolved on each worker.
+
+```python
+from vane import EnvironmentSecret, MilvusSink
+
+sink = MilvusSink(
+    "documents",
+    uri="https://milvus.example:19530",
+    primary_key="id",
+    token=EnvironmentSecret("MILVUS_TOKEN"),
+)
+summary = relation.write_datasink(sink)
+```
+
+The default `max_retries=0` disables Vane's full-operation replay after an
+unknown outcome; PyMilvus can still recover transport failures within an SDK
+call's configured timeout. If Vane retries are enabled, it replays the complete
+input with the same operation ID; the adapter replaces the same explicit
+primary keys, but concurrent external writers can still race. Successful
+batches are acknowledged and applied independently, so a failed operation can
+be partially applied. Vane does not provide an atomic transaction, rollback,
+or exactly-once delivery, and read visibility follows the consistency level
+used by Milvus readers.
 
 ### Execution Policy
 
