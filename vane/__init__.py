@@ -208,6 +208,7 @@ from vane.datasink import (
     WriteSummary,
     write_datasink,
 )
+from vane.datasink.milvus import MilvusSink
 from vane.value.constant import (
     BinaryValue,
     BitValue,
@@ -369,6 +370,7 @@ __all__: list[str] = [
     "ListValue",
     "LongValue",
     "MapValue",
+    "MilvusSink",
     "NUMBER",
     "NotImplementedException",
     "NotSupportedError",
