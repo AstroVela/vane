@@ -29,6 +29,7 @@ from vane.datasink import (
     WriteState,
 )
 from vane.execution.udf_lifecycle import ExecutionCancelledError
+from vane.runners.common import QueryDeadlineExceeded
 
 
 class _Worker(DataSinkWorker):
@@ -1190,6 +1191,7 @@ def test_mock_distributed_retry_budget_is_exact(monkeypatch):
         asyncio.CancelledError,
         FutureCancelledError,
         ExecutionCancelledError,
+        QueryDeadlineExceeded,
     ],
 )
 def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, error_type):
@@ -1217,6 +1219,37 @@ def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, err
     assert type(exc_info.value) is DataSinkWriteError
     assert exc_info.value.outcome is WriteOutcome.UNKNOWN
     assert "planned execution interruption" in exc_info.value.detail
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
+def test_mock_distributed_wrapped_query_deadline_is_not_retried(monkeypatch):
+    from vane import runners
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            try:
+                raise QueryDeadlineExceeded("planned query deadline")
+            except QueryDeadlineExceeded as deadline_error:
+                raise RuntimeError("planned teardown failure") from deadline_error
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id="wrapped-deadline-no-retry",
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert "planned teardown failure" in exc_info.value.detail
     assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
 
 

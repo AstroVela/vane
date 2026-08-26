@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vane.execution._diagnostics import exception_message_from_args, safe_exception_type_name
 from vane.execution.udf_lifecycle import ExecutionCancelledError
+from vane.runners.common import QueryDeadlineExceeded
 
 if TYPE_CHECKING:
     import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -41,6 +42,7 @@ _MAX_WRITE_RESULT_WARNINGS = 4
 _MAX_SUMMARY_WARNINGS = 16
 _MAX_WARNING_BYTES = 4 * 1024
 _MAX_ERROR_TYPE_NAME_BYTES = 256
+_MAX_INTERRUPTION_CAUSE_DEPTH = 16
 _MAX_RESULT_METADATA_INTEGER_BITS = math.ceil(_MAX_RESULT_METADATA_BYTES * math.log2(10))
 _RESULT_DECODE_BATCH_ROWS = 2 * 1024
 _MAX_INT64 = (1 << 63) - 1
@@ -1097,10 +1099,22 @@ def _interrupted_error(
 
 
 def _is_execution_interruption(error: BaseException) -> bool:
-    return not isinstance(error, Exception) or isinstance(
-        error,
-        (FutureCancelledError, ExecutionCancelledError),
-    )
+    candidate: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(_MAX_INTERRUPTION_CAUSE_DEPTH):
+        if candidate is None:
+            return False
+        if id(candidate) in seen:
+            return False
+        seen.add(id(candidate))
+        if not isinstance(candidate, Exception) or isinstance(
+            candidate,
+            (FutureCancelledError, ExecutionCancelledError, QueryDeadlineExceeded),
+        ):
+            return True
+        cause = candidate.__cause__
+        candidate = cause if isinstance(cause, BaseException) else None
+    return False
 
 
 def _aborted_error(
