@@ -317,6 +317,14 @@ def test_provider_extras_match_provider_import_errors():
     assert "sglang" in _requirements_for_extra("sglang")
 
 
+def test_datasink_extras_require_supported_sdk_versions():
+    milvus = _requirement_for_extra("milvus", "pymilvus")
+    qdrant = _requirement_for_extra("qdrant", "qdrant-client")
+
+    assert milvus.specifier == SpecifierSet(">=3.0.1,<4")
+    assert qdrant.specifier == SpecifierSet(">=1.19.0,<2")
+
+
 def test_structured_provider_extras_require_supported_sdk_versions():
     openai = _requirement_for_extra("openai", "openai")
     google = _requirement_for_extra("google", "google-genai")

@@ -498,6 +498,84 @@ jobs:
         continue-on-error: true
         run: docker rm --force vane-milvus
 
+  qdrant-tests:
+    name: Qdrant integration test
+    needs:
+      - changes
+      - native-fast-tests
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      VANE_TEST_QDRANT_URL: http://127.0.0.1:6333
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Download the built wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-python-artifacts-3.12
+          path: dist
+
+      - name: Install the wheel and Qdrant test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m pip install --force-reinstall "${wheel_path}[qdrant]" pytest
+          python -m pip check
+          python -c 'import qdrant_client'
+
+      - name: Start Qdrant
+        run: |
+          docker run --detach \
+            --name vane-qdrant \
+            --publish 127.0.0.1:6333:6333 \
+            qdrant/qdrant:v1.19.0@sha256:6c0652f8d6925b22f2f6f0e0a5365a6c9dbc8768bd6e70ccc1cdc14847e452a0
+
+      - name: Wait for Qdrant to become healthy
+        run: |
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:6333/healthz > /dev/null; then
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Status}}' vane-qdrant)" != "running" ]]; then
+              echo "Qdrant stopped before becoming healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Qdrant did not become healthy within 120 seconds" >&2
+          exit 1
+
+      - name: Run the live Qdrant sink test
+        run: |
+          timeout --signal=INT --kill-after=30s 300s \
+            scripts/run_installed_pytest.sh \
+              -o addopts= \
+              -m external_service \
+              tests/fast/test_qdrant_datasink.py
+
+      - name: Print Qdrant logs on failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: docker logs vane-qdrant
+
+      - name: Stop Qdrant
+        if: ${{ always() }}
+        continue-on-error: true
+        run: docker rm --force vane-qdrant
+
   ai-tests:
     name: AI tests
     needs:
@@ -581,6 +659,7 @@ jobs:
       - native-fast-tests
       - fast-tests
       - milvus-tests
+      - qdrant-tests
       - ai-tests
     runs-on: ubuntu-24.04
     steps:
@@ -590,6 +669,7 @@ jobs:
           AI_TESTS_RESULT: ${{ needs.ai-tests.result }}
           FAST_TESTS_RESULT: ${{ needs.fast-tests.result }}
           MILVUS_TESTS_RESULT: ${{ needs.milvus-tests.result }}
+          QDRANT_TESTS_RESULT: ${{ needs.qdrant-tests.result }}
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
           NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
@@ -616,8 +696,9 @@ jobs:
                 "$NATIVE_TESTS_RESULT" != "$expected_result" ||
                 "$FAST_TESTS_RESULT" != "$expected_result" ||
                 "$MILVUS_TESTS_RESULT" != "$expected_result" ||
+                "$QDRANT_TESTS_RESULT" != "$expected_result" ||
                 "$AI_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 
