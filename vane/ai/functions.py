@@ -720,12 +720,11 @@ def chunk_text(
         raise ValueError("max_chars must be a positive integer")
     if isinstance(overlap_chars, bool) or not isinstance(overlap_chars, int) or overlap_chars < 0:
         raise ValueError("overlap_chars must be an integer >= 0")
+    if overlap_chars >= max_chars:
+        raise ValueError("overlap_chars must be smaller than max_chars")
 
     if len(text) <= max_chars:
         return [text]
-
-    if overlap_chars >= max_chars:
-        raise ValueError("overlap_chars must be smaller than max_chars")
 
     chunks: list[str] = []
     start = 0
