@@ -310,13 +310,7 @@ void JSONMultiFileInfo::BindReader(ClientContext &context, vector<LogicalType> &
 	bind_data.multi_file_reader->BindOptions(bind_data.file_options, *bind_data.file_list, return_types, names,
 	                                         bind_data.reader_bind);
 
-	auto &transform_options = json_data.transform_options;
-	transform_options.strict_cast = !options.ignore_errors;
-	transform_options.error_duplicate_key = !options.ignore_errors;
-	transform_options.error_missing_key = false;
-	transform_options.error_unknown_key = options.auto_detect && !options.ignore_errors;
-	transform_options.date_format_map = json_data.date_format_map.get();
-	transform_options.delay_error = true;
+	json_data.InitializeTransformOptions();
 
 	if (options.auto_detect) {
 		// JSON may contain columns such as "id" and "Id", which are duplicates for us due to case-insensitivity
@@ -441,7 +435,7 @@ shared_ptr<BaseFileReader> JSONMultiFileInfo::CreateReader(ClientContext &contex
                                                            const OpenFileInfo &file, idx_t file_idx,
                                                            const MultiFileBindData &bind_data) {
 	auto &json_data = bind_data.bind_data->Cast<JSONScanData>();
-	auto reader = make_shared_ptr<JSONReader>(context, json_data.options, file.path);
+	auto reader = make_shared_ptr<JSONReader>(context, json_data.options, file);
 	reader->columns = MultiFileColumnDefinition::ColumnsFromNamesAndTypes(bind_data.names, bind_data.types);
 	return std::move(reader);
 }
@@ -589,6 +583,10 @@ optional_idx JSONMultiFileInfo::MaxThreads(const MultiFileBindData &bind_data, c
 	// get the max threads from the bind data (if it is set)
 	auto &json_data = bind_data.bind_data->Cast<JSONScanData>();
 	return json_data.max_threads;
+}
+
+unique_ptr<MultiFileReaderInterface> JSONMultiFileInfo::Copy() {
+	return make_uniq<JSONMultiFileInfo>();
 }
 
 FileGlobInput JSONMultiFileInfo::GetGlobInput() {

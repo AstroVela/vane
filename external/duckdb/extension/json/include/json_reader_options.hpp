@@ -125,6 +125,9 @@ struct JSONReaderOptions {
 	//! Forced date/timestamp formats
 	string date_format;
 	string timestamp_format;
+
+	void Serialize(Serializer &serializer) const;
+	static JSONReaderOptions Deserialize(Deserializer &deserializer);
 };
 
 } // namespace duckdb

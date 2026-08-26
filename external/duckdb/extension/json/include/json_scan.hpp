@@ -21,12 +21,27 @@
 
 namespace duckdb {
 
+//! Owned, deterministic representation of an OpenFileInfo used by a bound JSON scan.
+struct JSONFileSnapshot {
+	JSONFileSnapshot() = default;
+	explicit JSONFileSnapshot(const OpenFileInfo &file);
+
+	string path;
+	map<string, Value> options;
+
+	OpenFileInfo ToOpenFileInfo() const;
+	void Serialize(Serializer &serializer) const;
+	static JSONFileSnapshot Deserialize(Deserializer &deserializer);
+};
+
 struct JSONScanData : public TableFunctionData {
 public:
 	JSONScanData();
 
 	void InitializeFormats();
 	void InitializeFormats(bool auto_detect);
+	void InitializeTransformOptions();
+	unique_ptr<FunctionData> Copy() const override;
 
 public:
 	//! JSON reader options
@@ -42,6 +57,27 @@ public:
 
 	optional_idx max_threads;
 	optional_idx estimated_cardinality_per_file;
+};
+
+//! Complete owned state required to reconstruct a bound JSON multi-file scan without reopening or resampling files.
+struct SerializedJSONScanData {
+	vector<JSONFileSnapshot> files;
+	vector<LogicalType> types;
+	vector<string> names;
+	MultiFileOptions file_options;
+	MultiFileReaderBindData reader_bind;
+	vector<string> table_columns;
+	vector<idx_t> bind_column_ids;
+	JSONReaderOptions options;
+	vector<string> key_names;
+	vector<StrpTimeFormat> date_formats;
+	vector<StrpTimeFormat> timestamp_formats;
+	optional_idx max_threads;
+	optional_idx estimated_cardinality_per_file;
+	vector<idx_t> reader_column_ids;
+
+	void Serialize(Serializer &serializer) const;
+	static SerializedJSONScanData Deserialize(Deserializer &deserializer);
 };
 
 struct JSONScanInfo : public TableFunctionInfo {

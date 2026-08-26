@@ -6,6 +6,8 @@ Tests the core serialization functionality without requiring full execution pipe
 """
 
 import csv
+import datetime
+import pickle
 
 import pytest
 
@@ -15,6 +17,43 @@ except Exception:
     ray = None
 
 import vane
+
+
+def test_json_scan_family_plans_serialize_for_ray(tmp_path):
+    """Every JSON multi-file alias retains a complete worker-owned bind."""
+    input_path = tmp_path / "json-family-plans.ndjson"
+    input_path.write_text('{"id":1,"value":"a"}\n{"id":2,"value":"b"}\n', encoding="utf-8")
+    queries = {
+        "read_json": f"""
+            SELECT * FROM read_json(
+                '{input_path}',
+                format='newline_delimited',
+                auto_detect=false,
+                columns={{'id': 'BIGINT', 'value': 'VARCHAR'}}
+            )
+        """,
+        "read_json_auto": f"SELECT * FROM read_json_auto('{input_path}')",
+        "read_ndjson": f"SELECT * FROM read_ndjson('{input_path}')",
+        "read_ndjson_auto": f"SELECT * FROM read_ndjson_auto('{input_path}')",
+        "read_json_objects": f"SELECT * FROM read_json_objects('{input_path}')",
+        "read_json_objects_auto": f"SELECT * FROM read_json_objects_auto('{input_path}')",
+        "read_ndjson_objects": f"SELECT * FROM read_ndjson_objects('{input_path}')",
+    }
+
+    for function_name, query in queries.items():
+        connection = vane.connect()
+        try:
+            relation = connection.sql(query)
+            logical_plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                relation,
+                f"{function_name}-serialization-plan",
+            )
+            restored_plan = pickle.loads(pickle.dumps(logical_plan))
+            physical_plan = restored_plan.to_physical_plan(connection)
+            assert physical_plan.num_partitions() == 1
+            assert [len(batches) for batches in physical_plan.scan_split_batch_map().values()] == [1]
+        finally:
+            connection.close()
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
@@ -41,8 +80,6 @@ def test_ray_plan_serialization_core():
     assert plan.idx() == "test-e2e-query"
 
     # Test pickling (this is what Ray uses for serialization)
-    import pickle
-
     serialized = pickle.dumps(plan)
     assert len(serialized) > 0
 
@@ -227,5 +264,78 @@ def test_multi_file_csv_union_reader_state_survives_worker_serde(tmp_path, monke
         (2, "beta", 0),
         (3, "gamma", 1),
         (4, "delta", 1),
+    ]
+    connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_json_bind_state_survives_real_ray_serde(tmp_path, monkeypatch):
+    """Ray workers retain JSON options, inferred schema, formats, and multi-file metadata."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    left_path = tmp_path / "left.ndjson"
+    right_path = tmp_path / "right.ndjson"
+    left_path.write_text(
+        '{"id":1,"event_date":"08-25-2026","event_time":"08-25-2026 03:04:05 PM","left_value":"alpha"}\n',
+        encoding="utf-8",
+    )
+    right_path.write_text(
+        '{"id":2,"event_date":"08-26-2026","event_time":"08-26-2026 04:05:06 PM","right_value":"beta"}\n',
+        encoding="utf-8",
+    )
+
+    connection = vane.connect()
+    relation = connection.sql(
+        f"""
+        SELECT id, event_date, event_time, coalesce(left_value, right_value) AS value, filename
+        FROM read_ndjson_auto(
+            ['{left_path}', '{right_path}'],
+            union_by_name=true,
+            filename=true,
+            dateformat='%m-%d-%Y',
+            timestampformat='%m-%d-%Y %I:%M:%S %p'
+        )
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        "multi-json-bind-serde-plan",
+    ).to_physical_plan(connection)
+    assert [len(batches) for batches in plan.scan_split_batch_map().values()] == [2]
+
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    parts = list(runner.run_iter_tables(relation))
+    assert len(parts) == 2
+    tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+    result = pa.concat_tables(tables)
+    assert sorted(
+        zip(
+            result.column(0).to_pylist(),
+            result.column(1).to_pylist(),
+            result.column(2).to_pylist(),
+            result.column(3).to_pylist(),
+            result.column(4).to_pylist(),
+        )
+    ) == [
+        (
+            1,
+            datetime.date(2026, 8, 25),
+            datetime.datetime(2026, 8, 25, 15, 4, 5),
+            "alpha",
+            str(left_path),
+        ),
+        (
+            2,
+            datetime.date(2026, 8, 26),
+            datetime.datetime(2026, 8, 26, 16, 5, 6),
+            "beta",
+            str(right_path),
+        ),
     ]
     connection.close()

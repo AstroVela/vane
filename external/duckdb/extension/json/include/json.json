@@ -32,5 +32,197 @@
       }
     ],
     "pointer_type": "none"
+  },
+  {
+    "class": "JSONReaderOptions",
+    "includes": [
+      "json_reader_options.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "type",
+        "type": "JSONScanType"
+      },
+      {
+        "id": 101,
+        "name": "format",
+        "type": "JSONFormat"
+      },
+      {
+        "id": 102,
+        "name": "record_type",
+        "type": "JSONRecordType"
+      },
+      {
+        "id": 103,
+        "name": "compression",
+        "type": "FileCompressionType"
+      },
+      {
+        "id": 104,
+        "name": "ignore_errors",
+        "type": "bool"
+      },
+      {
+        "id": 105,
+        "name": "maximum_object_size",
+        "type": "idx_t"
+      },
+      {
+        "id": 106,
+        "name": "auto_detect",
+        "type": "bool"
+      },
+      {
+        "id": 107,
+        "name": "sample_size",
+        "type": "idx_t"
+      },
+      {
+        "id": 108,
+        "name": "max_depth",
+        "type": "idx_t"
+      },
+      {
+        "id": 109,
+        "name": "field_appearance_threshold",
+        "type": "double"
+      },
+      {
+        "id": 110,
+        "name": "maximum_sample_files",
+        "type": "idx_t"
+      },
+      {
+        "id": 111,
+        "name": "convert_strings_to_integers",
+        "type": "bool"
+      },
+      {
+        "id": 112,
+        "name": "map_inference_threshold",
+        "type": "idx_t"
+      },
+      {
+        "id": 113,
+        "name": "name_list",
+        "type": "vector<string>"
+      },
+      {
+        "id": 114,
+        "name": "sql_type_list",
+        "type": "vector<LogicalType>"
+      },
+      {
+        "id": 115,
+        "name": "date_format",
+        "type": "string"
+      },
+      {
+        "id": 116,
+        "name": "timestamp_format",
+        "type": "string"
+      }
+    ],
+    "pointer_type": "none"
+  },
+  {
+    "class": "JSONFileSnapshot",
+    "includes": [
+      "json_scan.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "path",
+        "type": "string"
+      },
+      {
+        "id": 101,
+        "name": "options",
+        "type": "map<string, Value>"
+      }
+    ],
+    "pointer_type": "none"
+  },
+  {
+    "class": "SerializedJSONScanData",
+    "includes": [
+      "json_scan.hpp"
+    ],
+    "members": [
+      {
+        "id": 100,
+        "name": "files",
+        "type": "vector<JSONFileSnapshot>"
+      },
+      {
+        "id": 101,
+        "name": "types",
+        "type": "vector<LogicalType>"
+      },
+      {
+        "id": 102,
+        "name": "names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 103,
+        "name": "file_options",
+        "type": "MultiFileOptions"
+      },
+      {
+        "id": 104,
+        "name": "reader_bind",
+        "type": "MultiFileReaderBindData"
+      },
+      {
+        "id": 105,
+        "name": "table_columns",
+        "type": "vector<string>"
+      },
+      {
+        "id": 106,
+        "name": "bind_column_ids",
+        "type": "vector<idx_t>"
+      },
+      {
+        "id": 107,
+        "name": "options",
+        "type": "JSONReaderOptions"
+      },
+      {
+        "id": 108,
+        "name": "key_names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 109,
+        "name": "date_formats",
+        "type": "vector<StrpTimeFormat>"
+      },
+      {
+        "id": 110,
+        "name": "timestamp_formats",
+        "type": "vector<StrpTimeFormat>"
+      },
+      {
+        "id": 111,
+        "name": "max_threads",
+        "type": "optional_idx"
+      },
+      {
+        "id": 112,
+        "name": "estimated_cardinality_per_file",
+        "type": "optional_idx"
+      },
+      {
+        "id": 113,
+        "name": "reader_column_ids",
+        "type": "vector<idx_t>"
+      }
+    ],
+    "pointer_type": "none"
   }
 ]
