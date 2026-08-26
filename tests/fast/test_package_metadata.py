@@ -312,9 +312,12 @@ def test_provider_extras_match_provider_import_errors():
     assert _requirements_for_extra("openai") == {"openai", "tiktoken"}
     assert _requirements_for_extra("anthropic") == {"anthropic"}
     assert _requirements_for_extra("google") == {"google-genai"}
+    assert _requirements_for_extra("milvus") == {"pymilvus"}
+    assert _requirements_for_extra("turbopuffer") == {"turbopuffer"}
     assert {"sentence-transformers", "torch", "transformers"} <= _requirements_for_extra("transformers")
     assert "vllm" in _requirements_for_extra("vllm")
     assert "sglang" in _requirements_for_extra("sglang")
+    assert {"pymilvus", "turbopuffer"} <= _requirements_for_extra("all")
 
 
 def test_structured_provider_extras_require_supported_sdk_versions():
@@ -335,6 +338,14 @@ def test_structured_provider_extras_require_supported_sdk_versions():
     assert google.specifier == SpecifierSet(">=1.22.0")
     assert vllm.specifier == SpecifierSet(">=0.11.0")
     assert sglang.specifier == SpecifierSet("==0.5.17")
+
+
+def test_datasink_extras_require_supported_sdk_versions():
+    milvus = _requirement_for_extra("milvus", "pymilvus")
+    turbopuffer = _requirement_for_extra("turbopuffer", "turbopuffer")
+
+    assert milvus.specifier == SpecifierSet(">=3.0.1,<4")
+    assert turbopuffer.specifier == SpecifierSet(">=2.9.0,<3")
 
 
 def test_wheel_or_install_contains_primary_and_third_party_license_files():
