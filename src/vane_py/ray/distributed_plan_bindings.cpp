@@ -3169,6 +3169,7 @@ struct PyPhysicalPlanWrapperRunner {
 			out["write_results"] = py::list();
 			out["outcome_aborted"] = py::bool_(false);
 			out["outcome_unknown"] = py::bool_(true);
+			out["outcome_cancelled"] = py::bool_(false);
 			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(error));
 			py::list cleanup_warnings;
 			if (cleanup_error) {
@@ -3233,6 +3234,7 @@ struct PyPhysicalPlanWrapperRunner {
 			out["operation_id"] = py::str(finalized.data_sink_result.operation_id);
 			out["outcome_aborted"] = py::bool_(finalized.data_sink_result.outcome_aborted);
 			out["outcome_unknown"] = py::bool_(finalized.data_sink_result.outcome_unknown);
+			out["outcome_cancelled"] = py::bool_(false);
 			out["outcome_error"] = py::str(BoundDataSinkOutcomeError(finalized.data_sink_result.outcome_error));
 			py::list write_results;
 			auto json_loads = py::module_::import("json").attr("loads");

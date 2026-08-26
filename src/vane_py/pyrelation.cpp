@@ -26,6 +26,7 @@
 #include "duckdb/parser/statement/explain_statement.hpp"
 #include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/relation/value_relation.hpp"
 #include "duckdb/main/relation/filter_relation.hpp"
 #include "duckdb/main/relation/delete_relation.hpp"
@@ -39,6 +40,7 @@
 #include "vane_python/python_udf_utils.hpp"
 #include "vane_python/python_udf_actor_resources.hpp"
 #include "vane_python/python_conversion.hpp"
+#include "vane_python/python_dependency.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -46,6 +48,8 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include <algorithm>
@@ -318,6 +322,67 @@ void DuckDBPyRelation::ValidateDataSinkTransaction() {
 		throw InvalidInputException(
 		    "DataSink writes require DuckDB auto-commit mode and cannot participate in an explicit transaction");
 	}
+}
+
+static bool IsSingleUseDataSinkArrowDependency(const shared_ptr<DependencyItem> &dependency_item) {
+	if (!dependency_item) {
+		return false;
+	}
+	auto python_dependency = dynamic_cast<PythonDependencyItem *>(dependency_item.get());
+	if (!python_dependency || !python_dependency->object) {
+		return false;
+	}
+	auto registered_arrow = dynamic_cast<RegisteredArrow *>(python_dependency->object.get());
+	if (!registered_arrow || !registered_arrow->arrow_factory) {
+		return false;
+	}
+
+	const auto arrow_type = registered_arrow->arrow_factory->cached_arrow_type;
+	if (arrow_type == PyArrowObjectType::PyCapsule || arrow_type == PyArrowObjectType::Scanner) {
+		return true;
+	}
+	if (arrow_type != PyArrowObjectType::PyCapsuleInterface) {
+		return false;
+	}
+	if (!ModuleIsLoaded<PyarrowCacheItem>()) {
+		return true;
+	}
+	auto &import_cache = *DuckDBPyConnection::ImportCache();
+	return !py::isinstance(registered_arrow->obj, import_cache.pyarrow.Table());
+}
+
+static void ValidateDataSinkRetryOperator(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.function.function == ArrowTableFunction::ArrowScanFunction && get.bind_data) {
+			auto &arrow_data = get.bind_data->Cast<ArrowScanFunctionData>();
+			if (IsSingleUseDataSinkArrowDependency(arrow_data.dependency)) {
+				throw InvalidInputException(
+				    "DataSink retries require replayable input, but the relation contains a potentially single-use "
+				    "Arrow stream. "
+				    "Materialize the stream before setting max_retries greater than zero");
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		ValidateDataSinkRetryOperator(*child);
+	}
+}
+
+void DuckDBPyRelation::ValidateDataSinkRetryInput() {
+	AssertRelation();
+	if (!rel->context) {
+		throw InternalException("Cannot validate DataSink retry input: relation has no context");
+	}
+	auto context = rel->context->GetContext();
+	context->RunFunctionInTransaction([&]() {
+		auto binder = Binder::CreateBinder(*context);
+		auto statement = rel->Bind(*binder);
+		if (!statement.plan) {
+			throw InternalException("Cannot validate DataSink retry input: relation binding produced no logical plan");
+		}
+		ValidateDataSinkRetryOperator(*statement.plan);
+	});
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::MarkDataSink(const string &operation_id) {

@@ -67,6 +67,7 @@ public:
 	unique_ptr<DuckDBPyRelation> Repartition(const py::args &args, const py::kwargs &kwargs);
 	unique_ptr<DuckDBPyRelation> LocalExchange(const py::object &num_partitions);
 	void ValidateDataSinkTransaction();
+	void ValidateDataSinkRetryInput();
 	unique_ptr<DuckDBPyRelation> MarkDataSink(const string &operation_id);
 	unique_ptr<DuckDBPyRelation> Order(const string &expr);
 	unique_ptr<DuckDBPyRelation> Sort(const py::args &args);

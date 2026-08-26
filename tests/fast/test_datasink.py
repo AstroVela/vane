@@ -327,12 +327,14 @@ def _native_result(
     *,
     outcome_unknown: bool = False,
     outcome_aborted: bool = False,
+    outcome_cancelled: bool = False,
 ) -> dict[str, object]:
     state = "aborted" if outcome_aborted else "applied"
     return {
         "operation_id": operation_id,
         "outcome_aborted": outcome_aborted,
         "outcome_unknown": outcome_unknown,
+        "outcome_cancelled": outcome_cancelled,
         "outcome_error": "planned unknown outcome" if outcome_unknown else "",
         "write_results": [
             {
@@ -677,6 +679,113 @@ def test_configured_retry_replays_full_non_idempotent_append(monkeypatch, tmp_pa
     ]
     assert summary.warnings[0].startswith("DataSink made 1 framework retry attempt")
     assert "may have applied external writes" in summary.warnings[0]
+
+
+def test_configured_retry_rejects_record_batch_reader_before_consuming_it():
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    relation = vane.from_arrow(reader).project("id + 1 AS id")
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-reader",
+        )
+
+    assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_default_no_retry_accepts_record_batch_reader(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+
+    summary = vane.from_arrow(reader).write_datasink(
+        _Sink(_Bound()),
+        operation_id="single-use-reader-no-retry",
+    )
+
+    assert summary.outcome is WriteOutcome.APPLIED
+    assert summary.rows_received == 3
+
+
+def test_configured_retry_rejects_record_batch_reader_in_join():
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    streamed = vane.from_arrow(reader).set_alias("streamed")
+    relation = vane.sql("SELECT 1 AS id").set_alias("fixed").join(streamed, "id")
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-reader-join",
+        )
+
+    assert reader.read_all().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_configured_retry_rejects_bare_arrow_stream_before_consuming_it():
+    stream = pa.table({"id": [1, 2, 3]}).__arrow_c_stream__()
+    relation = vane.from_arrow(stream)
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="single-use-capsule",
+        )
+
+    assert relation.fetchall() == [(1,), (2,), (3,)]
+
+
+def test_configured_retry_rejects_potentially_single_use_arrow_scanner():
+    import pyarrow.dataset as ds
+
+    reader = pa.RecordBatchReader.from_batches(
+        pa.schema([("id", pa.int64())]),
+        [pa.record_batch([pa.array([1, 2, 3])], names=["id"])],
+    )
+    scanner = ds.Scanner.from_batches(reader)
+    relation = vane.from_arrow(scanner)
+
+    with pytest.raises(vane.InvalidInputException, match="potentially single-use Arrow stream"):
+        relation.write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+            operation_id="potentially-single-use-scanner",
+        )
+
+    assert scanner.to_table().column("id").to_pylist() == [1, 2, 3]
+
+
+def test_configured_retry_accepts_replayable_arrow_table(monkeypatch):
+    from vane import runners
+
+    operation_id = "replayable-arrow-table"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(operation_id, outcome_unknown=self.calls == 1)
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    summary = vane.from_arrow(pa.table({"id": [1, 2, 3]})).write_datasink(
+        _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=1))),
+        operation_id=operation_id,
+    )
+
+    assert runner.calls == 2
+    assert summary.outcome is WriteOutcome.APPLIED
 
 
 def test_unserializable_bound_sink_fails_before_execution(monkeypatch):
@@ -1111,6 +1220,39 @@ def test_mock_distributed_execution_interruption_is_not_retried(monkeypatch, err
     assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
 
 
+def test_mock_distributed_cancelled_unknown_is_not_retried(monkeypatch):
+    from vane import runners
+
+    operation_id = "cancelled-unknown-no-retry"
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_datasink(self, relation):
+            self.calls += 1
+            return _native_result(
+                operation_id,
+                outcome_unknown=True,
+                outcome_cancelled=True,
+            )
+
+    runner = FakeRunner()
+    monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
+    monkeypatch.setattr(runners, "get_or_create_runner", lambda: runner)
+
+    with pytest.raises(DataSinkWriteError) as exc_info:
+        vane.sql("SELECT 1 AS id").write_datasink(
+            _Sink(_Bound(options=DataSinkExecutionOptions(max_retries=3))),
+            operation_id=operation_id,
+        )
+
+    assert runner.calls == 1
+    assert type(exc_info.value) is DataSinkWriteError
+    assert exc_info.value.outcome is WriteOutcome.UNKNOWN
+    assert not any("framework retry" in warning for warning in exc_info.value.summary.warnings)
+
+
 def test_mock_distributed_aborted_outcome_is_not_retried(monkeypatch):
     from vane import runners
 
@@ -1188,6 +1330,7 @@ def test_local_wire_limit_excludes_arrow_container_overhead(monkeypatch):
     [
         _native_result("outcome-mismatch", outcome_aborted=True) | {"outcome_aborted": False},
         _native_result("outcome-mismatch") | {"outcome_aborted": True},
+        _native_result("outcome-mismatch") | {"outcome_cancelled": True},
     ],
 )
 def test_mock_distributed_known_outcome_rejects_mismatched_worker_states(monkeypatch, native_result):

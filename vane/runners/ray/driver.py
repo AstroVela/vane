@@ -787,15 +787,23 @@ async def _run_in_executor_with_owned_side_effects(
     callback: Callable[..., Any],
     /,
     *args: Any,
+    _on_cancellation: Callable[[asyncio.CancelledError], None] | None = None,
     **kwargs: Any,
 ) -> Any:
     """Finish an executor-owned mutation before exposing caller cancellation."""
 
     executor_future = _submit_to_executor(executor, callback, *args, **kwargs)
-    return await _await_future_with_owned_side_effects(executor_future)
+    return await _await_future_with_owned_side_effects(
+        executor_future,
+        _on_cancellation=_on_cancellation,
+    )
 
 
-async def _await_future_with_owned_side_effects(future: asyncio.Future[Any]) -> Any:
+async def _await_future_with_owned_side_effects(
+    future: asyncio.Future[Any],
+    *,
+    _on_cancellation: Callable[[asyncio.CancelledError], None] | None = None,
+) -> Any:
     """Observe one owned mutation to completion across repeated cancellation."""
 
     cancellation: asyncio.CancelledError | None = None
@@ -805,6 +813,8 @@ async def _await_future_with_owned_side_effects(future: asyncio.Future[Any]) -> 
         except asyncio.CancelledError as error:
             if cancellation is None:
                 cancellation = error
+            if _on_cancellation is not None:
+                _on_cancellation(error)
         except BaseException:
             break
     result = future.result()
@@ -7657,6 +7667,12 @@ class RayQueryDriverActor:
         )
         setup_finished = False
         execution_started = False
+        cancellation_error: asyncio.CancelledError | None = None
+
+        def observe_cancellation(error: asyncio.CancelledError) -> None:
+            nonlocal cancellation_error
+            if cancellation_error is None:
+                cancellation_error = error
 
         def add_cleanup_warning(result: dict[str, Any], stage: str, error: BaseException) -> None:
             _append_datasink_cleanup_warning(result, self._copy_cleanup_warning(stage, error))
@@ -7674,6 +7690,7 @@ class RayQueryDriverActor:
                 logical_plan,
                 plan_id,
                 lifecycle,
+                _on_cancellation=observe_cancellation,
             )
             if prepared_plan_id != plan_id:
                 raise RuntimeError(
@@ -7696,6 +7713,7 @@ class RayQueryDriverActor:
                 graph,
                 query_connection=query_connection,
                 session_config=session.config,
+                _on_cancellation=observe_cancellation,
             )
             if lifecycle.close_requested():
                 raise RuntimeError(f"DataSink query plan closed during actor startup: {plan_id}")
@@ -7705,6 +7723,7 @@ class RayQueryDriverActor:
                 plan,
                 query_connection=query_connection,
                 session_config=session.config,
+                _on_cancellation=observe_cancellation,
             )
             if lifecycle.close_requested():
                 raise RuntimeError(f"DataSink query plan closed during actor startup: {plan_id}")
@@ -7733,12 +7752,19 @@ class RayQueryDriverActor:
             public_result = dict(result)
         except BaseException as execution_error:
             lifecycle.request_close()
+            if isinstance(execution_error, asyncio.CancelledError):
+                observe_cancellation(execution_error)
             primary_error = execution_error
             if startup_decision is not None and not setup_finished:
                 try:
-                    execution_started = bool(await _await_future_with_owned_side_effects(startup_decision))
-                except asyncio.CancelledError:
-                    pass
+                    execution_started = bool(
+                        await _await_future_with_owned_side_effects(
+                            startup_decision,
+                            _on_cancellation=observe_cancellation,
+                        )
+                    )
+                except asyncio.CancelledError as error:
+                    observe_cancellation(error)
                 except BaseException as startup_error:
                     if isinstance(primary_error, asyncio.CancelledError):
                         primary_error = startup_error
@@ -7753,9 +7779,10 @@ class RayQueryDriverActor:
                     self._teardown_plan_resources,
                     plan_id,
                     lifecycle,
+                    _on_cancellation=observe_cancellation,
                 )
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as error:
+                observe_cancellation(error)
             except BaseException as error:
                 teardown_error = error
             retain_incomplete_teardown(teardown_error)
@@ -7763,17 +7790,27 @@ class RayQueryDriverActor:
             observed_result: Mapping[str, Any] | None = None
             if plan_execution is not None:
                 try:
-                    await _await_future_with_owned_side_effects(plan_execution)
+                    await _await_future_with_owned_side_effects(
+                        plan_execution,
+                        _on_cancellation=observe_cancellation,
+                    )
+                except asyncio.CancelledError as error:
+                    observe_cancellation(error)
                 except BaseException:
                     pass
                 try:
                     candidate = plan_execution.result()
+                except asyncio.CancelledError as error:
+                    observe_cancellation(error)
+                    candidate = None
                 except BaseException:
                     candidate = None
                 if isinstance(candidate, Mapping):
                     observed_result = candidate
             if observed_result is not None:
                 public_result = dict(observed_result)
+                if cancellation_error is not None and public_result.get("outcome_unknown") is True:
+                    public_result["outcome_cancelled"] = True
                 add_cleanup_warning(public_result, "DataSink execution finalization", primary_error)
                 if teardown_error is not None:
                     add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
@@ -7785,12 +7822,17 @@ class RayQueryDriverActor:
                     "write_results": [],
                     "outcome_aborted": False,
                     "outcome_unknown": True,
+                    "outcome_cancelled": cancellation_error is not None,
                     "outcome_error": detail,
                     "data_sink_cleanup_warnings": [],
                 }
                 if teardown_error is not None:
                     add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
                 return public_result
+            if cancellation_error is not None:
+                if cancellation_error is execution_error:
+                    raise
+                raise cancellation_error from primary_error
             if teardown_error is not None:
                 aggregate_error = QueryExecutionCleanupError.from_errors(
                     f"DataSink query plan {plan_id} failed before execution and teardown also failed",
@@ -7809,12 +7851,15 @@ class RayQueryDriverActor:
                 self._teardown_plan_resources,
                 plan_id,
                 lifecycle,
+                _on_cancellation=observe_cancellation,
             )
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError as error:
+            observe_cancellation(error)
         except BaseException as error:
             teardown_error = error
         retain_incomplete_teardown(teardown_error)
+        if cancellation_error is not None and public_result.get("outcome_unknown") is True:
+            public_result["outcome_cancelled"] = True
         if teardown_error is not None:
             add_cleanup_warning(public_result, "DataSink teardown", teardown_error)
         return public_result

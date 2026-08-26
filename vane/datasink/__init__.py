@@ -274,7 +274,8 @@ class DataSinkExecutionOptions:
     UNKNOWN outcome. It defaults to zero. Cancellation-derived UNKNOWN
     outcomes are terminal. Each retry re-executes the complete input with the
     same operation ID, so the sink owns deduplication and all delivery
-    guarantees.
+    guarantees. Retry-enabled writes reject non-materialized Arrow stream
+    inputs that may be single-use; materialize them before writing.
     """
 
     worker_count: int = 1
@@ -932,8 +933,13 @@ def _results_from_native(operation_id: str, payload: Mapping[str, Any]) -> tuple
     outcome_aborted = payload.get("outcome_aborted")
     if not isinstance(outcome_aborted, bool):
         raise TypeError("native DataSink outcome_aborted must be a boolean")
+    outcome_cancelled = payload.get("outcome_cancelled")
+    if not isinstance(outcome_cancelled, bool):
+        raise TypeError("native DataSink outcome_cancelled must be a boolean")
     if outcome_unknown and outcome_aborted:
         raise RuntimeError("native DataSink result cannot be both aborted and unknown")
+    if outcome_cancelled and not outcome_unknown:
+        raise RuntimeError("cancelled DataSink outcome must be unknown")
     if native_operation_id != operation_id and not (outcome_unknown and native_operation_id == ""):
         raise RuntimeError(
             f"native DataSink operation_id mismatch: expected {operation_id!r}, got {native_operation_id!r}"
@@ -1204,6 +1210,11 @@ def _execute_datasink_once(
             detail = native_result.get("outcome_error")
             if not isinstance(detail, str) or not detail:
                 detail = "distributed execution may have applied external writes"
+            if native_result["outcome_cancelled"]:
+                raise _InterruptedDataSinkWriteError(
+                    _summary(context, WriteOutcome.UNKNOWN, results, warnings),
+                    detail,
+                )
             raise _unknown_error(context, results, detail, warnings)
         if native_result["outcome_aborted"]:
             detail = native_result.get("outcome_error")
@@ -1233,6 +1244,8 @@ def write_datasink(
     The default does not retry. When ``execution_options.max_retries`` is
     positive, retryable UNKNOWN outcomes re-execute the complete input and use
     the same operation ID. Cancellation-derived UNKNOWN outcomes are terminal.
+    Retry-enabled writes reject non-materialized Arrow stream inputs that may
+    be single-use; materialize them first.
     Vane does not deduplicate external writes or provide exactly-once delivery
     or rollback.
     """
@@ -1263,6 +1276,8 @@ def write_datasink(
     if not isinstance(prepared_relation, RuntimeDuckDBPyRelation):
         raise TypeError("BoundDataSink.prepare_input() must return DuckDBPyRelation")
     prepared_relation._validate_datasink_transaction()
+    if options.max_retries:
+        prepared_relation._validate_datasink_retry_input()
     key_validation = None
     if isinstance(bound, BoundKeyedUpsertSink):
         prepared_relation, key_validation = _prepare_key_validation(prepared_relation, bound)

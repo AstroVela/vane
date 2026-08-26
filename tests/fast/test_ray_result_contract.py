@@ -1602,6 +1602,7 @@ def test_query_driver_datasink_retries_incomplete_teardown(monkeypatch):
                 "write_results": [],
                 "outcome_aborted": False,
                 "outcome_unknown": False,
+                "outcome_cancelled": False,
                 "outcome_error": "",
                 "data_sink_cleanup_warnings": [],
             }
@@ -1644,6 +1645,164 @@ def test_query_driver_datasink_retries_incomplete_teardown(monkeypatch):
     assert plan_id not in runner._plan_session_ids
     assert plan_id not in runner._sessions[_TEST_SESSION_ID].plan_ids
     assert not runner._datasink_cleanup_tasks
+
+
+def test_query_driver_marks_unknown_result_from_cancellation(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-cancelled-after-start"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    execution_started = threading.Event()
+    release_execution = threading.Event()
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            execution_started.set()
+            assert release_execution.wait(timeout=5)
+            raise RuntimeError("planned native cancellation cleanup")
+
+    def _teardown(_self, actual_plan_id, expected_lifecycle):
+        assert actual_plan_id == plan_id
+        lifecycle, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert expected_lifecycle is lifecycle
+        assert (query_id, drop_fragments) == (plan_id, True)
+        release_execution.set()
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def cancel_after_execution_starts():
+        task = asyncio.create_task(_run_actor_datasink_plan(runner, logical_plan))
+        assert await asyncio.to_thread(execution_started.wait, 5)
+        task.cancel()
+        return await task
+
+    try:
+        result = asyncio.run(cancel_after_execution_starts())
+    finally:
+        release_execution.set()
+        cls._shutdown_driver_executors(runner)
+
+    assert result["outcome_unknown"] is True
+    assert result["outcome_cancelled"] is True
+    assert result["operation_id"] == ""
+    assert result["write_results"] == []
+    assert plan_id not in runner._plan_lifecycles
+
+
+def test_query_driver_marks_unknown_result_when_cancelled_during_teardown(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-cancelled-during-teardown"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_started = threading.Event()
+    release_teardown = threading.Event()
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            return {
+                "operation_id": plan_id,
+                "write_results": [],
+                "outcome_aborted": False,
+                "outcome_unknown": True,
+                "outcome_cancelled": False,
+                "outcome_error": "planned unknown outcome",
+                "data_sink_cleanup_warnings": [],
+            }
+
+    def _teardown(_self, actual_plan_id, expected_lifecycle):
+        assert actual_plan_id == plan_id
+        lifecycle, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert expected_lifecycle is lifecycle
+        assert (query_id, drop_fragments) == (plan_id, True)
+        teardown_started.set()
+        assert release_teardown.wait(timeout=5)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+        cleanup_error = RuntimeError("planned teardown diagnostic after cancellation")
+        raise driver._QueryCleanupDiagnostic(
+            f"query plan {plan_id} graceful actor cleanup failed: {cleanup_error}",
+            (cleanup_error,),
+        )
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def cancel_during_teardown():
+        task = asyncio.create_task(_run_actor_datasink_plan(runner, logical_plan))
+        assert await asyncio.to_thread(teardown_started.wait, 5)
+        task.cancel()
+        release_teardown.set()
+        return await task
+
+    try:
+        result = asyncio.run(cancel_during_teardown())
+    finally:
+        release_teardown.set()
+        cls._shutdown_driver_executors(runner)
+
+    assert result["outcome_unknown"] is True
+    assert result["outcome_cancelled"] is True
+    assert result["operation_id"] == plan_id
+    assert any(
+        "planned teardown diagnostic after cancellation" in warning for warning in result["data_sink_cleanup_warnings"]
+    )
+    assert plan_id not in runner._plan_lifecycles
+
+
+def test_query_driver_marks_failed_execution_when_cancelled_during_cleanup(monkeypatch):
+    cls, runner = _make_local_query_driver_actor()
+    plan_id = "datasink-failed-then-cancelled-during-cleanup"
+    logical_plan = _FakeLogicalPlan(_FakePhysicalPlanWithoutPlanAttr(plan_id))
+    teardown_started = threading.Event()
+    release_teardown = threading.Event()
+
+    class _PlanRunner:
+        @staticmethod
+        def run_datasink_plan(_plan, _conn, on_execution_started):
+            on_execution_started()
+            raise RuntimeError("planned native execution failure")
+
+    def _teardown(_self, actual_plan_id, expected_lifecycle):
+        assert actual_plan_id == plan_id
+        lifecycle, query_id, _query_connection, drop_fragments = _test_plan_teardown_state(runner, actual_plan_id)
+        assert expected_lifecycle is lifecycle
+        assert (query_id, drop_fragments) == (plan_id, True)
+        teardown_started.set()
+        assert release_teardown.wait(timeout=5)
+        _release_test_plan_session_state(cls, runner, actual_plan_id)
+
+    monkeypatch.setattr(cls, "_precreate_udf_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_precreate_vllm_actors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cls, "_get_plan_runner", lambda _self: _PlanRunner())
+    monkeypatch.setattr(cls, "_register_query_resources", _query_registration_stub(plan_id))
+    monkeypatch.setattr(cls, "_teardown_plan_resources", _teardown)
+
+    async def cancel_during_cleanup():
+        task = asyncio.create_task(_run_actor_datasink_plan(runner, logical_plan))
+        assert await asyncio.to_thread(teardown_started.wait, 5)
+        task.cancel()
+        release_teardown.set()
+        return await task
+
+    try:
+        result = asyncio.run(cancel_during_cleanup())
+    finally:
+        release_teardown.set()
+        cls._shutdown_driver_executors(runner)
+
+    assert result["outcome_unknown"] is True
+    assert result["outcome_cancelled"] is True
+    assert result["operation_id"] == ""
+    assert plan_id not in runner._plan_lifecycles
 
 
 def test_query_driver_shutdown_bounds_in_progress_datasink_cleanup(monkeypatch):
