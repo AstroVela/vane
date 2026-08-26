@@ -206,7 +206,9 @@ def _scalar_kind(data_type: pa.DataType) -> _ScalarKind:
 
 def _attribute_field(source: pa.Field, target: str) -> _AttributeField:
     data_type = source.type
-    is_array = pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type)
+    is_array = (
+        pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type)
+    )
     value_type = data_type.value_type if is_array else data_type
     try:
         kind = _scalar_kind(value_type)
@@ -308,9 +310,7 @@ class TurbopufferSink(DataSink):
         self.distance_metric = normalized_metric
         self.worker_count = _positive_int("worker_count", worker_count)
         self.max_batch_rows = _positive_int("max_batch_rows", max_batch_rows)
-        self.max_request_bytes = _positive_int(
-            "max_request_bytes", max_request_bytes, maximum=_MAX_WRITE_REQUEST_BYTES
-        )
+        self.max_request_bytes = _positive_int("max_request_bytes", max_request_bytes, maximum=_MAX_WRITE_REQUEST_BYTES)
         self.max_batch_bytes = _positive_int("max_batch_bytes", max_batch_bytes)
         if self.max_batch_bytes > self.max_request_bytes:
             raise ValueError("max_batch_bytes must not exceed max_request_bytes")
@@ -495,9 +495,7 @@ class _TurbopufferWorker(DataSinkWorker):
             if not isinstance(vector, list) or len(vector) != self._vector_field.dimension:
                 raise ValueError("Turbopuffer vector contains a null or invalid dimension")
             if any(
-                isinstance(element, bool)
-                or not isinstance(element, (int, float))
-                or not math.isfinite(float(element))
+                isinstance(element, bool) or not isinstance(element, (int, float)) or not math.isfinite(float(element))
                 for element in vector
             ):
                 raise ValueError("Turbopuffer vector contains a null or non-finite value")
@@ -508,26 +506,20 @@ class _TurbopufferWorker(DataSinkWorker):
         if field.scalar_kind is _ScalarKind.BOOL:
             valid = isinstance(value, bool)
         elif field.scalar_kind is _ScalarKind.INT:
-            valid = (
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and -(1 << 63) <= value <= _MAX_INT64
-            )
+            valid = isinstance(value, int) and not isinstance(value, bool) and -(1 << 63) <= value <= _MAX_INT64
         elif field.scalar_kind is _ScalarKind.UINT:
             valid = isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_UINT64
         elif field.scalar_kind is _ScalarKind.FLOAT:
-            valid = (
-                isinstance(value, (int, float))
-                and not isinstance(value, bool)
-                and math.isfinite(float(value))
-            )
+            valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
         else:
-            valid = isinstance(value, str)
-            if valid:
+            if isinstance(value, str):
+                valid = True
                 try:
                     value.encode("utf-8")
                 except UnicodeEncodeError:
                     valid = False
+            else:
+                valid = False
         if not valid:
             raise ValueError(f"Turbopuffer attribute {field.target_name!r} contains an invalid value")
 
@@ -538,16 +530,14 @@ class _TurbopufferWorker(DataSinkWorker):
                 continue
             if field.is_array:
                 if not isinstance(value, list) or any(element is None for element in value):
-                    raise ValueError(
-                        f"Turbopuffer array attribute {field.target_name!r} contains an invalid value"
-                    )
+                    raise ValueError(f"Turbopuffer array attribute {field.target_name!r} contains an invalid value")
                 for element in value:
                     self._validate_scalar(field, element)
             else:
                 self._validate_scalar(field, value)
         return values
 
-    def _request(self, table: pa.Table) -> tuple[dict[str, list[object]], int, int, int]:
+    def _request(self, table: pa.Table) -> tuple[dict[str, Sequence[object]], int, int, int]:
         self._validate_schema(table)
         row_count = table.num_rows
         batch_bytes = table.nbytes
@@ -556,7 +546,7 @@ class _TurbopufferWorker(DataSinkWorker):
         if batch_bytes > self._sink.max_batch_bytes:
             raise ValueError("Turbopuffer batch exceeds max_batch_bytes")
 
-        columns: dict[str, list[object]] = {
+        columns: dict[str, Sequence[object]] = {
             "id": self._ids(table),
             "vector": self._vectors(table),
         }

@@ -20,7 +20,6 @@ import vane.datasink.turbopuffer as turbopuffer
 from vane import EnvironmentSecret, TurbopufferSink
 from vane.datasink import BoundKeyedUpsertSink, WriteContext
 
-
 _REAL_LOAD_TURBOPUFFER_SDK = turbopuffer._load_turbopuffer_sdk
 _DEFAULT_RESPONSE = object()
 
@@ -47,9 +46,7 @@ class _Namespace:
         assert isinstance(ids, list)
         for index, document_id in enumerate(ids):
             _Client.store[document_id] = {
-                name: deepcopy(values[index])
-                for name, values in columns.items()
-                if isinstance(values, list)
+                name: deepcopy(values[index]) for name, values in columns.items() if isinstance(values, list)
             }
         if _Client.response is _DEFAULT_RESPONSE:
             return _Response(len(ids), len(ids))
