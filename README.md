@@ -98,6 +98,7 @@ pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
 pip install 'vane-ai[milvus]'   # distributed full-row Milvus upserts
+pip install 'vane-ai[qdrant]'   # distributed full-point Qdrant upserts
 ```
 
 The SGLang extra follows SGLang 0.5.17's default CUDA 13 dependency set. Python package metadata cannot select a
@@ -165,6 +166,51 @@ batches are acknowledged and applied independently, so a failed operation can
 be partially applied. Vane does not provide an atomic transaction, rollback,
 or exactly-once delivery, and read visibility follows the consistency level
 used by Milvus readers.
+
+### Qdrant DataSink
+
+`QdrantSink` writes distributed relation batches as full-point upserts. Each
+row must provide an explicit Arrow `uint64` or UUID-string point ID. Use a
+single source column for a collection with one unnamed dense vector, or map
+source columns to every named dense vector in the collection. Payload fields
+are also explicitly mapped; project away any relation columns that should not
+be written. Dense vector columns must be Arrow lists of `float32`, and their
+dimensions must match the collection. Payload values may be nulls, booleans,
+integers whose values fit Qdrant's signed 64-bit payload range, finite
+`float32`/`float64` values, strings, or nested Arrow lists and structs composed
+from those types. Convert binary, decimal, temporal, and other values to an
+explicit supported representation before writing.
+
+UUID text is normalized before Vane's global key check, so invalid, null, and
+semantically duplicate point IDs are rejected before workers open.
+`max_batch_rows` limits rows per worker call, while `max_batch_bytes` limits
+the Arrow buffer size before point conversion.
+
+```python
+from vane import EnvironmentSecret, QdrantSink
+
+sink = QdrantSink(
+    "documents",
+    url="https://qdrant.example:6333",
+    point_id="id",
+    vector_mapping="embedding",
+    payload_mapping={"title": "title", "source": "source"},
+    api_key=EnvironmentSecret("QDRANT_API_KEY"),
+)
+summary = relation.write_datasink(sink)
+```
+
+The endpoint itself may instead be supplied as an `EnvironmentSecret` when it
+must not be serialized with the plan. API-key values are always resolved from
+the worker environment. Qdrant receives `wait=True`, and Vane reports a batch
+as applied only when Qdrant returns `completed`. Each upsert replaces all
+vectors and payload for its point ID; partial updates are not exposed.
+
+The default `max_retries=0` disables Vane's full-operation replay after an
+unknown outcome. Enabling retries replays the complete input with the same
+normalized point IDs. Successful worker batches remain independently visible
+if another batch or the overall job later fails. Vane does not provide an
+atomic transaction, rollback, deletion, or exactly-once delivery.
 
 ### Execution Policy
 
