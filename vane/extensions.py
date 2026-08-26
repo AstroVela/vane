@@ -17,6 +17,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,8 @@ _CAPI_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9
 _WINDOWS_PERMISSION_MODEL = os.name == "nt"
 _WRITE_PERMISSION_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
 _SHARED_DIRECTORY_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+_CACHE_DIRECTORY_NORMALIZATION_TIMEOUT_SECONDS = 5.0
+_CACHE_DIRECTORY_NORMALIZATION_RETRY_SECONDS = 0.01
 
 
 def _snapshot_mode_is_read_only(mode: int) -> bool:
@@ -811,7 +814,7 @@ class DynamicExtensionResolver:
     @staticmethod
     def _validate_windows_cache_ancestors(path: Path) -> None:
         for ancestor in (path, *path.parents):
-            if _native_cache_path_is_replaceable(ancestor, volume_root=ancestor.parent == ancestor):
+            if _native_cache_path_is_replaceable(ancestor):
                 _fail(
                     "ARTIFACT_CACHE_CORRUPT",
                     f"verified artifact cache has a replaceable ancestor: {ancestor}",
@@ -857,6 +860,35 @@ class DynamicExtensionResolver:
             ) from exception
 
     @staticmethod
+    def _wait_for_cache_directory_normalization(path: Path, *, exact_mode: bool) -> None:
+        # mkdir applies the process umask before returning. A competing creator
+        # may therefore expose a temporarily inaccessible owner-only directory
+        # until its immediate chmod(0700) completes.
+        deadline = time.monotonic() + _CACHE_DIRECTORY_NORMALIZATION_TIMEOUT_SECONDS
+        trusted_owners = {0, os.geteuid()}
+        while True:
+            directory_metadata = path.lstat()
+            directory_mode = stat.S_IMODE(directory_metadata.st_mode)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or directory_metadata.st_uid not in trusted_owners
+                or directory_mode & (stat.S_IRWXG | stat.S_IRWXO)
+            ):
+                return
+            if exact_mode:
+                normalized = directory_mode == 0o700
+            else:
+                normalized = directory_mode & 0o300 == 0o300
+            if normalized:
+                return
+            if time.monotonic() >= deadline:
+                _fail(
+                    "ARTIFACT_SNAPSHOT_FAILED",
+                    f"timed out waiting for verified artifact cache directory permissions: {path}",
+                )
+            time.sleep(_CACHE_DIRECTORY_NORMALIZATION_RETRY_SECONDS)
+
+    @staticmethod
     def _create_missing_cache_directories(path: Path) -> None:
         missing_directories: list[Path] = []
         candidate = path
@@ -864,6 +896,11 @@ class DynamicExtensionResolver:
             while True:
                 try:
                     candidate.lstat()
+                    if not _WINDOWS_PERMISSION_MODEL:
+                        DynamicExtensionResolver._wait_for_cache_directory_normalization(
+                            candidate,
+                            exact_mode=candidate == path,
+                        )
                     break
                 except FileNotFoundError:
                     missing_directories.append(candidate)
@@ -878,7 +915,11 @@ class DynamicExtensionResolver:
                     directory.mkdir(mode=0o700)
                     created = True
                 except FileExistsError:
-                    pass
+                    if not _WINDOWS_PERMISSION_MODEL:
+                        DynamicExtensionResolver._wait_for_cache_directory_normalization(
+                            directory,
+                            exact_mode=directory == path,
+                        )
                 if created and not _WINDOWS_PERMISSION_MODEL:
                     directory.chmod(0o700)
                 directory_metadata = directory.lstat()
@@ -1087,14 +1128,11 @@ def _secure_native_cache_path(path: Path, *, directory: bool) -> None:
         ) from exception
 
 
-def _native_cache_path_is_replaceable(path: Path, *, volume_root: bool) -> bool:
+def _native_cache_path_is_replaceable(path: Path) -> bool:
     from vane import _native
 
     try:
-        replaceable = _native._dynamic_extension_cache_path_is_replaceable(
-            str(path),
-            volume_root=volume_root,
-        )
+        replaceable = _native._dynamic_extension_cache_path_is_replaceable(str(path))
     except Exception as exception:
         raise DynamicExtensionError(
             "ARTIFACT_CACHE_CORRUPT",

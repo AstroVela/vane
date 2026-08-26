@@ -66,6 +66,27 @@ static vector<uint8_t> DynamicExtensionWellKnownSid(WELL_KNOWN_SID_TYPE type, co
 	return sid_buffer;
 }
 
+static vector<uint8_t> DynamicExtensionAccountSid(const wchar_t *account_name, const string &path) {
+	DWORD sid_size = 0;
+	DWORD domain_name_size = 0;
+	SID_NAME_USE sid_type;
+	LookupAccountNameW(nullptr, account_name, nullptr, &sid_size, nullptr, &domain_name_size, &sid_type);
+	auto status = GetLastError();
+	if (status != ERROR_INSUFFICIENT_BUFFER || sid_size == 0 || domain_name_size == 0) {
+		throw IOException("Could not size a trusted account identity for extension cache path '%s' (Windows error %u)",
+		                  path, status);
+	}
+	vector<uint8_t> sid_buffer(sid_size);
+	vector<wchar_t> domain_name_buffer(domain_name_size);
+	if (!LookupAccountNameW(nullptr, account_name, sid_buffer.data(), &sid_size, domain_name_buffer.data(),
+	                        &domain_name_size, &sid_type)) {
+		throw IOException("Could not read a trusted account identity for extension cache path '%s' (Windows error %u)",
+		                  path, GetLastError());
+	}
+	sid_buffer.resize(sid_size);
+	return sid_buffer;
+}
+
 static bool DynamicExtensionSidEquals(PSID candidate, const vector<uint8_t> &trusted_sid) {
 	return candidate && IsValidSid(candidate) && EqualSid(candidate, const_cast<uint8_t *>(trusted_sid.data()));
 }
@@ -73,12 +94,14 @@ static bool DynamicExtensionSidEquals(PSID candidate, const vector<uint8_t> &tru
 static bool DynamicExtensionCacheTrustedSid(PSID candidate, PSID owner, PSID process_user_sid,
                                             const vector<uint8_t> &local_system_sid,
                                             const vector<uint8_t> &administrators_sid,
+                                            const vector<uint8_t> &trusted_installer_sid,
                                             const vector<uint8_t> &creator_owner_sid,
                                             const vector<uint8_t> &creator_owner_rights_sid) {
 	if ((candidate && process_user_sid && IsValidSid(candidate) && IsValidSid(process_user_sid) &&
 	     EqualSid(candidate, process_user_sid)) ||
 	    DynamicExtensionSidEquals(candidate, local_system_sid) ||
-	    DynamicExtensionSidEquals(candidate, administrators_sid)) {
+	    DynamicExtensionSidEquals(candidate, administrators_sid) ||
+	    DynamicExtensionSidEquals(candidate, trusted_installer_sid)) {
 		return true;
 	}
 	return owner && (DynamicExtensionSidEquals(candidate, creator_owner_sid) ||
@@ -123,7 +146,7 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 #endif
 }
 
-static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volume_root) {
+static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 #ifdef DUCKDB_WINDOWS
 	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
 	auto attributes = GetFileAttributesW(windows_path.c_str());
@@ -138,6 +161,8 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volu
 	auto process_user = reinterpret_cast<TOKEN_USER *>(process_user_buffer.data());
 	auto local_system_sid = DynamicExtensionWellKnownSid(WinLocalSystemSid, path);
 	auto administrators_sid = DynamicExtensionWellKnownSid(WinBuiltinAdministratorsSid, path);
+	// Windows system-volume roots can be owned by the Windows Modules Installer service.
+	auto trusted_installer_sid = DynamicExtensionAccountSid(L"NT SERVICE\\TrustedInstaller", path);
 	auto creator_owner_sid = DynamicExtensionWellKnownSid(WinCreatorOwnerSid, path);
 	auto creator_owner_rights_sid = DynamicExtensionWellKnownSid(WinCreatorOwnerRightsSid, path);
 
@@ -155,8 +180,8 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volu
 	bool replaceable = !dacl;
 	auto owner_trusted =
 	    DynamicExtensionCacheTrustedSid(owner, nullptr, process_user->User.Sid, local_system_sid, administrators_sid,
-	                                    creator_owner_sid, creator_owner_rights_sid);
-	if (!volume_root && !owner_trusted) {
+	                                    trusted_installer_sid, creator_owner_sid, creator_owner_rights_sid);
+	if (!owner_trusted) {
 		replaceable = true;
 	}
 
@@ -193,8 +218,8 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volu
 			trustee_sid = objects_and_sid->pSid;
 		}
 		if (!DynamicExtensionCacheTrustedSid(trustee_sid, owner_trusted ? owner : nullptr, process_user->User.Sid,
-		                                     local_system_sid, administrators_sid, creator_owner_sid,
-		                                     creator_owner_rights_sid)) {
+		                                     local_system_sid, administrators_sid, trusted_installer_sid,
+		                                     creator_owner_sid, creator_owner_rights_sid)) {
 			replaceable = true;
 		}
 	}
@@ -205,7 +230,6 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path, bool volu
 	LocalFree(security_descriptor);
 	return replaceable;
 #else
-	(void)volume_root;
 	throw NotImplementedException("Windows DACLs are unavailable for extension cache ancestor '%s'", path);
 #endif
 }
@@ -284,8 +308,8 @@ void InitializeDynamicExtensionBindings(py::module_ &module) {
 	module.def("_dynamic_extension_compatibility_version", &ExtensionHelper::GetVersionDirectoryName);
 	module.def("_secure_dynamic_extension_cache_path", &SecureDynamicExtensionCachePath, py::arg("path"), py::kw_only(),
 	           py::arg("directory"));
-	module.def("_dynamic_extension_cache_path_is_replaceable", &DynamicExtensionCachePathIsReplaceable, py::arg("path"),
-	           py::kw_only(), py::arg("volume_root"));
+	module.def("_dynamic_extension_cache_path_is_replaceable", &DynamicExtensionCachePathIsReplaceable,
+	           py::arg("path"));
 	module.def("_inspect_dynamic_extension", &InspectDynamicExtension, py::arg("path"));
 	module.def("_load_dynamic_extension", &LoadDynamicExtension, py::arg("path"), py::kw_only(),
 	           py::arg("connection").none(false));
