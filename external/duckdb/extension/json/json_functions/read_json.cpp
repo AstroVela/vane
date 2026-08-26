@@ -75,7 +75,7 @@ public:
 			throw InternalException("Union data already set");
 		}
 		auto &reader = *json_reader;
-		auto union_data = make_uniq<BaseUnionData>(files[file_idx].path);
+		auto union_data = make_uniq<BaseUnionData>(files[file_idx]);
 		union_data->reader = std::move(json_reader);
 		bind_data.union_readers[file_idx] = std::move(union_data);
 

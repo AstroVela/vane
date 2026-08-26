@@ -14,12 +14,14 @@ namespace duckdb {
 void JSONFileSnapshot::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(100, "path", path);
 	serializer.WritePropertyWithDefault<map<string, Value>>(101, "options", options);
+	serializer.WritePropertyWithDefault<idx_t>(102, "ordinal", ordinal);
 }
 
 JSONFileSnapshot JSONFileSnapshot::Deserialize(Deserializer &deserializer) {
 	JSONFileSnapshot result;
 	deserializer.ReadPropertyWithDefault<string>(100, "path", result.path);
 	deserializer.ReadPropertyWithDefault<map<string, Value>>(101, "options", result.options);
+	deserializer.ReadPropertyWithDefault<idx_t>(102, "ordinal", result.ordinal);
 	return result;
 }
 

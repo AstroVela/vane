@@ -142,6 +142,11 @@
         "id": 101,
         "name": "options",
         "type": "map<string, Value>"
+      },
+      {
+        "id": 102,
+        "name": "ordinal",
+        "type": "idx_t"
       }
     ],
     "pointer_type": "none"

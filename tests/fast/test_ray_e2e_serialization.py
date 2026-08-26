@@ -339,3 +339,45 @@ def test_multi_file_json_bind_state_survives_real_ray_serde(tmp_path, monkeypatc
         ),
     ]
     connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_multi_file_json_preserves_file_index_through_real_ray(tmp_path, monkeypatch):
+    """Each singleton Ray split retains its coordinator-side file ordinal."""
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_DISTRIBUTED_WORKER_SLOTS", "2")
+    monkeypatch.setenv("VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION", "1")
+    first_path = tmp_path / "first.ndjson"
+    second_path = tmp_path / "second.ndjson"
+    first_path.write_text('{"id":1}\n', encoding="utf-8")
+    second_path.write_text('{"id":2}\n', encoding="utf-8")
+    paths = f"['{first_path}', '{second_path}']"
+
+    connection = vane.connect()
+    from vane import runners
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+
+    def execute(query, plan_id):
+        relation = connection.sql(query)
+        plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, plan_id).to_physical_plan(connection)
+        split_batches = next(iter(plan.scan_split_batch_map().values()))
+        assert len(split_batches) == 2
+        assert all(len(vane.ray_cxx.split_scan_split_batch(batch)) == 1 for batch in split_batches)
+        parts = list(runner.run_iter_tables(relation))
+        tables = [part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts]
+        result = pa.concat_tables(tables)
+        return sorted(zip(result.column(0).to_pylist(), result.column(1).to_pylist()))
+
+    assert execute(
+        f"SELECT id, file_index FROM read_ndjson_auto({paths})",
+        "multi-json-file-index-projection-plan",
+    ) == [(1, 0), (2, 1)]
+    assert execute(
+        f"SELECT id, file_index FROM read_ndjson_auto({paths}) WHERE file_index = 1",
+        "multi-json-file-index-filter-plan",
+    ) == [(2, 1)]
+    connection.close()

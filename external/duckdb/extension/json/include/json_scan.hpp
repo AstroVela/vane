@@ -24,10 +24,14 @@ namespace duckdb {
 //! Owned, deterministic representation of an OpenFileInfo used by a bound JSON scan.
 struct JSONFileSnapshot {
 	JSONFileSnapshot() = default;
-	explicit JSONFileSnapshot(const OpenFileInfo &file);
+	JSONFileSnapshot(idx_t ordinal, const OpenFileInfo &file);
+
+	static constexpr const char *ORDINAL_OPTION = "__vane_json_file_ordinal";
+	static bool TryGetOrdinal(const OpenFileInfo &file, idx_t &ordinal);
 
 	string path;
 	map<string, Value> options;
+	idx_t ordinal = 0;
 
 	OpenFileInfo ToOpenFileInfo() const;
 	void Serialize(Serializer &serializer) const;

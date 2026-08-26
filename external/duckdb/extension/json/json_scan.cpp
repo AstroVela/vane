@@ -12,9 +12,13 @@
 
 namespace duckdb {
 
-JSONFileSnapshot::JSONFileSnapshot(const OpenFileInfo &file) : path(file.path) {
+JSONFileSnapshot::JSONFileSnapshot(idx_t ordinal_p, const OpenFileInfo &file) : path(file.path), ordinal(ordinal_p) {
 	if (file.extended_info) {
 		for (const auto &entry : file.extended_info->options) {
+			if (entry.first == ORDINAL_OPTION) {
+				ordinal = entry.second.GetValue<idx_t>();
+				continue;
+			}
 			options.emplace(entry.first, entry.second);
 		}
 	}
@@ -22,13 +26,24 @@ JSONFileSnapshot::JSONFileSnapshot(const OpenFileInfo &file) : path(file.path) {
 
 OpenFileInfo JSONFileSnapshot::ToOpenFileInfo() const {
 	OpenFileInfo result(path);
-	if (!options.empty()) {
-		result.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-		for (const auto &entry : options) {
-			result.extended_info->options.emplace(entry.first, entry.second);
-		}
+	result.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	for (const auto &entry : options) {
+		result.extended_info->options.emplace(entry.first, entry.second);
 	}
+	result.extended_info->options[ORDINAL_OPTION] = Value::UBIGINT(ordinal);
 	return result;
+}
+
+bool JSONFileSnapshot::TryGetOrdinal(const OpenFileInfo &file, idx_t &ordinal) {
+	if (!file.extended_info) {
+		return false;
+	}
+	auto entry = file.extended_info->options.find(ORDINAL_OPTION);
+	if (entry == file.extended_info->options.end()) {
+		return false;
+	}
+	ordinal = entry->second.GetValue<idx_t>();
+	return true;
 }
 
 JSONScanData::JSONScanData() {
@@ -291,6 +306,24 @@ static void ValidateJSONBindData(const MultiFileBindData &bind_data, const strin
 	}
 }
 
+static void ValidateJSONFiles(const vector<JSONFileSnapshot> &files, const string &function_name,
+                              const string &operation) {
+	set<idx_t> ordinals;
+	for (const auto &file : files) {
+		if (file.path.empty()) {
+			throw SerializationException("Cannot %s %s with an empty JSON file path", operation, function_name);
+		}
+		if (file.options.find(JSONFileSnapshot::ORDINAL_OPTION) != file.options.end()) {
+			throw SerializationException("Cannot %s %s with nested JSON file ordinal metadata", operation,
+			                             function_name);
+		}
+		if (!ordinals.insert(file.ordinal).second) {
+			throw SerializationException("Cannot %s %s with duplicate JSON file ordinal %llu", operation, function_name,
+			                             static_cast<unsigned long long>(file.ordinal));
+		}
+	}
+}
+
 void JSONScan::Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                          const TableFunction &function) {
 	if (!bind_data_p) {
@@ -303,12 +336,10 @@ void JSONScan::Serialize(Serializer &serializer, const optional_ptr<FunctionData
 	SerializedJSONScanData serialized_data;
 	auto files = bind_data.file_list->GetAllFiles();
 	serialized_data.files.reserve(files.size());
-	for (const auto &file : files) {
-		if (file.path.empty()) {
-			throw SerializationException("Cannot serialize %s with an empty JSON file path", function.name);
-		}
-		serialized_data.files.emplace_back(file);
+	for (idx_t file_idx = 0; file_idx < files.size(); file_idx++) {
+		serialized_data.files.emplace_back(file_idx, files[file_idx]);
 	}
+	ValidateJSONFiles(serialized_data.files, function.name, "serialize");
 	serialized_data.types = bind_data.types;
 	serialized_data.names = bind_data.names;
 	serialized_data.file_options = bind_data.file_options;
@@ -335,11 +366,7 @@ unique_ptr<FunctionData> JSONScan::Deserialize(Deserializer &deserializer, Table
 	ValidateJSONFormats(serialized_data.timestamp_formats, function.name);
 	ValidateJSONSchema(serialized_data.types, serialized_data.names, serialized_data.key_names,
 	                   serialized_data.file_options, serialized_data.reader_bind, function.name);
-	for (const auto &file : serialized_data.files) {
-		if (file.path.empty()) {
-			throw SerializationException("Cannot deserialize %s with an empty JSON file path", function.name);
-		}
-	}
+	ValidateJSONFiles(serialized_data.files, function.name, "deserialize");
 
 	vector<OpenFileInfo> files;
 	files.reserve(serialized_data.files.size());
