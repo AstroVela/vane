@@ -395,7 +395,7 @@ def test_concurrent_different_artifacts_report_exactly_one_winner(tmp_path, fake
     assert len(connection.loaded_paths) == 1
 
 
-def test_default_cache_uses_duckdb_extension_directory(tmp_path, monkeypatch):
+def test_default_cache_uses_duckdb_extension_directory_without_native_creation(tmp_path):
     platform = _runtime_platform()
     artifact_path = _write_extension_artifact(
         tmp_path / "root.duckdb_extension",
@@ -404,18 +404,32 @@ def test_default_cache_uses_duckdb_extension_directory(tmp_path, monkeypatch):
     )
     descriptor = _descriptor(artifact_path, name="root")
     extension_directory = tmp_path / "duckdb-extensions"
-    monkeypatch.setattr(extension_module, "_native_extension_directory", lambda _connection: extension_directory)
+    connection = vane.connect(config={"extension_directory": str(extension_directory)})
+    try:
+        native_directory = extension_module._native_extension_directory(connection)
+        assert native_directory.parent.parent == extension_directory
+        assert not extension_directory.exists()
 
-    resolved = DynamicExtensionResolver(trusted_identities={"local-tests"}).resolve(
-        RecordingConnection(platform),
-        descriptor,
-        artifact=artifact_path,
-    )
+        previous_umask = os.umask(0o777) if os.name != "nt" else None
+        try:
+            resolved = DynamicExtensionResolver(trusted_identities={"local-tests"}).resolve(
+                connection,
+                descriptor,
+                artifact=artifact_path,
+            )
+        finally:
+            if previous_umask is not None:
+                os.umask(previous_umask)
+    finally:
+        connection.close()
 
-    assert resolved[0].path.parent.parent.parent == extension_directory / ".vane" / "verified-v1"
+    cache_root = native_directory / ".vane" / "verified-v1"
+    assert resolved[0].path.parent.parent.parent == cache_root
     if os.name != "nt":
-        assert stat.S_IMODE(extension_directory.stat().st_mode) == 0o700
-        assert stat.S_IMODE((extension_directory / ".vane").stat().st_mode) == 0o700
+        for directory in resolved[0].path.parents:
+            if directory == tmp_path:
+                break
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows directory privacy is represented by its DACL, not umask")

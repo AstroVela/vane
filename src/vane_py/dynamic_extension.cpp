@@ -270,7 +270,14 @@ void InitializeDynamicExtensionBindings(py::module_ &module) {
 	module.def(
 	    "_dynamic_extension_directory",
 	    [](const shared_ptr<DuckDBPyConnection> &connection) {
-		    return ExtensionHelper::ExtensionDirectory(DynamicExtensionContext(connection));
+		    // Vane creates every missing cache component with private permissions; DuckDB's ExtensionDirectory helper
+		    // would create the whole path first using the process umask.
+		    auto extension_directories =
+		        ExtensionHelper::GetExtensionDirectoryPath(DynamicExtensionContext(connection));
+		    if (extension_directories.empty()) {
+			    throw InternalException("DuckDB returned no configured extension directories");
+		    }
+		    return extension_directories[0];
 	    },
 	    py::kw_only(), py::arg("connection").none(false));
 	module.def("_dynamic_extension_platform", &DuckDB::Platform);
