@@ -720,15 +720,19 @@ class DynamicExtensionResolver:
     ) -> None:
         if snapshot_path.is_symlink() or not snapshot_path.is_file():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is invalid: {snapshot_path}")
-        if _WINDOWS_PERMISSION_MODEL:
-            _secure_native_cache_path(snapshot_path, directory=False)
         try:
-            snapshot_mode = snapshot_path.stat().st_mode
+            snapshot_metadata = snapshot_path.stat()
         except OSError as exception:
             raise DynamicExtensionError(
                 "ARTIFACT_CACHE_CORRUPT", f"could not inspect verified artifact cache entry: {snapshot_path}"
             ) from exception
-        if not _snapshot_mode_is_read_only(snapshot_mode):
+        if snapshot_metadata.st_nlink != 1:
+            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry has unsafe hard links: {snapshot_path}")
+        if _WINDOWS_PERMISSION_MODEL:
+            _secure_native_cache_path(snapshot_path, directory=False)
+        elif snapshot_metadata.st_uid not in {0, os.geteuid()}:
+            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry has an untrusted owner: {snapshot_path}")
+        if not _snapshot_mode_is_read_only(snapshot_metadata.st_mode):
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is not read-only: {snapshot_path}")
         if _sha256_file(snapshot_path) != descriptor.sha256:
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache digest is invalid: {snapshot_path}")
@@ -937,6 +941,8 @@ class DynamicExtensionResolver:
 
     @staticmethod
     def _prepare_cache_directory(path: Path) -> Path:
+        if path.parent == path:
+            _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache must not be a filesystem root: {path}")
         DynamicExtensionResolver._create_missing_cache_directories(path)
         try:
             directory_metadata = path.lstat()
@@ -1124,7 +1130,7 @@ def _secure_native_cache_path(path: Path, *, directory: bool) -> None:
     except Exception as exception:
         raise DynamicExtensionError(
             "ARTIFACT_CACHE_CORRUPT",
-            f"could not apply a private Windows DACL to verified artifact cache path: {path}",
+            f"could not validate or apply a private Windows DACL to verified artifact cache path: {path}",
         ) from exception
 
 

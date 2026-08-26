@@ -91,17 +91,28 @@ static bool DynamicExtensionSidEquals(PSID candidate, const vector<uint8_t> &tru
 	return candidate && IsValidSid(candidate) && EqualSid(candidate, const_cast<uint8_t *>(trusted_sid.data()));
 }
 
+static bool DynamicExtensionCacheTrustedPrincipal(PSID candidate, PSID process_user_sid,
+                                                  const vector<uint8_t> &local_system_sid,
+                                                  const vector<uint8_t> &administrators_sid,
+                                                  const vector<uint8_t> &trusted_installer_sid) {
+	if ((candidate && process_user_sid && IsValidSid(candidate) && IsValidSid(process_user_sid) &&
+	     EqualSid(candidate, process_user_sid)) ||
+	    DynamicExtensionSidEquals(candidate, local_system_sid) ||
+	    DynamicExtensionSidEquals(candidate, administrators_sid) ||
+	    DynamicExtensionSidEquals(candidate, trusted_installer_sid)) {
+		return true;
+	}
+	return false;
+}
+
 static bool DynamicExtensionCacheTrustedSid(PSID candidate, PSID owner, PSID process_user_sid,
                                             const vector<uint8_t> &local_system_sid,
                                             const vector<uint8_t> &administrators_sid,
                                             const vector<uint8_t> &trusted_installer_sid,
                                             const vector<uint8_t> &creator_owner_sid,
                                             const vector<uint8_t> &creator_owner_rights_sid) {
-	if ((candidate && process_user_sid && IsValidSid(candidate) && IsValidSid(process_user_sid) &&
-	     EqualSid(candidate, process_user_sid)) ||
-	    DynamicExtensionSidEquals(candidate, local_system_sid) ||
-	    DynamicExtensionSidEquals(candidate, administrators_sid) ||
-	    DynamicExtensionSidEquals(candidate, trusted_installer_sid)) {
+	if (DynamicExtensionCacheTrustedPrincipal(candidate, process_user_sid, local_system_sid, administrators_sid,
+	                                          trusted_installer_sid)) {
 		return true;
 	}
 	return owner && (DynamicExtensionSidEquals(candidate, creator_owner_sid) ||
@@ -112,8 +123,37 @@ static bool DynamicExtensionCacheTrustedSid(PSID candidate, PSID owner, PSID pro
 static void SecureDynamicExtensionCachePath(const string &path, bool directory) {
 #ifdef DUCKDB_WINDOWS
 	auto windows_path = WindowsUtil::UTF8ToUnicode(path.c_str());
+	auto attributes = GetFileAttributesW(windows_path.c_str());
+	if (attributes == INVALID_FILE_ATTRIBUTES) {
+		throw IOException("Could not inspect extension cache path '%s' (Windows error %u)", path, GetLastError());
+	}
+	bool path_is_directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+	if (path_is_directory != directory || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		throw IOException("Extension cache path has an unsafe file type: '%s'", path);
+	}
 	auto token_user_buffer = DynamicExtensionProcessUserSid(path);
 	auto token_user = reinterpret_cast<TOKEN_USER *>(token_user_buffer.data());
+	auto local_system_sid = DynamicExtensionWellKnownSid(WinLocalSystemSid, path);
+	auto administrators_sid = DynamicExtensionWellKnownSid(WinBuiltinAdministratorsSid, path);
+	auto trusted_installer_sid = DynamicExtensionAccountSid(L"NT SERVICE\\TrustedInstaller", path);
+
+	PSID owner = nullptr;
+	PSECURITY_DESCRIPTOR owner_security_descriptor = nullptr;
+	auto status =
+	    GetNamedSecurityInfoW(const_cast<LPWSTR>(windows_path.c_str()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+	                          &owner, nullptr, nullptr, nullptr, &owner_security_descriptor);
+	if (status != ERROR_SUCCESS) {
+		if (owner_security_descriptor) {
+			LocalFree(owner_security_descriptor);
+		}
+		throw IOException("Could not read the owner of extension cache path '%s' (Windows error %u)", path, status);
+	}
+	auto owner_trusted = DynamicExtensionCacheTrustedPrincipal(owner, token_user->User.Sid, local_system_sid,
+	                                                           administrators_sid, trusted_installer_sid);
+	LocalFree(owner_security_descriptor);
+	if (!owner_trusted) {
+		throw IOException("Extension cache path has an untrusted owner: '%s'", path);
+	}
 
 	EXPLICIT_ACCESSW user_access {};
 	user_access.grfAccessPermissions = GENERIC_ALL;
@@ -124,7 +164,7 @@ static void SecureDynamicExtensionCachePath(const string &path, bool directory) 
 	user_access.Trustee.ptstrName = static_cast<LPWSTR>(token_user->User.Sid);
 
 	PACL private_acl = nullptr;
-	auto status = SetEntriesInAclW(1, &user_access, nullptr, &private_acl);
+	status = SetEntriesInAclW(1, &user_access, nullptr, &private_acl);
 	if (status != ERROR_SUCCESS || !private_acl) {
 		if (private_acl) {
 			LocalFree(private_acl);
@@ -178,9 +218,8 @@ static bool DynamicExtensionCachePathIsReplaceable(const string &path) {
 	}
 
 	bool replaceable = !dacl;
-	auto owner_trusted =
-	    DynamicExtensionCacheTrustedSid(owner, nullptr, process_user->User.Sid, local_system_sid, administrators_sid,
-	                                    trusted_installer_sid, creator_owner_sid, creator_owner_rights_sid);
+	auto owner_trusted = DynamicExtensionCacheTrustedPrincipal(owner, process_user->User.Sid, local_system_sid,
+	                                                           administrators_sid, trusted_installer_sid);
 	if (!owner_trusted) {
 		replaceable = true;
 	}

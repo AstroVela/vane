@@ -559,6 +559,67 @@ def test_content_cache_with_writable_snapshot_fails_closed(tmp_path):
         resolver.resolve(connection, descriptor, artifact=artifact_path)
 
 
+def test_content_cache_with_hard_link_fails_closed(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = _resolver(tmp_path / "verified")
+    connection = RecordingConnection(platform)
+    snapshot = resolver.resolve(connection, descriptor, artifact=artifact_path)[0].path
+    os.link(snapshot, tmp_path / "external-snapshot-link.duckdb_extension")
+
+    with pytest.raises(DynamicExtensionError, match="unsafe hard links"):
+        resolver.resolve(connection, descriptor, artifact=artifact_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cache ownership is validated by the native DACL helper")
+def test_content_cache_with_untrusted_snapshot_owner_fails_closed(tmp_path, monkeypatch):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    resolver = _resolver(tmp_path / "verified")
+    connection = RecordingConnection(platform)
+    snapshot = resolver.resolve(connection, descriptor, artifact=artifact_path)[0].path
+    original_stat = Path.stat
+
+    def stat_with_untrusted_owner(path, *, follow_symlinks=True):
+        metadata = original_stat(path, follow_symlinks=follow_symlinks)
+        if path != snapshot:
+            return metadata
+        values = list(metadata)
+        values[4] = os.geteuid() + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "stat", stat_with_untrusted_owner)
+
+    with pytest.raises(DynamicExtensionError, match="untrusted owner"):
+        resolver.resolve(connection, descriptor, artifact=artifact_path)
+
+
+def test_cache_root_rejects_a_filesystem_root_before_permission_changes(monkeypatch):
+    filesystem_root = Path.cwd().anchor
+    secured_paths = []
+    monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
+    monkeypatch.setattr(
+        extension_module,
+        "_secure_native_cache_path",
+        lambda path, *, directory: secured_paths.append((path, directory)),
+    )
+
+    with pytest.raises(DynamicExtensionError, match="must not be a filesystem root"):
+        DynamicExtensionResolver._prepare_cache_directory(Path(filesystem_root))
+
+    assert secured_paths == []
+
+
 def test_windows_permission_model_secures_cached_paths_and_removes_staging_directories(tmp_path, monkeypatch):
     platform = _runtime_platform()
     artifact_path = _write_extension_artifact(
