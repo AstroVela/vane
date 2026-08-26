@@ -412,18 +412,77 @@ def test_content_cache_with_writable_snapshot_fails_closed(tmp_path):
         resolver.resolve(connection, descriptor, artifact=artifact_path)
 
 
-def test_windows_permission_model_uses_private_acl_and_read_only_file_attribute(tmp_path, monkeypatch):
-    secured_directories = []
-    monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
-    monkeypatch.setattr(extension_module, "_secure_native_cache_directory", secured_directories.append)
-
+def test_windows_permission_model_secures_cached_paths_and_removes_staging_directories(tmp_path, monkeypatch):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
     cache_directory = tmp_path / "verified"
-    prepared_directory = DynamicExtensionResolver._prepare_cache_directory(cache_directory)
+    secured_paths = []
 
-    assert prepared_directory == cache_directory
-    assert secured_directories == [cache_directory]
+    monkeypatch.setattr(extension_module, "_WINDOWS_PERMISSION_MODEL", True)
+    monkeypatch.setattr(
+        extension_module,
+        "_secure_native_cache_path",
+        lambda path, *, directory: secured_paths.append((path, directory)),
+    )
+
+    resolver = _resolver(cache_directory)
+    first = resolver.resolve(RecordingConnection(platform), descriptor, artifact=artifact_path)[0]
+
+    digest_directory = first.path.parent.parent
+    artifact_directory = first.path.parent
+    staging_directories = [path for path, directory in secured_paths if directory and path.name.startswith(".root-")]
+    assert len(staging_directories) == 1
+    assert secured_paths == [
+        (cache_directory, True),
+        (staging_directories[0], True),
+        (digest_directory, True),
+        (artifact_directory, True),
+        (first.path, False),
+    ]
+    assert not [path for path in cache_directory.iterdir() if path.name.startswith(".root-")]
+    assert extension_module._snapshot_mode_is_read_only(first.path.stat().st_mode)
+
+    secured_paths.clear()
+    second = resolver.resolve(RecordingConnection(platform), descriptor, artifact=artifact_path)[0]
+
+    assert second == first
+    assert secured_paths == [
+        (cache_directory, True),
+        (digest_directory, True),
+        (artifact_directory, True),
+        (first.path, False),
+    ]
     assert extension_module._snapshot_mode_is_read_only(0o444)
     assert not extension_module._snapshot_mode_is_read_only(0o666)
+
+
+def test_resolver_rejects_a_bare_trusted_identity_string():
+    with pytest.raises(DynamicExtensionError, match="trusted_identities must be an iterable"):
+        DynamicExtensionResolver(trusted_identities="local-tests")
+
+
+def test_resolve_preserves_the_callers_pending_result(tmp_path):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    descriptor = _descriptor(artifact_path, name="root")
+    connection = vane.connect()
+    try:
+        connection.execute("SELECT * FROM (VALUES (41), (42))")
+
+        _resolver(tmp_path / "verified").resolve(connection, descriptor, artifact=artifact_path)
+
+        assert connection.fetchall() == [(41,), (42,)]
+    finally:
+        connection.close()
 
 
 def test_corrupt_content_cache_fails_closed(tmp_path):

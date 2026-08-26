@@ -422,6 +422,8 @@ class DynamicExtensionResolver:
         providers: Iterable[LocalExtensionProvider] = (),
         cache_directory: str | Path | None = None,
     ):
+        if isinstance(trusted_identities, str):
+            _fail("DESCRIPTOR_INVALID", "trusted_identities must be an iterable of identities, not one string")
         trusted = frozenset(_validate_trust_identity(identity) for identity in trusted_identities)
         if not trusted:
             _fail("DESCRIPTOR_INVALID", "trusted_identities must not be empty")
@@ -449,7 +451,7 @@ class DynamicExtensionResolver:
         self._validate_resolved_names(candidate for candidate, _ in load_plan)
 
         current_source_id, current_vane_version = _runtime_identity()
-        current_platform = _connection_platform(connection)
+        current_platform = _native_platform()
         for candidate, _ in load_plan:
             self._validate_runtime_compatibility(
                 candidate,
@@ -595,6 +597,8 @@ class DynamicExtensionResolver:
         artifact_directory = digest_directory / descriptor.name
         snapshot_path = artifact_directory / expected_filename
         if snapshot_path.exists() or snapshot_path.is_symlink():
+            self._prepare_cache_directory(digest_directory)
+            self._prepare_cache_directory(artifact_directory)
             source_digest = _sha256_file(artifact_path)
             self._validate_digest(descriptor, source_digest)
             self._validate_cached_snapshot(
@@ -607,6 +611,8 @@ class DynamicExtensionResolver:
         staging_directory = Path(tempfile.mkdtemp(prefix=f".{descriptor.name}-", dir=cache_root))
         staging_path = staging_directory / expected_filename
         try:
+            if _WINDOWS_PERMISSION_MODEL:
+                _secure_native_cache_path(staging_directory, directory=True)
             actual_digest = _copy_and_hash_artifact(artifact_path, staging_path)
             self._validate_digest(descriptor, actual_digest)
             try:
@@ -631,23 +637,27 @@ class DynamicExtensionResolver:
             metadata = _inspect_native_extension(staging_path)
             self._validate_native_metadata(descriptor, metadata, current_platform=current_platform)
             self._prepare_cache_directory(digest_directory)
-            self._prepare_cache_directory(artifact_directory)
             try:
-                os.link(staging_path, snapshot_path, follow_symlinks=False)
-            except FileExistsError:
+                os.rename(staging_directory, artifact_directory)
+            except OSError as exception:
+                if not (artifact_directory.exists() or artifact_directory.is_symlink()):
+                    raise DynamicExtensionError(
+                        "ARTIFACT_SNAPSHOT_FAILED",
+                        f"could not publish verified artifact snapshot: {snapshot_path}",
+                    ) from exception
+                self._prepare_cache_directory(artifact_directory)
                 self._validate_cached_snapshot(
                     descriptor,
                     snapshot_path,
                     current_platform=current_platform,
                 )
-            except OSError as exception:
-                raise DynamicExtensionError(
-                    "ARTIFACT_SNAPSHOT_FAILED",
-                    f"could not publish verified artifact snapshot: {snapshot_path}",
-                ) from exception
+            else:
+                self._prepare_cache_directory(artifact_directory)
+                if _WINDOWS_PERMISSION_MODEL:
+                    _secure_native_cache_path(snapshot_path, directory=False)
             return snapshot_path
         finally:
-            shutil.rmtree(staging_directory, ignore_errors=True)
+            _cleanup_staging_directory(staging_directory, staging_path)
 
     def _validate_runtime_compatibility(
         self,
@@ -692,6 +702,8 @@ class DynamicExtensionResolver:
     ) -> None:
         if snapshot_path.is_symlink() or not snapshot_path.is_file():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache entry is invalid: {snapshot_path}")
+        if _WINDOWS_PERMISSION_MODEL:
+            _secure_native_cache_path(snapshot_path, directory=False)
         try:
             snapshot_mode = snapshot_path.stat().st_mode
         except OSError as exception:
@@ -778,7 +790,7 @@ class DynamicExtensionResolver:
         if path.is_symlink() or not path.is_dir():
             _fail("ARTIFACT_CACHE_CORRUPT", f"verified artifact cache directory is invalid: {path}")
         if _WINDOWS_PERMISSION_MODEL:
-            _secure_native_cache_directory(path)
+            _secure_native_cache_path(path, directory=True)
             return path
         try:
             directory_mode = path.stat().st_mode
@@ -880,16 +892,18 @@ def create_dynamic_extension_descriptor(
     )
 
 
-def _connection_platform(connection: DuckDBPyConnection) -> str:
+def _native_platform() -> str:
+    from vane import _native
+
     try:
-        row = connection.execute("SELECT platform FROM pragma_platform()").fetchone()
+        platform = _native._dynamic_extension_platform()
     except Exception as exception:
         raise DynamicExtensionError(
-            "RUNTIME_IDENTITY_UNAVAILABLE", "could not query the DuckDB platform"
+            "RUNTIME_IDENTITY_UNAVAILABLE", "DuckDB could not report its runtime platform"
         ) from exception
-    if not isinstance(row, tuple) or len(row) != 1 or not isinstance(row[0], str):
-        _fail("RUNTIME_IDENTITY_UNAVAILABLE", "pragma_platform() did not return one platform string")
-    return _validate_platform(row[0])
+    if not isinstance(platform, str):
+        _fail("RUNTIME_IDENTITY_UNAVAILABLE", "DuckDB returned a non-string runtime platform")
+    return _validate_platform(platform)
 
 
 def _native_extension_directory(connection: DuckDBPyConnection) -> Path:
@@ -906,15 +920,35 @@ def _native_extension_directory(connection: DuckDBPyConnection) -> Path:
     return Path(directory).expanduser().resolve()
 
 
-def _secure_native_cache_directory(path: Path) -> None:
+def _secure_native_cache_path(path: Path, *, directory: bool) -> None:
     from vane import _native
 
     try:
-        _native._secure_dynamic_extension_cache_directory(str(path))
+        _native._secure_dynamic_extension_cache_path(str(path), directory=directory)
     except Exception as exception:
         raise DynamicExtensionError(
             "ARTIFACT_CACHE_CORRUPT",
-            f"could not apply a private Windows DACL to verified artifact cache directory: {path}",
+            f"could not apply a private Windows DACL to verified artifact cache path: {path}",
+        ) from exception
+
+
+def _cleanup_staging_directory(
+    staging_directory: Path,
+    staging_path: Path,
+) -> None:
+    if not (staging_directory.exists() or staging_directory.is_symlink()):
+        return
+    try:
+        if _WINDOWS_PERMISSION_MODEL and staging_path.exists():
+            # Windows refuses to unlink a read-only file. This path remains an
+            # unpublished private copy because publication renames its parent
+            # directory atomically instead of creating a hard link.
+            staging_path.chmod(0o600)
+        shutil.rmtree(staging_directory)
+    except OSError as exception:
+        raise DynamicExtensionError(
+            "ARTIFACT_SNAPSHOT_FAILED",
+            f"could not remove verified artifact staging directory: {staging_directory}",
         ) from exception
 
 
