@@ -1202,6 +1202,8 @@ class RayWorkerActor:
         pending_entries: list[dict[str, Any]] = []
         pending_refs: list[ray.ObjectRef[Any]] = []
         pending_ref_indexes: list[int] = []
+        preparations: list[QuerySnapshotPreparation] = []
+        existing_entries: list[dict[str, Any]] = []
         seen_new_fragment_ids: dict[str, str] = {}
         unique_entries: list[dict[str, Any]] = []
         for entry in fragments:
@@ -1245,7 +1247,7 @@ class RayWorkerActor:
                 fragment_id = str(entry["fragment_id"])
                 query_id = str(entry["query_id"])
                 if fragment_id in self._plan_fragments:
-                    existing += 1
+                    existing_entries.append(entry)
                     continue
                 plan = entry.get("plan")
                 token = object()
@@ -1284,14 +1286,12 @@ class RayWorkerActor:
                             f"fragment={fragment_id} query={query_id}"
                         )
                     if fragment_id in self._plan_fragments:
-                        owner_query_id = self._fragment_query_ids[fragment_id]
-                        if owner_query_id != query_id:
+                        awaited_owner_query_id = self._fragment_query_ids[fragment_id]
+                        if awaited_owner_query_id != query_id:
                             raise RuntimeError(
                                 "fragment registration query ownership changed while awaiting plan: "
-                                f"fragment={fragment_id} owner={owner_query_id} requested={query_id}"
+                                f"fragment={fragment_id} owner={awaited_owner_query_id} requested={query_id}"
                             )
-                        existing += 1
-                        self._pending_fragment_registrations.pop(fragment_id, None)
                         continue
 
                 preparation_task = asyncio.create_task(
@@ -1302,47 +1302,83 @@ class RayWorkerActor:
                         QuerySnapshotPreparation,
                         await _await_future_with_owned_side_effects(preparation_task),
                     )
-                except asyncio.CancelledError as cancellation:
+                except asyncio.CancelledError:
                     preparation = preparation_task.result()
-                    self._rollback_query_snapshot_preparation(preparation, cancellation)
+                    preparations.append(preparation)
                     raise
+                preparations.append(preparation)
 
-                try:
-                    self._ensure_worker_runtime_running()
-                    with registry_lock:
+                self._ensure_worker_runtime_running()
+                with registry_lock:
+                    pending_owner = self._pending_fragment_registrations.get(fragment_id)
+                    if pending_owner != (query_id, token):
+                        raise RuntimeError(
+                            "fragment registration was dropped during worker snapshot preparation: "
+                            f"fragment={fragment_id} query={query_id}"
+                        )
+                    published_owner_query_id = self._fragment_query_ids.get(fragment_id)
+                    if published_owner_query_id is not None and published_owner_query_id != query_id:
+                        raise RuntimeError(
+                            "fragment registration query ownership changed during worker snapshot preparation: "
+                            f"fragment={fragment_id} owner={published_owner_query_id} requested={query_id}"
+                        )
+
+            shutdown_lock = getattr(self, "_shutdown_lock", None)
+            if shutdown_lock is None:
+                shutdown_lock = threading.RLock()
+                self._shutdown_lock = shutdown_lock
+            with shutdown_lock:
+                if getattr(self, "_shutdown_started", False):
+                    raise RuntimeError("Ray worker runtime is shutting down")
+                with registry_lock:
+                    for entry in existing_entries:
+                        fragment_id = str(entry["fragment_id"])
+                        query_id = str(entry["query_id"])
+                        owner_query_id = self._fragment_query_ids.get(fragment_id)
+                        if fragment_id not in self._plan_fragments or owner_query_id != query_id:
+                            raise RuntimeError(
+                                "existing fragment registration was dropped before batch publication: "
+                                f"fragment={fragment_id} query={query_id}"
+                            )
+                    for entry in pending_entries:
+                        fragment_id = str(entry["fragment_id"])
+                        query_id = str(entry["query_id"])
+                        token = entry["token"]
                         pending_owner = self._pending_fragment_registrations.get(fragment_id)
                         if pending_owner != (query_id, token):
                             raise RuntimeError(
-                                "fragment registration was dropped during worker snapshot preparation: "
+                                "fragment registration was dropped before batch publication: "
                                 f"fragment={fragment_id} query={query_id}"
                             )
                         published_owner_query_id = self._fragment_query_ids.get(fragment_id)
-                        if published_owner_query_id is not None:
-                            if published_owner_query_id != query_id:
-                                raise RuntimeError(
-                                    "fragment registration query ownership changed during worker snapshot preparation: "
-                                    f"fragment={fragment_id} owner={published_owner_query_id} requested={query_id}"
-                                )
+                        if published_owner_query_id is not None and published_owner_query_id != query_id:
+                            raise RuntimeError(
+                                "fragment registration query ownership changed before batch publication: "
+                                f"fragment={fragment_id} owner={published_owner_query_id} requested={query_id}"
+                            )
+                    for entry in pending_entries:
+                        fragment_id = str(entry["fragment_id"])
+                        query_id = str(entry["query_id"])
+                        if fragment_id in self._plan_fragments:
                             existing += 1
                         else:
-                            self._plan_fragments[fragment_id] = plan
+                            self._plan_fragments[fragment_id] = entry["plan"]
                             self._fragment_query_ids[fragment_id] = query_id
                             self._query_fragments.setdefault(query_id, set()).add(fragment_id)
                             registered += 1
                         self._pending_fragment_registrations.pop(fragment_id, None)
-                except BaseException as publication_error:
-                    self._rollback_query_snapshot_preparation(preparation, publication_error)
-                    raise
-
-            with registry_lock:
-                self._fragment_registered_total += registered
-                self._fragment_existing_total += existing
-                total = len(self._plan_fragments)
+                    existing += len(existing_entries)
+                    self._fragment_registered_total += registered
+                    self._fragment_existing_total += existing
+                    total = len(self._plan_fragments)
             return {
                 "registered": registered,
                 "existing": existing,
                 "total": total,
             }
+        except BaseException as registration_error:
+            self._rollback_query_snapshot_preparations(preparations, registration_error)
+            raise
         finally:
             with registry_lock:
                 for entry in pending_entries:
@@ -2201,19 +2237,25 @@ class RayWorkerActor:
         return QuerySnapshotPreparation(connection_snapshot_query_id, replay_state_created)
 
     @staticmethod
-    def _rollback_query_snapshot_preparation(
-        preparation: QuerySnapshotPreparation,
+    def _rollback_query_snapshot_preparations(
+        preparations: list[QuerySnapshotPreparation],
         primary_error: BaseException,
     ) -> None:
-        if not preparation.replay_state_created:
-            return
-        try:
-            _cleanup_query_python_replay_state(preparation.connection_snapshot_query_id)
-        except BaseException as cleanup_error:
+        rollback_errors: list[str] = []
+        for preparation in reversed(preparations):
+            if not preparation.replay_state_created:
+                continue
+            try:
+                _cleanup_query_python_replay_state(preparation.connection_snapshot_query_id)
+            except BaseException as cleanup_error:
+                rollback_errors.append(
+                    f"query={preparation.connection_snapshot_query_id} {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        if rollback_errors:
             raise RuntimeError(
                 "worker snapshot registration rollback failed after admission changed: "
                 f"admission={type(primary_error).__name__}: {primary_error}; "
-                f"rollback={type(cleanup_error).__name__}: {cleanup_error}"
+                f"rollback={'; '.join(rollback_errors)}"
             ) from primary_error
 
     @staticmethod
