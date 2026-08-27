@@ -2,11 +2,11 @@
 
 ## Scope
 
-This document defines the explicit contracts that let a statically linked
-DuckDB extension participate in Vane's Ray distributed execution. The engine
-owns scheduling, transport, and the coordinator transaction boundary; each
-extension continues to own its bind state, scan semantics, artifact production,
-and catalog mutation logic.
+This document defines the explicit contracts that let a DuckDB extension
+participate in Vane's Ray distributed execution. The engine owns scheduling,
+transport, and the coordinator transaction boundary; each extension continues
+to own its bind state, scan semantics, artifact production, and catalog mutation
+logic.
 
 An extension participates by attaching a concrete distributed scan contract to
 a normal table function or by registering a concrete distributed write hook.
@@ -23,8 +23,10 @@ when it runs through DuckDB's native runner.
 
 ## Design rules
 
-- Extensions used by Ray are pinned, reviewed, and statically linked into the
-  Vane release artifact.
+- Extensions used by Ray are pinned and reviewed. They are either statically
+  linked into the Vane release artifact or supplied by an exact preinstalled
+  dynamic provider whose descriptor and artifact are verified during worker
+  preparation.
 - The coordinator resolves catalog state and selects immutable work before
   worker execution starts.
 - Workers receive portable split data and restore extension state through the
@@ -76,8 +78,9 @@ accepts only implemented hook kinds: distributed table scans and distributed
 write operators. It has no public placeholder API for hypothetical aggregate,
 COPY, storage, or context protocols.
 
-Ordinary DuckDB registrations remain available on every statically linked
-worker:
+Ordinary DuckDB registrations remain available on every prepared worker
+DatabaseInstance after the exact static or provider-backed dynamic extension is
+loaded:
 
 - ordinary worker-safe scalar functions, types, casts, and collations use their
   normal DuckDB registrations after the exact extension is loaded;
@@ -212,10 +215,11 @@ IcebergCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
 }
 ```
 
-After loading the required static extension, each worker resolves the normal
-DuckDB table function from its catalog and calls its `deserialize` callback.
-The worker never invokes the original bind callback and never repeats catalog or
-metadata planning. Missing or incomplete bind serde is a hard error.
+After loading the required extension through its declared static or verified
+dynamic path, each worker resolves the normal DuckDB table function from its
+catalog and calls its `deserialize` callback. The worker never invokes the
+original bind callback and never repeats catalog or metadata planning. Missing
+or incomplete bind serde is a hard error.
 
 ### Extension-owned splits
 
@@ -340,7 +344,7 @@ write-operator name, plus opaque dynamic worker bind bytes for callback mode.
 File-artifact plans must leave the worker bind empty. Vane resolves the mode,
 capability protocol, fragment codec, and worker callbacks from the
 database-local immutable `DistributedWriteOperatorExtension`. A physical plan
-cannot override that static contract.
+cannot override that registered contract.
 
 In callback mode, the worker bind may carry an extension-created write handle
 and artifact namespace, analogous to a connector insert handle. The physical
@@ -483,9 +487,9 @@ For every distributed write provider:
 
 - return a `DistributedExtensionWritePlan` containing the exact registered
   extension/operator key and portable dynamic worker bind bytes;
-- register the mode, protocol, codec, and callbacks once in the static
-  `DistributedWriteOperatorExtension`; do not duplicate them in the physical
-  provider;
+- register the mode, protocol, codec, and callbacks once in the database-local
+  immutable `DistributedWriteOperatorExtension`; do not duplicate them in the
+  physical provider;
 - keep `ValidateDistributedWrite` read-only and limit it to catalog and output
   precondition checks before workers start;
 - accept only the selected task-result envelopes during finalization;
