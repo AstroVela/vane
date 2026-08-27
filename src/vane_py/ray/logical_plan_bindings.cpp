@@ -205,8 +205,12 @@ static bool IsWorkerExtensionLocationSetting(const string &lower_name) {
 	       lower_name == "autoinstall_extension_repository";
 }
 
+static bool IsWorkerLocalSetting(const string &lower_name) {
+	return IsWorkerResourceSetting(lower_name) || IsWorkerExtensionLocationSetting(lower_name);
+}
+
 static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets,
-                                        bool remove_worker_resource_settings = false) {
+                                        bool remove_worker_local_settings = false) {
 	py::dict sanitized;
 	for (auto item : config) {
 		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
@@ -217,8 +221,7 @@ static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_per
 		if (disable_persistent_secrets && IsSecretPersistenceSetting(name)) {
 			continue;
 		}
-		if (remove_worker_resource_settings &&
-		    (IsWorkerResourceSetting(name) || IsWorkerExtensionLocationSetting(name))) {
+		if (remove_worker_local_settings && IsWorkerLocalSetting(name)) {
 			continue;
 		}
 		sanitized[item.first] = item.second;
@@ -398,7 +401,7 @@ static py::object PrepareWorkerConnectionSnapshot(const py::object &snapshot_obj
 			auto setting = py::reinterpret_borrow<py::dict>(item);
 			if (setting.contains(py::str("name")) && py::isinstance<py::str>(setting[py::str("name")])) {
 				auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
-				if (IsWorkerResourceSetting(name)) {
+				if (IsWorkerLocalSetting(name)) {
 					continue;
 				}
 			}
@@ -462,7 +465,7 @@ static bool SnapshotHasDynamicExtensions(const py::object &snapshot_obj) {
 
 static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
                                                         bool force_file_read_only = false,
-                                                        bool remove_worker_resource_settings = false) {
+                                                        bool remove_worker_local_settings = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		py::dict config;
 		config[py::str("allow_persistent_secrets")] = py::str("false");
@@ -487,7 +490,7 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	}
 	const auto disable_persistent_secrets = !use_instance_cache || in_memory_database;
 	auto connection_config =
-	    SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets, remove_worker_resource_settings);
+	    SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets, remove_worker_local_settings);
 	auto worker_file_read_only = force_file_read_only && !in_memory_database;
 	if (worker_file_read_only) {
 		connection_config = ForceReadOnlyAccessMode(connection_config);

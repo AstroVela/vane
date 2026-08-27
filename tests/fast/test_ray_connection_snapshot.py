@@ -907,22 +907,50 @@ def test_worker_file_snapshot_disables_persistent_secrets_before_first_use(tmp_p
 def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
     ray_cxx = _require_ray_cxx()
     query_id = "snapshot-worker-local-extension-locations"
+    coordinator_extension_directory = tmp_path / "coordinator-extensions"
+    coordinator_secondary_extension_directory = coordinator_extension_directory / "secondary"
+    coordinator_home_directory = tmp_path / "coordinator-home"
+    custom_repository = "http://127.0.0.1:9/custom"
+    autoinstall_repository = "http://127.0.0.1:9/autoinstall"
     source_connection = vane.connect()
+    source_connection.execute(f"SET extension_directory = '{coordinator_extension_directory}'")
+    source_connection.execute(f"SET home_directory = '{coordinator_home_directory}'")
+    source_connection.execute(f"SET custom_extension_repository = '{custom_repository}'")
+    source_connection.execute(f"SET autoinstall_extension_repository = '{autoinstall_repository}'")
     logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(source_connection.sql("SELECT 1"), query_id)
+    worker_local_setting_names = {
+        "extension_directory",
+        "extension_directories",
+        "home_directory",
+        "custom_extension_repository",
+        "autoinstall_extension_repository",
+    }
+    logical_snapshot = logical_plan.__getstate__()[3]
+    captured_setting_names = {setting["name"].lower() for setting in logical_snapshot["settings"]}
+    assert worker_local_setting_names - {"extension_directories"} <= captured_setting_names
+
     physical_plan = logical_plan.to_physical_plan(vane.connect())
     state = list(physical_plan.__getstate__())
     snapshot = dict(state[6])
-    coordinator_extension_directory = tmp_path / "coordinator-extensions"
-    coordinator_home_directory = tmp_path / "coordinator-home"
+    physical_setting_names = {setting["name"].lower() for setting in snapshot["settings"]}
+    assert physical_setting_names.isdisjoint(worker_local_setting_names)
+    snapshot["settings"] = [
+        *snapshot["settings"],
+        {
+            "name": "extension_directories",
+            "value": [str(coordinator_secondary_extension_directory)],
+            "input_type": "VARCHAR[]",
+        },
+    ]
     snapshot["bootstrap"] = {
         "database": ":memory:",
         "read_only": False,
         "config": {
             "extension_directory": str(coordinator_extension_directory),
-            "extension_directories": [str(coordinator_extension_directory / "secondary")],
+            "extension_directories": [str(coordinator_secondary_extension_directory)],
             "home_directory": str(coordinator_home_directory),
-            "custom_extension_repository": "http://127.0.0.1:9/custom",
-            "autoinstall_extension_repository": "http://127.0.0.1:9/autoinstall",
+            "custom_extension_repository": custom_repository,
+            "autoinstall_extension_repository": autoinstall_repository,
         },
     }
     state[6] = snapshot
@@ -931,6 +959,9 @@ def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
     prepared_connection = None
     try:
         assert ray_cxx._register_query_python_replay_state(query_id, replay_plan) is True
+        worker_snapshot = ray_cxx._lookup_query_connection_snapshot(query_id)
+        worker_setting_names = {setting["name"].lower() for setting in worker_snapshot["settings"]}
+        assert worker_setting_names.isdisjoint(worker_local_setting_names)
         prepared_connection = ray_cxx._prepare_query_snapshot_connection(query_id)
         settings = dict(
             prepared_connection.execute(
