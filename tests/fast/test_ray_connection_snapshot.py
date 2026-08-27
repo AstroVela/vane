@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
+import hashlib
 import pickle
 import threading
 
@@ -27,48 +28,79 @@ def _table_from_native_result(result):
     return pa.concat_tables(payloads)
 
 
-@pytest.mark.parametrize(
-    ("function_name", "expression"),
-    [
-        ("to_file", "to_file('file:///driver-only/value.bin')"),
-        ("try_to_file", "try_to_file('file:///driver-only/value.bin')"),
-        (
-            "file_enrich",
-            "file_enrich(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL), ['size'])",
-        ),
-        (
-            "file_size",
-            "file_size(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
-        ),
-        (
-            "file_exists",
-            "file_exists(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
-        ),
-        (
-            "file_stat",
-            "file_stat(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
-        ),
-        (
-            "file_mime_type",
-            "file_mime_type(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL), 'content')",
-        ),
-    ],
-)
-def test_distributed_plan_rejects_storage_facing_file_scalars(function_name, expression):
+def _sql_string_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def test_distributed_plan_executes_storage_facing_file_scalars_after_transport(tmp_path):
     ray_cxx = _require_ray_cxx()
+    payload = b"\x89PNG\r\n\x1a\n" + b"distributed-file-payload"
+    payload_path = tmp_path / "distributed-file.bin"
+    payload_path.write_bytes(payload)
+    missing_path = tmp_path / "missing.bin"
+    range_position = 8
+    range_size = 12
+    range_digest = hashlib.sha256(payload[range_position : range_position + range_size]).hexdigest()
+    path_sql = _sql_string_literal(payload_path)
+    missing_sql = _sql_string_literal(missing_path)
+
     connection = vane.connect()
     try:
-        relation = connection.sql(f"SELECT {expression} FROM range(2)")
-        with pytest.raises(
-            ValueError,
-            match=rf"storage-facing FILE function '{function_name}'",
-        ):
-            ray_cxx.PyLogicalPlan.from_duckdb_relation(
-                relation,
-                f"storage-facing-file-{function_name}",
-            )
+        relation = connection.sql(
+            f"""
+            SELECT
+                file_size(to_file({path_sql})) AS converted_size,
+                file_size(try_to_file({path_sql})) AS optional_size,
+                file_exists(file({path_sql}, NULL, NULL, NULL, NULL)) AS exists,
+                file_stat(file({path_sql}, NULL, NULL, NULL, NULL)).object_size AS object_size,
+                file_mime_type(file({path_sql}, NULL, NULL, NULL, NULL), 'content') AS mime_type,
+                file_content_id(file_enrich(
+                    file({path_sql}, NULL, {range_position}, {range_size}, NULL),
+                    ['checksum']
+                )) AS content_id,
+                try_to_file({missing_sql}) IS NULL AS missing_is_null
+            FROM range(2)
+            """
+        )
+        logical_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+            relation,
+            "storage-facing-file-scalars",
+        )
+        snapshot = logical_plan.__getstate__()[3]
+        extension_names = {extension["name"] for extension in snapshot["extensions"]}
+        assert {"file", "httpfs"}.issubset(extension_names)
+
+        transported_logical_plan = pickle.loads(pickle.dumps(logical_plan))
     finally:
         connection.close()
+
+    planning_connection = vane.connect()
+    try:
+        physical_plan = transported_logical_plan.to_physical_plan(planning_connection)
+        transported_physical_plan = pickle.loads(pickle.dumps(physical_plan))
+    finally:
+        planning_connection.close()
+
+    worker_connection = vane.connect()
+    try:
+        result = ray_cxx.DistributedPhysicalPlanRunner().execute_native(
+            worker_connection.cursor(),
+            transported_physical_plan,
+        )
+        table = _table_from_native_result(result)
+    finally:
+        worker_connection.close()
+
+    expected = (
+        len(payload),
+        len(payload),
+        True,
+        len(payload),
+        "image/png",
+        f"file-content-v1:checksum:sha256:{range_digest}",
+        True,
+    )
+    assert [tuple(row.values()) for row in table.to_pylist()] == [expected, expected]
 
 
 def test_distributed_plan_allows_io_free_file_scalars():
@@ -96,6 +128,65 @@ def test_distributed_plan_allows_io_free_file_scalars():
         assert plan is not None
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("write_expression", ["check", "default"])
+def test_distributed_write_snapshot_covers_write_owned_file_io_expressions(
+    monkeypatch,
+    tmp_path,
+    write_expression,
+):
+    ray_cxx = _require_ray_cxx()
+    payload_path = tmp_path / f"write-{write_expression}.bin"
+    payload_path.write_bytes(b"write-owned-file-expression")
+    database_path = tmp_path / f"write-{write_expression}.duckdb"
+    path_sql = _sql_string_literal(payload_path)
+    captured_plans = []
+
+    class CapturingRunner:
+        def run_write(self, relation):
+            captured_plans.append(
+                ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
+                    relation,
+                    f"write-owned-file-{write_expression}",
+                )
+            )
+            return {"ok": True}
+
+    import vane.runners as runners_module
+
+    monkeypatch.setattr(runners_module, "set_runner_ray", lambda *_args, **_kwargs: CapturingRunner())
+    connection = vane.connect(str(database_path))
+    try:
+        if write_expression == "check":
+            connection.execute("CREATE TABLE file_target (value FILE, CHECK (file_exists(value)))")
+        else:
+            connection.execute(f"CREATE TABLE file_target (value FILE DEFAULT try_to_file({path_sql}))")
+            connection.execute(f"INSERT INTO file_target VALUES (file({path_sql}, NULL, NULL, NULL, NULL))")
+
+        monkeypatch.setenv("VANE_RUNNER", "ray")
+        if write_expression == "check":
+            connection.sql(f"SELECT file({path_sql}, NULL, NULL, NULL, NULL) AS value").insert_into("file_target")
+        else:
+            connection.table("file_target").update({"value": vane.DefaultExpression()})
+
+        assert len(captured_plans) == 1
+        logical_plan = captured_plans[0]
+        snapshot = logical_plan.__getstate__()[3]
+        extension_names = {extension["name"] for extension in snapshot["extensions"]}
+        assert {"file", "httpfs"}.issubset(extension_names)
+        transported_logical_plan = pickle.loads(pickle.dumps(logical_plan))
+    finally:
+        connection.close()
+
+    planning_connection = vane.connect()
+    try:
+        physical_plan = transported_logical_plan.to_physical_plan(planning_connection)
+        assert physical_plan is not None
+    finally:
+        planning_connection.close()
+    del physical_plan
+    gc.collect()
 
 
 def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):

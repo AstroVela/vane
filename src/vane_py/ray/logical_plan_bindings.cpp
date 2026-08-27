@@ -126,33 +126,6 @@ struct PyLogicalPlan {
 	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
-static bool IsStorageFacingFileScalar(const ScalarFunction &function) {
-	if (function.catalog_name != SYSTEM_CATALOG || function.schema_name != DEFAULT_SCHEMA ||
-	    function.GetStability() != FunctionStability::VOLATILE) {
-		return false;
-	}
-	// These are the FILE extension overloads registered with accesses_storage=true.
-	return function.name == "to_file" || function.name == "try_to_file" || function.name == "file_enrich" ||
-	       function.name == "file_size" || function.name == "file_exists" || function.name == "file_stat" ||
-	       function.name == "file_mime_type";
-}
-
-class DistributedFileScalarValidator final : public LogicalOperatorVisitor {
-public:
-	void VisitExpression(unique_ptr<Expression> *expression) override {
-		if ((*expression)->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-			auto &function = (*expression)->Cast<BoundFunctionExpression>().function;
-			if (IsStorageFacingFileScalar(function)) {
-				throw InvalidInputException(
-				    "Ray distributed execution does not yet support storage-facing FILE function '%s'; "
-				    "worker-side FILE connector, credential, and path resolution is not available",
-				    function.name);
-			}
-		}
-		LogicalOperatorVisitor::VisitExpression(expression);
-	}
-};
-
 static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
 	if (!rel) {
 		throw duckdb::InternalException("Relation is null");
@@ -165,7 +138,6 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 		duckdb::Planner planner(*client_context);
 		planner.CreatePlan(std::move(relation_stmt));
 		auto logical_plan = std::move(planner.plan);
-		DistributedFileScalarValidator().VisitOperator(*logical_plan);
 
 		// NOTE: We intentionally do NOT run the Optimizer here.
 		// The unoptimized (bound) logical plan is serialized and sent to the Driver,

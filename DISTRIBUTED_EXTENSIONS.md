@@ -145,6 +145,15 @@ inside the authenticated Ray cluster; they are not an untrusted interchange
 format or a persistence format. Executable attachment declarations travel only
 as far as the isolated coordinator planning connection.
 
+Storage-facing scalar functions from the static `file` extension use this same
+contract. FILE values retain only their canonical five fields; connection and
+credential state travels in the separate query/session snapshot. The official
+Vane build loads the statically linked `file` and `httpfs` extensions, and the
+existing snapshot records and verifies those exact extension identities before
+Worker execution. Workers never install or autoload them. Local FILE URLs
+identify Worker-visible paths and therefore require a shared or identically
+mounted filesystem when a query can run on more than one node.
+
 ## Distributed scans
 
 ### Worker bind serialization
