@@ -19,11 +19,11 @@ from typing import Any, NamedTuple, cast
 import ray
 
 from vane._ray_cxx import require_ray_cxx_attr
-from vane.extensions import _dynamic_extension_snapshot_cache_identity
 
 # Avoid importing C++ bindings at module import time (may not be registered yet).
 # Resolve `vane.ray_cxx` attributes lazily at use-time instead.
 from vane.event_loop import set_event_loop
+from vane.extensions import _dynamic_extension_snapshot_cache_identity
 from vane.runners.common import PartitionMetadata
 from vane.runners.fte import (
     FteTaskAttemptId,
@@ -2085,6 +2085,15 @@ class RayWorkerActor:
         prepared = self._prepare_query_snapshot_state(plan, acquire_execution_cursor=True)
         return cast(tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity, Any], prepared)
 
+    def _query_snapshot_session_state(self, session_id: str, connection: Any) -> tuple[bool, bool]:
+        """Read shutdown and session invalidation state under the shared lock."""
+        with self._session_connections_lock:
+            runtime_stopping = self._shutdown_started
+            session_closed = session_id in self._closed_session_ids
+            record = self._session_connections.get(session_id)
+            session_changed = record is None or record[1] is not connection
+        return runtime_stopping, session_closed or session_changed
+
     def _prepare_query_snapshot_state(
         self,
         plan: Any,
@@ -2132,14 +2141,12 @@ class RayWorkerActor:
                 connection_snapshot_query_id,
                 database_identity=database_identity,
             )
-            with self._session_connections_lock:
-                runtime_stopping = self._shutdown_started
-                session_closed = session_id in self._closed_session_ids
-                record = self._session_connections.get(session_id)
-                session_changed = record is None or record[1] is not connection
-            if runtime_stopping:
+            runtime_stopping_after_preparation, session_invalidated_after_preparation = (
+                self._query_snapshot_session_state(session_id, connection)
+            )
+            if runtime_stopping_after_preparation:
                 raise RuntimeError("Ray worker runtime is shutting down")
-            if session_closed or session_changed:
+            if session_invalidated_after_preparation:
                 # close_session() retires cached snapshot databases before it
                 # waits for this operation lock. Repeat retirement so a
                 # DatabaseInstance published inside that race window cannot
@@ -2156,15 +2163,13 @@ class RayWorkerActor:
                 except BaseException:
                     self._close_snapshot_execution_cursor(cursor)
                     raise
-                with self._session_connections_lock:
-                    runtime_stopping = self._shutdown_started
-                    session_closed = session_id in self._closed_session_ids
-                    record = self._session_connections.get(session_id)
-                    session_changed = record is None or record[1] is not connection
-                if runtime_stopping:
+                runtime_stopping_after_validation, session_invalidated_after_validation = (
+                    self._query_snapshot_session_state(session_id, connection)
+                )
+                if runtime_stopping_after_validation:
                     self._close_snapshot_execution_cursor(cursor)
                     raise RuntimeError("Ray worker runtime is shutting down")
-                if session_closed or session_changed:
+                if session_invalidated_after_validation:
                     self._close_snapshot_execution_cursor(cursor)
                     self._retire_snapshot_databases_for_session(session_id)
                     raise RuntimeError(f"Ray worker Vane session closed during snapshot preparation: {session_id}")
@@ -2763,7 +2768,6 @@ class RayWorkerActor:
             if not callable(has_explicit_s3_credentials):
                 raise TypeError("distributed physical plan is missing has_explicit_s3_credentials()")
             use_session_credentials = not bool(has_explicit_s3_credentials())
-            connection_snapshot_query_id = _plan_resource_query_id(plan)
         except BaseException:
             if cursor is not None:
                 self._close_snapshot_execution_cursor(cursor)
