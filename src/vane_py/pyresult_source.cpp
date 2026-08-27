@@ -200,6 +200,74 @@ static bool ResultPythonRuntimeUsable() {
 	return distributed::python::ray::SafePyObjectCanDecRef();
 }
 
+//! Arrow transports FILE using its canonical STRUCT storage. Restore that one
+//! Vane-owned alias only when the relation metadata declares FILE.
+static bool IsFileStorageType(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
+	    StructType::GetChildCount(type) != FileLogicalType::FIELD_COUNT) {
+		return false;
+	}
+	auto file_type = FileLogicalType::Create();
+	for (idx_t index = 0; index < FileLogicalType::FIELD_COUNT; index++) {
+		if (StructType::GetChildName(type, index) != StructType::GetChildName(file_type, index) ||
+		    StructType::GetChildType(type, index) != StructType::GetChildType(file_type, index)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool DistributedResultTypeMatches(const LogicalType &actual, const LogicalType &expected) {
+	if (actual == expected) {
+		return true;
+	}
+	if (FileLogicalType::IsFile(expected)) {
+		return IsFileStorageType(actual);
+	}
+	if (actual.HasAlias() || expected.HasAlias() || actual.id() != expected.id()) {
+		return false;
+	}
+
+	switch (expected.id()) {
+	case LogicalTypeId::LIST:
+		return DistributedResultTypeMatches(ListType::GetChildType(actual), ListType::GetChildType(expected));
+	case LogicalTypeId::ARRAY:
+		return ArrayType::GetSize(actual) == ArrayType::GetSize(expected) &&
+		       DistributedResultTypeMatches(ArrayType::GetChildType(actual), ArrayType::GetChildType(expected));
+	case LogicalTypeId::MAP:
+		return DistributedResultTypeMatches(MapType::KeyType(actual), MapType::KeyType(expected)) &&
+		       DistributedResultTypeMatches(MapType::ValueType(actual), MapType::ValueType(expected));
+	case LogicalTypeId::STRUCT: {
+		if (StructType::GetChildCount(actual) != StructType::GetChildCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < StructType::GetChildCount(expected); index++) {
+			if (StructType::GetChildName(actual, index) != StructType::GetChildName(expected, index) ||
+			    !DistributedResultTypeMatches(StructType::GetChildType(actual, index),
+			                                  StructType::GetChildType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION: {
+		if (UnionType::GetMemberCount(actual) != UnionType::GetMemberCount(expected)) {
+			return false;
+		}
+		for (idx_t index = 0; index < UnionType::GetMemberCount(expected); index++) {
+			if (UnionType::GetMemberName(actual, index) != UnionType::GetMemberName(expected, index) ||
+			    !DistributedResultTypeMatches(UnionType::GetMemberType(actual, index),
+			                                  UnionType::GetMemberType(expected, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
 //! Flattens the iterator of pyarrow.Table partitions into one Arrow C stream.
 //! The external schema is derived from the relation rather than partition
 //! field names (distributed partitions currently use positional c0/c1 names).
@@ -375,7 +443,7 @@ struct DistributedArrowStreamOwner {
 				                            partition_index, actual_types.size(), types.size());
 			}
 			for (idx_t col_idx = 0; col_idx < types.size(); col_idx++) {
-				if (actual_types[col_idx] != types[col_idx]) {
+				if (!DistributedResultTypeMatches(actual_types[col_idx], types[col_idx])) {
 					throw InvalidInputException("Distributed result partition %d column %d has type %s, expected %s",
 					                            partition_index, col_idx, actual_types[col_idx].ToString(),
 					                            types[col_idx].ToString());

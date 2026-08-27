@@ -26,6 +26,7 @@ from vane._dbapi_type_object import (
 from vane._env import EnvRegistry, env
 from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
+from vane._file import file
 
 if _typing.TYPE_CHECKING:
     from vane import ai as ai
@@ -57,6 +58,7 @@ from vane._native import (
     ExplainType,
     Expression,
     FatalException,
+    File,
     FunctionExpression,
     HTTPException,
     IntegrityError,
@@ -127,6 +129,7 @@ from vane._native import (
     fetchmany,
     fetchnumpy,
     fetchone,
+    file_type,
     filesystem_is_registered,
     filter,
     from_arrow,
@@ -369,6 +372,7 @@ __all__: list[str] = [
     "ExplainType",
     "Expression",
     "FatalException",
+    "File",
     "FloatValue",
     "FunctionExpression",
     "HTTPException",
@@ -484,6 +488,8 @@ __all__: list[str] = [
     "fetchmany",
     "fetchnumpy",
     "fetchone",
+    "file",
+    "file_type",
     "filesystem_is_registered",
     "filter",
     "from_arrow",

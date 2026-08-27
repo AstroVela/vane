@@ -5,11 +5,13 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_conversion.hpp"
+#include "vane_python/file.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 
 #include "vane_python/pyrelation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pyresult.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
 
@@ -49,7 +51,10 @@ static Value CastToTarget(Value val, const LogicalType &target_type) {
 	                          target_type.ToString());
 }
 
-static Value EmptyMapValue() {
+static Value EmptyMapValue(const LogicalType &target_type = LogicalType::UNKNOWN) {
+	if (target_type.id() == LogicalTypeId::MAP) {
+		return Value::MAP(MapType::KeyType(target_type), MapType::ValueType(target_type), {}, {});
+	}
 	auto map_type = LogicalType::MAP(LogicalType::SQLNULL, LogicalType::SQLNULL);
 	return Value::MAP(ListType::GetChildType(map_type), vector<Value>());
 }
@@ -114,31 +119,46 @@ bool DictionaryHasMapFormat(const PyDictionary &dict) {
 Value TransformDictionaryToStruct(const PyDictionary &dict, const LogicalType &target_type = LogicalType::UNKNOWN) {
 	auto struct_keys = TransformStructKeys(dict.keys, dict.len, target_type);
 
-	bool struct_target = target_type.id() == LogicalTypeId::STRUCT;
+	auto struct_target = target_type.id() == LogicalTypeId::STRUCT;
 	if (struct_target && dict.len != StructType::GetChildCount(target_type)) {
 		throw InvalidInputException("We could not convert the object %s to the desired target type (%s)",
 		                            dict.ToString(), target_type.ToString());
 	}
 
-	case_insensitive_map_t<idx_t> key_mapping;
-	for (idx_t i = 0; i < struct_keys.size(); i++) {
-		key_mapping[struct_keys[i]] = i;
+	if (struct_target) {
+		case_insensitive_map_t<idx_t> key_mapping;
+		for (idx_t i = 0; i < struct_keys.size(); i++) {
+			key_mapping[struct_keys[i]] = i;
+		}
+		if (key_mapping.size() != struct_keys.size()) {
+			throw InvalidInputException("Python dictionary contains duplicate case-insensitive STRUCT field names");
+		}
+
+		vector<Value> struct_values;
+		struct_values.reserve(dict.len);
+		for (idx_t i = 0; i < dict.len; i++) {
+			auto &key = StructType::GetChildName(target_type, i);
+			auto entry = key_mapping.find(key);
+			if (entry == key_mapping.end()) {
+				throw InvalidInputException("Python dictionary is missing required STRUCT field '%s'", key);
+			}
+			auto &child_type = StructType::GetChildType(target_type, i);
+			struct_values.push_back(TransformPythonValue(dict.values.attr("__getitem__")(entry->second), child_type));
+		}
+		return Value::STRUCT(target_type, std::move(struct_values));
 	}
 
 	child_list_t<Value> struct_values;
 	for (idx_t i = 0; i < dict.len; i++) {
-		auto &key = struct_target ? StructType::GetChildName(target_type, i) : struct_keys[i];
-		auto value_index = struct_target ? key_mapping[key] : i;
-		auto &child_type = struct_target ? StructType::GetChildType(target_type, i) : LogicalType::UNKNOWN;
-		auto val = TransformPythonValue(dict.values.attr("__getitem__")(value_index), child_type);
-		struct_values.emplace_back(make_pair(std::move(key), std::move(val)));
+		auto value = TransformPythonValue(dict.values.attr("__getitem__")(i));
+		struct_values.emplace_back(struct_keys[i], std::move(value));
 	}
 	return Value::STRUCT(std::move(struct_values));
 }
 
 Value TransformStructFormatDictionaryToMap(const PyDictionary &dict, const LogicalType &target_type) {
 	if (dict.len == 0) {
-		return EmptyMapValue();
+		return EmptyMapValue(target_type);
 	}
 
 	if (target_type.id() != LogicalTypeId::MAP) {
@@ -146,7 +166,7 @@ Value TransformStructFormatDictionaryToMap(const PyDictionary &dict, const Logic
 	}
 
 	if (py::none().is(dict.keys) || py::none().is(dict.values)) {
-		return Value(LogicalType::MAP(LogicalTypeId::SQLNULL, LogicalTypeId::SQLNULL));
+		return Value(target_type);
 	}
 
 	auto size = py::len(dict.keys);
@@ -155,34 +175,15 @@ Value TransformStructFormatDictionaryToMap(const PyDictionary &dict, const Logic
 	auto key_target = MapType::KeyType(target_type);
 	auto value_target = MapType::ValueType(target_type);
 
-	LogicalType key_type = LogicalType::SQLNULL;
-	LogicalType value_type = LogicalType::SQLNULL;
-
-	vector<Value> elements;
+	vector<Value> keys;
+	vector<Value> values;
+	keys.reserve(size);
+	values.reserve(size);
 	for (idx_t i = 0; i < size; i++) {
-
-		Value new_key = TransformPythonValue(dict.keys.attr("__getitem__")(i), key_target);
-		Value new_value = TransformPythonValue(dict.values.attr("__getitem__")(i), value_target);
-
-		key_type = LogicalType::ForceMaxLogicalType(key_type, new_key.type());
-		value_type = LogicalType::ForceMaxLogicalType(value_type, new_value.type());
-
-		child_list_t<Value> struct_values;
-		struct_values.emplace_back(make_pair("key", std::move(new_key)));
-		struct_values.emplace_back(make_pair("value", std::move(new_value)));
-
-		elements.push_back(Value::STRUCT(std::move(struct_values)));
+		keys.push_back(TransformPythonValue(dict.keys.attr("__getitem__")(i), key_target));
+		values.push_back(TransformPythonValue(dict.values.attr("__getitem__")(i), value_target));
 	}
-	if (key_type.id() == LogicalTypeId::SQLNULL) {
-		key_type = key_target;
-	}
-	if (value_type.id() == LogicalTypeId::SQLNULL) {
-		value_type = value_target;
-	}
-
-	LogicalType map_type = LogicalType::MAP(key_type, value_type);
-
-	return Value::MAP(ListType::GetChildType(map_type), std::move(elements));
+	return Value::MAP(key_target, value_target, std::move(keys), std::move(values));
 }
 
 Value TransformDictionaryToMap(const PyDictionary &dict, const LogicalType &target_type = LogicalType::UNKNOWN) {
@@ -196,14 +197,16 @@ Value TransformDictionaryToMap(const PyDictionary &dict, const LogicalType &targ
 
 	if (py::none().is(keys) || py::none().is(values)) {
 		// Either 'key' or 'value' is None, return early with a NULL value
-		return Value(LogicalType::MAP(LogicalTypeId::SQLNULL, LogicalTypeId::SQLNULL));
+		return target_type.id() == LogicalTypeId::MAP
+		           ? Value(target_type)
+		           : Value(LogicalType::MAP(LogicalTypeId::SQLNULL, LogicalTypeId::SQLNULL));
 	}
 
 	auto key_size = py::len(keys);
 	D_ASSERT(key_size == py::len(values));
 	if (key_size == 0) {
 		// dict == { 'key': [], 'value': [] }
-		return EmptyMapValue();
+		return EmptyMapValue(target_type);
 	}
 
 	// dict == { 'key': [ ... ], 'value' : [ ... ] }
@@ -237,6 +240,10 @@ Value TransformDictionaryToMap(const PyDictionary &dict, const LogicalType &targ
 		elements.push_back(Value::STRUCT(std::move(struct_values)));
 	}
 
+	if (target_type.id() == LogicalTypeId::MAP) {
+		key_type = MapType::KeyType(target_type);
+		value_type = MapType::ValueType(target_type);
+	}
 	LogicalType map_type = LogicalType::MAP(key_type, value_type);
 
 	return Value::MAP(ListType::GetChildType(map_type), std::move(elements));
@@ -254,15 +261,14 @@ Value TransformTupleToStruct(py::handle ele, const LogicalType &target_type = Lo
 		                            "STRUCT consists of %d children",
 		                            size, child_count);
 	}
-	child_list_t<Value> children;
+	vector<Value> children;
+	children.reserve(child_count);
 	for (idx_t i = 0; i < child_count; i++) {
 		auto &type = child_types[i].second;
-		auto &name = StructType::GetChildName(target_type, i);
 		auto element = py::handle(tuple[i]);
-		auto converted_value = TransformPythonValue(element, type);
-		children.emplace_back(make_pair(name, std::move(converted_value)));
+		children.push_back(TransformPythonValue(element, type));
 	}
-	auto result = Value::STRUCT(std::move(children));
+	auto result = Value::STRUCT(target_type, std::move(children));
 	return result;
 }
 
@@ -436,11 +442,113 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::NdArray;
 	} else if (py::isinstance(ele, import_cache.numpy.datetime64())) {
 		return PythonObjectType::NdDatetime;
+	} else if (py::isinstance<PythonFile>(ele)) {
+		return PythonObjectType::File;
 	} else if (py::isinstance(ele, import_cache.vane.Value())) {
 		return PythonObjectType::Value;
 	} else {
 		return PythonObjectType::Other;
 	}
+}
+
+static bool UnionMemberAcceptsComposite(PythonObjectType object_type, const LogicalType &member_type) {
+	if (FileLogicalType::IsFile(member_type)) {
+		return false;
+	}
+	switch (object_type) {
+	case PythonObjectType::List:
+		return member_type.id() == LogicalTypeId::LIST || member_type.id() == LogicalTypeId::ARRAY;
+	case PythonObjectType::Tuple:
+		return member_type.id() == LogicalTypeId::STRUCT || member_type.id() == LogicalTypeId::LIST ||
+		       member_type.id() == LogicalTypeId::ARRAY;
+	case PythonObjectType::Dict:
+		return member_type.id() == LogicalTypeId::STRUCT || member_type.id() == LogicalTypeId::MAP;
+	default:
+		return false;
+	}
+}
+
+static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &target_type, bool nan_as_null) {
+	auto object_type = GetPythonObjectType(ele);
+	if (object_type == PythonObjectType::None ||
+	    (object_type == PythonObjectType::Float && nan_as_null && std::isnan(PyFloat_AsDouble(ele.ptr())))) {
+		return Value(target_type);
+	}
+	if (object_type == PythonObjectType::NdArray) {
+		return TransformPythonValueToUnion(ele.attr("tolist")(), target_type, nan_as_null);
+	}
+
+	if (object_type == PythonObjectType::File) {
+		for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
+			auto &member_type = UnionType::GetMemberType(target_type, index);
+			if (!FileLogicalType::IsFile(member_type)) {
+				continue;
+			}
+			auto value = py::cast<PythonFile>(ele).ToValue();
+			return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(index), std::move(value));
+		}
+		throw InvalidInputException("vane.File value has no FILE member in target type %s", target_type);
+	}
+
+	auto composite = object_type == PythonObjectType::List || object_type == PythonObjectType::Tuple ||
+	                 object_type == PythonObjectType::Dict;
+	if (composite) {
+		string last_error;
+		auto attempted = false;
+		for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
+			auto &member_type = UnionType::GetMemberType(target_type, index);
+			if (!UnionMemberAcceptsComposite(object_type, member_type)) {
+				continue;
+			}
+			attempted = true;
+			try {
+				auto value = TransformPythonValue(ele, member_type, nan_as_null);
+				if (value.type() != member_type && !value.DefaultTryCastAs(member_type)) {
+					continue;
+				}
+				return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(index),
+				                    std::move(value));
+			} catch (const InvalidInputException &error) {
+				last_error = ErrorData(error).RawMessage();
+			} catch (const ConversionException &error) {
+				last_error = ErrorData(error).RawMessage();
+			} catch (const OutOfRangeException &error) {
+				last_error = ErrorData(error).RawMessage();
+			} catch (const TypeMismatchException &error) {
+				last_error = ErrorData(error).RawMessage();
+			}
+		}
+		if (!last_error.empty()) {
+			throw InvalidInputException("Could not convert Python value to %s: %s", target_type, last_error);
+		}
+		if (attempted) {
+			throw InvalidInputException("Could not convert Python value to %s", target_type);
+		}
+		throw InvalidInputException("Python value of type '%s' has no compatible composite member in %s",
+		                            py::str(py::type::of(ele)).cast<string>(), target_type);
+	}
+
+	auto value = TransformPythonValue(ele, LogicalType::UNKNOWN, nan_as_null);
+	if (value.type() == target_type) {
+		return value;
+	}
+	for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
+		if (UnionType::GetMemberType(target_type, index) == value.type()) {
+			return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(index), std::move(value));
+		}
+	}
+	switch (value.type().id()) {
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY:
+	case LogicalTypeId::MAP:
+	case LogicalTypeId::STRUCT:
+	case LogicalTypeId::UNION:
+		throw InvalidInputException("Declared composite value of type %s has no exact member in %s", value.type(),
+		                            target_type);
+	default:
+		break;
+	}
+	return CastToTarget(std::move(value), target_type);
 }
 
 struct PythonValueConversion {
@@ -449,7 +557,7 @@ struct PythonValueConversion {
 	}
 
 	static void HandleNull(Value &result, const LogicalType &target_type) {
-		result = Value();
+		result = target_type.id() == LogicalTypeId::UNKNOWN ? Value() : Value(target_type);
 	}
 	static void HandleBoolean(Value &result, const LogicalType &target_type, bool val) {
 		result = Value::BOOLEAN(val);
@@ -533,6 +641,12 @@ struct PythonValueConversion {
 		if (target_type.id() == LogicalTypeId::ARRAY) {
 			child_type = ArrayType::GetChildType(target_type);
 			is_array = true;
+			if (list_size != ArrayType::GetSize(target_type)) {
+				throw InvalidInputException(
+				    "Python Conversion Failure: Array size mismatch - expected an array of size "
+				    "%d, but got a list of size %d",
+				    ArrayType::GetSize(target_type), list_size);
+			}
 		} else if (target_type.id() == LogicalTypeId::LIST) {
 			child_type = ListType::GetChildType(target_type);
 		}
@@ -541,6 +655,9 @@ struct PythonValueConversion {
 			Value new_value = TransformPythonValue(ele.attr("__getitem__")(i), child_type);
 			element_type = LogicalType::ForceMaxLogicalType(element_type, new_value.type());
 			values.push_back(std::move(new_value));
+		}
+		if (child_type.id() != LogicalTypeId::UNKNOWN) {
+			element_type = child_type;
 		}
 		if (is_array) {
 			result = Value::ARRAY(element_type, std::move(values));
@@ -572,6 +689,13 @@ struct PythonValueConversion {
 			auto timedelta = PyTimeDelta(ele);
 			return Value::INTERVAL(timedelta.ToInterval());
 		}
+		case PythonObjectType::File: {
+			auto converted = py::cast<PythonFile>(ele).ToValue();
+			if (target_type.id() == LogicalTypeId::UNKNOWN || FileLogicalType::IsFile(target_type)) {
+				return converted;
+			}
+			throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
 			switch (target_type.id()) {
@@ -593,7 +717,14 @@ struct PythonValueConversion {
 				throw InvalidInputException("The 'type' of a Value should be of type DuckDBPyType, not '%s'",
 				                            actual_type);
 			}
-			return TransformPythonValue(object, internal_type->Type());
+			auto converted = TransformPythonValue(object, internal_type->Type());
+			if (target_type.id() == LogicalTypeId::UNKNOWN || converted.type() == target_type) {
+				return converted;
+			}
+			if (FileLogicalType::IsFile(target_type) || FileLogicalType::IsFile(converted.type())) {
+				throw InvalidInputException("vane.File values can only be converted to FILE");
+			}
+			return CastToTarget(std::move(converted), target_type);
 		}
 		default:
 			throw InternalException("Unsupported fallback");
@@ -899,6 +1030,16 @@ struct PythonVectorConversion {
 template <class OP, class A, class B>
 void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bool nan_as_null) {
 	auto object_type = GetPythonObjectType(ele);
+	auto &conversion_target = OP::ConversionTarget(result, param);
+	if (FileLogicalType::IsFile(conversion_target)) {
+		auto is_null = object_type == PythonObjectType::None;
+		if (object_type == PythonObjectType::Float && nan_as_null) {
+			is_null = std::isnan(PyFloat_AsDouble(ele.ptr()));
+		}
+		if (!is_null && object_type != PythonObjectType::File && object_type != PythonObjectType::Value) {
+			throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
+		}
+	}
 
 	switch (object_type) {
 	case PythonObjectType::None:
@@ -922,7 +1063,6 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 
 		if (overflow != 0) {
 			PyErr_Clear();
-			auto &conversion_target = OP::ConversionTarget(result, param);
 			switch (conversion_target.id()) {
 			case LogicalTypeId::BIGINT:
 			case LogicalTypeId::INTEGER:
@@ -965,7 +1105,6 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 	}
 	case PythonObjectType::Tuple: {
 		auto list_size = py::len(ele);
-		auto &conversion_target = OP::ConversionTarget(result, param);
 		switch (conversion_target.id()) {
 		case LogicalTypeId::STRUCT:
 		case LogicalTypeId::UNKNOWN:
@@ -1030,6 +1169,7 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 	case PythonObjectType::NdDatetime:
 		TransformPythonObjectInternal<OP>(ele.attr("tolist")(), result, param, nan_as_null);
 		break;
+	case PythonObjectType::File:
 	case PythonObjectType::Uuid:
 	case PythonObjectType::Timedelta:
 	case PythonObjectType::Dict:
@@ -1051,6 +1191,9 @@ void TransformPythonObject(py::handle ele, Vector &vector, idx_t result_offset, 
 }
 
 Value TransformPythonValue(py::handle ele, const LogicalType &target_type, bool nan_as_null) {
+	if (target_type.id() == LogicalTypeId::UNION) {
+		return TransformPythonValueToUnion(ele, target_type, nan_as_null);
+	}
 	Value result;
 	TransformPythonObjectInternal<PythonValueConversion>(ele, result, target_type, nan_as_null);
 	return result;

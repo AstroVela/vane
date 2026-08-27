@@ -442,6 +442,17 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 
 	docs = "";
 	expression.def("collate", &DuckDBPyExpression::Collate, py::arg("collation"), docs);
+
+	expression.def("as_file", &DuckDBPyExpression::AsFile,
+	               "Construct a FILE expression using this expression as its URL");
+	expression.def_property_readonly("url", [](const DuckDBPyExpression &self) { return self.FileField("url"); });
+	expression.def_property_readonly("content_type",
+	                                 [](const DuckDBPyExpression &self) { return self.FileField("content_type"); });
+	expression.def_property_readonly("position",
+	                                 [](const DuckDBPyExpression &self) { return self.FileField("position"); });
+	expression.def_property_readonly("size", [](const DuckDBPyExpression &self) { return self.FileField("size"); });
+	expression.def_property_readonly("checksum",
+	                                 [](const DuckDBPyExpression &self) { return self.FileField("checksum"); });
 }
 
 } // namespace duckdb
