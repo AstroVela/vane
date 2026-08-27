@@ -1177,8 +1177,8 @@ def test_connection_snapshot_rejects_recorded_dynamic_descriptor_without_loaded_
     ray_cxx = _require_ray_cxx()
     connection = vane.connect()
     descriptor = _dynamic_snapshot_descriptor()
-    connection._record_dynamic_extension_snapshot_entry(
-        extension_module.DynamicExtensionDescriptor.from_dict(descriptor).to_json()
+    assert connection._compare_and_record_dynamic_extension_snapshot_entry(
+        [], extension_module.DynamicExtensionDescriptor.from_dict(descriptor).to_json()
     )
     try:
         with pytest.raises(Exception, match="Dynamic extension identities changed while capturing"):

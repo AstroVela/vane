@@ -93,8 +93,8 @@ def _run_real_ray_dynamic_extension_rejection_matrix(cases: list[dict[str, Any]]
             try:
                 existing_descriptor = case.get("existing_descriptor")
                 if existing_descriptor is not None:
-                    connection._record_dynamic_extension_snapshot_entry(
-                        DynamicExtensionDescriptor.from_dict(existing_descriptor).to_json()
+                    assert connection._compare_and_record_dynamic_extension_snapshot_entry(
+                        [], DynamicExtensionDescriptor.from_dict(existing_descriptor).to_json()
                     )
                 extension_module._prepare_dynamic_extension_snapshot(connection, case["manifest"])
             except DynamicExtensionError as exception:

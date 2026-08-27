@@ -492,8 +492,15 @@ def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnectio
 
 def _capture_dynamic_extension_snapshot(connection: DuckDBPyConnection) -> list[dict[str, object]]:
     """Capture resolver-owned descriptors without serializing local paths."""
+    return _deserialize_dynamic_extension_snapshot_entries(_serialized_dynamic_extension_snapshot_entries(connection))
+
+
+def _deserialize_dynamic_extension_snapshot_entries(
+    serialized_entries: list[str],
+) -> list[dict[str, object]]:
+    """Parse one native session snapshot captured under a single lock."""
     entries: list[object] = []
-    for index, serialized_entry in enumerate(_serialized_dynamic_extension_snapshot_entries(connection)):
+    for index, serialized_entry in enumerate(serialized_entries):
         try:
             entries.append(json.loads(serialized_entry))
         except ValueError as exception:
@@ -509,41 +516,47 @@ def _record_dynamic_extension_snapshot_entry(
     candidate: ResolvedDynamicExtension,
 ) -> None:
     """Record one verified, successfully loaded artifact for snapshot capture."""
-    existing_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
-    for existing in existing_descriptors:
-        if existing.identity == candidate.identity:
-            if existing != candidate.descriptor:
-                _fail(
-                    "LOADED_IDENTITY_CONFLICT",
-                    f"{candidate.identity} has conflicting immutable descriptors on this connection",
-                )
-            return
-        if existing.name == candidate.descriptor.name:
-            _fail(
-                "LOADED_NAME_CONFLICT",
-                f"{candidate.descriptor.name} is already recorded as {existing.identity}",
-            )
-    available_identities = {descriptor.identity for descriptor in existing_descriptors}
-    missing_dependencies = [
-        dependency.identity
-        for dependency in candidate.descriptor.dependencies
-        if dependency.identity not in available_identities
-    ]
-    if missing_dependencies:
-        _fail(
-            "SNAPSHOT_DEPENDENCY_ORDER",
-            f"cannot record {candidate.identity} before dependencies {', '.join(missing_dependencies)}",
-        )
-
-    record_entry = getattr(connection, "_record_dynamic_extension_snapshot_entry", None)
-    if not callable(record_entry):
+    compare_and_record = getattr(connection, "_compare_and_record_dynamic_extension_snapshot_entry", None)
+    if not callable(compare_and_record):
         _fail("SNAPSHOT_UNAVAILABLE", "connection cannot record dynamic extension snapshot entries")
-    try:
-        record_entry(candidate.descriptor.to_json())
-    except Exception as exception:
-        raise DynamicExtensionError(
-            "SNAPSHOT_UNAVAILABLE", "could not record the connection's dynamic extension snapshot"
-        ) from exception
+    candidate_json = candidate.descriptor.to_json()
+
+    while True:
+        serialized_entries = _serialized_dynamic_extension_snapshot_entries(connection)
+        existing_descriptors = _parse_dynamic_extension_snapshot(
+            _deserialize_dynamic_extension_snapshot_entries(serialized_entries)
+        )
+        for existing in existing_descriptors:
+            if existing.identity == candidate.identity:
+                if existing != candidate.descriptor:
+                    _fail(
+                        "LOADED_IDENTITY_CONFLICT",
+                        f"{candidate.identity} has conflicting immutable descriptors on this connection session",
+                    )
+                return
+            if existing.name == candidate.descriptor.name:
+                _fail(
+                    "LOADED_NAME_CONFLICT",
+                    f"{candidate.descriptor.name} is already recorded as {existing.identity} on this connection session",
+                )
+        available_identities = {descriptor.identity for descriptor in existing_descriptors}
+        missing_dependencies = [
+            dependency.identity
+            for dependency in candidate.descriptor.dependencies
+            if dependency.identity not in available_identities
+        ]
+        if missing_dependencies:
+            _fail(
+                "SNAPSHOT_DEPENDENCY_ORDER",
+                f"cannot record {candidate.identity} before dependencies {', '.join(missing_dependencies)}",
+            )
+        try:
+            if compare_and_record(serialized_entries, candidate_json):
+                return
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_UNAVAILABLE", "could not record the connection's dynamic extension snapshot"
+            ) from exception
 
 
 def _load_installed_dynamic_extension_providers(

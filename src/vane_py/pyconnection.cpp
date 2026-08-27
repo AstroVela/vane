@@ -808,7 +808,8 @@ static void InitializeConnectionMethods(py::class_<DuckDBPyConnection, shared_pt
 	      py::arg("extension"), py::kw_only(), py::arg("force_install") = false, py::arg("repository") = py::none(),
 	      py::arg("repository_url") = py::none(), py::arg("version") = py::none());
 	m.def("load_extension", &DuckDBPyConnection::LoadExtension, "Load an installed extension", py::arg("extension"));
-	m.def("_record_dynamic_extension_snapshot_entry", &DuckDBPyConnection::RecordDynamicExtensionSnapshotEntry,
+	m.def("_compare_and_record_dynamic_extension_snapshot_entry",
+	      &DuckDBPyConnection::CompareAndRecordDynamicExtensionSnapshotEntry, py::arg("expected_entries"),
 	      py::arg("entry"));
 	m.def("_export_dynamic_extension_snapshot_entries", &DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries);
 	m.def("get_profiling_information", &DuckDBPyConnection::GetProfilingInformation,
@@ -2996,7 +2997,8 @@ void DuckDBPyConnection::MarkVaneRaySessionOpened() {
 	vane_session->ray_session_opened = true;
 }
 
-void DuckDBPyConnection::RecordDynamicExtensionSnapshotEntry(const string &entry) {
+bool DuckDBPyConnection::CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries,
+                                                                       const string &entry) {
 	if (entry.empty()) {
 		throw InvalidInputException("Dynamic extension snapshot entry must not be empty");
 	}
@@ -3007,12 +3009,16 @@ void DuckDBPyConnection::RecordDynamicExtensionSnapshotEntry(const string &entry
 	if (!vane_session_attached || vane_session->connection_count == 0) {
 		throw InternalException("DuckDB connection Vane session is closed");
 	}
+	if (vane_session->dynamic_extension_snapshot_entries != expected_entries) {
+		return false;
+	}
 	for (const auto &existing : vane_session->dynamic_extension_snapshot_entries) {
 		if (existing == entry) {
-			return;
+			return true;
 		}
 	}
 	vane_session->dynamic_extension_snapshot_entries.push_back(entry);
+	return true;
 }
 
 vector<string> DuckDBPyConnection::ExportDynamicExtensionSnapshotEntries() const {

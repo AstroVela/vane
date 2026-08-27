@@ -39,30 +39,38 @@ class _RecordingDatabase:
         self.loaded = {}
 
 
+class _RecordingSession:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.dynamic_extension_snapshot_entries = []
+
+
 class RecordingConnection:
-    def __init__(self, platform, *, database=None, before_load=None):
+    def __init__(self, platform, *, database=None, session=None, before_load=None):
         self.platform = platform
         self.database = database if database is not None else _RecordingDatabase()
+        self.session = session if session is not None else _RecordingSession()
         self.before_load = before_load
         self.load_calls = []
         self.loaded_paths = []
         self.loaded_payloads = []
-        self._dynamic_extension_snapshot_entries = []
-        self._snapshot_lock = threading.Lock()
 
     def execute(self, query):
         if query == "SELECT platform FROM pragma_platform()":
             return _Result([(self.platform,)])
         raise AssertionError(f"unexpected query: {query}")
 
-    def _record_dynamic_extension_snapshot_entry(self, entry):
-        with self._snapshot_lock:
-            if entry not in self._dynamic_extension_snapshot_entries:
-                self._dynamic_extension_snapshot_entries.append(entry)
+    def _compare_and_record_dynamic_extension_snapshot_entry(self, expected_entries, entry):
+        with self.session.lock:
+            if self.session.dynamic_extension_snapshot_entries != expected_entries:
+                return False
+            if entry not in self.session.dynamic_extension_snapshot_entries:
+                self.session.dynamic_extension_snapshot_entries.append(entry)
+            return True
 
     def _export_dynamic_extension_snapshot_entries(self):
-        with self._snapshot_lock:
-            return list(self._dynamic_extension_snapshot_entries)
+        with self.session.lock:
+            return list(self.session.dynamic_extension_snapshot_entries)
 
 
 class _InstalledProviderEntryPoint:
@@ -617,6 +625,73 @@ def test_concurrent_different_artifacts_report_exactly_one_winner(tmp_path, fake
 
     assert sorted(outcomes) == ["LOADED", "LOADED_ARTIFACT_CONFLICT"]
     assert len(connection.loaded_paths) == 1
+
+
+def test_concurrent_conflicting_descriptors_record_exactly_one_session_winner(
+    tmp_path,
+    fake_native_loader,
+    monkeypatch,
+):
+    platform = _runtime_platform()
+    artifact_path = _write_extension_artifact(
+        tmp_path / "root.duckdb_extension",
+        platform=platform,
+        source_id=vane.__git_revision__,
+    )
+    first_descriptor = _descriptor(artifact_path, name="root", trust_identity="first-trust")
+    second_descriptor = replace(first_descriptor, trust_identity="second-trust")
+    cache_directory = tmp_path / "verified"
+    database = _RecordingDatabase()
+    session = _RecordingSession()
+    connections = [
+        RecordingConnection(platform, database=database, session=session),
+        RecordingConnection(platform, database=database, session=session),
+    ]
+    candidates = [
+        (_resolver(cache_directory, trust_identity="first-trust"), connections[0], first_descriptor),
+        (_resolver(cache_directory, trust_identity="second-trust"), connections[1], second_descriptor),
+    ]
+    initial_exports = 0
+    initial_exports_lock = threading.Lock()
+    initial_export_barrier = threading.Barrier(2)
+    serialized_entries = extension_module._serialized_dynamic_extension_snapshot_entries
+
+    def synchronize_initial_empty_exports(connection):
+        nonlocal initial_exports
+        entries = serialized_entries(connection)
+        wait_for_peer = False
+        with initial_exports_lock:
+            if not entries and initial_exports < 2:
+                initial_exports += 1
+                wait_for_peer = True
+        if wait_for_peer:
+            initial_export_barrier.wait(timeout=10)
+        return entries
+
+    monkeypatch.setattr(
+        extension_module,
+        "_serialized_dynamic_extension_snapshot_entries",
+        synchronize_initial_empty_exports,
+    )
+
+    def load(candidate):
+        resolver, connection, descriptor = candidate
+        try:
+            resolver.load(connection, descriptor, artifact=artifact_path)
+        except DynamicExtensionError as exception:
+            return exception.code
+        return "LOADED"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(load, candidates))
+
+    assert sorted(outcomes) == ["LOADED", "LOADED_IDENTITY_CONFLICT"]
+    recorded_entries = connections[0]._export_dynamic_extension_snapshot_entries()
+    assert len(recorded_entries) == 1
+    assert DynamicExtensionDescriptor.from_json(recorded_entries[0]) in {
+        first_descriptor,
+        second_descriptor,
+    }
 
 
 def test_default_cache_uses_duckdb_extension_directory_without_native_creation(tmp_path):

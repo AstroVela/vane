@@ -383,7 +383,7 @@ public:
 	const string &GetVaneSessionId() const;
 	py::dict ExportVaneSessionConfig() const;
 	void MarkVaneRaySessionOpened();
-	void RecordDynamicExtensionSnapshotEntry(const string &entry);
+	bool CompareAndRecordDynamicExtensionSnapshotEntry(const vector<string> &expected_entries, const string &entry);
 	vector<string> ExportDynamicExtensionSnapshotEntries() const;
 	void ReleaseVaneSession();
 
