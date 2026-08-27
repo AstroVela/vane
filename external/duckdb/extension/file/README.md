@@ -93,10 +93,23 @@ deferred.
 
 ## Distributed boundary
 
-Ray plan admission rejects storage-facing FILE scalars (`to_file`,
-`try_to_file`, `file_enrich`, `file_size`, `file_exists`, `file_stat`, and the
-two-argument `file_mime_type`) until workers have an explicit connector,
-credential, path-resolution, and refresh contract. Connection-scoped DuckDB
-Secrets are not serialized to workers. I/O-free FILE construction, field and
-path access, one-argument metadata MIME lookup, comparison, and identity
-functions remain distributable.
+Ray execution treats the source Driver, Ray object transport, and the Workers
+participating in one Vane query as one trusted runtime boundary. FILE values
+remain the canonical five-field value and never carry connector configuration
+or credentials. The immutable connection/session snapshot is transported
+separately and applied to each Worker-owned DuckDB connection before FILE
+functions execute.
+
+The official Vane build loads statically linked `file` and `httpfs` extensions,
+and its existing snapshot records and verifies their exact identities before
+Worker execution. This makes HTTP and S3 connector lookup available without
+runtime extension installation or autoload. Existing Vane session handling
+resolves and refreshes supported AWS credentials per connection session.
+Explicit supported DuckDB connection settings retain their normal precedence.
+DuckDB `CREATE SECRET` objects are not serialized.
+
+This first distributed contract is for controlled, single-trust-domain Ray
+deployments. A local path names a Worker-visible path and is portable only when
+all participating Workers see the same object at that path. Multi-scope Secret
+selection and untrusted-cluster isolation remain a later execution-layer
+contract; neither requires changing FILE's persisted representation.

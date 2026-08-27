@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import threading
 import time
 
 import pytest
@@ -11,6 +13,97 @@ except Exception:
     ray = None
 
 import vane
+
+
+def _sql_string_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _start_s3_object_server(payload):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class S3ObjectHandler(BaseHTTPRequestHandler):
+        requests = []
+        requests_lock = threading.Lock()
+
+        def _record_request(self):
+            with type(self).requests_lock:
+                type(self).requests.append(
+                    {
+                        "authorization": self.headers.get("Authorization"),
+                        "command": self.command,
+                        "path": self.path,
+                        "range": self.headers.get("Range"),
+                    }
+                )
+
+        def _send_object(self, include_body):
+            self._record_request()
+            if self.path.split("?", 1)[0] != "/bucket/object.bin":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            status = 200
+            body = payload
+            content_range = None
+            range_header = self.headers.get("Range")
+            if range_header:
+                unit, separator, bounds = range_header.partition("=")
+                start_text, dash, end_text = bounds.partition("-")
+                if (
+                    unit != "bytes"
+                    or not separator
+                    or not dash
+                    or not start_text.isdigit()
+                    or (end_text and not end_text.isdigit())
+                ):
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{len(payload)}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start = int(start_text)
+                end = len(payload) - 1 if not end_text else min(int(end_text), len(payload) - 1)
+                if start >= len(payload) or end < start:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{len(payload)}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                status = 206
+                body = payload[start : end + 1]
+                content_range = f"bytes {start}-{end}/{len(payload)}"
+
+            self.send_response(status)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "image/png")
+            self.send_header("ETag", '"trusted-file-etag"')
+            self.send_header("Last-Modified", "Thu, 27 Aug 2026 00:00:00 GMT")
+            if content_range is not None:
+                self.send_header("Content-Range", content_range)
+            self.end_headers()
+            if include_body:
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def do_HEAD(self):
+            self._send_object(False)
+
+        def do_GET(self):
+            self._send_object(True)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), S3ObjectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, S3ObjectHandler
 
 
 def _collect_rows_from_parts(parts):
@@ -35,7 +128,7 @@ def _collect_rows_from_parts(parts):
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
-def test_default_ray_rejects_file_io_for_driver_only_path(monkeypatch, tmp_path):
+def test_default_ray_resolves_file_io_in_worker_process(monkeypatch, tmp_path):
     import fcntl
     import os
 
@@ -57,12 +150,108 @@ def test_default_ray_rejects_file_io_for_driver_only_path(monkeypatch, tmp_path)
                 vane.teardown_runner()
                 relation = connection.sql(f"SELECT file_size(try_to_file('{driver_path}')) FROM range(2)")
 
-                with pytest.raises(ValueError, match="storage-facing FILE function"):
-                    relation.fetchall()
+                assert relation.fetchall() == [(None,), (None,)]
             finally:
                 os.close(descriptor)
     finally:
         connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_reads_worker_visible_file_with_strict_range(monkeypatch, tmp_path):
+    payload = b"worker-visible-payload"
+    payload_path = tmp_path / "worker-visible.bin"
+    payload_path.write_bytes(payload)
+    path_sql = _sql_string_literal(payload_path)
+
+    monkeypatch.delenv("VANE_RUNNER", raising=False)
+    vane.teardown_runner()
+    connection = vane.connect()
+    try:
+        relation = connection.sql(
+            f"""
+            SELECT
+                file_size(to_file({path_sql})),
+                file_size(file({path_sql}, NULL, 7, 7, NULL)),
+                file_exists(file({path_sql}, NULL, 7, 7, NULL)),
+                file_content_id(file_enrich(
+                    file({path_sql}, NULL, 7, 7, NULL),
+                    ['checksum']
+                ))
+            FROM range(2)
+            """
+        )
+        digest = hashlib.sha256(payload[7:14]).hexdigest()
+        expected = (
+            len(payload),
+            7,
+            True,
+            f"file-content-v1:checksum:sha256:{digest}",
+        )
+        assert relation.fetchall() == [expected, expected]
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_file_io_uses_connection_session_s3_context(monkeypatch):
+    payload = b"\x89PNG\r\n\x1a\n" + b"ray-session-file-payload"
+    server, thread, handler = _start_s3_object_server(payload)
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+    http_url_sql = _sql_string_literal(f"{endpoint}/bucket/object.bin")
+    access_key = "trusted-file-access-key"
+    environment_keys = (
+        "AWS_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_REGION",
+    )
+    try:
+        monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", access_key)
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "trusted-file-secret-key")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.delenv("VANE_RUNNER", raising=False)
+        vane.teardown_runner()
+        connection = vane.connect()
+        for key in environment_keys:
+            monkeypatch.delenv(key)
+
+        try:
+            connection.execute("SET http_proxy=''")
+            relation = connection.sql(
+                f"""
+                SELECT
+                    file_size(to_file({http_url_sql})),
+                    file_size(to_file('s3://bucket/object.bin')),
+                    file_mime_type(
+                        file('s3://bucket/object.bin', NULL, NULL, NULL, NULL),
+                        'content'
+                    )
+                FROM range(2)
+                """
+            )
+            expected = (len(payload), len(payload), "image/png")
+            assert relation.fetchall() == [expected, expected]
+        finally:
+            connection.close()
+
+        with handler.requests_lock:
+            requests = list(handler.requests)
+        assert requests
+        assert any(
+            request["authorization"] and f"Credential={access_key}/" in request["authorization"] for request in requests
+        )
+        assert any(request["range"] for request in requests)
+    finally:
+        try:
+            vane.teardown_runner()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
