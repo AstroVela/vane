@@ -6,6 +6,8 @@
 #
 # Modified by Vane contributors.
 
+duckdb_require_static_extension(file "Vane Python FILE API")
+
 # this is used for clang-tidy checks
 add_library(python_native OBJECT file.cpp python_objects.cpp
                                  python_conversion.cpp)

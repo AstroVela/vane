@@ -770,6 +770,16 @@ function(duckdb_add_library target_name)
       PARENT_SCOPE)
 endfunction()
 
+function(duckdb_require_static_extension extension_name consumer)
+  if(NOT "${extension_name}" IN_LIST BUILD_EXTENSIONS)
+    message(
+      FATAL_ERROR
+        "${consumer} requires DuckDB extension '${extension_name}' to be "
+        "statically linked. Keep '${extension_name}' in BUILD_EXTENSIONS and "
+        "remove it from VANE_LOADABLE_EXTENSIONS.")
+  endif()
+endfunction()
+
 function(duckdb_link_extensions target_name)
   # Link to the DuckDB static library and extensions We use WHOLE_ARCHIVE
   # because duckdb_static calls LoadAllExtensions which is defined in the

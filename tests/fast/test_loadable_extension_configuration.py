@@ -4,6 +4,8 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -89,3 +91,55 @@ endif()
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("build_extensions", "loadable_extensions", "expected_success"),
+    (
+        ("core_functions;file;json", "", True),
+        ("core_functions;json", "", False),
+        ("core_functions;file;json", "file", False),
+    ),
+    ids=("static", "omitted", "loadable"),
+)
+def test_python_file_api_requires_static_file_extension(
+    tmp_path: Path,
+    build_extensions: str,
+    loadable_extensions: str,
+    expected_success: bool,
+):
+    probe = tmp_path / "probe.cmake"
+    probe.write_text(
+        f"""
+cmake_minimum_required(VERSION 3.29)
+set(PROJECT_SOURCE_DIR "${{VANE_TEST_REPOSITORY}}")
+set(DUCKDB_SOURCE_PATH "${{VANE_TEST_REPOSITORY}}/external/duckdb")
+set(BUILD_EXTENSIONS "{build_extensions}")
+set(VANE_LOADABLE_EXTENSIONS "{loadable_extensions}")
+include("${{PROJECT_SOURCE_DIR}}/cmake/duckdb_loader.cmake")
+_duckdb_configure_loadable_extensions()
+duckdb_require_static_extension(file "Vane Python FILE API")
+""".lstrip(),
+        encoding="ascii",
+    )
+
+    result = subprocess.run(
+        (
+            "cmake",
+            f"-DVANE_TEST_REPOSITORY={REPOSITORY_ROOT}",
+            "-P",
+            str(probe),
+        ),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    normalized_output = " ".join(output.split())
+
+    if expected_success:
+        assert result.returncode == 0, output
+    else:
+        assert result.returncode != 0
+        assert "Vane Python FILE API requires DuckDB extension 'file' to be statically linked" in normalized_output
