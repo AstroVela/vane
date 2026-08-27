@@ -13450,15 +13450,24 @@ def test_stats_fragments_reads_worker_actor_counters():
     assert actor.fragment_stats_calls == 1
 
 
-def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+def _new_fragment_registry_actor():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._plan_fragments = {}
     actor._query_fragments = {}
     actor._fragment_query_ids = {}
+    actor._pending_fragment_registrations = {}
+    actor._fragment_registry_lock = threading.RLock()
     actor._fragment_register_calls = 0
     actor._fragment_registered_total = 0
     actor._fragment_existing_total = 0
+    actor._fragment_lookup_hits = 0
+    actor._fragment_lookup_misses = 0
+    return actor_cls, actor
+
+
+def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
 
     class _AwaitablePlanRef:
         def __init__(self, value):
@@ -13518,14 +13527,7 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
 
 
 def test_register_fragments_rolls_back_new_replay_state_when_snapshot_preparation_fails(monkeypatch):
-    actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
-    actor = object.__new__(actor_cls)
-    actor._plan_fragments = {}
-    actor._query_fragments = {}
-    actor._fragment_query_ids = {}
-    actor._fragment_register_calls = 0
-    actor._fragment_registered_total = 0
-    actor._fragment_existing_total = 0
+    actor_cls, actor = _new_fragment_registry_actor()
     events = []
 
     monkeypatch.setattr(
@@ -13560,6 +13562,192 @@ def test_register_fragments_rolls_back_new_replay_state_when_snapshot_preparatio
         ("register", "query-resource", plan),
         ("cleanup", "query-resource"),
     ]
+    assert actor._plan_fragments == {}
+
+
+def test_register_fragments_prepares_snapshot_off_actor_event_loop(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    preparation_thread_ids = []
+    event_loop_thread_id = threading.get_ident()
+
+    monkeypatch.setattr(worker_mod, "_register_query_python_replay_state", lambda _query_id, _plan: True)
+    monkeypatch.setattr(worker_mod, "_cleanup_query_python_replay_state", lambda _query_id: None)
+
+    def prepare_snapshot(_plan):
+        preparation_thread_ids.append(threading.get_ident())
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            heartbeat = []
+            await asyncio.sleep(0)
+            heartbeat.append("responsive")
+            assert heartbeat == ["responsive"]
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        return await registration
+
+    result = asyncio.run(run())
+
+    assert result == {"registered": 1, "existing": 0, "total": 1}
+    assert preparation_thread_ids
+    assert preparation_thread_ids[0] != event_loop_thread_id
+
+
+def test_register_fragments_cancellation_waits_for_preparation_and_rolls_back(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, _plan: events.append(("register", query_id)) or True,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(_plan):
+        events.append(("prepare-start", threading.get_ident()))
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+        events.append(("prepare-end", threading.get_ident()))
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            registration.cancel()
+            await asyncio.sleep(0)
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+    asyncio.run(run())
+
+    assert [event[0] for event in events] == ["register", "prepare-start", "prepare-end", "cleanup"]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_drop_query_fragments_invalidates_inflight_snapshot_preparation(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, _plan: events.append(("register", query_id)) or True,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(_plan):
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            assert actor_cls.drop_query_fragments(actor, "query-1") == 0
+        finally:
+            release_preparation.set()
+        with pytest.raises(RuntimeError, match="dropped during worker snapshot preparation"):
+            await registration
+
+    asyncio.run(run())
+
+    assert events == [("register", "query-resource"), ("cleanup", "query-resource")]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_fragment_template_rejects_unprepared_inline_fallback():
+    actor_cls, actor = _new_fragment_registry_actor()
+
+    with pytest.raises(ValueError, match="was not prepared in the actor registry"):
+        actor_cls._resolve_fragment_template(
+            actor,
+            "query-1:node:1",
+            {"query_id": "query-1"},
+            object(),
+            "query-1",
+        )
+
     assert actor._plan_fragments == {}
 
 

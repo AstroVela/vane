@@ -1025,6 +1025,13 @@ class NativeQueryCleanupContext(NamedTuple):
     connection_snapshot_identity: CleanupConnectionSnapshotIdentity
 
 
+class QuerySnapshotPreparation(NamedTuple):
+    """Replay state owned by one completed worker snapshot preparation."""
+
+    connection_snapshot_query_id: str
+    replay_state_created: bool
+
+
 @ray.remote(concurrency_groups={"execute": 128, "control": 512})  # type: ignore[call-overload]
 class RayWorkerActor:
     """RayWorkerActor is a ray actor that runs local physical plans on worker.
@@ -1085,6 +1092,9 @@ class RayWorkerActor:
         self._plan_fragments: dict[str, Any] = {}
         self._query_fragments: dict[str, set[str]] = {}
         self._fragment_query_ids: dict[str, str] = {}
+        self._pending_fragment_registrations: dict[str, tuple[str, object]] = {}
+        self._fragment_registry_lock = threading.RLock()
+        self._fragment_registration_lock = asyncio.Lock()
         self._fragment_register_calls = 0
         self._fragment_registered_total = 0
         self._fragment_existing_total = 0
@@ -1107,6 +1117,9 @@ class RayWorkerActor:
         self._shared_conn_lock = threading.Lock()
         self._snapshot_connections: dict[WorkerSnapshotDatabaseIdentity, Any] = {}
         self._snapshot_connections_lock = threading.Lock()
+        self._snapshot_database_prepare_calls = 0
+        self._snapshot_database_cache_hits = 0
+        self._snapshot_database_created_total = 0
         self._snapshot_connection_active_cursors: dict[WorkerSnapshotDatabaseIdentity, int] = {}
         self._snapshot_cursor_database_identities: dict[Any, WorkerSnapshotDatabaseIdentity] = {}
         self._retired_snapshot_database_identities: set[WorkerSnapshotDatabaseIdentity] = set()
@@ -1174,15 +1187,23 @@ class RayWorkerActor:
         - plan: plan object (PhysicalPlan / DistributedPhysicalPlan wrapper)
         - query_id: query identity for lifecycle cleanup
         """
+        registration_lock = getattr(self, "_fragment_registration_lock", None)
+        if registration_lock is None:
+            registration_lock = asyncio.Lock()
+            self._fragment_registration_lock = registration_lock
+        async with registration_lock:
+            return await self._register_fragments_owned(fragments)
+
+    async def _register_fragments_owned(self, fragments: list[dict[str, Any]]) -> dict[str, int]:
+        """Resolve, prepare, and atomically publish one fragment batch."""
         self._ensure_worker_runtime_running()
         registered = 0
         existing = 0
-        self._fragment_register_calls += 1
         pending_entries: list[dict[str, Any]] = []
         pending_refs: list[ray.ObjectRef[Any]] = []
         pending_ref_indexes: list[int] = []
         seen_new_fragment_ids: dict[str, str] = {}
-
+        unique_entries: list[dict[str, Any]] = []
         for entry in fragments:
             fragment_id = str(entry.get("fragment_id", "")).strip()
             if not fragment_id:
@@ -1190,92 +1211,201 @@ class RayWorkerActor:
             query_id = str(entry.get("query_id", "")).strip()
             if not query_id:
                 raise ValueError("fragment registration requires non-empty query_id")
-            existing_owner = self._fragment_query_ids.get(fragment_id)
-            if existing_owner is not None and existing_owner != query_id:
-                raise RuntimeError(
-                    "fragment registration query ownership mismatch: "
-                    f"fragment={fragment_id} owner={existing_owner} requested={query_id}"
-                )
             batch_owner = seen_new_fragment_ids.get(fragment_id)
-            if batch_owner is not None and batch_owner != query_id:
-                raise RuntimeError(
-                    "fragment registration batch contains conflicting query ownership: "
-                    f"fragment={fragment_id} owners={batch_owner},{query_id}"
-                )
-            if fragment_id in self._plan_fragments or batch_owner is not None:
-                existing += 1
-                continue
-            plan = entry.get("plan")
-            seen_new_fragment_ids[fragment_id] = query_id
-            pending_entries.append(
-                {
-                    "fragment_id": fragment_id,
-                    "plan": plan,
-                    "query_id": query_id,
-                }
-            )
-            if isinstance(plan, ray.ObjectRef):
-                pending_refs.append(plan)
-                pending_ref_indexes.append(len(pending_entries) - 1)
-
-        if pending_refs:
-            resolved_plans = await asyncio.gather(*pending_refs)
-            for entry_index, resolved_plan in zip(pending_ref_indexes, resolved_plans, strict=False):
-                pending_entries[entry_index]["plan"] = resolved_plan
-
-        self._ensure_worker_runtime_running()
-        for entry in pending_entries:
-            fragment_id = str(entry["fragment_id"])
-            plan = entry.get("plan")
-            if plan is None:
-                raise ValueError(f"fragment {fragment_id} registration requires a physical plan")
-            if fragment_id in self._plan_fragments:
-                owner_query_id = self._fragment_query_ids[fragment_id]
-                if owner_query_id != entry["query_id"]:
+            if batch_owner is not None:
+                if batch_owner != query_id:
                     raise RuntimeError(
-                        "fragment registration query ownership changed while awaiting plan: "
-                        f"fragment={fragment_id} owner={owner_query_id} "
-                        f"requested={entry['query_id']}"
+                        "fragment registration batch contains conflicting query ownership: "
+                        f"fragment={fragment_id} owners={batch_owner},{query_id}"
                     )
                 existing += 1
                 continue
-            query_id = str(entry.get("query_id", "")).strip()
-            self._register_and_prepare_query_snapshot_database(plan)
-            self._plan_fragments[fragment_id] = plan
-            self._fragment_query_ids[fragment_id] = query_id
-            self._query_fragments.setdefault(query_id, set()).add(fragment_id)
-            registered += 1
-        self._fragment_registered_total += registered
-        self._fragment_existing_total += existing
-        return {
-            "registered": registered,
-            "existing": existing,
-            "total": len(self._plan_fragments),
-        }
+            seen_new_fragment_ids[fragment_id] = query_id
+            unique_entries.append(
+                {
+                    "fragment_id": fragment_id,
+                    "plan": entry.get("plan"),
+                    "query_id": query_id,
+                }
+            )
+
+        registry_lock = self._get_fragment_registry_lock()
+        with registry_lock:
+            self._fragment_register_calls += 1
+            for entry in unique_entries:
+                fragment_id = str(entry["fragment_id"])
+                query_id = str(entry["query_id"])
+                existing_owner = self._fragment_query_ids.get(fragment_id)
+                if existing_owner is not None and existing_owner != query_id:
+                    raise RuntimeError(
+                        "fragment registration query ownership mismatch: "
+                        f"fragment={fragment_id} owner={existing_owner} requested={query_id}"
+                    )
+            for entry in unique_entries:
+                fragment_id = str(entry["fragment_id"])
+                query_id = str(entry["query_id"])
+                if fragment_id in self._plan_fragments:
+                    existing += 1
+                    continue
+                plan = entry.get("plan")
+                token = object()
+                pending_entries.append(
+                    {
+                        "fragment_id": fragment_id,
+                        "plan": plan,
+                        "query_id": query_id,
+                        "token": token,
+                    }
+                )
+                self._pending_fragment_registrations[fragment_id] = (query_id, token)
+                if isinstance(plan, ray.ObjectRef):
+                    pending_refs.append(plan)
+                    pending_ref_indexes.append(len(pending_entries) - 1)
+
+        try:
+            if pending_refs:
+                resolved_plans = await asyncio.gather(*pending_refs)
+                for entry_index, resolved_plan in zip(pending_ref_indexes, resolved_plans, strict=False):
+                    pending_entries[entry_index]["plan"] = resolved_plan
+
+            for entry in pending_entries:
+                fragment_id = str(entry["fragment_id"])
+                query_id = str(entry["query_id"])
+                token = entry["token"]
+                plan = entry.get("plan")
+                if plan is None:
+                    raise ValueError(f"fragment {fragment_id} registration requires a physical plan")
+                self._ensure_worker_runtime_running()
+                with registry_lock:
+                    pending_owner = self._pending_fragment_registrations.get(fragment_id)
+                    if pending_owner != (query_id, token):
+                        raise RuntimeError(
+                            "fragment registration was dropped while awaiting its physical plan: "
+                            f"fragment={fragment_id} query={query_id}"
+                        )
+                    if fragment_id in self._plan_fragments:
+                        owner_query_id = self._fragment_query_ids[fragment_id]
+                        if owner_query_id != query_id:
+                            raise RuntimeError(
+                                "fragment registration query ownership changed while awaiting plan: "
+                                f"fragment={fragment_id} owner={owner_query_id} requested={query_id}"
+                            )
+                        existing += 1
+                        self._pending_fragment_registrations.pop(fragment_id, None)
+                        continue
+
+                preparation_task = asyncio.create_task(
+                    asyncio.to_thread(self._register_and_prepare_query_snapshot_database, plan)
+                )
+                try:
+                    preparation = cast(
+                        QuerySnapshotPreparation,
+                        await _await_future_with_owned_side_effects(preparation_task),
+                    )
+                except asyncio.CancelledError as cancellation:
+                    preparation = cast(QuerySnapshotPreparation, preparation_task.result())
+                    self._rollback_query_snapshot_preparation(preparation, cancellation)
+                    raise
+
+                try:
+                    self._ensure_worker_runtime_running()
+                    with registry_lock:
+                        pending_owner = self._pending_fragment_registrations.get(fragment_id)
+                        if pending_owner != (query_id, token):
+                            raise RuntimeError(
+                                "fragment registration was dropped during worker snapshot preparation: "
+                                f"fragment={fragment_id} query={query_id}"
+                            )
+                        owner_query_id = self._fragment_query_ids.get(fragment_id)
+                        if owner_query_id is not None:
+                            if owner_query_id != query_id:
+                                raise RuntimeError(
+                                    "fragment registration query ownership changed during worker snapshot preparation: "
+                                    f"fragment={fragment_id} owner={owner_query_id} requested={query_id}"
+                                )
+                            existing += 1
+                        else:
+                            self._plan_fragments[fragment_id] = plan
+                            self._fragment_query_ids[fragment_id] = query_id
+                            self._query_fragments.setdefault(query_id, set()).add(fragment_id)
+                            registered += 1
+                        self._pending_fragment_registrations.pop(fragment_id, None)
+                except BaseException as publication_error:
+                    self._rollback_query_snapshot_preparation(preparation, publication_error)
+                    raise
+
+            with registry_lock:
+                self._fragment_registered_total += registered
+                self._fragment_existing_total += existing
+                total = len(self._plan_fragments)
+            return {
+                "registered": registered,
+                "existing": existing,
+                "total": total,
+            }
+        finally:
+            with registry_lock:
+                for entry in pending_entries:
+                    fragment_id = str(entry["fragment_id"])
+                    pending_owner = (str(entry["query_id"]), entry["token"])
+                    if self._pending_fragment_registrations.get(fragment_id) == pending_owner:
+                        self._pending_fragment_registrations.pop(fragment_id, None)
+
+    def _get_fragment_registry_lock(self) -> threading.RLock:
+        registry_lock = getattr(self, "_fragment_registry_lock", None)
+        if registry_lock is None:
+            registry_lock = threading.RLock()
+            self._fragment_registry_lock = registry_lock
+        pending_registrations = getattr(self, "_pending_fragment_registrations", None)
+        if pending_registrations is None:
+            self._pending_fragment_registrations = {}
+        return registry_lock
 
     @ray.method(concurrency_group="control")
     def drop_query_fragments(self, query_id: str) -> int:
         self._ensure_worker_runtime_running()
-        fragment_ids = self._query_fragments.pop(query_id, set())
-        removed = 0
-        for fragment_id in fragment_ids:
-            if fragment_id in self._plan_fragments:
-                self._plan_fragments.pop(fragment_id, None)
-                self._fragment_query_ids.pop(fragment_id, None)
-                removed += 1
-        return removed
+        query_id = str(query_id).strip()
+        if not query_id:
+            raise ValueError("fragment cleanup requires non-empty query_id")
+        with self._get_fragment_registry_lock():
+            for fragment_id, pending_owner in list(self._pending_fragment_registrations.items()):
+                if pending_owner[0] == query_id:
+                    self._pending_fragment_registrations.pop(fragment_id, None)
+            fragment_ids = self._query_fragments.pop(query_id, set())
+            removed = 0
+            for fragment_id in fragment_ids:
+                if fragment_id in self._plan_fragments:
+                    self._plan_fragments.pop(fragment_id, None)
+                    self._fragment_query_ids.pop(fragment_id, None)
+                    removed += 1
+            return removed
 
     @ray.method(concurrency_group="control")
     def stats_fragments(self) -> dict[str, int]:
-        return {
-            "fragments_total": len(self._plan_fragments),
-            "queries_tracked": len(self._query_fragments),
-            "register_calls": self._fragment_register_calls,
-            "registered_total": self._fragment_registered_total,
-            "existing_total": self._fragment_existing_total,
-            "lookup_hits": self._fragment_lookup_hits,
-            "lookup_misses": self._fragment_lookup_misses,
-        }
+        with self._get_fragment_registry_lock():
+            return {
+                "fragments_total": len(self._plan_fragments),
+                "queries_tracked": len(self._query_fragments),
+                "register_calls": self._fragment_register_calls,
+                "registered_total": self._fragment_registered_total,
+                "existing_total": self._fragment_existing_total,
+                "lookup_hits": self._fragment_lookup_hits,
+                "lookup_misses": self._fragment_lookup_misses,
+            }
+
+    @ray.method(concurrency_group="control")
+    def stats_snapshot_databases(self) -> dict[str, int]:
+        snapshot_connections_lock = getattr(self, "_snapshot_connections_lock", None)
+        if snapshot_connections_lock is None:
+            snapshot_connections_lock = threading.Lock()
+            self._snapshot_connections_lock = snapshot_connections_lock
+        with snapshot_connections_lock:
+            return {
+                "prepare_calls": int(getattr(self, "_snapshot_database_prepare_calls", 0)),
+                "cache_hits": int(getattr(self, "_snapshot_database_cache_hits", 0)),
+                "created_total": int(getattr(self, "_snapshot_database_created_total", 0)),
+                "active_databases": len(getattr(self, "_snapshot_connections", {})),
+            }
 
     def _get_fte_task_manager(self) -> FteWorkerTaskManager:
         shutdown_lock = getattr(self, "_shutdown_lock", None)
@@ -1603,28 +1733,25 @@ class RayWorkerActor:
         if not resolved_query_id:
             raise ValueError("fragment template lookup requires non-empty query_id")
 
-        if fragment_id in self._plan_fragments:
-            owner_query_id = self._fragment_query_ids.get(fragment_id)
-            if owner_query_id != resolved_query_id:
-                raise RuntimeError(
-                    "fragment template query ownership mismatch: "
-                    f"fragment={fragment_id} owner={owner_query_id} "
-                    f"requested={resolved_query_id}"
-                )
-            template_plan = self._plan_fragments[fragment_id]
-            self._fragment_lookup_hits += 1
-            return template_plan
+        with self._get_fragment_registry_lock():
+            if fragment_id in self._plan_fragments:
+                owner_query_id = self._fragment_query_ids.get(fragment_id)
+                if owner_query_id != resolved_query_id:
+                    raise RuntimeError(
+                        "fragment template query ownership mismatch: "
+                        f"fragment={fragment_id} owner={owner_query_id} "
+                        f"requested={resolved_query_id}"
+                    )
+                template_plan = self._plan_fragments[fragment_id]
+                self._fragment_lookup_hits += 1
+                return template_plan
 
-        if fragment_plan is None:
             self._fragment_lookup_misses += 1
-            raise ValueError(f"PlanFragment not found in actor registry: {fragment_id}")
-
-        self._register_and_prepare_query_snapshot_database(fragment_plan)
-        self._plan_fragments[fragment_id] = fragment_plan
-        self._fragment_query_ids[fragment_id] = resolved_query_id
-        self._query_fragments.setdefault(resolved_query_id, set()).add(fragment_id)
-        self._fragment_lookup_hits += 1
-        return fragment_plan
+        if fragment_plan is not None:
+            raise ValueError(
+                f"PlanFragment was not prepared in the actor registry before task admission: {fragment_id}"
+            )
+        raise ValueError(f"PlanFragment not found in actor registry: {fragment_id}")
 
     def _configure_conn(self, conn: Any) -> None:
         """Apply standard DuckDB settings (S3, threading, etc.) to a connection."""
@@ -1743,12 +1870,14 @@ class RayWorkerActor:
                 snapshot_connections_lock = threading.Lock()
                 self._snapshot_connections_lock = snapshot_connections_lock
             with snapshot_connections_lock:
+                self._snapshot_database_prepare_calls = int(getattr(self, "_snapshot_database_prepare_calls", 0)) + 1
                 snapshot_connections = getattr(self, "_snapshot_connections", None)
                 if snapshot_connections is None:
                     snapshot_connections = {}
                     self._snapshot_connections = snapshot_connections
                 self._activate_snapshot_database_identity_locked(database_identity)
                 if database_identity in snapshot_connections:
+                    self._snapshot_database_cache_hits = int(getattr(self, "_snapshot_database_cache_hits", 0)) + 1
                     return
                 prepare = require_ray_cxx_attr(
                     "_prepare_query_snapshot_connection",
@@ -1774,6 +1903,7 @@ class RayWorkerActor:
                             ) from config_error
                     raise
                 snapshot_connections[database_identity] = connection
+                self._snapshot_database_created_total = int(getattr(self, "_snapshot_database_created_total", 0)) + 1
                 connection = None
         except BaseException as preparation_error:
             if connection is not None:
@@ -2051,7 +2181,7 @@ class RayWorkerActor:
         prepared = self._prepare_query_snapshot_state(plan, acquire_execution_cursor=False)
         return cast(tuple[Any, dict[str, str], WorkerSnapshotDatabaseIdentity], prepared)
 
-    def _register_and_prepare_query_snapshot_database(self, plan: Any) -> None:
+    def _register_and_prepare_query_snapshot_database(self, plan: Any) -> QuerySnapshotPreparation:
         """Register replay metadata and roll it back if first preparation fails."""
         connection_snapshot_query_id = _plan_resource_query_id(plan)
         replay_state_created = _register_query_python_replay_state(connection_snapshot_query_id, plan)
@@ -2068,6 +2198,23 @@ class RayWorkerActor:
                         f"rollback={type(cleanup_error).__name__}: {cleanup_error}"
                     ) from preparation_error
             raise
+        return QuerySnapshotPreparation(connection_snapshot_query_id, replay_state_created)
+
+    @staticmethod
+    def _rollback_query_snapshot_preparation(
+        preparation: QuerySnapshotPreparation,
+        primary_error: BaseException,
+    ) -> None:
+        if not preparation.replay_state_created:
+            return
+        try:
+            _cleanup_query_python_replay_state(preparation.connection_snapshot_query_id)
+        except BaseException as cleanup_error:
+            raise RuntimeError(
+                "worker snapshot registration rollback failed after admission changed: "
+                f"admission={type(primary_error).__name__}: {primary_error}; "
+                f"rollback={type(cleanup_error).__name__}: {cleanup_error}"
+            ) from primary_error
 
     @staticmethod
     def _validate_query_snapshot_database(connection: Any, connection_snapshot_query_id: str) -> None:

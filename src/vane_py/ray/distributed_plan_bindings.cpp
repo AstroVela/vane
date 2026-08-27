@@ -4070,6 +4070,13 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	}
 
 	py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+	if (SnapshotHasDynamicExtensions(plan.connection_snapshot_)) {
+		// Progress topology deserializes a worker fragment against its own
+		// DatabaseInstance. Prepare that instance before the deserializer sees
+		// extension-owned operators or expressions, using the same strict local
+		// provider and native LOAD path as worker snapshot preparation.
+		PrepareConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_);
+	}
 	PyPhysicalPlanWrapper topology_plan;
 	topology_plan.query_id_ = plan.idx();
 	topology_plan.resource_query_id_ = plan.resource_query_id_;

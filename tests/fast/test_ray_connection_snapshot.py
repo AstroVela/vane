@@ -751,7 +751,7 @@ def test_worker_nondefault_snapshot_reuses_database(monkeypatch):
         source_connection.close()
 
 
-def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_path, monkeypatch):
+def test_worker_file_snapshot_identity_ignores_coordinator_thread_config(tmp_path, monkeypatch):
     from vane.runners.ray import worker as worker_module
 
     ray_cxx = _require_ray_cxx()
@@ -808,6 +808,7 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
             effective_s3_config={},
             use_session_credentials=True,
         )
+        assert first_identity == second_identity
         actor_class._prepare_snapshot_database(
             actor,
             first_query_id,
@@ -829,7 +830,7 @@ def test_worker_file_snapshot_identities_use_isolated_read_only_instances(tmp_pa
             database_identity=second_identity,
         )
 
-        assert len(actor._snapshot_connections) == 2
+        assert len(actor._snapshot_connections) == 1
         plan_runner = ray_cxx.DistributedPhysicalPlanRunner()
         first_result = plan_runner.execute_native(first_cursor, first_plan)
         second_result = plan_runner.execute_native(second_cursor, second_plan)
@@ -962,6 +963,8 @@ def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
         worker_snapshot = ray_cxx._lookup_query_connection_snapshot(query_id)
         worker_setting_names = {setting["name"].lower() for setting in worker_snapshot["settings"]}
         assert worker_setting_names.isdisjoint(worker_local_setting_names)
+        worker_bootstrap_config_names = {name.lower() for name in worker_snapshot["bootstrap"]["config"]}
+        assert worker_bootstrap_config_names.isdisjoint(worker_local_setting_names)
         prepared_connection = ray_cxx._prepare_query_snapshot_connection(query_id)
         settings = dict(
             prepared_connection.execute(
@@ -980,8 +983,7 @@ def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
             f"{query_id}-identity",
         )
         identity_config = identity_plan.__getstate__()[3]["bootstrap"]["config"]
-        assert identity_config["extension_directory"] == str(coordinator_extension_directory)
-        assert identity_config["home_directory"] == str(coordinator_home_directory)
+        assert {name.lower() for name in identity_config}.isdisjoint(worker_local_setting_names)
     finally:
         ray_cxx._cleanup_query_python_replay_state(query_id)
         if prepared_connection is not None:
@@ -990,6 +992,84 @@ def test_worker_preparation_uses_worker_local_extension_locations(tmp_path):
 
     assert not coordinator_extension_directory.exists()
     assert not coordinator_home_directory.exists()
+
+
+def test_worker_snapshot_identity_ignores_worker_local_bootstrap_config(tmp_path):
+    from vane.runners.ray import worker as worker_module
+
+    ray_cxx = _require_ray_cxx()
+    source_connection = vane.connect()
+    planning_connection = vane.connect()
+    source_plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        source_connection.sql("SELECT 1"),
+        "snapshot-worker-local-identity-source",
+    ).to_physical_plan(planning_connection)
+    worker_local_setting_names = {
+        "extension_directory",
+        "extension_directories",
+        "home_directory",
+        "custom_extension_repository",
+        "autoinstall_extension_repository",
+        "threads",
+    }
+    query_ids = [
+        "snapshot-worker-local-identity-first",
+        "snapshot-worker-local-identity-second",
+    ]
+    local_configs = [
+        {
+            "extension_directory": str(tmp_path / "first-extensions"),
+            "extension_directories": [str(tmp_path / "first-secondary")],
+            "custom_extension_repository": "http://127.0.0.1:9/first",
+            "threads": "2",
+        },
+        {
+            "home_directory": str(tmp_path / "second-home"),
+            "autoinstall_extension_repository": "http://127.0.0.1:9/second",
+            "threads": "7",
+        },
+    ]
+    replay_plans = []
+    try:
+        for query_id, local_config in zip(query_ids, local_configs, strict=True):
+            state = list(source_plan.__getstate__())
+            snapshot = dict(state[6])
+            bootstrap = dict(
+                snapshot.get("bootstrap")
+                or {
+                    "database": ":memory:",
+                    "read_only": False,
+                    "config": {},
+                }
+            )
+            bootstrap["config"] = {**dict(bootstrap.get("config") or {}), **local_config}
+            snapshot["bootstrap"] = bootstrap
+            state[6] = snapshot
+            replay_plan = ray_cxx.DistributedPhysicalPlan.__new__(ray_cxx.DistributedPhysicalPlan)
+            replay_plan.__setstate__(tuple(state))
+            replay_plans.append(replay_plan)
+            assert ray_cxx._register_query_python_replay_state(query_id, replay_plan) is True
+
+        worker_snapshots = [ray_cxx._lookup_query_connection_snapshot(query_id) for query_id in query_ids]
+        for worker_snapshot in worker_snapshots:
+            worker_config_names = {name.lower() for name in worker_snapshot["bootstrap"]["config"]}
+            assert worker_config_names.isdisjoint(worker_local_setting_names)
+
+        identities = [
+            worker_module._query_worker_snapshot_database_identity(
+                query_id,
+                session_id="test-session",
+                effective_s3_config={},
+                use_session_credentials=True,
+            )
+            for query_id in query_ids
+        ]
+        assert identities[0] == identities[1]
+    finally:
+        for query_id in query_ids:
+            ray_cxx._cleanup_query_python_replay_state(query_id)
+        planning_connection.close()
+        source_connection.close()
 
 
 def test_pickled_physical_plan_replays_connection_snapshot_on_execute_native():

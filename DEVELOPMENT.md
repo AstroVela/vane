@@ -94,6 +94,12 @@ download artifacts, autoinstall, autoload, or enable unsigned loading.
 Coordinator extension/home directory and extension repository bootstrap
 settings are ignored on workers so verified caches stay node-local.
 
+The real-Ray CI gate signs DuckDB's `loadable_extension_demo` with the
+repository's existing mbedTLS test key and installs a test-only provider entry
+point. Its Python 3.12 wheel explicitly enables
+`VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; the option is off by default and must
+never be enabled for release artifacts.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test

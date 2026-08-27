@@ -10,6 +10,10 @@ string(REPLACE ";" "\;" EXT_DIR_ESCAPED "${EXTENSION_DIRECTORIES}")
 target_compile_definitions(
   duckdb_main_extension
   PRIVATE "DUCKDB_EXTENSION_DIRECTORIES=\"${EXT_DIR_ESCAPED}\"")
+if(VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY)
+  target_compile_definitions(duckdb_main_extension
+                             PRIVATE VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY)
+endif()
 
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_main_extension>

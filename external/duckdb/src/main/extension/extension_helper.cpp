@@ -418,6 +418,21 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 }
 
 static const char *const public_keys[] = {
+#ifdef VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY
+    // This public key matches test/mbedtls/private.pem and is intentionally
+    // available only in builds that opt into Vane's integration-test fixture.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4EX5LT9FCzmRj4HITMSA
+Lc6J8ImxZkGXF2ihx4sm2D/rusc+qnIC2na0/NiSssgTCUnL79Yp2uby5FOmr3xf
+zkcpu6Zv1vplnECfzpnzl7xiaUHleMZaCRddD5BjaoTOJjHxNSnLO3V8eUkp8nLc
+pm8XW8k18LVSGezgBHy4ExnRiVsG1JJ7W+QUdCHXs5Nn5b8SQR3TdhsyJhL6tlml
+Xynb/I+gAHGLiencTn4S7P8C5X5HS03Np1itaEp81S+yqSuxBCelGn1mNKE8R84/
+bRuiDHF1RWdl/S31XIAGPjWIOhsGwpFoJpIkHsMKUgl7YZVduupF4lzCVjLDbffb
+CwIDAQAB
+-----END PUBLIC KEY-----
+)",
+#endif
     R"(
 -----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6aZuHUa1cLR9YDDYaEfi

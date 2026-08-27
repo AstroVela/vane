@@ -132,6 +132,7 @@ jobs:
             flex \
             libtool \
             ninja-build \
+            openssl \
             pkg-config \
             tar \
             unzip \
@@ -172,10 +173,19 @@ jobs:
         if: matrix.python-version == '3.12'
         run: scripts/run_native_tests.sh
 
+      - name: Sign the real-Ray dynamic extension fixture
+        if: matrix.python-version == '3.12'
+        run: |
+          python scripts/sign_test_dynamic_extension.py \
+            --private-key external/duckdb/test/mbedtls/private.pem \
+            build/native-cxx20/test/extension/loadable_extension_demo.duckdb_extension \
+            dist/test-dynamic-extension/loadable_extension_demo.duckdb_extension
+
       - name: Build release artifacts
         env:
           SKBUILD_BUILD_DIR: ${{ github.workspace }}/build
           SKBUILD_CMAKE_BUILD_TYPE: Release
+          CMAKE_ARGS: -DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=${{ matrix.python-version == '3.12' && 'ON' || 'OFF' }}
         run: python -m build --sdist --wheel --no-isolation --outdir dist
 
       - name: Validate release artifacts
@@ -296,6 +306,9 @@ jobs:
       VANE_FAST_TEST_NON_RAY_SHARD_COUNT: ${{ matrix.shard_count }}
       VANE_FAST_TEST_NON_RAY_SHARD_INDEX: ${{ matrix.shard_index }}
       VANE_FAST_TEST_PROCESS_TIMEOUT_SECONDS: ${{ matrix.process_timeout }}
+      VANE_REQUIRE_SIGNED_DYNAMIC_EXTENSION_FIXTURE: "1"
+      VANE_TEST_SIGNED_DYNAMIC_EXTENSION_NAME: loadable_extension_demo
+      VANE_TEST_SIGNED_DYNAMIC_EXTENSION_PATH: ${{ github.workspace }}/dist/test-dynamic-extension/loadable_extension_demo.duckdb_extension
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -323,7 +336,8 @@ jobs:
       - name: Install the wheel and CPU test dependencies
         run: |
           python -m pip install --upgrade pip uv
-          uv pip install --system --group build --group test duckdb dist/*.whl
+          uv pip install --system --group build --group test duckdb \
+            tests/fixtures/dynamic_extension_provider dist/*.whl
           uv pip check
 
       - name: Verify the artifact-installed CPU environment

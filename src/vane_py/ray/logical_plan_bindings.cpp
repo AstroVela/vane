@@ -209,6 +209,17 @@ static bool IsWorkerLocalSetting(const string &lower_name) {
 	return IsWorkerResourceSetting(lower_name) || IsWorkerExtensionLocationSetting(lower_name);
 }
 
+static py::dict RemoveWorkerLocalBootstrapSettings(const py::dict &config) {
+	py::dict worker_config;
+	for (auto item : config) {
+		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
+		if (!IsWorkerLocalSetting(name)) {
+			worker_config[item.first] = item.second;
+		}
+	}
+	return worker_config;
+}
+
 static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets,
                                         bool remove_worker_local_settings = false) {
 	py::dict sanitized;
@@ -390,6 +401,15 @@ static py::object PrepareWorkerConnectionSnapshot(const py::object &snapshot_obj
 	// so forwarding executable ATTACH statements (and their options) to workers
 	// would cross an unnecessary credential and metadata boundary.
 	snapshot.attr("pop")(py::str("attached_databases"), py::none());
+	auto bootstrap_key = py::str("bootstrap");
+	if (snapshot.contains(bootstrap_key) && py::isinstance<py::dict>(snapshot[bootstrap_key])) {
+		auto bootstrap = CopyPyDict(snapshot[bootstrap_key].cast<py::dict>());
+		auto config_key = py::str("config");
+		if (bootstrap.contains(config_key) && py::isinstance<py::dict>(bootstrap[config_key])) {
+			bootstrap[config_key] = RemoveWorkerLocalBootstrapSettings(bootstrap[config_key].cast<py::dict>());
+		}
+		snapshot[bootstrap_key] = std::move(bootstrap);
+	}
 	auto settings_key = py::str("settings");
 	if (!snapshot.contains(settings_key) || !py::isinstance<py::list>(snapshot[settings_key])) {
 		return snapshot;
