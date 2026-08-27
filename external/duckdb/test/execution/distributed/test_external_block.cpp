@@ -3,6 +3,7 @@
 
 #include "catch.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/external_block.hpp"
 #include "duckdb/main/connection.hpp"
@@ -68,8 +69,25 @@ struct ExternalBlockBackendGuard {
 
 class TestExternalBlockBackend : public ExternalBlockBackendInterface {
 public:
+	static int GetSchema(ArrowArrayStream *, ArrowSchema *) {
+		return -1;
+	}
+	static int GetNext(ArrowArrayStream *, ArrowArray *array) {
+		array->release = nullptr;
+		return 0;
+	}
+	static void Release(ArrowArrayStream *stream) {
+		stream->release = nullptr;
+	}
+	static const char *GetLastError(ArrowArrayStream *) {
+		return "test Arrow stream error";
+	}
+
 	bool CanMaterialize(const ExternalBlockDescriptor &desc) override {
 		return desc.object_ref != nullptr;
+	}
+	bool CanExportArrow(const ExternalBlockDescriptor &desc) override {
+		return arrow_export_enabled && desc.object_ref != nullptr;
 	}
 
 	unique_ptr<DataChunk> Materialize(ClientContext &context, const LazyDataChunk &chunk) override {
@@ -87,7 +105,23 @@ public:
 		return result;
 	}
 
+	unique_ptr<ArrowArrayStreamWrapper> ExportArrow(ClientContext &, const LazyDataChunk &) override {
+		arrow_export_calls++;
+		auto result = make_uniq<ArrowArrayStreamWrapper>();
+		if (!valid_arrow_stream) {
+			return result;
+		}
+		result->arrow_array_stream.get_schema = GetSchema;
+		result->arrow_array_stream.get_next = GetNext;
+		result->arrow_array_stream.get_last_error = GetLastError;
+		result->arrow_array_stream.release = Release;
+		return result;
+	}
+
 	idx_t materialize_calls = 0;
+	idx_t arrow_export_calls = 0;
+	bool arrow_export_enabled = true;
+	bool valid_arrow_stream = true;
 };
 
 } // namespace
@@ -343,4 +377,46 @@ TEST_CASE("MaterializeExternalBlockBarrier reports standard barrier stats", "[ex
 	REQUIRE(barrier.stats.rows == 8);
 	REQUIRE(barrier.stats.estimated_bytes == 80);
 	REQUIRE(backend_raw->materialize_calls == 1);
+}
+
+TEST_CASE("ExportExternalBlockArrow dispatches without materializing", "[execution][external_block]") {
+	ExternalBlockBackendGuard guard;
+	auto backend = make_shared_ptr<TestExternalBlockBackend>();
+	auto backend_raw = backend.get();
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto chunk = MakeLazyChunk({MakeDescriptor(128, 1280, 16, 20)});
+
+	auto stream = ExportExternalBlockArrow(*con.context, *chunk);
+	REQUIRE(stream);
+	REQUIRE(backend_raw->arrow_export_calls == 1);
+	REQUIRE(backend_raw->materialize_calls == 0);
+}
+
+TEST_CASE("ExportExternalBlockArrow rejects descriptors without Arrow support", "[execution][external_block]") {
+	ExternalBlockBackendGuard guard;
+	auto backend = make_shared_ptr<TestExternalBlockBackend>();
+	backend->arrow_export_enabled = false;
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto chunk = MakeLazyChunk({MakeDescriptor(8, 80)});
+
+	REQUIRE_THROWS_AS(ExportExternalBlockArrow(*con.context, *chunk), InvalidInputException);
+}
+
+TEST_CASE("ExportExternalBlockArrow rejects an invalid stream", "[execution][external_block]") {
+	ExternalBlockBackendGuard guard;
+	auto backend = make_shared_ptr<TestExternalBlockBackend>();
+	backend->valid_arrow_stream = false;
+	SetExternalBlockBackend(ExternalBlockBackend::RAY_OBJECT_STORE, backend);
+
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto chunk = MakeLazyChunk({MakeDescriptor(8, 80)});
+
+	REQUIRE_THROWS_AS(ExportExternalBlockArrow(*con.context, *chunk), InvalidInputException);
 }

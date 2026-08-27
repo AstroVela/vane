@@ -33,6 +33,7 @@ class FileSystem;
 class FileOpener;
 class ParquetEncryptionConfig;
 class ParquetStatsAccumulator;
+struct ParquetWriteArrowLocalState;
 
 class Serializer;
 class Deserializer;
@@ -81,12 +82,14 @@ private:
 struct ParquetWriteLocalState : public LocalFunctionData {
 public:
 	explicit ParquetWriteLocalState(ClientContext &context, const vector<LogicalType> &types);
+	~ParquetWriteLocalState() override;
 
 public:
 	ColumnDataCollection buffer;
 	ColumnDataAppendState append_state;
 	//! If any of the column writers require a transformation to a different shape, this will be initialized and used
 	unique_ptr<ParquetWriteTransformData> transform_data;
+	unique_ptr<ParquetWriteArrowLocalState> arrow_state;
 };
 
 struct ParquetWriteGlobalState : public GlobalFunctionData {

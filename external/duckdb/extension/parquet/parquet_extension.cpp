@@ -40,8 +40,10 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/pragma_function.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -139,11 +141,18 @@ void ParquetWriteGlobalState::LogFlushingRowGroup(const ColumnDataCollection &bu
 	            {"reason", reason}});
 }
 
+struct ParquetWriteArrowLocalState {
+	ArrowTableSchema table;
+	bool requires_cast = false;
+};
+
 ParquetWriteLocalState::ParquetWriteLocalState(ClientContext &context, const vector<LogicalType> &types)
     : buffer(context, types) {
 	buffer.SetPartitionIndex(0); // Makes the buffer manager less likely to spill this data
 	buffer.InitializeAppend(append_state);
 }
+
+ParquetWriteLocalState::~ParquetWriteLocalState() = default;
 
 static void ParquetListCopyOptions(ClientContext &context, CopyOptionsInput &input) {
 	auto &copy_options = input.options;
@@ -416,6 +425,70 @@ static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_
 		local_state.append_state.current_chunk_state.handles.clear();
 		global_state.writer->Flush(local_state.buffer, local_state.transform_data);
 		local_state.buffer.InitializeAppend(local_state.append_state);
+	}
+}
+
+static void ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
+                                  LocalFunctionData &lstate, CopyFunctionArrowInput &input) {
+	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
+	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
+	if (input.types != bind_data.sql_types) {
+		throw InvalidInputException("Arrow Parquet input types do not match the bound COPY schema");
+	}
+
+	if (input.new_stream) {
+		local_state.arrow_state = make_uniq<ParquetWriteArrowLocalState>();
+		auto &arrow_state = *local_state.arrow_state;
+		ArrowTableFunction::PopulateArrowTableSchema(context.client, arrow_state.table, input.schema);
+		auto &arrow_types = arrow_state.table.GetTypes();
+		if (arrow_types.size() != input.types.size()) {
+			throw InvalidInputException("Arrow Parquet input has %d columns but COPY expects %d", arrow_types.size(),
+			                            input.types.size());
+		}
+		for (idx_t column_idx = 0; column_idx < arrow_types.size(); column_idx++) {
+			if (arrow_types[column_idx] != input.types[column_idx]) {
+				arrow_state.requires_cast = true;
+				break;
+			}
+		}
+	}
+	if (!local_state.arrow_state) {
+		throw InternalException("Arrow Parquet sink received a record batch without stream state");
+	}
+	auto &arrow_state = *local_state.arrow_state;
+	auto &arrow_types = arrow_state.table.GetTypes();
+
+	if (!input.array || !input.array->arrow_array.release) {
+		throw InvalidInputException("Arrow Parquet input has no record batch");
+	}
+	if (input.array->arrow_array.n_children != NumericCast<int64_t>(input.types.size())) {
+		throw InvalidInputException("Arrow Parquet array has %d columns but COPY expects %d",
+		                            input.array->arrow_array.n_children, input.types.size());
+	}
+	auto array_rows = NumericCast<idx_t>(input.array->arrow_array.length);
+	if (input.offset > array_rows || input.cardinality > array_rows - input.offset) {
+		throw InvalidInputException("Arrow Parquet input slice exceeds its record batch");
+	}
+
+	ArrowScanLocalState scan_state(make_uniq<ArrowArrayWrapper>(), context.client);
+	scan_state.chunk = input.array;
+	scan_state.chunk_offset = input.offset;
+	DataChunk arrow_chunk;
+	arrow_chunk.Initialize(context.client, arrow_types);
+	arrow_chunk.SetCardinality(input.cardinality);
+	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_state.table.GetColumns(), arrow_chunk);
+
+	if (!arrow_state.requires_cast) {
+		ParquetWriteSink(context, bind_data_p, gstate, lstate, arrow_chunk);
+	} else {
+		DataChunk cast_chunk;
+		cast_chunk.Initialize(context.client, input.types);
+		cast_chunk.SetCardinality(input.cardinality);
+		for (idx_t column_idx = 0; column_idx < arrow_chunk.ColumnCount(); column_idx++) {
+			VectorOperations::Cast(context.client, arrow_chunk.data[column_idx], cast_chunk.data[column_idx],
+			                       input.cardinality);
+		}
+		ParquetWriteSink(context, bind_data_p, gstate, lstate, cast_chunk);
 	}
 }
 
@@ -920,6 +993,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.copy_to_initialize_local = ParquetWriteInitializeLocal;
 	function.copy_to_get_written_statistics = ParquetWriteGetWrittenStatistics;
 	function.copy_to_sink = ParquetWriteSink;
+	function.copy_to_sink_arrow = ParquetWriteArrowSink;
 	function.copy_to_combine = ParquetWriteCombine;
 	function.copy_to_finalize = ParquetWriteFinalize;
 	function.execution_mode = ParquetWriteExecutionMode;

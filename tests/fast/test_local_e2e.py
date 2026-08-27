@@ -61,6 +61,38 @@ def test_local_runner_write_parquet_e2e(local_runner, tmp_path, monkeypatch):
     assert rows == (80, 3960, 0, 4)
 
 
+def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    from vane import _native
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        return pa.table({"y": [value * 3 for value in values], "label": [f"row-{value % 7}" for value in values]})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "lazy_udf_arrow_copy.parquet"
+    con = vane.connect()
+    try:
+        _native._reset_udf_executor_debug_counters()
+        relation = con.sql("select i::BIGINT as x from range(4097) t(i)").map_batches(
+            transform,
+            schema={"y": vane.sqltypes.BIGINT, "label": vane.sqltypes.VARCHAR},
+            execution_backend="subprocess_task",
+            batch_size=4097,
+            output_batch_size=4097,
+        )
+        relation.write_parquet(str(output), row_group_size=2048)
+        rows = con.sql(f"select count(*), sum(y), count(distinct label) from read_parquet('{output}')").fetchone()
+        counters = dict(_native._udf_executor_debug_counters())
+    finally:
+        con.close()
+
+    assert rows == (4097, 25171968, 7)
+    assert counters["udf_external_arrow_stream_export_count"] >= 1
+    assert counters["udf_direct_arrow_table_conversion_count"] == 0
+    assert counters["udf_python_export_under_client_context_lock_count"] == 0
+
+
 def test_local_runner_direct_target_per_thread_output_allows_sequential_partitions(tmp_path, monkeypatch):
     monkeypatch.delenv("VANE_DISTRIBUTED_COPY_LOCAL_STAGING", raising=False)
     _teardown_runner_if_supported()

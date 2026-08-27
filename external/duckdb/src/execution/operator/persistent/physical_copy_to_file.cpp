@@ -6,6 +6,7 @@
 
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/hive_partitioning.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/execution/external_block.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/main/settings.hpp"
 
@@ -593,7 +595,61 @@ void PhysicalCopyToFile::WriteRotateInternal(ExecutionContext &context, GlobalSi
 	}
 }
 
-SinkResultType PhysicalCopyToFile::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+namespace {
+
+class DataChunkCopyInput {
+public:
+	explicit DataChunkCopyInput(DataChunk &chunk_p) : chunk(chunk_p) {
+	}
+
+	idx_t Count() const {
+		return chunk.size();
+	}
+
+	void Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
+	           LocalFunctionData &lstate) {
+		op.function.copy_to_sink(context, *op.bind_data, gstate, lstate, chunk);
+	}
+
+	void AppendToPartition(ExecutionContext &context, const PhysicalCopyToFile &op, CopyToFunctionGlobalState &gstate,
+	                       CopyToFunctionLocalState &lstate) {
+		lstate.AppendToPartition(context, op, gstate, chunk);
+	}
+
+private:
+	DataChunk &chunk;
+};
+
+class ArrowCopyInput {
+public:
+	ArrowCopyInput(const ArrowSchema &schema, shared_ptr<ArrowArrayWrapper> array, const LazyDataChunk &chunk,
+	               idx_t offset, idx_t cardinality, bool new_stream)
+	    : input(schema, std::move(array), chunk.logical_types, chunk.names, offset, cardinality, new_stream) {
+	}
+
+	idx_t Count() const {
+		return input.cardinality;
+	}
+
+	void Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
+	           LocalFunctionData &lstate) {
+		op.function.copy_to_sink_arrow(context, *op.bind_data, gstate, lstate, input);
+	}
+
+	void AppendToPartition(ExecutionContext &, const PhysicalCopyToFile &, CopyToFunctionGlobalState &,
+	                       CopyToFunctionLocalState &) {
+		throw NotImplementedException("Arrow COPY input does not support PARTITION_BY");
+	}
+
+private:
+	CopyFunctionArrowInput input;
+};
+
+} // namespace
+
+template <class INPUT>
+SinkResultType PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT &copy_input,
+                                                OperatorSinkInput &input) const {
 	auto &g = input.global_state.Cast<CopyToFunctionGlobalState>();
 	auto &l = input.local_state.Cast<CopyToFunctionLocalState>();
 
@@ -601,10 +657,10 @@ SinkResultType PhysicalCopyToFile::Sink(ExecutionContext &context, DataChunk &ch
 		// if we are only writing the file when there are rows to write we need to initialize here
 		g.Initialize(context.client, *this);
 	}
-	l.total_rows_copied += chunk.size();
+	l.total_rows_copied += copy_input.Count();
 
 	if (partition_output) {
-		l.AppendToPartition(context, *this, g, chunk);
+		copy_input.AppendToPartition(context, *this, g, l);
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
@@ -619,19 +675,97 @@ SinkResultType PhysicalCopyToFile::Sink(ExecutionContext &context, DataChunk &ch
 			auto global_lock = g.lock.GetExclusiveLock();
 			gstate = CreateFileState(context.client, *sink_state, *global_lock);
 		}
-		function.copy_to_sink(context, *bind_data, *gstate, *l.local_state, chunk);
+		copy_input.Write(context, *this, *gstate, *l.local_state);
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
 	if (!file_size_bytes.IsValid() && !rotate) {
-		function.copy_to_sink(context, *bind_data, *g.global_state, *l.local_state, chunk);
+		copy_input.Write(context, *this, *g.global_state, *l.local_state);
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
-	WriteRotateInternal(context, input.global_state, [&](GlobalFunctionData &gstate) {
-		function.copy_to_sink(context, *bind_data, gstate, *l.local_state, chunk);
-	});
+	WriteRotateInternal(context, input.global_state,
+	                    [&](GlobalFunctionData &gstate) { copy_input.Write(context, *this, gstate, *l.local_state); });
 
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkResultType PhysicalCopyToFile::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+	DataChunkCopyInput copy_input(chunk);
+	return SinkInternal(context, copy_input, input);
+}
+
+SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, ExecutionBatch &batch,
+                                             OperatorSinkInput &input) const {
+	if (batch.kind == ExecutionBatchKind::MATERIALIZED_CHUNK) {
+		if (!batch.materialized || batch.materialized->size() == 0) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		return Sink(context, *batch.materialized, input);
+	}
+	if (batch.kind != ExecutionBatchKind::LAZY_DATA_CHUNK) {
+		throw InvalidInputException("COPY SinkBatch received unsupported input batch kind");
+	}
+	if (!batch.lazy) {
+		if (batch.rows != 0) {
+			throw InternalException("lazy COPY input has rows but no payload");
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	batch.lazy->RecomputeCardinality();
+	if (batch.lazy->Empty()) {
+		batch = ExecutionBatch();
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+	if (!function.copy_to_sink_arrow) {
+		throw NotImplementedException("COPY format '%s' does not support Arrow input", function.name);
+	}
+	if (partition_output) {
+		throw NotImplementedException("Arrow COPY input does not support PARTITION_BY");
+	}
+	if (batch.lazy->wrap_columns_as_struct) {
+		throw InvalidInputException("Arrow COPY input requires projected columns instead of a wrapped STRUCT");
+	}
+	if (batch.lazy->logical_types != expected_types) {
+		throw InvalidInputException("Arrow COPY input types do not match the bound COPY schema");
+	}
+
+	auto stream = ExportExternalBlockArrow(context.client, *batch.lazy);
+	ArrowSchemaWrapper schema;
+	stream->GetSchema(schema);
+
+	idx_t rows_written = 0;
+	bool first_slice = true;
+	while (true) {
+		auto array = stream->GetNextChunk();
+		if (!array->arrow_array.release) {
+			break;
+		}
+		if (array->arrow_array.length < 0) {
+			throw InvalidInputException("Arrow COPY input has a negative array length");
+		}
+		auto array_rows = NumericCast<idx_t>(array->arrow_array.length);
+		if (rows_written > batch.lazy->cardinality || array_rows > batch.lazy->cardinality - rows_written) {
+			throw InvalidInputException("Arrow COPY input exceeds lazy metadata row count %d", batch.lazy->cardinality);
+		}
+		if (array_rows == 0) {
+			continue;
+		}
+
+		for (idx_t offset = 0; offset < array_rows; offset += STANDARD_VECTOR_SIZE) {
+			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, array_rows - offset);
+			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice);
+			SinkInternal(context, copy_input, input);
+			first_slice = false;
+		}
+		rows_written += array_rows;
+	}
+	if (rows_written != batch.lazy->cardinality) {
+		throw InvalidInputException("Arrow COPY input row count %d does not match lazy metadata row count %d",
+		                            rows_written, batch.lazy->cardinality);
+	}
+	batch = ExecutionBatch();
 	return SinkResultType::NEED_MORE_INPUT;
 }
 

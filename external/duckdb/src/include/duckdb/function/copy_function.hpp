@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
@@ -18,6 +19,7 @@ namespace duckdb {
 
 struct BoundStatement;
 struct CopyFunctionFileStatistics;
+class ArrowArrayWrapper;
 class Binder;
 class ColumnDataCollection;
 class ExecutionContext;
@@ -123,6 +125,23 @@ struct CopyOptionsInput {
 	case_insensitive_map_t<CopyOption> &options;
 };
 
+struct CopyFunctionArrowInput {
+	CopyFunctionArrowInput(const ArrowSchema &schema_p, shared_ptr<ArrowArrayWrapper> array_p,
+	                       const vector<LogicalType> &types_p, const vector<string> &names_p, idx_t offset_p,
+	                       idx_t cardinality_p, bool new_stream_p)
+	    : schema(schema_p), array(std::move(array_p)), types(types_p), names(names_p), offset(offset_p),
+	      cardinality(cardinality_p), new_stream(new_stream_p) {
+	}
+
+	const ArrowSchema &schema;
+	shared_ptr<ArrowArrayWrapper> array;
+	const vector<LogicalType> &types;
+	const vector<string> &names;
+	idx_t offset;
+	idx_t cardinality;
+	bool new_stream;
+};
+
 enum class CopyFunctionExecutionMode { REGULAR_COPY_TO_FILE, PARALLEL_COPY_TO_FILE, BATCH_COPY_TO_FILE };
 
 typedef BoundStatement (*copy_to_plan_t)(Binder &binder, CopyStatement &stmt);
@@ -134,6 +153,8 @@ typedef unique_ptr<GlobalFunctionData> (*copy_to_initialize_global_t)(ClientCont
                                                                       const string &file_path);
 typedef void (*copy_to_sink_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                LocalFunctionData &lstate, DataChunk &input);
+typedef void (*copy_to_sink_arrow_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                                     LocalFunctionData &lstate, CopyFunctionArrowInput &input);
 typedef void (*copy_to_combine_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                   LocalFunctionData &lstate);
 typedef void (*copy_to_finalize_t)(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate);
@@ -196,6 +217,7 @@ public:
 	copy_to_initialize_global_t copy_to_initialize_global;
 	copy_to_get_written_statistics_t copy_to_get_written_statistics;
 	copy_to_sink_t copy_to_sink;
+	copy_to_sink_arrow_t copy_to_sink_arrow;
 	copy_to_combine_t copy_to_combine;
 	copy_to_finalize_t copy_to_finalize;
 	copy_to_execution_mode_t execution_mode;
