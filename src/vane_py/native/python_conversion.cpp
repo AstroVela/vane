@@ -656,7 +656,8 @@ struct PythonValueConversion {
 			element_type = LogicalType::ForceMaxLogicalType(element_type, new_value.type());
 			values.push_back(std::move(new_value));
 		}
-		if (child_type.id() != LogicalTypeId::UNKNOWN) {
+		// Preserve a declared type when no concrete child type was inferred without overriding inferred nesting.
+		if (element_type.id() == LogicalTypeId::SQLNULL && child_type.id() != LogicalTypeId::UNKNOWN) {
 			element_type = child_type;
 		}
 		if (is_array) {
