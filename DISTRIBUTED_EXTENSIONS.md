@@ -119,7 +119,9 @@ another route makes snapshot capture fail closed.
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
 already-verified extension state and does not require a provider entry point on
-the driver after an explicit artifact load.
+the driver after an explicit artifact load. This coordinator path is
+verification-only and does not apply worker security settings to the user's
+DatabaseInstance.
 
 Fragment registration prepares an isolated worker DatabaseInstance before any
 task can deserialize the plan. Immediately before native admission, the worker

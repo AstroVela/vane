@@ -4073,15 +4073,21 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	}
 
 	const bool has_dynamic_extensions = SnapshotHasDynamicExtensions(plan.connection_snapshot_);
+	const bool has_bound_execution_connection = !plan.worker_connection_.is_none();
 	py::object exec_conn = has_dynamic_extensions ? plan.resolve_execution_connection(conn_obj)
 	                                              : ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
 	if (has_dynamic_extensions) {
-		// Coordinator-created fragment plans retain the resolver-owned planning
-		// DatabaseInstance for progress deserialization. This verifies the exact
-		// recorded manifest without requiring an installed driver provider merely
-		// to inspect topology. A transported plan with no retained connection still
-		// uses the strict local provider and native LOAD preparation path.
-		PrepareConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_);
+		if (has_bound_execution_connection) {
+			// A bound physical plan already owns either the resolver-loaded
+			// coordinator DatabaseInstance or a prepared worker DatabaseInstance.
+			// Topology inspection is verification-only: worker hardening must not
+			// mutate database-global settings on the user's coordinator connection.
+			ValidateConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_, false);
+		} else {
+			// A transported plan has no process-local extension state. Prepare its
+			// isolated DatabaseInstance through the strict worker provider path.
+			PrepareConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_);
+		}
 	}
 	PyPhysicalPlanWrapper topology_plan;
 	topology_plan.query_id_ = plan.idx();

@@ -143,12 +143,25 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
     from vane.runners.ray.worker import RayWorkerActor
 
     provider, artifact = _configured_signed_provider()
-    connection = vane.connect()
+    connection = vane.connect(
+        config={
+            "allow_unsigned_extensions": "true",
+            "autoinstall_known_extensions": "true",
+            "autoload_known_extensions": "true",
+        }
+    )
     resolver = DynamicExtensionResolver(
         trusted_identities={provider.trust_identity},
         providers=(provider,),
     )
     resolver.load(connection, artifact.descriptor)
+    extension_security_settings = """
+        SELECT
+            CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
+            CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
+            CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
+    """
+    assert connection.execute(extension_security_settings).fetchone() == (True, True, True)
     monkeypatch.setattr(
         extension_module,
         "entry_points",
@@ -165,6 +178,8 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
             result = pa.concat_tables([part.to_arrow() if hasattr(part, "to_arrow") else part for part in parts])
             assert result.column(0).to_pylist() == [11]
             assert result.column(1).to_pylist() == [query_id]
+
+        assert connection.execute(extension_security_settings).fetchone() == (True, True, True)
 
         admission_query_id = "real-ray-dynamic-extension-admission-retry"
         admission_plan = _physical_plan_with_dynamic_manifest(
