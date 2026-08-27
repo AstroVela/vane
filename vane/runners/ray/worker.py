@@ -1303,7 +1303,7 @@ class RayWorkerActor:
                         await _await_future_with_owned_side_effects(preparation_task),
                     )
                 except asyncio.CancelledError as cancellation:
-                    preparation = cast(QuerySnapshotPreparation, preparation_task.result())
+                    preparation = preparation_task.result()
                     self._rollback_query_snapshot_preparation(preparation, cancellation)
                     raise
 
@@ -1316,12 +1316,12 @@ class RayWorkerActor:
                                 "fragment registration was dropped during worker snapshot preparation: "
                                 f"fragment={fragment_id} query={query_id}"
                             )
-                        owner_query_id = self._fragment_query_ids.get(fragment_id)
-                        if owner_query_id is not None:
-                            if owner_query_id != query_id:
+                        published_owner_query_id = self._fragment_query_ids.get(fragment_id)
+                        if published_owner_query_id is not None:
+                            if published_owner_query_id != query_id:
                                 raise RuntimeError(
                                     "fragment registration query ownership changed during worker snapshot preparation: "
-                                    f"fragment={fragment_id} owner={owner_query_id} requested={query_id}"
+                                    f"fragment={fragment_id} owner={published_owner_query_id} requested={query_id}"
                                 )
                             existing += 1
                         else:

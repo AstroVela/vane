@@ -56,9 +56,7 @@ def sign_test_extension(source: Path, destination: Path, private_key: Path) -> N
         signature = signature_path.read_bytes()
 
     if len(signature) != _DUCKDB_SIGNATURE_SIZE:
-        raise ValueError(
-            f"test signing key produced {len(signature)} bytes; expected {_DUCKDB_SIGNATURE_SIZE}"
-        )
+        raise ValueError(f"test signing key produced {len(signature)} bytes; expected {_DUCKDB_SIGNATURE_SIZE}")
     with tempfile.NamedTemporaryFile(
         dir=destination.parent,
         prefix=f".{destination.name}.",
