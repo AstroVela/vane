@@ -74,6 +74,9 @@ string PythonFilesystem::DecodeFlags(FileOpenFlags flags) {
 
 unique_ptr<FileHandle> PythonFilesystem::OpenFile(const string &path, FileOpenFlags flags,
                                                   optional_ptr<FileOpener> opener) {
+	if (flags.OpenNonBlocking()) {
+		throw NotImplementedException("Nonblocking opens are not supported by registered Python filesystems");
+	}
 	PythonGILWrapper gil;
 
 	if (flags.Compression() != FileCompressionType::UNCOMPRESSED) {

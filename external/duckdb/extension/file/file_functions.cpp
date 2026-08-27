@@ -9,40 +9,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "file_functions.hpp"
+#include "file_value.hpp"
 
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
 namespace duckdb {
 
 namespace {
-
-static void ValidateFileFields(bool url_is_valid, bool position_is_valid, int64_t position, bool size_is_valid,
-                               int64_t size, const string *checksum) {
-	if (!url_is_valid) {
-		throw InvalidInputException("file() url cannot be NULL");
-	}
-	if (position_is_valid != size_is_valid) {
-		throw InvalidInputException("file() position and size must either both be NULL or both be non-NULL");
-	}
-	if (position_is_valid) {
-		if (position < 0 || size < 0) {
-			throw InvalidInputException("file() position and size must be non-negative");
-		}
-		if (position > NumericLimits<int64_t>::Maximum() - size) {
-			throw InvalidInputException("file() byte range exceeds BIGINT");
-		}
-	}
-	if (checksum) {
-		auto separator = checksum->find(':');
-		if (separator == string::npos || separator == 0 || separator + 1 == checksum->size() ||
-		    checksum->find(':', separator + 1) != string::npos) {
-			throw InvalidInputException("file() checksum must have the form <algorithm>:<digest>");
-		}
-	}
-}
 
 static void ValidateFileArguments(DataChunk &args) {
 	UnifiedVectorFormat url_data;
@@ -57,15 +31,22 @@ static void ValidateFileArguments(DataChunk &args) {
 	auto positions = UnifiedVectorFormat::GetData<int64_t>(position_data);
 	auto sizes = UnifiedVectorFormat::GetData<int64_t>(size_data);
 	auto checksums = UnifiedVectorFormat::GetData<string_t>(checksum_data);
+	auto urls = UnifiedVectorFormat::GetData<string_t>(url_data);
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto url_index = url_data.sel->get_index(row);
 		auto position_index = position_data.sel->get_index(row);
 		auto size_index = size_data.sel->get_index(row);
 		auto checksum_index = checksum_data.sel->get_index(row);
-		auto position_is_valid = position_data.validity.RowIsValid(position_index);
-		auto size_is_valid = size_data.validity.RowIsValid(size_index);
-		auto position = position_is_valid ? positions[position_index] : 0;
-		auto size = size_is_valid ? sizes[size_index] : 0;
+		auto has_position = position_data.validity.RowIsValid(position_index);
+		auto has_size = size_data.validity.RowIsValid(size_index);
+		auto position = has_position ? positions[position_index] : 0;
+		auto size = has_size ? sizes[size_index] : 0;
+		string url;
+		const string *url_ptr = nullptr;
+		if (url_data.validity.RowIsValid(url_index)) {
+			url = urls[url_index].GetString();
+			url_ptr = &url;
+		}
 
 		string checksum;
 		const string *checksum_ptr = nullptr;
@@ -73,8 +54,7 @@ static void ValidateFileArguments(DataChunk &args) {
 			checksum = checksums[checksum_index].GetString();
 			checksum_ptr = &checksum;
 		}
-		ValidateFileFields(url_data.validity.RowIsValid(url_index), position_is_valid, position, size_is_valid, size,
-		                   checksum_ptr);
+		FileReference::ValidateFields(url_ptr, has_position, position, has_size, size, checksum_ptr, "file");
 	}
 }
 

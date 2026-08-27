@@ -38,6 +38,8 @@
 #include <duckdb/execution/distributed/pipeline_node/vllm.hpp>
 #include <duckdb/execution/distributed/utils/channel.hpp>
 #include <duckdb/planner/planner.hpp>
+#include <duckdb/planner/logical_operator_visitor.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/limits.hpp>
 #include <duckdb/common/local_file_system.hpp>

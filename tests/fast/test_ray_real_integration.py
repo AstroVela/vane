@@ -35,6 +35,38 @@ def _collect_rows_from_parts(parts):
 
 @pytest.mark.skipif(ray is None, reason="ray not installed")
 @pytest.mark.usefixtures("ray_local")
+def test_default_ray_rejects_file_io_for_driver_only_path(monkeypatch, tmp_path):
+    import fcntl
+    import os
+
+    payload = b"driver-only-payload"
+    payload_path = tmp_path / "driver-only.bin"
+    payload_path.write_bytes(payload)
+
+    connection = vane.connect()
+    try:
+        with payload_path.open("rb") as source:
+            descriptor = fcntl.fcntl(source.fileno(), fcntl.F_DUPFD_CLOEXEC, 512)
+            try:
+                driver_path = f"/proc/self/fd/{descriptor}"
+                assert connection.execute(f"SELECT file_size(try_to_file('{driver_path}'))").fetchone() == (
+                    len(payload),
+                )
+
+                monkeypatch.delenv("VANE_RUNNER", raising=False)
+                vane.teardown_runner()
+                relation = connection.sql(f"SELECT file_size(try_to_file('{driver_path}')) FROM range(2)")
+
+                with pytest.raises(ValueError, match="storage-facing FILE function"):
+                    relation.fetchall()
+            finally:
+                os.close(descriptor)
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(ray is None, reason="ray not installed")
+@pytest.mark.usefixtures("ray_local")
 def test_run_simple_plan_on_ray_local():
     from vane import runners as _runners
 

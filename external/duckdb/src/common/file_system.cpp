@@ -62,6 +62,7 @@ constexpr FileOpenFlags FileFlags::FILE_FLAGS_NULL_IF_EXISTS;
 constexpr FileOpenFlags FileFlags::FILE_FLAGS_MULTI_CLIENT_ACCESS;
 constexpr FileOpenFlags FileFlags::FILE_FLAGS_DISABLE_LOGGING;
 constexpr FileOpenFlags FileFlags::FILE_FLAGS_ENABLE_EXTENSION_INSTALL;
+constexpr FileOpenFlags FileFlags::FILE_FLAGS_NONBLOCKING;
 
 void FileOpenFlags::Verify() {
 #ifdef DEBUG

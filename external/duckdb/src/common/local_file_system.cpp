@@ -13,6 +13,7 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <sys/stat.h>
@@ -356,6 +357,9 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 #else
 		open_flags |= O_DIRECT;
 #endif
+	}
+	if (flags.OpenNonBlocking()) {
+		open_flags |= O_NONBLOCK;
 	}
 
 	// Determine permissions
@@ -866,6 +870,24 @@ std::string LocalFileSystem::GetLastErrorAsString() {
 	return message;
 }
 
+static bool IsWindowsNotFoundError(DWORD error_code) {
+	return error_code == ERROR_FILE_NOT_FOUND || error_code == ERROR_PATH_NOT_FOUND ||
+	       error_code == ERROR_INVALID_DRIVE;
+}
+
+static unordered_map<string, string> WindowsErrorInfo(DWORD error_code) {
+	unordered_map<string, string> result;
+	result["windows_error"] = std::to_string(error_code);
+	if (IsWindowsNotFoundError(error_code)) {
+		result["errno"] = std::to_string(ENOENT);
+	} else if (error_code == ERROR_DIRECTORY) {
+		result["errno"] = std::to_string(ENOTDIR);
+	} else if (error_code == ERROR_ACCESS_DENIED) {
+		result["errno"] = std::to_string(EACCES);
+	}
+	return result;
+}
+
 static timestamp_t FiletimeToTimeStamp(FILETIME file_time) {
 	// https://stackoverflow.com/questions/29266743/what-is-dwlowdatetime-and-dwhighdatetime
 	ULARGE_INTEGER ul;
@@ -1076,19 +1098,26 @@ unique_ptr<FileHandle> LocalFileSystem::OpenFile(const string &path_p, FileOpenF
 	if (flags.DirectIO()) {
 		flags_and_attributes |= FILE_FLAG_NO_BUFFERING;
 	}
+	if (flags.OpenNonBlocking()) {
+		// This also lets the caller open a directory and reject it from the resulting handle type.
+		flags_and_attributes |= FILE_FLAG_BACKUP_SEMANTICS;
+	}
 	HANDLE hFile = CreateFileW(unicode_path.c_str(), desired_access, share_mode, NULL, creation_disposition,
 	                           flags_and_attributes, NULL);
 	if (hFile == INVALID_HANDLE_VALUE) {
-		if (flags.ReturnNullIfNotExists() && GetLastError() == ERROR_FILE_NOT_FOUND) {
+		auto error_code = GetLastError();
+		if (flags.ReturnNullIfNotExists() && IsWindowsNotFoundError(error_code)) {
 			return nullptr;
 		}
+		SetLastError(error_code);
 		auto error = LocalFileSystem::GetLastErrorAsString();
 
 		auto extended_error = AdditionalLockInfo(unicode_path);
 		if (!extended_error.empty()) {
 			extended_error = "\n" + extended_error;
 		}
-		throw IOException("Cannot open file \"%s\": %s%s", path.c_str(), error, extended_error);
+		throw IOException(WindowsErrorInfo(error_code), "Cannot open file \"%s\": %s%s", path.c_str(), error,
+		                  extended_error);
 	}
 	auto handle = make_uniq<WindowsFileHandle>(*this, path.c_str(), hFile, flags);
 	if (flags.OpenForAppending()) {

@@ -10,6 +10,7 @@
 #include "test_helpers.hpp"
 #if (!defined(_WIN32) && !defined(WIN32))
 #define TEST_HAVE_SYMLINK
+#include <sys/stat.h>
 #include <unistd.h>
 #else
 #include "duckdb/common/windows.hpp"
@@ -192,6 +193,31 @@ TEST_CASE("Test file operations", "[file_system]") {
 	handle.reset();
 	fs->RemoveFile(fname);
 }
+
+#if !defined(_WIN32) && !defined(WIN32)
+TEST_CASE("Nonblocking local opens do not wait for FIFO peers", "[file_system]") {
+	auto fs = FileSystem::CreateLocal();
+	auto fifo_path = TestCreatePath("nonblocking_open_fifo");
+	if (fs->IsPipe(fifo_path)) {
+		fs->RemoveFile(fifo_path);
+	}
+	REQUIRE(mkfifo(fifo_path.c_str(), 0600) == 0);
+
+	auto handle = fs->OpenFile(fifo_path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NONBLOCKING);
+	REQUIRE(handle);
+	REQUIRE(fs->GetFileType(*handle) == FileType::FILE_TYPE_FIFO);
+	handle.reset();
+
+	auto virtual_fs = make_uniq<VirtualFileSystem>(FileSystem::CreateLocal());
+	auto wrapped_handle =
+	    virtual_fs->OpenFile(fifo_path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NONBLOCKING |
+	                                        FileFlags::FILE_FLAGS_PARALLEL_ACCESS);
+	REQUIRE(wrapped_handle);
+	REQUIRE(wrapped_handle->IsPipe());
+	wrapped_handle.reset();
+	fs->RemoveFile(fifo_path);
+}
+#endif
 
 TEST_CASE("absolute paths", "[file_system]") {
 	duckdb::LocalFileSystem fs;

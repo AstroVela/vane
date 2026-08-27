@@ -27,6 +27,77 @@ def _table_from_native_result(result):
     return pa.concat_tables(payloads)
 
 
+@pytest.mark.parametrize(
+    ("function_name", "expression"),
+    [
+        ("to_file", "to_file('file:///driver-only/value.bin')"),
+        ("try_to_file", "try_to_file('file:///driver-only/value.bin')"),
+        (
+            "file_enrich",
+            "file_enrich(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL), ['size'])",
+        ),
+        (
+            "file_size",
+            "file_size(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
+        ),
+        (
+            "file_exists",
+            "file_exists(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
+        ),
+        (
+            "file_stat",
+            "file_stat(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL))",
+        ),
+        (
+            "file_mime_type",
+            "file_mime_type(file('file:///driver-only/value.bin', NULL, NULL, NULL, NULL), 'content')",
+        ),
+    ],
+)
+def test_distributed_plan_rejects_storage_facing_file_scalars(function_name, expression):
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    try:
+        relation = connection.sql(f"SELECT {expression} FROM range(2)")
+        with pytest.raises(
+            ValueError,
+            match=rf"storage-facing FILE function '{function_name}'",
+        ):
+            ray_cxx.PyLogicalPlan.from_duckdb_relation(
+                relation,
+                f"storage-facing-file-{function_name}",
+            )
+    finally:
+        connection.close()
+
+
+def test_distributed_plan_allows_io_free_file_scalars():
+    ray_cxx = _require_ray_cxx()
+    connection = vane.connect()
+    try:
+        file_value = "file('file:///driver-only/value.txt', 'text/plain', 1, 2, 'sha256:abcd')"
+        relation = connection.sql(
+            f"""
+            SELECT
+                file_path({file_value}),
+                file_mime_type({file_value}),
+                guess_mime_type('GIF89a'::BLOB),
+                file_same_location({file_value}, {file_value}),
+                file_same_content({file_value}, {file_value}),
+                file_locator_id({file_value}),
+                file_content_id({file_value}),
+                {file_value} = {file_value}
+            FROM range(2)
+            """
+        )
+
+        plan = ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "io-free-file-scalars")
+
+        assert plan is not None
+    finally:
+        connection.close()
+
+
 def test_logical_plan_captures_connection_scoped_vane_session(monkeypatch):
     ray_cxx = _require_ray_cxx()
 
