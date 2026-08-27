@@ -116,6 +116,11 @@ records it only after `DynamicExtensionResolver.load()` verifies the local
 artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
 another route makes snapshot capture fail closed.
 
+Coordinator progress-topology inspection clones each fragment with an isolated
+cursor from the resolver-owned planning DatabaseInstance. It reuses the
+already-verified extension state and does not require a provider entry point on
+the driver after an explicit artifact load.
+
 Fragment registration prepares an isolated worker DatabaseInstance before any
 task can deserialize the plan. Immediately before native admission, the worker
 refreshes the exact database identity and prepares any cache miss first, such
@@ -510,7 +515,8 @@ distributed tests before an extension is enabled in release builds.
 
 ## Failure rules
 
-- Unknown or non-static extension names in a connection snapshot are rejected.
+- Unknown static extension names, non-static names without an exact tracked
+  dynamic descriptor, and invalid dynamic descriptor manifests are rejected.
 - DuckDB source, static extension version, and distributed contract mismatches
   are rejected before planning or scheduling.
 - A callback/provider whose capability identity was not registered is rejected

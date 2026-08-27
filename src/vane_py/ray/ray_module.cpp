@@ -709,6 +709,15 @@ void register_ray_bindings(py::module_ &mod) {
 		    result.udf_registrations_ = udf_registrations_obj;
 		    result.udf_actor_handles_ = udf_actor_handles_obj;
 		    result.connection_snapshot_ = connection_snapshot_obj;
+		    auto coordinator_connection = LookupQueryCoordinatorConnection(resource_query_id);
+		    if (!coordinator_connection.is_none()) {
+			    auto &coordinator_wrapper = ExtractPyConnectionWrapper(coordinator_connection);
+			    if (coordinator_wrapper.con.ConnectionIsClosed()) {
+				    throw py::value_error("DistributedPhysicalPlan coordinator connection is closed");
+			    }
+			    result.worker_connection_ = py::cast(coordinator_wrapper.Cursor());
+			    result.client_context_ = coordinator_wrapper.con.GetConnection().context;
+		    }
 		    (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
 		    (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
 		    return result;
@@ -773,7 +782,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    // The resource query owns this lifecycle. A retried FTE task can carry a
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
-		                                          plan.connection_snapshot_);
+		                                          plan.connection_snapshot_, plan.worker_connection_);
 	    },
 	    py::arg("query_id"), py::arg("plan"));
 

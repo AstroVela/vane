@@ -608,14 +608,19 @@ struct QueryPythonReplayState {
 	duckdb::distributed::python::ray::SafePyObject udf_registrations;
 	duckdb::distributed::python::ray::SafePyObject udf_actor_handles;
 	duckdb::distributed::python::ray::SafePyObject connection_snapshot;
+	// Driver-only state. Fragment wrappers take isolated cursors from this
+	// connection, and DistributedPhysicalPlan pickle state never includes it.
+	duckdb::distributed::python::ray::SafePyObject coordinator_connection;
 
 	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
-	                       py::object udf_actor_handles_p, py::object connection_snapshot_p)
+	                       py::object udf_actor_handles_p, py::object connection_snapshot_p,
+	                       py::object coordinator_connection_p)
 	    : session_id(std::move(session_id_p)),
 	      session_config(duckdb::distributed::python::ray::SafePyObject(std::move(session_config_p))),
 	      udf_registrations(duckdb::distributed::python::ray::SafePyObject(std::move(udf_registrations_p))),
 	      udf_actor_handles(duckdb::distributed::python::ray::SafePyObject(std::move(udf_actor_handles_p))),
-	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))) {
+	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))),
+	      coordinator_connection(duckdb::distributed::python::ray::SafePyObject(std::move(coordinator_connection_p))) {
 	}
 };
 
@@ -1558,6 +1563,7 @@ enum class QueryPythonReplayField : uint8_t {
 	UDFRegistrations,
 	UDFActorHandles,
 	ConnectionSnapshot,
+	CoordinatorConnection,
 };
 
 static py::object LookupQueryPythonReplayState(const string &query_id, QueryPythonReplayField field) {
@@ -1576,26 +1582,33 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 		return entry->second->udf_actor_handles.get();
 	case QueryPythonReplayField::ConnectionSnapshot:
 		return entry->second->connection_snapshot.get();
+	case QueryPythonReplayField::CoordinatorConnection:
+		return entry->second->coordinator_connection.get();
 	default:
 		throw duckdb::InternalException("Unknown query Python replay field");
 	}
 }
 
 static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
-                                           const py::object &udf_actor_handles, const py::object &connection_snapshot) {
+                                           const py::object &udf_actor_handles, const py::object &connection_snapshot,
+                                           const py::object &coordinator_connection) {
 	if (query_id.empty()) {
 		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
 	}
 	auto session_id = VaneSessionIdFromSnapshot(connection_snapshot);
 	py::object session_config = VaneSessionConfigFromSnapshot(connection_snapshot);
+	py::object retained_coordinator_connection = SnapshotHasDynamicExtensions(connection_snapshot)
+	                                                 ? py::reinterpret_borrow<py::object>(coordinator_connection)
+	                                                 : py::none();
 	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
 	auto entry = g_query_python_replay_states.find(query_id);
 	if (entry == g_query_python_replay_states.end()) {
-		g_query_python_replay_states.emplace(query_id, std::make_unique<QueryPythonReplayState>(
-		                                                   std::move(session_id), std::move(session_config),
-		                                                   py::reinterpret_borrow<py::object>(udf_registrations),
-		                                                   py::reinterpret_borrow<py::object>(udf_actor_handles),
-		                                                   py::reinterpret_borrow<py::object>(connection_snapshot)));
+		g_query_python_replay_states.emplace(
+		    query_id, std::make_unique<QueryPythonReplayState>(std::move(session_id), std::move(session_config),
+		                                                       py::reinterpret_borrow<py::object>(udf_registrations),
+		                                                       py::reinterpret_borrow<py::object>(udf_actor_handles),
+		                                                       py::reinterpret_borrow<py::object>(connection_snapshot),
+		                                                       std::move(retained_coordinator_connection)));
 		return true;
 	}
 	auto &state = *entry->second;
@@ -1614,6 +1627,10 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		throw duckdb::InvalidInputException("Query " + query_id +
 		                                    " was registered with different Python UDF actor handles");
 	}
+	if (state.coordinator_connection.get().is_none() && !retained_coordinator_connection.is_none()) {
+		state.coordinator_connection =
+		    duckdb::distributed::python::ray::SafePyObject(std::move(retained_coordinator_connection));
+	}
 	return false;
 }
 
@@ -1623,6 +1640,10 @@ static py::object LookupQueryUDFRegistrations(const string &query_id) {
 
 static py::object LookupQueryConnectionSnapshot(const string &query_id) {
 	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::ConnectionSnapshot);
+}
+
+static py::object LookupQueryCoordinatorConnection(const string &query_id) {
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::CoordinatorConnection);
 }
 
 static py::object LookupQueryUDFActorHandles(const string &query_id) {

@@ -2735,7 +2735,8 @@ struct PyPhysicalPlanWrapperRunner {
 		// Call PlanRunner::run_plan
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -2906,7 +2907,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -3184,7 +3186,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -4069,12 +4072,15 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 		throw py::value_error("DistributedPhysicalPlan is uninitialized");
 	}
 
-	py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
-	if (SnapshotHasDynamicExtensions(plan.connection_snapshot_)) {
-		// Progress topology deserializes a worker fragment against its own
-		// DatabaseInstance. Prepare that instance before the deserializer sees
-		// extension-owned operators or expressions, using the same strict local
-		// provider and native LOAD path as worker snapshot preparation.
+	const bool has_dynamic_extensions = SnapshotHasDynamicExtensions(plan.connection_snapshot_);
+	py::object exec_conn = has_dynamic_extensions ? plan.resolve_execution_connection(conn_obj)
+	                                              : ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+	if (has_dynamic_extensions) {
+		// Coordinator-created fragment plans retain the resolver-owned planning
+		// DatabaseInstance for progress deserialization. This verifies the exact
+		// recorded manifest without requiring an installed driver provider merely
+		// to inspect topology. A transported plan with no retained connection still
+		// uses the strict local provider and native LOAD preparation path.
 		PrepareConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_);
 	}
 	PyPhysicalPlanWrapper topology_plan;

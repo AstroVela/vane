@@ -133,10 +133,11 @@ def _descriptor_dict(
     }
 
 
-def test_real_ray_prepares_and_reuses_signed_dynamic_extension(ray_local, monkeypatch):
+def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_provider(ray_local, monkeypatch):
     import pyarrow as pa
     import ray
 
+    import vane.extensions as extension_module
     from vane import runners
     from vane.runners.ray.runner import RayRunner
     from vane.runners.ray.worker import RayWorkerActor
@@ -148,6 +149,11 @@ def test_real_ray_prepares_and_reuses_signed_dynamic_extension(ray_local, monkey
         providers=(provider,),
     )
     resolver.load(connection, artifact.descriptor)
+    monkeypatch.setattr(
+        extension_module,
+        "entry_points",
+        lambda *, group: pytest.fail(f"coordinator topology must not discover provider group {group}"),
+    )
     runner = RayRunner(address=None, max_task_backlog=None)
     admission_actor = None
     monkeypatch.setattr(runners, "get_or_infer_runner_type", lambda: "ray")
