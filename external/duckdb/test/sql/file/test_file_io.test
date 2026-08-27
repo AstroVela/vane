@@ -1,0 +1,287 @@
+# name: test/sql/file/test_file_io.test
+# description: Test FILE execution-time metadata, content evidence, and identity
+# group: [file]
+
+require file
+
+statement ok
+PRAGMA enable_verification
+
+# Constructor fields and suffix metadata remain usable without opening the URL.
+query TI
+SELECT file_path(value), file_size(value)
+FROM (SELECT file('missing.txt', NULL, 7, 3, NULL) AS value)
+----
+missing.txt	3
+
+query T
+SELECT file_mime_type(file('missing.txt', NULL, NULL, NULL, NULL))
+----
+text/plain
+
+# Conversion opens the object and materializes the complete logical window.
+query TTIIT
+SELECT typeof(value), value.url, value.position, value.size, value.content_type
+FROM (SELECT to_file('test/sql/table_function/files/one.txt') AS value)
+----
+FILE	test/sql/table_function/files/one.txt	0	12	text/plain
+
+query I
+SELECT try_to_file('test/sql/table_function/files/does-not-exist') IS NULL
+----
+true
+
+statement error
+SELECT to_file('test/sql/table_function/files/does-not-exist')
+----
+<REGEX>:.*(Cannot open file|could not open).*
+
+query IIIII
+SELECT
+	file_exists(file('test/sql/table_function/files/one.txt', NULL, NULL, NULL, NULL)),
+	file_exists(file('test/sql/table_function/files/does-not-exist', NULL, NULL, NULL, NULL)),
+	file_exists(file('test/sql/table_function/files', NULL, NULL, NULL, NULL)),
+	file_exists(file('test/sql/table_function/files/one.txt', NULL, 12, 0, NULL)),
+	file_exists(file('test/sql/table_function/files/one.txt', NULL, 13, 0, NULL))
+----
+true	false	false	true	false
+
+query IIIII
+SELECT
+	file_stat(value).object_size,
+	file_stat(value).last_modified IS NOT NULL,
+	file_stat(value).version IS NULL,
+	file_stat(value).etag IS NULL,
+	file_stat(value).content_type = 'text/plain'
+FROM (SELECT file('test/sql/table_function/files/one.txt', NULL, 6, 5, NULL) AS value)
+----
+12	true	true	true	true
+
+# MIME sniffing reads only the declared logical view.
+query TTTTT
+SELECT
+	guess_mime_type(unhex('89504e470d0a1a0a')),
+	guess_mime_type(unhex('504b0304')),
+	file_mime_type(file('test/sql/table_function/files/four.blob', NULL, NULL, NULL, NULL), 'content'),
+	file_mime_type(file('test/sql/table_function/files/four.blob', NULL, 4, 8, NULL), 'content'),
+	file_mime_type(file('test/sql/table_function/files/one.txt', NULL, NULL, NULL, NULL), 'auto')
+----
+image/png	NULL	application/zip	NULL	text/plain
+
+# Content sniffing follows Daft's bounded best-effort contract. Unknown binary,
+# plain text, and structured text without a supported magic signature return NULL.
+query TTTT
+SELECT
+	guess_mime_type(unhex('0001')),
+	guess_mime_type('plain text'::BLOB),
+	guess_mime_type('{}'::BLOB),
+	guess_mime_type('GIF89a notes'::BLOB)
+----
+NULL	NULL	NULL	NULL
+
+query TTTTTT
+SELECT
+	guess_mime_type(unhex('89504e470d0a1a0a')),
+	guess_mime_type(unhex('ffd8ff')),
+	guess_mime_type(unhex('47494638396101000100000000')),
+	guess_mime_type(unhex('524946460c0000005745425056503820')),
+	guess_mime_type(unhex('255044462d312e37')),
+	guess_mime_type(unhex('504b03040a00' || repeat('00', 24)))
+----
+image/png	image/jpeg	image/gif	image/webp	application/pdf	application/zip
+
+query TTTTTTT
+SELECT
+	guess_mime_type(unhex('4944330400000000000b5449543200000001000000')),
+	guess_mime_type(unhex('fffb9064')),
+	guess_mime_type(unhex('524946460400000057415645')),
+	guess_mime_type(unhex('4f6767530000' || repeat('00', 21))),
+	guess_mime_type(unhex('000001ba')),
+	guess_mime_type('<html'::BLOB),
+	guess_mime_type(unhex('894844460d0a1a0a'))
+----
+audio/mpeg	audio/mpeg	audio/wav	audio/ogg	video/mpeg	text/html	application/vnd.hdfgroup.hdf5
+
+# ISO-BMFF inspects every available brand. Specific compatible brands override
+# generic container brands regardless of their order.
+query TTTTTT
+SELECT
+	guess_mime_type(unhex('00000010667479706d70343200000000')),
+	guess_mime_type(unhex('00000010667479707878787800000000')),
+	guess_mime_type(unhex('000000146674797069736f6d000000004d344120')),
+	guess_mime_type(unhex('00000014667479706d6966310000000061766966')),
+	guess_mime_type(unhex('00000014667479706d6966310000000068656963')),
+	guess_mime_type(unhex('00000011667479706d703432000000000000'))
+----
+video/mp4	video/mp4	audio/mp4	image/avif	image/heic	NULL
+
+# Suffix hints distinguish URI delimiters from literal local filename bytes.
+query TTTTT
+SELECT
+	file_mime_type(file('report.json?part', NULL, NULL, NULL, NULL)),
+	file_mime_type(file('https://example.test/report.json?part', NULL, NULL, NULL, NULL)),
+	file_mime_type(file('https://service.json', NULL, NULL, NULL, NULL)),
+	file_mime_type(file('s3://bucket/report.json?versionId=1', NULL, NULL, NULL, NULL)),
+	file_mime_type(file('file:///tmp/report.json?part', NULL, NULL, NULL, NULL))
+----
+NULL	application/json	NULL	NULL	NULL
+
+statement error
+SELECT file_mime_type(file('x', NULL, NULL, NULL, NULL), 'fallback')
+----
+<REGEX>:.*detect must be 'metadata', 'content', or 'auto'.*
+
+query TT
+SELECT
+	file_mime_type(file('missing.json', NULL, NULL, NULL, NULL), 'metadata'),
+	file_mime_type(file('missing.json', 'image/png', NULL, NULL, NULL), 'auto')
+----
+application/json	image/png
+
+statement error
+SELECT file_mime_type(file('missing.json', NULL, NULL, NULL, NULL), 'auto')
+----
+<REGEX>:.*(Cannot open file|could not open).*
+
+statement ok
+COPY (
+	SELECT repeat('x', 16384)::BLOB || unhex('894844460d0a1a0a')
+) TO '__TEST_DIR__/hdf5_user_block.bin' (FORMAT BLOB)
+
+query T
+SELECT file_mime_type(
+	file('__TEST_DIR__/hdf5_user_block.bin', NULL, NULL, NULL, NULL),
+	'content'
+)
+----
+application/vnd.hdfgroup.hdf5
+
+# Enrichment preserves the logical view and hashes exactly that view.
+query TTIIT
+SELECT typeof(value), value.content_type, value.position, value.size, value.checksum
+FROM (
+	SELECT file_enrich(
+		file('test/sql/table_function/files/one.txt', NULL, 6, 5, NULL),
+		['size', 'content_type', 'checksum']
+	) AS value
+)
+----
+FILE	text/plain	6	5	sha256:78ae647dc5544d227130a0682a51e30bc7777fbb6d8a8f17007463a3ecd1d524
+
+query IIT
+SELECT value.position, value.size, value.checksum
+FROM (
+	SELECT file_enrich(
+		file('test/sql/table_function/files/one.txt', NULL, NULL, NULL, NULL),
+		['size', 'checksum']
+	) AS value
+)
+----
+0	12	sha256:7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069
+
+query T
+SELECT file_enrich(
+	file('test/sql/table_function/files/one.txt', NULL, 12, 0, NULL),
+	['checksum']
+).checksum
+----
+sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+statement error
+SELECT file_enrich(file('test/sql/table_function/files/one.txt', NULL, 8, 8, NULL), ['checksum'])
+----
+<REGEX>:.*byte range.*exceeds the backing object size.*
+
+statement error
+SELECT file_enrich(file('x', NULL, NULL, NULL, NULL), ['etag'])
+----
+<REGEX>:.*field 'etag' is not supported.*
+
+statement error
+SELECT file_path(struct_pack(
+	url := NULL::VARCHAR,
+	content_type := NULL::VARCHAR,
+	"position" := NULL::BIGINT,
+	size := NULL::BIGINT,
+	checksum := NULL::VARCHAR
+)::FILE)
+----
+<REGEX>:.*url cannot be NULL.*
+
+statement error
+SELECT file('before' || chr(0) || 'after', NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*url cannot contain NUL bytes.*
+
+statement error
+SELECT file_exists(struct_pack(
+	url := 'test/sql/table_function/files/one.txt',
+	content_type := NULL::VARCHAR,
+	"position" := 0::BIGINT,
+	size := NULL::BIGINT,
+	checksum := NULL::VARCHAR
+)::FILE)
+----
+<REGEX>:.*position and size must either both be NULL or both be non-NULL.*
+
+statement error
+SELECT file_stat(struct_pack(
+	url := 'test/sql/table_function/files/one.txt',
+	content_type := NULL::VARCHAR,
+	"position" := NULL::BIGINT,
+	size := NULL::BIGINT,
+	checksum := 'invalid'::VARCHAR
+)::FILE)
+----
+<REGEX>:.*checksum must have the form <algorithm>:<digest>.*
+
+statement error
+SELECT file_content_id(struct_pack(
+	url := 'x',
+	content_type := NULL::VARCHAR,
+	"position" := NULL::BIGINT,
+	size := NULL::BIGINT,
+	checksum := ('sha256:a' || chr(0) || 'b')::VARCHAR
+)::FILE)
+----
+<REGEX>:.*checksum must have the form <algorithm>:<digest>.*
+
+# Locator identity and content evidence are independent and I/O-free.
+query IIII
+SELECT
+	file_same_location(file('x', NULL, NULL, NULL, NULL), file('x', 'text/plain', NULL, NULL, NULL)),
+	file_same_location(file('x', NULL, 1, 2, NULL), file('x', NULL, 1, 2, NULL)),
+	file_same_location(file('x', NULL, 1, 2, NULL), file('x', NULL, 1, 3, NULL)),
+	file_same_location(file('x', NULL, NULL, NULL, NULL), file('x', NULL, 0, 3, NULL))
+----
+true	true	false	NULL
+
+query IIIIII
+SELECT
+	file_same_content(file('a', NULL, 0, 3, 'sha256:abc'), file('b', NULL, 7, 3, 'SHA256:abc')),
+	file_same_content(file('a', NULL, 0, 3, 'sha256:abc'), file('b', NULL, 7, 3, 'sha256:def')),
+	file_same_content(file('a', NULL, 0, 3, 'sha256:abc'), file('b', NULL, 7, 3, 'md5:def')),
+	file_same_content(file('a', NULL, 0, 3, NULL), file('b', NULL, 7, 4, NULL)),
+	file_same_content(file('a', NULL, 0, 0, NULL), file('b', NULL, 9, 0, NULL)),
+	file_same_content(file('a', NULL, NULL, NULL, NULL), file('b', NULL, NULL, NULL, NULL))
+----
+true	false	NULL	false	true	NULL
+
+query TTT
+SELECT
+	file_content_id(file('x', NULL, 0, 1, 'SHA256:AbC')),
+	file_content_id(file('x', NULL, 0, 0, NULL)),
+	file_content_id(file('x', NULL, NULL, NULL, NULL))
+----
+file-content-v1:checksum:sha256:AbC	file-content-v1:empty	NULL
+
+query TTII
+SELECT
+	file_locator_id(file('x', NULL, NULL, NULL, NULL)),
+	file_locator_id(file('x', NULL, 2, 3, NULL)),
+	file_locator_id(file('x', NULL, NULL, NULL, NULL)) =
+		file_locator_id(file('x', 'text/plain', NULL, NULL, 'sha256:any')),
+	file_locator_id(file('x', NULL, NULL, NULL, NULL)) !=
+		file_locator_id(file('x', NULL, 0, 1, NULL))
+----
+file-locator-v1:sha256:5b0c80f0d235a7012cd2e4fa9b1a50118ed42c184eb797c52986fc114bf8e144	file-locator-v1:sha256:4def93c927555f3931c34c6aefe0f0c709e90a6596bea35a644b65334ce05487	true	true
