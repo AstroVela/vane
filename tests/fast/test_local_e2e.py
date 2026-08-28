@@ -448,6 +448,8 @@ def test_local_runner_arrow_native_parquet_rejects_schema_changes_across_rotated
             execution_backend="subprocess_task",
             batch_size=1,
             output_batch_size=1,
+            # Keep the incompatible schemas in separate task results and Arrow streams.
+            task_input_max_bytes=1,
         )
         with pytest.raises(ValueError, match="Arrow schema changed during Arrow-native Parquet COPY"):
             relation.query(
