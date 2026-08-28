@@ -136,6 +136,7 @@ static atomic<uint64_t> g_udf_distributed_ref_bundle_data_events {0};
 static atomic<uint64_t> g_udf_distributed_direct_table_rejected_events {0};
 static atomic<uint64_t> g_udf_direct_arrow_table_conversion_count {0};
 static atomic<uint64_t> g_udf_direct_output_arrow_table_conversion_count {0};
+static atomic<uint64_t> g_udf_external_arrow_stream_export_count {0};
 static atomic<uint64_t> g_udf_python_export_under_client_context_lock_count {0};
 
 // Global mutex protecting ClientContext access from multiple threads.
@@ -206,6 +207,25 @@ public:
 	ArrowSchema schema;
 };
 
+static ArrowArrayStream TakeArrowTableStream(const py::object &table) {
+	D_ASSERT(py::gil_check());
+	if (ClientContextMutexHeldByCurrentThread()) {
+		g_udf_python_export_under_client_context_lock_count.fetch_add(1, std::memory_order_relaxed);
+		throw InternalException("direct Arrow table export attempted while holding ClientContext lock");
+	}
+	ArrowArrayStream result;
+	std::memset(&result, 0, sizeof(result));
+	auto capsule_obj = table.attr("__arrow_c_stream__")();
+	auto capsule = py::reinterpret_borrow<py::capsule>(capsule_obj);
+	auto stream = capsule.get_pointer<struct ArrowArrayStream>();
+	if (!stream || !stream->release) {
+		throw InvalidInputException("The __arrow_c_stream__() method returned a released stream");
+	}
+	result = *stream;
+	stream->release = nullptr;
+	return result;
+}
+
 static unique_ptr<ArrowArrayStreamWrapper> ProduceOwnedArrowTableStream(uintptr_t factory_ptr,
                                                                         ArrowStreamParameters &parameters) {
 	if (parameters.filters && !parameters.filters->filters.empty()) {
@@ -231,21 +251,8 @@ static void GetOwnedArrowTableStreamSchema(ArrowArrayStream *factory_ptr, ArrowS
 }
 
 static unique_ptr<OwnedArrowTableStreamFactory> ExportOwnedArrowTableStream(const py::object &table) {
-	D_ASSERT(py::gil_check());
-	if (ClientContextMutexHeldByCurrentThread()) {
-		g_udf_python_export_under_client_context_lock_count.fetch_add(1, std::memory_order_relaxed);
-		throw InternalException(
-		    "direct Arrow table conversion attempted Python export while holding ClientContext lock");
-	}
 	auto factory = make_uniq<OwnedArrowTableStreamFactory>();
-	auto capsule_obj = table.attr("__arrow_c_stream__")();
-	auto capsule = py::reinterpret_borrow<py::capsule>(capsule_obj);
-	auto stream = capsule.get_pointer<struct ArrowArrayStream>();
-	if (!stream || !stream->release) {
-		throw InvalidInputException("The __arrow_c_stream__() method returned a released stream");
-	}
-	factory->stream = *stream;
-	stream->release = nullptr;
+	factory->stream = TakeArrowTableStream(table);
 	if (factory->stream.get_schema(&factory->stream, &factory->schema)) {
 		auto error =
 		    factory->stream.get_last_error ? factory->stream.get_last_error(&factory->stream) : "unknown error";
@@ -653,9 +660,60 @@ static unique_ptr<DataChunk> WrapDataChunkColumnsAsStruct(ClientContext &context
 	return output;
 }
 
+static py::object ResolveExternalBlockArrowTable(const LazyDataChunk &chunk, const char *operation) {
+	D_ASSERT(py::gil_check());
+	py::list refs;
+	py::list slices;
+	py::list metadata;
+	py::list names;
+	if (!chunk.wrap_columns_as_struct) {
+		for (auto &name : chunk.names) {
+			names.append(py::str(name));
+		}
+	}
+	for (auto &block : chunk.blocks) {
+		refs.append(BorrowPythonObjectHolder(block.object_ref));
+		if (block.has_slice) {
+			slices.append(py::make_tuple(block.slice.start_offset, block.slice.end_offset));
+		} else {
+			slices.append(py::none());
+		}
+		py::dict meta;
+		meta[py::str("num_rows")] = py::int_(block.metadata.num_rows);
+		meta[py::str("size_bytes")] = py::int_(block.metadata.size_bytes);
+		if (!block.metadata.query_id.empty()) {
+			meta[py::str("query_id")] = py::str(block.metadata.query_id);
+		}
+		if (!block.metadata.operator_id.empty()) {
+			meta[py::str("operator_id")] = py::str(block.metadata.operator_id);
+		}
+		if (!block.metadata.attempt_id.empty()) {
+			meta[py::str("attempt_id")] = py::str(block.metadata.attempt_id);
+		}
+		if (!block.column_ids.empty()) {
+			py::list column_ids;
+			for (auto column_id : block.column_ids) {
+				column_ids.append(py::int_(column_id));
+			}
+			meta[py::str("column_ids")] = std::move(column_ids);
+		}
+		metadata.append(std::move(meta));
+	}
+
+	try {
+		auto helper = py::module_::import("vane.execution.ref_bundle").attr("materialize_ref_bundle");
+		return helper(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
+	} catch (const py::error_already_set &ex) {
+		throw InvalidInputException("external block %s failed: %s", operation, ex.what());
+	}
+}
+
 class PythonRayExternalBlockBackend : public ExternalBlockBackendInterface {
 public:
 	bool CanMaterialize(const ExternalBlockDescriptor &desc) override {
+		return desc.object_ref != nullptr;
+	}
+	bool CanExportArrow(const ExternalBlockDescriptor &desc) override {
 		return desc.object_ref != nullptr;
 	}
 
@@ -668,51 +726,7 @@ public:
 		}
 
 		PythonGILWrapper gil;
-		py::list refs;
-		py::list slices;
-		py::list metadata;
-		py::list names;
-		if (!chunk.wrap_columns_as_struct) {
-			for (auto &name : chunk.names) {
-				names.append(py::str(name));
-			}
-		}
-		for (auto &block : chunk.blocks) {
-			refs.append(BorrowPythonObjectHolder(block.object_ref));
-			if (block.has_slice) {
-				slices.append(py::make_tuple(block.slice.start_offset, block.slice.end_offset));
-			} else {
-				slices.append(py::none());
-			}
-			py::dict meta;
-			meta[py::str("num_rows")] = py::int_(block.metadata.num_rows);
-			meta[py::str("size_bytes")] = py::int_(block.metadata.size_bytes);
-			if (!block.metadata.query_id.empty()) {
-				meta[py::str("query_id")] = py::str(block.metadata.query_id);
-			}
-			if (!block.metadata.operator_id.empty()) {
-				meta[py::str("operator_id")] = py::str(block.metadata.operator_id);
-			}
-			if (!block.metadata.attempt_id.empty()) {
-				meta[py::str("attempt_id")] = py::str(block.metadata.attempt_id);
-			}
-			if (!block.column_ids.empty()) {
-				py::list column_ids;
-				for (auto column_id : block.column_ids) {
-					column_ids.append(py::int_(column_id));
-				}
-				meta[py::str("column_ids")] = std::move(column_ids);
-			}
-			metadata.append(std::move(meta));
-		}
-
-		py::object table;
-		try {
-			auto helper = py::module_::import("vane.execution.ref_bundle").attr("materialize_ref_bundle");
-			table = helper(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
-		} catch (const py::error_already_set &ex) {
-			throw InvalidInputException("external block materialization failed: %s", ex.what());
-		}
+		auto table = ResolveExternalBlockArrowTable(chunk, "materialization");
 
 		if (chunk.wrap_columns_as_struct) {
 			if (chunk.logical_types.size() != 1 || chunk.logical_types[0].id() != LogicalTypeId::STRUCT) {
@@ -724,6 +738,15 @@ public:
 			return WrapDataChunkColumnsAsStruct(context, std::move(raw), chunk.logical_types[0]);
 		}
 		return ConvertArrowTableToDataChunk(table, context, chunk.logical_types);
+	}
+
+	unique_ptr<ArrowArrayStreamWrapper> ExportArrow(ClientContext &, const LazyDataChunk &chunk) override {
+		PythonGILWrapper gil;
+		auto table = ResolveExternalBlockArrowTable(chunk, "Arrow export");
+		auto result = make_uniq<ArrowArrayStreamWrapper>();
+		result->arrow_array_stream = TakeArrowTableStream(table);
+		g_udf_external_arrow_stream_export_count.fetch_add(1, std::memory_order_relaxed);
+		return result;
 	}
 };
 
@@ -3992,6 +4015,8 @@ py::dict GetUDFExecutorDebugCounters() {
 	    py::int_(g_udf_direct_arrow_table_conversion_count.load(std::memory_order_relaxed));
 	result["udf_direct_output_arrow_table_conversion_count"] =
 	    py::int_(g_udf_direct_output_arrow_table_conversion_count.load(std::memory_order_relaxed));
+	result["udf_external_arrow_stream_export_count"] =
+	    py::int_(g_udf_external_arrow_stream_export_count.load(std::memory_order_relaxed));
 	result["udf_python_export_under_client_context_lock_count"] =
 	    py::int_(g_udf_python_export_under_client_context_lock_count.load(std::memory_order_relaxed));
 	return result;
@@ -4002,6 +4027,7 @@ void ResetUDFExecutorDebugCounters() {
 	g_udf_distributed_direct_table_rejected_events.store(0, std::memory_order_relaxed);
 	g_udf_direct_arrow_table_conversion_count.store(0, std::memory_order_relaxed);
 	g_udf_direct_output_arrow_table_conversion_count.store(0, std::memory_order_relaxed);
+	g_udf_external_arrow_stream_export_count.store(0, std::memory_order_relaxed);
 	g_udf_python_export_under_client_context_lock_count.store(0, std::memory_order_relaxed);
 }
 

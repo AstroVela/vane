@@ -33,6 +33,9 @@ class FileSystem;
 class FileOpener;
 class ParquetEncryptionConfig;
 class ParquetStatsAccumulator;
+class ArrowParquetLocalState;
+class ArrowParquetWriter;
+struct ParquetWriteDataChunkLocalState;
 
 class Serializer;
 class Deserializer;
@@ -80,25 +83,29 @@ private:
 
 struct ParquetWriteLocalState : public LocalFunctionData {
 public:
-	explicit ParquetWriteLocalState(ClientContext &context, const vector<LogicalType> &types);
+	ParquetWriteLocalState();
+	~ParquetWriteLocalState() override;
 
 public:
-	ColumnDataCollection buffer;
-	ColumnDataAppendState append_state;
-	//! If any of the column writers require a transformation to a different shape, this will be initialized and used
-	unique_ptr<ParquetWriteTransformData> transform_data;
+	unique_ptr<ParquetWriteDataChunkLocalState> data_chunk_state;
+	unique_ptr<ArrowParquetLocalState> arrow_state;
 };
 
 struct ParquetWriteGlobalState : public GlobalFunctionData {
 public:
-	ParquetWriteGlobalState() {
-	}
+	ParquetWriteGlobalState(ClientContext &context, FileSystem &fs, string file_path);
+	~ParquetWriteGlobalState() override;
 
 public:
 	void LogFlushingRowGroup(const ColumnDataCollection &buffer, const string &reason);
 
 public:
+	ClientContext &context;
+	FileSystem &fs;
+	string file_path;
 	unique_ptr<ParquetWriter> writer;
+	unique_ptr<ArrowParquetWriter> arrow_writer;
+	optional_ptr<CopyFunctionFileStatistics> written_stats;
 	optional_ptr<const PhysicalOperator> op;
 	mutex lock;
 	unique_ptr<ColumnDataCollection> combine_buffer;

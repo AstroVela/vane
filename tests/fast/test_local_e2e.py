@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import builtins
+import datetime
 import sys
 
 import pytest
@@ -59,6 +60,617 @@ def test_local_runner_write_parquet_e2e(local_runner, tmp_path, monkeypatch):
         con.close()
 
     assert rows == (80, 3960, 0, 4)
+
+
+def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from vane import _native
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        chunk_size = 7
+
+        def chunked(items, arrow_type):
+            return pa.chunked_array(
+                [
+                    pa.array(items[offset : offset + chunk_size], type=arrow_type)
+                    for offset in range(0, len(items), chunk_size)
+                ]
+            )
+
+        def dictionary_floats(indices, dictionary):
+            return pa.chunked_array(
+                [
+                    pa.DictionaryArray.from_arrays(
+                        pa.array(indices[offset : offset + chunk_size], type=pa.int32()),
+                        pa.array(dictionary, type=pa.float64()),
+                    )
+                    for offset in range(0, len(indices), chunk_size)
+                ]
+            )
+
+        return pa.table(
+            {
+                "y": chunked([value * 3 for value in values], pa.int64()),
+                "label": chunked([f"row-{value % 7}" for value in values], pa.string()),
+                "score": chunked([float("nan")] * len(values), pa.float64()),
+                "encoded_score": dictionary_floats([0] * len(values), [float("nan")]),
+                "encoded_weight": dictionary_floats([value % 2 for value in values], [1.0, 2.0]),
+                "weight": chunked([float(value) for value in values], pa.float32()),
+                "samples": chunked([[float("nan"), float(value)] for value in values], pa.list_(pa.float64())),
+                "attributes": chunked([[("value", float("nan"))] for _ in values], pa.map_(pa.string(), pa.float64())),
+                "event_time": chunked([datetime.datetime(1970, 1, 1)] * len(values), pa.timestamp("us")),
+                "event_time_tz": chunked(
+                    [datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)] * len(values),
+                    pa.timestamp("us", tz="UTC"),
+                ),
+                "clock": chunked([datetime.time()] * len(values), pa.time64("us")),
+            }
+        )
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "lazy_udf_arrow_copy.parquet"
+    copy_result = {}
+    original_run_write = local_runner.run_write
+
+    def capture_run_write(relation):
+        result = original_run_write(relation)
+        copy_result.update(result)
+        return result
+
+    monkeypatch.setattr(local_runner, "run_write", capture_run_write)
+    con = vane.connect()
+    try:
+        _native._reset_udf_executor_debug_counters()
+        relation = con.sql("select i::BIGINT as x from range(4097) t(i)").map_batches(
+            transform,
+            schema={
+                "y": vane.sqltypes.BIGINT,
+                "label": vane.sqltypes.VARCHAR,
+                "score": vane.sqltypes.DOUBLE,
+                "encoded_score": vane.sqltypes.DOUBLE,
+                "encoded_weight": vane.sqltypes.DOUBLE,
+                "weight": vane.sqltypes.FLOAT,
+                "samples": vane.list_type(vane.sqltypes.DOUBLE),
+                "attributes": vane.map_type(vane.sqltypes.VARCHAR, vane.sqltypes.DOUBLE),
+                "event_time": vane.sqltypes.TIMESTAMP,
+                "event_time_tz": vane.sqltypes.TIMESTAMP_TZ,
+                "clock": vane.sqltypes.TIME,
+            },
+            execution_backend="subprocess_task",
+            batch_size=4097,
+            output_batch_size=4097,
+        )
+        relation.write_parquet(str(output), row_group_size=64)
+        rows = con.sql(f"select count(*), sum(y), count(distinct label) from read_parquet('{output}')").fetchone()
+        counters = dict(_native._udf_executor_debug_counters())
+        output_files = list(output.glob("*.parquet"))
+        metadata = [pq.ParquetFile(path).metadata for path in output_files]
+        bloom_metadata = [
+            row
+            for path in output_files
+            for row in con.sql(f"select path_in_schema, bloom_filter_offset from parquet_metadata('{path}')").fetchall()
+        ]
+    finally:
+        con.close()
+
+    assert rows == (4097, 25171968, 7)
+    assert metadata
+    assert sum(file_metadata.num_rows for file_metadata in metadata) == 4097
+    assert all(file_metadata.num_row_groups == (file_metadata.num_rows + 63) // 64 for file_metadata in metadata)
+    assert any(file_metadata.num_row_groups > 1 for file_metadata in metadata)
+    assert all("parquet-cpp-arrow" in file_metadata.created_by.lower() for file_metadata in metadata)
+    assert all(file_metadata.format_version == "1.0" for file_metadata in metadata)
+    assert bloom_metadata
+    y_bloom_offsets = [offset for path, offset in bloom_metadata if path == "y"]
+    repeated_bloom_offsets = [
+        offset for path, offset in bloom_metadata if path.split(", ", 1)[0] in {"samples", "attributes"}
+    ]
+    assert y_bloom_offsets and all(offset is not None for offset in y_bloom_offsets)
+    assert repeated_bloom_offsets and all(offset is None for offset in repeated_bloom_offsets)
+
+    copy_files = copy_result["files"]
+    assert sum(file_info["row_count"] for file_info in copy_files) == 4097
+    assert all(file_info["file_size_bytes"] > 0 for file_info in copy_files)
+    assert all(int(file_info["footer_size_bytes"]) > 0 for file_info in copy_files)
+    assert all(file_info["column_statistics"] is not None for file_info in copy_files)
+    for file_info in copy_files:
+        statistics = file_info["column_statistics"]
+        score_statistics = statistics[statistics.index('"score"') :]
+        score_statistics = score_statistics[: score_statistics.index("}")]
+        encoded_score_statistics = statistics[statistics.index('"encoded_score"') :]
+        encoded_score_statistics = encoded_score_statistics[: encoded_score_statistics.index("}")]
+        encoded_weight_statistics = statistics[statistics.index('"encoded_weight"') :]
+        encoded_weight_statistics = encoded_weight_statistics[: encoded_weight_statistics.index("}")]
+        weight_statistics = statistics[statistics.index('"weight"') :]
+        weight_statistics = weight_statistics[: weight_statistics.index("}")]
+        assert "has_nan=true" in score_statistics
+        assert "has_nan=true" in encoded_score_statistics
+        assert "has_nan=false" in encoded_weight_statistics
+        assert "has_nan=false" in weight_statistics
+        assert '"samples"."element"' in statistics
+        assert '"samples"."list"."element"' not in statistics
+        assert '"attributes"."key"' in statistics
+        assert '"attributes"."value"' in statistics
+        assert '"attributes"."key_value"' not in statistics
+        samples_statistics = statistics[statistics.index('"samples"."element"') :]
+        samples_statistics = samples_statistics[: samples_statistics.index("}")]
+        attributes_statistics = statistics[statistics.index('"attributes"."value"') :]
+        attributes_statistics = attributes_statistics[: attributes_statistics.index("}")]
+        assert "has_nan=true" in samples_statistics
+        assert "has_nan=true" in attributes_statistics
+        event_time_statistics = statistics[statistics.index('"event_time"') :]
+        event_time_statistics = event_time_statistics[: event_time_statistics.index("}")]
+        event_time_tz_statistics = statistics[statistics.index('"event_time_tz"') :]
+        event_time_tz_statistics = event_time_tz_statistics[: event_time_tz_statistics.index("}")]
+        clock_statistics = statistics[statistics.index('"clock"') :]
+        clock_statistics = clock_statistics[: clock_statistics.index("}")]
+        assert "1970-01-01 00:00:00" in event_time_statistics
+        assert ".000000" not in event_time_statistics
+        assert "1970-01-01 00:00:00+00" in event_time_tz_statistics
+        assert "Z" not in event_time_tz_statistics
+        assert "00:00:00" in clock_statistics
+        assert ".000000" not in clock_statistics
+
+    assert counters["udf_external_arrow_stream_export_count"] >= 1
+    assert counters["udf_direct_arrow_table_conversion_count"] == 0
+    assert counters["udf_python_export_under_client_context_lock_count"] == 0
+
+
+def test_local_runner_arrow_native_parquet_parallel_rotation_is_exact(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    def transform(table):
+        return pa.table({"value": pa.array(table.column("x").to_pylist(), type=pa.int64())})
+
+    _teardown_runner_if_supported()
+    try:
+        set_runner_local(num_workers=4, max_running_tasks=4)
+        runner = _runners.get_or_create_runner()
+        if getattr(runner, "name", None) != "local":
+            pytest.skip(f"Local runner not active, got runner={getattr(runner, 'name', None)!r}")
+
+        monkeypatch.setenv("VANE_RUNNER", "local")
+        output = tmp_path / "parallel_arrow_rotation.parquet"
+        escaped_output = str(output).replace("'", "''")
+        con = vane.connect()
+        try:
+            con.execute("SET preserve_insertion_order=false")
+            con.execute("SET threads=4")
+            relation = con.sql("select i::BIGINT as x from range(32769) t(i)").map_batches(
+                transform,
+                schema={"value": vane.sqltypes.BIGINT},
+                execution_backend="subprocess_task",
+                batch_size=2048,
+                output_batch_size=2048,
+            )
+            relation.query(
+                "parallel_arrow_rotation",
+                f"COPY parallel_arrow_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 2048, ROW_GROUPS_PER_FILE 1, DICTIONARY_SIZE_LIMIT 0)",
+            )
+        finally:
+            con.close()
+
+        metadata = [pq.ParquetFile(path).metadata for path in output.glob("*.parquet")]
+        assert len(metadata) == 17
+        assert sum(file_metadata.num_rows for file_metadata in metadata) == 32769
+        assert all(file_metadata.num_row_groups == 1 for file_metadata in metadata)
+        assert all(file_metadata.num_rows <= 2048 for file_metadata in metadata)
+    finally:
+        _teardown_runner_if_supported()
+
+
+def test_local_runner_arrow_native_parquet_rejects_duckdb_extension_scalars(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        return pa.table({"huge": pa.array(values, type=pa.decimal128(38, 0))})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_extension.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"huge": vane.sqltypes.HUGEINT},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="HUGEINT, UHUGEINT, and TIME WITH TIME ZONE"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_arrow_bool8(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [value % 2 for value in table.column("x").to_pylist()]
+        return pa.table({"flag": pa.array(values, type=pa.bool8())})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_bool8.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"flag": vane.sqltypes.BOOLEAN},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="arrow.bool8 is not supported by Arrow-native Parquet COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_dictionary_encoded_nested_values(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        dictionary = pa.array(
+            [{"reading": float("nan")}, {"reading": 1.0}],
+            type=pa.struct([pa.field("reading", pa.float64())]),
+        )
+        indices = pa.array([value % 2 for value in values], type=pa.int32())
+        return pa.table({"encoded": pa.DictionaryArray.from_arrays(indices, dictionary)})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_nested_dictionary.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"encoded": vane.struct_type({"reading": vane.sqltypes.DOUBLE})},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(
+            ValueError, match="Dictionary-encoded nested values are not supported by Arrow-native Parquet COPY"
+        ):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_v1_rejects_nanosecond_timestamps(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [datetime.datetime(1970, 1, 1)] * table.num_rows
+        return pa.table({"event_time": pa.array(values, type=pa.timestamp("ns"))})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_timestamp_ns.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"event_time": vane.sqltypes.TIMESTAMP_NS},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(
+            ValueError, match="Nanosecond Arrow timestamps are not supported by Arrow-native Parquet V1 COPY"
+        ):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_time_ns(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [43_200_123_456_789 + value for value in table.column("x").to_pylist()]
+        return pa.table({"clock": pa.array(values, type=pa.time64("ns"))})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_time_ns.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"clock": vane.sqltypes.TIME_NS},
+            execution_backend="subprocess_task",
+            batch_size=2,
+            output_batch_size=2,
+        )
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Parquet COPY"):
+            relation.query(
+                "arrow_time_ns",
+                f"COPY arrow_time_ns TO '{escaped_output}' (FORMAT PARQUET)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_nested_time_ns(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [43_200_123_456_789 + value for value in table.column("x").to_pylist()]
+        clock = pa.array(values, type=pa.time64("ns"))
+        payload = pa.StructArray.from_arrays([clock], names=["clock"])
+        return pa.table({"payload": payload})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_nested_time_ns.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"payload": vane.struct_type({"clock": vane.sqltypes.TIME_NS})},
+            execution_backend="subprocess_task",
+            batch_size=2,
+            output_batch_size=2,
+        )
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Parquet COPY"):
+            relation.query(
+                "arrow_nested_time_ns",
+                f"COPY arrow_nested_time_ns TO '{escaped_output}' (FORMAT PARQUET)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_v1_rejects_uinteger(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        return pa.table({"value": pa.array(values, type=pa.uint32())})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_uinteger.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.UINTEGER},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="UINTEGER is not supported by Arrow-native Parquet V1 COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_writes_lz4_raw(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        return pa.table({"value": table.column("x")})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_lz4_raw.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        relation.write_parquet(str(output), compression="lz4")
+        output_files = list(output.glob("*.parquet"))
+        compression = {
+            row[0]
+            for path in output_files
+            for row in con.sql(f"select distinct compression from parquet_metadata('{path}')").fetchall()
+        }
+    finally:
+        con.close()
+
+    assert output_files
+    assert compression == {"LZ4_RAW"}
+
+
+def test_local_runner_arrow_native_parquet_sizes_bloom_filter_from_actual_row_group(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        return pa.table({"value": table.column("x")})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_small_bloom_filter.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select 42::BIGINT as x").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+        )
+        relation.write_parquet(str(output), row_group_size=122_880)
+        output_files = list(output.glob("*.parquet"))
+        bloom_metadata = [
+            row
+            for path in output_files
+            for row in con.sql(
+                f"select row_group_num_rows, bloom_filter_length from parquet_metadata('{path}') "
+                "where path_in_schema = 'value'"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+    assert output_files
+    assert bloom_metadata
+    assert all(row_count == 1 and 0 < bloom_length < 1024 for row_count, bloom_length in bloom_metadata)
+
+
+def test_local_runner_arrow_native_parquet_rejects_schema_changes_across_rotated_files(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        arrow_type = pa.time32("ms") if values[0] == 0 else pa.time64("us")
+        return pa.table({"clock": pa.array([datetime.time()] * len(values), type=arrow_type)})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_schema_rotation.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"clock": vane.sqltypes.TIME},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+            # Keep the incompatible schemas in separate task results and Arrow streams.
+            task_input_max_bytes=1,
+        )
+        with pytest.raises(vane.InvalidInputException, match="Arrow schema changed during Arrow-native Parquet COPY"):
+            relation.query(
+                "arrow_schema_rotation",
+                f"COPY arrow_schema_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 1, ROW_GROUPS_PER_FILE 1)",
+            )
+    finally:
+        con.close()
+
+    assert len(list(output.glob("*.parquet"))) <= 1
+
+
+def test_local_runner_arrow_native_parquet_rejects_field_ids_across_rotated_streams(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        field_id = str(10 + values[0])
+        schema = pa.schema([pa.field("value", pa.int64(), metadata={"PARQUET:field_id": field_id})])
+        return pa.Table.from_arrays([pa.array(values, type=pa.int64())], schema=schema)
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_field_id_rotation.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+            task_input_max_bytes=1,
+        )
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="PARQUET:field_id metadata is not supported by Arrow-native Parquet COPY",
+        ):
+            relation.query(
+                "arrow_field_id_rotation",
+                f"COPY arrow_field_id_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 1, ROW_GROUPS_PER_FILE 1)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_duplicate_nested_field_ids(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        struct_type = pa.struct([pa.field("value", pa.int64(), metadata={"PARQUET:field_id": "7"})])
+        arrays = [
+            pa.array([{"value": value} for value in values], type=struct_type),
+            pa.array([{"value": value} for value in values], type=struct_type),
+        ]
+        return pa.Table.from_arrays(arrays, names=["left", "right"])
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_duplicate_nested_field_ids.parquet"
+    escaped_output = str(output).replace("'", "''")
+    nested_type = vane.struct_type({"value": vane.sqltypes.BIGINT})
+    con = vane.connect()
+    try:
+        relation = con.sql("select 1::BIGINT as x").map_batches(
+            transform,
+            schema={"left": nested_type, "right": nested_type},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+        )
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="PARQUET:field_id metadata is not supported by Arrow-native Parquet COPY",
+        ):
+            relation.query(
+                "arrow_duplicate_nested_field_ids",
+                f"COPY arrow_duplicate_nested_field_ids TO '{escaped_output}' (FORMAT PARQUET)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_file_size_rotation(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        return pa.table({"y": table.column("x")})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_file_size.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"y": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="FILE_SIZE_BYTES is not supported by Arrow-native Parquet COPY"):
+            relation.write_parquet(str(output), row_group_size=2, file_size_bytes=1024)
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
 
 
 def test_local_runner_direct_target_per_thread_output_allows_sequential_partitions(tmp_path, monkeypatch):

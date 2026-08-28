@@ -11,6 +11,7 @@
 #include "duckdb/execution/external_block.hpp"
 
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -77,6 +78,36 @@ unique_ptr<DataChunk> MaterializeExternalBlock(ClientContext &context, const Laz
 		}
 	}
 	return backend->Materialize(context, chunk);
+}
+
+unique_ptr<ArrowArrayStreamWrapper> ExportExternalBlockArrow(ClientContext &context, const LazyDataChunk &chunk) {
+	if (chunk.blocks.empty()) {
+		throw InvalidInputException("cannot export an empty LazyDataChunk as an Arrow stream");
+	}
+
+	auto backend_id = chunk.blocks[0].backend;
+	auto backend = GetExternalBlockBackend(backend_id);
+	if (!backend) {
+		throw InvalidInputException("no external block backend registered for %s",
+		                            ExternalBlockBackendName(backend_id));
+	}
+	for (auto &block : chunk.blocks) {
+		if (block.backend != backend_id) {
+			throw InvalidInputException("cannot export a LazyDataChunk with mixed external block backends as Arrow");
+		}
+		if (!backend->CanExportArrow(block)) {
+			throw InvalidInputException("external block backend cannot export this descriptor as Arrow");
+		}
+	}
+	auto result = backend->ExportArrow(context, chunk);
+	if (!result) {
+		throw InternalException("external block backend returned a null Arrow stream");
+	}
+	auto &stream = result->arrow_array_stream;
+	if (!stream.release || !stream.get_schema || !stream.get_next || !stream.get_last_error) {
+		throw InvalidInputException("external block backend returned an invalid Arrow stream");
+	}
+	return result;
 }
 
 ExternalBlockMaterializeResult MaterializeExternalBlockBarrier(ClientContext &context, const LazyDataChunk &chunk,

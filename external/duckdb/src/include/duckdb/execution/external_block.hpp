@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -151,11 +152,15 @@ public:
 
 	virtual bool CanMaterialize(const ExternalBlockDescriptor &desc) = 0;
 	virtual unique_ptr<DataChunk> Materialize(ClientContext &context, const LazyDataChunk &chunk) = 0;
+	virtual bool CanExportArrow(const ExternalBlockDescriptor &desc) = 0;
+	virtual unique_ptr<ArrowArrayStreamWrapper> ExportArrow(ClientContext &context, const LazyDataChunk &chunk) = 0;
 };
 
 DUCKDB_API void SetExternalBlockBackend(ExternalBlockBackend backend, shared_ptr<ExternalBlockBackendInterface> impl);
 DUCKDB_API shared_ptr<ExternalBlockBackendInterface> GetExternalBlockBackend(ExternalBlockBackend backend);
 DUCKDB_API unique_ptr<DataChunk> MaterializeExternalBlock(ClientContext &context, const LazyDataChunk &chunk);
+DUCKDB_API unique_ptr<ArrowArrayStreamWrapper> ExportExternalBlockArrow(ClientContext &context,
+                                                                        const LazyDataChunk &chunk);
 DUCKDB_API ExternalBlockMaterializeResult MaterializeExternalBlockBarrier(ClientContext &context,
                                                                           const LazyDataChunk &chunk,
                                                                           string reason = string());

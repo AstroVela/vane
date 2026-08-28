@@ -78,6 +78,7 @@ public:
 public:
 	// Sink interface
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkResultType SinkBatch(ExecutionContext &context, ExecutionBatch &batch, OperatorSinkInput &input) const override;
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
@@ -106,9 +107,12 @@ public:
 	static void ReturnStatistics(DataChunk &chunk, idx_t row_idx, CopyToFileInfo &written_file_info);
 
 private:
+	template <class INPUT>
+	idx_t SinkInternal(ExecutionContext &context, INPUT &copy_input, OperatorSinkInput &input) const;
+
 	unique_ptr<GlobalFunctionData> CreateFileState(ClientContext &context, GlobalSinkState &sink,
 	                                               StorageLockKey &global_lock) const;
 	void WriteRotateInternal(ExecutionContext &context, GlobalSinkState &global_state,
-	                         const std::function<void(GlobalFunctionData &)> &fun) const;
+	                         const std::function<void(GlobalFunctionData &)> &fun, bool atomic_rotation_write) const;
 };
 } // namespace duckdb

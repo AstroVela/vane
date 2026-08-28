@@ -6,6 +6,7 @@
 
 #include "parquet_extension.hpp"
 
+#include "arrow_parquet_writer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/parser/expression/positional_reference_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -40,8 +41,10 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/pragma_function.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -86,6 +89,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	//! This is huge but we grow it starting from 1 MB
 	idx_t string_dictionary_page_size_limit = PrimitiveColumnWriter::MAX_UNCOMPRESSED_DICT_PAGE_SIZE;
+	bool string_dictionary_page_size_limit_set = false;
 
 	bool enable_bloom_filters = true;
 	//! What false positive rate are we willing to accept for bloom filters
@@ -116,6 +120,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 		result->encryption_config = encryption_config;
 		result->dictionary_size_limit = dictionary_size_limit;
 		result->string_dictionary_page_size_limit = string_dictionary_page_size_limit;
+		result->string_dictionary_page_size_limit_set = string_dictionary_page_size_limit_set;
 		result->enable_bloom_filters = enable_bloom_filters;
 		result->bloom_filter_false_positive_ratio = bloom_filter_false_positive_ratio;
 		result->row_groups_per_file = row_groups_per_file;
@@ -126,6 +131,10 @@ struct ParquetWriteBindData : public TableFunctionData {
 		result->geoparquet_version = geoparquet_version;
 		return unique_ptr<FunctionData>(std::move(result));
 	}
+};
+
+struct ParquetWriteArrowGlobalState : public GlobalFunctionData {
+	ArrowParquetSchemaState schema_state;
 };
 
 void ParquetWriteGlobalState::LogFlushingRowGroup(const ColumnDataCollection &buffer, const string &reason) {
@@ -139,11 +148,27 @@ void ParquetWriteGlobalState::LogFlushingRowGroup(const ColumnDataCollection &bu
 	            {"reason", reason}});
 }
 
-ParquetWriteLocalState::ParquetWriteLocalState(ClientContext &context, const vector<LogicalType> &types)
-    : buffer(context, types) {
-	buffer.SetPartitionIndex(0); // Makes the buffer manager less likely to spill this data
-	buffer.InitializeAppend(append_state);
+struct ParquetWriteDataChunkLocalState {
+	ParquetWriteDataChunkLocalState(ClientContext &context, const vector<LogicalType> &types) : buffer(context, types) {
+		buffer.SetPartitionIndex(0); // Makes the buffer manager less likely to spill this data
+		buffer.InitializeAppend(append_state);
+	}
+
+	ColumnDataCollection buffer;
+	ColumnDataAppendState append_state;
+	//! If a column writer requires a transformation to a different shape, this owns the local transform.
+	unique_ptr<ParquetWriteTransformData> transform_data;
+};
+
+ParquetWriteLocalState::ParquetWriteLocalState() = default;
+
+ParquetWriteLocalState::~ParquetWriteLocalState() = default;
+
+ParquetWriteGlobalState::ParquetWriteGlobalState(ClientContext &context_p, FileSystem &fs_p, string file_path_p)
+    : context(context_p), fs(fs_p), file_path(std::move(file_path_p)) {
 }
+
+ParquetWriteGlobalState::~ParquetWriteGlobalState() = default;
 
 static void ParquetListCopyOptions(ClientContext &context, CopyOptionsInput &input) {
 	auto &copy_options = input.options;
@@ -317,6 +342,7 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 				    PrimitiveColumnWriter::MAX_UNCOMPRESSED_DICT_PAGE_SIZE);
 			}
 			bind_data->string_dictionary_page_size_limit = val;
+			bind_data->string_dictionary_page_size_limit_set = true;
 		} else if (loption == "write_bloom_filter") {
 			bind_data->enable_bloom_filters = BooleanValue::Get(option.second[0].DefaultCastAs(LogicalType::BOOLEAN));
 		} else if (loption == "bloom_filter_false_positive_ratio") {
@@ -378,24 +404,56 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 
 static unique_ptr<GlobalFunctionData> ParquetWriteInitializeGlobal(ClientContext &context, FunctionData &bind_data,
                                                                    const string &file_path) {
-	auto global_state = make_uniq<ParquetWriteGlobalState>();
-	auto &parquet_bind = bind_data.Cast<ParquetWriteBindData>();
-
 	auto &fs = FileSystem::GetFileSystem(context);
-	global_state->writer = make_uniq<ParquetWriter>(
-	    context, fs, file_path, parquet_bind.sql_types, parquet_bind.column_names, parquet_bind.codec,
-	    parquet_bind.field_ids.Copy(), parquet_bind.shredding_types.Copy(), parquet_bind.kv_metadata,
-	    parquet_bind.encryption_config, parquet_bind.dictionary_size_limit,
-	    parquet_bind.string_dictionary_page_size_limit, parquet_bind.enable_bloom_filters,
-	    parquet_bind.bloom_filter_false_positive_ratio, parquet_bind.compression_level, parquet_bind.parquet_version,
-	    parquet_bind.geoparquet_version);
-	return std::move(global_state);
+	return make_uniq<ParquetWriteGlobalState>(context, fs, file_path);
+}
+
+static unique_ptr<GlobalFunctionData> ParquetWriteInitializeArrowGlobal(ClientContext &, FunctionData &) {
+	return make_uniq<ParquetWriteArrowGlobalState>();
+}
+
+static ParquetWriter &GetDuckDBParquetWriter(ParquetWriteGlobalState &global_state, ParquetWriteBindData &bind_data) {
+	lock_guard<mutex> guard(global_state.lock);
+	if (global_state.arrow_writer) {
+		throw InvalidInputException("Cannot mix DataChunk and Arrow input in one Parquet COPY file");
+	}
+	if (!global_state.writer) {
+		global_state.writer = make_uniq<ParquetWriter>(
+		    global_state.context, global_state.fs, global_state.file_path, bind_data.sql_types, bind_data.column_names,
+		    bind_data.codec, bind_data.field_ids.Copy(), bind_data.shredding_types.Copy(), bind_data.kv_metadata,
+		    bind_data.encryption_config, bind_data.dictionary_size_limit, bind_data.string_dictionary_page_size_limit,
+		    bind_data.enable_bloom_filters, bind_data.bloom_filter_false_positive_ratio, bind_data.compression_level,
+		    bind_data.parquet_version, bind_data.geoparquet_version);
+		if (global_state.written_stats) {
+			global_state.writer->SetWrittenStatistics(*global_state.written_stats);
+		}
+	}
+	return *global_state.writer;
+}
+
+static ParquetWriteDataChunkLocalState &GetDataChunkParquetLocalState(ClientContext &context,
+                                                                      ParquetWriteBindData &bind_data,
+                                                                      ParquetWriteLocalState &local_state) {
+	if (local_state.arrow_state) {
+		throw InvalidInputException("Cannot mix DataChunk and Arrow input in one local Parquet COPY stream");
+	}
+	if (!local_state.data_chunk_state) {
+		local_state.data_chunk_state = make_uniq<ParquetWriteDataChunkLocalState>(context, bind_data.sql_types);
+	}
+	return *local_state.data_chunk_state;
 }
 
 static void ParquetWriteGetWrittenStatistics(ClientContext &context, FunctionData &bind_data,
                                              GlobalFunctionData &gstate, CopyFunctionFileStatistics &statistics) {
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
-	global_state.writer->SetWrittenStatistics(statistics);
+	lock_guard<mutex> guard(global_state.lock);
+	global_state.written_stats = &statistics;
+	if (global_state.writer) {
+		global_state.writer->SetWrittenStatistics(statistics);
+	}
+	if (global_state.arrow_writer) {
+		global_state.arrow_writer->SetWrittenStatistics(statistics);
+	}
 }
 
 static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
@@ -403,20 +461,169 @@ static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
+	auto &writer = GetDuckDBParquetWriter(global_state, bind_data);
+	auto &data_chunk_state = GetDataChunkParquetLocalState(context.client, bind_data, local_state);
 
 	// append data to the local (buffered) chunk collection
-	local_state.buffer.Append(local_state.append_state, input);
+	data_chunk_state.buffer.Append(data_chunk_state.append_state, input);
 
-	if (local_state.buffer.Count() >= bind_data.row_group_size ||
-	    local_state.buffer.SizeInBytes() >= bind_data.row_group_size_bytes) {
+	if (data_chunk_state.buffer.Count() >= bind_data.row_group_size ||
+	    data_chunk_state.buffer.SizeInBytes() >= bind_data.row_group_size_bytes) {
 		const string reason =
-		    local_state.buffer.Count() >= bind_data.row_group_size ? "ROW_GROUP_SIZE" : "ROW_GROUP_SIZE_BYTES";
-		global_state.LogFlushingRowGroup(local_state.buffer, reason);
+		    data_chunk_state.buffer.Count() >= bind_data.row_group_size ? "ROW_GROUP_SIZE" : "ROW_GROUP_SIZE_BYTES";
+		global_state.LogFlushingRowGroup(data_chunk_state.buffer, reason);
 		// if the chunk collection exceeds a certain size (rows/bytes) we flush it to the parquet file
-		local_state.append_state.current_chunk_state.handles.clear();
-		global_state.writer->Flush(local_state.buffer, local_state.transform_data);
-		local_state.buffer.InitializeAppend(local_state.append_state);
+		data_chunk_state.append_state.current_chunk_state.handles.clear();
+		writer.Flush(data_chunk_state.buffer, data_chunk_state.transform_data);
+		data_chunk_state.buffer.InitializeAppend(data_chunk_state.append_state);
 	}
+}
+
+static void RejectUnsupportedParquetTimeNs(const LogicalType &type) {
+	if (TypeVisitor::Contains(type, LogicalTypeId::TIME_NS)) {
+		throw NotImplementedException("TIME_NS is not supported by Parquet COPY");
+	}
+}
+
+static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data,
+                                        const ParquetWriteGlobalState &global_state) {
+	if (global_state.op && global_state.op->type == PhysicalOperatorType::COPY_TO_FILE &&
+	    global_state.op->Cast<PhysicalCopyToFile>().file_size_bytes.IsValid()) {
+		throw NotImplementedException("FILE_SIZE_BYTES is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.row_group_size == 0) {
+		throw InvalidInputException("ROW_GROUP_SIZE must be greater than zero for Arrow-native Parquet COPY");
+	}
+	if (bind_data.row_groups_per_file.IsValid() && bind_data.row_groups_per_file.GetIndex() == 0) {
+		throw InvalidInputException("ROW_GROUPS_PER_FILE must be greater than zero for Arrow-native Parquet COPY");
+	}
+	if (bind_data.row_group_size_bytes != NumericLimits<idx_t>::Maximum()) {
+		throw NotImplementedException("ROW_GROUP_SIZE_BYTES is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.encryption_config) {
+		throw NotImplementedException("ENCRYPTION_CONFIG is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.field_ids.ids && !bind_data.field_ids.ids->empty()) {
+		throw NotImplementedException("FIELD_IDS is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.shredding_types.set ||
+	    (bind_data.shredding_types.children.types && !bind_data.shredding_types.children.types->empty())) {
+		throw NotImplementedException("SHREDDING is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.dictionary_size_limit.IsValid() && bind_data.dictionary_size_limit.GetIndex() != 0) {
+		throw NotImplementedException("A positive DICTIONARY_SIZE_LIMIT is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.string_dictionary_page_size_limit_set) {
+		throw NotImplementedException(
+		    "STRING_DICTIONARY_PAGE_SIZE_LIMIT is not supported by Arrow-native Parquet COPY");
+	}
+	if (bind_data.parquet_version == ParquetVersion::V2) {
+		throw NotImplementedException("PARQUET_VERSION V2 is not supported by Arrow-native Parquet COPY");
+	}
+	for (const auto &type : bind_data.sql_types) {
+		RejectUnsupportedParquetTimeNs(type);
+		if (TypeVisitor::Contains(type, LogicalTypeId::UINTEGER)) {
+			throw NotImplementedException("UINTEGER is not supported by Arrow-native Parquet V1 COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::HUGEINT) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::UHUGEINT) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::TIME_TZ)) {
+			throw NotImplementedException(
+			    "HUGEINT, UHUGEINT, and TIME WITH TIME ZONE are not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::INTERVAL) || TypeVisitor::Contains(type, LogicalTypeId::UNION)) {
+			throw NotImplementedException("INTERVAL and UNION are not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::BIT) || TypeVisitor::Contains(type, LogicalTypeId::BIGNUM) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::AGGREGATE_STATE)) {
+			throw NotImplementedException(
+			    "BIT, BIGNUM, and AGGREGATE_STATE are not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT)) {
+			throw NotImplementedException("VARIANT is not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::GEOMETRY)) {
+			throw NotImplementedException("GEOMETRY is not supported by Arrow-native Parquet COPY");
+		}
+	}
+}
+
+static ArrowParquetWriterOptions GetArrowParquetWriterOptions(const ParquetWriteBindData &bind_data) {
+	ArrowParquetWriterOptions result;
+	result.codec = bind_data.codec;
+	result.row_group_size = bind_data.row_group_size;
+	result.disable_dictionary =
+	    bind_data.dictionary_size_limit.IsValid() && bind_data.dictionary_size_limit.GetIndex() == 0;
+	result.enable_bloom_filters = bind_data.enable_bloom_filters && !result.disable_dictionary;
+	result.bloom_filter_false_positive_ratio = bind_data.bloom_filter_false_positive_ratio;
+	result.compression_level = bind_data.compression_level;
+	result.key_value_metadata = bind_data.kv_metadata;
+	result.sql_types = bind_data.sql_types;
+	return result;
+}
+
+static idx_t ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
+                                   LocalFunctionData &lstate, CopyFunctionArrowInput &input) {
+	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
+	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
+	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
+	ValidateArrowParquetOptions(bind_data, global_state);
+	if (input.types != bind_data.sql_types) {
+		throw InvalidInputException("Arrow Parquet input types do not match the bound COPY schema");
+	}
+	if (local_state.data_chunk_state) {
+		throw InvalidInputException("Cannot mix DataChunk and Arrow input in one local Parquet COPY stream");
+	}
+
+	if (input.new_stream) {
+		if (!input.schema.release) {
+			throw InvalidInputException("Arrow Parquet input has no schema");
+		}
+		ArrowTableSchema table;
+		ArrowTableFunction::PopulateArrowTableSchema(context.client, table, input.schema);
+		if (table.GetTypes() != input.types) {
+			throw InvalidInputException("Arrow C schema does not match the bound Parquet COPY schema");
+		}
+		local_state.arrow_state = make_uniq<ArrowParquetLocalState>();
+		local_state.arrow_state->ImportSchema(input.schema, bind_data.column_names);
+		input.copy_state.Cast<ParquetWriteArrowGlobalState>().schema_state.Validate(*local_state.arrow_state);
+	}
+	if (!local_state.arrow_state) {
+		throw InternalException("Arrow Parquet sink received a record batch without stream state");
+	}
+	auto &arrow_state = *local_state.arrow_state;
+	if (input.new_batch) {
+		if (!input.array || !input.array->arrow_array.release) {
+			throw InvalidInputException("Arrow Parquet input has no record batch");
+		}
+		if (input.array->arrow_array.n_children != NumericCast<int64_t>(input.types.size())) {
+			throw InvalidInputException("Arrow Parquet array has %d columns but COPY expects %d",
+			                            input.array->arrow_array.n_children, input.types.size());
+		}
+		if (input.array->arrow_array.length < 0) {
+			throw InvalidInputException("Arrow Parquet input has a negative array length");
+		}
+		auto array_rows = NumericCast<idx_t>(input.array->arrow_array.length);
+		if (input.offset > array_rows || input.cardinality > array_rows - input.offset) {
+			throw InvalidInputException("Arrow Parquet input slice exceeds its record batch");
+		}
+		arrow_state.ImportRecordBatch(input.array->arrow_array);
+	}
+
+	lock_guard<mutex> guard(global_state.lock);
+	if (global_state.writer) {
+		throw InvalidInputException("Cannot mix DataChunk and Arrow input in one Parquet COPY file");
+	}
+	if (!global_state.arrow_writer) {
+		global_state.arrow_writer = make_uniq<ArrowParquetWriter>(global_state.fs, global_state.file_path, arrow_state,
+		                                                          GetArrowParquetWriterOptions(bind_data));
+		if (global_state.written_stats) {
+			global_state.arrow_writer->SetWrittenStatistics(*global_state.written_stats);
+		}
+	}
+	auto cardinality = MinValue<idx_t>(input.cardinality, global_state.arrow_writer->RowsUntilRowGroupBoundary());
+	global_state.arrow_writer->Write(arrow_state, input.offset, cardinality);
+	return cardinality;
 }
 
 static void ParquetWriteCombine(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
@@ -424,19 +631,24 @@ static void ParquetWriteCombine(ExecutionContext &context, FunctionData &bind_da
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
+	if (!local_state.data_chunk_state) {
+		return;
+	}
+	auto &data_chunk_state = *local_state.data_chunk_state;
+	auto &writer = GetDuckDBParquetWriter(global_state, bind_data);
 
-	if (local_state.buffer.Count() >= bind_data.row_group_size / 2 ||
-	    local_state.buffer.SizeInBytes() >= bind_data.row_group_size_bytes / 2) {
+	if (data_chunk_state.buffer.Count() >= bind_data.row_group_size / 2 ||
+	    data_chunk_state.buffer.SizeInBytes() >= bind_data.row_group_size_bytes / 2) {
 		// local state buffer is more than half of the row_group_size(_bytes), just flush it
-		global_state.LogFlushingRowGroup(local_state.buffer, "Combine");
-		global_state.writer->Flush(local_state.buffer, local_state.transform_data);
+		global_state.LogFlushingRowGroup(data_chunk_state.buffer, "Combine");
+		writer.Flush(data_chunk_state.buffer, data_chunk_state.transform_data);
 		return;
 	}
 
 	unique_lock<mutex> guard(global_state.lock);
 	if (global_state.combine_buffer) {
 		// There is still some data, combine it
-		global_state.combine_buffer->Combine(local_state.buffer);
+		global_state.combine_buffer->Combine(data_chunk_state.buffer);
 		if (global_state.combine_buffer->Count() >= bind_data.row_group_size / 2 ||
 		    global_state.combine_buffer->SizeInBytes() >= bind_data.row_group_size_bytes / 2) {
 			// After combining, the combine buffer is more than half of the row_group_size(_bytes), so we flush
@@ -444,30 +656,35 @@ static void ParquetWriteCombine(ExecutionContext &context, FunctionData &bind_da
 			guard.unlock();
 			global_state.LogFlushingRowGroup(*owned_combine_buffer, "Combine");
 			// Lock free, of course
-			global_state.writer->Flush(*owned_combine_buffer, local_state.transform_data);
+			writer.Flush(*owned_combine_buffer, data_chunk_state.transform_data);
 		}
 		return;
 	}
 
-	global_state.combine_buffer = make_uniq<ColumnDataCollection>(context.client, local_state.buffer.Types());
-	global_state.combine_buffer->Combine(local_state.buffer);
+	global_state.combine_buffer = make_uniq<ColumnDataCollection>(context.client, data_chunk_state.buffer.Types());
+	global_state.combine_buffer->Combine(data_chunk_state.buffer);
 }
 
-static void ParquetWriteFinalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
+static void ParquetWriteFinalize(ClientContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate) {
+	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
+	if (global_state.arrow_writer) {
+		global_state.arrow_writer->Finalize();
+		return;
+	}
+	auto &writer = GetDuckDBParquetWriter(global_state, bind_data);
 	// flush the combine buffer (if it's there)
 	if (global_state.combine_buffer) {
 		global_state.LogFlushingRowGroup(*global_state.combine_buffer, "Finalize");
-		global_state.writer->Flush(*global_state.combine_buffer, global_state.transform_data);
+		writer.Flush(*global_state.combine_buffer, global_state.transform_data);
 	}
 
 	// finalize: write any additional metadata to the file here
-	global_state.writer->Finalize();
+	writer.Finalize();
 }
 
 static unique_ptr<LocalFunctionData> ParquetWriteInitializeLocal(ExecutionContext &context, FunctionData &bind_data_p) {
-	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
-	return make_uniq<ParquetWriteLocalState>(context.client, bind_data.sql_types);
+	return make_uniq<ParquetWriteLocalState>();
 }
 
 // LCOV_EXCL_START
@@ -645,6 +862,11 @@ static void ParquetCopySerialize(Serializer &serializer, const FunctionData &bin
 	                                    default_value.geoparquet_version);
 	serializer.WritePropertyWithDefault<ShreddingType>(117, "shredding_types", bind_data.shredding_types,
 	                                                   default_value.shredding_types);
+	serializer.WritePropertyWithDefault(118, "string_dictionary_page_size_limit_set",
+	                                    bind_data.string_dictionary_page_size_limit_set,
+	                                    default_value.string_dictionary_page_size_limit_set);
+	serializer.WritePropertyWithDefault(119, "enable_bloom_filters", bind_data.enable_bloom_filters,
+	                                    default_value.enable_bloom_filters);
 }
 
 static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserializer, CopyFunction &function) {
@@ -680,6 +902,10 @@ static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserialize
 	    deserializer.ReadPropertyWithExplicitDefault(116, "geoparquet_version", default_value.geoparquet_version);
 	data->shredding_types =
 	    deserializer.ReadPropertyWithExplicitDefault<ShreddingType>(117, "shredding_types", ShreddingType());
+	data->string_dictionary_page_size_limit_set = deserializer.ReadPropertyWithExplicitDefault(
+	    118, "string_dictionary_page_size_limit_set", default_value.string_dictionary_page_size_limit_set);
+	data->enable_bloom_filters =
+	    deserializer.ReadPropertyWithExplicitDefault(119, "enable_bloom_filters", default_value.enable_bloom_filters);
 
 	return std::move(data);
 }
@@ -715,9 +941,11 @@ static unique_ptr<PreparedBatchData> ParquetWritePrepareBatch(ClientContext &con
                                                               GlobalFunctionData &gstate,
                                                               unique_ptr<ColumnDataCollection> collection) {
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
+	auto &parquet_bind = bind_data.Cast<ParquetWriteBindData>();
+	auto &writer = GetDuckDBParquetWriter(global_state, parquet_bind);
 	auto result = make_uniq<ParquetWriteBatchData>();
 	unique_ptr<ParquetWriteTransformData> transform_data;
-	global_state.writer->PrepareRowGroup(*collection, result->prepared_row_group, transform_data);
+	writer.PrepareRowGroup(*collection, result->prepared_row_group, transform_data);
 	return std::move(result);
 }
 
@@ -727,8 +955,10 @@ static unique_ptr<PreparedBatchData> ParquetWritePrepareBatch(ClientContext &con
 static void ParquetWriteFlushBatch(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                    PreparedBatchData &batch_p) {
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
+	auto &parquet_bind = bind_data.Cast<ParquetWriteBindData>();
+	auto &writer = GetDuckDBParquetWriter(global_state, parquet_bind);
 	auto &batch = batch_p.Cast<ParquetWriteBatchData>();
-	global_state.writer->FlushRowGroup(batch.prepared_row_group);
+	writer.FlushRowGroup(batch.prepared_row_group);
 }
 
 //===--------------------------------------------------------------------===//
@@ -751,11 +981,22 @@ static bool ParquetWriteRotateNextFile(GlobalFunctionData &gstate, FunctionData 
                                        const optional_idx &file_size_bytes) {
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
-	if (file_size_bytes.IsValid() && global_state.writer->FileSize() > file_size_bytes.GetIndex()) {
+	lock_guard<mutex> guard(global_state.lock);
+	idx_t file_size = 0;
+	idx_t row_groups = 0;
+	if (global_state.arrow_writer) {
+		file_size = global_state.arrow_writer->FileSize();
+		row_groups = global_state.arrow_writer->NumberOfRowGroups();
+	} else if (global_state.writer) {
+		file_size = global_state.writer->FileSize();
+		row_groups = global_state.writer->NumberOfRowGroups();
+	} else {
+		return false;
+	}
+	if (file_size_bytes.IsValid() && file_size > file_size_bytes.GetIndex()) {
 		return true;
 	}
-	if (bind_data.row_groups_per_file.IsValid() &&
-	    global_state.writer->NumberOfRowGroups() >= bind_data.row_groups_per_file.GetIndex()) {
+	if (bind_data.row_groups_per_file.IsValid() && row_groups >= bind_data.row_groups_per_file.GetIndex()) {
 		return true;
 	}
 	return false;
@@ -917,9 +1158,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.copy_to_bind = ParquetWriteBind;
 	function.copy_options = ParquetListCopyOptions;
 	function.copy_to_initialize_global = ParquetWriteInitializeGlobal;
+	function.copy_to_initialize_arrow_global = ParquetWriteInitializeArrowGlobal;
 	function.copy_to_initialize_local = ParquetWriteInitializeLocal;
 	function.copy_to_get_written_statistics = ParquetWriteGetWrittenStatistics;
 	function.copy_to_sink = ParquetWriteSink;
+	function.copy_to_sink_arrow = ParquetWriteArrowSink;
 	function.copy_to_combine = ParquetWriteCombine;
 	function.copy_to_finalize = ParquetWriteFinalize;
 	function.execution_mode = ParquetWriteExecutionMode;
