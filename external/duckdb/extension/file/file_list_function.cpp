@@ -185,24 +185,28 @@ static idx_t GlobPathBegin(const string &path) {
 	return scheme + 3;
 }
 
-static bool HasPathGlob(const string &path) {
+static optional_idx FindPathGlob(const string &path) {
 	auto begin = GlobPathBegin(path);
 	auto suffix = FindURISuffix(path);
 	auto end = suffix.IsValid() ? suffix.GetIndex() : path.size();
 	if (end <= begin) {
-		return false;
+		return optional_idx();
 	}
 	for (idx_t index = begin; index < end; index++) {
 		switch (path[index]) {
 		case '*':
 		case '?':
 		case '[':
-			return true;
+			return optional_idx(index);
 		default:
 			break;
 		}
 	}
-	return false;
+	return optional_idx();
+}
+
+static bool HasPathGlob(const string &path) {
+	return FindPathGlob(path).IsValid();
 }
 
 static string EscapeLiteralGlobPath(const string &path) {
@@ -242,6 +246,89 @@ static string AppendPathComponent(FileSystem &file_system, const string &path, c
 		return base + component + suffix;
 	}
 	return file_system.JoinPath(base, component) + suffix;
+}
+
+static string DiscoveryPathPrefix(FileSystem &file_system, const string &locator) {
+	auto path_end = FindURISuffix(locator);
+	auto end = path_end.IsValid() ? path_end.GetIndex() : locator.size();
+	auto glob = FindPathGlob(locator);
+	auto separator = file_system.PathSeparator(locator);
+	if (separator.empty()) {
+		return string();
+	}
+	if (glob.IsValid()) {
+		auto separator_offset = locator.rfind(separator, glob.GetIndex());
+		if (separator_offset == string::npos) {
+			return string();
+		}
+		return locator.substr(0, separator_offset + separator.size());
+	}
+	auto prefix = locator.substr(0, end);
+	if (!StringUtil::EndsWith(prefix, separator)) {
+		prefix += separator;
+	}
+	return prefix;
+}
+
+static string TrimLeadingURLSeparators(const string &path) {
+	idx_t offset = 0;
+	while (offset < path.size() && path[offset] == '/') {
+		offset++;
+	}
+	return path.substr(offset);
+}
+
+// Filesystem adapters can erase the caller's URI spelling while expanding a
+// glob (for example, file:// to a native path or memory:// to memory:///). Only
+// restore that spelling when the returned key is still below the caller's
+// stable, non-glob prefix; otherwise the provider result remains authoritative.
+static string NormalizeDiscoveredPath(FileSystem &file_system, const string &locator, const string &discovered_path) {
+	auto scheme_separator = locator.find("://");
+	if (scheme_separator == string::npos) {
+		return discovered_path;
+	}
+	auto discovered_scheme_separator = discovered_path.find("://");
+	if (discovered_scheme_separator != string::npos &&
+	    !StringUtil::CIEquals(locator.substr(0, scheme_separator),
+	                          discovered_path.substr(0, discovered_scheme_separator))) {
+		return discovered_path;
+	}
+
+	auto prefix = DiscoveryPathPrefix(file_system, locator);
+	if (prefix.empty()) {
+		return discovered_path;
+	}
+	string prefix_key;
+	string discovered_key;
+	if (IsNativePath(locator)) {
+		prefix_key = file_system.ConvertSeparators(file_system.ExpandPath(prefix));
+		discovered_key = file_system.ConvertSeparators(file_system.ExpandPath(discovered_path));
+	} else {
+		prefix_key = TrimLeadingURLSeparators(prefix.substr(scheme_separator + 3));
+		discovered_key = TrimLeadingURLSeparators(discovered_scheme_separator == string::npos
+		                                              ? discovered_path
+		                                              : discovered_path.substr(discovered_scheme_separator + 3));
+	}
+	if (prefix_key.empty()) {
+		return discovered_path;
+	}
+
+#ifdef _WIN32
+	auto matches_prefix = IsNativePath(locator) ? StringUtil::CIStartsWith(discovered_key, prefix_key)
+	                                            : StringUtil::StartsWith(discovered_key, prefix_key);
+#else
+	auto matches_prefix = StringUtil::StartsWith(discovered_key, prefix_key);
+#endif
+	if (!matches_prefix) {
+		return discovered_path;
+	}
+	auto suffix = discovered_key.substr(prefix_key.size());
+#ifdef _WIN32
+	if (IsNativePath(locator)) {
+		suffix = StringUtil::Replace(suffix, "\\", "/");
+	}
+#endif
+	return prefix + suffix;
 }
 
 static void VerifyNativeDirectoryAccessible(FileSystem &file_system, const string &path) {
@@ -327,7 +414,8 @@ static bool TryListConcreteDirectory(ClientContext &context, FileSystem &file_sy
 				    if (context.IsInterrupted()) {
 					    throw InterruptException();
 				    }
-				    info.path = ResolveListedPath(file_system, directory, info.path);
+				    info.path = NormalizeDiscoveredPath(file_system, directory,
+				                                        ResolveListedPath(file_system, directory, info.path));
 				    if (FileSystem::IsDirectory(info)) {
 					    if (recursive && (!native_directory || !IsNativeSymbolicLink(file_system, info.path)) &&
 					        scheduled_directories.insert(info.path).second) {
@@ -430,6 +518,9 @@ static vector<OpenFileInfo> ExpandGlob(FileSystem &file_system, const string &pa
 			                  path);
 		}
 		files = file_list->GetAllFiles();
+		for (auto &file : files) {
+			file.path = NormalizeDiscoveredPath(file_system, path, file.path);
+		}
 	} catch (const NotImplementedException &) {
 		throw NotImplementedException("list_files() filesystem '%s' does not support %s listing for path '%s'",
 		                              file_system.GetName(), explicit_glob ? "glob" : "directory", path);

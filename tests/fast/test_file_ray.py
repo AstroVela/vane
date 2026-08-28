@@ -74,6 +74,6 @@ def test_default_ray_discovers_connection_registered_filesystem_on_coordinator(m
         connection.close()
 
     assert sorted(rows, key=lambda row: row[0].url) == [
-        (vane.File("memory:///root/a.txt", "text/plain"),),
-        (vane.File("memory:///root/b.json", "application/json"),),
+        (vane.File("memory://root/a.txt", "text/plain"),),
+        (vane.File("memory://root/b.json", "application/json"),),
     ]
