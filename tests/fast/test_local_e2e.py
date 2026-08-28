@@ -333,6 +333,60 @@ def test_local_runner_arrow_native_parquet_v1_rejects_nanosecond_timestamps(loca
     assert not list(output.glob("*.parquet"))
 
 
+def test_local_runner_arrow_native_parquet_rejects_time_ns(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [43_200_123_456_789 + value for value in table.column("x").to_pylist()]
+        return pa.table({"clock": pa.array(values, type=pa.time64("ns"))})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_time_ns.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"clock": vane.sqltypes.TIME_NS},
+            execution_backend="subprocess_task",
+            batch_size=2,
+            output_batch_size=2,
+        )
+        with pytest.raises(ValueError, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_nested_time_ns(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [43_200_123_456_789 + value for value in table.column("x").to_pylist()]
+        clock = pa.array(values, type=pa.time64("ns"))
+        payload = pa.StructArray.from_arrays([clock], names=["clock"])
+        return pa.table({"payload": payload})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_nested_time_ns.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"payload": vane.struct_type({"clock": vane.sqltypes.TIME_NS})},
+            execution_backend="subprocess_task",
+            batch_size=2,
+            output_batch_size=2,
+        )
+        with pytest.raises(ValueError, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
 def test_local_runner_arrow_native_parquet_v1_rejects_uinteger(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 

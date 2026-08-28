@@ -515,6 +515,9 @@ static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data,
 		throw NotImplementedException("PARQUET_VERSION V2 is not supported by Arrow-native Parquet COPY");
 	}
 	for (const auto &type : bind_data.sql_types) {
+		if (TypeVisitor::Contains(type, LogicalTypeId::TIME_NS)) {
+			throw NotImplementedException("TIME_NS is not supported by Arrow-native Parquet COPY");
+		}
 		if (TypeVisitor::Contains(type, LogicalTypeId::UINTEGER)) {
 			throw NotImplementedException("UINTEGER is not supported by Arrow-native Parquet V1 COPY");
 		}
