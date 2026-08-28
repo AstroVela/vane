@@ -448,3 +448,58 @@ def test_file_reader_interrupt_cancels_only_the_active_operation():
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=2)
+
+
+def test_concurrent_file_reader_close_waits_for_complete_cleanup():
+    payload = bytes(range(256)) * (2 * 1024 * 1024 // 256)
+    server, server_thread, handler = _start_object_server(payload)
+    connection = vane.connect()
+    reader = None
+    read_thread = None
+    close_threads = []
+    close_started = [threading.Event(), threading.Event()]
+    close_finished = [threading.Event(), threading.Event()]
+    try:
+        connection.execute("SET http_proxy = ''")
+        url = f"http://127.0.0.1:{server.server_address[1]}/bucket/object.bin"
+        reader = vane.File(url).open(buffer_size=4096, connection=connection)
+        handler.block_reads = True
+
+        read_thread = threading.Thread(target=reader.read)
+        read_thread.start()
+        assert handler.read_started.wait(timeout=5)
+
+        def close_reader(index):
+            close_started[index].set()
+            reader.close()
+            close_finished[index].set()
+
+        close_threads = [threading.Thread(target=close_reader, args=(index,)) for index in range(2)]
+        for thread in close_threads:
+            thread.start()
+        assert all(started.wait(timeout=5) for started in close_started)
+
+        assert not close_finished[0].wait(timeout=0.2)
+        assert not close_finished[1].is_set()
+
+        handler.release_read.set()
+        read_thread.join(timeout=5)
+        for thread in close_threads:
+            thread.join(timeout=5)
+
+        assert not read_thread.is_alive()
+        assert all(not thread.is_alive() for thread in close_threads)
+        assert all(finished.is_set() for finished in close_finished)
+        assert reader.closed
+    finally:
+        handler.release_read.set()
+        if read_thread is not None:
+            read_thread.join(timeout=5)
+        for thread in close_threads:
+            thread.join(timeout=5)
+        if reader is not None:
+            reader.close()
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)

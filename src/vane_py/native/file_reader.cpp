@@ -23,32 +23,35 @@ namespace {
 
 class ReaderContextScope {
 public:
-	explicit ReaderContextScope(ClientContext &context_p) : context(context_p) {
-		// A reader operation is not a SQL query, so it owns the interrupt lifecycle
-		// inside RunFunctionInTransaction's public ClientContext lock boundary.
-		context.ClearInterrupt();
-	}
-
-	~ReaderContextScope() {
-		context.ClearInterrupt();
+	ReaderContextScope(ClientContext &context_p, const DuckDBPyConnection &connection_p,
+	                   uint64_t interrupt_generation_p)
+	    : context(context_p), connection(connection_p), interrupt_generation(interrupt_generation_p) {
 	}
 
 	void CheckInterrupted() const {
-		if (context.IsInterrupted()) {
+		if (connection.InterruptInProgress() || connection.InterruptGeneration() != interrupt_generation ||
+		    context.IsInterrupted()) {
 			throw InterruptException();
 		}
 	}
 
 private:
 	ClientContext &context;
+	const DuckDBPyConnection &connection;
+	const uint64_t interrupt_generation;
 };
 
 template <class FUNC>
-void RunReaderContextOperation(ClientContext &context, FUNC &&operation) {
+void RunReaderContextOperation(ClientContext &context, DuckDBPyConnection &connection, uint64_t interrupt_generation,
+                               FUNC &&operation) {
+	// The caller captures the generation when the reader operation becomes active.
+	// It preserves an interrupt that races with this stale-state reset or with
+	// RunFunctionInTransaction's auto-transaction startup reset.
+	context.ClearInterrupt();
 	std::exception_ptr operation_error;
 	context.RunFunctionInTransaction(
 	    [&]() {
-		    ReaderContextScope context_scope(context);
+		    ReaderContextScope context_scope(context, connection, interrupt_generation);
 		    try {
 			    context_scope.CheckInterrupted();
 			    operation(context_scope);
@@ -104,12 +107,13 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 	}
 	auto reference = FileReference::FromValue(file.ToValue(), "File.open");
 	auto context = connection->con.GetConnection().context;
+	auto interrupt_generation = connection->InterruptGeneration();
 	unique_ptr<ResolvedFile> resolved;
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
 		unique_lock<mutex> connection_guard(connection->py_connection_lock);
-		RunReaderContextOperation(*context,
+		RunReaderContextOperation(*context, *connection, interrupt_generation,
 		                          [&](ReaderContextScope &) { resolved = ResolvedFile::Open(*context, reference); });
 	}
 	return shared_ptr<PythonFileReaderHandle>(new PythonFileReaderHandle(
@@ -176,17 +180,20 @@ py::bytes PythonFileReaderHandle::Read(int64_t size) {
 		auto requested_size = size < 0 ? remaining : MinValue<uint64_t>(remaining, NumericCast<uint64_t>(size));
 		if (requested_size > 0) {
 			auto initial_position = position;
+			auto interrupt_generation = connection->InterruptGeneration();
 			try {
 				unique_lock<mutex> connection_guard(connection->py_connection_lock);
-				RunReaderContextOperation(*context, [&](ReaderContextScope &context_scope) {
-					result.resize(NumericCast<idx_t>(requested_size));
-					context_scope.CheckInterrupted();
-					auto read_size =
-					    ReadLocked(reinterpret_cast<data_ptr_t>(result.data()), NumericCast<idx_t>(requested_size));
-					if (read_size != requested_size) {
-						throw InternalException("FILE reader produced fewer bytes than its bounded logical request");
-					}
-				});
+				RunReaderContextOperation(
+				    *context, *connection, interrupt_generation, [&](ReaderContextScope &context_scope) {
+					    result.resize(NumericCast<idx_t>(requested_size));
+					    context_scope.CheckInterrupted();
+					    auto read_size =
+					        ReadLocked(reinterpret_cast<data_ptr_t>(result.data()), NumericCast<idx_t>(requested_size));
+					    if (read_size != requested_size) {
+						    throw InternalException(
+						        "FILE reader produced fewer bytes than its bounded logical request");
+					    }
+				    });
 			} catch (...) {
 				position = initial_position;
 				throw;
@@ -271,23 +278,27 @@ py::object PythonFileReaderHandle::GuessMimeType() {
 		py::gil_scoped_release release;
 		unique_lock<mutex> reader_guard(lock);
 		RequireOpen();
+		auto interrupt_generation = connection->InterruptGeneration();
 		unique_lock<mutex> connection_guard(connection->py_connection_lock);
-		RunReaderContextOperation(*context, [&](ReaderContextScope &) { found = resolved->GuessMimeType(result); });
+		RunReaderContextOperation(*context, *connection, interrupt_generation,
+		                          [&](ReaderContextScope &) { found = resolved->GuessMimeType(result); });
 	}
 	return found ? py::cast(std::move(result)) : py::none();
 }
 
 void PythonFileReaderHandle::Close() {
-	if (closed.exchange(true)) {
-		return;
-	}
+	closed.store(true);
+	unique_lock<mutex> reader_guard(lock, std::defer_lock);
 	{
 		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
-		unique_lock<mutex> reader_guard(lock);
+		reader_guard.lock();
 		resolved.reset();
 		buffer.clear();
 	}
+	// Keep the reader lock across GIL reacquisition and release of the retained
+	// context/connection. Every concurrent close therefore returns only after the
+	// complete cleanup has finished.
 	context.reset();
 	connection.reset();
 }

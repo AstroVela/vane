@@ -2681,7 +2681,23 @@ void DuckDBPyConnection::Close() {
 
 void DuckDBPyConnection::Interrupt() {
 	auto &connection = con.GetConnection();
-	connection.Interrupt();
+	interrupts_in_progress.fetch_add(1);
+	try {
+		connection.Interrupt();
+	} catch (...) {
+		interrupts_in_progress.fetch_sub(1);
+		throw;
+	}
+	interrupt_generation.fetch_add(1);
+	interrupts_in_progress.fetch_sub(1);
+}
+
+uint64_t DuckDBPyConnection::InterruptGeneration() const {
+	return interrupt_generation.load();
+}
+
+bool DuckDBPyConnection::InterruptInProgress() const {
+	return interrupts_in_progress.load() != 0;
 }
 
 double DuckDBPyConnection::QueryProgress() {
