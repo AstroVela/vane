@@ -88,6 +88,16 @@ static DuckPhysicalPlanRef MakeScanPlanWithRoot() {
 	return plan;
 }
 
+static DuckPhysicalPlanRef MakeEmptyScanPlanWithRoot(const vector<LogicalType> &types) {
+	Allocator &alloc = Allocator::DefaultAllocator();
+	auto plan = std::make_shared<PhysicalPlan>(alloc);
+	auto collection = make_uniq<ColumnDataCollection>(alloc, types);
+	auto &scan =
+	    plan->Make<PhysicalColumnDataScan>(types, PhysicalOperatorType::COLUMN_DATA_SCAN, 0, std::move(collection));
+	plan->SetRoot(scan);
+	return plan;
+}
+
 static JoinCondition MakeJoinCondition(ExpressionType comparison, idx_t left_index = 0, idx_t right_index = 0) {
 	JoinCondition condition;
 	condition.left = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, left_index);
@@ -117,6 +127,16 @@ static WorkerTask MakeWorkerTaskWithInput(NodeID node_id, const std::string &nod
                                           const std::string &input_bytes) {
 	WorkerTask task(TaskContext::from_node_context(1, node_id, static_cast<TaskID>(node_id)), MakeScanPlanWithRoot(),
 	                DuckDBExecutionConfigRef(), PipelineNodeContext(1, "join-query", node_id, node_name).to_hashmap());
+	task.mutable_inputs()[source_node_id] = TaskInput::make_scan_split_batch(input_bytes);
+	return task;
+}
+
+static WorkerTask MakeWorkerTaskWithTypesAndInput(NodeID node_id, const std::string &node_name,
+                                                  SourceNodeId source_node_id, const std::string &input_bytes,
+                                                  const vector<LogicalType> &types) {
+	WorkerTask task(TaskContext::from_node_context(1, node_id, static_cast<TaskID>(node_id)),
+	                MakeEmptyScanPlanWithRoot(types), DuckDBExecutionConfigRef(),
+	                PipelineNodeContext(1, "join-query", node_id, node_name).to_hashmap());
 	task.mutable_inputs()[source_node_id] = TaskInput::make_scan_split_batch(input_bytes);
 	return task;
 }
@@ -441,6 +461,59 @@ TEST_CASE("PhysicalPlanTranslator: normalizes range joins to a gathered nested-l
 	}
 }
 
+TEST_CASE("PhysicalPlanTranslator: preserves range join projection maps", "[distributed][join][nested_loop_join]") {
+	Allocator allocator;
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> left_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<LogicalType> right_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                                    LogicalType::BIGINT};
+	auto &left = plan->Make<PhysicalColumnDataScan>(left_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 2,
+	                                                MakeCollection(left_types, 2));
+	auto &right = plan->Make<PhysicalColumnDataScan>(right_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 3,
+	                                                 MakeCollection(right_types, 3));
+	LogicalComparisonJoin logical_join(JoinType::LEFT);
+	logical_join.types = output_types;
+	logical_join.left_projection_map = {0, 1};
+	logical_join.right_projection_map = {0, 1};
+	vector<JoinCondition> conditions;
+	conditions.push_back(MakeJoinCondition(ExpressionType::COMPARE_GREATERTHANOREQUALTO, 0, 0));
+	conditions.push_back(MakeJoinCondition(ExpressionType::COMPARE_LESSTHAN, 0, 2));
+	auto &join = plan->Make<PhysicalIEJoin>(logical_join, left, right, std::move(conditions), JoinType::LEFT, 2);
+	plan->SetRoot(join);
+
+	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
+	REQUIRE(result.ok);
+	auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
+	REQUIRE(join_node != nullptr);
+	REQUIRE(join_node->left_projection_map_ == vector<idx_t> {0, 1});
+	REQUIRE(join_node->right_projection_map_ == vector<idx_t> {0, 1});
+
+	auto left_task =
+	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(10, "left", 10, "left_scan", left_types));
+	auto right_task =
+	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", right_types));
+	TaskIDCounter task_id_counter;
+	auto join_task =
+	    join_node->BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+	REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::PROJECTION);
+	auto &project = join_task.task()->plan()->Root().Cast<PhysicalProjection>();
+	REQUIRE(project.GetTypes() == output_types);
+	REQUIRE(project.children.size() == 1);
+	REQUIRE(project.children[0].get().type == PhysicalOperatorType::NESTED_LOOP_JOIN);
+	REQUIRE(project.children[0].get().GetTypes().size() == 5);
+	REQUIRE(project.select_list.size() == 4);
+	for (idx_t index = 0; index < project.select_list.size(); index++) {
+		REQUIRE(project.select_list[index]->Cast<BoundReferenceExpression>().index == index);
+	}
+
+	auto cloned = ClonePhysicalPlanOrThrow(join_task.task()->plan(), "range_join_projection_test", nullptr);
+	REQUIRE(cloned->Root().type == PhysicalOperatorType::PROJECTION);
+	REQUIRE(cloned->Root().GetTypes() == output_types);
+	REQUIRE(cloned->Root().children[0].get().type == PhysicalOperatorType::NESTED_LOOP_JOIN);
+}
+
 TEST_CASE("PhysicalPlanTranslator: translates blockwise nested-loop joins", "[distributed][join][nested_loop_join]") {
 	Allocator allocator;
 	auto plan = std::make_shared<PhysicalPlan>(allocator);
@@ -656,6 +729,36 @@ TEST_CASE("NestedLoopJoinNode: replacement tasks own both inputs", "[distributed
 		auto cloned = ClonePhysicalPlanOrThrow(join_task.task()->plan(), "blockwise_owned_children_test", nullptr);
 		REQUIRE(cloned->Root().type == PhysicalOperatorType::BLOCKWISE_NL_JOIN);
 		REQUIRE(cloned->Root().GetTypes() == output_types);
+	}
+
+	SECTION("nested comparison types fall back to blockwise execution") {
+		auto list_type = LogicalType::LIST(LogicalType::BIGINT);
+		vector<LogicalType> list_output_types = {list_type, list_type};
+		vector<JoinCondition> conditions;
+		JoinCondition condition;
+		condition.left = make_uniq<BoundReferenceExpression>(list_type, 0);
+		condition.right = make_uniq<BoundReferenceExpression>(list_type, 0);
+		condition.comparison = ExpressionType::COMPARE_LESSTHAN;
+		conditions.push_back(std::move(condition));
+		NestedLoopJoinNode node(305, plan_cfg, PhysicalOperatorType::PIECEWISE_MERGE_JOIN, std::move(conditions),
+		                        nullptr, JoinType::INNER, list_output_types, 1, nullptr, nullptr,
+		                        MakeSchemaRef(list_output_types));
+		auto left_task =
+		    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(10, "left", 10, "left_scan", {list_type}));
+		auto right_task =
+		    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", {list_type}));
+		TaskIDCounter task_id_counter;
+		auto join_task =
+		    node.BuildNestedLoopJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+		REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::BLOCKWISE_NL_JOIN);
+		auto &join = join_task.task()->plan()->Root().Cast<PhysicalBlockwiseNLJoin>();
+		auto &comparison = join.condition->Cast<BoundComparisonExpression>();
+		REQUIRE(comparison.left->Cast<BoundReferenceExpression>().index == 0);
+		REQUIRE(comparison.right->Cast<BoundReferenceExpression>().index == 1);
+		auto cloned = ClonePhysicalPlanOrThrow(join_task.task()->plan(), "nested_type_blockwise_test", nullptr);
+		REQUIRE(cloned->Root().type == PhysicalOperatorType::BLOCKWISE_NL_JOIN);
+		REQUIRE(cloned->Root().GetTypes() == list_output_types);
 	}
 }
 

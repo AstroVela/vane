@@ -25,7 +25,8 @@ public:
 	                   duckdb::vector<JoinCondition> conditions, unique_ptr<Expression> predicate, JoinType join_type,
 	                   duckdb::vector<LogicalType> output_types, idx_t estimated_cardinality,
 	                   std::shared_ptr<DistributedPipelineNode> left, std::shared_ptr<DistributedPipelineNode> right,
-	                   SchemaRef schema);
+	                   SchemaRef schema, duckdb::vector<idx_t> left_projection_map = {},
+	                   duckdb::vector<idx_t> right_projection_map = {});
 
 	NestedLoopJoinNode(NodeID node_id, const PlanConfig &plan_config, unique_ptr<Expression> condition,
 	                   JoinType join_type, duckdb::vector<LogicalType> output_types, idx_t estimated_cardinality,
@@ -61,6 +62,8 @@ private:
 	unique_ptr<Expression> arbitrary_condition_;
 	JoinType join_type_;
 	duckdb::vector<LogicalType> output_types_;
+	duckdb::vector<idx_t> left_projection_map_;
+	duckdb::vector<idx_t> right_projection_map_;
 	idx_t estimated_cardinality_;
 	std::shared_ptr<DistributedPipelineNode> left_;
 	std::shared_ptr<DistributedPipelineNode> right_;

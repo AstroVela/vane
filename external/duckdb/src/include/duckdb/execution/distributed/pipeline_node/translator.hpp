@@ -26,6 +26,7 @@ class PhysicalHashJoin;
 class PhysicalComparisonJoin;
 class PhysicalBlockwiseNLJoin;
 class PhysicalNestedLoopJoin;
+class PhysicalRangeJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
 class PhysicalDummyScan;
@@ -153,7 +154,7 @@ private:
 	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
-	TranslateRangeJoin(const PhysicalComparisonJoin &op,
+	TranslateRangeJoin(const PhysicalRangeJoin &op,
 	                   const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
@@ -162,7 +163,9 @@ private:
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateComparisonNestedLoopJoin(const PhysicalComparisonJoin &op, const Expression *predicate,
-	                                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+	                                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children,
+	                                  duckdb::vector<idx_t> left_projection_map = {},
+	                                  duckdb::vector<idx_t> right_projection_map = {});
 
 	std::shared_ptr<DistributedPipelineNode>
 	TranslateHashGroupBy(const PhysicalHashAggregate &op,

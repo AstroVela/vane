@@ -3897,6 +3897,25 @@ def test_ray_piecewise_merge_join(ray_runner, duckdb_conn):
     )
 
 
+def test_ray_piecewise_merge_join_nested_values(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: piecewise merge join nested values"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS l
+        JOIN (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS r
+          ON l.x < r.x
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["PIECEWISE_MERGE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_ie_join(ray_runner, duckdb_conn):
     label = "test_ray_e2e: ie join"
     duckdb_conn.execute("SET nested_loop_join_threshold=0")
@@ -3911,6 +3930,38 @@ def test_ray_ie_join(ray_runner, duckdb_conn):
         JOIN (VALUES (0, 2), (3, 5), (6, 9)) AS r(begin_value, end_value)
           ON l.begin_value < r.end_value
          AND l.end_value > r.begin_value
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["IE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_ie_join_preserves_asof_projection(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: IE join ASOF projection"
+    duckdb_conn.execute("SET debug_asof_iejoin=true")
+    sql = """
+        SELECT
+            l.ts AS left_ts,
+            l.value AS left_value,
+            r.ts AS right_ts,
+            r.value AS right_value
+        FROM (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 10),
+                (TIMESTAMP '2026-01-01 00:00:03', 30)
+        ) AS l(ts, value)
+        ASOF LEFT JOIN (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 100),
+                (TIMESTAMP '2026-01-01 00:00:02', 200)
+        ) AS r(ts, value)
+          ON l.ts >= r.ts
     """
 
     _run_query_case(

@@ -24,6 +24,7 @@
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
+#include "duckdb/execution/operator/join/physical_range_join.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -87,24 +88,39 @@ duckdb::vector<std::string> BuildCrossProductOutputNames(const SchemaRef &left_s
 }
 
 duckdb::vector<std::string> BuildComparisonJoinOutputNames(JoinType join_type, const SchemaRef &left_schema,
-                                                           const SchemaRef &right_schema, idx_t output_count) {
+                                                           const SchemaRef &right_schema, idx_t output_count,
+                                                           const duckdb::vector<idx_t> &left_projection_map = {},
+                                                           const duckdb::vector<idx_t> &right_projection_map = {}) {
 	if (!left_schema || !right_schema) {
 		return {};
 	}
 
 	duckdb::vector<std::string> output_names;
+	bool names_valid = true;
+	auto append_names = [&](const SchemaRef &schema, const duckdb::vector<idx_t> &projection_map) {
+		auto names = duckdb::distributed::GetSchemaNames(schema);
+		if (projection_map.empty()) {
+			output_names.insert(output_names.end(), names.begin(), names.end());
+			return;
+		}
+		for (auto index : projection_map) {
+			if (index >= names.size()) {
+				names_valid = false;
+				return;
+			}
+			output_names.push_back(names[index]);
+		}
+	};
 	if (JoinOutputsLeft(join_type)) {
-		auto left_names = duckdb::distributed::GetSchemaNames(left_schema);
-		output_names.insert(output_names.end(), left_names.begin(), left_names.end());
+		append_names(left_schema, left_projection_map);
 	}
 	if (JoinOutputsRight(join_type)) {
-		auto right_names = duckdb::distributed::GetSchemaNames(right_schema);
-		output_names.insert(output_names.end(), right_names.begin(), right_names.end());
+		append_names(right_schema, right_projection_map);
 	}
 	if (join_type == JoinType::MARK) {
 		output_names.push_back("mark");
 	}
-	if (output_names.size() != output_count) {
+	if (!names_valid || output_names.size() != output_count) {
 		return {};
 	}
 	return output_names;
@@ -462,13 +478,15 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateRangeJoin(
-    const PhysicalComparisonJoin &range_join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
-	return TranslateComparisonNestedLoopJoin(range_join, nullptr, children);
+    const PhysicalRangeJoin &range_join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	return TranslateComparisonNestedLoopJoin(range_join, nullptr, children, range_join.left_projection_map,
+	                                         range_join.right_projection_map);
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateComparisonNestedLoopJoin(
     const PhysicalComparisonJoin &join, const Expression *predicate,
-    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children, duckdb::vector<idx_t> left_projection_map,
+    duckdb::vector<idx_t> right_projection_map) {
 	if (children.size() != 2 || !children[0] || !children[1]) {
 		throw InvalidInputException("Distributed %s requires exactly two input nodes", EnumUtil::ToString(join.type));
 	}
@@ -476,7 +494,8 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	SchemaRef schema = nullptr;
 	if (!join.GetTypes().empty()) {
 		auto output_names = BuildComparisonJoinOutputNames(join.join_type, children[0]->config().schema(),
-		                                                   children[1]->config().schema(), join.GetTypes().size());
+		                                                   children[1]->config().schema(), join.GetTypes().size(),
+		                                                   left_projection_map, right_projection_map);
 		schema = output_names.empty() ? MakeSchemaRef(join.GetTypes()) : MakeSchemaRef(join.GetTypes(), output_names);
 	}
 
@@ -488,7 +507,8 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	return std::make_shared<NestedLoopJoinNode>(
 	    get_next_pipeline_node_id(), plan_config_, join.type, CopyJoinConditions(join.conditions),
 	    predicate ? predicate->Copy() : nullptr, join.join_type, join.GetTypes(), join.estimated_cardinality,
-	    std::move(left), std::move(right), std::move(schema));
+	    std::move(left), std::move(right), std::move(schema), std::move(left_projection_map),
+	    std::move(right_projection_map));
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateBlockwiseNLJoin(
