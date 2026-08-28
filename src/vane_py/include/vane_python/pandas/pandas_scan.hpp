@@ -57,6 +57,10 @@ public:
 	// Helper function that transform pandas df names to make them work with our binder
 	static py::object PandasReplaceCopiedNames(const py::object &original_df);
 
+	//! Return the DataFrame retained by bound pandas_scan data.
+	//! Used by the Ray planner to create a process-independent Arrow snapshot.
+	static py::object GetDataFrame(const FunctionData &bind_data);
+
 	static void PandasBackendScanSwitch(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out);
 
 	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,

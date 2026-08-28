@@ -1,0 +1,151 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import pickle
+
+import pandas as pd
+import pyarrow as pa
+import pytest
+
+try:
+    import ray
+except Exception:
+    ray = None
+
+import vane
+from vane import runners
+
+pytestmark = [
+    pytest.mark.skipif(ray is None, reason="ray not installed"),
+    pytest.mark.usefixtures("ray_local"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _ray_execution_env(monkeypatch):
+    monkeypatch.setenv("VANE_SHUFFLE_ALGORITHM", "flight_shuffle")
+    monkeypatch.setenv("VANE_SHUFFLE_LOCAL_DIRS", "/tmp/duckdb_shuffle")
+    monkeypatch.setenv("RAY_DEDUP_LOGS", "0")
+
+
+@pytest.fixture
+def connection():
+    con = vane.connect()
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def _memory_relation(con, source_kind: str, row_count: int):
+    values = range(row_count)
+    if source_kind == "pandas":
+        return con.from_df(pd.DataFrame({"id": values, "value": [value * 10 for value in values]}))
+    if source_kind == "arrow":
+        return con.from_arrow(
+            pa.table(
+                {
+                    "id": pa.array(values, type=pa.int64()),
+                    "value": pa.array((value * 10 for value in values), type=pa.int64()),
+                }
+            )
+        )
+    raise AssertionError(f"unknown source kind: {source_kind}")
+
+
+@pytest.mark.parametrize("source_kind", ["pandas", "arrow"])
+def test_python_memory_plan_uses_compact_query_owned_object_ref(connection, source_kind):
+    relation = _memory_relation(connection, source_kind, 100_000)
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"compact-{source_kind}-memory-source")
+    serialized = pickle.dumps(logical)
+
+    assert logical._memory_source_ref_count_for_test() == 1
+    assert len(serialized) < 64 * 1024
+
+    restored = pickle.loads(serialized)
+    assert restored._memory_source_ref_count_for_test() == 1
+    physical = restored.to_physical_plan(connection)
+    assert physical._memory_source_ref_count_for_test() == 1
+    split_batches = physical.scan_split_batch_map()
+    assert [len(batches) for batches in split_batches.values()] == [1]
+    assert sum(len(batch) for batches in split_batches.values() for batch in batches) < 4096
+
+
+def test_repeated_arrow_source_is_snapshotted_once(connection, monkeypatch):
+    from vane.datasource import _memory
+
+    source = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    snapshot_calls = 0
+    original = _memory._as_arrow_table
+
+    def count_snapshot(value, source_kind):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original(value, source_kind)
+
+    monkeypatch.setattr(_memory, "_as_arrow_table", count_snapshot)
+    left = connection.from_arrow(source).set_alias("left_source")
+    right = connection.from_arrow(source).set_alias("right_source")
+    relation = left.join(right, "left_source.id = right_source.id")
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "deduplicated-arrow-memory-source")
+
+    assert snapshot_calls == 1
+    assert logical._memory_source_ref_count_for_test() == 1
+    physical = logical.to_physical_plan(connection)
+    assert sorted(len(batches) for batches in physical.scan_split_batch_map().values()) == [1, 1]
+
+
+def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connection):
+    row_count = 1_200_000
+    relation = connection.from_arrow(
+        pa.table(
+            {
+                "id": pa.array(range(row_count), type=pa.int64()),
+                "value": pa.array(range(row_count), type=pa.int64()),
+            }
+        )
+    )
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "partitioned-arrow-memory-source")
+    physical = logical.to_physical_plan(connection)
+
+    assert len(pickle.dumps(logical)) < 64 * 1024
+    assert logical._memory_source_ref_count_for_test() == 2
+    assert physical._memory_source_ref_count_for_test() == 2
+    assert [len(batches) for batches in physical.scan_split_batch_map().values()] == [2]
+
+
+def test_pandas_and_arrow_memory_relations_execute_through_ray(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+
+    for source_kind in ("pandas", "arrow"):
+        relation = _memory_relation(connection, source_kind, 4).filter("id >= 2").project("id, value * 2")
+        result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+        rows = sorted(zip(result.column(0).to_pylist(), result.column(1).to_pylist(), strict=True))
+        assert rows == [(2, 40), (3, 60)]
+
+
+def test_pandas_snapshot_preserves_bound_object_integer_type(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    source = pd.DataFrame({"small_integer": pd.Series([1, 2, None], dtype=object)})
+    relation = connection.from_df(source).project("small_integer + 1")
+
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == [2, 3, None]
+
+
+def test_bare_arrow_stream_capsule_executes_through_ray(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    source = pa.table({"id": [1, 2, 3]}).__arrow_c_stream__()
+
+    result = pa.concat_tables(list(runner.run_iter_tables(connection.from_arrow(source))))
+
+    assert result.column(0).to_pylist() == [1, 2, 3]

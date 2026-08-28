@@ -452,6 +452,35 @@ void DataSourceStreamFactory::ReleaseSource(const char *pickled_source, idx_t pi
 // Creates a DuckDB Relation backed by datasource_scan.
 // Called from Python: con.from_datasource(source)
 
+unique_ptr<DataSourceScanBindData> CreateRayMemoryDataSourceScanBind(ClientContext &context, const string &source_id,
+                                                                     const py::object &arrow_schema,
+                                                                     const py::object &tasks) {
+	if (source_id.empty()) {
+		throw InvalidInputException("Ray memory datasource source ID must not be empty");
+	}
+
+	auto cloudpickle = py::module::import("cloudpickle");
+	auto source_identity = py::bytes("ray-memory-source:" + source_id);
+	auto source_package = py::make_tuple(source_identity, arrow_schema);
+	auto pickled_source = PyBytesToString(cloudpickle.attr("dumps")(source_package));
+
+	auto result = make_uniq<DataSourceScanBindData>();
+	result->pickled_source = EncodeDataSourcePayload(source_id, pickled_source);
+	for (auto task : tasks) {
+		auto pickled_task = PyBytesToString(cloudpickle.attr("dumps")(task));
+		result->pickled_tasks.push_back(EncodeDataSourcePayload(source_id, pickled_task));
+	}
+	if (result->pickled_tasks.empty()) {
+		throw InvalidInputException("Ray memory datasource requires at least one partition task");
+	}
+	result->produce_stream = DataSourceStreamFactory::ProduceStream;
+
+	ArrowSchemaWrapper exported_schema;
+	arrow_schema.attr("_export_to_c")(reinterpret_cast<uintptr_t>(&exported_schema.arrow_schema));
+	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, exported_schema.arrow_schema);
+	return result;
+}
+
 vector<Value> SerializeDataSourceParameters(py::object &source, string &source_id) {
 	// 1. Convert DataSource schema (dict[str, str]) to Arrow schema
 	auto schema_dict = py::cast<py::dict>(source.attr("schema"));
