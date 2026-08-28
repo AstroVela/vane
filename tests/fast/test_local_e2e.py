@@ -352,7 +352,7 @@ def test_local_runner_arrow_native_parquet_rejects_time_ns(local_runner, tmp_pat
             batch_size=2,
             output_batch_size=2,
         )
-        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Parquet COPY"):
             relation.query(
                 "arrow_time_ns",
                 f"COPY arrow_time_ns TO '{escaped_output}' (FORMAT PARQUET)",
@@ -384,7 +384,7 @@ def test_local_runner_arrow_native_parquet_rejects_nested_time_ns(local_runner, 
             batch_size=2,
             output_batch_size=2,
         )
-        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Parquet COPY"):
             relation.query(
                 "arrow_nested_time_ns",
                 f"COPY arrow_nested_time_ns TO '{escaped_output}' (FORMAT PARQUET)",

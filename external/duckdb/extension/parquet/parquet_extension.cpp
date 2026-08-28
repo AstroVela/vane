@@ -479,6 +479,12 @@ static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_
 	}
 }
 
+static void RejectUnsupportedParquetTimeNs(const LogicalType &type) {
+	if (TypeVisitor::Contains(type, LogicalTypeId::TIME_NS)) {
+		throw NotImplementedException("TIME_NS is not supported by Parquet COPY");
+	}
+}
+
 static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data,
                                         const ParquetWriteGlobalState &global_state) {
 	if (global_state.op && global_state.op->type == PhysicalOperatorType::COPY_TO_FILE &&
@@ -515,9 +521,7 @@ static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data,
 		throw NotImplementedException("PARQUET_VERSION V2 is not supported by Arrow-native Parquet COPY");
 	}
 	for (const auto &type : bind_data.sql_types) {
-		if (TypeVisitor::Contains(type, LogicalTypeId::TIME_NS)) {
-			throw NotImplementedException("TIME_NS is not supported by Arrow-native Parquet COPY");
-		}
+		RejectUnsupportedParquetTimeNs(type);
 		if (TypeVisitor::Contains(type, LogicalTypeId::UINTEGER)) {
 			throw NotImplementedException("UINTEGER is not supported by Arrow-native Parquet V1 COPY");
 		}
@@ -1058,6 +1062,9 @@ static vector<unique_ptr<Expression>> ParquetWriteSelect(CopyToSelectInput &inpu
 	for (auto &expr : input.select_list) {
 		const auto &type = expr->return_type;
 		const auto &name = expr->GetAlias();
+		if (input.copy_to_type == CopyToType::COPY_TO_FILE) {
+			RejectUnsupportedParquetTimeNs(type);
+		}
 
 		// Spatial types need to be encoded into WKB when writing GeoParquet.
 		// But dont perform this conversion if this is a EXPORT DATABASE statement
