@@ -560,7 +560,8 @@ void PhysicalCopyToFile::SerializeOperatorData(Serializer &serializer) const {
 }
 
 void PhysicalCopyToFile::WriteRotateInternal(ExecutionContext &context, GlobalSinkState &global_state,
-                                             const std::function<void(GlobalFunctionData &)> &fun) const {
+                                             const std::function<void(GlobalFunctionData &)> &fun,
+                                             bool atomic_rotation_write) const {
 	auto &g = global_state.Cast<CopyToFunctionGlobalState>();
 
 	// Loop until we can write (synchronize using locks when using parallel writes to the same files and "rotate")
@@ -572,6 +573,22 @@ void PhysicalCopyToFile::WriteRotateInternal(ExecutionContext &context, GlobalSi
 		}
 		auto &file_state = *g.global_state;
 		auto &file_lock = *g.file_write_lock_if_rotating;
+		if (atomic_rotation_write) {
+			// Arrow sinks update rotation state directly while writing. Serialize the rotation check with that write so
+			// another sink cannot pass a stale check while an in-flight batch completes the current file.
+			auto file_guard = file_lock.GetExclusiveLock();
+			if (rotate && function.rotate_next_file(file_state, *bind_data, file_size_bytes)) {
+				auto owned_gstate = std::move(g.global_state);
+				g.global_state = CreateFileState(context.client, *sink_state, *global_guard);
+				g.file_write_lock_if_rotating = make_uniq<StorageLock>();
+				global_guard.reset();
+				function.copy_to_finalize(context.client, *bind_data, *owned_gstate);
+				continue;
+			}
+			global_guard.reset();
+			fun(file_state);
+			break;
+		}
 		if (rotate && function.rotate_next_file(file_state, *bind_data, file_size_bytes)) {
 			// Global state must be rotated. Move to local scope, create an new one, and immediately release global lock
 			auto owned_gstate = std::move(g.global_state);
@@ -610,6 +627,10 @@ public:
 		return chunk.size();
 	}
 
+	bool RequiresAtomicRotationWrite() const {
+		return false;
+	}
+
 	idx_t Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
 	            LocalFunctionData &lstate) {
 		op.function.copy_to_sink(context, *op.bind_data, gstate, lstate, chunk);
@@ -635,6 +656,10 @@ public:
 
 	idx_t Count() const {
 		return input.cardinality;
+	}
+
+	bool RequiresAtomicRotationWrite() const {
+		return true;
 	}
 
 	idx_t Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
@@ -698,7 +723,7 @@ idx_t PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT &copy_in
 		return consumed;
 	}
 
-	WriteRotateInternal(context, input.global_state, write_input);
+	WriteRotateInternal(context, input.global_state, write_input, copy_input.RequiresAtomicRotationWrite());
 
 	l.total_rows_copied += consumed;
 	return consumed;
@@ -818,9 +843,12 @@ SinkCombineResultType PhysicalCopyToFile::Combine(ExecutionContext &context, Ope
 				function.copy_to_finalize(context.client, *bind_data, *l.global_state);
 			}
 		} else if (rotate) {
-			WriteRotateInternal(context, input.global_state, [&](GlobalFunctionData &gstate) {
-				function.copy_to_combine(context, *bind_data, gstate, *l.local_state);
-			});
+			WriteRotateInternal(
+			    context, input.global_state,
+			    [&](GlobalFunctionData &gstate) {
+				    function.copy_to_combine(context, *bind_data, gstate, *l.local_state);
+			    },
+			    false);
 		} else if (g.global_state) {
 			function.copy_to_combine(context, *bind_data, *g.global_state, *l.local_state);
 		}

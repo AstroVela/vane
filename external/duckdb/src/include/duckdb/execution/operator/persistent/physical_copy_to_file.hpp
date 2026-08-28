@@ -113,6 +113,6 @@ private:
 	unique_ptr<GlobalFunctionData> CreateFileState(ClientContext &context, GlobalSinkState &sink,
 	                                               StorageLockKey &global_lock) const;
 	void WriteRotateInternal(ExecutionContext &context, GlobalSinkState &global_state,
-	                         const std::function<void(GlobalFunctionData &)> &fun) const;
+	                         const std::function<void(GlobalFunctionData &)> &fun, bool atomic_rotation_write) const;
 };
 } // namespace duckdb

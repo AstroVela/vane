@@ -218,6 +218,51 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
     assert counters["udf_python_export_under_client_context_lock_count"] == 0
 
 
+def test_local_runner_arrow_native_parquet_parallel_rotation_is_exact(tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    def transform(table):
+        return pa.table({"value": pa.array(table.column("x").to_pylist(), type=pa.int64())})
+
+    _teardown_runner_if_supported()
+    try:
+        set_runner_local(num_workers=4, max_running_tasks=4)
+        runner = _runners.get_or_create_runner()
+        if getattr(runner, "name", None) != "local":
+            pytest.skip(f"Local runner not active, got runner={getattr(runner, 'name', None)!r}")
+
+        monkeypatch.setenv("VANE_RUNNER", "local")
+        output = tmp_path / "parallel_arrow_rotation.parquet"
+        escaped_output = str(output).replace("'", "''")
+        con = vane.connect()
+        try:
+            con.execute("SET preserve_insertion_order=false")
+            con.execute("SET threads=4")
+            relation = con.sql("select i::BIGINT as x from range(32769) t(i)").map_batches(
+                transform,
+                schema={"value": vane.sqltypes.BIGINT},
+                execution_backend="subprocess_task",
+                batch_size=2048,
+                output_batch_size=2048,
+            )
+            relation.query(
+                "parallel_arrow_rotation",
+                f"COPY parallel_arrow_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 2048, ROW_GROUPS_PER_FILE 1, DICTIONARY_SIZE_LIMIT 0)",
+            )
+        finally:
+            con.close()
+
+        metadata = [pq.ParquetFile(path).metadata for path in output.glob("*.parquet")]
+        assert len(metadata) == 17
+        assert sum(file_metadata.num_rows for file_metadata in metadata) == 32769
+        assert all(file_metadata.num_row_groups == 1 for file_metadata in metadata)
+        assert all(file_metadata.num_rows <= 2048 for file_metadata in metadata)
+    finally:
+        _teardown_runner_if_supported()
+
+
 def test_local_runner_arrow_native_parquet_rejects_duckdb_extension_scalars(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 
