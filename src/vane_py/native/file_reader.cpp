@@ -170,8 +170,12 @@ idx_t PythonFileReaderHandle::ReadLocked(data_ptr_t target, idx_t requested_size
 
 py::bytes PythonFileReaderHandle::Read(int64_t size) {
 	string result;
+	D_ASSERT(py::gil_check());
+	// Python connection.interrupt() also requires the GIL, and Close only resets
+	// the retained connection after reacquiring it. Snapshot before releasing the
+	// GIL so this call is cancellable while waiting on either mutex.
+	auto interrupt_generation = connection ? connection->InterruptGeneration() : 0;
 	{
-		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
 		unique_lock<mutex> reader_guard(lock);
 		RequireOpen();
@@ -180,7 +184,6 @@ py::bytes PythonFileReaderHandle::Read(int64_t size) {
 		auto requested_size = size < 0 ? remaining : MinValue<uint64_t>(remaining, NumericCast<uint64_t>(size));
 		if (requested_size > 0) {
 			auto initial_position = position;
-			auto interrupt_generation = connection->InterruptGeneration();
 			try {
 				unique_lock<mutex> connection_guard(connection->py_connection_lock);
 				RunReaderContextOperation(
@@ -273,12 +276,14 @@ int64_t PythonFileReaderHandle::Size() {
 py::object PythonFileReaderHandle::GuessMimeType() {
 	string result;
 	bool found;
+	D_ASSERT(py::gil_check());
+	// Establish the pending-operation boundary before another Python thread can
+	// interrupt this connection or this call can wait for the reader mutex.
+	auto interrupt_generation = connection ? connection->InterruptGeneration() : 0;
 	{
-		D_ASSERT(py::gil_check());
 		py::gil_scoped_release release;
 		unique_lock<mutex> reader_guard(lock);
 		RequireOpen();
-		auto interrupt_generation = connection->InterruptGeneration();
 		unique_lock<mutex> connection_guard(connection->py_connection_lock);
 		RunReaderContextOperation(*context, *connection, interrupt_generation,
 		                          [&](ReaderContextScope &) { found = resolved->GuessMimeType(result); });
