@@ -75,6 +75,25 @@ if TYPE_CHECKING:
     from vane.runners.fte.fte_types import FteSplit
 
 
+_ORDERED_FTE_PARTITION_ORDER_BITS = 32
+_ORDERED_FTE_ORDER_COMPONENT_MAX = (1 << _ORDERED_FTE_PARTITION_ORDER_BITS) - 1
+_INVALID_IDX = (1 << 64) - 1
+
+
+def _ordered_fte_source_task_order(source_task_order: int, partition_id: int) -> int:
+    """Pack the coordinator task order and its FTE partition into one ordered key."""
+    source_task_order = _check_non_negative("source_task_order", source_task_order)
+    partition_id = _check_non_negative("partition_id", partition_id)
+    if source_task_order > _ORDERED_FTE_ORDER_COMPONENT_MAX:
+        raise ValueError("source_task_order exceeds the ordered FTE key range")
+    if partition_id > _ORDERED_FTE_ORDER_COMPONENT_MAX:
+        raise ValueError("partition_id exceeds the ordered FTE key range")
+    result = (source_task_order << _ORDERED_FTE_PARTITION_ORDER_BITS) | partition_id
+    if result == _INVALID_IDX:
+        raise ValueError("ordered FTE source task order collides with the invalid index sentinel")
+    return result
+
+
 class FteWorkerControlFailure(RuntimeError):
     def __init__(
         self,
@@ -152,6 +171,7 @@ class FteTaskPartition:
         max_attempts: int = 4,
         sink_handle: ExchangeSinkHandle | None = None,
         exchange_sink_task_partition_id: int | None = None,
+        source_task_order: int | None = None,
         node_requirements: NodeRequirements | None = None,
         memory_requirement_bytes: int | None = None,
         execution_class: FteTaskExecutionClass | str | None = None,
@@ -169,6 +189,9 @@ class FteTaskPartition:
             None
             if exchange_sink_task_partition_id is None
             else _check_non_negative("exchange_sink_task_partition_id", exchange_sink_task_partition_id)
+        )
+        self.source_task_order = (
+            None if source_task_order is None else _check_non_negative("source_task_order", source_task_order)
         )
         if self.sink_handle is not None and self.exchange_sink_task_partition_id is not None:
             raise ValueError(
@@ -671,24 +694,43 @@ class FteFragmentExecution:
         self,
         partition_id: int,
         node_requirements: NodeRequirements | None = None,
+        *,
+        coordinator_source_task_order: int | None = None,
     ) -> FteTaskPartition:
         with self._state_lock:
-            return self._add_partition_locked(partition_id, node_requirements)
+            return self._add_partition_locked(
+                partition_id,
+                node_requirements,
+                coordinator_source_task_order=coordinator_source_task_order,
+            )
 
     def _add_partition_locked(
         self,
         partition_id: int,
         node_requirements: NodeRequirements | None = None,
+        *,
+        coordinator_source_task_order: int | None = None,
     ) -> FteTaskPartition:
         if not self._state_lock_owned_by_current_thread():
             raise RuntimeError("FTE partition mutation requires the fragment state lock")
         partition_id = _check_non_negative("partition_id", partition_id)
         existing = self.partitions.get(partition_id)
         if existing is not None:
+            if coordinator_source_task_order is not None:
+                expected_source_task_order = self._source_task_order_for_partition(
+                    partition_id,
+                    coordinator_source_task_order,
+                )
+                if existing.source_task_order != expected_source_task_order:
+                    raise ValueError("coordinator source task order cannot change for an FTE partition")
             if existing.node_requirements is None and node_requirements is not None:
                 existing.node_requirements = node_requirements
                 existing._invalidate_placement()
             return existing
+        source_task_order = self._source_task_order_for_partition(
+            partition_id,
+            coordinator_source_task_order,
+        )
         task_id = FteTaskId(self.query_id, self.fragment_execution_id, partition_id)
         if self.exchange is None:
             sink_handle = None
@@ -726,6 +768,7 @@ class FteFragmentExecution:
             max_attempts=self.max_attempts,
             sink_handle=sink_handle,
             exchange_sink_task_partition_id=exchange_sink_task_partition_id,
+            source_task_order=source_task_order,
             node_requirements=node_requirements,
             memory_requirement_bytes=self.task_memory_bytes,
             execution_class=self.execution_class,
@@ -733,6 +776,24 @@ class FteFragmentExecution:
         self.partitions[partition_id] = partition
         self.descriptor_storage.put(task_id, descriptor)
         return partition
+
+    def _source_task_order_for_partition(
+        self,
+        partition_id: int,
+        coordinator_source_task_order: int | None,
+    ) -> int | None:
+        preserves_order = bool(
+            self.exchange_sink_config is not None and self.exchange_sink_config.get("preserve_order", False)
+        )
+        if not preserves_order:
+            if coordinator_source_task_order is not None:
+                raise ValueError("coordinator source task order requires an order-preserving exchange sink")
+            return None
+        if coordinator_source_task_order is None:
+            coordinator_source_task_order = self.context.get("source_task_order")
+        if coordinator_source_task_order is None:
+            raise ValueError("ordered Ray FTE exchange sink requires a coordinator task sequence")
+        return _ordered_fte_source_task_order(coordinator_source_task_order, partition_id)
 
     def merge_submission_metadata(
         self,
@@ -1933,9 +1994,7 @@ class FteFragmentExecution:
                 sink_config,
                 attempt_id=partition.next_attempt_number(),
                 task_partition_id=scheduler_task_partition_id,
-                source_task_order=(
-                    partition.task_id.partition_id if sink_config.get("preserve_order", False) else None
-                ),
+                source_task_order=partition.source_task_order if sink_config.get("preserve_order", False) else None,
             )
         worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:

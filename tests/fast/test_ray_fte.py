@@ -5302,6 +5302,7 @@ def test_fte_fragment_execution_binds_ordered_sink_to_semantic_partition_order()
         fragment_id="q:node:ordered-shuffle",
         logical_fragment_identity="q:node:ordered-shuffle",
         worker=worker,
+        context={"source_task_order": "4"},
         exchange_sink_config={
             "query_id": "q",
             "output_partition_count": 1,
@@ -5316,8 +5317,9 @@ def test_fte_fragment_execution_binds_ordered_sink_to_semantic_partition_order()
     scheduled = scheduled_result[0]
     _execute_stage_commands(stage, scheduled_result)
 
-    assert scheduled.request["exchange_sink_instance"]["source_task_order"] == 3
-    assert worker.calls[0][1]["exchange_sink_instance"]["source_task_order"] == 3
+    expected_source_task_order = (4 << 32) | 3
+    assert scheduled.request["exchange_sink_instance"]["source_task_order"] == expected_source_task_order
+    assert worker.calls[0][1]["exchange_sink_instance"]["source_task_order"] == expected_source_task_order
 
 
 def test_fte_fragment_execution_allocates_exchange_identity_when_partition_is_created():

@@ -3897,6 +3897,29 @@ def test_ray_positional_join_values_preserves_order_and_pads_nulls(ray_runner, d
     )
 
 
+def test_ray_positional_join_preserves_union_all_order(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: positional join union all"
+    sql = """
+        SELECT l.v AS left_v, r.v AS right_v
+        FROM (
+            SELECT * FROM (VALUES (1), (2)) AS a(v)
+            UNION ALL
+            SELECT * FROM (VALUES (3), (4)) AS b(v)
+        ) AS l
+        POSITIONAL JOIN (VALUES (10), (20), (30), (40)) AS r(v)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_JOIN"],
+        timeout_s=60.0,
+        ordered=True,
+    )
+
+
 def test_ray_positional_scan_folds_three_ordered_multifile_inputs(
     ray_runner,
     duckdb_conn,
