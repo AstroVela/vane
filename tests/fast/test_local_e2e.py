@@ -79,14 +79,14 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
                 ]
             )
 
-        def dictionary_nan(count):
+        def dictionary_floats(indices, dictionary):
             return pa.chunked_array(
                 [
                     pa.DictionaryArray.from_arrays(
-                        pa.array([0] * min(chunk_size, count - offset), type=pa.int32()),
-                        pa.array([float("nan")], type=pa.float64()),
+                        pa.array(indices[offset : offset + chunk_size], type=pa.int32()),
+                        pa.array(dictionary, type=pa.float64()),
                     )
-                    for offset in range(0, count, chunk_size)
+                    for offset in range(0, len(indices), chunk_size)
                 ]
             )
 
@@ -95,7 +95,8 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
                 "y": chunked([value * 3 for value in values], pa.int64()),
                 "label": chunked([f"row-{value % 7}" for value in values], pa.string()),
                 "score": chunked([float("nan")] * len(values), pa.float64()),
-                "encoded_score": dictionary_nan(len(values)),
+                "encoded_score": dictionary_floats([0] * len(values), [float("nan")]),
+                "encoded_weight": dictionary_floats([value % 2 for value in values], [1.0, 2.0]),
                 "weight": chunked([float(value) for value in values], pa.float32()),
                 "samples": chunked([[float("nan"), float(value)] for value in values], pa.list_(pa.float64())),
                 "attributes": chunked([[("value", float("nan"))] for _ in values], pa.map_(pa.string(), pa.float64())),
@@ -129,6 +130,7 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
                 "label": vane.sqltypes.VARCHAR,
                 "score": vane.sqltypes.DOUBLE,
                 "encoded_score": vane.sqltypes.DOUBLE,
+                "encoded_weight": vane.sqltypes.DOUBLE,
                 "weight": vane.sqltypes.FLOAT,
                 "samples": vane.list_type(vane.sqltypes.DOUBLE),
                 "attributes": vane.map_type(vane.sqltypes.VARCHAR, vane.sqltypes.DOUBLE),
@@ -179,10 +181,13 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
         score_statistics = score_statistics[: score_statistics.index("}")]
         encoded_score_statistics = statistics[statistics.index('"encoded_score"') :]
         encoded_score_statistics = encoded_score_statistics[: encoded_score_statistics.index("}")]
+        encoded_weight_statistics = statistics[statistics.index('"encoded_weight"') :]
+        encoded_weight_statistics = encoded_weight_statistics[: encoded_weight_statistics.index("}")]
         weight_statistics = statistics[statistics.index('"weight"') :]
         weight_statistics = weight_statistics[: weight_statistics.index("}")]
         assert "has_nan=true" in score_statistics
         assert "has_nan=true" in encoded_score_statistics
+        assert "has_nan=false" in encoded_weight_statistics
         assert "has_nan=false" in weight_statistics
         assert '"samples"."element"' in statistics
         assert '"samples"."list"."element"' not in statistics
@@ -266,6 +271,34 @@ def test_local_runner_arrow_native_parquet_rejects_dictionary_encoded_nested_val
         )
         with pytest.raises(
             ValueError, match="Dictionary-encoded nested values are not supported by Arrow-native Parquet COPY"
+        ):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_v1_rejects_nanosecond_timestamps(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [datetime.datetime(1970, 1, 1)] * table.num_rows
+        return pa.table({"event_time": pa.array(values, type=pa.timestamp("ns"))})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_timestamp_ns.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"event_time": vane.sqltypes.TIMESTAMP_NS},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(
+            ValueError, match="Nanosecond Arrow timestamps are not supported by Arrow-native Parquet V1 COPY"
         ):
             relation.write_parquet(str(output))
     finally:

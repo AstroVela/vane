@@ -211,6 +211,10 @@ static std::shared_ptr<::arrow::DataType> ExtensionStorageType(std::shared_ptr<:
 
 static void ValidateArrowNativeParquetEncoding(std::shared_ptr<::arrow::DataType> type) {
 	type = ExtensionStorageType(std::move(type));
+	if (type->id() == ::arrow::Type::TIMESTAMP &&
+	    static_cast<const ::arrow::TimestampType &>(*type).unit() == ::arrow::TimeUnit::NANO) {
+		throw NotImplementedException("Nanosecond Arrow timestamps are not supported by Arrow-native Parquet V1 COPY");
+	}
 	if (type->id() == ::arrow::Type::RUN_END_ENCODED) {
 		throw NotImplementedException("Run-end encoded arrays are not supported by Arrow-native Parquet COPY");
 	}
@@ -224,6 +228,7 @@ static void ValidateArrowNativeParquetEncoding(std::shared_ptr<::arrow::DataType
 			throw NotImplementedException(
 			    "Dictionary-encoded nested values are not supported by Arrow-native Parquet COPY");
 		}
+		ValidateArrowNativeParquetEncoding(std::move(value_type));
 		return;
 	}
 	for (const auto &field : type->fields()) {
@@ -256,43 +261,60 @@ static std::shared_ptr<::arrow::Array> FlattenListArray(std::shared_ptr<::arrow:
 	}
 }
 
+template <class ARRAY_TYPE>
+static bool PrimitiveFloatingArrayHasNaN(const ::arrow::Array &array) {
+	auto &values = static_cast<const ARRAY_TYPE &>(array);
+	for (int64_t row_idx = 0; row_idx < values.length(); row_idx++) {
+		if (values.IsValid(row_idx) && std::isnan(values.Value(row_idx))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+template <class ARRAY_TYPE>
+static bool DictionaryFloatingArrayHasNaN(const ::arrow::DictionaryArray &encoded, const ::arrow::Array &dictionary) {
+	auto &values = static_cast<const ARRAY_TYPE &>(dictionary);
+	vector<uint8_t> nan_state(NumericCast<idx_t>(values.length()), 0);
+	for (int64_t row_idx = 0; row_idx < encoded.length(); row_idx++) {
+		if (!encoded.IsValid(row_idx)) {
+			continue;
+		}
+		auto dictionary_idx = encoded.GetValueIndex(row_idx);
+		if (dictionary_idx < 0 || dictionary_idx >= values.length()) {
+			throw InvalidInputException("Arrow dictionary index is outside the dictionary for RETURN_STATS");
+		}
+		auto &state = nan_state[NumericCast<idx_t>(dictionary_idx)];
+		if (state == 0) {
+			state = values.IsValid(dictionary_idx) && std::isnan(values.Value(dictionary_idx)) ? 2 : 1;
+		}
+		if (state == 2) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool FloatingArrayHasNaN(std::shared_ptr<::arrow::Array> array) {
 	array = ExtensionStorage(std::move(array));
 	switch (array->type_id()) {
-	case ::arrow::Type::FLOAT: {
-		auto &values = static_cast<const ::arrow::FloatArray &>(*array);
-		for (int64_t row_idx = 0; row_idx < values.length(); row_idx++) {
-			if (values.IsValid(row_idx) && std::isnan(values.Value(row_idx))) {
-				return true;
-			}
-		}
-		return false;
-	}
-	case ::arrow::Type::DOUBLE: {
-		auto &values = static_cast<const ::arrow::DoubleArray &>(*array);
-		for (int64_t row_idx = 0; row_idx < values.length(); row_idx++) {
-			if (values.IsValid(row_idx) && std::isnan(values.Value(row_idx))) {
-				return true;
-			}
-		}
-		return false;
-	}
+	case ::arrow::Type::FLOAT:
+		return PrimitiveFloatingArrayHasNaN<::arrow::FloatArray>(*array);
+	case ::arrow::Type::DOUBLE:
+		return PrimitiveFloatingArrayHasNaN<::arrow::DoubleArray>(*array);
 	case ::arrow::Type::DICTIONARY: {
 		auto &dictionary_array = static_cast<const ::arrow::DictionaryArray &>(*array);
 		auto dictionary = ExtensionStorage(dictionary_array.dictionary());
-		for (int64_t row_idx = 0; row_idx < dictionary_array.length(); row_idx++) {
-			if (!dictionary_array.IsValid(row_idx)) {
-				continue;
-			}
-			auto dictionary_idx = dictionary_array.GetValueIndex(row_idx);
-			if (dictionary_idx < 0 || dictionary_idx >= dictionary->length()) {
-				throw InvalidInputException("Arrow dictionary index is outside the dictionary for RETURN_STATS");
-			}
-			if (FloatingArrayHasNaN(dictionary->Slice(dictionary_idx, 1))) {
-				return true;
-			}
+		switch (dictionary->type_id()) {
+		case ::arrow::Type::FLOAT:
+			return DictionaryFloatingArrayHasNaN<::arrow::FloatArray>(dictionary_array, *dictionary);
+		case ::arrow::Type::DOUBLE:
+			return DictionaryFloatingArrayHasNaN<::arrow::DoubleArray>(dictionary_array, *dictionary);
+		default:
+			throw InvalidInputException(
+			    "Arrow-native Parquet COPY expected a FLOAT or DOUBLE dictionary for RETURN_STATS, received %s",
+			    dictionary->type()->ToString());
 		}
-		return false;
 	}
 	default:
 		throw InvalidInputException(
