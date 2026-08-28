@@ -202,6 +202,35 @@ static std::shared_ptr<::arrow::Array> ExtensionStorage(std::shared_ptr<::arrow:
 	return array;
 }
 
+static std::shared_ptr<::arrow::DataType> ExtensionStorageType(std::shared_ptr<::arrow::DataType> type) {
+	while (type->id() == ::arrow::Type::EXTENSION) {
+		type = static_cast<const ::arrow::ExtensionType &>(*type).storage_type();
+	}
+	return type;
+}
+
+static void ValidateArrowNativeParquetEncoding(std::shared_ptr<::arrow::DataType> type) {
+	type = ExtensionStorageType(std::move(type));
+	if (type->id() == ::arrow::Type::RUN_END_ENCODED) {
+		throw NotImplementedException("Run-end encoded arrays are not supported by Arrow-native Parquet COPY");
+	}
+	if (type->id() == ::arrow::Type::LIST_VIEW || type->id() == ::arrow::Type::LARGE_LIST_VIEW) {
+		throw NotImplementedException("List-view arrays are not supported by Arrow-native Parquet COPY");
+	}
+	if (type->id() == ::arrow::Type::DICTIONARY) {
+		auto value_type = ExtensionStorageType(static_cast<const ::arrow::DictionaryType &>(*type).value_type());
+		if (value_type->id() == ::arrow::Type::DICTIONARY || value_type->id() == ::arrow::Type::RUN_END_ENCODED ||
+		    value_type->num_fields() != 0) {
+			throw NotImplementedException(
+			    "Dictionary-encoded nested values are not supported by Arrow-native Parquet COPY");
+		}
+		return;
+	}
+	for (const auto &field : type->fields()) {
+		ValidateArrowNativeParquetEncoding(field->type());
+	}
+}
+
 template <class ARRAY_TYPE>
 static std::shared_ptr<::arrow::Array> FlattenListArray(const ::arrow::Array &array) {
 	auto flattened = static_cast<const ARRAY_TYPE &>(array).Flatten();
@@ -219,10 +248,6 @@ static std::shared_ptr<::arrow::Array> FlattenListArray(std::shared_ptr<::arrow:
 		return FlattenListArray<::arrow::ListArray>(*array);
 	case ::arrow::Type::LARGE_LIST:
 		return FlattenListArray<::arrow::LargeListArray>(*array);
-	case ::arrow::Type::LIST_VIEW:
-		return FlattenListArray<::arrow::ListViewArray>(*array);
-	case ::arrow::Type::LARGE_LIST_VIEW:
-		return FlattenListArray<::arrow::LargeListViewArray>(*array);
 	case ::arrow::Type::FIXED_SIZE_LIST:
 		return FlattenListArray<::arrow::FixedSizeListArray>(*array);
 	default:
@@ -268,10 +293,6 @@ static bool FloatingArrayHasNaN(std::shared_ptr<::arrow::Array> array) {
 			}
 		}
 		return false;
-	}
-	case ::arrow::Type::RUN_END_ENCODED: {
-		auto &encoded = static_cast<const ::arrow::RunEndEncodedArray &>(*array);
-		return FloatingArrayHasNaN(encoded.LogicalValues());
 	}
 	default:
 		throw InvalidInputException(
@@ -443,6 +464,7 @@ static std::shared_ptr<::parquet::WriterProperties>
 BuildWriterProperties(const std::shared_ptr<::arrow::Schema> &schema, const ArrowParquetWriterOptions &options,
                       const std::shared_ptr<::parquet::ArrowWriterProperties> &arrow_properties) {
 	::parquet::WriterProperties::Builder builder;
+	builder.version(::parquet::ParquetVersion::PARQUET_1_0);
 	builder.compression(ArrowCompression(options.codec));
 	builder.max_row_group_length(NumericCast<int64_t>(options.row_group_size));
 	// Keep Arrow's bounded 1 MiB dictionary fallback. DuckDB's string-only page limit is not
@@ -468,7 +490,7 @@ BuildWriterProperties(const std::shared_ptr<::arrow::Schema> &schema, const Arro
 		bloom_options.fpp = options.bloom_filter_false_positive_ratio;
 		for (int column_idx = 0; column_idx < parquet_schema->num_columns(); column_idx++) {
 			auto column = parquet_schema->Column(column_idx);
-			if (column->physical_type() != ::parquet::Type::BOOLEAN) {
+			if (column->physical_type() != ::parquet::Type::BOOLEAN && column->max_repetition_level() == 0) {
 				builder.enable_bloom_filter(column->path(), bloom_options);
 			}
 		}
@@ -525,7 +547,9 @@ struct ArrowParquetWriter::Impl {
 			throw InternalException("Arrow-native Parquet writer SQL and Arrow schemas have different column counts");
 		}
 		for (idx_t column_idx = 0; column_idx < options.sql_types.size(); column_idx++) {
-			auto name = KeywordHelper::WriteQuoted(schema->field(NumericCast<int>(column_idx))->name(), '"');
+			auto field = schema->field(NumericCast<int>(column_idx));
+			ValidateArrowNativeParquetEncoding(field->type());
+			auto name = KeywordHelper::WriteQuoted(field->name(), '"');
 			AppendLeafMetadata(options.sql_types[column_idx], name, leaf_types, leaf_names);
 		}
 		has_nan.resize(leaf_types.size(), false);

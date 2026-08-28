@@ -79,11 +79,23 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
                 ]
             )
 
+        def dictionary_nan(count):
+            return pa.chunked_array(
+                [
+                    pa.DictionaryArray.from_arrays(
+                        pa.array([0] * min(chunk_size, count - offset), type=pa.int32()),
+                        pa.array([float("nan")], type=pa.float64()),
+                    )
+                    for offset in range(0, count, chunk_size)
+                ]
+            )
+
         return pa.table(
             {
                 "y": chunked([value * 3 for value in values], pa.int64()),
                 "label": chunked([f"row-{value % 7}" for value in values], pa.string()),
                 "score": chunked([float("nan")] * len(values), pa.float64()),
+                "encoded_score": dictionary_nan(len(values)),
                 "weight": chunked([float(value) for value in values], pa.float32()),
                 "samples": chunked([[float("nan"), float(value)] for value in values], pa.list_(pa.float64())),
                 "attributes": chunked([[("value", float("nan"))] for _ in values], pa.map_(pa.string(), pa.float64())),
@@ -116,6 +128,7 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
                 "y": vane.sqltypes.BIGINT,
                 "label": vane.sqltypes.VARCHAR,
                 "score": vane.sqltypes.DOUBLE,
+                "encoded_score": vane.sqltypes.DOUBLE,
                 "weight": vane.sqltypes.FLOAT,
                 "samples": vane.list_type(vane.sqltypes.DOUBLE),
                 "attributes": vane.map_type(vane.sqltypes.VARCHAR, vane.sqltypes.DOUBLE),
@@ -132,6 +145,11 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
         counters = dict(_native._udf_executor_debug_counters())
         output_files = list(output.glob("*.parquet"))
         metadata = [pq.ParquetFile(path).metadata for path in output_files]
+        bloom_metadata = [
+            row
+            for path in output_files
+            for row in con.sql(f"select path_in_schema, bloom_filter_offset from parquet_metadata('{path}')").fetchall()
+        ]
     finally:
         con.close()
 
@@ -141,6 +159,14 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
     assert all(file_metadata.num_row_groups == (file_metadata.num_rows + 63) // 64 for file_metadata in metadata)
     assert any(file_metadata.num_row_groups > 1 for file_metadata in metadata)
     assert all("parquet-cpp-arrow" in file_metadata.created_by.lower() for file_metadata in metadata)
+    assert all(file_metadata.format_version == "1.0" for file_metadata in metadata)
+    assert bloom_metadata
+    y_bloom_offsets = [offset for path, offset in bloom_metadata if path == "y"]
+    repeated_bloom_offsets = [
+        offset for path, offset in bloom_metadata if path.split(", ", 1)[0] in {"samples", "attributes"}
+    ]
+    assert y_bloom_offsets and all(offset is not None for offset in y_bloom_offsets)
+    assert repeated_bloom_offsets and all(offset is None for offset in repeated_bloom_offsets)
 
     copy_files = copy_result["files"]
     assert sum(file_info["row_count"] for file_info in copy_files) == 4097
@@ -151,9 +177,12 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
         statistics = file_info["column_statistics"]
         score_statistics = statistics[statistics.index('"score"') :]
         score_statistics = score_statistics[: score_statistics.index("}")]
+        encoded_score_statistics = statistics[statistics.index('"encoded_score"') :]
+        encoded_score_statistics = encoded_score_statistics[: encoded_score_statistics.index("}")]
         weight_statistics = statistics[statistics.index('"weight"') :]
         weight_statistics = weight_statistics[: weight_statistics.index("}")]
         assert "has_nan=true" in score_statistics
+        assert "has_nan=true" in encoded_score_statistics
         assert "has_nan=false" in weight_statistics
         assert '"samples"."element"' in statistics
         assert '"samples"."list"."element"' not in statistics
@@ -203,6 +232,41 @@ def test_local_runner_arrow_native_parquet_rejects_duckdb_extension_scalars(loca
             output_batch_size=4,
         )
         with pytest.raises(ValueError, match="HUGEINT, UHUGEINT, and TIME WITH TIME ZONE"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_dictionary_encoded_nested_values(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        dictionary = pa.array(
+            [{"reading": float("nan")}, {"reading": 1.0}],
+            type=pa.struct([pa.field("reading", pa.float64())]),
+        )
+        indices = pa.array([value % 2 for value in values], type=pa.int32())
+        return pa.table({"encoded": pa.DictionaryArray.from_arrays(indices, dictionary)})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_nested_dictionary.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"encoded": vane.struct_type({"reading": vane.sqltypes.DOUBLE})},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(
+            ValueError, match="Dictionary-encoded nested values are not supported by Arrow-native Parquet COPY"
+        ):
             relation.write_parquet(str(output))
     finally:
         con.close()
