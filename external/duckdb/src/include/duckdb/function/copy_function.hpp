@@ -126,20 +126,23 @@ struct CopyOptionsInput {
 };
 
 struct CopyFunctionArrowInput {
-	CopyFunctionArrowInput(const ArrowSchema &schema_p, shared_ptr<ArrowArrayWrapper> array_p,
+	CopyFunctionArrowInput(ArrowSchema &schema_p, shared_ptr<ArrowArrayWrapper> array_p,
 	                       const vector<LogicalType> &types_p, const vector<string> &names_p, idx_t offset_p,
-	                       idx_t cardinality_p, bool new_stream_p)
+	                       idx_t cardinality_p, bool new_stream_p, bool new_batch_p)
 	    : schema(schema_p), array(std::move(array_p)), types(types_p), names(names_p), offset(offset_p),
-	      cardinality(cardinality_p), new_stream(new_stream_p) {
+	      cardinality(cardinality_p), new_stream(new_stream_p), new_batch(new_batch_p) {
 	}
 
-	const ArrowSchema &schema;
+	//! The sink may consume the schema when new_stream is true.
+	ArrowSchema &schema;
+	//! The sink may consume array->arrow_array when new_batch is true.
 	shared_ptr<ArrowArrayWrapper> array;
 	const vector<LogicalType> &types;
 	const vector<string> &names;
 	idx_t offset;
 	idx_t cardinality;
 	bool new_stream;
+	bool new_batch;
 };
 
 enum class CopyFunctionExecutionMode { REGULAR_COPY_TO_FILE, PARALLEL_COPY_TO_FILE, BATCH_COPY_TO_FILE };

@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.5...3.29)
 
 project(ParquetExtension)
 
+find_package(Parquet CONFIG REQUIRED)
+set(ARROW_PARQUET_TARGET
+    "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Parquet::parquet_static,Parquet::parquet_shared>"
+)
+
 include_directories(
   include ../../third_party/lz4 ../../third_party/parquet
   ../../third_party/thrift ../../third_party/snappy
@@ -12,6 +17,7 @@ add_subdirectory(reader)
 add_subdirectory(writer)
 set(PARQUET_EXTENSION_FILES
     ${PARQUET_EXTENSION_FILES}
+    arrow_parquet_writer.cpp
     column_reader.cpp
     column_writer.cpp
     parquet_crypto.cpp
@@ -81,10 +87,12 @@ if(NOT CLANG_TIDY)
 endif()
 
 build_static_extension(parquet ${PARQUET_EXTENSION_FILES})
+target_link_libraries(parquet_extension ${ARROW_PARQUET_TARGET})
 set(PARAMETERS "-warnings")
 
 build_loadable_extension(parquet ${PARAMETERS} ${PARQUET_EXTENSION_FILES})
-target_link_libraries(parquet_loadable_extension duckdb_mbedtls duckdb_zstd)
+target_link_libraries(parquet_loadable_extension duckdb_mbedtls duckdb_zstd
+                      ${ARROW_PARQUET_TARGET})
 
 install(
   TARGETS parquet_extension

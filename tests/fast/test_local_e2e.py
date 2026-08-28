@@ -63,6 +63,7 @@ def test_local_runner_write_parquet_e2e(local_runner, tmp_path, monkeypatch):
 
 def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     from vane import _native
 
     def transform(table):
@@ -81,13 +82,20 @@ def test_local_runner_writes_lazy_udf_arrow_output_through_native_copy(local_run
             batch_size=4097,
             output_batch_size=4097,
         )
-        relation.write_parquet(str(output), row_group_size=2048)
+        relation.write_parquet(str(output), row_group_size=64)
         rows = con.sql(f"select count(*), sum(y), count(distinct label) from read_parquet('{output}')").fetchone()
         counters = dict(_native._udf_executor_debug_counters())
+        output_files = list(output.glob("*.parquet"))
+        metadata = [pq.ParquetFile(path).metadata for path in output_files]
     finally:
         con.close()
 
     assert rows == (4097, 25171968, 7)
+    assert metadata
+    assert sum(file_metadata.num_rows for file_metadata in metadata) == 4097
+    assert all(file_metadata.num_row_groups == (file_metadata.num_rows + 63) // 64 for file_metadata in metadata)
+    assert any(file_metadata.num_row_groups > 1 for file_metadata in metadata)
+    assert all("parquet-cpp-arrow" in file_metadata.created_by.lower() for file_metadata in metadata)
     assert counters["udf_external_arrow_stream_export_count"] >= 1
     assert counters["udf_direct_arrow_table_conversion_count"] == 0
     assert counters["udf_python_export_under_client_context_lock_count"] == 0

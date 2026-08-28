@@ -622,9 +622,10 @@ private:
 
 class ArrowCopyInput {
 public:
-	ArrowCopyInput(const ArrowSchema &schema, shared_ptr<ArrowArrayWrapper> array, const LazyDataChunk &chunk,
-	               idx_t offset, idx_t cardinality, bool new_stream)
-	    : input(schema, std::move(array), chunk.logical_types, chunk.names, offset, cardinality, new_stream) {
+	ArrowCopyInput(ArrowSchema &schema, shared_ptr<ArrowArrayWrapper> array, const LazyDataChunk &chunk, idx_t offset,
+	               idx_t cardinality, bool new_stream, bool new_batch)
+	    : input(schema, std::move(array), chunk.logical_types, chunk.names, offset, cardinality, new_stream,
+	            new_batch) {
 	}
 
 	idx_t Count() const {
@@ -734,6 +735,14 @@ SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, Executio
 	auto stream = ExportExternalBlockArrow(context.client, *batch.lazy);
 	ArrowSchemaWrapper schema;
 	stream->GetSchema(schema);
+	idx_t max_slice_size = NumericLimits<idx_t>::Maximum();
+	if (rotate) {
+		max_slice_size = function.desired_batch_size ? function.desired_batch_size(context.client, *bind_data)
+		                                             : STANDARD_VECTOR_SIZE;
+		if (max_slice_size == 0) {
+			max_slice_size = STANDARD_VECTOR_SIZE;
+		}
+	}
 
 	idx_t rows_written = 0;
 	bool first_slice = true;
@@ -753,11 +762,12 @@ SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, Executio
 			continue;
 		}
 
-		for (idx_t offset = 0; offset < array_rows; offset += STANDARD_VECTOR_SIZE) {
-			auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, array_rows - offset);
-			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice);
+		for (idx_t offset = 0; offset < array_rows;) {
+			auto count = MinValue<idx_t>(max_slice_size, array_rows - offset);
+			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice, offset == 0);
 			SinkInternal(context, copy_input, input);
 			first_slice = false;
+			offset += count;
 		}
 		rows_written += array_rows;
 	}
