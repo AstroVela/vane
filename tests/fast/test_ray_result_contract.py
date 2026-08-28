@@ -7580,6 +7580,37 @@ def test_execute_native_empty_result_returns_typed_contract():
     assert result.result_schema["types"] == ["BIGINT"]
 
 
+def test_execute_native_cross_product_root_materializes_probe_output():
+    con = vane.connect()
+    relation = con.sql(
+        """
+        SELECT *
+        FROM (VALUES (1), (2)) AS lhs(value)
+        CROSS JOIN (VALUES (3), (4)) AS rhs(value)
+        """
+    )
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation,
+        str(uuid.uuid4()),
+    ).to_physical_plan(con)
+
+    topology = vane.ray_cxx.describe_native_progress(con.cursor(), plan)
+    assert any("RESULT_COLLECTOR" in pipeline["operators"] for pipeline in topology["pipelines"])
+
+    runner = vane.ray_cxx.DistributedPhysicalPlanRunner()
+    result = runner.execute_native(con.cursor(), plan, None, None)
+
+    assert result.completion_status == "ok"
+    assert sum(metadata.num_rows for metadata in result.partition_metadatas) == 4
+    payload = list(result.partition_payloads)[0]
+    assert sorted(zip(payload.column(0).to_pylist(), payload.column(1).to_pylist(), strict=True)) == [
+        (1, 3),
+        (1, 4),
+        (2, 3),
+        (2, 4),
+    ]
+
+
 def test_describe_native_progress_materializes_deferred_clone_without_execution(tmp_path):
     import ray
 

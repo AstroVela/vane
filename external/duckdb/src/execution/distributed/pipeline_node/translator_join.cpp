@@ -12,12 +12,14 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/delim_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/utils/optional.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -65,6 +67,20 @@ duckdb::vector<std::string> BuildJoinOutputNames(const PhysicalHashJoin &hj, con
 
 	if (output_count != 0 && output_names.size() != output_count) {
 		output_names.clear();
+	}
+	return output_names;
+}
+
+duckdb::vector<std::string> BuildCrossProductOutputNames(const SchemaRef &left_schema, const SchemaRef &right_schema,
+                                                         idx_t output_count) {
+	if (!left_schema || !right_schema) {
+		return {};
+	}
+	auto output_names = duckdb::distributed::GetSchemaNames(left_schema);
+	auto right_names = duckdb::distributed::GetSchemaNames(right_schema);
+	output_names.insert(output_names.end(), right_names.begin(), right_names.end());
+	if (output_names.size() != output_count) {
+		return {};
 	}
 	return output_names;
 }
@@ -206,6 +222,33 @@ Optional<bool> BroadcastReceiverRepartitionOverride() {
 }
 
 } // namespace
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateCrossProduct(
+    const PhysicalCrossProduct &cross_product, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed cross product requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!cross_product.GetTypes().empty()) {
+		auto output_names = BuildCrossProductOutputNames(children[0]->config().schema(), children[1]->config().schema(),
+		                                                 cross_product.GetTypes().size());
+		if (!output_names.empty()) {
+			schema = MakeSchemaRef(cross_product.GetTypes(), output_names);
+		} else {
+			schema = MakeSchemaRef(cross_product.GetTypes());
+		}
+	}
+
+	// Correctness baseline: every row on each side must meet every row on the
+	// other side. The gather policy stays in translation so a future broadcast
+	// or partition-pair strategy does not change task fan-in or physical serde.
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<CrossProductNode>(get_next_pipeline_node_id(), plan_config_, cross_product.GetTypes(),
+	                                          cross_product.estimated_cardinality, std::move(left), std::move(right),
+	                                          std::move(schema));
+}
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateHashJoin(
     const PhysicalHashJoin &hj, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {

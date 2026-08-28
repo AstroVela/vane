@@ -32,6 +32,7 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/distributed/exchange/flight_exchange_manager.hpp"
@@ -1081,6 +1082,40 @@ TEST_CASE("PhysicalPlan tree: TopN -> ColumnDataScan", "[serialization][physical
 	REQUIRE(root_op->children[0].get().type == PhysicalOperatorType::COLUMN_DATA_SCAN);
 
 	std::cerr << "[test] PhysicalPlan tree TopN roundtrip PASSED" << std::endl;
+}
+
+TEST_CASE("PhysicalCrossProduct serialization roundtrip", "[serialization][physical_plan][cross_product]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> left_types = {LogicalType::INTEGER};
+	vector<LogicalType> right_types = {LogicalType::VARCHAR};
+	vector<LogicalType> output_types = {LogicalType::INTEGER, LogicalType::VARCHAR};
+
+	auto &left = MakeColumnDataScan(plan, left_types);
+	auto &right = MakeColumnDataScan(plan, right_types);
+	auto &cross_product = plan.Make<PhysicalCrossProduct>(output_types, left, right, 12);
+	plan.SetRoot(cross_product);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	plan.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	PhysicalPlan deserialized_plan(allocator);
+	deserializer.Begin();
+	auto root = deserialized_plan.Deserialize(deserializer);
+	deserializer.End();
+
+	REQUIRE(root != nullptr);
+	REQUIRE(root->type == PhysicalOperatorType::CROSS_PRODUCT);
+	REQUIRE(root->GetTypes() == output_types);
+	REQUIRE(root->estimated_cardinality == 12);
+	REQUIRE(root->children.size() == 2);
+	REQUIRE(root->children[0].get().GetTypes() == left_types);
+	REQUIRE(root->children[1].get().GetTypes() == right_types);
 }
 
 TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_plan]") {
