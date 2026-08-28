@@ -43,6 +43,7 @@ struct PyPhysicalPlanWrapper {
 	py::object arrow_schema_;        // Arrow schema for type information
 	py::object udf_registrations_;   // Connection-local Python UDF registrations captured from the source relation
 	py::object udf_actor_handles_;   // Node-id keyed actor handles for UDF worker execution
+	py::object memory_source_refs_;  // Query-owned Ray ObjectRefs for Python in-memory scans
 	py::object connection_snapshot_; // Connection settings/extensions snapshot captured from the source relation
 	string serialized_root_;         // Deferred serialized PhysicalOperator bytes (for pickle round-trips)
 
@@ -255,6 +256,7 @@ struct PyPhysicalPlanWrapper {
 		result.resource_query_id_ = resource_query_id_;
 		result.udf_registrations_ = udf_registrations_;
 		result.udf_actor_handles_ = udf_actor_handles_;
+		result.memory_source_refs_ = memory_source_refs_;
 		result.connection_snapshot_ = connection_snapshot_;
 		result.serialized_root_ = serialize_root_for_clone();
 		result.ensure_plan_identity();
@@ -267,7 +269,8 @@ struct PyPhysicalPlanWrapper {
 	PyPhysicalPlanWrapper()
 	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr), query_id_(),
 	      resource_query_id_(), plan_(nullptr), arrow_schema_(py::none()), udf_registrations_(py::none()),
-	      udf_actor_handles_(py::none()), connection_snapshot_(py::none()), serialized_root_() {
+	      udf_actor_handles_(py::none()), memory_source_refs_(py::none()), connection_snapshot_(py::none()),
+	      serialized_root_() {
 		// Create a minimal placeholder DistributedPhysicalPlan directly (avoid using from_logical_plan_builder).
 		try {
 			uint16_t idx = duckdb::distributed::get_query_idx_counter().fetch_add(1);
@@ -287,7 +290,7 @@ struct PyPhysicalPlanWrapper {
 	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr),
 	      query_id_(p ? p->query_id() : string()), resource_query_id_(query_id_), plan_(std::move(p)),
 	      arrow_schema_(py::none()), udf_registrations_(py::none()), udf_actor_handles_(py::none()),
-	      connection_snapshot_(py::none()), serialized_root_() {
+	      memory_source_refs_(py::none()), connection_snapshot_(py::none()), serialized_root_() {
 		if (plan_ && plan_->physical_plan() && plan_->physical_plan()->HasRoot()) {
 			AssignDataSourceQueryOwner(plan_->physical_plan()->Root(), resource_query_id_);
 		}
@@ -297,7 +300,8 @@ struct PyPhysicalPlanWrapper {
 	    : init_magic_(INIT_MAGIC), worker_connection_(py::none()), client_context_(nullptr),
 	      query_id_(p ? p->query_id() : string()), resource_query_id_(std::move(resource_query_id)),
 	      plan_(std::move(p)), arrow_schema_(py::none()), udf_registrations_(py::none()),
-	      udf_actor_handles_(py::none()), connection_snapshot_(py::none()), serialized_root_() {
+	      udf_actor_handles_(py::none()), memory_source_refs_(py::none()), connection_snapshot_(py::none()),
+	      serialized_root_() {
 		if (resource_query_id_.empty()) {
 			throw duckdb::InternalException("DistributedPhysicalPlan requires a non-empty resource_query_id");
 		}
@@ -1109,6 +1113,7 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	plan_wrapper.worker_connection_ = planning_conn;
 	plan_wrapper.client_context_ = conn_wrapper.con.GetConnection().context;
 	plan_wrapper.udf_registrations_ = udf_registrations_;
+	plan_wrapper.memory_source_refs_ = memory_source_refs_;
 	plan_wrapper.connection_snapshot_ = PrepareWorkerConnectionSnapshot(connection_snapshot_);
 	auto validate_serialization =
 	    py::module_::import("vane._ray_cxx").attr("validate_plan_serialization_for_submission");
@@ -2735,8 +2740,8 @@ struct PyPhysicalPlanWrapperRunner {
 		// Call PlanRunner::run_plan
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
-			    plan.worker_connection_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.memory_source_refs_,
+			    plan.connection_snapshot_, plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -2907,8 +2912,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
-			    plan.worker_connection_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.memory_source_refs_,
+			    plan.connection_snapshot_, plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -3186,8 +3191,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
-			    plan.worker_connection_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.memory_source_refs_,
+			    plan.connection_snapshot_, plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -4094,6 +4099,7 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 	topology_plan.resource_query_id_ = plan.resource_query_id_;
 	topology_plan.udf_registrations_ = plan.udf_registrations_;
 	topology_plan.udf_actor_handles_ = plan.udf_actor_handles_;
+	topology_plan.memory_source_refs_ = plan.memory_source_refs_;
 	topology_plan.connection_snapshot_ = plan.connection_snapshot_;
 	topology_plan.serialized_root_ = plan.serialize_root_for_clone();
 	topology_plan.worker_connection_ = exec_conn;

@@ -16,6 +16,7 @@
 #include "vane_python/python_objects.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
+#include "vane_python/pandas/pandas_scan.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include <duckdb/execution/distributed/plan/distributed_physical_plan.hpp>
@@ -103,6 +104,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
+#include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/execution/operator/projection/physical_tableinout_function.hpp>
 #include <duckdb/execution/operator/projection/physical_udf_inout.hpp>
 #include <duckdb/function/scalar/udf_functions.hpp>
@@ -677,7 +679,8 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_create_physical_plan_from_capsule",
 	    [](py::capsule capsule, py::object query_id_obj, py::object resource_query_id_obj,
-	       py::object udf_registrations_obj, py::object udf_actor_handles_obj, py::object connection_snapshot_obj) {
+	       py::object udf_registrations_obj, py::object udf_actor_handles_obj, py::object memory_source_refs_obj,
+	       py::object connection_snapshot_obj) {
 		    auto *plan_ptr = static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(capsule.get_pointer());
 		    if (!plan_ptr || !*plan_ptr) {
 			    return PyPhysicalPlanWrapper();
@@ -708,6 +711,7 @@ void register_ray_bindings(py::module_ &mod) {
 		    result.query_id_ = query_id;
 		    result.udf_registrations_ = udf_registrations_obj;
 		    result.udf_actor_handles_ = udf_actor_handles_obj;
+		    result.memory_source_refs_ = memory_source_refs_obj;
 		    result.connection_snapshot_ = connection_snapshot_obj;
 		    auto coordinator_connection = LookupQueryCoordinatorConnection(resource_query_id);
 		    if (!coordinator_connection.is_none()) {
@@ -724,7 +728,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    },
 	    py::arg("capsule"), py::arg("query_id") = py::none(), py::arg("resource_query_id") = py::none(),
 	    py::arg("udf_registrations") = py::none(), py::arg("udf_actor_handles") = py::none(),
-	    py::arg("connection_snapshot") = py::none(),
+	    py::arg("memory_source_refs") = py::none(), py::arg("connection_snapshot") = py::none(),
 	    "Internal helper to create PyPhysicalPlanWrapper from C++ capsule");
 
 	m.def(
@@ -734,6 +738,10 @@ void register_ray_bindings(py::module_ &mod) {
 	m.def(
 	    "_lookup_query_udf_actor_handles", [](const string &query_id) { return LookupQueryUDFActorHandles(query_id); },
 	    py::arg("query_id"));
+
+	m.def(
+	    "_lookup_query_memory_source_refs",
+	    [](const string &query_id) { return LookupQueryMemorySourceRefs(query_id); }, py::arg("query_id"));
 
 	m.def(
 	    "_lookup_query_connection_snapshot",
@@ -782,7 +790,8 @@ void register_ray_bindings(py::module_ &mod) {
 		    // The resource query owns this lifecycle. A retried FTE task can carry a
 		    // physical plan created under a different source plan identifier.
 		    return RegisterQueryPythonReplayState(query_id, plan.udf_registrations_, plan.udf_actor_handles_,
-		                                          plan.connection_snapshot_, plan.worker_connection_);
+		                                          plan.memory_source_refs_, plan.connection_snapshot_,
+		                                          plan.worker_connection_);
 	    },
 	    py::arg("query_id"), py::arg("plan"));
 
@@ -958,6 +967,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_config", &PyPhysicalPlanWrapper::session_config)
 	    .def("has_explicit_s3_credentials", &PyPhysicalPlanWrapper::has_explicit_s3_credentials)
 	    .def("has_root", &PyPhysicalPlanWrapper::has_root)
+	    .def("_memory_source_ref_count_for_test",
+	         [](const PyPhysicalPlanWrapper &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
 	    .def("clone", &PyPhysicalPlanWrapper::clone, py::arg("conn") = py::none())
 	    .def("num_partitions", &PyPhysicalPlanWrapper::num_partitions)
 	    .def("repr_ascii", &PyPhysicalPlanWrapper::repr_ascii)
@@ -981,19 +992,21 @@ void register_ray_bindings(py::module_ &mod) {
 		        if (!p.has_root()) {
 			        if (!p.serialized_root_.empty()) {
 				        return py::make_tuple(true, py::bytes(p.serialized_root_), p.query_id_, p.resource_query_id_,
-				                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
+				                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_,
+				                              p.memory_source_refs_);
 			        }
 			        return py::make_tuple(false, py::bytes(""), p.query_id_, p.resource_query_id_, p.udf_registrations_,
-			                              p.udf_actor_handles_, p.connection_snapshot_);
+			                              p.udf_actor_handles_, p.connection_snapshot_, p.memory_source_refs_);
 		        }
 
 		        auto serialized_root = p.serialize_root_for_clone();
 		        return py::make_tuple(true, py::bytes(serialized_root), p.query_id_, p.resource_query_id_,
-		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_);
+		                              p.udf_registrations_, p.udf_actor_handles_, p.connection_snapshot_,
+		                              p.memory_source_refs_);
 	        },
 	        // __setstate__: store deferred bytes for later deserialization
 	        [](py::tuple t) {
-		        if (t.size() != 7) {
+		        if (t.size() != 7 && t.size() != 8) {
 			        throw duckdb::InternalException("Invalid state for PyPhysicalPlanWrapper pickle");
 		        }
 		        bool has_data = t[0].cast<bool>();
@@ -1019,6 +1032,9 @@ void register_ray_bindings(py::module_ &mod) {
 		        result.udf_registrations_ = t[4];
 		        result.udf_actor_handles_ = t[5];
 		        result.connection_snapshot_ = t[6];
+		        if (t.size() == 8) {
+			        result.memory_source_refs_ = t[7];
+		        }
 		        (void)VaneSessionIdFromSnapshot(result.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(result.connection_snapshot_);
 		        result.ensure_plan_identity();
@@ -1196,6 +1212,8 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("session_id", &PyLogicalPlan::session_id)
 	    .def("session_config", &PyLogicalPlan::session_config)
 	    .def("has_explicit_s3_credentials", &PyLogicalPlan::has_explicit_s3_credentials)
+	    .def("_memory_source_ref_count_for_test",
+	         [](const PyLogicalPlan &p) { return PythonMemorySourceObjectRefCount(p.memory_source_refs_); })
 	    .def("to_physical_plan", &PyLogicalPlan::to_physical_plan, py::arg("conn") = py::none(),
 	         py::arg("effective_session_config") = py::none())
 	    .def(py::pickle(
@@ -1205,10 +1223,10 @@ void register_ray_bindings(py::module_ &mod) {
 		        }
 		        (void)DecodeLogicalPlanEnvelope(p.serialized_logical_plan_);
 		        return py::make_tuple(p.query_id_, py::bytes(p.serialized_logical_plan_), p.udf_registrations_,
-		                              p.connection_snapshot_);
+		                              p.connection_snapshot_, p.memory_source_refs_);
 	        },
 	        [](py::tuple t) {
-		        if (t.size() != 4)
+		        if (t.size() != 4 && t.size() != 5)
 			        throw duckdb::InternalException("Invalid state for PyLogicalPlan");
 		        string query_id = py::cast<string>(t[0]);
 		        py::bytes serialized_bytes = py::cast<py::bytes>(t[1]);
@@ -1222,6 +1240,9 @@ void register_ray_bindings(py::module_ &mod) {
 		        plan.serialized_logical_plan_ = std::move(serialized_plan);
 		        plan.udf_registrations_ = t[2];
 		        plan.connection_snapshot_ = t[3];
+		        if (t.size() == 5) {
+			        plan.memory_source_refs_ = t[4];
+		        }
 		        (void)VaneSessionIdFromSnapshot(plan.connection_snapshot_);
 		        (void)VaneSessionConfigFromSnapshot(plan.connection_snapshot_);
 		        return plan;
@@ -1786,6 +1807,7 @@ void register_ray_bindings(py::module_ &mod) {
 					        deferred_exec_plan.resource_query_id_ = plan.resource_query_id_;
 					        deferred_exec_plan.udf_registrations_ = plan.udf_registrations_;
 					        deferred_exec_plan.udf_actor_handles_ = plan.udf_actor_handles_;
+					        deferred_exec_plan.memory_source_refs_ = plan.memory_source_refs_;
 					        deferred_exec_plan.connection_snapshot_ = plan.connection_snapshot_;
 					        deferred_exec_plan.serialized_root_ = plan.serialized_root_;
 					        deferred_exec_plan.worker_connection_ = exec_conn;

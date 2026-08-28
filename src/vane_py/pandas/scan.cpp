@@ -238,6 +238,12 @@ py::object PandasScanFunction::PandasReplaceCopiedNames(const py::object &origin
 	return copy_df;
 }
 
+py::object PandasScanFunction::GetDataFrame(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	return py::reinterpret_borrow<py::object>(data.df);
+}
+
 void PandasScanFunction::PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                                          const TableFunction &function) {
 	throw NotImplementedException("PandasScan function cannot be serialized");
