@@ -463,6 +463,84 @@ def test_local_runner_arrow_native_parquet_rejects_schema_changes_across_rotated
     assert len(list(output.glob("*.parquet"))) <= 1
 
 
+def test_local_runner_arrow_native_parquet_rejects_field_ids_across_rotated_streams(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        field_id = str(10 + values[0])
+        schema = pa.schema([pa.field("value", pa.int64(), metadata={"PARQUET:field_id": field_id})])
+        return pa.Table.from_arrays([pa.array(values, type=pa.int64())], schema=schema)
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_field_id_rotation.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+            task_input_max_bytes=1,
+        )
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="PARQUET:field_id metadata is not supported by Arrow-native Parquet COPY",
+        ):
+            relation.query(
+                "arrow_field_id_rotation",
+                f"COPY arrow_field_id_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 1, ROW_GROUPS_PER_FILE 1)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_rejects_duplicate_nested_field_ids(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        struct_type = pa.struct([pa.field("value", pa.int64(), metadata={"PARQUET:field_id": "7"})])
+        arrays = [
+            pa.array([{"value": value} for value in values], type=struct_type),
+            pa.array([{"value": value} for value in values], type=struct_type),
+        ]
+        return pa.Table.from_arrays(arrays, names=["left", "right"])
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_duplicate_nested_field_ids.parquet"
+    escaped_output = str(output).replace("'", "''")
+    nested_type = vane.struct_type({"value": vane.sqltypes.BIGINT})
+    con = vane.connect()
+    try:
+        relation = con.sql("select 1::BIGINT as x").map_batches(
+            transform,
+            schema={"left": nested_type, "right": nested_type},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+        )
+        with pytest.raises(
+            vane.NotImplementedException,
+            match="PARQUET:field_id metadata is not supported by Arrow-native Parquet COPY",
+        ):
+            relation.query(
+                "arrow_duplicate_nested_field_ids",
+                f"COPY arrow_duplicate_nested_field_ids TO '{escaped_output}' (FORMAT PARQUET)",
+            )
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
 def test_local_runner_arrow_native_parquet_rejects_file_size_rotation(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 

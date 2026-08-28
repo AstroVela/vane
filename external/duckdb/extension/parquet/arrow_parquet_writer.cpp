@@ -214,6 +214,35 @@ static std::shared_ptr<::arrow::DataType> ExtensionStorageType(std::shared_ptr<:
 	return type;
 }
 
+static void RejectArrowParquetFieldIDs(const std::shared_ptr<::arrow::Field> &field);
+
+static void RejectArrowParquetFieldIDs(std::shared_ptr<::arrow::DataType> type) {
+	while (type->id() == ::arrow::Type::EXTENSION) {
+		type = static_cast<const ::arrow::ExtensionType &>(*type).storage_type();
+	}
+	if (type->id() == ::arrow::Type::DICTIONARY) {
+		RejectArrowParquetFieldIDs(static_cast<const ::arrow::DictionaryType &>(*type).value_type());
+		return;
+	}
+	for (const auto &child : type->fields()) {
+		RejectArrowParquetFieldIDs(child);
+	}
+}
+
+static void RejectArrowParquetFieldIDs(const std::shared_ptr<::arrow::Field> &field) {
+	auto metadata = field->metadata();
+	if (metadata && metadata->Contains("PARQUET:field_id")) {
+		throw NotImplementedException("PARQUET:field_id metadata is not supported by Arrow-native Parquet COPY");
+	}
+	RejectArrowParquetFieldIDs(field->type());
+}
+
+static void RejectArrowParquetFieldIDs(const ::arrow::Schema &schema) {
+	for (const auto &field : schema.fields()) {
+		RejectArrowParquetFieldIDs(field);
+	}
+}
+
 static void ValidateArrowNativeParquetEncoding(std::shared_ptr<::arrow::DataType> type) {
 	type = ExtensionStorageType(std::move(type));
 	if (type->id() == ::arrow::Type::TIMESTAMP &&
@@ -568,6 +597,7 @@ void ArrowParquetLocalState::ImportSchema(ArrowSchema &schema, const vector<stri
 	}
 	std::vector<std::string> normalized_names(names.begin(), names.end());
 	auto imported_schema = std::move(imported).ValueUnsafe();
+	RejectArrowParquetFieldIDs(*imported_schema);
 	auto normalized = imported_schema->WithNames(normalized_names);
 	if (!normalized.ok()) {
 		ThrowArrowInputError(normalized.status(), "normalize the Arrow schema names");
