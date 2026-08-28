@@ -490,7 +490,8 @@ static ::parquet::Compression::type ArrowCompression(duckdb_parquet::Compression
 
 static std::shared_ptr<::parquet::WriterProperties>
 BuildWriterProperties(const std::shared_ptr<::arrow::Schema> &schema, const ArrowParquetWriterOptions &options,
-                      const std::shared_ptr<::parquet::ArrowWriterProperties> &arrow_properties) {
+                      const std::shared_ptr<::parquet::ArrowWriterProperties> &arrow_properties,
+                      vector<std::shared_ptr<::parquet::schema::ColumnPath>> &bloom_filter_paths) {
 	::parquet::WriterProperties::Builder builder;
 	builder.version(::parquet::ParquetVersion::PARQUET_1_0);
 	builder.compression(ArrowCompression(options.codec));
@@ -513,17 +514,38 @@ BuildWriterProperties(const std::shared_ptr<::arrow::Schema> &schema, const Arro
 			ThrowArrowInputError(status, "convert the Arrow schema");
 		}
 		::parquet::BloomFilterOptions bloom_options;
-		bloom_options.ndv = NumericCast<int32_t>(
-		    MinValue<idx_t>(options.row_group_size, NumericCast<idx_t>(std::numeric_limits<int32_t>::max())));
+		// The actual row-group cardinality is installed immediately before Arrow creates each filter.
+		bloom_options.ndv = 1;
 		bloom_options.fpp = options.bloom_filter_false_positive_ratio;
 		for (int column_idx = 0; column_idx < parquet_schema->num_columns(); column_idx++) {
 			auto column = parquet_schema->Column(column_idx);
 			if (column->physical_type() != ::parquet::Type::BOOLEAN && column->max_repetition_level() == 0) {
 				builder.enable_bloom_filter(column->path(), bloom_options);
+				bloom_filter_paths.push_back(column->path());
 			}
 		}
 	}
 	return builder.build();
+}
+
+static void SetBloomFilterCardinality(const vector<std::shared_ptr<::parquet::schema::ColumnPath>> &paths,
+                                      idx_t cardinality, double false_positive_ratio,
+                                      ::parquet::WriterProperties &properties) {
+	if (paths.empty()) {
+		return;
+	}
+	D_ASSERT(cardinality > 0);
+	::parquet::BloomFilterOptions bloom_options;
+	bloom_options.ndv =
+	    NumericCast<int32_t>(MinValue<idx_t>(cardinality, NumericCast<idx_t>(std::numeric_limits<int32_t>::max())));
+	bloom_options.fpp = false_positive_ratio;
+	::parquet::WriterProperties::Builder builder(properties);
+	for (const auto &path : paths) {
+		builder.enable_bloom_filter(path, bloom_options);
+	}
+	// Arrow's FileWriter retains this WriterProperties object and reads the Bloom options when it creates
+	// each buffered row group's column writers. Preserve the object's identity while replacing its contents.
+	properties = *builder.build();
 }
 
 } // namespace
@@ -585,7 +607,7 @@ struct ArrowParquetWriter::Impl {
 		::parquet::ArrowWriterProperties::Builder arrow_builder;
 		arrow_builder.set_use_threads(false);
 		auto arrow_properties = arrow_builder.build();
-		auto properties = BuildWriterProperties(schema, options, arrow_properties);
+		properties = BuildWriterProperties(schema, options, arrow_properties, bloom_filter_paths);
 		std::shared_ptr<::parquet::SchemaDescriptor> parquet_schema;
 		auto schema_status =
 		    ::parquet::arrow::ToParquetSchema(schema.get(), *properties, *arrow_properties, &parquet_schema);
@@ -621,8 +643,27 @@ struct ArrowParquetWriter::Impl {
 		}
 	}
 
+	void FlushPendingRowGroup() {
+		if (pending_row_group.empty()) {
+			return;
+		}
+		SetBloomFilterCardinality(bloom_filter_paths, rows_in_current_row_group,
+		                          options.bloom_filter_false_positive_ratio, *properties);
+		for (auto &batch : pending_row_group) {
+			auto status = writer->WriteRecordBatch(*batch);
+			if (!status.ok()) {
+				ThrowArrowWriterError(status, "write the Arrow record batch");
+			}
+			batch.reset();
+		}
+		pending_row_group.clear();
+	}
+
 	std::shared_ptr<::arrow::Schema> schema;
 	ArrowParquetWriterOptions options;
+	std::shared_ptr<::parquet::WriterProperties> properties;
+	vector<std::shared_ptr<::parquet::schema::ColumnPath>> bloom_filter_paths;
+	vector<std::shared_ptr<::arrow::RecordBatch>> pending_row_group;
 	std::shared_ptr<DuckDBArrowOutputStream> output;
 	std::unique_ptr<::parquet::arrow::FileWriter> writer;
 	optional_ptr<CopyFunctionFileStatistics> written_statistics;
@@ -674,22 +715,22 @@ void ArrowParquetWriter::Write(ArrowParquetLocalState &local_state, idx_t offset
 			throw InternalException("Arrow-native Parquet RETURN_STATS leaf count changed while writing");
 		}
 	}
-	auto status = impl->writer->WriteRecordBatch(*slice);
-	if (!status.ok()) {
-		ThrowArrowWriterError(status, "write the Arrow record batch");
+	if (impl->bloom_filter_paths.empty()) {
+		auto status = impl->writer->WriteRecordBatch(*slice);
+		if (!status.ok()) {
+			ThrowArrowWriterError(status, "write the Arrow record batch");
+		}
+	} else {
+		// Arrow 24 fixes a Bloom filter's allocation when its row group is created and cannot shrink it
+		// afterward. Retain zero-copy slices for one row group so the final group uses its actual row count.
+		impl->pending_row_group.push_back(std::move(slice));
 	}
 	impl->rows_written += cardinality;
-
-	idx_t remaining = cardinality;
-	while (remaining > 0) {
-		auto available = impl->options.row_group_size - impl->rows_in_current_row_group;
-		auto count = MinValue<idx_t>(remaining, available);
-		impl->rows_in_current_row_group += count;
-		remaining -= count;
-		if (impl->rows_in_current_row_group == impl->options.row_group_size) {
-			impl->rows_in_current_row_group = 0;
-			impl->completed_row_groups++;
-		}
+	impl->rows_in_current_row_group += cardinality;
+	if (impl->rows_in_current_row_group == impl->options.row_group_size) {
+		impl->FlushPendingRowGroup();
+		impl->rows_in_current_row_group = 0;
+		impl->completed_row_groups++;
 	}
 	if (cardinality == batch_rows - offset) {
 		local.record_batch.reset();
@@ -780,6 +821,7 @@ void ArrowParquetWriter::Finalize() {
 	if (impl->finalized) {
 		return;
 	}
+	impl->FlushPendingRowGroup();
 	auto writer_status = impl->writer->Close();
 	auto output_status = impl->output->Close();
 	impl->finalized = true;

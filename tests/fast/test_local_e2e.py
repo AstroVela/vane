@@ -390,6 +390,43 @@ def test_local_runner_arrow_native_parquet_writes_lz4_raw(local_runner, tmp_path
     assert compression == {"LZ4_RAW"}
 
 
+def test_local_runner_arrow_native_parquet_sizes_bloom_filter_from_actual_row_group(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        return pa.table({"value": table.column("x")})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_small_bloom_filter.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select 42::BIGINT as x").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+        )
+        relation.write_parquet(str(output), row_group_size=122_880)
+        output_files = list(output.glob("*.parquet"))
+        bloom_metadata = [
+            row
+            for path in output_files
+            for row in con.sql(
+                f"select row_group_num_rows, bloom_filter_length from parquet_metadata('{path}') "
+                "where path_in_schema = 'value'"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+
+    assert output_files
+    assert bloom_metadata
+    assert all(row_count == 1 and 0 < bloom_length < 1024 for row_count, bloom_length in bloom_metadata)
+
+
 def test_local_runner_arrow_native_parquet_rejects_file_size_rotation(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 
