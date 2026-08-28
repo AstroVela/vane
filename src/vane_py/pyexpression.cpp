@@ -127,6 +127,21 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileField(const string &field
 	return InternalFunctionExpression("struct_extract", std::move(children));
 }
 
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileFunction(const string &function_name) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(GetExpression().Copy());
+	return InternalFunctionExpression(function_name, std::move(children));
+}
+
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileMimeType(const string &detect) const {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(GetExpression().Copy());
+	if (detect != "metadata") {
+		children.push_back(make_uniq<duckdb::ConstantExpression>(Value(detect)));
+	}
+	return InternalFunctionExpression("file_mime_type", std::move(children));
+}
+
 // Case Expression modifiers
 
 void DuckDBPyExpression::AssertCaseExpression() const {

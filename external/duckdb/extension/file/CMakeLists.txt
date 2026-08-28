@@ -5,8 +5,13 @@ project(FileExtension)
 include_directories(include)
 
 set(FILE_EXTENSION_FILES
-    file_extension.cpp file_functions.cpp file_metadata_functions.cpp
-    file_mime_type.cpp file_resolver.cpp file_value.cpp)
+    file_extension.cpp
+    file_functions.cpp
+    file_list_function.cpp
+    file_metadata_functions.cpp
+    file_mime_type.cpp
+    file_resolver.cpp
+    file_value.cpp)
 
 build_static_extension(file ${FILE_EXTENSION_FILES})
 set(PARAMETERS "-warnings")

@@ -74,6 +74,8 @@ public:
 	shared_ptr<DuckDBPyExpression> Collate(const string &collation);
 	shared_ptr<DuckDBPyExpression> AsFile() const;
 	shared_ptr<DuckDBPyExpression> FileField(const string &field) const;
+	shared_ptr<DuckDBPyExpression> FileFunction(const string &function_name) const;
+	shared_ptr<DuckDBPyExpression> FileMimeType(const string &detect) const;
 
 	// AND, OR and NOT
 

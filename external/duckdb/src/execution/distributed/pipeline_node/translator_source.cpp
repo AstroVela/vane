@@ -178,7 +178,7 @@ PhysicalPlanToPipelineNodeTranslator::TranslateTableScanSource(PhysicalTableScan
 	}
 
 	scan_plan = MakeTableScanPlan(op);
-	scan_splits = MakeTableScanSplits(op, *exec_cfg, plan_config_.db);
+	scan_splits = MakeTableScanSplits(op, *exec_cfg, plan_config_.db, client_context_);
 	if (!scan_plan || !scan_plan->HasRoot()) {
 		throw std::runtime_error(
 		    "[translate.cpp] TABLE_SCAN: MakeTableScanPlan returned null/empty plan for function " + op.function.name);

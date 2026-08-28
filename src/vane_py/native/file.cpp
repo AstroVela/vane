@@ -7,7 +7,11 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "file_value.hpp"
+#include "vane_python/pybind11/conversions/pyconnection_default.hpp"
+#include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/python_objects.hpp"
 
+#include <mutex>
 #include <utility>
 
 namespace duckdb {
@@ -77,6 +81,40 @@ static FileReference MakeReference(const string &url, const std::optional<string
 	                                 OptionalIntegerValue(size), OptionalStringValue(checksum), "File");
 }
 
+static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
+                                    const string &query, vector<Value> parameters = {}) {
+	if (!connection) {
+		connection = DuckDBPyConnection::DefaultConnection();
+	}
+	parameters.insert(parameters.begin(), file.ToValue());
+	Value value;
+	ClientProperties client_properties;
+	{
+		D_ASSERT(py::gil_check());
+		py::gil_scoped_release release;
+		unique_lock<mutex> lock(connection->py_connection_lock);
+		auto &native_connection = connection->con.GetConnection();
+		auto pending = native_connection.PendingQuery(query, parameters);
+		if (pending->HasError()) {
+			pending->ThrowError();
+		}
+		auto result = DuckDBPyConnection::CompletePendingQuery(*pending);
+		if (!result || result->HasError()) {
+			if (result) {
+				result->ThrowError();
+			}
+			throw InternalException("FILE metadata query returned no result");
+		}
+		auto chunk = result->Fetch();
+		if (!chunk || chunk->size() != 1 || chunk->ColumnCount() != 1) {
+			throw InternalException("FILE metadata query did not return exactly one value");
+		}
+		value = chunk->GetValue(0, 0);
+		client_properties = native_connection.context->GetClientProperties();
+	}
+	return PythonObject::FromValue(value, value.type(), client_properties);
+}
+
 } // namespace
 
 PythonFile::PythonFile(string url_p, std::optional<string> content_type_p, std::optional<int64_t> position_p,
@@ -99,6 +137,12 @@ void PythonFile::Initialize(py::handle &m) {
 	file.def_property_readonly("position", &PythonFile::Position);
 	file.def_property_readonly("size", &PythonFile::Size);
 	file.def_property_readonly("checksum", &PythonFile::Checksum);
+	file.def("exists", &PythonFile::Exists, "Return whether this FILE's logical view is accessible", py::kw_only(),
+	         py::arg("connection") = py::none());
+	file.def("stat", &PythonFile::Stat, "Return the six-field SQL file_stat value", py::kw_only(),
+	         py::arg("connection") = py::none());
+	file.def("mime_type", &PythonFile::MimeType, "Return the MIME type selected by SQL file_mime_type",
+	         py::arg("detect") = "metadata", py::kw_only(), py::arg("connection") = py::none());
 	file.def("__str__", &PythonFile::ToString);
 	file.def("__repr__", &PythonFile::Repr);
 	file.def("__eq__", &PythonFile::Equals, py::arg("other"), py::is_operator());
@@ -173,6 +217,21 @@ Py_hash_t PythonFile::Hash() const {
 
 py::tuple PythonFile::State() const {
 	return py::make_tuple(url, content_type, position, size, checksum);
+}
+
+py::object PythonFile::Exists(shared_ptr<DuckDBPyConnection> connection) const {
+	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_exists(?)");
+}
+
+py::object PythonFile::Stat(shared_ptr<DuckDBPyConnection> connection) const {
+	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_stat(?)");
+}
+
+py::object PythonFile::MimeType(const string &detect, shared_ptr<DuckDBPyConnection> connection) const {
+	if (detect == "metadata") {
+		return ExecuteFileScalar(*this, std::move(connection), "SELECT file_mime_type(?)");
+	}
+	return ExecuteFileScalar(*this, std::move(connection), "SELECT file_mime_type(?, ?)", {Value(detect)});
 }
 
 const string &PythonFile::Url() const {

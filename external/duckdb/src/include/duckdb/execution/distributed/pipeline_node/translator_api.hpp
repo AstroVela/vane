@@ -30,9 +30,9 @@ DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline
     PlanConfig plan_config, DuckPhysicalPlanRef plan, ClientContext *client_context = nullptr,
     optional_ptr<const DistributedExtensionWriteInfo> resolved_extension_write_info = nullptr);
 
-std::unordered_map<idx_t, std::vector<ScanSplit>> physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan,
-                                                                                       DuckDBExecutionConfigRef config,
-                                                                                       shared_ptr<DatabaseInstance> db);
+std::unordered_map<idx_t, std::vector<ScanSplit>>
+physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionConfigRef config,
+                                     shared_ptr<DatabaseInstance> db, ClientContext *client_context = nullptr);
 
 } // namespace distributed
 } // namespace duckdb

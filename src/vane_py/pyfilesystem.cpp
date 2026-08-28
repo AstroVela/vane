@@ -139,7 +139,15 @@ bool PythonFilesystem::FileExists(const string &filename, optional_ptr<FileOpene
 bool PythonFilesystem::Exists(const string &filename, const char *func_name) const {
 	PythonGILWrapper gil;
 
-	return py::bool_(filesystem.attr(func_name)(filename));
+	try {
+		return py::bool_(filesystem.attr(func_name)(filename));
+	} catch (const py::error_already_set &error) {
+		if (!error.matches(PyExc_NotImplementedError)) {
+			throw;
+		}
+		throw NotImplementedException("Registered Python filesystem '%s' does not implement %s()", GetName(),
+		                              func_name);
+	}
 }
 vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *opener) {
 	PythonGILWrapper gil;
@@ -147,15 +155,22 @@ vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *open
 	if (path.empty()) {
 		return {path};
 	}
-	auto returner = py::list(filesystem.attr("glob")(path));
+	try {
+		auto returner = py::list(filesystem.attr("glob")(path));
 
-	vector<OpenFileInfo> results;
-	auto unstrip_protocol = filesystem.attr("unstrip_protocol");
-	for (auto item : returner) {
-		string file_path = py::str(unstrip_protocol(py::str(item)));
-		results.emplace_back(file_path);
+		vector<OpenFileInfo> results;
+		auto unstrip_protocol = filesystem.attr("unstrip_protocol");
+		for (auto item : returner) {
+			string file_path = py::str(unstrip_protocol(py::str(item)));
+			results.emplace_back(file_path);
+		}
+		return results;
+	} catch (const py::error_already_set &error) {
+		if (!error.matches(PyExc_NotImplementedError)) {
+			throw;
+		}
+		throw NotImplementedException("Registered Python filesystem '%s' does not implement glob()", GetName());
 	}
-	return results;
 }
 string PythonFilesystem::PathSeparator(const string &path) {
 	return "/";
@@ -234,15 +249,22 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
                                  FileOpener *opener) {
 	D_ASSERT(!py::gil_check());
 	PythonGILWrapper gil;
-	bool nonempty = false;
 
-	for (auto item : filesystem.attr("ls")(py::str(directory), py::arg("detail") = true)) {
-		bool is_dir = py::cast<std::string>(item["type"]) == "directory";
-		callback(py::str(item["name"]), is_dir);
-		nonempty = true;
+	try {
+		for (auto item : filesystem.attr("ls")(py::str(directory), py::arg("detail") = true)) {
+			bool is_dir = py::cast<std::string>(item["type"]) == "directory";
+			callback(py::str(item["name"]), is_dir);
+		}
+	} catch (const py::error_already_set &error) {
+		if (!error.matches(PyExc_NotImplementedError)) {
+			throw;
+		}
+		throw NotImplementedException("Registered Python filesystem '%s' does not implement ls()", GetName());
 	}
 
-	return nonempty;
+	// The return value reports whether listing succeeded, not whether the
+	// directory contained entries.
+	return true;
 }
 void PythonFilesystem::Truncate(FileHandle &handle, int64_t new_size) {
 	D_ASSERT(!py::gil_check());

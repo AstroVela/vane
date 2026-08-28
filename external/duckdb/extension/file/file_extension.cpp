@@ -4,6 +4,7 @@
 #include "file_extension.hpp"
 
 #include "file_functions.hpp"
+#include "file_list_function.hpp"
 #include "file_metadata_functions.hpp"
 
 #include "duckdb/function/scalar/nested_functions.hpp"
@@ -18,6 +19,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(function));
 	}
 	for (auto &function : FileMetadataFunctions::GetFunctions()) {
+		loader.RegisterFunction(std::move(function));
+	}
+	for (auto &function : FileListFunction::GetFunctions()) {
 		loader.RegisterFunction(std::move(function));
 	}
 

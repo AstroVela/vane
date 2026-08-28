@@ -453,6 +453,11 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def_property_readonly("size", [](const DuckDBPyExpression &self) { return self.FileField("size"); });
 	expression.def_property_readonly("checksum",
 	                                 [](const DuckDBPyExpression &self) { return self.FileField("checksum"); });
+	expression.def("file_path", [](const DuckDBPyExpression &self) { return self.FileFunction("file_path"); });
+	expression.def("file_size", [](const DuckDBPyExpression &self) { return self.FileFunction("file_size"); });
+	expression.def("file_exists", [](const DuckDBPyExpression &self) { return self.FileFunction("file_exists"); });
+	expression.def("file_stat", [](const DuckDBPyExpression &self) { return self.FileFunction("file_stat"); });
+	expression.def("file_mime_type", &DuckDBPyExpression::FileMimeType, py::arg("detect") = "metadata");
 }
 
 } // namespace duckdb

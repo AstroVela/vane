@@ -543,9 +543,10 @@ DuckDBResult<std::shared_ptr<DistributedPipelineNode>> physical_plan_to_pipeline
 	return result;
 }
 
-std::unordered_map<idx_t, std::vector<ScanSplit>>
-physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionConfigRef config,
-                                     shared_ptr<DatabaseInstance> db) {
+std::unordered_map<idx_t, std::vector<ScanSplit>> physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan,
+                                                                                       DuckDBExecutionConfigRef config,
+                                                                                       shared_ptr<DatabaseInstance> db,
+                                                                                       ClientContext *client_context) {
 	std::unordered_map<idx_t, std::vector<ScanSplit>> out;
 	if (!plan || !plan->HasRoot()) {
 		return out;
@@ -595,7 +596,7 @@ physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCo
 				scan.extra_info.scan_node_id = optional_idx(allocate_scan_node_id());
 			}
 
-			auto splits = MakeTableScanSplits(scan, *exec_cfg, db);
+			auto splits = MakeTableScanSplits(scan, *exec_cfg, db, client_context);
 			out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(splits));
 		}
 		for (auto &child : op.children) {
