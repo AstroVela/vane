@@ -3942,6 +3942,33 @@ def test_ray_ie_join(ray_runner, duckdb_conn):
     )
 
 
+def test_ray_native_asof_join_gathers_both_inputs(ray_runner, duckdb_conn, parquet_path):
+    label = "test_ray_e2e: native ASOF join gathers both inputs"
+    sql = f"""
+        SELECT
+            l.a AS left_a,
+            l.b AS left_value,
+            r.c AS right_value
+        FROM read_parquet('{parquet_path}') AS l
+        ASOF LEFT JOIN read_parquet('{parquet_path}') AS r
+          ON (l.a % 8) = (r.a % 8)
+         AND l.a >= r.a
+    """
+
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, label)
+    assert plan_text and "ASOF JOIN" in plan_text.upper(), f"{label}: expected distributed ASOF join:\n{plan_text}"
+    assert num_parts == 1, f"{label}: correctness fallback must gather to one partition, got {num_parts}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["ASOF_JOIN"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_ie_join_preserves_asof_projection(ray_runner, duckdb_conn):
     label = "test_ray_e2e: IE join ASOF projection"
     duckdb_conn.execute("SET debug_asof_iejoin=true")

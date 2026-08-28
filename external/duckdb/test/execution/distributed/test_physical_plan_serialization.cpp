@@ -32,6 +32,7 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
@@ -1160,6 +1161,66 @@ TEST_CASE("PhysicalBlockwiseNLJoin serialization roundtrip", "[serialization][ph
 	REQUIRE(roundtrip->children.size() == 2);
 	REQUIRE(roundtrip->children[0].get().GetTypes() == input_types);
 	REQUIRE(roundtrip->children[1].get().GetTypes() == input_types);
+}
+
+TEST_CASE("PhysicalAsOfJoin serialization roundtrip", "[serialization][physical_plan][join][asof_join]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> left_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<LogicalType> right_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::VARCHAR};
+
+	auto &left = MakeColumnDataScan(plan, left_types);
+	auto &right = MakeColumnDataScan(plan, right_types);
+	LogicalComparisonJoin logical_join(JoinType::LEFT);
+	logical_join.types = output_types;
+	logical_join.estimated_cardinality = 12;
+	logical_join.right_projection_map = {2};
+
+	JoinCondition partition;
+	partition.left = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	partition.right = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0);
+	partition.comparison = ExpressionType::COMPARE_EQUAL;
+	logical_join.conditions.push_back(std::move(partition));
+
+	JoinCondition order;
+	order.left = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 1);
+	order.right = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 1);
+	order.comparison = ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+	logical_join.conditions.push_back(std::move(order));
+
+	auto &join = plan.Make<PhysicalAsOfJoin>(logical_join, left, right);
+	plan.SetRoot(join);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	plan.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	PhysicalPlan deserialized_plan(allocator);
+	deserializer.Begin();
+	auto root = deserialized_plan.Deserialize(deserializer);
+	deserializer.End();
+
+	REQUIRE(root != nullptr);
+	auto *roundtrip = dynamic_cast<PhysicalAsOfJoin *>(root.get());
+	REQUIRE(roundtrip != nullptr);
+	REQUIRE(roundtrip->join_type == JoinType::LEFT);
+	REQUIRE(roundtrip->conditions.size() == 2);
+	REQUIRE(roundtrip->lhs_partitions.size() == 1);
+	REQUIRE(roundtrip->rhs_partitions.size() == 1);
+	REQUIRE(roundtrip->lhs_orders.size() == 1);
+	REQUIRE(roundtrip->rhs_orders.size() == 1);
+	REQUIRE(roundtrip->comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO);
+	REQUIRE(roundtrip->right_projection_map == vector<column_t> {2});
+	REQUIRE(roundtrip->GetTypes() == output_types);
+	REQUIRE(roundtrip->estimated_cardinality == 12);
+	REQUIRE(roundtrip->children.size() == 2);
+	REQUIRE(roundtrip->children[0].get().GetTypes() == left_types);
+	REQUIRE(roundtrip->children[1].get().GetTypes() == right_types);
 }
 
 TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_plan]") {

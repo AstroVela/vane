@@ -21,6 +21,10 @@ public:
 public:
 	PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, PhysicalOperator &left,
 	                 PhysicalOperator &right);
+	//! Constructor for deserialization (children added later)
+	PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op, vector<JoinCondition> conditions,
+	                 JoinType join_type, vector<column_t> right_projection_map, idx_t estimated_cardinality,
+	                 bool skip_child_init);
 
 	vector<LogicalType> join_key_types;
 	vector<column_t> null_sensitive;
@@ -36,6 +40,9 @@ public:
 
 	// Projection mappings
 	vector<column_t> right_projection_map;
+
+	//! Serialization
+	void SerializeOperatorData(Serializer &serializer) const override;
 
 protected:
 	// CachingOperator Interface
@@ -75,6 +82,9 @@ public:
 
 public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+
+private:
+	void InitializeJoinConditions();
 };
 
 } // namespace duckdb

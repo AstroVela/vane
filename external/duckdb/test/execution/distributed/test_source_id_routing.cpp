@@ -33,6 +33,7 @@
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
@@ -47,6 +48,7 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
 #define private public
+#include "duckdb/execution/distributed/pipeline_node/join/asof_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
@@ -418,6 +420,62 @@ TEST_CASE("PhysicalPlanTranslator: translates cross product with two inputs", "[
 	REQUIRE(cross_node != nullptr);
 	REQUIRE(cross_node->children().size() == 2);
 	REQUIRE(cross_node->config().clustering_spec()->num_partitions() == 1);
+}
+
+TEST_CASE("PhysicalPlanTranslator: translates ASOF joins to a gathered native worker plan",
+          "[distributed][join][asof_join]") {
+	Allocator allocator;
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> left_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<LogicalType> right_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+
+	auto &left = plan->Make<PhysicalColumnDataScan>(left_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 2,
+	                                                MakeCollection(left_types, 2));
+	auto &right = plan->Make<PhysicalColumnDataScan>(right_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 3,
+	                                                 MakeCollection(right_types, 3));
+	LogicalComparisonJoin logical_join(JoinType::LEFT);
+	logical_join.types = output_types;
+	logical_join.estimated_cardinality = 6;
+	logical_join.right_projection_map = {2};
+	logical_join.conditions.push_back(MakeJoinCondition(ExpressionType::COMPARE_EQUAL, 0, 0));
+	logical_join.conditions.push_back(MakeJoinCondition(ExpressionType::COMPARE_GREATERTHANOREQUALTO, 1, 1));
+	auto &join = plan->Make<PhysicalAsOfJoin>(logical_join, left, right);
+	plan->SetRoot(join);
+
+	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
+	REQUIRE(result.ok);
+	REQUIRE(result.value() != nullptr);
+	auto join_node = std::dynamic_pointer_cast<AsOfJoinNode>(result.value()->inner());
+	REQUIRE(join_node != nullptr);
+	REQUIRE(join_node->children().size() == 2);
+	REQUIRE(join_node->config().clustering_spec()->num_partitions() == 1);
+	REQUIRE(join_node->conditions_.size() == 2);
+	REQUIRE(join_node->right_projection_map_ == vector<column_t> {2});
+
+	auto left_task =
+	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(10, "left", 10, "left_scan", left_types));
+	auto right_task =
+	    SubmittableTask<WorkerTask>(MakeWorkerTaskWithTypesAndInput(20, "right", 20, "right_scan", right_types));
+	TaskIDCounter task_id_counter;
+	auto join_task =
+	    join_node->BuildAsOfJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+	REQUIRE(join_task.task()->inputs().size() == 2);
+	REQUIRE(join_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
+	REQUIRE(join_task.task()->inputs().at(20).scan_split_batch_bytes == "right_scan");
+	REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::ASOF_JOIN);
+	REQUIRE(join_task.task()->plan()->Root().GetTypes() == output_types);
+	auto &worker_join = join_task.task()->plan()->Root().Cast<PhysicalAsOfJoin>();
+	REQUIRE(worker_join.children.size() == 2);
+	REQUIRE(worker_join.conditions.size() == 2);
+	REQUIRE(worker_join.right_projection_map == vector<column_t> {2});
+
+	auto cloned = ClonePhysicalPlanOrThrow(join_task.task()->plan(), "asof_join_owned_children_test", nullptr);
+	REQUIRE(cloned->Root().type == PhysicalOperatorType::ASOF_JOIN);
+	REQUIRE(cloned->Root().GetTypes() == output_types);
+	REQUIRE(cloned->Root().children.size() == 2);
+	REQUIRE(cloned->Root().Cast<PhysicalAsOfJoin>().right_projection_map == vector<column_t> {2});
 }
 
 TEST_CASE("PhysicalPlanTranslator: normalizes range joins to a gathered nested-loop node",
