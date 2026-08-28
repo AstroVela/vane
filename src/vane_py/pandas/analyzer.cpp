@@ -136,6 +136,12 @@ static bool UpgradeType(LogicalType &left, const LogicalType &right) {
 		return true;
 	}
 
+	auto left_is_file = FileLogicalType::IsFile(left);
+	auto right_is_file = FileLogicalType::IsFile(right);
+	if (left_is_file || right_is_file) {
+		return left_is_file && right_is_file;
+	}
+
 	switch (left.id()) {
 	case LogicalTypeId::LIST: {
 		if (right.id() != left.id()) {
@@ -406,6 +412,8 @@ LogicalType PandasAnalyzer::GetItemType(py::object ele, bool &can_convert) {
 		return LogicalType::DATE;
 	case PythonObjectType::Timedelta:
 		return LogicalType::INTERVAL;
+	case PythonObjectType::File:
+		return FileLogicalType::Create();
 	case PythonObjectType::String:
 		return LogicalType::VARCHAR;
 	case PythonObjectType::Uuid:

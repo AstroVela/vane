@@ -5,6 +5,8 @@
 // Modified by Vane contributors.
 
 #include "vane_python/python_objects.hpp"
+
+#include "vane_python/file.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -421,6 +423,9 @@ py::object PythonObject::FromStruct(const Value &val, const LogicalType &type,
 }
 
 static bool KeyIsHashable(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return true;
+	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
 	case LogicalTypeId::TINYINT:
@@ -478,6 +483,9 @@ py::object PythonObject::FromValue(const Value &val, const LogicalType &type,
 	auto &import_cache = *DuckDBPyConnection::ImportCache();
 	if (val.IsNull()) {
 		return py::none();
+	}
+	if (FileLogicalType::IsFile(type)) {
+		return py::cast(PythonFile::FromValue(val));
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
