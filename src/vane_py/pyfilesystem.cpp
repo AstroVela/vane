@@ -149,6 +149,86 @@ bool PythonFilesystem::Exists(const string &filename, const char *func_name) con
 		                              func_name);
 	}
 }
+
+static string StablePathKeyPrefix(const string &path, bool glob_pattern) {
+	auto glob = glob_pattern ? path.find_first_of("*?[") : string::npos;
+	if (glob == string::npos) {
+		return path;
+	}
+	auto separator = path.rfind('/', glob);
+	return separator == string::npos ? string() : path.substr(0, separator + 1);
+}
+
+static bool IsSameOrChildPathKey(const string &path, const string &prefix) {
+	if (prefix.empty() || !StringUtil::StartsWith(path, prefix)) {
+		return false;
+	}
+	return path.size() == prefix.size() || StringUtil::EndsWith(prefix, "/") || path[prefix.size()] == '/';
+}
+
+static bool HasCallerIdentityPrefix(const string &path) {
+	auto scheme_separator = path.find("://");
+	if (scheme_separator == string::npos) {
+		return true;
+	}
+	auto offset = scheme_separator + 3;
+	while (offset < path.size() && path[offset] == '/') {
+		offset++;
+	}
+	return offset < path.size();
+}
+
+// fsspec unstrip_protocol() always selects the provider's first protocol and
+// can omit an authority owned by the configured instance. Compare paths in the
+// provider's stripped key space, then restore only the caller's stable locator
+// prefix. Results outside that prefix retain the provider representation.
+string PythonFilesystem::RestoreCallerPath(const string &locator, const string &returned_path,
+                                           const string &fallback_path, bool glob_pattern) const {
+	D_ASSERT(py::gil_check());
+	auto scheme_separator = returned_path.find("://");
+	if (scheme_separator != string::npos) {
+		auto returned_protocol = returned_path.substr(0, scheme_separator);
+		bool supported_protocol = false;
+		for (const auto &protocol : protocols) {
+			if (StringUtil::CIEquals(protocol, returned_protocol)) {
+				supported_protocol = true;
+				break;
+			}
+		}
+		if (!supported_protocol) {
+			return fallback_path;
+		}
+	}
+
+	auto strip_protocol = filesystem.attr("_strip_protocol");
+	string locator_key = py::str(strip_protocol(py::str(locator)));
+	string returned_key = py::str(strip_protocol(py::str(returned_path)));
+	if (locator_key.empty()) {
+		return fallback_path;
+	}
+	auto stable_prefix = StablePathKeyPrefix(locator_key, glob_pattern);
+	if (!IsSameOrChildPathKey(returned_key, stable_prefix)) {
+		return fallback_path;
+	}
+
+	auto caller_prefix = locator;
+	if (stable_prefix.size() < locator_key.size()) {
+		auto pattern_suffix = locator_key.substr(stable_prefix.size());
+		if (!StringUtil::EndsWith(locator, pattern_suffix)) {
+			return fallback_path;
+		}
+		caller_prefix.resize(locator.size() - pattern_suffix.size());
+	}
+	if (stable_prefix == "/" && !HasCallerIdentityPrefix(caller_prefix)) {
+		return fallback_path;
+	}
+	auto returned_suffix = returned_key.substr(stable_prefix.size());
+	if (StringUtil::EndsWith(caller_prefix, "/") && StringUtil::StartsWith(returned_suffix, "/")) {
+		returned_suffix.erase(0, 1);
+	}
+	return caller_prefix + returned_suffix;
+}
+
 vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *opener) {
 	PythonGILWrapper gil;
 
@@ -161,8 +241,12 @@ vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *open
 		vector<OpenFileInfo> results;
 		auto unstrip_protocol = filesystem.attr("unstrip_protocol");
 		for (auto item : returner) {
-			string file_path = py::str(unstrip_protocol(py::str(item)));
-			results.emplace_back(file_path);
+			string returned_path = py::str(item);
+			string fallback_path = returned_path;
+			if (returned_path.find("://") == string::npos) {
+				fallback_path = py::str(unstrip_protocol(py::str(item)));
+			}
+			results.emplace_back(RestoreCallerPath(path, returned_path, fallback_path, true));
 		}
 		return results;
 	} catch (const py::error_already_set &error) {
@@ -253,7 +337,8 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
 	try {
 		for (auto item : filesystem.attr("ls")(py::str(directory), py::arg("detail") = true)) {
 			bool is_dir = py::cast<std::string>(item["type"]) == "directory";
-			callback(py::str(item["name"]), is_dir);
+			string returned_path = py::str(item["name"]);
+			callback(RestoreCallerPath(directory, returned_path, returned_path, false), is_dir);
 		}
 	} catch (const py::error_already_set &error) {
 		if (!error.matches(PyExc_NotImplementedError)) {

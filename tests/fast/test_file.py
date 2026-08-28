@@ -998,6 +998,80 @@ def test_list_files_normalizes_registered_url_identity_across_directory_and_glob
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+def test_list_files_normalizes_registered_protocol_alias_identity_across_directory_and_glob(duckdb_cursor, tmp_path):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    directory = tmp_path / "alias-identity"
+    directory.mkdir()
+    child = directory / "value.txt"
+    child.write_text("value", encoding="utf-8")
+    directory_url = directory.as_uri().replace("file://", "local://", 1)
+
+    filesystem = fsspec.filesystem("file", skip_instance_cache=True)
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        direct = duckdb_cursor.execute(
+            "SELECT url, file_locator_id(file), file FROM list_files(?)", [directory_url]
+        ).fetchone()
+        glob = duckdb_cursor.execute(
+            "SELECT url, file_locator_id(file), file FROM list_files(?)", [f"{directory_url}/*"]
+        ).fetchone()
+    finally:
+        duckdb_cursor.unregister_filesystem("file")
+
+    assert direct[0] == glob[0] == child.as_uri().replace("file://", "local://", 1)
+    assert direct[1] == glob[1]
+    assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
+
+
+def test_list_files_normalizes_registered_authority_identity_across_directory_and_glob(duckdb_cursor):
+    pytest.importorskip("fsspec", minversion="2022.11.0")
+    ftp_module = pytest.importorskip("fsspec.implementations.ftp")
+    memory_module = pytest.importorskip("fsspec.implementations.memory")
+
+    class DirectoryFTPFileSystem(memory_module.MemoryFileSystem):
+        protocol = "ftp"
+        vane_directory_semantics = True
+        _strip_protocol = classmethod(ftp_module.FTPFileSystem._strip_protocol.__func__)
+
+    filesystem = DirectoryFTPFileSystem(skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+    filesystem.pipe("/root/value.txt", b"value")
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        direct = duckdb_cursor.execute(
+            "SELECT url, file_locator_id(file), file FROM list_files('ftp://host/root')"
+        ).fetchone()
+        glob = duckdb_cursor.execute(
+            "SELECT url, file_locator_id(file), file FROM list_files('ftp://host/root/*')"
+        ).fetchone()
+    finally:
+        duckdb_cursor.unregister_filesystem("ftp")
+
+    assert direct[0] == glob[0] == "ftp://host/root/value.txt"
+    assert direct[1] == glob[1]
+    assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
+
+
+def test_list_files_preserves_unrelated_registered_glob_urls(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class ForeignResultFileSystem(fsspec.AbstractFileSystem):
+        protocol = "source"
+
+        def glob(self, path, **kwargs):
+            return ["other://bucket/value.txt"]
+
+    filesystem = ForeignResultFileSystem(skip_instance_cache=True)
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('source://root/*')").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("source")
+
+    assert rows == [("other://bucket/value.txt",)]
+
+
 def test_list_files_registered_directory_filesystem_accepts_trailing_directory_separator(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
 
