@@ -2,11 +2,11 @@
 
 ## Scope
 
-This document defines the explicit contracts that let a statically linked
-DuckDB extension participate in Vane's Ray distributed execution. The engine
-owns scheduling, transport, and the coordinator transaction boundary; each
-extension continues to own its bind state, scan semantics, artifact production,
-and catalog mutation logic.
+This document defines the explicit contracts that let a DuckDB extension
+participate in Vane's Ray distributed execution. The engine owns scheduling,
+transport, and the coordinator transaction boundary; each extension continues
+to own its bind state, scan semantics, artifact production, and catalog mutation
+logic.
 
 An extension participates by attaching a concrete distributed scan contract to
 a normal table function or by registering a concrete distributed write hook.
@@ -23,8 +23,10 @@ when it runs through DuckDB's native runner.
 
 ## Design rules
 
-- Extensions used by Ray are pinned, reviewed, and statically linked into the
-  Vane release artifact.
+- Extensions used by Ray are pinned and reviewed. They are either statically
+  linked into the Vane release artifact or supplied by an exact preinstalled
+  dynamic provider whose descriptor and artifact are verified during worker
+  preparation.
 - The coordinator resolves catalog state and selects immutable work before
   worker execution starts.
 - Workers receive portable split data and restore extension state through the
@@ -76,8 +78,9 @@ accepts only implemented hook kinds: distributed table scans and distributed
 write operators. It has no public placeholder API for hypothetical aggregate,
 COPY, storage, or context protocols.
 
-Ordinary DuckDB registrations remain available on every statically linked
-worker:
+Ordinary DuckDB registrations remain available on every prepared worker
+DatabaseInstance after the exact static or provider-backed dynamic extension is
+loaded:
 
 - ordinary worker-safe scalar functions, types, casts, and collations use their
   normal DuckDB registrations after the exact extension is loaded;
@@ -108,16 +111,47 @@ method, matching DuckDB's `OperatorExtension`, `ParserExtension`,
 ## Build and loading
 
 The connection snapshot records the content-derived DuckDB `SourceID`, every
-loaded static extension name and exact extension version, and a sorted list of
-canonical distributed contract identities. A worker first validates its
-`SourceID`, invokes DuckDB's generated static loader, compares the loaded
-extension identities, and then compares the registered contracts before
-deserializing a plan. Dynamically
-installed extension binaries are not accepted by distributed execution.
+loaded static extension name and exact extension version, an ordered dynamic
+extension descriptor manifest, and a sorted list of canonical distributed
+contract identities. Each dynamic descriptor carries the artifact SHA-256,
+platform and source identity, trust identity, and direct dependencies. Vane
+records it only after `DynamicExtensionResolver.load()` verifies the local
+artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
+another route makes snapshot capture fail closed.
+
+Coordinator progress-topology inspection clones each fragment with an isolated
+cursor from the resolver-owned planning DatabaseInstance. It reuses the
+already-verified extension state and does not require a provider entry point on
+the driver after an explicit artifact load. This coordinator path is
+verification-only and does not apply worker security settings to the user's
+DatabaseInstance.
+
+Fragment registration prepares an isolated worker DatabaseInstance before any
+task can deserialize the plan. Immediately before native admission, the worker
+refreshes the exact database identity and prepares any cache miss first, such
+as one caused by S3 credential rotation. Preparation validates the `SourceID`,
+loads the declared static extensions, resolves only the exact preinstalled
+`vane.dynamic_extension_providers` entry points, verifies the complete
+dependency graph before loading, invokes the existing resolver in manifest
+order, and compares registered distributed contracts. The manifest is part of the worker
+database/cache identity. The worker acquires a cursor from that prepared entry
+before admission; the cursor lease prevents credential rotation from retiring
+the DatabaseInstance during handoff. Execution issues no further dynamic-extension
+load and verifies the exact recorded descriptors, native loaded names, static
+identities, and contracts.
+
+No coordinator artifact path or binary payload is transported. Workers do not
+scan an implicit directory or use a repository, network download, autoinstall,
+autoload, unsigned loading, compatibility behavior, or fallback artifact.
+Worker bootstrap sanitization ignores coordinator extension/home directories
+and extension repository settings, so the resolver cache remains node-local.
+Missing or ambiguous providers, altered bytes, trust failures, platform or
+source mismatches, invalid dependency order, and worker disagreement fail
+deterministically during preparation.
 
 The snapshot schema is strict. Legacy name-only extension lists, absent
 contract data, extra worker contracts, and any protocol mismatch are rejected.
-This validation occurs before task scheduling.
+This validation occurs before task admission and plan deserialization.
 
 The snapshot also carries declarations of attached catalogs needed to plan a
 transported logical plan. Transported logical plans use an isolated planning
@@ -181,10 +215,11 @@ IcebergCreateWorkerBind(const TableFunctionDistributedScanInput &input) {
 }
 ```
 
-After loading the required static extension, each worker resolves the normal
-DuckDB table function from its catalog and calls its `deserialize` callback.
-The worker never invokes the original bind callback and never repeats catalog or
-metadata planning. Missing or incomplete bind serde is a hard error.
+After loading the required extension through its declared static or verified
+dynamic path, each worker resolves the normal DuckDB table function from its
+catalog and calls its `deserialize` callback. The worker never invokes the
+original bind callback and never repeats catalog or metadata planning. Missing
+or incomplete bind serde is a hard error.
 
 ### Extension-owned splits
 
@@ -309,7 +344,7 @@ write-operator name, plus opaque dynamic worker bind bytes for callback mode.
 File-artifact plans must leave the worker bind empty. Vane resolves the mode,
 capability protocol, fragment codec, and worker callbacks from the
 database-local immutable `DistributedWriteOperatorExtension`. A physical plan
-cannot override that static contract.
+cannot override that registered contract.
 
 In callback mode, the worker bind may carry an extension-created write handle
 and artifact namespace, analogous to a connector insert handle. The physical
@@ -452,9 +487,9 @@ For every distributed write provider:
 
 - return a `DistributedExtensionWritePlan` containing the exact registered
   extension/operator key and portable dynamic worker bind bytes;
-- register the mode, protocol, codec, and callbacks once in the static
-  `DistributedWriteOperatorExtension`; do not duplicate them in the physical
-  provider;
+- register the mode, protocol, codec, and callbacks once in the database-local
+  immutable `DistributedWriteOperatorExtension`; do not duplicate them in the
+  physical provider;
 - keep `ValidateDistributedWrite` read-only and limit it to catalog and output
   precondition checks before workers start;
 - accept only the selected task-result envelopes during finalization;
@@ -486,7 +521,8 @@ distributed tests before an extension is enabled in release builds.
 
 ## Failure rules
 
-- Unknown or non-static extension names in a connection snapshot are rejected.
+- Unknown static extension names, non-static names without an exact tracked
+  dynamic descriptor, and invalid dynamic descriptor manifests are rejected.
 - DuckDB source, static extension version, and distributed contract mismatches
   are rejected before planning or scheduling.
 - A callback/provider whose capability identity was not registered is rejected

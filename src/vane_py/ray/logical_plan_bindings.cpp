@@ -199,8 +199,29 @@ static bool IsWorkerResourceSetting(const string &lower_name) {
 	       lower_name == "local_exchange_buffer_bytes" || lower_name == "arrow_large_buffer_size";
 }
 
+static bool IsWorkerExtensionLocationSetting(const string &lower_name) {
+	return lower_name == "extension_directory" || lower_name == "extension_directories" ||
+	       lower_name == "home_directory" || lower_name == "custom_extension_repository" ||
+	       lower_name == "autoinstall_extension_repository";
+}
+
+static bool IsWorkerLocalSetting(const string &lower_name) {
+	return IsWorkerResourceSetting(lower_name) || IsWorkerExtensionLocationSetting(lower_name);
+}
+
+static py::dict RemoveWorkerLocalBootstrapSettings(const py::dict &config) {
+	py::dict worker_config;
+	for (auto item : config) {
+		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
+		if (!IsWorkerLocalSetting(name)) {
+			worker_config[item.first] = item.second;
+		}
+	}
+	return worker_config;
+}
+
 static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_persistent_secrets,
-                                        bool remove_worker_resource_settings = false) {
+                                        bool remove_worker_local_settings = false) {
 	py::dict sanitized;
 	for (auto item : config) {
 		auto name = duckdb::StringUtil::Lower(py::str(item.first).cast<string>());
@@ -211,7 +232,7 @@ static py::dict SanitizeBootstrapConfig(const py::dict &config, bool disable_per
 		if (disable_persistent_secrets && IsSecretPersistenceSetting(name)) {
 			continue;
 		}
-		if (remove_worker_resource_settings && IsWorkerResourceSetting(name)) {
+		if (remove_worker_local_settings && IsWorkerLocalSetting(name)) {
 			continue;
 		}
 		sanitized[item.first] = item.second;
@@ -380,6 +401,15 @@ static py::object PrepareWorkerConnectionSnapshot(const py::object &snapshot_obj
 	// so forwarding executable ATTACH statements (and their options) to workers
 	// would cross an unnecessary credential and metadata boundary.
 	snapshot.attr("pop")(py::str("attached_databases"), py::none());
+	auto bootstrap_key = py::str("bootstrap");
+	if (snapshot.contains(bootstrap_key) && py::isinstance<py::dict>(snapshot[bootstrap_key])) {
+		auto bootstrap = CopyPyDict(snapshot[bootstrap_key].cast<py::dict>());
+		auto config_key = py::str("config");
+		if (bootstrap.contains(config_key) && py::isinstance<py::dict>(bootstrap[config_key])) {
+			bootstrap[config_key] = RemoveWorkerLocalBootstrapSettings(bootstrap[config_key].cast<py::dict>());
+		}
+		snapshot[bootstrap_key] = std::move(bootstrap);
+	}
 	auto settings_key = py::str("settings");
 	if (!snapshot.contains(settings_key) || !py::isinstance<py::list>(snapshot[settings_key])) {
 		return snapshot;
@@ -391,7 +421,7 @@ static py::object PrepareWorkerConnectionSnapshot(const py::object &snapshot_obj
 			auto setting = py::reinterpret_borrow<py::dict>(item);
 			if (setting.contains(py::str("name")) && py::isinstance<py::str>(setting[py::str("name")])) {
 				auto name = duckdb::StringUtil::Lower(py::str(setting[py::str("name")]).cast<string>());
-				if (IsWorkerResourceSetting(name)) {
+				if (IsWorkerLocalSetting(name)) {
 					continue;
 				}
 			}
@@ -444,9 +474,18 @@ static bool SnapshotHasAttachedDatabases(const py::object &snapshot_obj) {
 	return py::len(attached_obj) > 0;
 }
 
+static bool SnapshotHasDynamicExtensions(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
+		return false;
+	}
+	auto snapshot = snapshot_obj.cast<py::dict>();
+	auto key = py::str("dynamic_extensions");
+	return snapshot.contains(key) && py::isinstance<py::list>(snapshot[key]) && py::len(snapshot[key]) > 0;
+}
+
 static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootstrap_obj, bool use_instance_cache = true,
                                                         bool force_file_read_only = false,
-                                                        bool remove_worker_resource_settings = false) {
+                                                        bool remove_worker_local_settings = false) {
 	if (IsDefaultBootstrapSnapshot(bootstrap_obj)) {
 		py::dict config;
 		config[py::str("allow_persistent_secrets")] = py::str("false");
@@ -471,7 +510,7 @@ static py::object CreateConnectionFromBootstrapSnapshot(const py::object &bootst
 	}
 	const auto disable_persistent_secrets = !use_instance_cache || in_memory_database;
 	auto connection_config =
-	    SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets, remove_worker_resource_settings);
+	    SanitizeBootstrapConfig(bootstrap_config, disable_persistent_secrets, remove_worker_local_settings);
 	auto worker_file_read_only = force_file_read_only && !in_memory_database;
 	if (worker_file_read_only) {
 		connection_config = ForceReadOnlyAccessMode(connection_config);
@@ -541,7 +580,7 @@ static py::object ResolvePlanningConnectionForSnapshot(py::object conn_obj, cons
 		// secrets that are intentionally absent from the snapshot.
 		return CreateConnectionFromBootstrapSnapshot(bootstrap_obj, false);
 	}
-	if (SnapshotHasAttachedDatabases(snapshot_obj)) {
+	if (SnapshotHasAttachedDatabases(snapshot_obj) || SnapshotHasDynamicExtensions(snapshot_obj)) {
 		if (ConnectionMatchesBootstrapSnapshot(source_conn_obj, snapshot_obj)) {
 			// Local execution can keep using the source DatabaseInstance where the
 			// attached catalog already exists.
@@ -569,14 +608,19 @@ struct QueryPythonReplayState {
 	duckdb::distributed::python::ray::SafePyObject udf_registrations;
 	duckdb::distributed::python::ray::SafePyObject udf_actor_handles;
 	duckdb::distributed::python::ray::SafePyObject connection_snapshot;
+	// Driver-only state. Fragment wrappers take isolated cursors from this
+	// connection, and DistributedPhysicalPlan pickle state never includes it.
+	duckdb::distributed::python::ray::SafePyObject coordinator_connection;
 
 	QueryPythonReplayState(string session_id_p, py::object session_config_p, py::object udf_registrations_p,
-	                       py::object udf_actor_handles_p, py::object connection_snapshot_p)
+	                       py::object udf_actor_handles_p, py::object connection_snapshot_p,
+	                       py::object coordinator_connection_p)
 	    : session_id(std::move(session_id_p)),
 	      session_config(duckdb::distributed::python::ray::SafePyObject(std::move(session_config_p))),
 	      udf_registrations(duckdb::distributed::python::ray::SafePyObject(std::move(udf_registrations_p))),
 	      udf_actor_handles(duckdb::distributed::python::ray::SafePyObject(std::move(udf_actor_handles_p))),
-	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))) {
+	      connection_snapshot(duckdb::distributed::python::ray::SafePyObject(std::move(connection_snapshot_p))),
+	      coordinator_connection(duckdb::distributed::python::ray::SafePyObject(std::move(coordinator_connection_p))) {
 	}
 };
 
@@ -734,7 +778,9 @@ static void ApplyVaneSessionConfigValues(duckdb::Connection &conn, const py::dic
 		return;
 	}
 
-	ExecuteSnapshotQuery(conn, "LOAD httpfs");
+	// Every caller establishes and validates the snapshot's extension set before
+	// applying connection-local S3 settings. Never turn configuration replay
+	// into another extension-loading path.
 	if (!region.empty()) {
 		ExecuteSnapshotQuery(conn, "SET s3_region=" + QuoteSQLStringLiteral(region));
 	}
@@ -786,26 +832,136 @@ static void ApplyEffectiveVaneSessionConfig(DuckDBPyConnection &conn_wrapper, co
 	ApplyVaneSessionConfigValues(conn_wrapper.con.GetConnection(), config_obj.cast<py::dict>());
 }
 
-static std::vector<string> QueryLoadedNonStaticExtensionNames(DuckDBPyConnection &conn_wrapper) {
-	std::vector<string> extensions;
-	auto result =
-	    ExecuteSnapshotQuery(conn_wrapper.con.GetConnection(), "SELECT extension_name "
-	                                                           "FROM duckdb_extensions() "
-	                                                           "WHERE loaded AND install_mode <> 'STATICALLY_LINKED' "
-	                                                           "ORDER BY extension_name");
-	auto &collection = result->Collection();
-	extensions.reserve(collection.Count());
-	for (auto &row : collection.Rows()) {
-		auto value = row.GetValue(0);
-		if (value.IsNull()) {
+static vector<string> LoadedNonStaticExtensionNames(DuckDBPyConnection &conn_wrapper) {
+	vector<string> extensions;
+	auto &database = DatabaseInstance::GetDatabase(*conn_wrapper.con.GetConnection().context);
+	auto &manager = ExtensionManager::Get(database);
+	for (const auto &extension_name : manager.GetExtensions()) {
+		auto info = manager.GetExtensionInfo(extension_name);
+		if (!info) {
 			continue;
 		}
-		auto extension_name = value.ToString();
-		if (!extension_name.empty()) {
-			extensions.push_back(std::move(extension_name));
+		lock_guard<mutex> guard(info->lock);
+		if (!info->is_loaded) {
+			continue;
 		}
+		// A loaded extension without install provenance is not demonstrably
+		// static. Classify it as dynamic so snapshot capture/admission fails
+		// closed unless resolver-owned state declares the same name.
+		if (info->install_info && info->install_info->mode == ExtensionInstallMode::STATICALLY_LINKED) {
+			continue;
+		}
+		extensions.push_back(extension_name);
 	}
+	std::sort(extensions.begin(), extensions.end());
 	return extensions;
+}
+
+static py::list NormalizeDynamicExtensionSnapshot(const py::object &snapshot_obj) {
+	try {
+		auto extensions_module = py::module_::import("vane.extensions");
+		auto normalized = extensions_module.attr("_normalize_dynamic_extension_snapshot")(snapshot_obj);
+		if (!py::isinstance<py::list>(normalized)) {
+			throw duckdb::InternalException("Dynamic extension snapshot normalizer did not return a list");
+		}
+		return normalized.cast<py::list>();
+	} catch (const py::error_already_set &exception) {
+		throw duckdb::InvalidInputException("Failed to validate dynamic extension snapshot: %s", exception.what());
+	}
+}
+
+static py::list CaptureDynamicExtensionSnapshot(const py::object &conn_obj) {
+	try {
+		auto extensions_module = py::module_::import("vane.extensions");
+		auto snapshot = extensions_module.attr("_capture_dynamic_extension_snapshot")(conn_obj);
+		if (!py::isinstance<py::list>(snapshot)) {
+			throw duckdb::InternalException("Dynamic extension snapshot capture did not return a list");
+		}
+		return snapshot.cast<py::list>();
+	} catch (const py::error_already_set &exception) {
+		throw duckdb::InvalidInputException("Failed to capture dynamic extension snapshot: %s", exception.what());
+	}
+}
+
+static vector<string> DynamicExtensionNamesFromSnapshot(const py::list &dynamic_extensions,
+                                                        const string &snapshot_description) {
+	vector<string> names;
+	set<string> unique_names;
+	for (auto item : dynamic_extensions) {
+		if (!py::isinstance<py::dict>(item)) {
+			throw duckdb::InvalidInputException("%s dynamic extension entry must be a descriptor dict",
+			                                    snapshot_description);
+		}
+		auto descriptor = py::reinterpret_borrow<py::dict>(item);
+		auto name_key = py::str("name");
+		if (!descriptor.contains(name_key) || !py::isinstance<py::str>(descriptor[name_key])) {
+			throw duckdb::InvalidInputException("%s dynamic extension descriptor is missing a string name",
+			                                    snapshot_description);
+		}
+		auto name = descriptor[name_key].cast<string>();
+		if (name.empty() || !unique_names.insert(name).second) {
+			throw duckdb::InvalidInputException("%s has an empty or duplicate dynamic extension name",
+			                                    snapshot_description);
+		}
+		names.push_back(std::move(name));
+	}
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+static string DynamicExtensionListIdentity(const vector<string> &extensions) {
+	return "[" + StringUtil::Join(extensions, ",") + "]";
+}
+
+static void ValidateCapturedDynamicExtensionNames(const vector<string> &loaded_extensions,
+                                                  const vector<string> &snapshot_extensions) {
+	if (loaded_extensions == snapshot_extensions) {
+		return;
+	}
+	if (snapshot_extensions.empty() && !loaded_extensions.empty()) {
+		throw duckdb::InvalidInputException(
+		    "Ray distributed execution rejects dynamic extensions that were not loaded through "
+		    "vane.DynamicExtensionResolver: %s",
+		    StringUtil::Join(loaded_extensions, ", "));
+	}
+	throw duckdb::InvalidInputException(
+	    "Dynamic extension identities changed while capturing the connection snapshot: loaded %s, snapshot has %s",
+	    DynamicExtensionListIdentity(loaded_extensions), DynamicExtensionListIdentity(snapshot_extensions));
+}
+
+static void ValidateWorkerDynamicExtensionNames(DuckDBPyConnection &conn_wrapper,
+                                                const vector<string> &expected_extensions) {
+	auto loaded_extensions = LoadedNonStaticExtensionNames(conn_wrapper);
+	if (loaded_extensions != expected_extensions) {
+		throw duckdb::InvalidInputException(
+		    "Dynamic extension identities differ between coordinator and worker: expected %s, worker loaded %s",
+		    DynamicExtensionListIdentity(expected_extensions), DynamicExtensionListIdentity(loaded_extensions));
+	}
+}
+
+static void ValidateWorkerRecordedDynamicExtensionSnapshot(DuckDBPyConnection &conn_wrapper, const py::object &conn_obj,
+                                                           const py::list &expected_extensions) {
+	auto recorded_extensions = CaptureDynamicExtensionSnapshot(conn_obj);
+	if (!PythonObjectsEqual(recorded_extensions, expected_extensions)) {
+		throw duckdb::InvalidInputException(
+		    "Worker recorded dynamic extension manifest differs from the coordinator manifest");
+	}
+	auto recorded_names = DynamicExtensionNamesFromSnapshot(recorded_extensions, "Worker connection dynamic state");
+	auto loaded_extensions = LoadedNonStaticExtensionNames(conn_wrapper);
+	if (loaded_extensions != recorded_names) {
+		throw duckdb::InvalidInputException(
+		    "Worker dynamic extension state is not resolver-owned: loaded %s, recorded %s",
+		    DynamicExtensionListIdentity(loaded_extensions), DynamicExtensionListIdentity(recorded_names));
+	}
+}
+
+static void PrepareDynamicExtensionSnapshot(py::object conn_obj, const py::list &dynamic_extensions) {
+	try {
+		auto extensions_module = py::module_::import("vane.extensions");
+		extensions_module.attr("_prepare_dynamic_extension_snapshot")(conn_obj, dynamic_extensions);
+	} catch (const py::error_already_set &exception) {
+		throw duckdb::InvalidInputException("Failed to prepare dynamic extension snapshot: %s", exception.what());
+	}
 }
 
 struct StaticExtensionSnapshotEntry {
@@ -820,6 +976,48 @@ struct StaticExtensionSnapshotEntry {
 		return name < other.name;
 	}
 };
+
+static vector<StaticExtensionSnapshotEntry> ParseStaticExtensionSnapshot(const py::dict &snapshot) {
+	if (!snapshot.contains(py::str("extensions")) || !py::isinstance<py::list>(snapshot[py::str("extensions")])) {
+		throw InvalidInputException("Connection snapshot extensions must be a list");
+	}
+	vector<StaticExtensionSnapshotEntry> extensions;
+	set<string> extension_names;
+	for (auto item : snapshot[py::str("extensions")].cast<py::list>()) {
+		if (!py::isinstance<py::dict>(item)) {
+			throw InvalidInputException("Connection snapshot extension entry must be a dict");
+		}
+		auto extension_obj = py::reinterpret_borrow<py::dict>(item);
+		if (!extension_obj.contains(py::str("name")) || !py::isinstance<py::str>(extension_obj[py::str("name")]) ||
+		    !extension_obj.contains(py::str("version")) ||
+		    !py::isinstance<py::str>(extension_obj[py::str("version")])) {
+			throw InvalidInputException("Connection snapshot extension entry is missing string name or version");
+		}
+		StaticExtensionSnapshotEntry extension;
+		extension.name = extension_obj[py::str("name")].cast<string>();
+		extension.version = extension_obj[py::str("version")].cast<string>();
+		if (extension.name.empty() || !extension_names.insert(extension.name).second) {
+			throw InvalidInputException("Connection snapshot has an empty or duplicate extension name");
+		}
+		extensions.push_back(std::move(extension));
+	}
+	std::sort(extensions.begin(), extensions.end());
+	return extensions;
+}
+
+static void
+ValidateDistinctStaticAndDynamicExtensionNames(const vector<StaticExtensionSnapshotEntry> &static_extensions,
+                                               const vector<string> &dynamic_extension_names) {
+	set<string> static_names;
+	for (const auto &extension : static_extensions) {
+		static_names.insert(StringUtil::Lower(extension.name));
+	}
+	for (const auto &name : dynamic_extension_names) {
+		if (static_names.find(StringUtil::Lower(name)) != static_names.end()) {
+			throw InvalidInputException("Connection snapshot declares extension '%s' as both static and dynamic", name);
+		}
+	}
+}
 
 static vector<StaticExtensionSnapshotEntry> QueryLoadedStaticExtensions(DuckDBPyConnection &conn_wrapper) {
 	vector<StaticExtensionSnapshotEntry> extensions;
@@ -868,20 +1066,6 @@ static std::vector<ConnectionSettingRecord> QueryConnectionSettings(DuckDBPyConn
 		settings.push_back(std::move(record));
 	}
 	return settings;
-}
-
-static void RejectNonStaticRayExtensions(const std::vector<string> &extension_names) {
-	if (extension_names.empty()) {
-		return;
-	}
-	auto joined_names = extension_names.front();
-	for (idx_t index = 1; index < extension_names.size(); index++) {
-		joined_names += ", " + extension_names[index];
-	}
-	throw duckdb::InvalidInputException("Ray distributed execution supports only statically linked extensions; "
-	                                    "non-static extensions are not supported: "
-	                                    "%s",
-	                                    joined_names);
 }
 
 static bool IsSafeStaticExtensionName(const string &name) {
@@ -1056,10 +1240,20 @@ static bool VaneRaySessionLifecycleEnabled() {
 	return runner == "ray";
 }
 
-static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
+static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper, const py::object &conn_obj) {
 	auto bootstrap_obj = conn_wrapper.ExportConnectionBootstrapConfig();
-	auto non_static_extensions = QueryLoadedNonStaticExtensionNames(conn_wrapper);
-	RejectNonStaticRayExtensions(non_static_extensions);
+	auto non_static_extensions_before = LoadedNonStaticExtensionNames(conn_wrapper);
+	auto dynamic_extensions = CaptureDynamicExtensionSnapshot(conn_obj);
+	auto non_static_extensions_after = LoadedNonStaticExtensionNames(conn_wrapper);
+	if (non_static_extensions_before != non_static_extensions_after) {
+		throw duckdb::InvalidInputException(
+		    "Dynamic extension identities changed while capturing the connection snapshot: before %s, after %s",
+		    DynamicExtensionListIdentity(non_static_extensions_before),
+		    DynamicExtensionListIdentity(non_static_extensions_after));
+	}
+	auto dynamic_extension_names =
+	    DynamicExtensionNamesFromSnapshot(dynamic_extensions, "Captured connection snapshot");
+	ValidateCapturedDynamicExtensionNames(non_static_extensions_after, dynamic_extension_names);
 	auto static_extensions = QueryLoadedStaticExtensions(conn_wrapper);
 	auto source_settings = QueryConnectionSettings(conn_wrapper);
 
@@ -1110,6 +1304,7 @@ static py::object CaptureConnectionSnapshot(DuckDBPyConnection &conn_wrapper) {
 		extensions_obj.append(std::move(extension_obj));
 	}
 	snapshot_obj[py::str("extensions")] = std::move(extensions_obj);
+	snapshot_obj[py::str("dynamic_extensions")] = std::move(dynamic_extensions);
 	auto &source_database = DatabaseInstance::GetDatabase(*conn_wrapper.con.GetConnection().context);
 	snapshot_obj[py::str("distributed_extension_contracts")] = CaptureDistributedExtensionContracts(source_database);
 	snapshot_obj[py::str("settings")] = std::move(settings_obj);
@@ -1173,7 +1368,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 		if (py::len(registrations) > 0) {
 			plan.udf_registrations_ = std::move(registrations);
 		}
-		plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper);
+		plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper, connection_owner);
 	}
 	return plan;
 }
@@ -1189,7 +1384,7 @@ struct ConnectionSnapshotApplyOptions {
 static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
                                     const ConnectionSnapshotApplyOptions &options);
 
-static bool ConnectionSnapshotDeclaresStaticExtension(const py::object &snapshot_obj, const string &extension_name) {
+static bool ConnectionSnapshotDeclaresExtension(const py::object &snapshot_obj, const string &extension_name) {
 	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
 		return false;
 	}
@@ -1210,6 +1405,21 @@ static bool ConnectionSnapshotDeclaresStaticExtension(const py::object &snapshot
 			return true;
 		}
 	}
+	auto dynamic_extensions_key = py::str("dynamic_extensions");
+	if (!snapshot.contains(dynamic_extensions_key) || !py::isinstance<py::list>(snapshot[dynamic_extensions_key])) {
+		return false;
+	}
+	for (auto item : snapshot[dynamic_extensions_key].cast<py::list>()) {
+		if (!py::isinstance<py::dict>(item)) {
+			continue;
+		}
+		auto descriptor = py::reinterpret_borrow<py::dict>(item);
+		auto name_key = py::str("name");
+		if (descriptor.contains(name_key) && py::isinstance<py::str>(descriptor[name_key]) &&
+		    StringUtil::Lower(descriptor[name_key].cast<string>()) == expected_name) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -1224,15 +1434,10 @@ static void ValidateConnectionSnapshotExtensions(py::object conn_obj, const py::
 	ApplyConnectionSnapshot(conn_obj, snapshot_obj, validation_options);
 }
 
-static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
-                                    const ConnectionSnapshotApplyOptions &options = {}) {
-	if (snapshot_obj.is_none()) {
-		return;
-	}
-	if (!py::isinstance<py::dict>(snapshot_obj)) {
+static py::dict ValidateConnectionSnapshotSourceID(const py::object &snapshot_obj) {
+	if (snapshot_obj.is_none() || !py::isinstance<py::dict>(snapshot_obj)) {
 		throw duckdb::InvalidInputException("Connection snapshot must be a dict");
 	}
-
 	auto snapshot = snapshot_obj.cast<py::dict>();
 	if (!snapshot.contains(py::str("duckdb_source_id")) ||
 	    !py::isinstance<py::str>(snapshot[py::str("duckdb_source_id")])) {
@@ -1244,30 +1449,23 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		    "DuckDB SourceID differs between coordinator and worker: expected %s, worker has %s", expected_source_id,
 		    DuckDB::SourceID());
 	}
-	if (!snapshot.contains(py::str("extensions")) || !py::isinstance<py::list>(snapshot[py::str("extensions")])) {
-		throw InvalidInputException("Connection snapshot extensions must be a list");
+	return snapshot;
+}
+
+static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snapshot_obj,
+                                    const ConnectionSnapshotApplyOptions &options = {}) {
+	if (snapshot_obj.is_none()) {
+		return;
 	}
-	vector<StaticExtensionSnapshotEntry> extensions;
-	set<string> extension_names;
-	for (auto item : snapshot[py::str("extensions")].cast<py::list>()) {
-		if (!py::isinstance<py::dict>(item)) {
-			throw InvalidInputException("Connection snapshot extension entry must be a dict");
-		}
-		auto extension_obj = py::reinterpret_borrow<py::dict>(item);
-		if (!extension_obj.contains(py::str("name")) || !py::isinstance<py::str>(extension_obj[py::str("name")]) ||
-		    !extension_obj.contains(py::str("version")) ||
-		    !py::isinstance<py::str>(extension_obj[py::str("version")])) {
-			throw InvalidInputException("Connection snapshot extension entry is missing string name or version");
-		}
-		StaticExtensionSnapshotEntry extension;
-		extension.name = extension_obj[py::str("name")].cast<string>();
-		extension.version = extension_obj[py::str("version")].cast<string>();
-		if (extension.name.empty() || !extension_names.insert(extension.name).second) {
-			throw InvalidInputException("Connection snapshot has an empty or duplicate extension name");
-		}
-		extensions.push_back(std::move(extension));
+	auto snapshot = ValidateConnectionSnapshotSourceID(snapshot_obj);
+	auto extensions = ParseStaticExtensionSnapshot(snapshot);
+	if (!snapshot.contains(py::str("dynamic_extensions")) ||
+	    !py::isinstance<py::list>(snapshot[py::str("dynamic_extensions")])) {
+		throw InvalidInputException("Connection snapshot dynamic_extensions must be a list");
 	}
-	std::sort(extensions.begin(), extensions.end());
+	auto dynamic_extensions = NormalizeDynamicExtensionSnapshot(snapshot[py::str("dynamic_extensions")]);
+	auto dynamic_extension_names = DynamicExtensionNamesFromSnapshot(dynamic_extensions, "Connection snapshot");
+	ValidateDistinctStaticAndDynamicExtensionNames(extensions, dynamic_extension_names);
 	auto distributed_extension_contracts = ParseDistributedExtensionContracts(snapshot);
 	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
 	// Snapshot replay starts a new unit of work on this Python cursor. Close a
@@ -1279,11 +1477,13 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 		// runtime downloads or unsigned extension binaries.
 		EnforceExtensionSecuritySettings(conn);
 	}
+	ValidateWorkerRecordedDynamicExtensionSnapshot(conn_wrapper, conn_obj, dynamic_extensions);
+	ValidateWorkerDynamicExtensionNames(conn_wrapper, dynamic_extension_names);
 	LoadStaticRayExtensions(conn, extensions);
 	DistributedExtensionManager::Get(DatabaseInstance::GetDatabase(*conn.context))
 	    .ValidateExact(distributed_extension_contracts);
 
-	if (options.apply_session_config) {
+	if (options.apply_session_config && ConnectionSnapshotDeclaresExtension(snapshot_obj, "httpfs")) {
 		ApplyVaneSessionConfig(conn, snapshot_obj);
 	}
 
@@ -1325,6 +1525,28 @@ static void ApplyConnectionSnapshot(py::object conn_obj, const py::object &snaps
 	}
 }
 
+static void PrepareConnectionSnapshotExtensions(py::object conn_obj, const py::object &snapshot_obj) {
+	auto snapshot = ValidateConnectionSnapshotSourceID(snapshot_obj);
+	auto static_extensions = ParseStaticExtensionSnapshot(snapshot);
+	if (!snapshot.contains(py::str("dynamic_extensions")) ||
+	    !py::isinstance<py::list>(snapshot[py::str("dynamic_extensions")])) {
+		throw InvalidInputException("Connection snapshot dynamic_extensions must be a list");
+	}
+	auto dynamic_extensions = NormalizeDynamicExtensionSnapshot(snapshot[py::str("dynamic_extensions")]);
+	auto dynamic_extension_names = DynamicExtensionNamesFromSnapshot(dynamic_extensions, "Connection snapshot");
+	ValidateDistinctStaticAndDynamicExtensionNames(static_extensions, dynamic_extension_names);
+	(void)ParseDistributedExtensionContracts(snapshot);
+	auto &conn_wrapper = ExtractPyConnectionWrapper(conn_obj);
+	CloseOpenPythonConnectionResult(conn_wrapper);
+	auto &conn = conn_wrapper.con.GetConnection();
+	EnforceExtensionSecuritySettings(conn);
+	// Preserve the established static-extension bootstrap order before invoking
+	// the same resolver-driven dynamic LOAD path used by the source connection.
+	LoadStaticRayExtensions(conn, static_extensions);
+	PrepareDynamicExtensionSnapshot(conn_obj, dynamic_extensions);
+	ValidateConnectionSnapshotExtensions(conn_obj, snapshot_obj, true);
+}
+
 string PyLogicalPlan::session_id() const {
 	return VaneSessionIdFromSnapshot(connection_snapshot_);
 }
@@ -1341,6 +1563,7 @@ enum class QueryPythonReplayField : uint8_t {
 	UDFRegistrations,
 	UDFActorHandles,
 	ConnectionSnapshot,
+	CoordinatorConnection,
 };
 
 static py::object LookupQueryPythonReplayState(const string &query_id, QueryPythonReplayField field) {
@@ -1359,26 +1582,33 @@ static py::object LookupQueryPythonReplayState(const string &query_id, QueryPyth
 		return entry->second->udf_actor_handles.get();
 	case QueryPythonReplayField::ConnectionSnapshot:
 		return entry->second->connection_snapshot.get();
+	case QueryPythonReplayField::CoordinatorConnection:
+		return entry->second->coordinator_connection.get();
 	default:
 		throw duckdb::InternalException("Unknown query Python replay field");
 	}
 }
 
 static bool RegisterQueryPythonReplayState(const string &query_id, const py::object &udf_registrations,
-                                           const py::object &udf_actor_handles, const py::object &connection_snapshot) {
+                                           const py::object &udf_actor_handles, const py::object &connection_snapshot,
+                                           const py::object &coordinator_connection) {
 	if (query_id.empty()) {
 		throw duckdb::InternalException("Query Python replay state requires a non-empty query_id");
 	}
 	auto session_id = VaneSessionIdFromSnapshot(connection_snapshot);
 	py::object session_config = VaneSessionConfigFromSnapshot(connection_snapshot);
+	py::object retained_coordinator_connection = SnapshotHasDynamicExtensions(connection_snapshot)
+	                                                 ? py::reinterpret_borrow<py::object>(coordinator_connection)
+	                                                 : py::none();
 	std::lock_guard<std::mutex> guard(g_query_python_replay_states_lock);
 	auto entry = g_query_python_replay_states.find(query_id);
 	if (entry == g_query_python_replay_states.end()) {
-		g_query_python_replay_states.emplace(query_id, std::make_unique<QueryPythonReplayState>(
-		                                                   std::move(session_id), std::move(session_config),
-		                                                   py::reinterpret_borrow<py::object>(udf_registrations),
-		                                                   py::reinterpret_borrow<py::object>(udf_actor_handles),
-		                                                   py::reinterpret_borrow<py::object>(connection_snapshot)));
+		g_query_python_replay_states.emplace(
+		    query_id, std::make_unique<QueryPythonReplayState>(std::move(session_id), std::move(session_config),
+		                                                       py::reinterpret_borrow<py::object>(udf_registrations),
+		                                                       py::reinterpret_borrow<py::object>(udf_actor_handles),
+		                                                       py::reinterpret_borrow<py::object>(connection_snapshot),
+		                                                       std::move(retained_coordinator_connection)));
 		return true;
 	}
 	auto &state = *entry->second;
@@ -1397,6 +1627,10 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 		throw duckdb::InvalidInputException("Query " + query_id +
 		                                    " was registered with different Python UDF actor handles");
 	}
+	if (state.coordinator_connection.get().is_none() && !retained_coordinator_connection.is_none()) {
+		state.coordinator_connection =
+		    duckdb::distributed::python::ray::SafePyObject(std::move(retained_coordinator_connection));
+	}
 	return false;
 }
 
@@ -1406,6 +1640,10 @@ static py::object LookupQueryUDFRegistrations(const string &query_id) {
 
 static py::object LookupQueryConnectionSnapshot(const string &query_id) {
 	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::ConnectionSnapshot);
+}
+
+static py::object LookupQueryCoordinatorConnection(const string &query_id) {
+	return LookupQueryPythonReplayState(query_id, QueryPythonReplayField::CoordinatorConnection);
 }
 
 static py::object LookupQueryUDFActorHandles(const string &query_id) {

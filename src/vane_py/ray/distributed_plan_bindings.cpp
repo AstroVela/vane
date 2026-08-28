@@ -1055,12 +1055,15 @@ PyPhysicalPlanWrapper PyLogicalPlan::to_physical_plan(py::object conn_obj, py::o
 	snapshot_options.apply_session_config = effective_session_config.is_none();
 	snapshot_options.enforce_extension_security = !shares_source_database;
 	snapshot_options.apply_attached_databases = !shares_source_database;
-	// Validate and load the exact static extension set before refreshed AWS
-	// settings are allowed to execute LOAD httpfs. A snapshot that does not
-	// declare httpfs must leave the planning DatabaseInstance uncontaminated.
+	if (!shares_source_database && SnapshotHasDynamicExtensions(connection_snapshot_)) {
+		PrepareConnectionSnapshotExtensions(planning_conn, connection_snapshot_);
+	}
+	// Validate and load the exact extension set before refreshed AWS settings
+	// are applied. A snapshot that does not declare httpfs must leave the
+	// planning DatabaseInstance uncontaminated.
 	ValidateConnectionSnapshotExtensions(planning_conn, connection_snapshot_,
 	                                     snapshot_options.enforce_extension_security);
-	if (ConnectionSnapshotDeclaresStaticExtension(connection_snapshot_, "httpfs")) {
+	if (ConnectionSnapshotDeclaresExtension(connection_snapshot_, "httpfs")) {
 		// Resolved environment/profile credentials are the session baseline.
 		// Replay the source connection below so explicit source SET values retain
 		// DuckDB's normal precedence.
@@ -2732,7 +2735,8 @@ struct PyPhysicalPlanWrapperRunner {
 		// Call PlanRunner::run_plan
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -2903,7 +2907,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -3181,7 +3186,8 @@ struct PyPhysicalPlanWrapperRunner {
 
 		try {
 			const bool replay_state_created = RegisterQueryPythonReplayState(
-			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_);
+			    plan.resource_query_id_, plan.udf_registrations_, plan.udf_actor_handles_, plan.connection_snapshot_,
+			    plan.worker_connection_);
 			try {
 				register_query_owner(plan.idx(), plan.resource_query_id_, &query_owner_registered);
 			} catch (...) {
@@ -4066,7 +4072,23 @@ static py::dict DescribeNativeProgress(py::object conn_obj, const PyPhysicalPlan
 		throw py::value_error("DistributedPhysicalPlan is uninitialized");
 	}
 
-	py::object exec_conn = ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+	const bool has_dynamic_extensions = SnapshotHasDynamicExtensions(plan.connection_snapshot_);
+	const bool has_bound_execution_connection = !plan.worker_connection_.is_none();
+	py::object exec_conn = has_dynamic_extensions ? plan.resolve_execution_connection(conn_obj)
+	                                              : ResolveConnectionForSnapshot(conn_obj, plan.connection_snapshot_);
+	if (has_dynamic_extensions) {
+		if (has_bound_execution_connection) {
+			// A bound physical plan already owns either the resolver-loaded
+			// coordinator DatabaseInstance or a prepared worker DatabaseInstance.
+			// Topology inspection is verification-only: worker hardening must not
+			// mutate database-global settings on the user's coordinator connection.
+			ValidateConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_, false);
+		} else {
+			// A transported plan has no process-local extension state. Prepare its
+			// isolated DatabaseInstance through the strict worker provider path.
+			PrepareConnectionSnapshotExtensions(exec_conn, plan.connection_snapshot_);
+		}
+	}
 	PyPhysicalPlanWrapper topology_plan;
 	topology_plan.query_id_ = plan.idx();
 	topology_plan.resource_query_id_ = plan.resource_query_id_;

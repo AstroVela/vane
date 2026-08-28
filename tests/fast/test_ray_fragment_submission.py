@@ -3829,19 +3829,20 @@ def test_worker_object_shuffle_cleanup_uses_refreshed_dedicated_cursor(monkeypat
         "test-source-id",
         (("httpfs", ""),),
         (),
+        (),
         "session-a",
         "test-s3-identity",
         True,
     )
     operation_lock = threading.Lock()
     actor._session_operation_locks = {"session-a": operation_lock}
-    actor._get_shared_conn = object
 
-    def _get_snapshot_execution_cursor(_connection, _query_id, *, database_identity):
+    def _get_snapshot_execution_cursor(_query_id, *, database_identity):
         assert operation_lock.locked()
         return cleanup_cursor
 
     actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
 
     def refresh(config, cached, *, use_session_credentials):
@@ -3979,12 +3980,13 @@ def test_worker_object_shuffle_cleanup_replays_explicit_connection_snapshot(monk
         "test-source-id",
         (("httpfs", ""),),
         (),
+        (),
         "session-a",
         "test-s3-identity",
         False,
     )
-    actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
+    actor._get_snapshot_execution_cursor = lambda _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     cleanup_calls = []
 
@@ -4099,12 +4101,13 @@ def test_worker_object_shuffle_cleanup_preserves_primary_error_when_cursor_close
         "test-source-id",
         (("httpfs", ""),),
         (),
+        (),
         "session-a",
         "test-s3-identity",
         True,
     )
-    actor._get_shared_conn = object
-    actor._get_snapshot_execution_cursor = lambda _connection, _query_id, *, database_identity: cleanup_cursor
+    actor._prepare_snapshot_database = lambda _query_id, *, database_identity: None
+    actor._get_snapshot_execution_cursor = lambda _query_id, *, database_identity: cleanup_cursor
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     monkeypatch.setattr(
         worker_mod,
@@ -13447,15 +13450,24 @@ def test_stats_fragments_reads_worker_actor_counters():
     assert actor.fragment_stats_calls == 1
 
 
-def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+def _new_fragment_registry_actor():
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._plan_fragments = {}
     actor._query_fragments = {}
     actor._fragment_query_ids = {}
+    actor._pending_fragment_registrations = {}
+    actor._fragment_registry_lock = threading.RLock()
     actor._fragment_register_calls = 0
     actor._fragment_registered_total = 0
     actor._fragment_existing_total = 0
+    actor._fragment_lookup_hits = 0
+    actor._fragment_lookup_misses = 0
+    return actor_cls, actor
+
+
+def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
 
     class _AwaitablePlanRef:
         def __init__(self, value):
@@ -13481,6 +13493,8 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
         "_register_query_python_replay_state",
         lambda query_id, plan: replay_registrations.append((query_id, plan)) or True,
     )
+    preparations = []
+    actor._prepare_query_snapshot_database = preparations.append
 
     class _Plan:
         @staticmethod
@@ -13509,6 +13523,272 @@ def test_register_fragments_awaits_plan_refs_without_ray_get(monkeypatch):
     assert actor._plan_fragments["query-1:node:1"] is resolved_plan
     assert actor._query_fragments == {"query-1": {"query-1:node:1"}}
     assert replay_registrations == [("query-resource", resolved_plan)]
+    assert preparations == [resolved_plan]
+
+
+def test_register_fragments_rolls_back_batch_when_later_snapshot_preparation_fails(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    events = []
+    registered_query_ids = set()
+
+    def register_replay_state(query_id, plan):
+        created = query_id not in registered_query_ids
+        registered_query_ids.add(query_id)
+        events.append(("register", query_id, plan, created))
+        return created
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        register_replay_state,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(plan):
+        events.append(("prepare", plan.resource_query_id(), plan))
+        if plan is second_plan:
+            raise RuntimeError("planned snapshot preparation failure")
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        def resource_query_id(self):
+            return "query-resource"
+
+    first_plan = _Plan()
+    second_plan = _Plan()
+    with pytest.raises(RuntimeError, match="planned snapshot preparation failure"):
+        asyncio.run(
+            actor_cls.register_fragments(
+                actor,
+                [
+                    {"fragment_id": "query-1:node:1", "plan": first_plan, "query_id": "query-1"},
+                    {"fragment_id": "query-1:node:2", "plan": second_plan, "query_id": "query-1"},
+                ],
+            )
+        )
+
+    assert events == [
+        ("register", "query-resource", first_plan, True),
+        ("prepare", "query-resource", first_plan),
+        ("register", "query-resource", second_plan, False),
+        ("prepare", "query-resource", second_plan),
+        ("cleanup", "query-resource"),
+    ]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+    assert actor._fragment_registered_total == 0
+
+
+def test_register_fragments_prepares_snapshot_off_actor_event_loop(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    preparation_thread_ids = []
+    event_loop_thread_id = threading.get_ident()
+
+    monkeypatch.setattr(worker_mod, "_register_query_python_replay_state", lambda _query_id, _plan: True)
+    monkeypatch.setattr(worker_mod, "_cleanup_query_python_replay_state", lambda _query_id: None)
+
+    def prepare_snapshot(_plan):
+        preparation_thread_ids.append(threading.get_ident())
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            heartbeat = []
+            await asyncio.sleep(0)
+            heartbeat.append("responsive")
+            assert heartbeat == ["responsive"]
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        return await registration
+
+    result = asyncio.run(run())
+
+    assert result == {"registered": 1, "existing": 0, "total": 1}
+    assert preparation_thread_ids
+    assert preparation_thread_ids[0] != event_loop_thread_id
+
+
+def test_register_fragments_cancellation_waits_for_preparation_and_rolls_back(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+    registered_query_ids = set()
+
+    def register_replay_state(query_id, _plan):
+        created = query_id not in registered_query_ids
+        registered_query_ids.add(query_id)
+        events.append(("register", query_id, created))
+        return created
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        register_replay_state,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(plan):
+        events.append(("prepare-start", plan.resource_query_id(), threading.get_ident()))
+        if plan is second_plan:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+        events.append(("prepare-end", plan.resource_query_id(), threading.get_ident()))
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        def resource_query_id(self):
+            return "query-resource"
+
+    first_plan = _Plan()
+    second_plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [
+                    {"fragment_id": "query-1:node:1", "plan": first_plan, "query_id": "query-1"},
+                    {"fragment_id": "query-1:node:2", "plan": second_plan, "query_id": "query-1"},
+                ],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            registration.cancel()
+            await asyncio.sleep(0)
+            assert not registration.done()
+        finally:
+            release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await registration
+
+    asyncio.run(run())
+
+    assert [(event[0], event[1]) for event in events] == [
+        ("register", "query-resource"),
+        ("prepare-start", "query-resource"),
+        ("prepare-end", "query-resource"),
+        ("register", "query-resource"),
+        ("prepare-start", "query-resource"),
+        ("prepare-end", "query-resource"),
+        ("cleanup", "query-resource"),
+    ]
+    assert [event[2] for event in events if event[0] == "register"] == [True, False]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_drop_query_fragments_invalidates_inflight_snapshot_preparation(monkeypatch):
+    actor_cls, actor = _new_fragment_registry_actor()
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    events = []
+
+    monkeypatch.setattr(
+        worker_mod,
+        "_register_query_python_replay_state",
+        lambda query_id, _plan: events.append(("register", query_id)) or True,
+    )
+    monkeypatch.setattr(
+        worker_mod,
+        "_cleanup_query_python_replay_state",
+        lambda query_id: events.append(("cleanup", query_id)),
+    )
+
+    def prepare_snapshot(_plan):
+        preparation_started.set()
+        assert release_preparation.wait(timeout=5)
+
+    actor._prepare_query_snapshot_database = prepare_snapshot
+
+    class _Plan:
+        @staticmethod
+        def resource_query_id():
+            return "query-resource"
+
+    plan = _Plan()
+
+    async def run():
+        registration = asyncio.create_task(
+            actor_cls.register_fragments(
+                actor,
+                [{"fragment_id": "query-1:node:1", "plan": plan, "query_id": "query-1"}],
+            )
+        )
+        try:
+            for _ in range(1000):
+                if preparation_started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert preparation_started.is_set()
+            assert actor_cls.drop_query_fragments(actor, "query-1") == 0
+        finally:
+            release_preparation.set()
+        with pytest.raises(RuntimeError, match="dropped during worker snapshot preparation"):
+            await registration
+
+    asyncio.run(run())
+
+    assert events == [("register", "query-resource"), ("cleanup", "query-resource")]
+    assert actor._plan_fragments == {}
+    assert actor._query_fragments == {}
+    assert actor._pending_fragment_registrations == {}
+
+
+def test_fragment_template_rejects_unprepared_inline_fallback():
+    actor_cls, actor = _new_fragment_registry_actor()
+
+    with pytest.raises(ValueError, match="was not prepared in the actor registry"):
+        actor_cls._resolve_fragment_template(
+            actor,
+            "query-1:node:1",
+            {"query_id": "query-1"},
+            object(),
+            "query-1",
+        )
+
+    assert actor._plan_fragments == {}
 
 
 def test_start_ray_workers_keeps_flight_host_worker_local_and_skips_nested_warmup(monkeypatch):
@@ -13708,11 +13988,11 @@ def test_worker_session_connection_rejects_reopen_after_close(monkeypatch):
 
     actor._get_shared_conn = lambda: _SharedConnection()
 
-    def _configure(_connection, config, *, use_session_credentials):
+    def _resolve(config, *, use_session_credentials):
         assert use_session_credentials is True
         return dict(config)
 
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _resolve)
 
     session_connection = actor_cls._get_session_conn(
         actor,
@@ -13775,8 +14055,8 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
     actor._closed_session_ids = worker_mod.BoundedReplayMap(capacity=65_536)
     actor._session_connections_lock = threading.RLock()
     actor._shutdown_started = False
-    configure_started = threading.Event()
-    configure_release = threading.Event()
+    resolution_started = threading.Event()
+    resolution_release = threading.Event()
     created_connections = []
     results = []
     errors = []
@@ -13791,14 +14071,14 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
             created_connections.append(connection)
             return connection
 
-    def _configure(_connection, config, *, use_session_credentials):
+    def _resolve(config, *, use_session_credentials):
         assert use_session_credentials is True
-        configure_started.set()
-        assert configure_release.wait(timeout=1.0)
+        resolution_started.set()
+        assert resolution_release.wait(timeout=1.0)
         return dict(config)
 
     actor._get_shared_conn = lambda: _SharedConnection()
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _configure)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _resolve)
 
     def _open():
         try:
@@ -13809,11 +14089,11 @@ def test_worker_session_connection_open_is_single_flight(monkeypatch):
     first = threading.Thread(target=_open)
     second = threading.Thread(target=_open)
     first.start()
-    assert configure_started.wait(timeout=1.0)
+    assert resolution_started.wait(timeout=1.0)
     second.start()
     time.sleep(0.01)
     assert len(created_connections) == 1
-    configure_release.set()
+    resolution_release.set()
     first.join(timeout=1.0)
     second.join(timeout=1.0)
 
@@ -13892,7 +14172,7 @@ def test_worker_session_credential_refresh_is_single_flight(monkeypatch):
     assert [result["AWS_ACCESS_KEY_ID"] for result in results] == ["new-key", "new-key"]
 
 
-def test_worker_session_configuration_failure_closes_unpublished_connection(monkeypatch):
+def test_worker_session_credential_resolution_failure_closes_unpublished_connection(monkeypatch):
     actor_cls = worker_mod.RayWorkerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._session_connections = {}
@@ -13911,17 +14191,17 @@ def test_worker_session_configuration_failure_closes_unpublished_connection(monk
 
     actor._get_shared_conn = lambda: _SharedConnection()
 
-    def _fail_configuration(_connection, _config, *, use_session_credentials):
+    def _fail_resolution(_config, *, use_session_credentials):
         assert use_session_credentials is True
-        raise RuntimeError("planned session configuration failure")
+        raise RuntimeError("planned session credential resolution failure")
 
     monkeypatch.setattr(
         worker_mod,
-        "_configure_duckdb_s3",
-        _fail_configuration,
+        "_effective_duckdb_s3_config",
+        _fail_resolution,
     )
 
-    with pytest.raises(RuntimeError, match="planned session configuration failure"):
+    with pytest.raises(RuntimeError, match="planned session credential resolution failure"):
         actor_cls._get_session_conn(
             actor,
             "session-a",
@@ -13953,14 +14233,14 @@ def test_worker_session_close_wins_race_with_credential_resolution(monkeypatch):
         def cursor(self):
             return _SessionConnection()
 
-    def _delayed_config(_connection, config, *, use_session_credentials):
+    def _delayed_resolution(config, *, use_session_credentials):
         assert use_session_credentials is True
         resolution_started.set()
         assert resolution_release.wait(timeout=1.0)
         return dict(config)
 
     actor._get_shared_conn = lambda: _SharedConnection()
-    monkeypatch.setattr(worker_mod, "_configure_duckdb_s3", _delayed_config)
+    monkeypatch.setattr(worker_mod, "_effective_duckdb_s3_config", _delayed_resolution)
 
     def _open():
         try:
@@ -14213,6 +14493,7 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         "test-source-id",
         (("httpfs", ""),),
         (),
+        (),
         "session-a",
         "test-s3-identity",
         True,
@@ -14227,17 +14508,6 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
         ),
     }
 
-    def _get_session_conn(session_id, config, *, use_session_credentials):
-        assert session_id == "session-a"
-        assert config == {
-            "AWS_ACCESS_KEY_ID": "key-a",
-            "AWS_SECRET_ACCESS_KEY": "secret-a",
-        }
-        assert use_session_credentials is True
-        return session_conn
-
-    actor._get_session_conn = _get_session_conn
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     monkeypatch.setattr(
         worker_mod,
@@ -14276,7 +14546,21 @@ def test_execute_native_task_configuration_failure_closes_unregistered_cursor(mo
             return "resource-query"
 
     with pytest.raises(RuntimeError, match="planned query cursor configuration failure"):
-        actor_cls._execute_native_task(actor, _Plan(), None, native_query_id="query-a")
+        actor_cls._execute_native_task(
+            actor,
+            _Plan(),
+            None,
+            prepared_snapshot=(
+                session_conn,
+                {
+                    "AWS_ACCESS_KEY_ID": "key-a",
+                    "AWS_SECRET_ACCESS_KEY": "secret-a",
+                },
+                database_identity,
+                cursor,
+            ),
+            native_query_id="query-a",
+        )
 
     assert closed == ["cursor"]
     assert actor._active_native_cursors == set()
@@ -14611,6 +14895,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "test-source-id",
         (("httpfs", ""),),
         (),
+        (),
         "session-a",
         "test-s3-identity",
         True,
@@ -14658,11 +14943,26 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
 
     actor._refresh_session_s3_config_locked = _refresh_session_s3_config_locked
 
-    def _get_snapshot_execution_cursor(connection, _query_id, *, database_identity):
+    def _prepare_snapshot_database(query_id, *, database_identity):
+        assert query_id == "resource-query"
         assert operation_lock.held is True
-        return connection.cursor()
+
+    actor._prepare_snapshot_database = _prepare_snapshot_database
+
+    def _get_snapshot_execution_cursor(_query_id, *, database_identity):
+        assert operation_lock.held is True
+        return shared_conn.cursor()
 
     actor._get_snapshot_execution_cursor = _get_snapshot_execution_cursor
+    validated = []
+
+    def _validate_snapshot_database(cursor, query_id):
+        assert operation_lock.held is True
+        assert cursor is shared_conn.cursor_obj
+        assert query_id == "resource-query"
+        validated.append((cursor, query_id))
+
+    actor._validate_query_snapshot_database = _validate_snapshot_database
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     actor._get_plan_runner = lambda: _FakePlanRunner()
     plan_object = _FakePlan()
@@ -14680,10 +14980,18 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     )
 
     dynamic_domains = {"df0": {"column": "id", "single_value": 7}}
+    prepared_snapshot = actor_cls._prepare_query_snapshot_execution(actor, plan_object)
+    actor._prepare_query_snapshot_execution = lambda _plan: pytest.fail(
+        "native execution must not perform worker snapshot preparation"
+    )
+    actor._get_snapshot_execution_cursor = lambda *_args, **_kwargs: pytest.fail(
+        "native execution must use its pre-admission cursor lease"
+    )
     result = actor_cls._execute_native_task(
         actor,
         plan_object,
         {"1": b"scan"},
+        prepared_snapshot=prepared_snapshot,
         copy_output_info={"base": "", "run_id": "run-native", "remote_base": "/tmp/out"},
         exchange_source_task_map={"9": b"exchange-binding"},
         exchange_sink_instance={"sink_handle": {"partition_id": 4}, "attempt_id": 2, "attempt_path": "/tmp/attempt"},
@@ -14693,6 +15001,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
     )
 
     assert result == "ok"
+    assert validated == [(shared_conn.cursor_obj, "resource-query")]
     assert configured == [
         (
             shared_conn.cursor_obj,
@@ -14736,7 +15045,7 @@ def test_execute_native_task_passes_exchange_and_sink_inputs(monkeypatch):
         "AWS_ACCESS_KEY_ID": "session-a-key",
         "AWS_SECRET_ACCESS_KEY": "session-a-secret",
     }
-    assert operation_lock.entry_count == 1
+    assert operation_lock.entry_count == 2
     assert lifecycle == ["execute", "cursor-close"]
 
 
@@ -14752,6 +15061,7 @@ def test_execute_native_task_rejects_conflicting_runtime_task_identity():
             actor,
             object(),
             None,
+            prepared_snapshot=(None, {}, None, None),
             debug_context={"task_id": "q1.2.3.5"},
             native_task_id="q1.2.3.4",
         )
@@ -14769,11 +15079,12 @@ def test_execute_native_task_rejects_debug_task_identity_without_native_identity
             actor,
             object(),
             None,
+            prepared_snapshot=(None, {}, None, None),
             debug_context={"task_id": "q1.2.3.4"},
         )
 
 
-def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_context():
+def test_configure_duckdb_s3_applies_static_credentials_without_loading_extension():
     statements = []
 
     class _FakeConnection:
@@ -14788,32 +15099,11 @@ def test_configure_duckdb_s3_applies_static_credentials_only_to_connection_conte
         },
     )
 
-    assert statements[0] == "LOAD httpfs"
+    assert "LOAD httpfs" not in statements
     assert "SET s3_access_key_id='access-key'" in statements
     assert "SET s3_secret_access_key='secret''value'" in statements
     assert "SET s3_session_token=''" in statements
     assert all("SET GLOBAL" not in statement for statement in statements)
-
-
-def test_configure_duckdb_s3_does_not_install_httpfs_when_load_fails():
-    statements = []
-
-    class _FakeConnection:
-        def execute(self, statement):
-            statements.append(statement)
-            raise RuntimeError("httpfs is unavailable")
-
-    with pytest.raises(RuntimeError, match="runtime extension installation is disabled") as exc_info:
-        worker_mod._configure_duckdb_s3(
-            _FakeConnection(),
-            {
-                "AWS_ACCESS_KEY_ID": "access-key",
-                "AWS_SECRET_ACCESS_KEY": "secret-key",
-            },
-        )
-
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
-    assert statements == ["LOAD httpfs"]
 
 
 def test_configure_duckdb_s3_preserves_scheme_less_endpoint_authority():
@@ -15126,6 +15416,7 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
         "test-source-id",
         (),
         (),
+        (),
         "",
         "",
         False,
@@ -15145,10 +15436,6 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
         def resource_query_id(self):
             return "resource-query"
 
-    actor._get_session_conn = lambda session_id, config, *, use_session_credentials: (
-        shared_conn if (session_id, config) == ("session-a", {}) else None
-    )
-    actor._get_snapshot_execution_cursor = lambda connection, _query_id, *, database_identity: connection.cursor()
     actor._close_snapshot_execution_cursor = lambda cursor: cursor.close()
     monkeypatch.setattr(
         worker_mod,
@@ -15184,6 +15471,7 @@ def test_execute_native_task_uses_session_database_for_fte(monkeypatch):
         actor,
         _FakePlan(),
         None,
+        prepared_snapshot=(shared_conn, {}, database_identity, shared_conn.cursor()),
         fte_scan_source_queues=scan_queues,
         fte_exchange_source_queues=exchange_queues,
     )

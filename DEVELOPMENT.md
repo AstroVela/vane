@@ -72,6 +72,34 @@ The staging directory is configurable with
 `VANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY`; packaging and trusted artifact
 metadata are intentionally handled separately.
 
+Applications load a trusted local artifact through
+`DynamicExtensionResolver.load()`. After DuckDB accepts the verified cache
+snapshot, Vane records the artifact's canonical `DynamicExtensionDescriptor`
+on the connection session. Ray snapshots preserve that ordered descriptor
+manifest, including each SHA-256 digest and dependency identity, but never a
+local artifact path or binary payload.
+
+Every Ray node must preinstall one provider entry point per required extension
+under `vane.dynamic_extension_providers`. The entry point name is the canonical
+DuckDB extension name and its callable returns a `LocalExtensionProvider` for
+the exact descriptor. Fragment registration prepares the worker's isolated
+DatabaseInstance from those providers before task admission. Immediately
+before native admission, a worker refreshes the exact database identity (for
+example after S3 credential rotation) and prepares a cache miss first; the
+worker leases a cursor from that prepared entry before admission, so credential
+rotation cannot retire it during handoff. The admitted execution path only uses
+that cursor and never issues another dynamic-extension load. Missing, ambiguous, or
+mismatched providers fail preparation; workers do not scan directories,
+download artifacts, autoinstall, autoload, or enable unsigned loading.
+Coordinator extension/home directory and extension repository bootstrap
+settings are ignored on workers so verified caches stay node-local.
+
+The real-Ray CI gate signs DuckDB's `loadable_extension_demo` with the
+repository's existing mbedTLS test key and installs a test-only provider entry
+point. Its Python 3.12 wheel explicitly enables
+`VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; the option is off by default and must
+never be enabled for release artifacts.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test

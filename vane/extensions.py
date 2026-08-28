@@ -20,6 +20,7 @@ import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -39,6 +40,7 @@ _WRITE_PERMISSION_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
 _SHARED_DIRECTORY_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
 _CACHE_DIRECTORY_NORMALIZATION_TIMEOUT_SECONDS = 5.0
 _CACHE_DIRECTORY_NORMALIZATION_RETRY_SECONDS = 0.01
+_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP = "vane.dynamic_extension_providers"
 
 
 def _snapshot_mode_is_read_only(mode: int) -> bool:
@@ -430,6 +432,212 @@ class LocalExtensionProvider:
         return self._artifact_by_identity.get(identity)
 
 
+def _parse_dynamic_extension_snapshot(snapshot: object) -> tuple[DynamicExtensionDescriptor, ...]:
+    """Validate an ordered dynamic-extension manifest without loading it."""
+    if not isinstance(snapshot, list):
+        _fail("SNAPSHOT_INVALID", "dynamic_extensions must be a list")
+
+    descriptors: list[DynamicExtensionDescriptor] = []
+    available_identities: set[str] = set()
+    seen_names: set[str] = set()
+    for index, raw_descriptor in enumerate(snapshot):
+        if not isinstance(raw_descriptor, Mapping):
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions[{index}] must be a descriptor object")
+        descriptor = DynamicExtensionDescriptor.from_dict(raw_descriptor)
+        if descriptor.identity in available_identities:
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions contains duplicate {descriptor.identity}")
+        if descriptor.name in seen_names:
+            _fail("SNAPSHOT_INVALID", f"dynamic_extensions contains conflicting name {descriptor.name}")
+        missing_dependencies = [
+            dependency.identity
+            for dependency in descriptor.dependencies
+            if dependency.identity not in available_identities
+        ]
+        if missing_dependencies:
+            _fail(
+                "SNAPSHOT_DEPENDENCY_ORDER",
+                f"dynamic_extensions[{index}] declares dependencies before their descriptors: "
+                f"{', '.join(missing_dependencies)}",
+            )
+        descriptors.append(descriptor)
+        available_identities.add(descriptor.identity)
+        seen_names.add(descriptor.name)
+    return tuple(descriptors)
+
+
+def _normalize_dynamic_extension_snapshot(snapshot: object) -> list[dict[str, object]]:
+    """Return the canonical manifest after strict structural validation."""
+    return [descriptor.to_dict() for descriptor in _parse_dynamic_extension_snapshot(snapshot)]
+
+
+def _dynamic_extension_snapshot_cache_identity(snapshot: object) -> tuple[tuple[str, str], ...]:
+    """Return the exact artifact identity used by a worker DatabaseInstance."""
+    return tuple((descriptor.name, descriptor.to_json()) for descriptor in _parse_dynamic_extension_snapshot(snapshot))
+
+
+def _serialized_dynamic_extension_snapshot_entries(connection: DuckDBPyConnection) -> list[str]:
+    export_entries = getattr(connection, "_export_dynamic_extension_snapshot_entries", None)
+    if not callable(export_entries):
+        _fail("SNAPSHOT_UNAVAILABLE", "connection cannot export dynamic extension snapshot entries")
+    try:
+        serialized_entries = export_entries()
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "SNAPSHOT_UNAVAILABLE", "could not read the connection's dynamic extension snapshot"
+        ) from exception
+    if not isinstance(serialized_entries, list) or any(not isinstance(entry, str) for entry in serialized_entries):
+        _fail("SNAPSHOT_INVALID", "connection dynamic extension entries must be a list of JSON strings")
+    return serialized_entries
+
+
+def _capture_dynamic_extension_snapshot(connection: DuckDBPyConnection) -> list[dict[str, object]]:
+    """Capture resolver-owned descriptors without serializing local paths."""
+    return _deserialize_dynamic_extension_snapshot_entries(_serialized_dynamic_extension_snapshot_entries(connection))
+
+
+def _deserialize_dynamic_extension_snapshot_entries(
+    serialized_entries: list[str],
+) -> list[dict[str, object]]:
+    """Parse one native session snapshot captured under a single lock."""
+    entries: list[object] = []
+    for index, serialized_entry in enumerate(serialized_entries):
+        try:
+            entries.append(json.loads(serialized_entry))
+        except ValueError as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_INVALID",
+                f"connection dynamic extension entry {index} is not valid JSON",
+            ) from exception
+    return _normalize_dynamic_extension_snapshot(entries)
+
+
+def _record_dynamic_extension_snapshot_entry(
+    connection: DuckDBPyConnection,
+    candidate: ResolvedDynamicExtension,
+) -> None:
+    """Record one verified, successfully loaded artifact for snapshot capture."""
+    compare_and_record = getattr(connection, "_compare_and_record_dynamic_extension_snapshot_entry", None)
+    if not callable(compare_and_record):
+        _fail("SNAPSHOT_UNAVAILABLE", "connection cannot record dynamic extension snapshot entries")
+    candidate_json = candidate.descriptor.to_json()
+
+    while True:
+        serialized_entries = _serialized_dynamic_extension_snapshot_entries(connection)
+        existing_descriptors = _parse_dynamic_extension_snapshot(
+            _deserialize_dynamic_extension_snapshot_entries(serialized_entries)
+        )
+        for existing in existing_descriptors:
+            if existing.identity == candidate.identity:
+                if existing != candidate.descriptor:
+                    _fail(
+                        "LOADED_IDENTITY_CONFLICT",
+                        f"{candidate.identity} has conflicting immutable descriptors on this connection session",
+                    )
+                return
+            if existing.name == candidate.descriptor.name:
+                _fail(
+                    "LOADED_NAME_CONFLICT",
+                    f"{candidate.descriptor.name} is already recorded as {existing.identity} on this connection session",
+                )
+        available_identities = {descriptor.identity for descriptor in existing_descriptors}
+        missing_dependencies = [
+            dependency.identity
+            for dependency in candidate.descriptor.dependencies
+            if dependency.identity not in available_identities
+        ]
+        if missing_dependencies:
+            _fail(
+                "SNAPSHOT_DEPENDENCY_ORDER",
+                f"cannot record {candidate.identity} before dependencies {', '.join(missing_dependencies)}",
+            )
+        try:
+            if compare_and_record(serialized_entries, candidate_json):
+                return
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "SNAPSHOT_UNAVAILABLE", "could not record the connection's dynamic extension snapshot"
+            ) from exception
+
+
+def _load_installed_dynamic_extension_providers(
+    descriptors: Iterable[DynamicExtensionDescriptor],
+) -> tuple[LocalExtensionProvider, ...]:
+    """Load exactly the preinstalled provider entry points named by a manifest."""
+    descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
+    if not descriptor_by_name:
+        return ()
+    try:
+        installed_entry_points = tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
+        ) from exception
+
+    providers: list[LocalExtensionProvider] = []
+    for name, descriptor in sorted(descriptor_by_name.items()):
+        matches = [installed for installed in installed_entry_points if installed.name == name]
+        if not matches:
+            _fail("PROVIDER_NOT_FOUND", f"no installed local provider entry point exists for {name}")
+        if len(matches) != 1:
+            _fail("PROVIDER_AMBIGUOUS", f"multiple installed local provider entry points exist for {name}")
+        try:
+            provider_factory = matches[0].load()
+            provider = provider_factory()
+        except DynamicExtensionError:
+            raise
+        except Exception as exception:
+            raise DynamicExtensionError(
+                "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
+            ) from exception
+        if not isinstance(provider, LocalExtensionProvider):
+            _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+        artifact = provider.find(descriptor.identity)
+        if artifact is None or artifact.descriptor != descriptor:
+            _fail(
+                "PROVIDER_DESCRIPTOR_MISMATCH",
+                f"installed local provider descriptor does not exactly match {descriptor.identity}",
+            )
+        # An entry point authorizes only the artifact named by that entry
+        # point. A provider may bundle other artifacts, but those extras must
+        # neither become fallback candidates nor make another exact entry
+        # point ambiguous.
+        providers.append(
+            LocalExtensionProvider(
+                provider.trust_identity,
+                (artifact,),
+            )
+        )
+    return tuple(providers)
+
+
+def _prepare_dynamic_extension_snapshot(connection: DuckDBPyConnection, snapshot: object) -> None:
+    """Resolve, verify, and load a worker manifest from preinstalled providers."""
+    expected_descriptors = _parse_dynamic_extension_snapshot(snapshot)
+    existing_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    if existing_descriptors:
+        if existing_descriptors != expected_descriptors:
+            _fail("WORKER_DISAGREEMENT", "worker dynamic extension manifest differs from the coordinator manifest")
+        return
+    if not expected_descriptors:
+        return
+
+    providers = _load_installed_dynamic_extension_providers(expected_descriptors)
+    resolver = DynamicExtensionResolver(
+        trusted_identities={descriptor.trust_identity for descriptor in expected_descriptors},
+        providers=providers,
+    )
+
+    # Verify the complete graph before changing the worker DatabaseInstance.
+    for descriptor in expected_descriptors:
+        resolver.resolve(connection, descriptor)
+    for descriptor in expected_descriptors:
+        resolver.load(connection, descriptor)
+
+    prepared_descriptors = _parse_dynamic_extension_snapshot(_capture_dynamic_extension_snapshot(connection))
+    if prepared_descriptors != expected_descriptors:
+        _fail("WORKER_DISAGREEMENT", "worker dynamic extension identities differ after preparation")
+
+
 class DynamicExtensionResolver:
     """Resolve and load only explicitly trusted local extension artifacts.
 
@@ -515,6 +723,7 @@ class DynamicExtensionResolver:
             # trust boundary as the process it could otherwise inject into.
             loaded = _load_native_extension(candidate.path, connection)
             self._validate_loaded_provenance(candidate, loaded)
+            _record_dynamic_extension_snapshot_entry(connection, candidate)
             with self._lock:
                 self._known_artifacts.setdefault((candidate.identity, str(candidate.path)), candidate)
         return resolved[-1]
