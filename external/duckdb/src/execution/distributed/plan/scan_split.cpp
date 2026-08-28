@@ -235,7 +235,7 @@ static idx_t MaxScanNodeId(const PhysicalOperator &op, idx_t max_id) {
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		max_id = MaxScanNodeId(child.get(), max_id);
 	}
 	return max_id;
@@ -248,7 +248,7 @@ static void CollectScanNodeIds(const PhysicalOperator &op, set<idx_t> &node_ids)
 			node_ids.insert(scan.extra_info.scan_node_id.GetIndex());
 		}
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetInputChildren()) {
 		CollectScanNodeIds(child.get(), node_ids);
 	}
 }
@@ -269,7 +269,7 @@ static bool CollectRequiredScanNodeIds(const PhysicalOperator &op, set<idx_t> &n
 		}
 		node_ids.insert(scan.extra_info.scan_node_id.GetIndex());
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetInputChildren()) {
 		if (!CollectRequiredScanNodeIds(child.get(), node_ids, error)) {
 			return false;
 		}
@@ -328,7 +328,7 @@ static void NormalizeScanNodeIdsByGroup(PhysicalOperator &op, unordered_map<idx_
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		NormalizeScanNodeIdsByGroup(child.get(), base_node_for_group, group_for_node, alias_to_parent, last_id, stats);
 	}
 }
@@ -466,7 +466,7 @@ static bool ApplyScanSplitBatchesToOperator(PhysicalOperator &op, const ScanSpli
 		}
 	}
 
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		if (ApplyScanSplitBatchesToOperator(child.get(), batches, matched_batches, stats, error)) {
 			applied_any = true;
 		}
@@ -965,7 +965,7 @@ bool ApplyFteScanSourceQueuesToOperator(PhysicalOperator &op,
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ApplyFteScanSourceQueuesToOperator(child.get(), queues, extension_batch_cache, dynamic_file_list_cache,
 		                                        matched_queues, error, applied)) {
 			ok = false;
@@ -1100,7 +1100,7 @@ static bool ValidateDistributedScanSplitsAppliedToOperator(const PhysicalOperato
 			return false;
 		}
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetInputChildren()) {
 		if (!ValidateDistributedScanSplitsAppliedToOperator(child.get(), error)) {
 			return false;
 		}

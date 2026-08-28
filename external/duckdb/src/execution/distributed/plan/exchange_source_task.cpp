@@ -41,7 +41,7 @@ bool CollectExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &node_i
 			node_ids.insert(source->RuntimeSourceNodeId().GetIndex());
 		}
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetInputChildren()) {
 		if (!CollectExchangeSourceNodeIds(child.get(), node_ids, error)) {
 			return false;
 		}
@@ -63,7 +63,7 @@ bool ApplyExchangeSourceTasksToOperator(PhysicalOperator &op,
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ApplyExchangeSourceTasksToOperator(child.get(), tasks, error, applied)) {
 			return false;
 		}

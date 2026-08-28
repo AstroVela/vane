@@ -18,6 +18,7 @@
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/join_output_types.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/nested_loop_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/positional_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/utils/optional.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
@@ -26,7 +27,9 @@
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
+#include "duckdb/execution/operator/join/physical_positional_join.hpp"
 #include "duckdb/execution/operator/join/physical_range_join.hpp"
+#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 
 namespace duckdb {
 namespace distributed {
@@ -291,6 +294,79 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	return std::make_shared<CrossProductNode>(get_next_pipeline_node_id(), plan_config_, cross_product.GetTypes(),
 	                                          cross_product.estimated_cardinality, std::move(left), std::move(right),
 	                                          std::move(schema));
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslatePositionalJoin(
+    const PhysicalPositionalJoin &positional_join,
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed positional join requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!positional_join.GetTypes().empty()) {
+		auto output_names = BuildCrossProductOutputNames(children[0]->config().schema(), children[1]->config().schema(),
+		                                                 positional_join.GetTypes().size());
+		schema = output_names.empty() ? MakeSchemaRef(positional_join.GetTypes())
+		                              : MakeSchemaRef(positional_join.GetTypes(), output_names);
+	}
+
+	// Each complete input must become one stable stream before the native
+	// positional operator aligns rows and pads the shorter side with NULLs.
+	auto left = gen_ordered_gather_node(children[0]);
+	auto right = gen_ordered_gather_node(children[1]);
+	return std::make_shared<PositionalJoinNode>(get_next_pipeline_node_id(), plan_config_, positional_join.GetTypes(),
+	                                            positional_join.estimated_cardinality, std::move(left),
+	                                            std::move(right), std::move(schema));
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslatePositionalScan(
+    const PhysicalPositionalScan &positional_scan,
+    const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() < 2 || children.size() != positional_scan.child_tables.size()) {
+		throw InvalidInputException("Distributed positional scan requires at least two table scan inputs");
+	}
+	for (const auto &child : children) {
+		if (!child) {
+			throw InvalidInputException("Distributed positional scan received a null input node");
+		}
+	}
+
+	auto accumulated = children[0];
+	duckdb::vector<LogicalType> accumulated_types = positional_scan.child_tables[0].get().GetTypes();
+	idx_t accumulated_cardinality = positional_scan.child_tables[0].get().estimated_cardinality;
+
+	for (idx_t child_idx = 1; child_idx < children.size(); child_idx++) {
+		const auto &right_op = positional_scan.child_tables[child_idx].get();
+		auto output_types = accumulated_types;
+		const auto &right_types = right_op.GetTypes();
+		output_types.insert(output_types.end(), right_types.begin(), right_types.end());
+		accumulated_cardinality = MaxValue(accumulated_cardinality, right_op.estimated_cardinality);
+
+		SchemaRef schema = nullptr;
+		if (!output_types.empty()) {
+			auto output_names = BuildCrossProductOutputNames(
+			    accumulated->config().schema(), children[child_idx]->config().schema(), output_types.size());
+			schema = output_names.empty() ? MakeSchemaRef(output_types) : MakeSchemaRef(output_types, output_names);
+		}
+
+		auto left = gen_ordered_gather_node(accumulated);
+		auto right = gen_ordered_gather_node(children[child_idx]);
+		auto join = std::make_shared<PositionalJoinNode>(get_next_pipeline_node_id(), plan_config_, output_types,
+		                                                 accumulated_cardinality, std::move(left), std::move(right),
+		                                                 std::move(schema));
+
+		accumulated_types = std::move(output_types);
+		if (child_idx + 1 == children.size()) {
+			if (accumulated_types != positional_scan.GetTypes()) {
+				throw InternalException("Distributed positional scan output schema does not match its table inputs");
+			}
+			return join;
+		}
+		accumulated = std::make_shared<DistributedPipelineNode>(std::move(join));
+	}
+
+	throw InternalException("Distributed positional scan translation produced no join node");
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateAsOfJoin(

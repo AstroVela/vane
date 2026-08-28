@@ -639,8 +639,12 @@ class FteWorkerSubmissionMixin:
                     "exchange_source_partition_ids": set(),
                     "exchange_source_partition_count": 0,
                     "exchange_source_task_count": 0,
+                    "preserve_order": bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
                 },
             )
+            item_preserves_order = bool((item.get("exchange_sink_config") or {}).get("preserve_order", False))
+            if aggregate["preserve_order"] != item_preserves_order:
+                raise ValueError("exchange sink order-preservation mode cannot change within a fragment")
             aggregate["dynamic_scan_sources"].update(dynamic_scan_sources)
             aggregate["dynamic_exchange_sources"].update(dynamic_exchange_sources)
             aggregate["replicated_exchange_sources"].update(replicated_exchange_sources)
@@ -690,6 +694,7 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=aggregate["exchange_source_partition_ids"],
                 exchange_source_partition_count=aggregate["exchange_source_partition_count"],
                 exchange_source_task_count=aggregate["exchange_source_task_count"],
+                preserve_order=aggregate["preserve_order"],
             )
 
         for prepared_index, (
@@ -734,7 +739,13 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=set(),
                 exchange_source_partition_count=0,
                 exchange_source_task_count=0,
+                preserve_order=bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
             )
+            coordinator_source_task_order = None
+            if fragment_state.preserve_order:
+                coordinator_source_task_order = (item.get("context") or {}).get("source_task_order")
+                if coordinator_source_task_order is None:
+                    raise ValueError("ordered Ray FTE exchange sink requires a coordinator task sequence")
             if fragment_state.assigner is None:
                 raise RuntimeError("FTE fragment state is missing split assigner")
             new_exchange_partition_ids_by_source, final_exchange_sources = mark_exchange_source_partitions_seen(
@@ -764,7 +775,10 @@ class FteWorkerSubmissionMixin:
                     prepared_index=prepared_index,
                     elapsed_ms=int((time.monotonic() - item_started_at) * 1000),
                 )
-                partition = fragment_execution.add_partition(0)
+                partition = fragment_execution.add_partition(
+                    0,
+                    coordinator_source_task_order=coordinator_source_task_order,
+                )
                 _fte_submission_debug_log(
                     "pending_item_empty_source_reserve_start",
                     prepared_index=prepared_index,
@@ -831,6 +845,7 @@ class FteWorkerSubmissionMixin:
                     partition = fragment_execution.add_partition(
                         partition_info.partition_id,
                         partition_info.node_requirements,
+                        coordinator_source_task_order=coordinator_source_task_order,
                     )
                     _fte_submission_debug_log(
                         "pending_item_reserve_start",

@@ -753,10 +753,19 @@ void FlightExchange::SinkFinished(const ExchangeSinkInstanceHandle &instance, co
 			SinkAttemptMetadata metadata;
 			metadata.task_partition_id = handle.task_partition_id;
 			metadata.attempt_id = attempt_id;
+			metadata.source_task_order = instance.source_task_order;
 			metadata.output_location = instance.output_location;
 			attempt_entry = sink_entry->second.emplace(attempt_id, std::move(metadata)).first;
 		}
 		auto &attempt_metadata = attempt_entry->second;
+		if (attempt_metadata.source_task_order != DConstants::INVALID_INDEX &&
+		    instance.source_task_order != DConstants::INVALID_INDEX &&
+		    attempt_metadata.source_task_order != instance.source_task_order) {
+			throw InvalidInputException("finished Flight sink source task order changed for one attempt");
+		}
+		if (instance.source_task_order != DConstants::INVALID_INDEX) {
+			attempt_metadata.source_task_order = instance.source_task_order;
+		}
 		if (instance.output_location.empty() || attempt_metadata.output_location != instance.output_location) {
 			throw InvalidInputException("finished Flight sink output location does not match instantiated attempt");
 		}
@@ -925,6 +934,28 @@ std::vector<ExchangeSourceHandle> FlightExchange::GetSourceHandles() {
 			attempt_metadata.task_partition_id = sink_partition_id;
 			attempt_metadata.attempt_id = attempt_id;
 			selected_attempts.emplace_back(sink_partition_id, std::move(attempt_metadata));
+		}
+		const bool has_source_order =
+		    std::any_of(selected_attempts.begin(), selected_attempts.end(),
+		                [](const auto &entry) { return entry.second.source_task_order != DConstants::INVALID_INDEX; });
+		if (has_source_order) {
+			if (std::any_of(selected_attempts.begin(), selected_attempts.end(), [](const auto &entry) {
+				    return entry.second.source_task_order == DConstants::INVALID_INDEX;
+			    })) {
+				throw InvalidInputException("selected Flight sinks have inconsistent source task ordering metadata");
+			}
+			std::sort(selected_attempts.begin(), selected_attempts.end(), [](const auto &left, const auto &right) {
+				if (left.second.source_task_order != right.second.source_task_order) {
+					return left.second.source_task_order < right.second.source_task_order;
+				}
+				return left.first < right.first;
+			});
+			for (idx_t entry_idx = 1; entry_idx < selected_attempts.size(); entry_idx++) {
+				if (selected_attempts[entry_idx - 1].second.source_task_order ==
+				    selected_attempts[entry_idx].second.source_task_order) {
+					throw InvalidInputException("selected Flight sinks have duplicate source task ordering metadata");
+				}
+			}
 		}
 	}
 	if (selected_attempts.empty()) {

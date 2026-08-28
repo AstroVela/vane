@@ -138,12 +138,13 @@ PhysicalRemoteExchangeSink::PhysicalRemoteExchangeSink(
     idx_t num_partitions, RepartitionSpec::Type repartition_type, vector<unique_ptr<Expression>> partition_by,
     std::string sink_query_id, std::string sink_output_location_prefix,
     std::shared_ptr<distributed::ExchangeManager> exchange_mgr, vector<string> range_boundaries,
-    vector<string> range_order_modifiers)
+    vector<string> range_order_modifiers, bool preserve_order)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXCHANGE_SINK, std::move(types), estimated_cardinality),
       exchange_id_(std::move(exchange_id)), num_partitions_(num_partitions), repartition_type_(repartition_type),
       partition_by_(std::move(partition_by)), sink_query_id_(std::move(sink_query_id)),
       sink_output_location_prefix_(std::move(sink_output_location_prefix)), exchange_mgr_(std::move(exchange_mgr)),
-      range_boundaries_(std::move(range_boundaries)), range_order_modifiers_(std::move(range_order_modifiers)) {
+      range_boundaries_(std::move(range_boundaries)), range_order_modifiers_(std::move(range_order_modifiers)),
+      preserve_order_(preserve_order) {
 	if (num_partitions_ == 0) {
 		throw InvalidInputException("remote exchange sink requires at least one partition");
 	}
@@ -341,6 +342,7 @@ InsertionOrderPreservingMap<string> PhysicalRemoteExchangeSink::ParamsToString()
 	result["exchange_id"] = exchange_id_;
 	result["num_partitions"] = std::to_string(num_partitions_);
 	result["type"] = "remote_exchange";
+	result["preserve_order"] = preserve_order_ ? "true" : "false";
 	return result;
 }
 
@@ -372,6 +374,7 @@ void PhysicalRemoteExchangeSink::SerializeOperatorData(Serializer &serializer) c
 	if (collect_mark_join_build_summary_) {
 		serializer.WriteProperty(114, "mark_join_build_expressions", mark_join_build_expressions_);
 	}
+	serializer.WritePropertyWithDefault<bool>(115, "preserve_order", preserve_order_, false);
 }
 
 } // namespace duckdb

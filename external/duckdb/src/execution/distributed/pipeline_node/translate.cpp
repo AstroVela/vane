@@ -45,9 +45,11 @@
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
+#include "duckdb/execution/operator/join/physical_positional_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_range_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/set/physical_union.hpp"
@@ -61,6 +63,14 @@ namespace duckdb {
 namespace distributed {
 
 namespace {
+
+vector<const_reference<PhysicalOperator>> TranslationChildren(const PhysicalOperator &op) {
+	return op.GetInputChildren();
+}
+
+vector<reference<PhysicalOperator>> TranslationChildren(PhysicalOperator &op) {
+	return op.GetInputChildren();
+}
 
 void ValidateResolvedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                         const DistributedExtensionWritePlan &plan) {
@@ -127,7 +137,7 @@ void PhysicalPlanToPipelineNodeTranslator::CollectUnionOrderRequirements(const P
 		}
 	}
 
-	for (const auto &child : op.children) {
+	for (const auto &child : TranslationChildren(op)) {
 		CollectUnionOrderRequirements(child.get(), child_order_required);
 	}
 }
@@ -183,8 +193,8 @@ PhysicalPlanToPipelineNodeTranslator::physical_plan_to_pipeline_node(
 
 std::shared_ptr<DistributedPipelineNode>
 PhysicalPlanToPipelineNodeTranslator::gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
-                                                       SchemaRef schema,
-                                                       std::shared_ptr<DistributedPipelineNode> child) {
+                                                       SchemaRef schema, std::shared_ptr<DistributedPipelineNode> child,
+                                                       bool preserve_order) {
 	if (!repartition_spec) {
 		throw InternalException("Cannot build shuffle node without a repartition specification");
 	}
@@ -206,7 +216,7 @@ PhysicalPlanToPipelineNodeTranslator::gen_shuffle_node(std::shared_ptr<Repartiti
 	auto plan_cfg_ptr = std::make_shared<PlanConfig>(plan_config_);
 	auto repartition_node =
 	    RepartitionNode::create(get_next_pipeline_node_id(), plan_cfg_ptr, std::move(repartition_spec), num_partitions,
-	                            std::move(schema), std::move(child), exchange_mgr_);
+	                            std::move(schema), std::move(child), exchange_mgr_, preserve_order);
 	if (!repartition_node) {
 		throw InternalException("Failed to build shuffle node");
 	}
@@ -227,12 +237,29 @@ PhysicalPlanToPipelineNodeTranslator::gen_gather_node(std::shared_ptr<Distribute
 	return gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node);
 }
 
+std::shared_ptr<DistributedPipelineNode>
+PhysicalPlanToPipelineNodeTranslator::gen_ordered_gather_node(std::shared_ptr<DistributedPipelineNode> input_node) {
+	if (!input_node) {
+		throw InternalException("Cannot build ordered gather node without an input");
+	}
+	// Always materialize, even when clustering metadata says one partition: a
+	// one-partition node may still emit multiple task fragments. Positional
+	// semantics require one complete, deterministically ordered input stream.
+	auto spec = RepartitionSpec::create_into_partitions(1);
+	return gen_shuffle_node(std::move(spec), input_node->config().schema(), input_node, true);
+}
+
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {
-	// First recurse into children using the base helper
-	PhysicalOperatorVisitor::VisitOperatorChildren(op);
+	// Translate only executable inputs. Some operators expose additional owned
+	// subplans through GetChildren(), but those are serialized into their owning
+	// distributed node rather than translated as independent pipelines.
+	auto physical_children = TranslationChildren(op);
+	for (auto &child : physical_children) {
+		VisitOperator(child.get());
+	}
 
 	// collect child distributed nodes (if any)
-	size_t n_children = op.children.size();
+	size_t n_children = physical_children.size();
 	std::vector<std::shared_ptr<DistributedPipelineNode>> children;
 	children.reserve(n_children);
 	for (size_t i = 0; i < n_children; ++i) {
@@ -381,6 +408,16 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	case PhysicalOperatorType::CROSS_PRODUCT: {
 		auto &cross_product = static_cast<PhysicalCrossProduct &>(op);
 		node_impl = TranslateCrossProduct(cross_product, children);
+		break;
+	}
+	case PhysicalOperatorType::POSITIONAL_JOIN: {
+		auto &positional_join = static_cast<PhysicalPositionalJoin &>(op);
+		node_impl = TranslatePositionalJoin(positional_join, children);
+		break;
+	}
+	case PhysicalOperatorType::POSITIONAL_SCAN: {
+		auto &positional_scan = static_cast<PhysicalPositionalScan &>(op);
+		node_impl = TranslatePositionalScan(positional_scan, children);
 		break;
 	}
 	case PhysicalOperatorType::ASOF_JOIN: {
@@ -569,7 +606,7 @@ std::unordered_map<idx_t, std::vector<ScanSplit>> physical_plan_scan_split_map_w
 				max_id = std::max(max_id, scan.extra_info.scan_group_id.GetIndex());
 			}
 		}
-		for (auto &child : op.children) {
+		for (auto &child : op.GetInputChildren()) {
 			update_max(child.get());
 		}
 	};
@@ -599,7 +636,7 @@ std::unordered_map<idx_t, std::vector<ScanSplit>> physical_plan_scan_split_map_w
 			auto splits = MakeTableScanSplits(scan, *exec_cfg, db, client_context);
 			out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(splits));
 		}
-		for (auto &child : op.children) {
+		for (auto &child : op.GetInputChildren()) {
 			collect(child.get());
 		}
 	};

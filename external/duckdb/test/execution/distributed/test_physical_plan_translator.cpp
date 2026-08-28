@@ -2145,11 +2145,10 @@ TEST_CASE("PhysicalPlanTranslator: left delim join -> placeholder node", "[distr
 	auto &left_scan = plan_ptr->Make<PhysicalColumnDataScan>(scan_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 1,
 	                                                         std::move(left_collection));
 
-	auto right_collection = MakeSingleValueCollection(scan_types, {Value::INTEGER(2)});
-	auto &right_scan =
-	    plan_ptr
-	        ->Make<PhysicalColumnDataScan>(scan_types, PhysicalOperatorType::DELIM_SCAN, 1, std::move(right_collection))
-	        .Cast<PhysicalColumnDataScan>();
+	auto &right_scan = plan_ptr
+	                       ->Make<PhysicalColumnDataScan>(scan_types, PhysicalOperatorType::DELIM_SCAN, 1,
+	                                                      optionally_owned_ptr<ColumnDataCollection>())
+	                       .Cast<PhysicalColumnDataScan>();
 	right_scan.delim_index = 7;
 
 	vector<JoinCondition> conditions;
@@ -2180,6 +2179,8 @@ TEST_CASE("PhysicalPlanTranslator: left delim join -> placeholder node", "[distr
 	                                                         distinct, delim_scans, 1, optional_idx(7));
 	delim_join.children.push_back(left_scan);
 	plan_ptr->SetRoot(delim_join);
+	REQUIRE(delim_join.GetInputChildren().size() == 1);
+	REQUIRE(delim_join.GetChildren().size() == 3);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
 	REQUIRE(res.ok);

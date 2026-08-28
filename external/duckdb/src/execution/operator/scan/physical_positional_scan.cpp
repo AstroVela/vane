@@ -1,6 +1,7 @@
 #include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -34,6 +35,20 @@ PhysicalPositionalScan::PhysicalPositionalScan(PhysicalPlan &physical_plan, vect
 	} else {
 		throw InternalException("Invalid right input for PhysicalPositionalScan");
 	}
+}
+
+PhysicalPositionalScan::PhysicalPositionalScan(PhysicalPlan &physical_plan, PositionalScanDeserializeTag,
+                                               vector<LogicalType> types,
+                                               vector<reference<PhysicalOperator>> child_tables_p,
+                                               idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::POSITIONAL_SCAN, std::move(types), estimated_cardinality),
+      child_tables(std::move(child_tables_p)) {
+}
+
+void PhysicalPositionalScan::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteList(103, "child_tables", child_tables.size(), [&](Serializer::List &list, idx_t i) {
+		list.WriteObject([&](Serializer &child_serializer) { child_tables[i].get().Serialize(child_serializer); });
+	});
 }
 
 class PositionalScanGlobalSourceState : public GlobalSourceState {
@@ -218,6 +233,10 @@ vector<const_reference<PhysicalOperator>> PhysicalPositionalScan::GetChildren() 
 		result.push_back(entry.get());
 	}
 	return result;
+}
+
+vector<const_reference<PhysicalOperator>> PhysicalPositionalScan::GetInputChildren() const {
+	return GetChildren();
 }
 
 } // namespace duckdb

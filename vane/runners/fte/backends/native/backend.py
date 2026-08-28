@@ -2207,10 +2207,17 @@ class NativeFteWorkerManagerBackend:
                 task_context_info,
                 context,
             )
+            source_task_order = None
+            if exchange_sink_config.get("preserve_order", False):
+                raw_source_task_order = context.get("source_task_order")
+                if raw_source_task_order is None:
+                    raise ValueError("ordered native FTE exchange sink requires a task sequence")
+                source_task_order = int(raw_source_task_order)
             exchange_sink_instance = bind_exchange_sink_instance(
                 exchange_sink_config,
                 attempt_id=attempt_id,
                 task_partition_id=scheduler_task_partition_id,
+                source_task_order=source_task_order,
             )
 
         node_name = str(context.get("node_name") or task.name() or "fragment")

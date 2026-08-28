@@ -59,6 +59,19 @@ vector<unique_ptr<Expression>> CopyExpressions(const vector<unique_ptr<Expressio
 	return result;
 }
 
+SubmittableTask<WorkerTask> TagOrderedExchangeTask(SubmittableTask<WorkerTask> task, idx_t source_task_order) {
+	auto *worker_task = task.task();
+	if (!worker_task) {
+		throw InvalidInputException("ordered exchange received an invalid worker task");
+	}
+	auto context = worker_task->context();
+	context["source_task_order"] = std::to_string(source_task_order);
+	auto inputs = std::move(worker_task->mutable_inputs());
+	WorkerTask tagged(worker_task->task_context(), worker_task->plan(), worker_task->config(), std::move(context),
+	                  worker_task->name(), std::move(inputs));
+	return std::move(task).with_new_task(std::move(tagged));
+}
+
 vector<unique_ptr<Expression>> CopyHashPartitionByExpressions(const std::shared_ptr<RepartitionSpec> &spec) {
 	vector<unique_ptr<Expression>> result;
 	if (!spec || spec->type() == RepartitionSpec::Type::Random ||
@@ -129,7 +142,8 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
                                               const distributed::Exchange &exchange,
                                               std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
                                               bool collect_mark_join_build_summary,
-                                              vector<unique_ptr<Expression>> mark_join_build_expressions) {
+                                              vector<unique_ptr<Expression>> mark_join_build_expressions,
+                                              bool preserve_order) {
 	if (!plan || !plan->HasRoot()) {
 		return plan;
 	}
@@ -154,7 +168,8 @@ DuckPhysicalPlanRef AddRemoteExchangeSinkPlan(DuckPhysicalPlanRef plan, const st
 	auto estimated = old_root.estimated_cardinality;
 	auto &sink = static_cast<PhysicalRemoteExchangeSink &>(plan->Make<PhysicalRemoteExchangeSink>(
 	    old_root.GetTypes(), estimated, exchange_id, num_partitions, repartition_type, std::move(partition_exprs),
-	    exchange_context.query_id, exchange.GetSinkOutputLocationPrefix(), std::move(exchange_mgr)));
+	    exchange_context.query_id, exchange.GetSinkOutputLocationPrefix(), std::move(exchange_mgr), vector<string> {},
+	    vector<string> {}, preserve_order));
 	if (collect_mark_join_build_summary) {
 		sink.EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 	}
@@ -197,13 +212,13 @@ DuckPhysicalPlanRef MakeRemoteExchangeSourcePlan(const vector<LogicalType> &type
                                                  std::vector<distributed::ExchangeSourceHandle> source_handles,
                                                  std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
                                                  const vector<std::string> &source_nodes,
-                                                 optional_idx runtime_source_node_id) {
+                                                 optional_idx runtime_source_node_id, bool preserve_order) {
 	Allocator &alloc = Allocator::DefaultAllocator();
 	auto plan = std::make_shared<duckdb::PhysicalPlan>(alloc);
 	auto types_copy = types;
 	auto &source = plan->Make<PhysicalRemoteExchangeSource>(
 	    std::move(types_copy), estimated_cardinality, exchange_id, std::move(partition_indices),
-	    std::move(source_handles), std::move(exchange_mgr), source_nodes, runtime_source_node_id);
+	    std::move(source_handles), std::move(exchange_mgr), source_nodes, runtime_source_node_id, preserve_order);
 	plan->SetRoot(source);
 	return plan;
 }
@@ -212,9 +227,10 @@ DuckPhysicalPlanRef MakeRemoteExchangeSourcePlan(const vector<LogicalType> &type
 RepartitionNode::RepartitionNode(PipelineNodeConfig config, PipelineNodeContext context,
                                  std::shared_ptr<::duckdb::RepartitionSpec> repartition_spec, size_t num_partitions,
                                  std::shared_ptr<DistributedPipelineNode> child,
-                                 std::shared_ptr<ExchangeManager> exchange_mgr)
+                                 std::shared_ptr<ExchangeManager> exchange_mgr, bool preserve_order)
     : config_(std::move(config)), context_(std::move(context)), repartition_spec_(std::move(repartition_spec)),
-      num_partitions_(num_partitions), child_(std::move(child)), exchange_mgr_(std::move(exchange_mgr)) {
+      num_partitions_(num_partitions), child_(std::move(child)), exchange_mgr_(std::move(exchange_mgr)),
+      preserve_order_(preserve_order) {
 	if (num_partitions_ == 0) {
 		throw InvalidInputException("RepartitionNode requires at least one partition");
 	}
@@ -225,7 +241,8 @@ std::shared_ptr<RepartitionNode> RepartitionNode::create(NodeID node_id, const s
                                                          std::shared_ptr<RepartitionSpec> repartition_spec,
                                                          size_t num_partitions, SchemaRef schema,
                                                          std::shared_ptr<DistributedPipelineNode> child,
-                                                         std::shared_ptr<ExchangeManager> exchange_mgr) {
+                                                         std::shared_ptr<ExchangeManager> exchange_mgr,
+                                                         bool preserve_order) {
 	if (num_partitions == 0) {
 		throw InvalidInputException("RepartitionNode requires at least one partition");
 	}
@@ -244,9 +261,9 @@ std::shared_ptr<RepartitionNode> RepartitionNode::create(NodeID node_id, const s
 	// std::make_shared cannot access the private constructor in some
 	// standard library implementations when used in this static method
 	// context; construct with `new` inside class scope instead.
-	return std::shared_ptr<RepartitionNode>(new RepartitionNode(std::move(config), std::move(context),
-	                                                            std::move(repartition_spec), num_partitions,
-	                                                            std::move(child), std::move(exchange_mgr)));
+	return std::shared_ptr<RepartitionNode>(
+	    new RepartitionNode(std::move(config), std::move(context), std::move(repartition_spec), num_partitions,
+	                        std::move(child), std::move(exchange_mgr), preserve_order));
 }
 
 // Convert to node.
@@ -275,6 +292,9 @@ std::vector<std::string> RepartitionNode::multiline_display(bool verbose) const 
 	result.push_back("Repartition");
 	if (collect_mark_join_build_summary_) {
 		result.push_back("MARK build summary: global");
+	}
+	if (preserve_order_) {
+		result.push_back("Order: preserved");
 	}
 
 	return result;
@@ -351,11 +371,15 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		auto plan_builder = [self_shared, repartition_spec, exchange, exchange_mgr](DuckPhysicalPlanRef plan) {
 			return AddRemoteExchangeSinkPlan(std::move(plan), repartition_spec, *exchange, exchange_mgr,
 			                                 self_shared->collect_mark_join_build_summary_,
-			                                 CopyExpressions(self_shared->mark_join_build_expressions_));
+			                                 CopyExpressions(self_shared->mark_join_build_expressions_),
+			                                 self_shared->preserve_order_);
 		};
 		auto node_ref = std::static_pointer_cast<PipelineNodeImpl>(self_shared);
 		auto first_with_sink =
 		    append_plan_to_existing_task(std::move(first_task), node_ref, plan_builder, client_context);
+		if (self_shared->preserve_order_) {
+			first_with_sink = TagOrderedExchangeTask(std::move(first_with_sink), 0);
+		}
 
 		struct ExchangeSinkStream {
 			std::shared_ptr<SubmittableTaskStream<WorkerTask>> input;
@@ -363,6 +387,8 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 			PipelineNodeRef node;
 			std::function<DuckPhysicalPlanRef(DuckPhysicalPlanRef)> plan_builder;
 			::duckdb::ClientContext *client_context = nullptr;
+			bool preserve_order = false;
+			idx_t next_source_task_order = 1;
 
 			std::pair<bool, SubmittableTask<WorkerTask>> poll_next() {
 				if (first.first) {
@@ -377,8 +403,11 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 				if (!next.first) {
 					return std::make_pair(false, SubmittableTask<WorkerTask>());
 				}
-				return std::make_pair(
-				    true, append_plan_to_existing_task(std::move(next.second), node, plan_builder, client_context));
+				auto task = append_plan_to_existing_task(std::move(next.second), node, plan_builder, client_context);
+				if (preserve_order) {
+					task = TagOrderedExchangeTask(std::move(task), next_source_task_order++);
+				}
+				return std::make_pair(true, std::move(task));
 			}
 
 			bool is_exhausted() const {
@@ -430,6 +459,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 		stream.node = node_ref;
 		stream.plan_builder = plan_builder;
 		stream.client_context = client_context;
+		stream.preserve_order = self_shared->preserve_order_;
 		auto sink_stream = SubmittableTaskStream<WorkerTask>(boxed<SubmittableTask<WorkerTask>>(std::move(stream)));
 		idx_t target_tasks = ResolveExchangeSourceTaskCount(num_partitions, self_shared->config_.execution_config());
 		auto sent_source_handle_keys = std::make_shared<std::unordered_set<std::string>>();
@@ -486,9 +516,9 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 				source_task.source_partition_count = num_partitions;
 				source_task.source_task_count = target_tasks;
 				source_task.mark_join_build_summary = mark_join_build_summary;
-				auto plan =
-				    MakeRemoteExchangeSourcePlan(output_types, estimated_cardinality, exchange_id, {}, {}, exchange_mgr,
-				                                 source_nodes, optional_idx(self_shared->node_id()));
+				auto plan = MakeRemoteExchangeSourcePlan(
+				    output_types, estimated_cardinality, exchange_id, {}, {}, exchange_mgr, source_nodes,
+				    optional_idx(self_shared->node_id()), self_shared->preserve_order_);
 				TaskContext task_context = TaskContext::from_node_context(
 				    self_shared->context().query_idx(), self_shared->node_id(), task_id_counter->next());
 				WorkerTask task(task_context, plan, self_shared->config_.execution_config(),
@@ -529,7 +559,7 @@ SubmittableTaskStream<WorkerTask> RepartitionNode::produce_tasks(PlanExecutionCo
 			const auto &sink_instance = output.exchange_sink_instance();
 			exchange->AddSink(sink_instance.sink_handle.task_partition_id);
 			exchange->SinkFinished(sink_instance, node_id, output.flight_port());
-			if (self_shared->collect_mark_join_build_summary_) {
+			if (self_shared->collect_mark_join_build_summary_ || self_shared->preserve_order_) {
 				return DuckDBResult<void>::ok();
 			}
 			return send_new_source_handles("sink_output");

@@ -352,7 +352,7 @@ bool CollectFteExchangeSourceNodeIds(const PhysicalOperator &op, set<idx_t> &nod
 			node_ids.insert(source->RuntimeSourceNodeId().GetIndex());
 		}
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetInputChildren()) {
 		if (!CollectFteExchangeSourceNodeIds(child.get(), node_ids, error)) {
 			return false;
 		}
@@ -381,7 +381,7 @@ bool ApplyFteExchangeSourceQueuesToOperator(PhysicalOperator &op,
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ApplyFteExchangeSourceQueuesToOperator(child.get(), queues, error, applied)) {
 			return false;
 		}

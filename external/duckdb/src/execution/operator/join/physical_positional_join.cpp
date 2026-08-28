@@ -13,6 +13,11 @@ PhysicalPositionalJoin::PhysicalPositionalJoin(PhysicalPlan &physical_plan, vect
 	children.push_back(right);
 }
 
+PhysicalPositionalJoin::PhysicalPositionalJoin(PhysicalPlan &physical_plan, PositionalJoinDeserializeTag,
+                                               vector<LogicalType> types, idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::POSITIONAL_JOIN, std::move(types), estimated_cardinality) {
+}
+
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//

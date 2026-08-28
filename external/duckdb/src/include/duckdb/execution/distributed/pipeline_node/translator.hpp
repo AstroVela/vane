@@ -27,6 +27,8 @@ class PhysicalHashJoin;
 class PhysicalComparisonJoin;
 class PhysicalBlockwiseNLJoin;
 class PhysicalNestedLoopJoin;
+class PhysicalPositionalJoin;
+class PhysicalPositionalScan;
 class PhysicalRangeJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
@@ -108,7 +110,8 @@ private:
 	// Generate a shuffle node using the logic from the Rust implementation
 	std::shared_ptr<DistributedPipelineNode> gen_shuffle_node(std::shared_ptr<RepartitionSpec> repartition_spec,
 	                                                          SchemaRef schema,
-	                                                          std::shared_ptr<DistributedPipelineNode> child);
+	                                                          std::shared_ptr<DistributedPipelineNode> child,
+	                                                          bool preserve_order = false);
 
 	// Generate aggregation nodes without pre-aggregation (GroupBy/Shuffle/Gather)
 	std::shared_ptr<DistributedPipelineNode> gen_without_pre_agg(std::shared_ptr<DistributedPipelineNode> input_node,
@@ -137,6 +140,8 @@ private:
 
 	// Generate a gather node using RepartitionNode with num_partitions=1
 	std::shared_ptr<DistributedPipelineNode> gen_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
+	std::shared_ptr<DistributedPipelineNode>
+	gen_ordered_gather_node(std::shared_ptr<DistributedPipelineNode> input_node);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateHashJoin(const PhysicalHashJoin &op,
@@ -149,6 +154,14 @@ private:
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateAsOfJoin(const PhysicalAsOfJoin &op,
 	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslatePositionalJoin(const PhysicalPositionalJoin &op,
+	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslatePositionalScan(const PhysicalPositionalScan &op,
+	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateDelimJoin(const PhysicalDelimJoin &op,
