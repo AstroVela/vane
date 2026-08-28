@@ -342,6 +342,7 @@ def test_local_runner_arrow_native_parquet_rejects_time_ns(local_runner, tmp_pat
 
     monkeypatch.setenv("VANE_RUNNER", "local")
     output = tmp_path / "unsupported_arrow_time_ns.parquet"
+    escaped_output = str(output).replace("'", "''")
     con = vane.connect()
     try:
         relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
@@ -351,8 +352,11 @@ def test_local_runner_arrow_native_parquet_rejects_time_ns(local_runner, tmp_pat
             batch_size=2,
             output_batch_size=2,
         )
-        with pytest.raises(ValueError, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
-            relation.write_parquet(str(output))
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+            relation.query(
+                "arrow_time_ns",
+                f"COPY arrow_time_ns TO '{escaped_output}' (FORMAT PARQUET)",
+            )
     finally:
         con.close()
 
@@ -370,6 +374,7 @@ def test_local_runner_arrow_native_parquet_rejects_nested_time_ns(local_runner, 
 
     monkeypatch.setenv("VANE_RUNNER", "local")
     output = tmp_path / "unsupported_arrow_nested_time_ns.parquet"
+    escaped_output = str(output).replace("'", "''")
     con = vane.connect()
     try:
         relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
@@ -379,8 +384,11 @@ def test_local_runner_arrow_native_parquet_rejects_nested_time_ns(local_runner, 
             batch_size=2,
             output_batch_size=2,
         )
-        with pytest.raises(ValueError, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
-            relation.write_parquet(str(output))
+        with pytest.raises(vane.NotImplementedException, match="TIME_NS is not supported by Arrow-native Parquet COPY"):
+            relation.query(
+                "arrow_nested_time_ns",
+                f"COPY arrow_nested_time_ns TO '{escaped_output}' (FORMAT PARQUET)",
+            )
     finally:
         con.close()
 
