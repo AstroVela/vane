@@ -51,6 +51,7 @@
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
+#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
@@ -1072,6 +1073,25 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	case PhysicalOperatorType::POSITIONAL_JOIN: {
 		return make_uniq<PhysicalPositionalJoin>(physical_plan, PositionalJoinDeserializeTag {}, std::move(types),
 		                                         estimated_cardinality);
+	}
+	case PhysicalOperatorType::POSITIONAL_SCAN: {
+		vector<reference<PhysicalOperator>> child_tables;
+		deserializer.ReadList(103, "child_tables", [&](Deserializer::List &list, idx_t /*i*/) {
+			list.ReadObject([&](Deserializer &child_deserializer) {
+				auto child = PhysicalOperator::Deserialize(child_deserializer, physical_plan);
+				if (!child || child->type != PhysicalOperatorType::TABLE_SCAN) {
+					throw SerializationException("PhysicalPositionalScan deserialization requires TABLE_SCAN children");
+				}
+				auto child_ptr = child.get();
+				physical_plan.TakeOwnership(std::move(child));
+				child_tables.emplace_back(*child_ptr);
+			});
+		});
+		if (child_tables.size() < 2) {
+			throw SerializationException("PhysicalPositionalScan deserialization requires at least two child tables");
+		}
+		return make_uniq<PhysicalPositionalScan>(physical_plan, PositionalScanDeserializeTag {}, std::move(types),
+		                                         std::move(child_tables), estimated_cardinality);
 	}
 	case PhysicalOperatorType::BLOCKWISE_NL_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");

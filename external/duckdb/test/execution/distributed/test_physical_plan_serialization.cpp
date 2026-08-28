@@ -15,6 +15,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/execution/physical_plan.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/projection/physical_grouping_set_expand.hpp"
@@ -29,6 +30,7 @@
 #include "duckdb/execution/operator/exchange/physical_remote_exchange_source.hpp"
 #include "duckdb/execution/operator/scan/physical_column_data_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
+#include "duckdb/execution/operator/scan/physical_positional_scan.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
@@ -1154,6 +1156,53 @@ TEST_CASE("PhysicalPositionalJoin serialization roundtrip", "[serialization][phy
 	REQUIRE(root->children.size() == 2);
 	REQUIRE(root->children[0].get().GetTypes() == left_types);
 	REQUIRE(root->children[1].get().GetTypes() == right_types);
+}
+
+TEST_CASE("PhysicalPositionalScan serialization roundtrip", "[serialization][physical_plan][positional_scan]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+	REQUIRE_NO_FAIL(conn.Query("CREATE TABLE positional_left(i INTEGER)"));
+	REQUIRE_NO_FAIL(conn.Query("CREATE TABLE positional_middle(s VARCHAR)"));
+	REQUIRE_NO_FAIL(conn.Query("CREATE TABLE positional_right(b BOOLEAN)"));
+	conn.BeginTransaction();
+
+	auto logical_plan = conn.ExtractPlan("SELECT * FROM positional_left POSITIONAL JOIN positional_middle "
+	                                     "POSITIONAL JOIN positional_right");
+	REQUIRE(logical_plan != nullptr);
+	PhysicalPlanGenerator generator(*conn.context);
+	auto plan = generator.Plan(std::move(logical_plan));
+	REQUIRE(plan != nullptr);
+	REQUIRE(plan->Root().type == PhysicalOperatorType::POSITIONAL_SCAN);
+	auto &positional_scan = plan->Root().Cast<PhysicalPositionalScan>();
+	REQUIRE(positional_scan.children.empty());
+	REQUIRE(positional_scan.child_tables.size() == 3);
+
+	Allocator &allocator = Allocator::DefaultAllocator();
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	plan->Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(*conn.context);
+	PhysicalPlan deserialized_plan(allocator);
+	deserializer.Begin();
+	auto root = deserialized_plan.Deserialize(deserializer);
+	deserializer.End();
+
+	REQUIRE(root != nullptr);
+	REQUIRE(root->type == PhysicalOperatorType::POSITIONAL_SCAN);
+	REQUIRE(root->GetTypes() == positional_scan.GetTypes());
+	REQUIRE(root->estimated_cardinality == positional_scan.estimated_cardinality);
+	REQUIRE(root->children.empty());
+	auto &deserialized_scan = root->Cast<PhysicalPositionalScan>();
+	REQUIRE(deserialized_scan.child_tables.size() == 3);
+	REQUIRE(deserialized_scan.GetChildren().size() == 3);
+	for (const auto &child : deserialized_scan.child_tables) {
+		REQUIRE(child.get().type == PhysicalOperatorType::TABLE_SCAN);
+	}
 }
 
 TEST_CASE("PhysicalBlockwiseNLJoin serialization roundtrip", "[serialization][physical_plan][join]") {

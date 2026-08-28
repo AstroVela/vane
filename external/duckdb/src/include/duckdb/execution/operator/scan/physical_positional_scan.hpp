@@ -15,6 +15,8 @@
 
 namespace duckdb {
 
+struct PositionalScanDeserializeTag {};
+
 //! Represents a scan of a base table
 class PhysicalPositionalScan : public PhysicalOperator {
 public:
@@ -24,6 +26,8 @@ public:
 	//! Regular Table Scan
 	PhysicalPositionalScan(PhysicalPlan &physical_plan, vector<LogicalType> types, PhysicalOperator &left,
 	                       PhysicalOperator &right);
+	PhysicalPositionalScan(PhysicalPlan &physical_plan, PositionalScanDeserializeTag, vector<LogicalType> types,
+	                       vector<reference<PhysicalOperator>> child_tables, idx_t estimated_cardinality);
 
 	//! The child table functions
 	vector<reference<PhysicalOperator>> child_tables;
@@ -48,6 +52,9 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+
+protected:
+	void SerializeOperatorData(Serializer &serializer) const override;
 };
 
 } // namespace duckdb
