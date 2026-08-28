@@ -204,7 +204,11 @@ static std::shared_ptr<::arrow::Array> ExtensionStorage(std::shared_ptr<::arrow:
 
 static std::shared_ptr<::arrow::DataType> ExtensionStorageType(std::shared_ptr<::arrow::DataType> type) {
 	while (type->id() == ::arrow::Type::EXTENSION) {
-		type = static_cast<const ::arrow::ExtensionType &>(*type).storage_type();
+		auto &extension = static_cast<const ::arrow::ExtensionType &>(*type);
+		if (extension.extension_name() == "arrow.bool8") {
+			throw NotImplementedException("arrow.bool8 is not supported by Arrow-native Parquet COPY");
+		}
+		type = extension.storage_type();
 	}
 	return type;
 }

@@ -244,6 +244,32 @@ def test_local_runner_arrow_native_parquet_rejects_duckdb_extension_scalars(loca
     assert not list(output.glob("*.parquet"))
 
 
+def test_local_runner_arrow_native_parquet_rejects_arrow_bool8(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = [value % 2 for value in table.column("x").to_pylist()]
+        return pa.table({"flag": pa.array(values, type=pa.bool8())})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_bool8.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"flag": vane.sqltypes.BOOLEAN},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="arrow.bool8 is not supported by Arrow-native Parquet COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
 def test_local_runner_arrow_native_parquet_rejects_dictionary_encoded_nested_values(
     local_runner, tmp_path, monkeypatch
 ):
