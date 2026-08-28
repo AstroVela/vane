@@ -47,6 +47,7 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/expression_scan.cpp
     pipeline_node/extension_write_sink.cpp
     pipeline_node/grouping_set_expand.cpp
+    pipeline_node/join/asof_join.cpp
     pipeline_node/join/broadcast_join.cpp
     pipeline_node/join/cross_product.cpp
     pipeline_node/join/delim_join.cpp

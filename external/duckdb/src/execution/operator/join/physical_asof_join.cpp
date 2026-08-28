@@ -1,6 +1,7 @@
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 
 #include "duckdb/common/row_operations/row_operations.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/sorting/sort_strategy.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
 #include "duckdb/common/sorting/sorted_run.hpp"
@@ -18,8 +19,35 @@ PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalCompariso
     : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::ASOF_JOIN, std::move(op.conditions), op.join_type,
                              op.estimated_cardinality),
       comparison_type(ExpressionType::INVALID) {
-	// Convert the conditions partitions and sorts
 	D_ASSERT(!op.predicate.get());
+	InitializeJoinConditions();
+
+	children.push_back(left);
+	children.push_back(right);
+
+	// Fill out the right projection map.
+	right_projection_map = op.right_projection_map;
+	if (right_projection_map.empty()) {
+		const auto right_count = children[1].get().GetTypes().size();
+		right_projection_map.reserve(right_count);
+		for (column_t i = 0; i < right_count; ++i) {
+			right_projection_map.emplace_back(i);
+		}
+	}
+}
+
+PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalComparisonJoin &op,
+                                   vector<JoinCondition> conditions_p, JoinType join_type,
+                                   vector<column_t> right_projection_map_p, idx_t estimated_cardinality,
+                                   bool /*skip_child_init*/)
+    : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::ASOF_JOIN, std::move(conditions_p), join_type,
+                             estimated_cardinality),
+      comparison_type(ExpressionType::INVALID), right_projection_map(std::move(right_projection_map_p)) {
+	InitializeJoinConditions();
+}
+
+void PhysicalAsOfJoin::InitializeJoinConditions() {
+	// Convert the conditions to partitions and sorts.
 	for (auto &cond : conditions) {
 		D_ASSERT(cond.left->return_type == cond.right->return_type);
 		join_key_types.push_back(cond.left->return_type);
@@ -55,19 +83,12 @@ PhysicalAsOfJoin::PhysicalAsOfJoin(PhysicalPlan &physical_plan, LogicalCompariso
 	}
 	D_ASSERT(!lhs_orders.empty());
 	D_ASSERT(!rhs_orders.empty());
+}
 
-	children.push_back(left);
-	children.push_back(right);
-
-	//	Fill out the right projection map.
-	right_projection_map = op.right_projection_map;
-	if (right_projection_map.empty()) {
-		const auto right_count = children[1].get().GetTypes().size();
-		right_projection_map.reserve(right_count);
-		for (column_t i = 0; i < right_count; ++i) {
-			right_projection_map.emplace_back(i);
-		}
-	}
+void PhysicalAsOfJoin::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "join_type", join_type);
+	serializer.WriteProperty(104, "conditions", conditions);
+	serializer.WriteProperty(105, "right_projection_map", right_projection_map);
 }
 
 //===--------------------------------------------------------------------===//

@@ -12,6 +12,7 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/asof_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/delim_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/distributed/utils/optional.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
@@ -289,6 +291,35 @@ std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::Translat
 	return std::make_shared<CrossProductNode>(get_next_pipeline_node_id(), plan_config_, cross_product.GetTypes(),
 	                                          cross_product.estimated_cardinality, std::move(left), std::move(right),
 	                                          std::move(schema));
+}
+
+std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateAsOfJoin(
+    const PhysicalAsOfJoin &asof_join, const std::vector<std::shared_ptr<DistributedPipelineNode>> &children) {
+	if (children.size() != 2 || !children[0] || !children[1]) {
+		throw InvalidInputException("Distributed ASOF join requires exactly two input nodes");
+	}
+
+	SchemaRef schema = nullptr;
+	if (!asof_join.GetTypes().empty()) {
+		auto output_names = BuildComparisonJoinOutputNames(asof_join.join_type, children[0]->config().schema(),
+		                                                   children[1]->config().schema(), asof_join.GetTypes().size(),
+		                                                   {}, asof_join.right_projection_map);
+		if (!output_names.empty()) {
+			schema = MakeSchemaRef(asof_join.GetTypes(), output_names);
+		} else {
+			schema = MakeSchemaRef(asof_join.GetTypes());
+		}
+	}
+
+	// Correctness baseline: an ASOF match can depend on any row from the
+	// opposite input. Co-locate both complete inputs before rebuilding the
+	// native ASOF operator on the worker.
+	auto left = gen_gather_node(children[0]);
+	auto right = gen_gather_node(children[1]);
+	return std::make_shared<AsOfJoinNode>(
+	    get_next_pipeline_node_id(), plan_config_, CopyJoinConditions(asof_join.conditions), asof_join.join_type,
+	    asof_join.GetTypes(), asof_join.right_projection_map, asof_join.estimated_cardinality, std::move(left),
+	    std::move(right), std::move(schema));
 }
 
 std::shared_ptr<PipelineNodeImpl> PhysicalPlanToPipelineNodeTranslator::TranslateHashJoin(

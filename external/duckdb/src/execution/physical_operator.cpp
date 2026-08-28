@@ -53,6 +53,7 @@
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
@@ -1070,6 +1071,16 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		dummy_join.types = std::move(types);
 		return make_uniq<PhysicalBlockwiseNLJoin>(physical_plan, dummy_join, std::move(condition), join_type,
 		                                          estimated_cardinality, true);
+	}
+	case PhysicalOperatorType::ASOF_JOIN: {
+		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
+		auto conditions = deserializer.ReadProperty<vector<JoinCondition>>(104, "conditions");
+		auto right_projection_map = deserializer.ReadProperty<vector<column_t>>(105, "right_projection_map");
+
+		LogicalComparisonJoin dummy_join(join_type);
+		dummy_join.types = std::move(types);
+		return make_uniq<PhysicalAsOfJoin>(physical_plan, dummy_join, std::move(conditions), join_type,
+		                                   std::move(right_projection_map), estimated_cardinality, true);
 	}
 	case PhysicalOperatorType::HASH_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
