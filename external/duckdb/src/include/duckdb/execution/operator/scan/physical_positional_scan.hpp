@@ -34,6 +34,7 @@ public:
 
 public:
 	bool Equals(const PhysicalOperator &other) const override;
+	vector<const_reference<PhysicalOperator>> GetInputChildren() const override;
 	vector<const_reference<PhysicalOperator>> GetChildren() const override;
 
 	OrderPreservationType OperatorOrder() const override {

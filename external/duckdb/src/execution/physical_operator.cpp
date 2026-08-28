@@ -218,10 +218,18 @@ void PhysicalOperator::Print() const {
 }
 // LCOV_EXCL_STOP
 
-vector<reference<PhysicalOperator>> PhysicalOperator::GetChildren() {
+vector<reference<PhysicalOperator>> PhysicalOperator::GetInputChildren() {
 	vector<reference<PhysicalOperator>> result;
-	for (auto &child : static_cast<const PhysicalOperator &>(*this).GetChildren()) {
+	for (auto &child : static_cast<const PhysicalOperator &>(*this).GetInputChildren()) {
 		result.push_back(const_cast<PhysicalOperator &>(child.get()));
+	}
+	return result;
+}
+
+vector<const_reference<PhysicalOperator>> PhysicalOperator::GetInputChildren() const {
+	vector<const_reference<PhysicalOperator>> result;
+	for (auto &child : children) {
+		result.push_back(child.get());
 	}
 	return result;
 }

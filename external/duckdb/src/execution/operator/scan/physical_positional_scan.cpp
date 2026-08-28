@@ -235,4 +235,8 @@ vector<const_reference<PhysicalOperator>> PhysicalPositionalScan::GetChildren() 
 	return result;
 }
 
+vector<const_reference<PhysicalOperator>> PhysicalPositionalScan::GetInputChildren() const {
+	return GetChildren();
+}
+
 } // namespace duckdb

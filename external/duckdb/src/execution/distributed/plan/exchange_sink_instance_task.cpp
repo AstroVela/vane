@@ -43,7 +43,7 @@ bool FindUniqueRemoteExchangeSink(const PhysicalOperator &op, const PhysicalRemo
 		}
 		sink = candidate;
 	}
-	for (const auto &child : op.GetChildren()) {
+	for (const auto &child : op.GetInputChildren()) {
 		if (!FindUniqueRemoteExchangeSink(child.get(), sink, count, error)) {
 			return false;
 		}
@@ -94,7 +94,7 @@ bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSin
 			}
 		}
 	}
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, error)) {
 			return false;
 		}
@@ -115,7 +115,7 @@ bool ValidateExchangeSinkInstanceForOperator(PhysicalOperator &op, const Exchang
 		}
 		validated++;
 	}
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ValidateExchangeSinkInstanceForOperator(child.get(), sink_instance, error, validated)) {
 			return false;
 		}
@@ -136,7 +136,7 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 		sink->ApplyRuntimeSinkHandle(task.sink_instance);
 		applied++;
 	}
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		if (!ApplyExchangeSinkInstanceToOperator(child.get(), task, error, applied)) {
 			return false;
 		}
@@ -151,7 +151,7 @@ void ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_
 			sample.ApplyRuntimeTaskIndex(task_partition_id);
 		}
 	}
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		ApplyRuntimeTaskIndexToOperator(child.get(), task_partition_id);
 	}
 }

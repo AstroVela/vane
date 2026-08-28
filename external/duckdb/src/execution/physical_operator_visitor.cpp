@@ -22,7 +22,7 @@ void PhysicalOperatorVisitor::VisitOperator(PhysicalOperator &op) {
 }
 
 void PhysicalOperatorVisitor::VisitOperatorChildren(PhysicalOperator &op) {
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		VisitOperator(child.get());
 	}
 }

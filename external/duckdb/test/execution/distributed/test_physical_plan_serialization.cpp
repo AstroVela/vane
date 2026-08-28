@@ -1199,6 +1199,7 @@ TEST_CASE("PhysicalPositionalScan serialization roundtrip", "[serialization][phy
 	REQUIRE(root->children.empty());
 	auto &deserialized_scan = root->Cast<PhysicalPositionalScan>();
 	REQUIRE(deserialized_scan.child_tables.size() == 3);
+	REQUIRE(deserialized_scan.GetInputChildren().size() == 3);
 	REQUIRE(deserialized_scan.GetChildren().size() == 3);
 	for (const auto &child : deserialized_scan.child_tables) {
 		REQUIRE(child.get().type == PhysicalOperatorType::TABLE_SCAN);

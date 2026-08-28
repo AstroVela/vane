@@ -22,7 +22,7 @@ static void AssignDataSourceQueryOwner(duckdb::PhysicalOperator &op, const strin
 			bind_data->query_id = query_id;
 		}
 	}
-	for (auto &child : op.GetChildren()) {
+	for (auto &child : op.GetInputChildren()) {
 		AssignDataSourceQueryOwner(child.get(), query_id, allow_unacquired_rebind);
 	}
 }
@@ -94,7 +94,7 @@ struct PyPhysicalPlanWrapper {
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
 				}
 			}
-			for (auto &child : op.GetChildren()) {
+			for (auto &child : op.GetInputChildren()) {
 				inject(child.get());
 			}
 		};
@@ -514,7 +514,7 @@ struct PyPhysicalPlanWrapper {
 		auto physical_plan = plan_->physical_plan();
 		std::function<void(PhysicalOperator &)> collect_physical_udfs = [&](PhysicalOperator &op) -> void {
 			CollectMutableUDFBindData(op, physical_udfs);
-			for (auto &child : op.GetChildren()) {
+			for (auto &child : op.GetInputChildren()) {
 				collect_physical_udfs(child.get());
 			}
 		};
@@ -782,7 +782,7 @@ struct PyPhysicalPlanWrapper {
 						}
 					}
 				}
-				for (auto &child : op.GetChildren()) {
+				for (auto &child : op.GetInputChildren()) {
 					update_max(child.get());
 				}
 			};
@@ -843,7 +843,7 @@ struct PyPhysicalPlanWrapper {
 						}
 					}
 				}
-				for (auto &child : op.GetChildren()) {
+				for (auto &child : op.GetInputChildren()) {
 					normalize(child.get());
 				}
 			};
@@ -918,7 +918,7 @@ struct PyPhysicalPlanWrapper {
 				}
 				result.append(meta);
 			}
-			for (auto &child : op.GetChildren()) {
+			for (auto &child : op.GetInputChildren()) {
 				collect(child.get());
 			}
 		};
@@ -992,7 +992,7 @@ struct PyPhysicalPlanWrapper {
 
 				result.append(meta);
 			}
-			for (auto &child : op.GetChildren()) {
+			for (auto &child : op.GetInputChildren()) {
 				collect(child.get());
 			}
 		};
@@ -1030,7 +1030,7 @@ struct PyPhysicalPlanWrapper {
 					bind_data->actor_handles = WrapPyObjectForUDFActorHandles(handles_obj);
 				}
 			}
-			for (auto &child : op.GetChildren()) {
+			for (auto &child : op.GetInputChildren()) {
 				inject(child.get());
 			}
 		};
@@ -3896,7 +3896,7 @@ struct PyPhysicalPlanWrapperRunner {
 							diag << indent << "  agg[" << i << "]: " << expr.GetName() << "\n";
 						}
 					}
-					for (auto &child : op.GetChildren()) {
+					for (auto &child : op.GetInputChildren()) {
 						dump_diag(child.get(), depth + 1);
 					}
 				};

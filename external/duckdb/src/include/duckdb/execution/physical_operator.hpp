@@ -97,7 +97,10 @@ public:
 	static void SetEstimatedCardinality(InsertionOrderPreservingMap<string> &result, idx_t estimated_cardinality);
 	virtual string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const;
 	void Print() const;
-	virtual vector<reference<PhysicalOperator>> GetChildren();
+	//! Return the operators that provide this operator's executable inputs. This
+	//! intentionally excludes additional owned subplans exposed by GetChildren().
+	vector<reference<PhysicalOperator>> GetInputChildren();
+	virtual vector<const_reference<PhysicalOperator>> GetInputChildren() const;
 	virtual vector<const_reference<PhysicalOperator>> GetChildren() const;
 
 	//! Optional coordinator-side contract for distributed extension writes.

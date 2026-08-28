@@ -64,6 +64,14 @@ namespace distributed {
 
 namespace {
 
+vector<const_reference<PhysicalOperator>> TranslationChildren(const PhysicalOperator &op) {
+	return op.GetInputChildren();
+}
+
+vector<reference<PhysicalOperator>> TranslationChildren(PhysicalOperator &op) {
+	return op.GetInputChildren();
+}
+
 void ValidateResolvedExtensionWriteInfo(ClientContext &context, const DistributedExtensionWriteInfo &info,
                                         const DistributedExtensionWritePlan &plan) {
 	info.Validate();
@@ -129,7 +137,7 @@ void PhysicalPlanToPipelineNodeTranslator::CollectUnionOrderRequirements(const P
 		}
 	}
 
-	for (const auto &child : op.GetChildren()) {
+	for (const auto &child : TranslationChildren(op)) {
 		CollectUnionOrderRequirements(child.get(), child_order_required);
 	}
 }
@@ -242,11 +250,16 @@ PhysicalPlanToPipelineNodeTranslator::gen_ordered_gather_node(std::shared_ptr<Di
 }
 
 void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOperator &op) {
-	// First recurse into children using the base helper
-	PhysicalOperatorVisitor::VisitOperatorChildren(op);
+	// Translate only executable inputs. Some operators expose additional owned
+	// subplans through GetChildren(), but those are serialized into their owning
+	// distributed node rather than translated as independent pipelines.
+	auto physical_children = TranslationChildren(op);
+	for (auto &child : physical_children) {
+		VisitOperator(child.get());
+	}
 
 	// collect child distributed nodes (if any)
-	size_t n_children = op.GetChildren().size();
+	size_t n_children = physical_children.size();
 	std::vector<std::shared_ptr<DistributedPipelineNode>> children;
 	children.reserve(n_children);
 	for (size_t i = 0; i < n_children; ++i) {
@@ -592,7 +605,7 @@ physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCo
 				max_id = std::max(max_id, scan.extra_info.scan_group_id.GetIndex());
 			}
 		}
-		for (auto &child : op.GetChildren()) {
+		for (auto &child : op.GetInputChildren()) {
 			update_max(child.get());
 		}
 	};
@@ -622,7 +635,7 @@ physical_plan_scan_split_map_wrapper(DuckPhysicalPlanRef plan, DuckDBExecutionCo
 			auto splits = MakeTableScanSplits(scan, *exec_cfg, db);
 			out.emplace(scan.extra_info.scan_node_id.GetIndex(), std::move(splits));
 		}
-		for (auto &child : op.GetChildren()) {
+		for (auto &child : op.GetInputChildren()) {
 			collect(child.get());
 		}
 	};
