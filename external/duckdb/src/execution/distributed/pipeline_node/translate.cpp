@@ -42,8 +42,10 @@
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
+#include "duckdb/execution/operator/join/physical_range_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
@@ -378,6 +380,17 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	case PhysicalOperatorType::CROSS_PRODUCT: {
 		auto &cross_product = static_cast<PhysicalCrossProduct &>(op);
 		node_impl = TranslateCrossProduct(cross_product, children);
+		break;
+	}
+	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+	case PhysicalOperatorType::IE_JOIN: {
+		auto &range_join = static_cast<PhysicalRangeJoin &>(op);
+		node_impl = TranslateRangeJoin(range_join, children);
+		break;
+	}
+	case PhysicalOperatorType::BLOCKWISE_NL_JOIN: {
+		auto &blockwise_join = static_cast<PhysicalBlockwiseNLJoin &>(op);
+		node_impl = TranslateBlockwiseNLJoin(blockwise_join, children);
 		break;
 	}
 	case PhysicalOperatorType::LEFT_DELIM_JOIN:

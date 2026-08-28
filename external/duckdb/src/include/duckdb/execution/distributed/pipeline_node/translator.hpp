@@ -14,6 +14,7 @@
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 
 namespace duckdb {
+class Expression;
 class RepartitionSpec;
 class PhysicalBatchCopyToFile;
 class PhysicalCopyToFile;
@@ -22,6 +23,8 @@ class PhysicalDataSink;
 class PhysicalOperator;
 class PhysicalDelimJoin;
 class PhysicalHashJoin;
+class PhysicalComparisonJoin;
+class PhysicalBlockwiseNLJoin;
 class PhysicalNestedLoopJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
@@ -148,6 +151,18 @@ private:
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateNestedLoopJoin(const PhysicalNestedLoopJoin &op,
 	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateRangeJoin(const PhysicalComparisonJoin &op,
+	                   const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateBlockwiseNLJoin(const PhysicalBlockwiseNLJoin &op,
+	                         const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateComparisonNestedLoopJoin(const PhysicalComparisonJoin &op, const Expression *predicate,
+	                                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<DistributedPipelineNode>
 	TranslateHashGroupBy(const PhysicalHashAggregate &op,

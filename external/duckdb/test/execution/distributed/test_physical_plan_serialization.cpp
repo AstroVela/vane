@@ -31,6 +31,7 @@
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
+#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
@@ -52,6 +53,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/common/enums/order_type.hpp"
@@ -1116,6 +1118,48 @@ TEST_CASE("PhysicalCrossProduct serialization roundtrip", "[serialization][physi
 	REQUIRE(root->children.size() == 2);
 	REQUIRE(root->children[0].get().GetTypes() == left_types);
 	REQUIRE(root->children[1].get().GetTypes() == right_types);
+}
+
+TEST_CASE("PhysicalBlockwiseNLJoin serialization roundtrip", "[serialization][physical_plan][join]") {
+	Allocator allocator;
+	PhysicalPlan plan(allocator);
+	vector<LogicalType> input_types = {LogicalType::BIGINT};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+
+	auto &left = MakeColumnDataScan(plan, input_types);
+	auto &right = MakeColumnDataScan(plan, input_types);
+	auto condition = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_LESSTHAN,
+	                                                      make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 0),
+	                                                      make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, 1));
+	LogicalAnyJoin logical_join(JoinType::INNER);
+	logical_join.types = output_types;
+	auto &join =
+	    plan.Make<PhysicalBlockwiseNLJoin>(logical_join, left, right, std::move(condition), JoinType::INNER, 12);
+	plan.SetRoot(join);
+
+	MemoryStream stream(allocator);
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	plan.Serialize(serializer);
+	serializer.End();
+
+	stream.Rewind();
+	BinaryDeserializer deserializer(stream);
+	PhysicalPlan deserialized_plan(allocator);
+	deserializer.Begin();
+	auto root = deserialized_plan.Deserialize(deserializer);
+	deserializer.End();
+
+	REQUIRE(root != nullptr);
+	auto *roundtrip = dynamic_cast<PhysicalBlockwiseNLJoin *>(root.get());
+	REQUIRE(roundtrip != nullptr);
+	REQUIRE(roundtrip->join_type == JoinType::INNER);
+	REQUIRE(roundtrip->condition != nullptr);
+	REQUIRE(roundtrip->GetTypes() == output_types);
+	REQUIRE(roundtrip->estimated_cardinality == 12);
+	REQUIRE(roundtrip->children.size() == 2);
+	REQUIRE(roundtrip->children[0].get().GetTypes() == input_types);
+	REQUIRE(roundtrip->children[1].get().GetTypes() == input_types);
 }
 
 TEST_CASE("PhysicalHashJoin serialization roundtrip", "[serialization][physical_plan]") {
