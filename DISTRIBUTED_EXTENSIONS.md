@@ -256,11 +256,12 @@ and `VANE_RAY_SCAN_SPLIT_MIN_COUNT`. It is not a task count. An extension may
 return more or fewer splits, but every returned split must remain independently
 executable and have an ID unique within that logical scan source.
 
-The planning input also borrows the coordinator `FileSystem` for the duration
-of the callback. File-backed implementations may use it to inspect the
-already-selected files and produce size estimates or safe byte boundaries.
-They must not retain the filesystem or any connection-level resource in worker
-bind data.
+The planning input also borrows the coordinator `FileSystem` and, when the
+caller has one, its `ClientContext` for the duration of the callback.
+File-backed implementations may use them to inspect already-selected files,
+resolve connection-scoped filesystem state, and produce size estimates or safe
+byte boundaries. They must not retain either object or any other
+connection-level resource in worker bind data.
 
 Extensions may return per-split byte and cardinality estimates for balancing.
 Vane never opens or parses an extension payload to infer those estimates, even

@@ -1,0 +1,82 @@
+# name: test/sql/file/test_list_files.test
+# description: Test deterministic FILE discovery without reading file content
+# group: [file]
+
+require file
+
+statement ok
+PRAGMA enable_verification
+
+# Binding carries only portable path options and must not touch the filesystem.
+statement ok
+EXPLAIN SELECT * FROM list_files('test/sql/file/list_files/does-not-exist')
+
+# A concrete file is statted and materialized as a complete canonical FILE view.
+query IIIITTTIII
+SELECT
+	object_size,
+	last_modified IS NOT NULL,
+	version IS NULL,
+	etag IS NULL,
+	content_type,
+	typeof(file),
+	file.url,
+	file.position,
+	file.size,
+	file.checksum IS NULL
+FROM list_files('test/sql/file/list_files/a.txt')
+----
+6	true	true	true	text/plain	FILE	test/sql/file/list_files/a.txt	0	6	true
+
+# Directory traversal is non-recursive by default and ordered by URL.
+query T
+SELECT url FROM list_files('test/sql/file/list_files')
+----
+test/sql/file/list_files/a.txt
+test/sql/file/list_files/b.csv
+
+query T
+SELECT url FROM list_files('test/sql/file/list_files', recursive => TRUE)
+----
+test/sql/file/list_files/a.txt
+test/sql/file/list_files/b.csv
+test/sql/file/list_files/nested/c.json
+test/sql/file/list_files/nested/deeper/d.txt
+
+# Explicit globs define their own recursion and may legally match nothing.
+query T
+SELECT url FROM list_files('test/sql/file/list_files/**/*.txt')
+----
+test/sql/file/list_files/a.txt
+test/sql/file/list_files/nested/deeper/d.txt
+
+query I
+SELECT count(*) FROM list_files('test/sql/file/list_files/**/*.missing')
+----
+0
+
+# The LIST overload preserves caller path order for Python from_files().
+query T
+SELECT url
+FROM list_files([
+	'test/sql/file/list_files/b.csv',
+	'test/sql/file/list_files/a.txt'
+])
+----
+test/sql/file/list_files/b.csv
+test/sql/file/list_files/a.txt
+
+statement error
+SELECT * FROM list_files('test/sql/file/list_files/does-not-exist')
+----
+<REGEX>:.*list_files.*path.*does not exist.*
+
+statement error
+SELECT * FROM list_files(NULL)
+----
+<REGEX>:.*list_files.*path cannot be NULL.*
+
+statement error
+SELECT * FROM list_files(['test/sql/file/list_files/a.txt', NULL])
+----
+<REGEX>:.*list_files.*path list cannot contain NULL.*

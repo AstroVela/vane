@@ -150,6 +150,7 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 		options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
 		options.serialize_default_values = true;
 		duckdb::BinarySerializer serializer(stream, options);
+		serializer.GetSerializationData().Set<duckdb::ClientContext &>(*client_context);
 		serializer.Begin();
 		logical_plan->Serialize(serializer);
 		serializer.End();

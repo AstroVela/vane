@@ -759,7 +759,7 @@ struct PyPhysicalPlanWrapper {
 			db = client_context_->db;
 		}
 		split_map = duckdb::distributed::physical_plan_scan_split_map_wrapper(physical_plan, plan_->execution_config(),
-		                                                                      std::move(db));
+		                                                                      std::move(db), client_context_.get());
 		for (auto &kv : split_map) {
 			py::list lst;
 			for (auto &split : kv.second) {

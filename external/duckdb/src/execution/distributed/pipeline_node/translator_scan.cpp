@@ -12,6 +12,7 @@
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/execution/physical_plan.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 
 #include <algorithm>
@@ -77,7 +78,7 @@ TableFunctionDistributedScanInput MakeDistributedScanInput(const PhysicalTableSc
 }
 
 vector<ScanSplit> MakeExtensionScanSplits(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                          const shared_ptr<DatabaseInstance> &db) {
+                                          const shared_ptr<DatabaseInstance> &db, ClientContext *client_context) {
 	if (!scan.function.HasSerializationCallbacks()) {
 		throw SerializationException("Distributed table function '%s' requires complete serialize and deserialize "
 		                             "callbacks; worker rebind is not supported",
@@ -95,10 +96,15 @@ vector<ScanSplit> MakeExtensionScanSplits(const PhysicalTableScan &scan, const D
 		                            scan.function.name);
 	}
 	DistributedExtensionManager::Get(*db).RequireCapability(capability);
+	if (client_context && client_context->db.get() != db.get()) {
+		throw InvalidInputException("Distributed extension scan '%s' received a coordinator context from a different "
+		                            "DatabaseInstance",
+		                            scan.function.name);
+	}
 
 	auto scan_input = MakeDistributedScanInput(scan);
 	TableFunctionDistributedScanPlanningInput planning_input(scan_input, ResolveScanSplitTargetCount(exec_cfg),
-	                                                         FileSystem::GetFileSystem(*db));
+	                                                         FileSystem::GetFileSystem(*db), client_context);
 	auto planned_splits = callbacks.plan_splits(planning_input);
 	if (planned_splits.empty()) {
 		return {ScanSplit::EmptyExtension(capability, callbacks.split_codec)};
@@ -180,9 +186,9 @@ DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan) {
 }
 
 vector<ScanSplit> MakeTableScanSplits(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                      const shared_ptr<DatabaseInstance> &db) {
+                                      const shared_ptr<DatabaseInstance> &db, ClientContext *client_context) {
 	if (scan.function.HasDistributedScanCallbacks()) {
-		return MakeExtensionScanSplits(scan, exec_cfg, db);
+		return MakeExtensionScanSplits(scan, exec_cfg, db, client_context);
 	}
 	if (!scan.bind_data) {
 		throw NotImplementedException("Distributed execution does not support table function \"%s\": bind data is "

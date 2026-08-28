@@ -1146,6 +1146,9 @@ def test_connection_snapshot_captures_exact_extension_contract():
     assert all(set(extension) >= {"name", "version"} for extension in snapshot["extensions"])
     assert snapshot["dynamic_extensions"] == []
     assert snapshot["distributed_extension_contracts"] == [
+        "file{table_function:list_files(VARCHAR)@1,"
+        "table_function:list_files(VARCHAR, BOOLEAN)@1,"
+        "table_function:list_files(VARCHAR[])@1}",
         "json{table_function:json_each(JSON)@1,"
         "table_function:json_each(JSON, VARCHAR)@1,"
         "table_function:json_each(VARCHAR)@1,"

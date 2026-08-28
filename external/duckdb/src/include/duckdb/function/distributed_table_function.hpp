@@ -22,6 +22,7 @@ namespace duckdb {
 
 class FunctionData;
 class FileSystem;
+class ClientContext;
 class TableFilterSet;
 class TableFunction;
 
@@ -76,15 +77,19 @@ struct TableFunctionDistributedScanInput {
 //! responsible for assigning planned splits to task attempts.
 struct TableFunctionDistributedScanPlanningInput : public TableFunctionDistributedScanInput {
 	TableFunctionDistributedScanPlanningInput(const TableFunctionDistributedScanInput &input,
-	                                          idx_t target_split_count_p, FileSystem &file_system_p)
+	                                          idx_t target_split_count_p, FileSystem &file_system_p,
+	                                          optional_ptr<ClientContext> client_context_p = nullptr)
 	    : TableFunctionDistributedScanInput(input), target_split_count(target_split_count_p),
-	      file_system(file_system_p) {
+	      file_system(file_system_p), client_context(client_context_p) {
 	}
 
 	idx_t target_split_count;
 	//! Coordinator filesystem used only while planning splits. Callbacks must not
 	//! retain references to this object in worker bind data or split payloads.
 	FileSystem &file_system;
+	//! Coordinator context used only while planning splits that require
+	//! connection-scoped filesystem or secret state. Callbacks must not retain it.
+	optional_ptr<ClientContext> client_context;
 };
 
 //! Plan extension-owned elementary splits as opaque envelopes.

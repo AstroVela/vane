@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import http.server
+import os
 import pickle
+import socket
+import threading
 
 import pandas as pd
 import pytest
@@ -9,6 +14,7 @@ import pytest
 import vane
 
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
+FILE_METHODS = ("exists", "mime_type", "stat")
 
 
 def test_file_value_contract():
@@ -23,7 +29,7 @@ def test_file_value_contract():
     )
     assert str(minimal) == "s3://bucket/object"
     assert repr(minimal) == "File(url='s3://bucket/object', content_type=None, position=None, size=None, checksum=None)"
-    assert {name for name in dir(minimal) if not name.startswith("_")} == set(FILE_FIELDS)
+    assert {name for name in dir(minimal) if not name.startswith("_")} == set(FILE_FIELDS + FILE_METHODS)
 
     complete = vane.File("memory://part", "text/plain", 2, 4, "sha256:abcd")
     assert tuple(getattr(complete, field) for field in FILE_FIELDS) == (
@@ -318,6 +324,694 @@ def test_explicit_file_conversion_rejects_structural_fallbacks(fallback):
         vane.ConstantExpression(vane.Value(fallback, vane.file_type()))
     with pytest.raises(vane.InvalidInputException, match="Only vane.File or NULL"):
         vane.ConstantExpression(vane.Value([fallback], vane.list_type(vane.file_type())))
+
+
+def test_file_expression_metadata_facade(duckdb_cursor, tmp_path):
+    path = tmp_path / "facade.txt"
+    path.write_text("hello", encoding="utf-8")
+    missing = tmp_path / "missing.txt"
+
+    source = duckdb_cursor.sql(
+        "SELECT file($1, NULL, NULL, NULL, NULL) AS value",
+        params=[str(path)],
+    )
+    value = vane.col("value")
+    row = source.select(
+        vane.file_path(value),
+        vane.file_size(value),
+        vane.file_exists(value),
+        vane.file_stat(value),
+        vane.file_mime_type(value),
+        value.file_path(),
+        value.file_size(),
+        value.file_exists(),
+        value.file_stat(),
+        value.file_mime_type(),
+    ).fetchone()
+
+    assert row[0:3] == (str(path), 5, True)
+    assert row[3]["object_size"] == 5
+    assert row[3]["content_type"] == "text/plain"
+    assert row[4] == "text/plain"
+    assert row[5:] == row[:5]
+    assert duckdb_cursor.values(vane.try_to_file(str(missing))).fetchone() == (None,)
+    assert duckdb_cursor.values(vane.to_file(str(path))).fetchone() == (vane.File(str(path), "text/plain", 0, 5),)
+
+
+def test_file_identity_and_enrichment_facade(duckdb_cursor, tmp_path):
+    path = tmp_path / "identity.bin"
+    path.write_bytes(b"abc")
+    value = vane.file(str(path), None, 0, 3)
+    enriched = vane.file_enrich(value, ["checksum"])
+
+    row = duckdb_cursor.values(
+        vane.file_same_location(value, enriched),
+        vane.file_same_content(enriched, enriched),
+        vane.file_locator_id(value),
+        vane.file_content_id(enriched),
+        vane.guess_mime_type(b"\x89PNG\r\n\x1a\n"),
+    ).fetchone()
+
+    assert row[0:2] == (True, True)
+    assert row[2].startswith("file-locator-v1:sha256:")
+    assert row[3].startswith("file-content-v1:checksum:sha256:")
+    assert row[4] == "image/png"
+
+
+def test_concrete_file_metadata_methods_use_sql_contract(tmp_path):
+    path = tmp_path / "concrete.json"
+    path.write_text("{}", encoding="utf-8")
+
+    value = vane.File(str(path))
+    stat = value.stat()
+
+    assert value.exists() is True
+    assert value.mime_type() == "application/json"
+    assert stat["url"] == str(path)
+    assert stat["object_size"] == 2
+    assert stat["last_modified"] is not None
+    assert stat["version"] is None
+    assert stat["etag"] is None
+    assert stat["content_type"] == "application/json"
+    assert vane.File(str(tmp_path / "missing")).exists() is False
+
+
+def test_concrete_file_metadata_methods_accept_connection(tmp_path):
+    scoped_home = tmp_path / "scoped-home"
+    scoped_home.mkdir()
+    path = scoped_home / "connection.bin"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    connection = vane.connect("")
+    try:
+        connection.execute("SET home_directory = ?", [str(scoped_home)])
+        value = vane.File("~/connection.bin")
+
+        assert value.exists(connection=connection) is True
+        assert value.mime_type("content", connection=connection) == "image/png"
+        assert value.stat(connection=connection)["object_size"] == 8
+    finally:
+        connection.close()
+
+
+def test_list_files_and_from_files_delegate_to_sql(duckdb_cursor, tmp_path):
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    nested_dir = first_dir / "nested"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    nested_dir.mkdir()
+    first = first_dir / "a.txt"
+    second = first_dir / "b.json"
+    nested = nested_dir / "c.txt"
+    last = second_dir / "d.txt"
+    for path, content in ((first, "a"), (second, "{}"), (nested, "c"), (last, "d")):
+        path.write_text(content, encoding="utf-8")
+
+    listed = vane.list_files(str(first_dir), connection=duckdb_cursor).fetchall()
+    assert [row[0] for row in listed] == [str(first), str(second)]
+    assert [row[6] for row in listed] == [
+        vane.File(str(first), "text/plain", 0, 1),
+        vane.File(str(second), "application/json", 0, 2),
+    ]
+
+    recursive = vane.list_files(str(first_dir), recursive=True, connection=duckdb_cursor).fetchall()
+    assert [row[0] for row in recursive] == [str(first), str(second), str(nested)]
+
+    values = vane.from_files(
+        [str(last), str(first)],
+        connection=duckdb_cursor,
+    ).fetchall()
+    assert values == [
+        (vane.File(str(last), "text/plain", 0, 1),),
+        (vane.File(str(first), "text/plain", 0, 1),),
+    ]
+
+
+def test_list_files_empty_glob_and_directory(duckdb_cursor, tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    assert vane.list_files(str(empty), connection=duckdb_cursor).fetchall() == []
+    assert vane.list_files(str(tmp_path / "*.missing"), connection=duckdb_cursor).fetchall() == []
+    assert vane.from_files([], connection=duckdb_cursor).fetchall() == []
+
+
+def test_list_files_accepts_literal_glob_filename(duckdb_cursor, tmp_path):
+    if os.name == "nt":
+        pytest.skip("Windows filenames cannot contain a literal asterisk")
+
+    directory = tmp_path / "literal_glob"
+    directory.mkdir()
+    literal = directory / "*"
+    literal.write_text("value", encoding="utf-8")
+
+    rows = vane.list_files(str(directory), connection=duckdb_cursor).fetchall()
+
+    assert [row[0] for row in rows] == [str(literal)]
+    assert rows[0][6] == vane.File(str(literal), None, 0, 5)
+
+
+@pytest.mark.parametrize(
+    ("literal_name", "matching_name"),
+    [
+        ("literal*directory", "literalXdirectory"),
+        ("literal?directory", "literalYdirectory"),
+        ("literal[d]irectory", "literalddirectory"),
+    ],
+)
+def test_list_files_accepts_literal_glob_directory(duckdb_cursor, tmp_path, literal_name, matching_name):
+    if os.name == "nt":
+        pytest.skip("Windows directory names cannot contain literal glob characters")
+
+    directory = tmp_path / literal_name
+    empty_directory = tmp_path / f"empty-{literal_name}"
+    matching_directory = tmp_path / matching_name
+    nested = directory / "nested"
+    directory.mkdir()
+    empty_directory.mkdir()
+    matching_directory.mkdir()
+    nested.mkdir()
+    child = directory / "child.txt"
+    descendant = nested / "descendant.txt"
+    (matching_directory / "excluded.txt").write_text("excluded", encoding="utf-8")
+    child.write_text("child", encoding="utf-8")
+    descendant.write_text("descendant", encoding="utf-8")
+
+    rows = vane.list_files(str(directory), connection=duckdb_cursor).fetchall()
+    recursive = vane.list_files(str(directory), recursive=True, connection=duckdb_cursor).fetchall()
+
+    assert [row[0] for row in rows] == [str(child)]
+    assert [row[0] for row in recursive] == [str(child), str(descendant)]
+    assert vane.list_files(str(empty_directory), connection=duckdb_cursor).fetchall() == []
+
+
+def test_list_files_treats_ipv6_authority_as_literal(duckdb_cursor, tmp_path):
+    class IPv6HTTPServer(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+    path = tmp_path / "value.txt"
+    path.write_text("value", encoding="utf-8")
+    handler = functools.partial(QuietHandler, directory=str(tmp_path))
+    try:
+        server = IPv6HTTPServer(("::1", 0), handler)
+    except OSError as error:
+        pytest.skip(f"IPv6 loopback is unavailable: {error}")
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://[::1]:{server.server_port}/value.txt?token=value?.txt"
+    try:
+        duckdb_cursor.execute("SET http_proxy = ''")
+        rows = duckdb_cursor.execute("SELECT url, object_size FROM list_files(?)", [url]).fetchall()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert rows == [(url, 5)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink traversal semantics differ on Windows")
+def test_list_files_recursive_preserves_file_symlinks_without_following_directory_symlinks(duckdb_cursor, tmp_path):
+    root = tmp_path / "root"
+    nested = root / "nested"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    nested.mkdir()
+    outside.mkdir()
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    regular = root / "regular.txt"
+    nested_regular = nested / "regular.txt"
+    regular.write_text("regular", encoding="utf-8")
+    nested_regular.write_text("nested", encoding="utf-8")
+    (outside / "excluded.txt").write_text("excluded", encoding="utf-8")
+    direct_link = root / "direct-link.txt"
+    nested_link = nested / "nested-link.txt"
+    directory_link = root / "directory-link"
+    try:
+        direct_link.symlink_to(target)
+        nested_link.symlink_to(target)
+        directory_link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks are unavailable: {error}")
+
+    non_recursive = duckdb_cursor.execute("SELECT url FROM list_files(?)", [str(root)]).fetchall()
+    recursive = duckdb_cursor.execute("SELECT url FROM list_files(?, TRUE)", [str(root)]).fetchall()
+
+    assert [row[0] for row in non_recursive] == sorted([str(direct_link), str(regular)])
+    assert [row[0] for row in recursive] == sorted(
+        [str(direct_link), str(nested_link), str(nested_regular), str(regular)]
+    )
+
+
+def test_list_files_honors_file_search_path(duckdb_cursor, tmp_path, monkeypatch):
+    search_path = tmp_path / "search"
+    directory = search_path / "directory"
+    empty = search_path / "empty"
+    literal_directory = search_path / "literal[d]irectory"
+    matching_directory = search_path / "literalddirectory"
+    direct_directory = tmp_path / "direct"
+    directory.mkdir(parents=True)
+    empty.mkdir()
+    literal_directory.mkdir()
+    matching_directory.mkdir()
+    direct_directory.mkdir()
+    concrete = search_path / "concrete.txt"
+    child = directory / "child.txt"
+    literal_child = literal_directory / "literal.txt"
+    direct_child = direct_directory / "direct.txt"
+    concrete.write_text("concrete", encoding="utf-8")
+    child.write_text("child", encoding="utf-8")
+    literal_child.write_text("literal", encoding="utf-8")
+    (matching_directory / "excluded.txt").write_text("excluded", encoding="utf-8")
+    direct_child.write_text("direct", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    duckdb_cursor.execute("SET file_search_path = ?", [str(search_path)])
+
+    assert [row[0] for row in vane.list_files("concrete.txt", connection=duckdb_cursor).fetchall()] == [str(concrete)]
+    assert [row[0] for row in vane.list_files("directory", connection=duckdb_cursor).fetchall()] == [str(child)]
+    assert [row[0] for row in vane.list_files("literal[d]irectory", connection=duckdb_cursor).fetchall()] == [
+        str(literal_child)
+    ]
+    direct_rows = vane.list_files("direct", connection=duckdb_cursor).fetchall()
+    assert len(direct_rows) == 1
+    assert os.path.samefile(direct_rows[0][0], direct_child)
+    assert vane.list_files("empty", connection=duckdb_cursor).fetchall() == []
+    with pytest.raises(vane.IOException, match="does not exist or is not listable"):
+        vane.list_files("missing", connection=duckdb_cursor).fetchall()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink traversal semantics differ on Windows")
+def test_list_files_search_path_preserves_direct_directory_symlink(duckdb_cursor, tmp_path, monkeypatch):
+    search_path = tmp_path / "search"
+    target = tmp_path / "target"
+    link = tmp_path / "link"
+    search_path.mkdir()
+    target.mkdir()
+    (target / "value.txt").write_text("value", encoding="utf-8")
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks are unavailable: {error}")
+
+    monkeypatch.chdir(tmp_path)
+    duckdb_cursor.execute("SET file_search_path = ?", [str(search_path)])
+
+    rows = duckdb_cursor.execute("SELECT url FROM list_files('link')").fetchall()
+
+    assert rows == [("link/value.txt",)]
+
+
+@pytest.mark.parametrize("mode", [0, 0o400])
+def test_list_files_search_path_reports_inaccessible_recursive_subdirectory(duckdb_cursor, tmp_path, monkeypatch, mode):
+    if os.name == "nt":
+        pytest.skip("POSIX directory permissions are required")
+
+    search_path = tmp_path / "search"
+    root = search_path / "root"
+    inaccessible = root / "inaccessible"
+    inaccessible.mkdir(parents=True)
+    (root / "visible.txt").write_text("visible", encoding="utf-8")
+    (inaccessible / "hidden.txt").write_text("hidden", encoding="utf-8")
+    inaccessible.chmod(mode)
+    monkeypatch.chdir(tmp_path)
+    duckdb_cursor.execute("SET file_search_path = ?", [str(search_path)])
+    try:
+        if os.access(inaccessible, os.R_OK | os.X_OK):
+            pytest.skip("test process can bypass directory permissions")
+        with pytest.raises(vane.IOException, match="exists but is not accessible"):
+            vane.list_files("root", recursive=True, connection=duckdb_cursor).fetchall()
+    finally:
+        inaccessible.chmod(0o700)
+
+
+def test_list_files_preserves_posix_backslashes_in_concrete_directories(duckdb_cursor, tmp_path):
+    if os.name == "nt":
+        pytest.skip("backslash is a path separator on Windows")
+
+    root = tmp_path / "literal\\directory"
+    nested = root / "nested\\directory"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    nested.mkdir()
+    outside.mkdir()
+    direct = root / "direct.txt"
+    nested_file = nested / "nested.txt"
+    outside_file = outside / "outside.txt"
+    direct.write_text("direct", encoding="utf-8")
+    nested_file.write_text("nested", encoding="utf-8")
+    outside_file.write_text("outside", encoding="utf-8")
+
+    file_link = root / "file-link.txt"
+    directory_link = root / "directory-link"
+    try:
+        file_link.symlink_to(outside_file)
+        directory_link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks are unavailable: {error}")
+
+    non_recursive = duckdb_cursor.execute("SELECT url FROM list_files(?)", [str(root)]).fetchall()
+    recursive = duckdb_cursor.execute("SELECT url FROM list_files(?, TRUE)", [str(root)]).fetchall()
+
+    assert [row[0] for row in non_recursive] == sorted([str(direct), str(file_link)])
+    assert [row[0] for row in recursive] == sorted([str(direct), str(file_link), str(nested_file)])
+
+
+def test_list_files_preserves_hash_in_local_directory_url(duckdb_cursor, tmp_path):
+    directory = tmp_path / "literal#directory"
+    nested = directory / "nested"
+    directory.mkdir()
+    nested.mkdir()
+    direct = directory / "direct.txt"
+    descendant = nested / "descendant.txt"
+    direct.write_text("direct", encoding="utf-8")
+    descendant.write_text("descendant", encoding="utf-8")
+    directory_url = directory.resolve().as_uri().replace("%23", "#")
+
+    rows = duckdb_cursor.execute("SELECT url FROM list_files(?)", [directory_url]).fetchall()
+    trailing = duckdb_cursor.execute("SELECT url FROM list_files(?)", [f"{directory_url}/"]).fetchall()
+    recursive = duckdb_cursor.execute("SELECT url FROM list_files(?, TRUE)", [directory_url]).fetchall()
+
+    assert [row[0] for row in rows] == [f"{directory_url}/direct.txt"]
+    assert trailing == rows
+    assert [row[0] for row in recursive] == sorted(
+        [f"{directory_url}/direct.txt", f"{directory_url}/nested/descendant.txt"]
+    )
+
+
+@pytest.mark.parametrize("mode", [0, 0o400])
+def test_list_files_reports_inaccessible_directory(duckdb_cursor, tmp_path, mode):
+    if os.name == "nt":
+        pytest.skip("POSIX directory permissions are required")
+
+    directory = tmp_path / "inaccessible"
+    directory.mkdir()
+    (directory / "value.txt").write_text("value", encoding="utf-8")
+    directory.chmod(mode)
+    try:
+        if os.access(directory, os.R_OK | os.X_OK):
+            pytest.skip("test process can bypass directory permissions")
+        with pytest.raises(vane.IOException, match="exists but is not accessible"):
+            vane.list_files(str(directory), connection=duckdb_cursor).fetchall()
+    finally:
+        directory.chmod(0o700)
+
+
+@pytest.mark.parametrize("mode", [0, 0o400])
+def test_list_files_reports_inaccessible_recursive_subdirectory(duckdb_cursor, tmp_path, mode):
+    if os.name == "nt":
+        pytest.skip("POSIX directory permissions are required")
+
+    root = tmp_path / "root"
+    inaccessible = root / "inaccessible"
+    root.mkdir()
+    inaccessible.mkdir()
+    (root / "visible.txt").write_text("visible", encoding="utf-8")
+    (inaccessible / "hidden.txt").write_text("hidden", encoding="utf-8")
+    inaccessible.chmod(mode)
+    try:
+        if os.access(inaccessible, os.R_OK | os.X_OK):
+            pytest.skip("test process can bypass directory permissions")
+        with pytest.raises(vane.IOException, match="exists but is not accessible"):
+            vane.list_files(str(root), recursive=True, connection=duckdb_cursor).fetchall()
+    finally:
+        inaccessible.chmod(0o700)
+
+
+def test_list_files_reports_missing_and_unsupported_http_listing(duckdb_cursor, tmp_path):
+    with pytest.raises(vane.IOException, match="does not exist"):
+        vane.list_files(str(tmp_path / "missing"), connection=duckdb_cursor).fetchall()
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+    handler = functools.partial(QuietHandler, directory=str(tmp_path))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        duckdb_cursor.execute("SET http_proxy = ''")
+        duckdb_cursor.execute("SET allow_asterisks_in_http_paths = true")
+        url = f"http://127.0.0.1:{server.server_port}/*.txt"
+        with pytest.raises(vane.NotImplementedException, match="does not support glob listing"):
+            vane.list_files(url, connection=duckdb_cursor).fetchall()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_list_files_reports_authoritatively_missing_path_before_unsupported_listing(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class ExistenceOnlyFileSystem(fsspec.AbstractFileSystem):
+        protocol = "exists-only"
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.glob_calls = 0
+
+        def isfile(self, _path):
+            return False
+
+        def isdir(self, _path):
+            return False
+
+        def glob(self, *_args, **_kwargs):
+            self.glob_calls += 1
+            raise NotImplementedError("globbing is unavailable")
+
+        def ls(self, *_args, **_kwargs):
+            raise NotImplementedError("directory listing is unavailable")
+
+    filesystem = ExistenceOnlyFileSystem(skip_instance_cache=True)
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        with pytest.raises(vane.IOException, match="does not exist"):
+            vane.list_files("exists-only://missing", connection=duckdb_cursor).fetchall()
+        assert filesystem.glob_calls == 1
+    finally:
+        duckdb_cursor.unregister_filesystem("exists-only")
+
+
+def test_list_files_registered_filesystem_filters_directories_and_preserves_unknown_metadata(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    memory = fsspec.filesystem("memory", skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("root/nested")
+    memory.pipe("root/value.txt", b"value")
+    memory.pipe("root/nested/child.txt", b"child")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = vane.list_files("memory://root/*", connection=duckdb_cursor).fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert len(rows) == 1
+    assert rows[0][0].endswith("/root/value.txt")
+    assert rows[0][1] is None
+    assert rows[0][6] == vane.File(rows[0][0], "text/plain")
+
+
+def test_list_files_registered_filesystem_accepts_literal_glob_key(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    memory = fsspec.filesystem("memory", skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.pipe("root/literal*", b"value")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files(?)", ["memory:///root/literal*"]).fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory:///root/literal*",)]
+
+
+def test_list_files_accepts_literal_glob_key_without_glob_support(duckdb_cursor, tmp_path):
+    (tmp_path / "literal*.txt").write_text("value", encoding="utf-8")
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+    handler = functools.partial(QuietHandler, directory=str(tmp_path))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        duckdb_cursor.execute("SET http_proxy = ''")
+        duckdb_cursor.execute("SET allow_asterisks_in_http_paths = true")
+        url = f"http://127.0.0.1:{server.server_port}/literal*.txt"
+        rows = duckdb_cursor.execute("SELECT url, object_size, file FROM list_files(?)", [url]).fetchall()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert rows == [(url, None, vane.File(url, "text/plain"))]
+
+
+def test_list_files_registered_filesystem_preserves_question_mark_globs(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    memory = fsspec.filesystem("memory", skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.pipe("root/value1.txt", b"one")
+    memory.pipe("root1/fixed.txt", b"fixed")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files(?)", ["memory:///root/value?.txt"]).fetchall()
+        empty = duckdb_cursor.execute("SELECT url FROM list_files(?)", ["memory:///root/missing?.txt"]).fetchall()
+        authority_match = duckdb_cursor.execute(
+            "SELECT url FROM list_files(?)", ["memory://root?/fixed.txt"]
+        ).fetchall()
+        authority_empty = duckdb_cursor.execute(
+            "SELECT url FROM list_files(?)", ["memory://missing?/fixed.txt"]
+        ).fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory:///root/value1.txt",)]
+    assert empty == []
+    assert authority_match == [("memory:///root1/fixed.txt",)]
+    assert authority_empty == []
+
+
+def test_list_files_registered_filesystem_preserves_hash_in_directory_key(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class DirectoryMemoryFileSystem(fsspec.implementations.memory.MemoryFileSystem):
+        vane_directory_semantics = True
+
+    memory = DirectoryMemoryFileSystem(skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("root/literal#directory")
+    memory.pipe("root/literal#directory/value.txt", b"value")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files(?)", ["memory://root/literal#directory"]).fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory://root/literal#directory/value.txt",)]
+
+
+def test_list_files_registered_filesystem_accepts_empty_directory(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class DirectoryMemoryFileSystem(fsspec.implementations.memory.MemoryFileSystem):
+        vane_directory_semantics = True
+
+    memory = DirectoryMemoryFileSystem(skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("empty")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = vane.list_files("memory://empty", connection=duckdb_cursor).fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == []
+
+
+def test_list_files_registered_directory_filesystem_does_not_require_glob(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class ListOnlyDirectoryMemoryFileSystem(fsspec.implementations.memory.MemoryFileSystem):
+        vane_directory_semantics = True
+
+        def glob(self, *_args, **_kwargs):
+            raise AssertionError("list_files() must not glob a confirmed directory")
+
+    memory = ListOnlyDirectoryMemoryFileSystem(skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("root/nested")
+    memory.pipe("root/direct.txt", b"direct")
+    memory.pipe("root/nested/child.txt", b"child")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('memory://root')").fetchall()
+        recursive = duckdb_cursor.execute("SELECT url FROM list_files('memory://root', TRUE)").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory://root/direct.txt",)]
+    assert recursive == [("memory://root/direct.txt",), ("memory://root/nested/child.txt",)]
+
+
+def test_list_files_registered_directory_filesystem_accepts_trailing_directory_separator(duckdb_cursor):
+    pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    memory_module = pytest.importorskip("fsspec.implementations.memory")
+
+    class TrailingDirectoryMemoryFileSystem(memory_module.MemoryFileSystem):
+        vane_directory_semantics = True
+
+        def ls(self, path, detail=True, **kwargs):
+            entries = super().ls(path, detail=detail, **kwargs)
+            if not detail:
+                return entries
+            result = []
+            for entry in entries:
+                entry = dict(entry)
+                if entry["type"] == "directory":
+                    entry["name"] = f"{entry['name'].rstrip('/')}/"
+                result.append(entry)
+            return result
+
+    memory = TrailingDirectoryMemoryFileSystem(skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("root/nested")
+    memory.pipe("root/direct.txt", b"direct")
+    memory.pipe("root/nested/child.txt", b"child")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('memory://root', TRUE)").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory://root/direct.txt",), ("memory://root/nested/child.txt",)]
+
+
+def test_list_files_registered_directory_filesystem_falls_back_when_ls_is_not_implemented(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+
+    class GlobOnlyDirectoryMemoryFileSystem(fsspec.implementations.memory.MemoryFileSystem):
+        vane_directory_semantics = True
+
+        def ls(self, *_args, **_kwargs):
+            raise NotImplementedError("directory listing is unavailable")
+
+        def glob(self, path, **_kwargs):
+            if path == "memory://root/*":
+                return ["/root/value.txt"]
+            return []
+
+    memory = GlobOnlyDirectoryMemoryFileSystem(skip_instance_cache=True)
+    memory.store = {}
+    memory.pseudo_dirs = [""]
+    memory.makedirs("root")
+    memory.pipe("root/value.txt", b"value")
+    duckdb_cursor.register_filesystem(memory)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('memory://root')").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory:///root/value.txt",)]
 
 
 def test_file_does_not_implicitly_convert_to_plain_struct():

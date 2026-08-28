@@ -10,6 +10,7 @@
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
+class ClientContext;
 class DatabaseInstance;
 class PhysicalPlan;
 
@@ -18,7 +19,7 @@ namespace distributed {
 DuckPhysicalPlanRef MakeTableScanPlan(const PhysicalTableScan &scan);
 
 vector<ScanSplit> MakeTableScanSplits(const PhysicalTableScan &scan, const DuckDBExecutionConfig &exec_cfg,
-                                      const shared_ptr<DatabaseInstance> &db);
+                                      const shared_ptr<DatabaseInstance> &db, ClientContext *client_context = nullptr);
 
 SchemaRef MakeTableScanSchema(const PhysicalTableScan &scan, const vector<LogicalType> &output_types);
 
