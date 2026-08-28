@@ -14,7 +14,7 @@ import pytest
 import vane
 
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
-FILE_METHODS = ("exists", "mime_type", "stat")
+FILE_METHODS = ("exists", "mime_type", "open", "stat", "to_tempfile")
 
 
 def test_file_value_contract():
