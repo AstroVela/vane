@@ -3823,6 +3823,87 @@ def test_ray_join(ray_runner, duckdb_conn, parquet_path):
     )
 
 
+def test_ray_cross_product_gathers_both_inputs(
+    ray_runner,
+    duckdb_conn,
+    parquet_path,
+    partitioned_parquet_path,
+):
+    label = "test_ray_e2e: cross product gathers both inputs"
+    sql = f"""
+        SELECT l.a AS left_a, r.a AS right_a
+        FROM (
+            SELECT a
+            FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
+            WHERE a < 3
+        ) AS l
+        CROSS JOIN (
+            SELECT a
+            FROM read_parquet('{parquet_path}')
+            WHERE a < 4
+        ) AS r
+    """
+
+    relation = duckdb_conn.sql(sql)
+    plan_text, num_parts = _get_distributed_plan_info(relation, label)
+    assert plan_text and "CROSS PRODUCT" in plan_text.upper(), (
+        f"{label}: expected distributed cross product:\n{plan_text}"
+    )
+    assert num_parts == 1, f"{label}: correctness fallback must gather to one partition, got {num_parts}"
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_cross_product_values(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: cross product values"
+    sql = """
+        SELECT l.value AS left_value, r.value AS right_value
+        FROM (VALUES (1), (2)) AS l(value)
+        CROSS JOIN (VALUES (3), (4)) AS r(value)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
+@pytest.mark.parametrize("empty_side", ["left", "right"])
+def test_ray_cross_product_empty_input(ray_runner, duckdb_conn, partitioned_parquet_path, empty_side):
+    label = f"test_ray_e2e: cross product empty {empty_side} input"
+    empty = f"""
+        SELECT a
+        FROM read_parquet('{partitioned_parquet_path}/*/*.parquet', hive_partitioning=1)
+        WHERE a < 0
+    """
+    non_empty = "SELECT value AS a FROM (VALUES (10), (20)) AS t(value)"
+    left_sql, right_sql = (empty, non_empty) if empty_side == "left" else (non_empty, empty)
+    sql = f"""
+        SELECT l.a AS left_a, r.a AS right_a
+        FROM ({left_sql}) AS l
+        CROSS JOIN ({right_sql}) AS r
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["CROSS_PRODUCT"],
+        timeout_s=60.0,
+    )
+
+
 def test_ray_join_multi_partition_plan(ray_runner, duckdb_conn, parquet_path):
     label = "test_ray_e2e: join multi-partition plan"
     sql = f"""

@@ -42,6 +42,7 @@
 #include "duckdb/execution/operator/helper/physical_streaming_sample.hpp"
 #include "duckdb/execution/operator/helper/physical_data_sink.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_delim_join.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
@@ -372,6 +373,11 @@ void PhysicalPlanToPipelineNodeTranslator::VisitOperator(::duckdb::PhysicalOpera
 	case PhysicalOperatorType::HASH_JOIN: {
 		auto &hj = static_cast<PhysicalHashJoin &>(op);
 		node_impl = TranslateHashJoin(hj, children);
+		break;
+	}
+	case PhysicalOperatorType::CROSS_PRODUCT: {
+		auto &cross_product = static_cast<PhysicalCrossProduct &>(op);
+		node_impl = TranslateCrossProduct(cross_product, children);
 		break;
 	}
 	case PhysicalOperatorType::LEFT_DELIM_JOIN:

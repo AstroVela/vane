@@ -53,6 +53,7 @@
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
@@ -1051,6 +1052,10 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 			scan->dynamic_filters = state.GetFilters(dynamic_filters_id);
 		}
 		return unique_ptr<PhysicalOperator>(std::move(scan));
+	}
+	case PhysicalOperatorType::CROSS_PRODUCT: {
+		return make_uniq<PhysicalCrossProduct>(physical_plan, CrossProductDeserializeTag {}, std::move(types),
+		                                       estimated_cardinality);
 	}
 	case PhysicalOperatorType::HASH_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");

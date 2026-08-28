@@ -852,8 +852,22 @@ static bool NativePlanNeedsResultCollector(const duckdb::PhysicalOperator &root_
 	if (root_op.type == PhysicalOperatorType::EXCHANGE_SINK) {
 		return false;
 	}
-	return !root_op.IsSink() || root_op.IsSource() || root_op.type == PhysicalOperatorType::CTE ||
-	       root_op.type == PhysicalOperatorType::RECURSIVE_CTE;
+	if (!root_op.IsSink() || root_op.IsSource()) {
+		return true;
+	}
+
+	// IsSink describes participation in a pipeline, not whether the root is a
+	// terminal consumer. Binary operators such as CROSS_PRODUCT sink their build
+	// side while producing rows from the probe pipeline. Their sources therefore
+	// come from below the root, whereas a terminal sink reports itself as its
+	// source. Use that pipeline topology instead of maintaining an operator-type
+	// allowlist that would need updating for every new build/probe operator.
+	for (const auto &source : root_op.GetSources()) {
+		if (&source.get() != &root_op) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static py::dict BuildNativeProgressTopology(duckdb::ClientContext &context,

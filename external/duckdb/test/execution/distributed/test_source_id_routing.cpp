@@ -31,6 +31,7 @@
 #include "duckdb/execution/distributed/pipeline_node/scan_source.hpp"
 #include "duckdb/execution/distributed/pipeline_node/pipeline_node.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -39,6 +40,7 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 
 #define private public
+#include "duckdb/execution/distributed/pipeline_node/join/cross_product.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
 #undef private
@@ -361,6 +363,30 @@ TEST_CASE("PhysicalPlanTranslator: assigns fresh id when source_node_id is not s
 	REQUIRE(scan_node->node_id() >= 0);
 }
 
+TEST_CASE("PhysicalPlanTranslator: translates cross product with two inputs", "[distributed][cross_product]") {
+	Allocator allocator;
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> input_types = {LogicalType::BIGINT};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+
+	auto left_collection = MakeCollection(input_types, 2);
+	auto &left = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 2,
+	                                                std::move(left_collection));
+	auto right_collection = MakeCollection(input_types, 3);
+	auto &right = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 3,
+	                                                 std::move(right_collection));
+	auto &cross = plan->Make<PhysicalCrossProduct>(output_types, left, right, 6);
+	plan->SetRoot(cross);
+
+	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
+	REQUIRE(result.ok);
+	REQUIRE(result.value() != nullptr);
+	auto cross_node = std::dynamic_pointer_cast<CrossProductNode>(result.value()->inner());
+	REQUIRE(cross_node != nullptr);
+	REQUIRE(cross_node->children().size() == 2);
+	REQUIRE(cross_node->config().clustering_spec()->num_partitions() == 1);
+}
+
 //===----------------------------------------------------------------------===//
 // WorkerTask inputs_ tests
 //===----------------------------------------------------------------------===//
@@ -469,6 +495,39 @@ TEST_CASE("HashJoinNode: replacement task preserves both side inputs", "[distrib
 	    ClonePhysicalPlanOrThrow(joined_task.task()->plan(), "hash_join_owned_children_test", nullptr);
 	REQUIRE(joined_plan_clone->HasRoot());
 	REQUIRE(joined_plan_clone->Root().children.size() == 2);
+}
+
+TEST_CASE("CrossProductNode: replacement task owns both inputs", "[distributed][source_id][cross_product]") {
+	PlanConfig plan_cfg(1, "cross-product-query", std::make_shared<DuckDBExecutionConfig>());
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto schema = MakeSchemaRef(output_types);
+	CrossProductNode node(302, plan_cfg, output_types, 1, nullptr, nullptr, schema);
+
+	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
+	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
+	TaskIDCounter task_id_counter;
+	auto cross_task = node.BuildCrossProductTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+	REQUIRE(cross_task.task()->inputs().size() == 2);
+	REQUIRE(cross_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
+	REQUIRE(cross_task.task()->inputs().at(20).scan_split_batch_bytes == "right_scan");
+	REQUIRE(cross_task.task()->plan()->Root().type == PhysicalOperatorType::CROSS_PRODUCT);
+	REQUIRE(cross_task.task()->plan()->Root().children.size() == 2);
+	auto &cross_root = cross_task.task()->plan()->Root();
+	auto &left_scan = cross_root.children[0].get().Cast<PhysicalColumnDataScan>();
+	auto &right_scan = cross_root.children[1].get().Cast<PhysicalColumnDataScan>();
+	REQUIRE(left_scan.collection);
+	REQUIRE(right_scan.collection);
+	REQUIRE(left_scan.collection->Count() == 1);
+	REQUIRE(right_scan.collection->Count() == 1);
+
+	auto cloned = ClonePhysicalPlanOrThrow(cross_task.task()->plan(), "cross_product_owned_children_test", nullptr);
+	REQUIRE(cloned->HasRoot());
+	REQUIRE(cloned->Root().type == PhysicalOperatorType::CROSS_PRODUCT);
+	REQUIRE(cloned->Root().children.size() == 2);
+	REQUIRE(cloned->Root().GetTypes() == output_types);
+	REQUIRE(cloned->Root().children[0].get().Cast<PhysicalColumnDataScan>().collection->Count() == 1);
+	REQUIRE(cloned->Root().children[1].get().Cast<PhysicalColumnDataScan>().collection->Count() == 1);
 }
 
 TEST_CASE("Join output types follow join semantics", "[distributed][join]") {

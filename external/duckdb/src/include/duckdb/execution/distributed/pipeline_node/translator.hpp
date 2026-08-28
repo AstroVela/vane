@@ -17,6 +17,7 @@ namespace duckdb {
 class RepartitionSpec;
 class PhysicalBatchCopyToFile;
 class PhysicalCopyToFile;
+class PhysicalCrossProduct;
 class PhysicalDataSink;
 class PhysicalOperator;
 class PhysicalDelimJoin;
@@ -135,6 +136,10 @@ private:
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateHashJoin(const PhysicalHashJoin &op,
 	                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateCrossProduct(const PhysicalCrossProduct &op,
+	                      const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
 
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateDelimJoin(const PhysicalDelimJoin &op,
