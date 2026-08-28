@@ -14,6 +14,7 @@
 #include "duckdb/execution/distributed/pipeline_node/aggregate.hpp"
 
 namespace duckdb {
+class Expression;
 class RepartitionSpec;
 class PhysicalBatchCopyToFile;
 class PhysicalCopyToFile;
@@ -22,7 +23,10 @@ class PhysicalDataSink;
 class PhysicalOperator;
 class PhysicalDelimJoin;
 class PhysicalHashJoin;
+class PhysicalComparisonJoin;
+class PhysicalBlockwiseNLJoin;
 class PhysicalNestedLoopJoin;
+class PhysicalRangeJoin;
 class PhysicalHashAggregate;
 class PhysicalColumnDataScan;
 class PhysicalDummyScan;
@@ -148,6 +152,20 @@ private:
 	std::shared_ptr<PipelineNodeImpl>
 	TranslateNestedLoopJoin(const PhysicalNestedLoopJoin &op,
 	                        const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateRangeJoin(const PhysicalRangeJoin &op,
+	                   const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateBlockwiseNLJoin(const PhysicalBlockwiseNLJoin &op,
+	                         const std::vector<std::shared_ptr<DistributedPipelineNode>> &children);
+
+	std::shared_ptr<PipelineNodeImpl>
+	TranslateComparisonNestedLoopJoin(const PhysicalComparisonJoin &op, const Expression *predicate,
+	                                  const std::vector<std::shared_ptr<DistributedPipelineNode>> &children,
+	                                  duckdb::vector<idx_t> left_projection_map = {},
+	                                  duckdb::vector<idx_t> right_projection_map = {});
 
 	std::shared_ptr<DistributedPipelineNode>
 	TranslateHashGroupBy(const PhysicalHashAggregate &op,

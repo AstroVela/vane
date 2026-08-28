@@ -3878,6 +3878,121 @@ def test_ray_cross_product_values(ray_runner, duckdb_conn):
     )
 
 
+def test_ray_piecewise_merge_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: piecewise merge join"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (VALUES (1), (2), (3), (4), (5)) AS l(x)
+        JOIN (VALUES (1), (2), (3), (4), (5)) AS r(x)
+          ON l.x < r.x
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["PIECEWISE_MERGE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_piecewise_merge_join_nested_values(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: piecewise merge join nested values"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS l
+        JOIN (SELECT [i] AS x FROM range(1, 9) AS t(i)) AS r
+          ON l.x < r.x
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["PIECEWISE_MERGE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_ie_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: ie join"
+    duckdb_conn.execute("SET nested_loop_join_threshold=0")
+    duckdb_conn.execute("SET merge_join_threshold=0")
+    sql = """
+        SELECT
+            l.begin_value AS left_begin,
+            l.end_value AS left_end,
+            r.begin_value AS right_begin,
+            r.end_value AS right_end
+        FROM (VALUES (1, 4), (2, 6), (5, 8)) AS l(begin_value, end_value)
+        JOIN (VALUES (0, 2), (3, 5), (6, 9)) AS r(begin_value, end_value)
+          ON l.begin_value < r.end_value
+         AND l.end_value > r.begin_value
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["IE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_ie_join_preserves_asof_projection(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: IE join ASOF projection"
+    duckdb_conn.execute("SET debug_asof_iejoin=true")
+    sql = """
+        SELECT
+            l.ts AS left_ts,
+            l.value AS left_value,
+            r.ts AS right_ts,
+            r.value AS right_value
+        FROM (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 10),
+                (TIMESTAMP '2026-01-01 00:00:03', 30)
+        ) AS l(ts, value)
+        ASOF LEFT JOIN (
+            VALUES
+                (TIMESTAMP '2026-01-01 00:00:01', 100),
+                (TIMESTAMP '2026-01-01 00:00:02', 200)
+        ) AS r(ts, value)
+          ON l.ts >= r.ts
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["IE_JOIN"],
+        timeout_s=60.0,
+    )
+
+
+def test_ray_blockwise_nested_loop_join(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: blockwise nested-loop join"
+    sql = """
+        SELECT l.x AS left_x, r.x AS right_x
+        FROM (VALUES (1), (2)) AS l(x)
+        JOIN (VALUES (1), (2)) AS r(x)
+          ON l.x + r.x = 3
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["BLOCKWISE_NL_JOIN"],
+        timeout_s=60.0,
+    )
+
+
 @pytest.mark.parametrize("empty_side", ["left", "right"])
 def test_ray_cross_product_empty_input(ray_runner, duckdb_conn, partitioned_parquet_path, empty_side):
     label = f"test_ray_e2e: cross product empty {empty_side} input"

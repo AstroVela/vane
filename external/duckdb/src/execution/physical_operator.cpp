@@ -52,11 +52,13 @@
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/operator/scan/physical_expression_scan.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/function/function_serialization.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
@@ -1056,6 +1058,18 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 	case PhysicalOperatorType::CROSS_PRODUCT: {
 		return make_uniq<PhysicalCrossProduct>(physical_plan, CrossProductDeserializeTag {}, std::move(types),
 		                                       estimated_cardinality);
+	}
+	case PhysicalOperatorType::BLOCKWISE_NL_JOIN: {
+		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
+		auto condition = deserializer.ReadProperty<unique_ptr<Expression>>(104, "condition");
+		if (!condition) {
+			throw SerializationException("PhysicalBlockwiseNLJoin deserialization requires a condition");
+		}
+
+		LogicalAnyJoin dummy_join(join_type);
+		dummy_join.types = std::move(types);
+		return make_uniq<PhysicalBlockwiseNLJoin>(physical_plan, dummy_join, std::move(condition), join_type,
+		                                          estimated_cardinality, true);
 	}
 	case PhysicalOperatorType::HASH_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");

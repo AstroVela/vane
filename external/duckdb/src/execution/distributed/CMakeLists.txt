@@ -51,6 +51,7 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/join/cross_product.cpp
     pipeline_node/join/delim_join.cpp
     pipeline_node/join/hash_join.cpp
+    pipeline_node/join/nested_loop_join.cpp
     pipeline_node/limit.cpp
     pipeline_node/materialized_coordinator.cpp
     pipeline_node/translate.cpp

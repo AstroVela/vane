@@ -1,12 +1,13 @@
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/join/outer_join_marker.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
-#include "duckdb/common/enum_util.hpp"
 
 namespace duckdb {
 
@@ -14,13 +15,24 @@ PhysicalBlockwiseNLJoin::PhysicalBlockwiseNLJoin(PhysicalPlan &physical_plan, Lo
                                                  PhysicalOperator &left, PhysicalOperator &right,
                                                  unique_ptr<Expression> condition, JoinType join_type,
                                                  idx_t estimated_cardinality)
-    : PhysicalJoin(physical_plan, op, PhysicalOperatorType::BLOCKWISE_NL_JOIN, join_type, estimated_cardinality),
-      condition(std::move(condition)) {
+    : PhysicalBlockwiseNLJoin(physical_plan, op, std::move(condition), join_type, estimated_cardinality, true) {
 	children.push_back(left);
 	children.push_back(right);
+}
+
+PhysicalBlockwiseNLJoin::PhysicalBlockwiseNLJoin(PhysicalPlan &physical_plan, LogicalOperator &op,
+                                                 unique_ptr<Expression> condition, JoinType join_type,
+                                                 idx_t estimated_cardinality, bool /*skip_child_init*/)
+    : PhysicalJoin(physical_plan, op, PhysicalOperatorType::BLOCKWISE_NL_JOIN, join_type, estimated_cardinality),
+      condition(std::move(condition)) {
 	// MARK and SINGLE joins not handled
 	D_ASSERT(join_type != JoinType::MARK);
 	D_ASSERT(join_type != JoinType::SINGLE);
+}
+
+void PhysicalBlockwiseNLJoin::SerializeOperatorData(Serializer &serializer) const {
+	serializer.WriteProperty(103, "join_type", join_type);
+	serializer.WriteProperty(104, "condition", condition);
 }
 
 //===--------------------------------------------------------------------===//
