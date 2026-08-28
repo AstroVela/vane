@@ -307,6 +307,63 @@ def test_local_runner_arrow_native_parquet_v1_rejects_nanosecond_timestamps(loca
     assert not list(output.glob("*.parquet"))
 
 
+def test_local_runner_arrow_native_parquet_v1_rejects_uinteger(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        return pa.table({"value": pa.array(values, type=pa.uint32())})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "unsupported_arrow_uinteger.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.UINTEGER},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        with pytest.raises(ValueError, match="UINTEGER is not supported by Arrow-native Parquet V1 COPY"):
+            relation.write_parquet(str(output))
+    finally:
+        con.close()
+
+    assert not list(output.glob("*.parquet"))
+
+
+def test_local_runner_arrow_native_parquet_writes_lz4_raw(local_runner, tmp_path, monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        return pa.table({"value": table.column("x")})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_lz4_raw.parquet"
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(4) t(i)").map_batches(
+            transform,
+            schema={"value": vane.sqltypes.BIGINT},
+            execution_backend="subprocess_task",
+            batch_size=4,
+            output_batch_size=4,
+        )
+        relation.write_parquet(str(output), compression="lz4")
+        output_files = list(output.glob("*.parquet"))
+        compression = {
+            row[0]
+            for path in output_files
+            for row in con.sql(f"select distinct compression from parquet_metadata('{path}')").fetchall()
+        }
+    finally:
+        con.close()
+
+    assert output_files
+    assert compression == {"LZ4_RAW"}
+
+
 def test_local_runner_arrow_native_parquet_rejects_file_size_rotation(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 

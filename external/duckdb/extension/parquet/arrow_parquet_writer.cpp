@@ -476,6 +476,8 @@ static ::parquet::Compression::type ArrowCompression(duckdb_parquet::Compression
 	case duckdb_parquet::CompressionCodec::BROTLI:
 		return ::parquet::Compression::BROTLI;
 	case duckdb_parquet::CompressionCodec::LZ4_RAW:
+		// Arrow 24 exposes the standard Parquet LZ4_RAW codec as Compression::LZ4.
+		// Its deprecated Hadoop-specific Parquet LZ4 codec is Compression::LZ4_HADOOP.
 		return ::parquet::Compression::LZ4;
 	default:
 		throw NotImplementedException("Compression codec is not supported by Arrow-native Parquet COPY");
