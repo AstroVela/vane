@@ -5294,6 +5294,32 @@ def test_fte_fragment_execution_binds_scheduler_owned_sink_partition():
     assert worker.calls[0][1]["exchange_sink_instance"] == sink_instance
 
 
+def test_fte_fragment_execution_binds_ordered_sink_to_semantic_partition_order():
+    worker = _FakeLiveWorker("worker-a")
+    stage = _fte_fragment_execution(
+        "q",
+        12,
+        fragment_id="q:node:ordered-shuffle",
+        logical_fragment_identity="q:node:ordered-shuffle",
+        worker=worker,
+        exchange_sink_config={
+            "query_id": "q",
+            "output_partition_count": 1,
+            "output_location_prefix": "q_ordered_shuffle_3",
+            "preserve_order": True,
+        },
+    )
+
+    scheduled_result = stage.apply_assignment_result(
+        AssignmentResult(partitions_added=[PartitionInfo(3)], sealed_partitions=[3])
+    )
+    scheduled = scheduled_result[0]
+    _execute_stage_commands(stage, scheduled_result)
+
+    assert scheduled.request["exchange_sink_instance"]["source_task_order"] == 3
+    assert worker.calls[0][1]["exchange_sink_instance"]["source_task_order"] == 3
+
+
 def test_fte_fragment_execution_allocates_exchange_identity_when_partition_is_created():
     registered_identities = []
     stage = _fte_fragment_execution(
@@ -5653,6 +5679,65 @@ def test_arbitrary_split_assigner_groups_by_node_requirements():
         NodeRequirements(host="host-a"),
         NodeRequirements(host="host-b"),
     ]
+
+
+def test_arbitrary_split_assigner_ordered_mode_does_not_reuse_noncontiguous_host_partition():
+    assigner = ArbitrarySplitAssigner(
+        partitioned_sources={"scan"},
+        preserve_order=True,
+        min_target_partition_size_bytes=1000,
+        standard_split_size_bytes=100,
+    )
+
+    result = assigner.assign(
+        "scan",
+        [
+            {
+                "kind": "scan_split",
+                "split_id": f"scan-{host}-{index}",
+                "data": host.encode(),
+                "addresses": [host],
+                "size_bytes": 100,
+            }
+            for index, host in enumerate(("host-a", "host-b", "host-a"))
+        ],
+        no_more_inputs=True,
+    )
+
+    assert [partition.partition_id for partition in result.partitions_added] == [0, 1, 2]
+    assert [partition.node_requirements.host for partition in result.partitions_added] == [
+        "host-a",
+        "host-b",
+        "host-a",
+    ]
+    data_updates = [update for update in result.partition_updates if update.splits]
+    assert [update.partition_id for update in data_updates] == [0, 1, 2]
+
+
+def test_fte_assigner_enables_contiguous_partitioning_for_ordered_sink():
+    state = _FteFragmentState()
+    state.source_node_ids.add("scan")
+    state.dynamic_scan_source_node_ids.add("scan")
+    state.preserve_order = True
+
+    assigner = make_fte_assigner(state)
+
+    assert isinstance(assigner, ArbitrarySplitAssigner)
+    result = assigner.assign(
+        "scan",
+        [
+            {
+                "kind": "scan_split",
+                "split_id": f"scan-{host}-{index}",
+                "addresses": [host],
+                "size_bytes": 1,
+            }
+            for index, host in enumerate(("host-a", "host-b", "host-a"))
+        ],
+        no_more_inputs=True,
+    )
+
+    assert [partition.partition_id for partition in result.partitions_added] == [0, 1, 2]
 
 
 def test_arbitrary_split_assigner_ranks_available_hosts():

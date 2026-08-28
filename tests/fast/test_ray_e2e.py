@@ -3878,6 +3878,58 @@ def test_ray_cross_product_values(ray_runner, duckdb_conn):
     )
 
 
+def test_ray_positional_join_values_preserves_order_and_pads_nulls(ray_runner, duckdb_conn):
+    label = "test_ray_e2e: positional join values"
+    sql = """
+        SELECT l.value AS left_value, r.value AS right_value
+        FROM (VALUES (1), (2), (3)) AS l(value)
+        POSITIONAL JOIN (VALUES (10), (20)) AS r(value)
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_JOIN"],
+        timeout_s=60.0,
+        ordered=True,
+    )
+
+
+def test_ray_positional_scan_folds_three_ordered_multifile_inputs(
+    ray_runner,
+    duckdb_conn,
+    partitioned_parquet_path,
+):
+    label = "test_ray_e2e: three-way positional scan"
+    sql = f"""
+        SELECT l.a AS left_a, m.a AS middle_a, r.a AS right_a
+        FROM read_parquet(
+            '{partitioned_parquet_path}/*/*.parquet',
+            hive_partitioning=1
+        ) AS l
+        POSITIONAL JOIN read_parquet(
+            '{partitioned_parquet_path}/grp=0/*.parquet',
+            hive_partitioning=1
+        ) AS m
+        POSITIONAL JOIN read_parquet(
+            '{partitioned_parquet_path}/grp=1/*.parquet',
+            hive_partitioning=1
+        ) AS r
+    """
+
+    _run_query_case(
+        duckdb_conn,
+        ray_runner,
+        sql,
+        label,
+        require_all=["POSITIONAL_SCAN"],
+        timeout_s=90.0,
+        ordered=True,
+    )
+
+
 def test_ray_piecewise_merge_join(ray_runner, duckdb_conn):
     label = "test_ray_e2e: piecewise merge join"
     sql = """

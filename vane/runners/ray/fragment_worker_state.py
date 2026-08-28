@@ -44,6 +44,7 @@ def get_or_create_fte_fragment_state(
     replicated_exchange_sources: set[str] | None = None,
     exchange_source_partition_count: int = 0,
     exchange_source_task_count: int = 0,
+    preserve_order: bool = False,
 ) -> _FteFragmentState:
     key = (str(query_id), str(fragment_id))
     with _FTE_REGISTRY_LOCK:
@@ -60,6 +61,9 @@ def get_or_create_fte_fragment_state(
         elif key not in _FTE_FRAGMENT_STATES:
             _FTE_FRAGMENT_STATES[key] = state
         had_assigner = state.assigner is not None
+        if had_assigner and state.preserve_order != bool(preserve_order):
+            raise RuntimeError("FTE fragment order-preservation mode cannot change")
+        state.preserve_order = bool(preserve_order)
         had_exchange_sources = bool(state.dynamic_exchange_source_node_ids)
         previous_exchange_partition_count = state.exchange_source_partition_count
         previous_exchange_task_count = state.exchange_source_task_count

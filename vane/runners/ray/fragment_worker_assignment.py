@@ -51,6 +51,7 @@ def _make_arbitrary_assigner(
     return ArbitrarySplitAssigner(
         partitioned_sources=partitioned_sources,
         replicated_sources=replicated_sources,
+        preserve_order=fragment_state.preserve_order,
         max_splits_per_partition=max_splits_per_partition,
         min_target_partition_size_bytes=min_target_partition_size_bytes,
         max_target_partition_size_bytes=max_target_partition_size_bytes,

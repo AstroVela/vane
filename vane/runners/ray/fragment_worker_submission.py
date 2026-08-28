@@ -639,8 +639,12 @@ class FteWorkerSubmissionMixin:
                     "exchange_source_partition_ids": set(),
                     "exchange_source_partition_count": 0,
                     "exchange_source_task_count": 0,
+                    "preserve_order": bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
                 },
             )
+            item_preserves_order = bool((item.get("exchange_sink_config") or {}).get("preserve_order", False))
+            if aggregate["preserve_order"] != item_preserves_order:
+                raise ValueError("exchange sink order-preservation mode cannot change within a fragment")
             aggregate["dynamic_scan_sources"].update(dynamic_scan_sources)
             aggregate["dynamic_exchange_sources"].update(dynamic_exchange_sources)
             aggregate["replicated_exchange_sources"].update(replicated_exchange_sources)
@@ -690,6 +694,7 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=aggregate["exchange_source_partition_ids"],
                 exchange_source_partition_count=aggregate["exchange_source_partition_count"],
                 exchange_source_task_count=aggregate["exchange_source_task_count"],
+                preserve_order=aggregate["preserve_order"],
             )
 
         for prepared_index, (
@@ -734,6 +739,7 @@ class FteWorkerSubmissionMixin:
                 exchange_source_partition_ids=set(),
                 exchange_source_partition_count=0,
                 exchange_source_task_count=0,
+                preserve_order=bool((item.get("exchange_sink_config") or {}).get("preserve_order", False)),
             )
             if fragment_state.assigner is None:
                 raise RuntimeError("FTE fragment state is missing split assigner")

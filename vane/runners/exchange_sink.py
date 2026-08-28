@@ -10,6 +10,7 @@ _CONFIG_KEYS = {
     "query_id",
     "output_location_prefix",
     "output_partition_count",
+    "preserve_order",
 }
 
 
@@ -43,11 +44,17 @@ def normalize_exchange_sink_config(exchange_sink_config: Any) -> dict[str, Any]:
     if output_partition_count == 0:
         raise ValueError("exchange_sink_config output_partition_count must be positive")
 
+    preserve_order = exchange_sink_config.get("preserve_order", False)
+    if not isinstance(preserve_order, bool):
+        raise TypeError("exchange_sink_config preserve_order must be a boolean")
+
     result: dict[str, Any] = {
         "query_id": query_id,
         "output_location_prefix": output_location_prefix,
         "output_partition_count": output_partition_count,
     }
+    if preserve_order:
+        result["preserve_order"] = True
     return result
 
 
@@ -56,16 +63,25 @@ def bind_exchange_sink_instance(
     *,
     attempt_id: int,
     task_partition_id: int,
+    source_task_order: int | None = None,
 ) -> dict[str, Any]:
     config = normalize_exchange_sink_config(exchange_sink_config)
     attempt_id = _non_negative_integer("attempt_id", attempt_id)
     task_partition_id = _non_negative_integer("task_partition_id", task_partition_id)
 
+    if config.get("preserve_order", False):
+        source_task_order = _non_negative_integer("source_task_order", source_task_order)
+    elif source_task_order is not None:
+        raise ValueError("source_task_order requires an order-preserving exchange sink")
+
     output_location = f"{config['output_location_prefix']}__sink_{task_partition_id}__attempt_{attempt_id}"
-    return {
+    payload = {
         "sink_handle": {"task_partition_id": task_partition_id},
         "attempt_id": attempt_id,
         "query_id": config["query_id"],
         "output_partition_count": config["output_partition_count"],
         "output_location": output_location,
     }
+    if source_task_order is not None:
+        payload["source_task_order"] = source_task_order
+    return payload

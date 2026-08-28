@@ -73,6 +73,7 @@ class _FteFragmentState:
         self.exchange_source_partition_ids: set[int] = set()
         self.exchange_source_partition_count: int = 0
         self.exchange_source_task_count: int = 0
+        self.preserve_order: bool = False
         self.exchange_source_partition_ids_by_source: dict[str, set[int]] = {}
         self.exchange_source_split_keys_by_source: dict[str, set[str]] = {}
         self.exchange_source_partition_count_by_source: dict[str, int] = {}

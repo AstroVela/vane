@@ -27,6 +27,52 @@ def test_bind_scheduler_task_identity_exchange_sink_attempt():
     assert retry["output_location"] == "exchange-a__sink_9__attempt_3"
 
 
+def test_bind_ordered_exchange_sink_carries_independent_source_order():
+    config = {
+        "query_id": "query-ordered",
+        "output_location_prefix": "exchange-ordered",
+        "output_partition_count": 1,
+        "preserve_order": True,
+    }
+
+    instance = bind_exchange_sink_instance(
+        config,
+        attempt_id=2,
+        task_partition_id=991,
+        source_task_order=4,
+    )
+
+    assert instance["sink_handle"]["task_partition_id"] == 991
+    assert instance["source_task_order"] == 4
+    assert instance["output_location"] == "exchange-ordered__sink_991__attempt_2"
+
+
+def test_ordered_exchange_sink_requires_source_order():
+    with pytest.raises(TypeError, match="source_task_order must be an integer"):
+        bind_exchange_sink_instance(
+            {
+                "query_id": "query-ordered",
+                "output_location_prefix": "exchange-ordered",
+                "output_partition_count": 1,
+                "preserve_order": True,
+            },
+            attempt_id=0,
+            task_partition_id=1,
+        )
+
+
+def test_exchange_sink_config_rejects_non_boolean_preserve_order():
+    with pytest.raises(TypeError, match="preserve_order must be a boolean"):
+        normalize_exchange_sink_config(
+            {
+                "query_id": "query-ordered",
+                "output_location_prefix": "exchange-ordered",
+                "output_partition_count": 1,
+                "preserve_order": 1,
+            }
+        )
+
+
 @pytest.mark.parametrize("field", ["identity_source", "plan_task_partition_id"])
 def test_exchange_sink_config_rejects_plan_owned_identity_fields(field):
     with pytest.raises(ValueError, match=f"unexpected fields.*{field}"):

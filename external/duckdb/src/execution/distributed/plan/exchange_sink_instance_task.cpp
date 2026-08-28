@@ -43,7 +43,7 @@ bool FindUniqueRemoteExchangeSink(const PhysicalOperator &op, const PhysicalRemo
 		}
 		sink = candidate;
 	}
-	for (const auto &child : op.children) {
+	for (const auto &child : op.GetChildren()) {
 		if (!FindUniqueRemoteExchangeSink(child.get(), sink, count, error)) {
 			return false;
 		}
@@ -64,6 +64,12 @@ bool ValidateRuntimeSinkHandle(const PhysicalRemoteExchangeSink &sink, const Exc
 	}
 	if (runtime_handle.sink_handle.task_partition_id == DConstants::INVALID_INDEX) {
 		return SetValidationError(error, "runtime exchange sink received an invalid task identity");
+	}
+	if (sink.PreservesOrder() && runtime_handle.source_task_order == DConstants::INVALID_INDEX) {
+		return SetValidationError(error, "ordered exchange sink is missing its source task order");
+	}
+	if (!sink.PreservesOrder() && runtime_handle.source_task_order != DConstants::INVALID_INDEX) {
+		return SetValidationError(error, "unordered exchange sink received an unexpected source task order");
 	}
 	const auto expected_output_location = sink.SinkOutputLocationPrefix() + "__sink_" +
 	                                      std::to_string(runtime_handle.sink_handle.task_partition_id) + "__attempt_" +
@@ -88,7 +94,7 @@ bool ValidateRuntimeTaskIndexForOperator(PhysicalOperator &op, const ExchangeSin
 			}
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetChildren()) {
 		if (!ValidateRuntimeTaskIndexForOperator(child.get(), sink_instance, error)) {
 			return false;
 		}
@@ -109,7 +115,7 @@ bool ValidateExchangeSinkInstanceForOperator(PhysicalOperator &op, const Exchang
 		}
 		validated++;
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetChildren()) {
 		if (!ValidateExchangeSinkInstanceForOperator(child.get(), sink_instance, error, validated)) {
 			return false;
 		}
@@ -130,7 +136,7 @@ bool ApplyExchangeSinkInstanceToOperator(PhysicalOperator &op, const ExchangeSin
 		sink->ApplyRuntimeSinkHandle(task.sink_instance);
 		applied++;
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetChildren()) {
 		if (!ApplyExchangeSinkInstanceToOperator(child.get(), task, error, applied)) {
 			return false;
 		}
@@ -145,7 +151,7 @@ void ApplyRuntimeTaskIndexToOperator(PhysicalOperator &op, idx_t task_partition_
 			sample.ApplyRuntimeTaskIndex(task_partition_id);
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetChildren()) {
 		ApplyRuntimeTaskIndexToOperator(child.get(), task_partition_id);
 	}
 }
@@ -181,6 +187,8 @@ void ExchangeSinkInstanceTaskDescriptor::Serialize(Serializer &serializer) const
 	                                          sink_instance.mark_join_build_summary.has_rows, false);
 	serializer.WritePropertyWithDefault<bool>(10, "mark_join_build_has_null",
 	                                          sink_instance.mark_join_build_summary.has_null, false);
+	serializer.WritePropertyWithDefault<idx_t>(11, "source_task_order", sink_instance.source_task_order,
+	                                           DConstants::INVALID_INDEX);
 }
 
 ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deserialize(Deserializer &deserializer) {
@@ -200,6 +208,8 @@ ExchangeSinkInstanceTaskDescriptor ExchangeSinkInstanceTaskDescriptor::Deseriali
 	                                           result.sink_instance.mark_join_build_summary.has_rows);
 	deserializer.ReadPropertyWithDefault<bool>(10, "mark_join_build_has_null",
 	                                           result.sink_instance.mark_join_build_summary.has_null);
+	result.sink_instance.source_task_order =
+	    deserializer.ReadPropertyWithExplicitDefault<idx_t>(11, "source_task_order", DConstants::INVALID_INDEX);
 	if (!result.sink_instance.mark_join_build_summary.IsConsistent()) {
 		throw SerializationException("invalid MARK join build summary in exchange sink task");
 	}

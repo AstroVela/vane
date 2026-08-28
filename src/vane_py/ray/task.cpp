@@ -108,6 +108,9 @@ bool ParseExchangeSinkInstanceObject(py::object obj, duckdb::distributed::Exchan
 	if (d.contains("attempt_id")) {
 		out.attempt_id = py::int_(d["attempt_id"]).cast<duckdb::idx_t>();
 	}
+	if (d.contains("source_task_order")) {
+		out.source_task_order = py::int_(d["source_task_order"]).cast<duckdb::idx_t>();
+	}
 	if (d.contains("output_partition_count")) {
 		out.output_partition_count = py::int_(d["output_partition_count"]).cast<duckdb::idx_t>();
 	}
@@ -1383,5 +1386,6 @@ py::object RayWorkerTask::ExchangeSinkConfig() const {
 	result["output_partition_count"] = sink->NumPartitions();
 	result["query_id"] = sink->SinkQueryId();
 	result["output_location_prefix"] = sink->SinkOutputLocationPrefix();
+	result["preserve_order"] = sink->PreservesOrder();
 	return result;
 }

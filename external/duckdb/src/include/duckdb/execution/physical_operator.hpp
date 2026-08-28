@@ -97,6 +97,7 @@ public:
 	static void SetEstimatedCardinality(InsertionOrderPreservingMap<string> &result, idx_t estimated_cardinality);
 	virtual string ToString(ExplainFormat format = ExplainFormat::DEFAULT) const;
 	void Print() const;
+	virtual vector<reference<PhysicalOperator>> GetChildren();
 	virtual vector<const_reference<PhysicalOperator>> GetChildren() const;
 
 	//! Optional coordinator-side contract for distributed extension writes.

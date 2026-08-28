@@ -32,7 +32,8 @@ public:
 	                           vector<unique_ptr<Expression>> partition_by, std::string sink_query_id,
 	                           std::string sink_output_location_prefix,
 	                           std::shared_ptr<distributed::ExchangeManager> exchange_mgr,
-	                           vector<string> range_boundaries = {}, vector<string> range_order_modifiers = {});
+	                           vector<string> range_boundaries = {}, vector<string> range_order_modifiers = {},
+	                           bool preserve_order = false);
 
 	bool IsSink() const override {
 		return true;
@@ -43,7 +44,11 @@ public:
 	}
 
 	bool ParallelSink() const override {
-		return true;
+		return !preserve_order_;
+	}
+
+	bool SinkOrderDependent() const override {
+		return preserve_order_;
 	}
 
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
@@ -93,6 +98,9 @@ public:
 	const vector<string> &RangeOrderModifiers() const {
 		return range_order_modifiers_;
 	}
+	bool PreservesOrder() const {
+		return preserve_order_;
+	}
 	void EnableMarkJoinBuildSummary(vector<unique_ptr<Expression>> expressions) {
 		collect_mark_join_build_summary_ = true;
 		mark_join_build_expressions_ = std::move(expressions);
@@ -120,6 +128,7 @@ private:
 	std::shared_ptr<distributed::ExchangeManager> exchange_mgr_;
 	vector<string> range_boundaries_;
 	vector<string> range_order_modifiers_;
+	bool preserve_order_ = false;
 	bool collect_mark_join_build_summary_ = false;
 	vector<unique_ptr<Expression>> mark_join_build_expressions_;
 };

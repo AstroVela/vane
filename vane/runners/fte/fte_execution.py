@@ -1933,6 +1933,9 @@ class FteFragmentExecution:
                 sink_config,
                 attempt_id=partition.next_attempt_number(),
                 task_partition_id=scheduler_task_partition_id,
+                source_task_order=(
+                    partition.task_id.partition_id if sink_config.get("preserve_order", False) else None
+                ),
             )
         worker_id, worker = self._select_worker(partition)
         if self.exchange is not None:

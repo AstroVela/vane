@@ -56,6 +56,7 @@
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
+#include "duckdb/execution/operator/join/physical_positional_join.hpp"
 #include "duckdb/execution/operator/join/physical_nested_loop_join.hpp"
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
@@ -215,6 +216,14 @@ void PhysicalOperator::Print() const {
 	Printer::Print(ToString());
 }
 // LCOV_EXCL_STOP
+
+vector<reference<PhysicalOperator>> PhysicalOperator::GetChildren() {
+	vector<reference<PhysicalOperator>> result;
+	for (auto &child : static_cast<const PhysicalOperator &>(*this).GetChildren()) {
+		result.push_back(const_cast<PhysicalOperator &>(child.get()));
+	}
+	return result;
+}
 
 vector<const_reference<PhysicalOperator>> PhysicalOperator::GetChildren() const {
 	vector<const_reference<PhysicalOperator>> result;
@@ -1060,6 +1069,10 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalCrossProduct>(physical_plan, CrossProductDeserializeTag {}, std::move(types),
 		                                       estimated_cardinality);
 	}
+	case PhysicalOperatorType::POSITIONAL_JOIN: {
+		return make_uniq<PhysicalPositionalJoin>(physical_plan, PositionalJoinDeserializeTag {}, std::move(types),
+		                                         estimated_cardinality);
+	}
 	case PhysicalOperatorType::BLOCKWISE_NL_JOIN: {
 		auto join_type = deserializer.ReadProperty<JoinType>(103, "join_type");
 		auto condition = deserializer.ReadProperty<unique_ptr<Expression>>(104, "condition");
@@ -1248,6 +1261,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		    deserializer.ReadPropertyWithDefault<bool>(113, "collect_mark_join_build_summary");
 		auto mark_join_build_expressions =
 		    deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(114, "mark_join_build_expressions");
+		auto preserve_order = deserializer.ReadPropertyWithDefault<bool>(115, "preserve_order");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.local_dirs = std::vector<std::string>(local_dirs.begin(), local_dirs.end());
@@ -1256,7 +1270,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto result = make_uniq<PhysicalRemoteExchangeSink>(
 		    physical_plan, std::move(types), estimated_cardinality, std::move(exchange_id), num_partitions,
 		    repartition_type, std::move(partition_by), std::move(sink_query_id), std::move(sink_output_location_prefix),
-		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers));
+		    std::move(exchange_mgr), std::move(range_boundaries), std::move(range_order_modifiers), preserve_order);
 		if (collect_mark_join_build_summary) {
 			result->EnableMarkJoinBuildSummary(std::move(mark_join_build_expressions));
 		}
@@ -1287,6 +1301,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		auto source_handle_flight_hosts = deserializer.ReadProperty<vector<string>>(116, "source_handle_flight_hosts");
 		auto source_handle_task_partition_ids =
 		    deserializer.ReadProperty<vector<idx_t>>(117, "source_handle_task_partition_ids");
+		auto preserve_order = deserializer.ReadPropertyWithDefault<bool>(118, "preserve_order");
 		// Create FlightExchangeManager from deserialized config
 		distributed::FlightExchangeConfig flight_config;
 		flight_config.node_id = distributed::ResolveFlightExchangeNodeIdFromEnv();
@@ -1323,7 +1338,7 @@ unique_ptr<PhysicalOperator> PhysicalOperator::DeserializeOperatorData(Deseriali
 		return make_uniq<PhysicalRemoteExchangeSource>(physical_plan, std::move(types), estimated_cardinality,
 		                                               std::move(exchange_id), std::move(partition_indices),
 		                                               std::move(source_handles), std::move(exchange_mgr), source_nodes,
-		                                               runtime_source_node_id);
+		                                               runtime_source_node_id, preserve_order);
 	}
 	case PhysicalOperatorType::REPARTITION: {
 		auto repartition_type_raw = deserializer.ReadProperty<uint8_t>(103, "repartition_type");

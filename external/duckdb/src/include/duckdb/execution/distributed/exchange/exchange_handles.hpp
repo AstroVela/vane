@@ -39,6 +39,9 @@ struct ExchangeSinkHandle {
 struct ExchangeSinkInstanceHandle {
 	ExchangeSinkHandle sink_handle;
 	idx_t attempt_id = 0;
+	/// Logical input sequence for an order-preserving exchange. This is
+	/// independent of the scheduler-owned task identity above.
+	idx_t source_task_order = DConstants::INVALID_INDEX;
 	/// Query that owns this concrete attempt.
 	std::string query_id;
 	/// Implementation-specific: output directory (Spooling),

@@ -32,6 +32,10 @@ public:
 	bool Equals(const PhysicalOperator &other) const override;
 	vector<const_reference<PhysicalOperator>> GetChildren() const override;
 
+	OrderPreservationType OperatorOrder() const override {
+		return OrderPreservationType::FIXED_ORDER;
+	}
+
 public:
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                 GlobalSourceState &gstate) const override;

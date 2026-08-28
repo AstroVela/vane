@@ -106,7 +106,7 @@ void DelimJoinNode::GatherDelimScans(PhysicalOperator &op, vector<const_referenc
 			delim_scans.push_back(op);
 		}
 	}
-	for (auto &child : op.children) {
+	for (auto &child : op.GetChildren()) {
 		GatherDelimScans(child, delim_scans, delim_idx);
 	}
 }

@@ -36,6 +36,8 @@
 #include "duckdb/execution/operator/join/physical_asof_join.hpp"
 #include "duckdb/execution/operator/join/physical_blockwise_nl_join.hpp"
 #include "duckdb/execution/operator/join/physical_cross_product.hpp"
+#include "duckdb/execution/operator/join/physical_positional_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/shuffles/repartition.hpp"
 #include "duckdb/execution/operator/join/physical_iejoin.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_piecewise_merge_join.hpp"
@@ -53,6 +55,7 @@
 #include "duckdb/execution/distributed/pipeline_node/join/hash_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/broadcast_join.hpp"
 #include "duckdb/execution/distributed/pipeline_node/join/nested_loop_join.hpp"
+#include "duckdb/execution/distributed/pipeline_node/join/positional_join.hpp"
 #undef private
 
 #include <algorithm>
@@ -422,6 +425,38 @@ TEST_CASE("PhysicalPlanTranslator: translates cross product with two inputs", "[
 	REQUIRE(cross_node->config().clustering_spec()->num_partitions() == 1);
 }
 
+TEST_CASE("PhysicalPlanTranslator: translates positional join through ordered gathers",
+          "[distributed][positional_join]") {
+	Allocator allocator;
+	auto plan = std::make_shared<PhysicalPlan>(allocator);
+	vector<LogicalType> input_types = {LogicalType::BIGINT};
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+
+	auto &left = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 2,
+	                                                MakeCollection(input_types, 2));
+	auto &right = plan->Make<PhysicalColumnDataScan>(input_types, PhysicalOperatorType::COLUMN_DATA_SCAN, 3,
+	                                                 MakeCollection(input_types, 3));
+	auto &join = plan->Make<PhysicalPositionalJoin>(output_types, left, right, 3);
+	plan->SetRoot(join);
+
+	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
+	REQUIRE(result.ok);
+	REQUIRE(result.value() != nullptr);
+	auto positional_node = std::dynamic_pointer_cast<PositionalJoinNode>(result.value()->inner());
+	REQUIRE(positional_node != nullptr);
+	REQUIRE(positional_node->children().size() == 2);
+	REQUIRE(positional_node->config().clustering_spec()->num_partitions() == 1);
+	for (const auto &child : positional_node->children()) {
+		auto ordered_gather = std::dynamic_pointer_cast<RepartitionNode>(child);
+		REQUIRE(ordered_gather != nullptr);
+		REQUIRE(ordered_gather->PreservesOrder());
+		REQUIRE(ordered_gather->is_materialization_barrier());
+		auto materialized_inputs = ordered_gather->materialized_input_node_ids();
+		REQUIRE(materialized_inputs.size() == 1);
+		REQUIRE(materialized_inputs[0] == ordered_gather->children()[0]->node_id());
+	}
+}
+
 TEST_CASE("PhysicalPlanTranslator: translates ASOF joins to a gathered native worker plan",
           "[distributed][join][asof_join]") {
 	Allocator allocator;
@@ -742,6 +777,33 @@ TEST_CASE("CrossProductNode: replacement task owns both inputs", "[distributed][
 	REQUIRE(cloned->Root().GetTypes() == output_types);
 	REQUIRE(cloned->Root().children[0].get().Cast<PhysicalColumnDataScan>().collection->Count() == 1);
 	REQUIRE(cloned->Root().children[1].get().Cast<PhysicalColumnDataScan>().collection->Count() == 1);
+}
+
+TEST_CASE("PositionalJoinNode: replacement task owns both ordered inputs",
+          "[distributed][source_id][positional_join]") {
+	PlanConfig plan_cfg(1, "positional-join-query", std::make_shared<DuckDBExecutionConfig>());
+	vector<LogicalType> output_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto schema = MakeSchemaRef(output_types);
+	PositionalJoinNode node(304, plan_cfg, output_types, 3, nullptr, nullptr, schema);
+
+	auto left_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(10, "left", 10, "left_scan"));
+	auto right_task = SubmittableTask<WorkerTask>(MakeWorkerTaskWithInput(20, "right", 20, "right_scan"));
+	TaskIDCounter task_id_counter;
+	auto join_task =
+	    node.BuildPositionalJoinTask(std::move(left_task), std::move(right_task), task_id_counter, nullptr);
+
+	REQUIRE(join_task.task()->inputs().size() == 2);
+	REQUIRE(join_task.task()->inputs().at(10).scan_split_batch_bytes == "left_scan");
+	REQUIRE(join_task.task()->inputs().at(20).scan_split_batch_bytes == "right_scan");
+	REQUIRE(join_task.task()->plan()->Root().type == PhysicalOperatorType::POSITIONAL_JOIN);
+	REQUIRE(join_task.task()->plan()->Root().children.size() == 2);
+	REQUIRE(join_task.task()->plan()->Root().GetTypes() == output_types);
+
+	auto cloned = ClonePhysicalPlanOrThrow(join_task.task()->plan(), "positional_join_owned_children_test", nullptr);
+	REQUIRE(cloned->HasRoot());
+	REQUIRE(cloned->Root().type == PhysicalOperatorType::POSITIONAL_JOIN);
+	REQUIRE(cloned->Root().children.size() == 2);
+	REQUIRE(cloned->Root().GetTypes() == output_types);
 }
 
 TEST_CASE("NestedLoopJoinNode: replacement tasks own both inputs", "[distributed][source_id][nested_loop_join]") {

@@ -235,6 +235,7 @@ private:
 	struct SinkAttemptMetadata {
 		idx_t task_partition_id = 0;
 		idx_t attempt_id = 0;
+		idx_t source_task_order = DConstants::INVALID_INDEX;
 		std::string output_location;
 		std::string node_id;
 		std::string flight_host;

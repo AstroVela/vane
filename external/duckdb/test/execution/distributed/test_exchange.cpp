@@ -1997,6 +1997,75 @@ TEST_CASE("Exchange: FlightExchange with no sinks has no unpublished source hand
 	exchange->Close();
 }
 
+TEST_CASE("Exchange: ordered Flight source handles use logical source order", "[distributed][exchange][order]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config;
+	config.node_id = "ordered-coordinator";
+	config.local_dirs = {TestCreatePath("exchange_ordered_handles")};
+	FlightExchangeManager manager(config, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "ordered-query";
+	ctx.exchange_id = "ordered-exchange";
+	auto exchange = manager.CreateExchange(ctx, 1);
+	auto last = exchange->InstantiateSink(exchange->AddSink(101), 0);
+	auto first = exchange->InstantiateSink(exchange->AddSink(202), 0);
+	auto middle = exchange->InstantiateSink(exchange->AddSink(303), 0);
+	last.source_task_order = 2;
+	first.source_task_order = 0;
+	middle.source_task_order = 1;
+	last.flight_host = "ordered-last.internal";
+	first.flight_host = "ordered-first.internal";
+	middle.flight_host = "ordered-middle.internal";
+	last.flight_server_epoch = "ordered-last-epoch";
+	first.flight_server_epoch = "ordered-first-epoch";
+	middle.flight_server_epoch = "ordered-middle-epoch";
+
+	// Completion order is deliberately unrelated to logical input order.
+	exchange->SinkFinished(last, "ordered-last", 5101);
+	exchange->SinkFinished(first, "ordered-first", 5102);
+	exchange->SinkFinished(middle, "ordered-middle", 5103);
+	exchange->AllRequiredSinksFinished();
+
+	auto handles = exchange->GetSourceHandles();
+	REQUIRE(handles.size() == 3);
+	REQUIRE(handles[0].source_task_partition_id == 202);
+	REQUIRE(handles[1].source_task_partition_id == 303);
+	REQUIRE(handles[2].source_task_partition_id == 101);
+	exchange->Close();
+}
+
+TEST_CASE("Exchange: ordered Flight source handles reject duplicate logical order", "[distributed][exchange][order]") {
+	DuckDB db(nullptr);
+	Connection conn(db);
+
+	FlightExchangeConfig config;
+	config.node_id = "ordered-duplicate-coordinator";
+	config.local_dirs = {TestCreatePath("exchange_ordered_duplicate_handles")};
+	FlightExchangeManager manager(config, conn.context.get());
+
+	ExchangeContext ctx;
+	ctx.query_id = "ordered-duplicate-query";
+	ctx.exchange_id = "ordered-duplicate-exchange";
+	auto exchange = manager.CreateExchange(ctx, 1);
+	auto first = exchange->InstantiateSink(exchange->AddSink(101), 0);
+	auto duplicate = exchange->InstantiateSink(exchange->AddSink(202), 0);
+	first.source_task_order = 0;
+	duplicate.source_task_order = 0;
+	first.flight_host = "ordered-first.internal";
+	duplicate.flight_host = "ordered-duplicate.internal";
+	first.flight_server_epoch = "ordered-first-epoch";
+	duplicate.flight_server_epoch = "ordered-duplicate-epoch";
+
+	exchange->SinkFinished(first, "ordered-first", 5101);
+	exchange->SinkFinished(duplicate, "ordered-duplicate", 5102);
+	exchange->AllRequiredSinksFinished();
+	REQUIRE_THROWS_WITH(exchange->GetSourceHandles(), Catch::Matchers::Contains("duplicate source task ordering"));
+	exchange->Close();
+}
+
 TEST_CASE("Exchange: FlightExchange reduces MARK build summaries from selected attempts only",
           "[distributed][exchange][join]") {
 	DuckDB db(nullptr);

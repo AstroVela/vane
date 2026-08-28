@@ -68,7 +68,11 @@ idx_t ResolveRemoteExchangeMaxThreads(ClientContext &context,
                                       const std::vector<distributed::ExchangeSourceHandle> &source_handles,
                                       const vector<idx_t> &partition_indices, idx_t source_partition_count,
                                       idx_t source_task_count,
-                                      const std::shared_ptr<distributed::FteSplitQueue> &runtime_split_queue) {
+                                      const std::shared_ptr<distributed::FteSplitQueue> &runtime_split_queue,
+                                      bool preserve_order) {
+	if (preserve_order) {
+		return 1;
+	}
 	idx_t max_threads = 1;
 	auto consider = [&](idx_t value) {
 		if (value > 0) {
@@ -170,11 +174,11 @@ PhysicalRemoteExchangeSource::PhysicalRemoteExchangeSource(
     PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality, std::string exchange_id,
     vector<idx_t> partition_indices, std::vector<distributed::ExchangeSourceHandle> source_handles,
     std::shared_ptr<distributed::ExchangeManager> exchange_mgr, const vector<std::string> &source_nodes,
-    optional_idx runtime_source_node_id)
+    optional_idx runtime_source_node_id, bool preserve_order)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXCHANGE_SOURCE, std::move(types), estimated_cardinality),
       exchange_id_(std::move(exchange_id)), partition_indices_(std::move(partition_indices)),
       source_handles_(std::move(source_handles)), exchange_mgr_(std::move(exchange_mgr)), source_nodes_(source_nodes),
-      runtime_source_node_id_(runtime_source_node_id) {
+      runtime_source_node_id_(runtime_source_node_id), preserve_order_(preserve_order) {
 	if (!exchange_mgr_) {
 		throw InvalidInputException("remote exchange source requires a non-null ExchangeManager");
 	}
@@ -204,7 +208,7 @@ unique_ptr<GlobalSourceState> PhysicalRemoteExchangeSource::GetGlobalSourceState
 	exchange_mgr_->SetContext(&context);
 	auto max_threads =
 	    ResolveRemoteExchangeMaxThreads(context, source_handles_, partition_indices_, runtime_source_partition_count_,
-	                                    runtime_source_task_count_, runtime_split_queue_);
+	                                    runtime_source_task_count_, runtime_split_queue_, preserve_order_);
 	return make_uniq<RemoteSourceGlobalState>(exchange_mgr_, source_handles_, runtime_split_queue_, max_threads);
 }
 
@@ -301,6 +305,7 @@ InsertionOrderPreservingMap<string> PhysicalRemoteExchangeSource::ParamsToString
 	}
 	result["partition_indices"] = parts_str;
 	result["type"] = "remote_exchange";
+	result["preserve_order"] = preserve_order_ ? "true" : "false";
 	return result;
 }
 
@@ -353,6 +358,7 @@ void PhysicalRemoteExchangeSource::SerializeOperatorData(Serializer &serializer)
 	serializer.WriteProperty(115, "source_catalog_handles_explicit", true);
 	serializer.WriteProperty(116, "source_handle_flight_hosts", handle_flight_hosts);
 	serializer.WriteProperty(117, "source_handle_task_partition_ids", handle_source_task_partition_ids);
+	serializer.WritePropertyWithDefault<bool>(118, "preserve_order", preserve_order_, false);
 }
 
 } // namespace duckdb
