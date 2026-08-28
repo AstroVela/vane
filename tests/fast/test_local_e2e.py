@@ -451,7 +451,7 @@ def test_local_runner_arrow_native_parquet_rejects_schema_changes_across_rotated
             # Keep the incompatible schemas in separate task results and Arrow streams.
             task_input_max_bytes=1,
         )
-        with pytest.raises(ValueError, match="Arrow schema changed during Arrow-native Parquet COPY"):
+        with pytest.raises(vane.InvalidInputException, match="Arrow schema changed during Arrow-native Parquet COPY"):
             relation.query(
                 "arrow_schema_rotation",
                 f"COPY arrow_schema_rotation TO '{escaped_output}' "
