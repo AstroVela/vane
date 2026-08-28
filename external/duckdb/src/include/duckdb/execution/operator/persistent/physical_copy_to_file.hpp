@@ -108,7 +108,7 @@ public:
 
 private:
 	template <class INPUT>
-	SinkResultType SinkInternal(ExecutionContext &context, INPUT &copy_input, OperatorSinkInput &input) const;
+	idx_t SinkInternal(ExecutionContext &context, INPUT &copy_input, OperatorSinkInput &input) const;
 
 	unique_ptr<GlobalFunctionData> CreateFileState(ClientContext &context, GlobalSinkState &sink,
 	                                               StorageLockKey &global_lock) const;

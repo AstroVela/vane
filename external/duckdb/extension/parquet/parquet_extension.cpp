@@ -41,6 +41,7 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -88,6 +89,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	//! This is huge but we grow it starting from 1 MB
 	idx_t string_dictionary_page_size_limit = PrimitiveColumnWriter::MAX_UNCOMPRESSED_DICT_PAGE_SIZE;
+	bool string_dictionary_page_size_limit_set = false;
 
 	bool enable_bloom_filters = true;
 	//! What false positive rate are we willing to accept for bloom filters
@@ -118,6 +120,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 		result->encryption_config = encryption_config;
 		result->dictionary_size_limit = dictionary_size_limit;
 		result->string_dictionary_page_size_limit = string_dictionary_page_size_limit;
+		result->string_dictionary_page_size_limit_set = string_dictionary_page_size_limit_set;
 		result->enable_bloom_filters = enable_bloom_filters;
 		result->bloom_filter_false_positive_ratio = bloom_filter_false_positive_ratio;
 		result->row_groups_per_file = row_groups_per_file;
@@ -335,6 +338,7 @@ static unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFun
 				    PrimitiveColumnWriter::MAX_UNCOMPRESSED_DICT_PAGE_SIZE);
 			}
 			bind_data->string_dictionary_page_size_limit = val;
+			bind_data->string_dictionary_page_size_limit_set = true;
 		} else if (loption == "write_bloom_filter") {
 			bind_data->enable_bloom_filters = BooleanValue::Get(option.second[0].DefaultCastAs(LogicalType::BOOLEAN));
 		} else if (loption == "bloom_filter_false_positive_ratio") {
@@ -467,9 +471,17 @@ static void ParquetWriteSink(ExecutionContext &context, FunctionData &bind_data_
 	}
 }
 
-static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data) {
+static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data,
+                                        const ParquetWriteGlobalState &global_state) {
+	if (global_state.op && global_state.op->type == PhysicalOperatorType::COPY_TO_FILE &&
+	    global_state.op->Cast<PhysicalCopyToFile>().file_size_bytes.IsValid()) {
+		throw NotImplementedException("FILE_SIZE_BYTES is not supported by Arrow-native Parquet COPY");
+	}
 	if (bind_data.row_group_size == 0) {
 		throw InvalidInputException("ROW_GROUP_SIZE must be greater than zero for Arrow-native Parquet COPY");
+	}
+	if (bind_data.row_groups_per_file.IsValid() && bind_data.row_groups_per_file.GetIndex() == 0) {
+		throw InvalidInputException("ROW_GROUPS_PER_FILE must be greater than zero for Arrow-native Parquet COPY");
 	}
 	if (bind_data.row_group_size_bytes != NumericLimits<idx_t>::Maximum()) {
 		throw NotImplementedException("ROW_GROUP_SIZE_BYTES is not supported by Arrow-native Parquet COPY");
@@ -487,10 +499,28 @@ static void ValidateArrowParquetOptions(const ParquetWriteBindData &bind_data) {
 	if (bind_data.dictionary_size_limit.IsValid() && bind_data.dictionary_size_limit.GetIndex() != 0) {
 		throw NotImplementedException("A positive DICTIONARY_SIZE_LIMIT is not supported by Arrow-native Parquet COPY");
 	}
+	if (bind_data.string_dictionary_page_size_limit_set) {
+		throw NotImplementedException(
+		    "STRING_DICTIONARY_PAGE_SIZE_LIMIT is not supported by Arrow-native Parquet COPY");
+	}
 	if (bind_data.parquet_version == ParquetVersion::V2) {
 		throw NotImplementedException("PARQUET_VERSION V2 is not supported by Arrow-native Parquet COPY");
 	}
 	for (const auto &type : bind_data.sql_types) {
+		if (TypeVisitor::Contains(type, LogicalTypeId::HUGEINT) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::UHUGEINT) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::TIME_TZ)) {
+			throw NotImplementedException(
+			    "HUGEINT, UHUGEINT, and TIME WITH TIME ZONE are not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::INTERVAL) || TypeVisitor::Contains(type, LogicalTypeId::UNION)) {
+			throw NotImplementedException("INTERVAL and UNION are not supported by Arrow-native Parquet COPY");
+		}
+		if (TypeVisitor::Contains(type, LogicalTypeId::BIT) || TypeVisitor::Contains(type, LogicalTypeId::BIGNUM) ||
+		    TypeVisitor::Contains(type, LogicalTypeId::AGGREGATE_STATE)) {
+			throw NotImplementedException(
+			    "BIT, BIGNUM, and AGGREGATE_STATE are not supported by Arrow-native Parquet COPY");
+		}
 		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT)) {
 			throw NotImplementedException("VARIANT is not supported by Arrow-native Parquet COPY");
 		}
@@ -504,22 +534,22 @@ static ArrowParquetWriterOptions GetArrowParquetWriterOptions(const ParquetWrite
 	ArrowParquetWriterOptions result;
 	result.codec = bind_data.codec;
 	result.row_group_size = bind_data.row_group_size;
-	result.dictionary_page_size_limit = bind_data.string_dictionary_page_size_limit;
 	result.disable_dictionary =
 	    bind_data.dictionary_size_limit.IsValid() && bind_data.dictionary_size_limit.GetIndex() == 0;
 	result.enable_bloom_filters = bind_data.enable_bloom_filters && !result.disable_dictionary;
 	result.bloom_filter_false_positive_ratio = bind_data.bloom_filter_false_positive_ratio;
 	result.compression_level = bind_data.compression_level;
 	result.key_value_metadata = bind_data.kv_metadata;
+	result.sql_types = bind_data.sql_types;
 	return result;
 }
 
-static void ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
-                                  LocalFunctionData &lstate, CopyFunctionArrowInput &input) {
+static idx_t ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
+                                   LocalFunctionData &lstate, CopyFunctionArrowInput &input) {
 	auto &bind_data = bind_data_p.Cast<ParquetWriteBindData>();
 	auto &global_state = gstate.Cast<ParquetWriteGlobalState>();
 	auto &local_state = lstate.Cast<ParquetWriteLocalState>();
-	ValidateArrowParquetOptions(bind_data);
+	ValidateArrowParquetOptions(bind_data, global_state);
 	if (input.types != bind_data.sql_types) {
 		throw InvalidInputException("Arrow Parquet input types do not match the bound COPY schema");
 	}
@@ -572,7 +602,9 @@ static void ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind_
 			global_state.arrow_writer->SetWrittenStatistics(*global_state.written_stats);
 		}
 	}
-	global_state.arrow_writer->Write(arrow_state, input.offset, input.cardinality);
+	auto cardinality = MinValue<idx_t>(input.cardinality, global_state.arrow_writer->RowsUntilRowGroupBoundary());
+	global_state.arrow_writer->Write(arrow_state, input.offset, cardinality);
+	return cardinality;
 }
 
 static void ParquetWriteCombine(ExecutionContext &context, FunctionData &bind_data_p, GlobalFunctionData &gstate,
@@ -811,6 +843,11 @@ static void ParquetCopySerialize(Serializer &serializer, const FunctionData &bin
 	                                    default_value.geoparquet_version);
 	serializer.WritePropertyWithDefault<ShreddingType>(117, "shredding_types", bind_data.shredding_types,
 	                                                   default_value.shredding_types);
+	serializer.WritePropertyWithDefault(118, "string_dictionary_page_size_limit_set",
+	                                    bind_data.string_dictionary_page_size_limit_set,
+	                                    default_value.string_dictionary_page_size_limit_set);
+	serializer.WritePropertyWithDefault(119, "enable_bloom_filters", bind_data.enable_bloom_filters,
+	                                    default_value.enable_bloom_filters);
 }
 
 static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserializer, CopyFunction &function) {
@@ -846,6 +883,10 @@ static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserialize
 	    deserializer.ReadPropertyWithExplicitDefault(116, "geoparquet_version", default_value.geoparquet_version);
 	data->shredding_types =
 	    deserializer.ReadPropertyWithExplicitDefault<ShreddingType>(117, "shredding_types", ShreddingType());
+	data->string_dictionary_page_size_limit_set = deserializer.ReadPropertyWithExplicitDefault(
+	    118, "string_dictionary_page_size_limit_set", default_value.string_dictionary_page_size_limit_set);
+	data->enable_bloom_filters =
+	    deserializer.ReadPropertyWithExplicitDefault(119, "enable_bloom_filters", default_value.enable_bloom_filters);
 
 	return std::move(data);
 }

@@ -140,6 +140,7 @@ struct CopyFunctionArrowInput {
 	const vector<LogicalType> &types;
 	const vector<string> &names;
 	idx_t offset;
+	//! Maximum number of rows available to this sink invocation.
 	idx_t cardinality;
 	bool new_stream;
 	bool new_batch;
@@ -156,8 +157,9 @@ typedef unique_ptr<GlobalFunctionData> (*copy_to_initialize_global_t)(ClientCont
                                                                       const string &file_path);
 typedef void (*copy_to_sink_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                LocalFunctionData &lstate, DataChunk &input);
-typedef void (*copy_to_sink_arrow_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
-                                     LocalFunctionData &lstate, CopyFunctionArrowInput &input);
+//! Consumes at least one and at most input.cardinality rows, and returns the consumed row count.
+typedef idx_t (*copy_to_sink_arrow_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
+                                      LocalFunctionData &lstate, CopyFunctionArrowInput &input);
 typedef void (*copy_to_combine_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                   LocalFunctionData &lstate);
 typedef void (*copy_to_finalize_t)(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate);

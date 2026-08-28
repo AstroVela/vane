@@ -6,6 +6,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/types.hpp"
 #include "parquet_types.h"
 
 namespace duckdb {
@@ -16,12 +17,12 @@ struct CopyFunctionFileStatistics;
 struct ArrowParquetWriterOptions {
 	duckdb_parquet::CompressionCodec::type codec;
 	idx_t row_group_size;
-	idx_t dictionary_page_size_limit;
 	bool disable_dictionary;
 	bool enable_bloom_filters;
 	double bloom_filter_false_positive_ratio;
 	int64_t compression_level;
 	vector<pair<string, string>> key_value_metadata;
+	vector<LogicalType> sql_types;
 };
 
 //! Owns the Arrow C Data objects imported for one local COPY stream.
@@ -52,6 +53,7 @@ public:
 	void Finalize();
 	idx_t FileSize() const;
 	idx_t NumberOfRowGroups() const;
+	idx_t RowsUntilRowGroupBoundary() const;
 
 private:
 	struct Impl;

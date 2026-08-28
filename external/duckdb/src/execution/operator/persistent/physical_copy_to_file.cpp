@@ -606,9 +606,10 @@ public:
 		return chunk.size();
 	}
 
-	void Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
-	           LocalFunctionData &lstate) {
+	idx_t Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
+	            LocalFunctionData &lstate) {
 		op.function.copy_to_sink(context, *op.bind_data, gstate, lstate, chunk);
+		return chunk.size();
 	}
 
 	void AppendToPartition(ExecutionContext &context, const PhysicalCopyToFile &op, CopyToFunctionGlobalState &gstate,
@@ -632,9 +633,9 @@ public:
 		return input.cardinality;
 	}
 
-	void Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
-	           LocalFunctionData &lstate) {
-		op.function.copy_to_sink_arrow(context, *op.bind_data, gstate, lstate, input);
+	idx_t Write(ExecutionContext &context, const PhysicalCopyToFile &op, GlobalFunctionData &gstate,
+	            LocalFunctionData &lstate) {
+		return op.function.copy_to_sink_arrow(context, *op.bind_data, gstate, lstate, input);
 	}
 
 	void AppendToPartition(ExecutionContext &, const PhysicalCopyToFile &, CopyToFunctionGlobalState &,
@@ -649,8 +650,7 @@ private:
 } // namespace
 
 template <class INPUT>
-SinkResultType PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT &copy_input,
-                                                OperatorSinkInput &input) const {
+idx_t PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT &copy_input, OperatorSinkInput &input) const {
 	auto &g = input.global_state.Cast<CopyToFunctionGlobalState>();
 	auto &l = input.local_state.Cast<CopyToFunctionLocalState>();
 
@@ -658,12 +658,19 @@ SinkResultType PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT
 		// if we are only writing the file when there are rows to write we need to initialize here
 		g.Initialize(context.client, *this);
 	}
-	l.total_rows_copied += copy_input.Count();
-
 	if (partition_output) {
 		copy_input.AppendToPartition(context, *this, g, l);
-		return SinkResultType::NEED_MORE_INPUT;
+		l.total_rows_copied += copy_input.Count();
+		return copy_input.Count();
 	}
+	idx_t consumed = 0;
+	auto write_input = [&](GlobalFunctionData &gstate) {
+		consumed = copy_input.Write(context, *this, gstate, *l.local_state);
+		if ((consumed == 0 && copy_input.Count() != 0) || consumed > copy_input.Count()) {
+			throw InternalException("COPY sink consumed %d rows from an input containing %d rows", consumed,
+			                        copy_input.Count());
+		}
+	};
 
 	if (per_thread_output) {
 		auto &gstate = l.global_state;
@@ -676,24 +683,27 @@ SinkResultType PhysicalCopyToFile::SinkInternal(ExecutionContext &context, INPUT
 			auto global_lock = g.lock.GetExclusiveLock();
 			gstate = CreateFileState(context.client, *sink_state, *global_lock);
 		}
-		copy_input.Write(context, *this, *gstate, *l.local_state);
-		return SinkResultType::NEED_MORE_INPUT;
+		write_input(*gstate);
+		l.total_rows_copied += consumed;
+		return consumed;
 	}
 
 	if (!file_size_bytes.IsValid() && !rotate) {
-		copy_input.Write(context, *this, *g.global_state, *l.local_state);
-		return SinkResultType::NEED_MORE_INPUT;
+		write_input(*g.global_state);
+		l.total_rows_copied += consumed;
+		return consumed;
 	}
 
-	WriteRotateInternal(context, input.global_state,
-	                    [&](GlobalFunctionData &gstate) { copy_input.Write(context, *this, gstate, *l.local_state); });
+	WriteRotateInternal(context, input.global_state, write_input);
 
-	return SinkResultType::NEED_MORE_INPUT;
+	l.total_rows_copied += consumed;
+	return consumed;
 }
 
 SinkResultType PhysicalCopyToFile::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	DataChunkCopyInput copy_input(chunk);
-	return SinkInternal(context, copy_input, input);
+	SinkInternal(context, copy_input, input);
+	return SinkResultType::NEED_MORE_INPUT;
 }
 
 SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, ExecutionBatch &batch,
@@ -765,9 +775,9 @@ SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, Executio
 		for (idx_t offset = 0; offset < array_rows;) {
 			auto count = MinValue<idx_t>(max_slice_size, array_rows - offset);
 			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice, offset == 0);
-			SinkInternal(context, copy_input, input);
+			auto consumed = SinkInternal(context, copy_input, input);
 			first_slice = false;
-			offset += count;
+			offset += consumed;
 		}
 		rows_written += array_rows;
 	}
