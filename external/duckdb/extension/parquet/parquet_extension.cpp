@@ -1062,9 +1062,6 @@ static vector<unique_ptr<Expression>> ParquetWriteSelect(CopyToSelectInput &inpu
 	for (auto &expr : input.select_list) {
 		const auto &type = expr->return_type;
 		const auto &name = expr->GetAlias();
-		if (input.copy_to_type == CopyToType::COPY_TO_FILE) {
-			RejectUnsupportedParquetTimeNs(type);
-		}
 
 		// Spatial types need to be encoded into WKB when writing GeoParquet.
 		// But dont perform this conversion if this is a EXPORT DATABASE statement

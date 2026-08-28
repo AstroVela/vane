@@ -12,6 +12,7 @@
 #include "duckdb/common/filename_pattern.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/relation.hpp"
@@ -23,10 +24,15 @@
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_copy_to_file.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_local_exchange.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_udf_project.hpp"
 #include "duckdb/planner/expression_binder/table_function_binder.hpp"
 #include "duckdb/common/algorithm.hpp"
 
@@ -36,6 +42,93 @@ namespace duckdb {
 
 static bool GetBooleanArg(ClientContext &context, const vector<Value> &arg) {
 	return arg.empty() || arg[0].CastAs(context, LogicalType::BOOLEAN).GetValue<bool>();
+}
+
+static bool UDFPayloadBoolFlag(const Value &payload, const string &name) {
+	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	auto &children = StructValue::GetChildren(payload);
+	auto child_count = StructType::GetChildCount(payload.type());
+	for (idx_t i = 0; i < child_count; i++) {
+		if (StructType::GetChildName(payload.type(), i) != name || i >= children.size() || children[i].IsNull()) {
+			continue;
+		}
+		return children[i].type().id() == LogicalTypeId::BOOLEAN && BooleanValue::Get(children[i]);
+	}
+	return false;
+}
+
+static bool IsStrictLazyUDFExpression(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if (!function.bind_info) {
+		return false;
+	}
+	auto bind_data = dynamic_cast<const UDFFunctionData *>(function.bind_info.get());
+	if (!bind_data) {
+		return false;
+	}
+	return UDFPayloadBoolFlag(bind_data->payload, "produce_ref_bundle_output") ||
+	       UDFPayloadBoolFlag(bind_data->payload, "produce_ray_block_stream");
+}
+
+static bool IsDirectColumnReference(const Expression &expr) {
+	return expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF;
+}
+
+static bool IsLazyStructExtract(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if (!StringUtil::CIEquals(function.function.name, "struct_extract") || function.children.size() != 2 ||
+	    function.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+	    function.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &ref = function.children[0]->Cast<BoundColumnRefExpression>();
+	return ref.binding.column_index == 0;
+}
+
+static bool CopyInputProducesStrictLazyBatch(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		bool has_lazy_udf = false;
+		bool all_direct_refs = true;
+		bool all_struct_extracts = true;
+		for (const auto &expr : op.expressions) {
+			if (IsStrictLazyUDFExpression(*expr)) {
+				has_lazy_udf = true;
+				all_struct_extracts = false;
+				continue;
+			}
+			all_direct_refs = all_direct_refs && IsDirectColumnReference(*expr);
+			all_struct_extracts = all_struct_extracts && IsLazyStructExtract(*expr);
+		}
+		if (has_lazy_udf) {
+			return all_direct_refs;
+		}
+		return (all_direct_refs || all_struct_extracts) && op.children.size() == 1 &&
+		       CopyInputProducesStrictLazyBatch(*op.children[0]);
+	}
+	case LogicalOperatorType::LOGICAL_UDF_PROJECT: {
+		auto &udf = op.Cast<LogicalUDFProject>();
+		return IsStrictLazyUDFExpression(*udf.udf_expr);
+	}
+	case LogicalOperatorType::LOGICAL_LOCAL_EXCHANGE: {
+		auto &exchange = op.Cast<LogicalLocalExchange>();
+		if (exchange.repartition_spec && exchange.repartition_spec->type() != RepartitionSpec::Type::Random &&
+		    exchange.repartition_spec->type() != RepartitionSpec::Type::IntoPartitions) {
+			return false;
+		}
+		return op.children.size() == 1 && CopyInputProducesStrictLazyBatch(*op.children[0]);
+	}
+	default:
+		return false;
+	}
 }
 
 void IsFormatExtensionKnown(const string &format) {
@@ -261,8 +354,11 @@ BoundStatement Binder::BindCopyTo(CopyStatement &stmt, const CopyFunction &funct
 		}
 	}
 
+	// Arrow sinks consume strict lazy batches in their original physical schema. A copy_to_select projection is a
+	// DataChunk rewrite and would materialize the batch before it can reach the Arrow sink.
+	const bool use_arrow_sink = function.copy_to_sink_arrow && CopyInputProducesStrictLazyBatch(*select_node.plan);
 	// Allow the copy function to intercept the select list and types and push a new projection on top of the plan
-	if (function.copy_to_select) {
+	if (function.copy_to_select && !use_arrow_sink) {
 		auto bindings = select_node.plan->GetColumnBindings();
 
 		CopyToSelectInput input = {context, stmt.info->options, {}, copy_to_type};
