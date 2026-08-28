@@ -5,6 +5,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -584,6 +585,31 @@ void ArrowParquetLocalState::ImportRecordBatch(ArrowArray &array) {
 		ThrowArrowInputError(imported.status(), "import the Arrow record batch");
 	}
 	impl->record_batch = std::move(imported).ValueUnsafe();
+}
+
+struct ArrowParquetSchemaState::Impl {
+	mutex lock;
+	std::shared_ptr<::arrow::Schema> schema;
+};
+
+ArrowParquetSchemaState::ArrowParquetSchemaState() : impl(make_uniq<Impl>()) {
+}
+
+ArrowParquetSchemaState::~ArrowParquetSchemaState() = default;
+
+void ArrowParquetSchemaState::Validate(const ArrowParquetLocalState &local_state) {
+	auto &local = *local_state.impl;
+	if (!local.schema) {
+		throw InternalException("Cannot validate an uninitialized Arrow-native Parquet schema");
+	}
+	lock_guard<mutex> guard(impl->lock);
+	if (!impl->schema) {
+		impl->schema = local.schema;
+		return;
+	}
+	if (!impl->schema->Equals(*local.schema, false)) {
+		throw InvalidInputException("Arrow schema changed during Arrow-native Parquet COPY");
+	}
 }
 
 struct ArrowParquetWriter::Impl {

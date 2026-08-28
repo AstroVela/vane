@@ -133,6 +133,10 @@ struct ParquetWriteBindData : public TableFunctionData {
 	}
 };
 
+struct ParquetWriteArrowGlobalState : public GlobalFunctionData {
+	ArrowParquetSchemaState schema_state;
+};
+
 void ParquetWriteGlobalState::LogFlushingRowGroup(const ColumnDataCollection &buffer, const string &reason) {
 	if (!op) {
 		return;
@@ -404,6 +408,10 @@ static unique_ptr<GlobalFunctionData> ParquetWriteInitializeGlobal(ClientContext
 	return make_uniq<ParquetWriteGlobalState>(context, fs, file_path);
 }
 
+static unique_ptr<GlobalFunctionData> ParquetWriteInitializeArrowGlobal(ClientContext &, FunctionData &) {
+	return make_uniq<ParquetWriteArrowGlobalState>();
+}
+
 static ParquetWriter &GetDuckDBParquetWriter(ParquetWriteGlobalState &global_state, ParquetWriteBindData &bind_data) {
 	lock_guard<mutex> guard(global_state.lock);
 	if (global_state.arrow_writer) {
@@ -571,6 +579,7 @@ static idx_t ParquetWriteArrowSink(ExecutionContext &context, FunctionData &bind
 		}
 		local_state.arrow_state = make_uniq<ArrowParquetLocalState>();
 		local_state.arrow_state->ImportSchema(input.schema, bind_data.column_names);
+		input.copy_state.Cast<ParquetWriteArrowGlobalState>().schema_state.Validate(*local_state.arrow_state);
 	}
 	if (!local_state.arrow_state) {
 		throw InternalException("Arrow Parquet sink received a record batch without stream state");
@@ -1142,6 +1151,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	function.copy_to_bind = ParquetWriteBind;
 	function.copy_options = ParquetListCopyOptions;
 	function.copy_to_initialize_global = ParquetWriteInitializeGlobal;
+	function.copy_to_initialize_arrow_global = ParquetWriteInitializeArrowGlobal;
 	function.copy_to_initialize_local = ParquetWriteInitializeLocal;
 	function.copy_to_get_written_statistics = ParquetWriteGetWrittenStatistics;
 	function.copy_to_sink = ParquetWriteSink;

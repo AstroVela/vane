@@ -57,10 +57,13 @@ using vector_of_value_map_t = unordered_map<vector<Value>, T, VectorOfValuesHash
 
 class CopyToFunctionGlobalState : public GlobalSinkState {
 public:
-	explicit CopyToFunctionGlobalState(ClientContext &context_p)
+	CopyToFunctionGlobalState(ClientContext &context_p, const PhysicalCopyToFile &op)
 	    : context(context_p), finalized(false), initialized(false), rows_copied(0), last_file_offset(0),
 	      file_write_lock_if_rotating(make_uniq<StorageLock>()) {
 		max_open_files = Settings::Get<PartitionedWriteMaxOpenFilesSetting>(context);
+		if (op.function.copy_to_initialize_arrow_global) {
+			arrow_global_state = op.function.copy_to_initialize_arrow_global(context, *op.bind_data);
+		}
 	}
 	~CopyToFunctionGlobalState() override;
 
@@ -75,6 +78,7 @@ public:
 	atomic<idx_t> rows_copied;
 	atomic<idx_t> last_file_offset;
 	unique_ptr<GlobalFunctionData> global_state;
+	unique_ptr<GlobalFunctionData> arrow_global_state;
 	//! Created directories
 	unordered_set<string> created_directories;
 	//! shared state for HivePartitionedColumnData
@@ -475,7 +479,7 @@ unique_ptr<GlobalSinkState> PhysicalCopyToFile::GetGlobalSinkState(ClientContext
 			CheckDirectory(fs, file_path, overwrite_mode);
 		}
 
-		auto state = make_uniq<CopyToFunctionGlobalState>(context);
+		auto state = make_uniq<CopyToFunctionGlobalState>(context, *this);
 		if (!per_thread_output && rotate && write_empty_file) {
 			auto global_lock = state->lock.GetExclusiveLock();
 			state->global_state = CreateFileState(context, *state, *global_lock);
@@ -488,7 +492,7 @@ unique_ptr<GlobalSinkState> PhysicalCopyToFile::GetGlobalSinkState(ClientContext
 		return std::move(state);
 	}
 
-	auto state = make_uniq<CopyToFunctionGlobalState>(context);
+	auto state = make_uniq<CopyToFunctionGlobalState>(context, *this);
 	if (write_empty_file) {
 		// if we are writing the file also if it is empty - initialize now
 		state->Initialize(context, *this);
@@ -624,9 +628,9 @@ private:
 class ArrowCopyInput {
 public:
 	ArrowCopyInput(ArrowSchema &schema, shared_ptr<ArrowArrayWrapper> array, const LazyDataChunk &chunk, idx_t offset,
-	               idx_t cardinality, bool new_stream, bool new_batch)
-	    : input(schema, std::move(array), chunk.logical_types, chunk.names, offset, cardinality, new_stream,
-	            new_batch) {
+	               idx_t cardinality, bool new_stream, bool new_batch, GlobalFunctionData &copy_state)
+	    : input(schema, std::move(array), chunk.logical_types, chunk.names, offset, cardinality, new_stream, new_batch,
+	            copy_state) {
 	}
 
 	idx_t Count() const {
@@ -732,6 +736,10 @@ SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, Executio
 	if (!function.copy_to_sink_arrow) {
 		throw NotImplementedException("COPY format '%s' does not support Arrow input", function.name);
 	}
+	auto &copy_global_state = input.global_state.Cast<CopyToFunctionGlobalState>();
+	if (!copy_global_state.arrow_global_state) {
+		throw InternalException("COPY format '%s' did not initialize Arrow global state", function.name);
+	}
 	if (partition_output) {
 		throw NotImplementedException("Arrow COPY input does not support PARTITION_BY");
 	}
@@ -774,7 +782,8 @@ SinkResultType PhysicalCopyToFile::SinkBatch(ExecutionContext &context, Executio
 
 		for (idx_t offset = 0; offset < array_rows;) {
 			auto count = MinValue<idx_t>(max_slice_size, array_rows - offset);
-			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice, offset == 0);
+			ArrowCopyInput copy_input(schema.arrow_schema, array, *batch.lazy, offset, count, first_slice, offset == 0,
+			                          *copy_global_state.arrow_global_state);
 			auto consumed = SinkInternal(context, copy_input, input);
 			first_slice = false;
 			offset += consumed;

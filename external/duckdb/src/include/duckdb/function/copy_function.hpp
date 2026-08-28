@@ -128,9 +128,9 @@ struct CopyOptionsInput {
 struct CopyFunctionArrowInput {
 	CopyFunctionArrowInput(ArrowSchema &schema_p, shared_ptr<ArrowArrayWrapper> array_p,
 	                       const vector<LogicalType> &types_p, const vector<string> &names_p, idx_t offset_p,
-	                       idx_t cardinality_p, bool new_stream_p, bool new_batch_p)
+	                       idx_t cardinality_p, bool new_stream_p, bool new_batch_p, GlobalFunctionData &copy_state_p)
 	    : schema(schema_p), array(std::move(array_p)), types(types_p), names(names_p), offset(offset_p),
-	      cardinality(cardinality_p), new_stream(new_stream_p), new_batch(new_batch_p) {
+	      cardinality(cardinality_p), new_stream(new_stream_p), new_batch(new_batch_p), copy_state(copy_state_p) {
 	}
 
 	//! The sink may consume the schema when new_stream is true.
@@ -144,6 +144,8 @@ struct CopyFunctionArrowInput {
 	idx_t cardinality;
 	bool new_stream;
 	bool new_batch;
+	//! State scoped to the complete COPY execution and shared across rotated files.
+	GlobalFunctionData &copy_state;
 };
 
 enum class CopyFunctionExecutionMode { REGULAR_COPY_TO_FILE, PARALLEL_COPY_TO_FILE, BATCH_COPY_TO_FILE };
@@ -155,6 +157,8 @@ typedef unique_ptr<FunctionData> (*copy_to_bind_t)(ClientContext &context, CopyF
 typedef unique_ptr<LocalFunctionData> (*copy_to_initialize_local_t)(ExecutionContext &context, FunctionData &bind_data);
 typedef unique_ptr<GlobalFunctionData> (*copy_to_initialize_global_t)(ClientContext &context, FunctionData &bind_data,
                                                                       const string &file_path);
+typedef unique_ptr<GlobalFunctionData> (*copy_to_initialize_arrow_global_t)(ClientContext &context,
+                                                                            FunctionData &bind_data);
 typedef void (*copy_to_sink_t)(ExecutionContext &context, FunctionData &bind_data, GlobalFunctionData &gstate,
                                LocalFunctionData &lstate, DataChunk &input);
 //! Consumes at least one and at most input.cardinality rows, and returns the consumed row count.
@@ -220,6 +224,7 @@ public:
 	copy_options_t copy_options;
 	copy_to_initialize_local_t copy_to_initialize_local;
 	copy_to_initialize_global_t copy_to_initialize_global;
+	copy_to_initialize_arrow_global_t copy_to_initialize_arrow_global;
 	copy_to_get_written_statistics_t copy_to_get_written_statistics;
 	copy_to_sink_t copy_to_sink;
 	copy_to_sink_arrow_t copy_to_sink_arrow;

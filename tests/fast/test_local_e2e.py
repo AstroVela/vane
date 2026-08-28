@@ -427,6 +427,40 @@ def test_local_runner_arrow_native_parquet_sizes_bloom_filter_from_actual_row_gr
     assert all(row_count == 1 and 0 < bloom_length < 1024 for row_count, bloom_length in bloom_metadata)
 
 
+def test_local_runner_arrow_native_parquet_rejects_schema_changes_across_rotated_files(
+    local_runner, tmp_path, monkeypatch
+):
+    pa = pytest.importorskip("pyarrow")
+
+    def transform(table):
+        values = table.column("x").to_pylist()
+        arrow_type = pa.time32("ms") if values[0] == 0 else pa.time64("us")
+        return pa.table({"clock": pa.array([datetime.time()] * len(values), type=arrow_type)})
+
+    monkeypatch.setenv("VANE_RUNNER", "local")
+    output = tmp_path / "arrow_schema_rotation.parquet"
+    escaped_output = str(output).replace("'", "''")
+    con = vane.connect()
+    try:
+        relation = con.sql("select i::BIGINT as x from range(2) t(i)").map_batches(
+            transform,
+            schema={"clock": vane.sqltypes.TIME},
+            execution_backend="subprocess_task",
+            batch_size=1,
+            output_batch_size=1,
+        )
+        with pytest.raises(ValueError, match="Arrow schema changed during Arrow-native Parquet COPY"):
+            relation.query(
+                "arrow_schema_rotation",
+                f"COPY arrow_schema_rotation TO '{escaped_output}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 1, ROW_GROUPS_PER_FILE 1)",
+            )
+    finally:
+        con.close()
+
+    assert len(list(output.glob("*.parquet"))) <= 1
+
+
 def test_local_runner_arrow_native_parquet_rejects_file_size_rotation(local_runner, tmp_path, monkeypatch):
     pa = pytest.importorskip("pyarrow")
 

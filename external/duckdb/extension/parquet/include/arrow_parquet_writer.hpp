@@ -38,7 +38,21 @@ private:
 	struct Impl;
 	unique_ptr<Impl> impl;
 
+	friend class ArrowParquetSchemaState;
 	friend class ArrowParquetWriter;
+};
+
+//! Keeps the physical Arrow schema stable across every file written by one COPY.
+class ArrowParquetSchemaState {
+public:
+	ArrowParquetSchemaState();
+	~ArrowParquetSchemaState();
+
+	void Validate(const ArrowParquetLocalState &local_state);
+
+private:
+	struct Impl;
+	unique_ptr<Impl> impl;
 };
 
 //! Writes imported Arrow RecordBatches directly with parquet::arrow::FileWriter.
