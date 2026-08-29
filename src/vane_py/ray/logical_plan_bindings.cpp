@@ -254,7 +254,7 @@ static py::object PythonMemorySourceExpectedArrowSchema(ClientContext &context, 
 	return pyarrow_lib.attr("Schema").attr("_import_from_c")(reinterpret_cast<uint64_t>(&arrow_schema));
 }
 
-static void ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expected_types,
+static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expected_types,
                                               const vector<string> &expected_names, DataSourceScanBindData &bind_data,
                                               const string &source_kind) {
 	auto snapshot_types = bind_data.arrow_table.GetTypes();
@@ -262,8 +262,17 @@ static void ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 		throw InvalidInputException("Ray %s memory snapshot produced %llu columns, expected %llu", source_kind,
 		                            snapshot_types.size(), expected_types.size());
 	}
+	bool requires_type_projection = false;
 	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
 		if (snapshot_types[column_idx] == expected_types[column_idx]) {
+			continue;
+		}
+		// Arrow dictionary schemas describe their value type but not the values
+		// required to reconstruct a DuckDB ENUM. Preserve Pandas categorical
+		// semantics with an explicit VARCHAR-to-ENUM projection above the scan.
+		if (source_kind == "pandas" && expected_types[column_idx].id() == LogicalTypeId::ENUM &&
+		    snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR) {
+			requires_type_projection = true;
 			continue;
 		}
 		throw InvalidInputException(
@@ -272,6 +281,7 @@ static void ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 		    source_kind, expected_names[column_idx], expected_types[column_idx].ToString(),
 		    snapshot_types[column_idx].ToString());
 	}
+	return requires_type_projection;
 }
 
 static bool ContainsPythonMemoryScan(const LogicalOperator &op) {
@@ -396,10 +406,11 @@ static optional_idx PythonMemoryScanCardinality(LogicalGet &get, ClientContext &
 	return optional_idx();
 }
 
-static void RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, const py::object &memory_module,
-                                     py::dict &memory_source_refs, const PythonMemoryScanGroups &scan_groups) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
+static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientContext &context, Binder &binder,
+                                     const py::object &memory_module, py::dict &memory_source_refs,
+                                     const PythonMemoryScanGroups &scan_groups) {
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
 		auto scan_entry = scan_groups.find(&get);
 		if (scan_entry != scan_groups.end()) {
 			auto &prepared = *scan_entry->second;
@@ -428,7 +439,9 @@ static void RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context
 			auto estimated_cardinality = PythonMemoryScanCardinality(get, context);
 			auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, selected_arrow_schema, tasks);
 			bind_data->estimated_cardinality = estimated_cardinality;
-			ValidateMemorySourceSnapshotTypes(selected_types, selected_names, *bind_data, prepared.source_kind);
+			auto requires_type_projection =
+			    ValidateMemorySourceSnapshotTypes(selected_types, selected_names, *bind_data, prepared.source_kind);
+			auto snapshot_types = bind_data->arrow_table.GetTypes();
 			if (estimated_cardinality.IsValid()) {
 				get.SetEstimatedCardinality(estimated_cardinality.GetIndex());
 			}
@@ -438,8 +451,8 @@ static void RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context
 			for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
 				compact_column_ids.emplace_back(column_idx);
 			}
-			get.returned_types = std::move(selected_types);
-			get.names = std::move(selected_names);
+			get.returned_types = snapshot_types;
+			get.names = selected_names;
 			get.SetColumnIds(std::move(compact_column_ids));
 			get.virtual_columns.clear();
 			get.function = DataSourceScanFunction::GetFunction();
@@ -449,11 +462,34 @@ static void RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context
 			get.input_table_types.clear();
 			get.input_table_names.clear();
 			get.projected_input.clear();
+
+			if (requires_type_projection) {
+				auto projection_table_index = get.table_index;
+				auto scan_table_index = binder.GenerateTableIndex();
+				get.table_index = scan_table_index;
+				vector<unique_ptr<Expression>> projection_expressions;
+				projection_expressions.reserve(selected_types.size());
+				for (idx_t column_idx = 0; column_idx < selected_types.size(); column_idx++) {
+					unique_ptr<Expression> expression = make_uniq<BoundColumnRefExpression>(
+					    snapshot_types[column_idx], ColumnBinding(scan_table_index, column_idx));
+					if (snapshot_types[column_idx] != selected_types[column_idx]) {
+						expression = BoundCastExpression::AddCastToType(context, std::move(expression),
+						                                                selected_types[column_idx]);
+					}
+					expression->alias = selected_names[column_idx];
+					projection_expressions.push_back(std::move(expression));
+				}
+				auto projection =
+				    make_uniq<LogicalProjection>(projection_table_index, std::move(projection_expressions));
+				projection->children.push_back(std::move(op));
+				op = std::move(projection);
+			}
+			return;
 		}
 	}
 
-	for (auto &child : op.children) {
-		RewritePythonMemoryScans(*child, context, memory_module, memory_source_refs, scan_groups);
+	for (auto &child : op->children) {
+		RewritePythonMemoryScans(child, context, binder, memory_module, memory_source_refs, scan_groups);
 	}
 }
 
@@ -485,7 +521,8 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 			PythonMemorySourceGroups source_groups;
 			PythonMemoryScanGroups scan_groups;
 			CollectPythonMemoryScans(*logical_plan, memory_module, source_groups, scan_groups);
-			RewritePythonMemoryScans(*logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
+			RewritePythonMemoryScans(logical_plan, *client_context, *planner.binder, memory_module, memory_source_refs,
+			                         scan_groups);
 			logical_plan->ResolveOperatorTypes();
 		}
 		if (py::len(memory_source_refs) > 0) {
