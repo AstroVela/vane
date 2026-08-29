@@ -3418,9 +3418,10 @@ static Value UDFTableFunctionSerializationPayload(const Value &payload) {
 		return ReplaceStructFields(payload, {{"payload_version", Value::BIGINT(999)}});
 	}
 	if (corruption == "logical_return_type") {
-		vector<Value> contract_types {Value(LogicalType::VARCHAR.ToString())};
+		vector<Value> contract_types;
+		contract_types.emplace_back(Value("VARCHAR"));
 		return ReplaceStructFields(
-		    payload, {{"method_return_type", Value(LogicalType::VARCHAR.ToString())},
+		    payload, {{"method_return_type", Value("VARCHAR")},
 		              {"output_contract_types", Value::LIST(LogicalType::VARCHAR, std::move(contract_types))}});
 	}
 	return payload;
