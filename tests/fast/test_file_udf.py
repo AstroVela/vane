@@ -363,6 +363,25 @@ def test_scalar_file_udf_preserves_non_file_composite_siblings():
     assert payload["created_at"].astimezone(timezone.utc) == created_at
 
 
+def test_scalar_file_udf_preserves_full_uhugeint_sibling():
+    wide = 2**127
+    output_type = vane.type("STRUCT(document FILE, wide UHUGEINT)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://wide-composite"),
+            "wide": wide,
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    document, returned_wide = result.project("payload.document AS document, payload.wide::VARCHAR AS wide").fetchone()
+    assert document == vane.File("memory://wide-composite")
+    assert int(returned_wide) == wide
+
+
 def test_empty_flat_map_file_udf_preserves_composite_output_type():
     output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, wide UHUGEINT)")
 
@@ -456,6 +475,87 @@ def test_batch_file_udf_accepts_chunked_eager_output():
     assert isinstance(result, pa.ChunkedArray)
     assert result.type.equals(_file_arrow_type())
     assert result.to_pylist() == values.to_pylist()
+
+
+def test_map_batches_normalizes_file_storage_across_output_batches():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def emit_files(_table):
+        import pyarrow as pa
+
+        for url, string_type in (("memory://regular", pa.string()), ("memory://large", pa.large_string())):
+            file_type = pa.struct(
+                [
+                    pa.field("url", string_type),
+                    pa.field("content_type", string_type),
+                    pa.field("position", pa.int64()),
+                    pa.field("size", pa.int64()),
+                    pa.field("checksum", string_type),
+                ]
+            )
+            yield pa.table({"value": pa.array([_file_record(url=url)], type=file_type)})
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(emit_files),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "output_schema": [{"name": "value", "kind": "duckdb_type", "type": "FILE"}],
+            "stream_output": True,
+            "output_batch_size": 2,
+        }
+    )
+    try:
+        executor.submit(pa.table({"input": [1]}))
+        output = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert len(output) == 1
+    assert output[0].column("value").type.equals(_file_arrow_type())
+    assert output[0].column("value").to_pylist() == [
+        _file_record(url="memory://regular"),
+        _file_record(url="memory://large"),
+    ]
+
+
+def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import validate_file_arrow_array
+
+    class ExplodingScalar(pa.ExtensionScalar):
+        def as_py(self, *args, **kwargs):
+            raise AssertionError("unrelated field was materialized")
+
+    class ExplodingType(pa.ExtensionType):
+        def __init__(self):
+            super().__init__(pa.binary(), "vane.test.file_validation_exploding")
+
+        def __arrow_ext_serialize__(self):
+            return b""
+
+        @classmethod
+        def __arrow_ext_deserialize__(cls, storage_type, serialized):
+            return cls()
+
+        def __arrow_ext_scalar_class__(self):
+            return ExplodingScalar
+
+    payload = pa.ExtensionArray.from_storage(ExplodingType(), pa.array([b"large-unrelated-payload"]))
+    array = pa.StructArray.from_arrays(
+        [pa.array([_file_record()], type=_file_arrow_type()), payload],
+        names=["document", "payload"],
+    )
+
+    validate_file_arrow_array(
+        array,
+        vane.type("STRUCT(document FILE, payload BLOB)"),
+        boundary="test output",
+    )
 
 
 def test_batch_file_udf_types_all_null_output_as_file():

@@ -11,6 +11,7 @@ row UDFs without changing generic STRUCT behavior.
 
 from __future__ import annotations
 
+import operator
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -208,37 +209,112 @@ def _file_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
         raise _invalid_input(f"{boundary} contains an invalid FILE value at {path}: {exc}") from exc
 
 
-def _validate_arrow_value(value: Any, dtype: Any, *, boundary: str, path: str) -> None:
-    if value is None:
+def _active_values(array: pa.Array, parent_active: Sequence[bool] | None) -> list[bool]:
+    active = [bool(value) for value in array.is_valid().to_pylist()]
+    if parent_active is None:
+        return active
+    if len(parent_active) != len(array):
+        raise RuntimeError("FILE validation received a mismatched parent validity mask")
+    return [parent and current for parent, current in zip(parent_active, active, strict=True)]
+
+
+def _child_window(array: Any) -> tuple[int, int, list[int]]:
+    offsets = [int(offset) for offset in array.offsets.to_pylist()]
+    start = offsets[0]
+    return start, offsets[-1] - start, offsets
+
+
+def _validate_file_arrow_values(
+    array: Any,
+    dtype: Any,
+    *,
+    boundary: str,
+    path: str,
+    parent_active: Sequence[bool] | None = None,
+) -> None:
+    """Validate FILE leaves without converting unrelated Arrow children."""
+    if isinstance(array, pa.ChunkedArray):
+        offset = 0
+        for chunk in array.chunks:
+            chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
+            _validate_file_arrow_values(
+                chunk,
+                dtype,
+                boundary=boundary,
+                path=path,
+                parent_active=chunk_active,
+            )
+            offset += len(chunk)
         return
-    if _is_file_type(dtype):
-        _file_from_arrow_value(value, boundary=boundary, path=path)
+    if pa.types.is_null(array.type):
         return
 
-    type_id = _type_id(dtype)
-    if type_id in ("list", "array"):
-        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-            raise _invalid_input(f"{boundary} value at {path} must be a sequence")
-        child = _sequence_child(dtype)
-        for index, item in enumerate(value):
-            _validate_arrow_value(item, child, boundary=boundary, path=f"{path}[{index}]")
+    if _is_file_type(dtype):
+        for index, value in enumerate(array.to_pylist()):
+            if value is None or (parent_active is not None and not parent_active[index]):
+                continue
+            _file_from_arrow_value(value, boundary=boundary, path=f"{path}[{index}]")
         return
+
+    active = _active_values(array, parent_active)
+    type_id = _type_id(dtype)
     if type_id == "struct":
-        if not isinstance(value, Mapping):
-            raise _invalid_input(f"{boundary} value at {path} must be an Arrow STRUCT")
         for name, child in dtype.children:
             if _contains_file(child):
-                _validate_arrow_value(value.get(name), child, boundary=boundary, path=f"{path}.{name}")
+                _validate_file_arrow_values(
+                    array.field(name),
+                    child,
+                    boundary=boundary,
+                    path=f"{path}.{name}",
+                    parent_active=active,
+                )
+        return
+    if type_id == "list":
+        start, length, offsets = _child_window(array)
+        child_active = [
+            is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
+        ]
+        _validate_file_arrow_values(
+            array.values.slice(start, length),
+            _sequence_child(dtype),
+            boundary=boundary,
+            path=f"{path}[]",
+            parent_active=child_active,
+        )
+        return
+    if type_id == "array":
+        array_size = int(_type_children(dtype)["size"])
+        child_active = [is_active for is_active in active for _ in range(array_size)]
+        _validate_file_arrow_values(
+            array.values.slice(array.offset * array_size, len(array) * array_size),
+            _sequence_child(dtype),
+            boundary=boundary,
+            path=f"{path}[]",
+            parent_active=child_active,
+        )
         return
     if type_id == "map":
+        start, length, offsets = _child_window(array)
+        child_active = [
+            is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
+        ]
         children = _type_children(dtype)
-        entries = value.items() if isinstance(value, Mapping) else value
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, Sequence) or len(entry) != 2:
-                raise _invalid_input(f"{boundary} MAP value at {path} must contain key/value pairs")
-            key, item = entry
-            _validate_arrow_value(key, children["key"], boundary=boundary, path=f"{path}[{index}].key")
-            _validate_arrow_value(item, children["value"], boundary=boundary, path=f"{path}[{index}].value")
+        if _contains_file(children["key"]):
+            _validate_file_arrow_values(
+                array.keys.slice(start, length),
+                children["key"],
+                boundary=boundary,
+                path=f"{path}.key",
+                parent_active=child_active,
+            )
+        if _contains_file(children["value"]):
+            _validate_file_arrow_values(
+                array.items.slice(start, length),
+                children["value"],
+                boundary=boundary,
+                path=f"{path}.value",
+                parent_active=child_active,
+            )
         return
     if type_id == "union":
         raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
@@ -375,6 +451,17 @@ def _canonical_values_to_arrow_array(
     """Encode canonical values while typing only branches that contain FILE."""
     if _is_file_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
+    if _type_id(dtype) == "uhugeint":
+        encoded: list[str | None] = []
+        for value in values:
+            if value is None:
+                encoded.append(None)
+                continue
+            integer = operator.index(value)
+            if integer < 0 or integer >= 1 << 128:
+                raise ValueError("UHUGEINT output is outside the unsigned 128-bit range")
+            encoded.append(str(integer))
+        return pa.array(encoded, type=pa.string())
     if not _contains_file(dtype):
         try:
             expected_type = _arrow_type_from_duckdb_pytype(dtype)
@@ -447,6 +534,76 @@ def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundar
         raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
 
 
+def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any:
+    """Canonicalize FILE storage while preserving unrelated Arrow children."""
+    if isinstance(array, pa.ChunkedArray):
+        if not array.chunks:
+            normalized_empty = _normalize_file_arrow_array(pa.array([], type=array.type), dtype, boundary=boundary)
+            return pa.chunked_array([], type=normalized_empty.type)
+        return pa.chunked_array(
+            [_normalize_file_arrow_array(chunk, dtype, boundary=boundary) for chunk in array.chunks]
+        )
+    if pa.types.is_null(array.type):
+        try:
+            expected = _expected_arrow_type(dtype, boundary=boundary)
+        except Exception:
+            # Preserve the promotable Arrow NULL type when a non-FILE sibling
+            # has no canonical Arrow mapping.
+            return array
+        return pa.nulls(len(array), type=expected)
+    if _is_file_type(dtype):
+        expected = _expected_arrow_type(dtype, boundary=boundary)
+        return array if array.type.equals(expected) else array.cast(expected)
+
+    type_id = _type_id(dtype)
+    if type_id == "struct":
+        declared_children = _type_children(dtype)
+        arrays = []
+        fields = []
+        for index, field in enumerate(array.type):
+            child_array = array.field(index)
+            child_dtype = declared_children.get(field.name)
+            file_child = child_dtype is not None and _contains_file(child_dtype)
+            if file_child:
+                child_array = _normalize_file_arrow_array(child_array, child_dtype, boundary=boundary)
+            arrays.append(child_array)
+            fields.append(pa.field(field.name, child_array.type) if file_child else field)
+        return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
+
+    if type_id == "list":
+        start, length, offsets = _child_window(array)
+        child_array = _normalize_file_arrow_array(
+            array.values.slice(start, length),
+            _sequence_child(dtype),
+            boundary=boundary,
+        )
+        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
+        return pa.ListArray.from_arrays(normalized_offsets, child_array, mask=array.is_null())
+
+    if type_id == "array":
+        array_size = int(_type_children(dtype)["size"])
+        child_array = _normalize_file_arrow_array(
+            array.values.slice(array.offset * array_size, len(array) * array_size),
+            _sequence_child(dtype),
+            boundary=boundary,
+        )
+        return pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=array.is_null())
+
+    if type_id == "map":
+        start, length, offsets = _child_window(array)
+        children = _type_children(dtype)
+        keys = array.keys.slice(start, length)
+        items = array.items.slice(start, length)
+        if _contains_file(children["key"]):
+            keys = _normalize_file_arrow_array(keys, children["key"], boundary=boundary)
+        if _contains_file(children["value"]):
+            items = _normalize_file_arrow_array(items, children["value"], boundary=boundary)
+        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
+        return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
+
+    raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}")
+
+
 def validate_file_arrow_array(
     array: Any,
     dtype: Any,
@@ -462,8 +619,7 @@ def validate_file_arrow_array(
         path="column",
         allow_untyped_null=allow_untyped_null,
     )
-    for row, value in enumerate(array.to_pylist()):
-        _validate_arrow_value(value, dtype, boundary=boundary, path=f"row {row}")
+    _validate_file_arrow_values(array, dtype, boundary=boundary, path="column")
 
 
 def validate_file_arrow_storage_type(
@@ -623,6 +779,40 @@ class FileUDFContract:
                     boundary=f"{boundary} column {index}",
                     allow_untyped_null=True,
                 )
+
+    def normalize_output_table(self, table: pa.Table) -> pa.Table:
+        """Validate and canonicalize FILE-bearing columns before buffering."""
+        self.validate_output_table(table)
+        if not self.has_file_outputs:
+            return table
+
+        boundary = f"UDF {self.udf_name!r} output"
+        columns = list(table.columns)
+        fields = list(table.schema)
+        changed = False
+        for index, dtype in enumerate(self.output_types):
+            if dtype is None:
+                continue
+            try:
+                normalized = _normalize_file_arrow_array(
+                    columns[index],
+                    dtype,
+                    boundary=f"{boundary} column {index}",
+                )
+            except Exception:
+                raise _invalid_input(f"{boundary} column {index} could not normalize its FILE storage") from None
+            normalized_field = pa.field(fields[index].name, normalized.type)
+            if normalized.type.equals(columns[index].type, check_metadata=True) and fields[index].equals(
+                normalized_field, check_metadata=True
+            ):
+                continue
+            columns[index] = normalized
+            fields[index] = normalized_field
+            changed = True
+
+        if not changed:
+            return table
+        return pa.Table.from_arrays(columns, schema=pa.schema(fields, metadata=table.schema.metadata))
 
 
 __all__ = [

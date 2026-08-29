@@ -588,8 +588,7 @@ class UDFExecutor:
             tables = _iter_output_tables(result)
             for table in tables:
                 if table is not None:
-                    self._file_contract.validate_output_table(table)
-                    yield table
+                    yield self._file_contract.normalize_output_table(table)
             return
         except TypeError as exc:
             raise TypeError(
@@ -618,8 +617,7 @@ class UDFExecutor:
             )
         if self._output_names and len(self._output_names) == 1 and table.num_columns != 1:
             raise ValueError(f"row-preserving map_batches output must have exactly 1 column, got {table.num_columns}")
-        self._file_contract.validate_output_table(table)
-        return table
+        return self._file_contract.normalize_output_table(table)
 
     def _iter_map_batches_compute_batches(self, args: pa.Table) -> Iterable[pa.Table]:
         if self._prebatched_input:

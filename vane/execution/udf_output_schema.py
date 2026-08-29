@@ -90,6 +90,10 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "interval": lambda: pa.duration("us"),
         "json": pa.string,
         "hugeint": lambda: pa.decimal128(38, 0),
+        # Arrow has no unsigned 128-bit integer type, and DuckDB does not
+        # import decimal256.  Decimal strings preserve the full UHUGEINT
+        # domain and DuckDB casts them to the declared logical type.
+        "uhugeint": pa.string,
         "uuid": lambda: pa.binary(16),
         "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
     }
