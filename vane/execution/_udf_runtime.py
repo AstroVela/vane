@@ -163,9 +163,9 @@ def _build_valid_mask(table: pa.Table) -> list[bool]:
         return []
     mask = [True] * row_count
     for column in table.columns:
-        values = column.to_pylist()
-        for idx, value in enumerate(values):
-            if value is None:
+        validity = column.is_valid().to_pylist()
+        for idx, is_valid in enumerate(validity):
+            if not is_valid:
                 mask[idx] = False
     return mask
 
@@ -874,25 +874,16 @@ class UDFExecutor:
         else:
             result_array = pa.array([])
 
-        if (
-            self._default_null_handling()
-            and not exception_occurred
-            and any(value is None for value in result_array.to_pylist())
-        ):
+        if self._default_null_handling() and not exception_occurred and result_array.null_count > 0:
             raise ValueError(_NULL_HANDLING_ERROR)
 
         if valid_indices is not None:
-            values = result_array.to_pylist()
-            if len(values) != len(valid_indices):
+            if len(result_array) != len(valid_indices):
                 raise ValueError("map output row count does not match filtered input")
-            full_values: list[Any] = [None] * row_count
-            for idx, value in zip(valid_indices, values, strict=False):
-                full_values[idx] = value
-            result_array = (
-                pa.array(full_values, type=result_array.type)
-                if self._file_contract.has_file_outputs
-                else pa.array(full_values)
-            )
+            take_indices: list[int | None] = [None] * row_count
+            for output_index, input_index in enumerate(valid_indices):
+                take_indices[input_index] = output_index
+            result_array = result_array.take(pa.array(take_indices, type=pa.int64()))
 
         self._file_contract.validate_output_table(pa.table({self._scalar_output_name: result_array}))
 

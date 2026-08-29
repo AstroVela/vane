@@ -531,6 +531,7 @@ def test_map_batches_normalizes_file_storage_across_output_batches():
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
     import pyarrow as pa
 
+    from vane.execution._udf_runtime import _build_valid_mask
     from vane.execution.udf_file_contract import validate_file_arrow_array
 
     class ExplodingScalar(pa.ExtensionScalar):
@@ -562,6 +563,7 @@ def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
         vane.type("STRUCT(document FILE, payload BLOB)"),
         boundary="test output",
     )
+    assert _build_valid_mask(pa.table({"value": array})) == [True]
 
 
 def test_file_composite_arrow_fields_match_case_insensitively():
