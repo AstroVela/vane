@@ -858,7 +858,8 @@ class UDFExecutor:
                 else:
                     raise
             result = ensure_synchronous_udf_result(result)
-            outputs.append(_coerce_scalar_array(result, batch.num_rows))
+            output = _coerce_scalar_array(result, batch.num_rows)
+            outputs.append(self._file_contract.normalize_scalar_arrow_output(output))
 
         if outputs:
             if len(outputs) == 1:

@@ -188,6 +188,41 @@ def test_batch_file_udf_receives_arrow_struct_and_restores_file_alias():
     ]
 
 
+def test_batch_file_udf_normalizes_each_worker_batch_before_concat():
+    import pyarrow as pa
+
+    @vane.func.batch(return_dtype=vane.file_type(), batch_size=2)
+    def build_files(identifiers):
+        string_type = pa.string() if identifiers[0].as_py() < 2 else pa.large_string()
+        file_type = pa.struct(
+            [
+                pa.field("url", string_type),
+                pa.field("content_type", string_type),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", string_type),
+            ]
+        )
+        return pa.array(
+            [
+                {
+                    "url": f"memory://{identifier}",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+                for identifier in identifiers.to_pylist()
+            ],
+            type=file_type,
+        )
+
+    connection = vane.connect()
+    result = connection.sql("SELECT i FROM range(4) AS t(i)").select(build_files(vane.col("i")).alias("value"))
+
+    assert result.fetchall() == [(vane.File(f"memory://{identifier}"),) for identifier in range(4)]
+
+
 def test_batch_file_udf_rejects_invalid_input_before_user_code(tmp_path):
     marker = tmp_path / "called"
 
@@ -660,6 +695,32 @@ def test_file_composite_arrow_fields_match_case_insensitively():
     assert normalized.column("payload").to_pylist() == [{"Document": _file_record()}]
 
 
+def test_file_composite_normalization_masks_children_beneath_null_parents():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "null-parent",
+            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": "STRUCT(document FILE, id BIGINT)"}],
+        }
+    )
+    hidden_values = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            pa.array(["invalid"]),
+        ],
+        names=["document", "id"],
+        mask=pa.array([True]),
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": hidden_values}))
+
+    assert normalized.column("payload").type.field("id").type == pa.int64()
+    assert normalized.column("payload").to_pylist() == [None]
+
+
 def test_file_composite_native_values_match_fields_case_insensitively():
     import pyarrow as pa
 
@@ -731,6 +792,51 @@ def test_batch_file_udf_reorders_named_struct_output_before_cast():
         {"document": _file_record(), "id": 0},
         {"document": _file_record(), "id": 1},
     ]
+
+
+def test_file_output_normalization_preserves_full_intervals():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    interval = pa.MonthDayNano((2, 3, 4_000))
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "interval",
+            "output_schema": [
+                {"name": "document", "kind": "duckdb_type", "type": "FILE"},
+                {"name": "span", "kind": "duckdb_type", "type": "INTERVAL"},
+            ],
+        }
+    )
+    table = pa.table(
+        {
+            "document": pa.array([_file_record()], type=_file_arrow_type()),
+            "span": pa.array([interval], type=pa.month_day_nano_interval()),
+        }
+    )
+
+    normalized = contract.normalize_output_table(table)
+
+    assert normalized.column("span").type == pa.month_day_nano_interval()
+    assert normalized.column("span").to_pylist() == [interval]
+
+
+def test_map_batches_file_schema_preserves_calendar_interval_semantics():
+    def identity(table):
+        return table
+
+    connection = vane.connect()
+    source = connection.sql(
+        "SELECT file('memory://interval', NULL, NULL, NULL, NULL) AS document, INTERVAL '1 month' AS span"
+    )
+    result = source.map_batches(
+        identity,
+        schema={"document": vane.file_type(), "span": vane.sqltypes.INTERVAL},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.project("DATE '2000-01-31' + span AS shifted").fetchone() == (datetime(2000, 2, 29),)
 
 
 @pytest.mark.parametrize(

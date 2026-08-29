@@ -269,6 +269,13 @@ def _active_values(array: pa.Array, parent_active: Sequence[bool] | None) -> lis
     return [parent and current for parent, current in zip(parent_active, active, strict=True)]
 
 
+def _mask_inactive(array: Any, active: Sequence[bool]) -> Any:
+    if all(active):
+        return array
+    indices = pa.array([index if is_active else None for index, is_active in enumerate(active)], type=pa.int64())
+    return array.take(indices)
+
+
 def _child_window(array: Any) -> tuple[int, int, list[int]]:
     offsets = [int(offset) for offset in array.offsets.to_pylist()]
     start = offsets[0]
@@ -595,15 +602,37 @@ def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundar
         raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
 
 
-def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any:
+def _normalize_file_arrow_array(
+    array: Any,
+    dtype: Any,
+    *,
+    boundary: str,
+    parent_active: Sequence[bool] | None = None,
+) -> Any:
     """Canonicalize a FILE-bearing Arrow value to its declared stable storage."""
     if isinstance(array, pa.ChunkedArray):
         if not array.chunks:
-            normalized_empty = _normalize_file_arrow_array(pa.array([], type=array.type), dtype, boundary=boundary)
+            normalized_empty = _normalize_file_arrow_array(
+                pa.array([], type=array.type),
+                dtype,
+                boundary=boundary,
+                parent_active=parent_active,
+            )
             return pa.chunked_array([], type=normalized_empty.type)
-        return pa.chunked_array(
-            [_normalize_file_arrow_array(chunk, dtype, boundary=boundary) for chunk in array.chunks]
-        )
+        chunks = []
+        offset = 0
+        for chunk in array.chunks:
+            chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
+            chunks.append(
+                _normalize_file_arrow_array(
+                    chunk,
+                    dtype,
+                    boundary=boundary,
+                    parent_active=chunk_active,
+                )
+            )
+            offset += len(chunk)
+        return pa.chunked_array(chunks)
     if pa.types.is_null(array.type):
         try:
             expected = _expected_arrow_type(dtype, boundary=boundary)
@@ -612,9 +641,11 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
             # has no canonical Arrow mapping.
             return array
         return pa.nulls(len(array), type=expected)
+    active = _active_values(array, parent_active)
     if _is_file_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
-        return array if array.type.equals(expected) else array.cast(expected)
+        source = _mask_inactive(array, active)
+        return source if source.type.equals(expected) else source.cast(expected)
 
     type_id = _type_id(dtype)
     if type_id == "struct":
@@ -626,7 +657,12 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
                 child_array = pa.nulls(len(array))
             else:
                 child_array = array.field(field_index)
-            child_array = _normalize_file_arrow_array(child_array, child, boundary=boundary)
+            child_array = _normalize_file_arrow_array(
+                child_array,
+                child,
+                boundary=boundary,
+                parent_active=active,
+            )
             arrays.append(child_array)
             fields.append(pa.field(name, child_array.type))
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
@@ -637,6 +673,9 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
             array.values.slice(start, length),
             _sequence_child(dtype),
             boundary=boundary,
+            parent_active=[
+                is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
+            ],
         )
         normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
         return pa.ListArray.from_arrays(normalized_offsets, child_array, mask=array.is_null())
@@ -647,27 +686,39 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
             array.values.slice(array.offset * array_size, len(array) * array_size),
             _sequence_child(dtype),
             boundary=boundary,
+            parent_active=[is_active for is_active in active for _ in range(array_size)],
         )
         return pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=array.is_null())
 
     if type_id == "map":
-        start, length, offsets = _child_window(array)
+        start, _, offsets = _child_window(array)
         children = _type_children(dtype)
-        keys = array.keys.slice(start, length)
-        items = array.items.slice(start, length)
+        selected_indices: list[int] = []
+        normalized_offsets = [0]
+        for index, is_active in enumerate(active):
+            if is_active:
+                selected_indices.extend(range(offsets[index] - start, offsets[index + 1] - start))
+            normalized_offsets.append(len(selected_indices))
+        selection = pa.array(selected_indices, type=pa.int64())
+        keys = array.keys.slice(start, offsets[-1] - start).take(selection)
+        items = array.items.slice(start, offsets[-1] - start).take(selection)
         keys = _normalize_file_arrow_array(keys, children["key"], boundary=boundary)
         items = _normalize_file_arrow_array(items, children["value"], boundary=boundary)
-        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
-        return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
+        return pa.MapArray.from_arrays(
+            pa.array(normalized_offsets, type=pa.int32()),
+            keys,
+            items,
+            mask=array.is_null(),
+        )
 
     try:
         expected = _arrow_type_from_duckdb_pytype(dtype)
     except Exception:
         return array
     if array.type.equals(expected):
-        return array
+        return _mask_inactive(array, active)
     try:
-        return array.cast(expected)
+        return _mask_inactive(array, active).cast(expected)
     except Exception as exc:
         raise _invalid_input(f"{boundary} value cannot be cast to declared type {dtype}") from exc
 
@@ -822,6 +873,18 @@ class FileUDFContract:
         dtype = self.output_types[0]
         boundary = f"UDF {self.udf_name!r} output"
         return _native_outputs_to_arrow_array(outputs, dtype, boundary=boundary)
+
+    def normalize_scalar_arrow_output(self, output: Any) -> Any:
+        if not self.has_file_outputs:
+            return output
+        if len(self.output_types) != 1 or self.output_types[0] is None:
+            raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
+        return normalize_file_arrow_array(
+            output,
+            self.output_types[0],
+            boundary=f"UDF {self.udf_name!r} output",
+            allow_untyped_null=True,
+        )
 
     def native_output_rows_to_table(
         self,
