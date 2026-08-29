@@ -434,6 +434,41 @@ def test_native_file_udfs_preserve_duckdb_sibling_coercions():
     )
 
 
+def test_scalar_file_udf_accepts_positional_struct_output():
+    output_type = vane.type("STRUCT(document FILE, id INTEGER)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return (vane.File("memory://positional-struct"), "42")
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.fetchone() == ({"document": vane.File("memory://positional-struct"), "id": 42},)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"document": vane.File("memory://missing-field")},
+        {"document": vane.File("memory://extra-field"), "id": 1, "extra": "discarded"},
+    ],
+    ids=["missing", "extra"],
+)
+def test_file_native_struct_outputs_require_exact_fields(payload):
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "strict-struct",
+            "method_return_type": "STRUCT(document FILE, id INTEGER)",
+        }
+    )
+
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields"):
+        contract.scalar_outputs_to_array([payload])
+
+
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
     local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
@@ -952,6 +987,46 @@ def test_map_batches_preserves_duckdb_casts_for_non_file_columns(raw_uuid_bytes)
     assert result.fetchone() == (vane.File("memory://batch-coercion"), identifier)
 
 
+def test_map_batches_preserves_invalid_blob_for_duckdb_uuid_cast():
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+
+    def build_output(table):
+        import pyarrow as pa
+
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        record = {
+            "url": "memory://invalid-uuid",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        }
+        return pa.table(
+            {
+                "document": pa.array([record] * table.num_rows, type=file_type),
+                "identifier": pa.array([str(identifier).encode()] * table.num_rows, type=pa.binary()),
+            }
+        )
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").map_batches(
+        build_output,
+        schema={"document": vane.file_type(), "identifier": vane.sqltypes.UUID},
+        execution_backend="subprocess_task",
+    )
+
+    with pytest.raises(Exception, match="BLOB.*UUID|Could not convert"):
+        result.fetchall()
+
+
 def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
     import cloudpickle
     import pyarrow as pa
@@ -989,6 +1064,62 @@ def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
     assert len(output) == 1
     assert output[0].column("identifier").type == pa.string()
     assert output[0].column("identifier").to_pylist() == [str(identifier), str(identifier)]
+
+
+def test_map_batches_keeps_cross_type_file_sibling_batches_separate():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def emit_documents(_table):
+        import pyarrow as pa
+
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        document = pa.array(
+            [
+                {
+                    "url": "memory://streamed-cast",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+            ],
+            type=file_type,
+        )
+        yield pa.table({"document": document, "text": pa.array([b"first"], type=pa.binary())})
+        yield pa.table({"document": document, "text": pa.array(["second"], type=pa.string())})
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(emit_documents),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "output_schema": [
+                {"name": "document", "kind": "duckdb_type", "type": "FILE"},
+                {"name": "text", "kind": "duckdb_type", "type": "VARCHAR"},
+            ],
+            "stream_output": True,
+            "output_batch_size": 2,
+        }
+    )
+    try:
+        executor.submit(pa.table({"input": [1]}))
+        output = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert [table.column("text").type for table in output] == [pa.binary(), pa.string()]
+    assert [table.column("text").to_pylist() for table in output] == [[b"first"], ["second"]]
 
 
 def test_eager_batch_file_udf_uses_stable_uuid_sibling_transport():
@@ -1297,6 +1428,28 @@ def test_batch_file_udf_reorders_named_struct_output_before_cast():
         {"document": _file_record(), "id": 0},
         {"document": _file_record(), "id": 1},
     ]
+
+
+def test_batch_file_udf_supports_time_ns_sibling():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, precise TIME_NS)")
+    precise = time(1, 2, 3, 456789)
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array([precise] * len(values), type=pa.time64("ns")),
+            ],
+            names=["document", "precise"],
+        )
+
+    result = build_document(pa.array([1], type=pa.int32()))
+
+    assert result.type.field("precise").type == pa.time64("ns")
+    assert result.to_pylist() == [{"document": _file_record(), "precise": precise}]
 
 
 def test_file_output_normalization_preserves_full_intervals():

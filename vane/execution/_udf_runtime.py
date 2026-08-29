@@ -320,6 +320,10 @@ class RuntimeOutputBuffer:
 
         self._saw_non_empty = True
         self._empty_table = None
+        # Preserve cross-type DuckDB cast semantics by sending incompatible
+        # Arrow schemas as separate output batches.
+        if self._tables and not self._tables[0].schema.equals(table.schema):
+            yield from self.flush()
         self._tables.append(table)
         self._row_count += table.num_rows
         self._byte_count += _table_nbytes(table)

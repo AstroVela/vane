@@ -87,6 +87,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "timestamp_ns": lambda: pa.timestamp("ns"),
         "date": pa.date32,
         "time": lambda: pa.time64("us"),
+        "time_ns": lambda: pa.time64("ns"),
         "interval": pa.month_day_nano_interval,
         "json": pa.string,
         # Arrow has no 128-bit integer type.  decimal128 is limited to 38

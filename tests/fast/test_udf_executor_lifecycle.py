@@ -2584,6 +2584,21 @@ def test_udf_runtime_output_buffer_accepts_zero_byte_null_tables():
     assert [value for output in outputs for value in output.column("payload").to_pylist()] == [None, None, None]
 
 
+def test_udf_runtime_output_buffer_flushes_before_an_output_schema_change():
+    from vane.execution._udf_runtime import RuntimeOutputBuffer
+
+    binary = pa.table({"payload": pa.array([b"first"], type=pa.binary())})
+    string = pa.table({"payload": pa.array(["second"], type=pa.string())})
+    buffer = RuntimeOutputBuffer(target_rows=2)
+
+    outputs = list(buffer.append(binary))
+    outputs.extend(buffer.append(string))
+    outputs.extend(buffer.flush())
+
+    assert [output.schema for output in outputs] == [binary.schema, string.schema]
+    assert [output.column("payload").to_pylist() for output in outputs] == [[b"first"], ["second"]]
+
+
 def test_udf_runtime_iter_submit_stream_output_flushes_by_target_bytes():
     from vane.execution._udf_runtime import UDFExecutor
 

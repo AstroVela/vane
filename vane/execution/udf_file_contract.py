@@ -563,11 +563,30 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             for index, item in enumerate(value)
         ]
     if type_id == "struct":
-        if not isinstance(value, Mapping):
-            raise _invalid_input(f"{boundary} value at {path} must be a mapping")
+        struct_children = list(dtype.children)
+        if isinstance(value, Mapping):
+            actual_keys: dict[str, Any] = {}
+            for key in value:
+                if not isinstance(key, str):
+                    raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
+                folded_key = key.casefold()
+                if folded_key in actual_keys:
+                    raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {key!r}")
+                actual_keys[folded_key] = key
+            declared_keys = {name.casefold() for name, _ in struct_children}
+            if set(actual_keys) != declared_keys:
+                raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
+            child_values = [value[actual_keys[name.casefold()]] for name, _ in struct_children]
+        elif isinstance(value, tuple):
+            if len(value) != len(struct_children):
+                raise _invalid_input(
+                    f"{boundary} STRUCT value at {path} must contain exactly {len(struct_children)} positional fields"
+                )
+            child_values = list(value)
+        else:
+            raise _invalid_input(f"{boundary} value at {path} must be a mapping or positional tuple")
         result = {}
-        for name, child in dtype.children:
-            child_value = _mapping_field_value(value, name, boundary=boundary, path=path)
+        for (name, child), child_value in zip(struct_children, child_values, strict=True):
             result[name] = (
                 _canonicalize_native_output(child_value, child, boundary=boundary, path=f"{path}.{name}")
                 if _contains_file(child)
@@ -789,15 +808,19 @@ def _normalize_file_arrow_array(
     type_id = _type_id(dtype)
     if type_id == "uuid":
         source = _mask_inactive(array, active)
+        values = source.to_pylist()
+        if _is_arrow_binary_storage(source.type) and any(
+            value is not None and len(bytes(value)) != 16 for value in values
+        ):
+            return source
         encoded: list[str | None] = []
-        for value in source.to_pylist():
+        for value in values:
             if value is None:
                 encoded.append(None)
             elif isinstance(value, UUID):
                 encoded.append(str(value))
             elif isinstance(value, (bytes, bytearray, memoryview)):
-                raw_value = bytes(value)
-                encoded.append(str(UUID(bytes=raw_value)) if len(raw_value) == 16 else raw_value.decode())
+                encoded.append(str(UUID(bytes=bytes(value))))
             else:
                 encoded.append(str(value))
         return pa.array(encoded, type=pa.string())
