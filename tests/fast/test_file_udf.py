@@ -637,6 +637,30 @@ def test_batch_file_udf_types_all_null_output_as_file():
     assert result.to_pylist() == [None, None]
 
 
+def test_batch_file_udf_reorders_named_struct_output_before_cast():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, id INTEGER)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def reordered(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(range(len(values)), type=pa.int32()),
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+            ],
+            names=["id", "document"],
+        )
+
+    result = reordered(pa.array([1, 2], type=pa.int32()))
+
+    assert result.type.names == ["document", "id"]
+    assert result.to_pylist() == [
+        {"document": _file_record(), "id": 0},
+        {"document": _file_record(), "id": 1},
+    ]
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [

@@ -356,25 +356,18 @@ def _normalize_batch_result(
         )
     if len(result) != expected_length:
         raise _invalid_input(f"batch UDF {udf_name!r} returned {len(result)} rows for {expected_length} input rows")
-    from vane.execution.udf_file_contract import contains_file_type, validate_file_arrow_storage_type
+    from vane.execution.udf_file_contract import contains_file_type, normalize_file_arrow_array
 
     file_output = contains_file_type(output_logical_type)
     if file_output:
-        validate_file_arrow_storage_type(
-            result.type,
+        result = normalize_file_arrow_array(
+            result,
             output_logical_type,
             boundary=f"batch UDF {udf_name!r} output",
             allow_untyped_null=True,
         )
     if not result.type.equals(output_arrow_type):
         if file_output:
-            if pa.types.is_null(result.type):
-                try:
-                    return pa.array([None] * len(result), type=output_arrow_type)
-                except Exception as exc:
-                    raise _invalid_input(
-                        f"batch UDF {udf_name!r} could not type its NULL output as {output_arrow_type}"
-                    ) from exc
             try:
                 return result.cast(output_arrow_type)
             except Exception as exc:

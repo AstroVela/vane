@@ -96,6 +96,20 @@ def _expected_arrow_type(dtype: Any, *, boundary: str) -> pa.DataType:
         raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}") from exc
 
 
+def _optional_struct_field_index(
+    actual: pa.StructType,
+    name: str,
+    *,
+    boundary: str,
+    path: str,
+) -> int | None:
+    folded_name = name.casefold()
+    matches = [index for index, field in enumerate(actual) if field.name.casefold() == folded_name]
+    if len(matches) > 1:
+        raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {name!r}")
+    return matches[0] if matches else None
+
+
 def _struct_field_index(
     actual: pa.StructType,
     name: str,
@@ -103,13 +117,10 @@ def _struct_field_index(
     boundary: str,
     path: str,
 ) -> int:
-    folded_name = name.casefold()
-    matches = [index for index, field in enumerate(actual) if field.name.casefold() == folded_name]
-    if not matches:
+    field_index = _optional_struct_field_index(actual, name, boundary=boundary, path=path)
+    if field_index is None:
         raise _invalid_input(f"{boundary} STRUCT at {path} is missing FILE-bearing field {name!r}")
-    if len(matches) > 1:
-        raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {name!r}")
-    return matches[0]
+    return field_index
 
 
 def _mapping_field_value(
@@ -595,20 +606,24 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
 
     type_id = _type_id(dtype)
     if type_id == "struct":
-        file_children: dict[int, tuple[str, Any]] = {}
-        for name, child in dtype.children:
-            if _contains_file(child):
-                field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
-                file_children[field_index] = (name, child)
         arrays = []
         fields = []
-        for index, field in enumerate(array.type):
-            child_array = array.field(index)
-            file_child = file_children.get(index)
-            if file_child is not None:
-                declared_name, child_dtype = file_child
-                child_array = _normalize_file_arrow_array(child_array, child_dtype, boundary=boundary)
-                field = pa.field(declared_name, child_array.type)
+        for name, child in dtype.children:
+            field_index = _optional_struct_field_index(array.type, name, boundary=boundary, path="column")
+            if field_index is None:
+                child_array = pa.nulls(len(array))
+                field = pa.field(name, child_array.type)
+            else:
+                child_array = array.field(field_index)
+                actual_field = array.type.field(field_index)
+                if _contains_file(child):
+                    child_array = _normalize_file_arrow_array(child_array, child, boundary=boundary)
+                field = pa.field(
+                    name,
+                    child_array.type,
+                    nullable=actual_field.nullable,
+                    metadata=actual_field.metadata,
+                )
             arrays.append(child_array)
             fields.append(field)
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
@@ -665,21 +680,21 @@ def validate_file_arrow_array(
     _validate_file_arrow_values(array, dtype, boundary=boundary, path="column")
 
 
-def validate_file_arrow_storage_type(
-    actual: pa.DataType,
+def normalize_file_arrow_array(
+    array: Any,
     dtype: Any,
     *,
     boundary: str,
     allow_untyped_null: bool = False,
-) -> None:
-    """Validate the Arrow storage shape of a logical type containing FILE."""
-    _validate_arrow_storage_type(
-        actual,
+) -> Any:
+    """Validate and canonicalize an Arrow array governed by a FILE type."""
+    validate_file_arrow_array(
+        array,
         dtype,
         boundary=boundary,
-        path="column",
         allow_untyped_null=allow_untyped_null,
     )
+    return _normalize_file_arrow_array(array, dtype, boundary=boundary)
 
 
 @dataclass(frozen=True)
@@ -861,6 +876,6 @@ class FileUDFContract:
 __all__ = [
     "FileUDFContract",
     "contains_file_type",
+    "normalize_file_arrow_array",
     "validate_file_arrow_array",
-    "validate_file_arrow_storage_type",
 ]
