@@ -75,15 +75,24 @@ def _snapshot_and_put_memory_source(
         table = table.cast(expected_schema, safe=True)
 
     if table.num_rows == 0:
-        partitions = [table]
+        partition_ranges = [(0, 0)]
     else:
         average_row_bytes = max(1, (table.nbytes + table.num_rows - 1) // table.num_rows)
         rows_per_partition = max(1, min(_MAX_PARTITION_ROWS, _TARGET_PARTITION_BYTES // average_row_bytes))
-        partitions = [
-            table.slice(offset, min(rows_per_partition, table.num_rows - offset))
+        partition_ranges = [
+            (offset, min(rows_per_partition, table.num_rows - offset))
             for offset in range(0, table.num_rows, rows_per_partition)
         ]
 
-    object_refs = [ray.put(partition) for partition in partitions]
+    object_refs = []
+    for offset, row_count in partition_ranges:
+        if len(partition_ranges) == 1:
+            partition = table
+        else:
+            sliced = table.slice(offset, row_count)
+            partition = pa.Table.from_arrays(
+                [column.combine_chunks() for column in sliced.columns], schema=table.schema
+            )
+        object_refs.append(ray.put(partition))
     tasks = [_RayMemorySourceTask(source_id, object_ref) for object_ref in object_refs]
     return table.schema, object_refs, tasks

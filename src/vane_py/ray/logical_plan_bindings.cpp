@@ -139,6 +139,23 @@ struct PreparedPythonMemorySource {
 	unique_ptr<DataSourceScanBindData> bind_data;
 };
 
+struct PythonMemorySourceCacheKey {
+	PyObject *source_identity;
+	string source_version;
+
+	bool operator==(const PythonMemorySourceCacheKey &other) const {
+		return source_identity == other.source_identity && source_version == other.source_version;
+	}
+};
+
+struct PythonMemorySourceCacheKeyHash {
+	size_t operator()(const PythonMemorySourceCacheKey &key) const {
+		auto identity_hash = std::hash<PyObject *> {}(key.source_identity);
+		auto version_hash = std::hash<string> {}(key.source_version);
+		return identity_hash ^ (version_hash + 0x9e3779b9 + (identity_hash << 6) + (identity_hash >> 2));
+	}
+};
+
 static idx_t PythonMemorySourceObjectRefCount(const py::object &memory_source_refs) {
 	if (memory_source_refs.is_none()) {
 		return 0;
@@ -198,12 +215,14 @@ static void ValidateMemorySourceSnapshotTypes(const LogicalGet &get, DataSourceS
 
 static void
 RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &memory_source_refs,
-                         std::unordered_map<PyObject *, unique_ptr<PreparedPythonMemorySource>> &prepared_sources) {
+                         std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
+                                            PythonMemorySourceCacheKeyHash> &prepared_sources) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		string source_kind;
 		py::object source = py::none();
 		py::object source_identity = py::none();
+		string source_version;
 		if (get.function.name == "pandas_scan") {
 			if (!get.bind_data) {
 				throw InvalidInputException("Python Pandas scan is missing bind data");
@@ -211,6 +230,7 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 			source_kind = "pandas";
 			source = PandasScanFunction::GetDataFrame(*get.bind_data);
 			source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
+			source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
 		} else if (get.function.name == "arrow_scan" || get.function.name == "arrow_scan_dumb") {
 			source_kind = "arrow";
 			source = PythonArrowScanSource(get);
@@ -218,7 +238,8 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 		}
 
 		if (!source_kind.empty()) {
-			auto prepared_entry = prepared_sources.find(source_identity.ptr());
+			PythonMemorySourceCacheKey source_key {source_identity.ptr(), std::move(source_version)};
+			auto prepared_entry = prepared_sources.find(source_key);
 			if (prepared_entry == prepared_sources.end()) {
 				auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
 				auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, get);
@@ -242,7 +263,7 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 				prepared->object_refs = std::move(object_refs);
 				prepared->bind_data = std::move(bind_data);
 				memory_source_refs[py::str(source_id)] = prepared->object_refs;
-				prepared_entry = prepared_sources.emplace(source_identity.ptr(), std::move(prepared)).first;
+				prepared_entry = prepared_sources.emplace(std::move(source_key), std::move(prepared)).first;
 			} else {
 				ValidateMemorySourceSnapshotTypes(get, *prepared_entry->second->bind_data, source_kind);
 			}
@@ -276,7 +297,9 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 		auto logical_plan = std::move(planner.plan);
 
 		py::dict memory_source_refs;
-		std::unordered_map<PyObject *, unique_ptr<PreparedPythonMemorySource>> prepared_sources;
+		std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
+		                   PythonMemorySourceCacheKeyHash>
+		    prepared_sources;
 		RewritePythonMemoryScans(*logical_plan, *client_context, memory_source_refs, prepared_sources);
 		if (py::len(memory_source_refs) > 0) {
 			result.memory_source_refs = std::move(memory_source_refs);
