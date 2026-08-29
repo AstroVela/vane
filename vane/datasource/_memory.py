@@ -122,6 +122,24 @@ def _select_memory_source_columns(source: Any, source_kind: str, column_indices:
     return source
 
 
+def _memory_source_row_count(source: Any, source_kind: str) -> int:
+    import pyarrow as pa
+
+    if source_kind == "pandas":
+        return len(source)
+    if source_kind == "numpy":
+        if not isinstance(source, dict) or not source:
+            raise TypeError("NumPy memory source must contain at least one normalized column")
+        return len(next(iter(source.values())))
+    if isinstance(source, (pa.Table, pa.RecordBatch)):
+        return source.num_rows
+    raise TypeError(
+        "Ray distributed execution only snapshots in-memory pyarrow.Table or pyarrow.RecordBatch sources; "
+        f"got {type(source).__name__}. Materialize lazy or streaming Arrow sources explicitly before calling "
+        "from_arrow()."
+    )
+
+
 def _truncating_integer_divide(values: Any, divisor: int) -> Any:
     import numpy as np
 
@@ -203,7 +221,11 @@ def _materialize_partition_column(column: Any) -> Any:
 
 
 def _snapshot_and_put_memory_source(
-    source: Any, source_kind: str, expected_schema: Any, column_indices: tuple[int, ...]
+    source: Any,
+    source_kind: str,
+    expected_schema: Any,
+    column_indices: tuple[int, ...],
+    include_row_count_column: bool,
 ) -> tuple[Any, list[Any]]:
     """Materialize selected columns into one canonical Ray-owned Arrow snapshot."""
 
@@ -213,11 +235,18 @@ def _snapshot_and_put_memory_source(
     if not ray.is_initialized():
         raise RuntimeError("Ray must be initialized before planning a Pandas or Arrow in-memory relation")
 
-    source = _select_memory_source_columns(source, source_kind, column_indices)
-    table = _as_arrow_table(source, source_kind)
     if not isinstance(expected_schema, pa.Schema):
         raise TypeError(f"Expected a pyarrow.Schema for a Python memory source, got {type(expected_schema).__name__}")
+    row_count = _memory_source_row_count(source, source_kind) if include_row_count_column else None
+    source = _select_memory_source_columns(source, source_kind, column_indices)
+    table = _as_arrow_table(source, source_kind)
     expected_names = expected_schema.names
+    if row_count is not None:
+        row_count_type = expected_schema.field(len(expected_names) - 1).type
+        table = pa.Table.from_arrays(
+            [*table.columns, pa.nulls(row_count, type=row_count_type)],
+            names=[*table.column_names, expected_names[-1]],
+        )
     if table.num_columns != len(expected_names):
         raise ValueError(
             f"Python memory source has {table.num_columns} columns after Arrow conversion, expected {len(expected_names)}"

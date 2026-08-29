@@ -157,7 +157,10 @@ struct PreparedPythonMemorySource {
 	vector<LogicalType> source_types;
 	vector<string> source_names;
 	std::set<idx_t> required_columns;
+	bool requires_row_count_column = false;
 	vector<idx_t> snapshot_columns;
+	optional_idx snapshot_row_count_column;
+	string row_count_column_name;
 	py::object snapshot_schema = py::none();
 	py::object object_refs = py::none();
 };
@@ -285,31 +288,36 @@ static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 	return requires_type_projection;
 }
 
-static bool ContainsPythonMemoryScan(const LogicalOperator &op) {
+static bool PreparePythonMemoryScansForPruning(LogicalOperator &op) {
+	bool contains_python_memory_scan = false;
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		if (get.function.name == "pandas_scan" || get.function.name == "arrow_scan" ||
 		    get.function.name == "arrow_scan_dumb") {
-			return true;
+			// Let RemoveUnusedColumns preserve row-count-only scans without
+			// choosing an arbitrary source column. The scan is replaced before
+			// execution, so its synthetic snapshot column implements this marker.
+			get.virtual_columns.emplace(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN));
+			contains_python_memory_scan = true;
 		}
 	}
 	for (auto &child : op.children) {
-		if (ContainsPythonMemoryScan(*child)) {
-			return true;
-		}
+		contains_python_memory_scan = PreparePythonMemoryScansForPruning(*child) || contains_python_memory_scan;
 	}
-	return false;
+	return contains_python_memory_scan;
 }
 
 static vector<idx_t> PythonMemoryScanColumnIds(const LogicalGet &get) {
 	vector<idx_t> result;
 	auto &column_ids = get.GetColumnIds();
-	if (column_ids.empty()) {
-		result.push_back(get.GetAnyColumn());
-		return result;
-	}
 	result.reserve(column_ids.size());
 	for (auto &column_id : column_ids) {
+		if (column_id.IsEmptyColumn()) {
+			if (column_ids.size() != 1) {
+				throw InternalException("Python memory empty-column scan unexpectedly references other columns");
+			}
+			return {};
+		}
 		if (!column_id.HasPrimaryIndex() || column_id.IsVirtualColumn() || column_id.IsPushdownExtract()) {
 			throw NotImplementedException(
 			    "Ray Python memory snapshots do not support virtual or pushed-down nested columns");
@@ -346,6 +354,9 @@ static void CollectPythonMemoryScans(LogicalOperator &op, const py::object &memo
 			}
 
 			auto source_columns = PythonMemoryScanColumnIds(get);
+			if (source_columns.empty()) {
+				source_entry->second->requires_row_count_column = true;
+			}
 			for (auto source_column : source_columns) {
 				source_entry->second->required_columns.insert(source_column);
 			}
@@ -364,7 +375,7 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		return;
 	}
 	prepared.snapshot_columns.assign(prepared.required_columns.begin(), prepared.required_columns.end());
-	if (prepared.snapshot_columns.empty()) {
+	if (prepared.snapshot_columns.empty() && !prepared.requires_row_count_column) {
 		throw InternalException("Python memory source snapshot has no referenced columns");
 	}
 
@@ -377,9 +388,16 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		snapshot_names.push_back(prepared.source_names[source_column]);
 		column_indices[column_idx] = py::int_(source_column);
 	}
+	if (prepared.requires_row_count_column) {
+		prepared.snapshot_row_count_column = optional_idx(snapshot_types.size());
+		prepared.row_count_column_name = "__vane_row_count_" + UUID::ToString(UUID::GenerateRandomUUID());
+		snapshot_types.push_back(LogicalType::BOOLEAN);
+		snapshot_names.push_back(prepared.row_count_column_name);
+	}
 	auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, snapshot_types, snapshot_names);
 	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
-	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, column_indices);
+	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, column_indices,
+	    py::bool_(prepared.requires_row_count_column));
 	if (!py::isinstance<py::tuple>(prepared_obj)) {
 		throw InternalException("Python memory snapshot helper must return a tuple");
 	}
@@ -419,17 +437,26 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			auto source_columns = PythonMemoryScanColumnIds(get);
 			vector<LogicalType> selected_types;
 			vector<string> selected_names;
-			py::tuple projected_columns(source_columns.size());
-			for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
-				auto source_column = source_columns[column_idx];
-				auto snapshot_entry =
-				    std::lower_bound(prepared.snapshot_columns.begin(), prepared.snapshot_columns.end(), source_column);
-				if (snapshot_entry == prepared.snapshot_columns.end() || *snapshot_entry != source_column) {
-					throw InternalException("Python memory scan column is missing from its shared snapshot");
+			py::tuple projected_columns(source_columns.empty() ? 1 : source_columns.size());
+			if (source_columns.empty()) {
+				if (!prepared.snapshot_row_count_column.IsValid()) {
+					throw InternalException("Python memory row-count scan is missing its synthetic snapshot column");
 				}
-				projected_columns[column_idx] = py::int_(snapshot_entry - prepared.snapshot_columns.begin());
-				selected_types.push_back(prepared.source_types[source_column]);
-				selected_names.push_back(prepared.source_names[source_column]);
+				projected_columns[0] = py::int_(prepared.snapshot_row_count_column.GetIndex());
+				selected_types.push_back(LogicalType::BOOLEAN);
+				selected_names.push_back(prepared.row_count_column_name);
+			} else {
+				for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
+					auto source_column = source_columns[column_idx];
+					auto snapshot_entry = std::lower_bound(prepared.snapshot_columns.begin(),
+					                                       prepared.snapshot_columns.end(), source_column);
+					if (snapshot_entry == prepared.snapshot_columns.end() || *snapshot_entry != source_column) {
+						throw InternalException("Python memory scan column is missing from its shared snapshot");
+					}
+					projected_columns[column_idx] = py::int_(snapshot_entry - prepared.snapshot_columns.begin());
+					selected_types.push_back(prepared.source_types[source_column]);
+					selected_names.push_back(prepared.source_names[source_column]);
+				}
 			}
 
 			auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
@@ -448,8 +475,8 @@ static void RewritePythonMemoryScans(unique_ptr<LogicalOperator> &op, ClientCont
 			}
 
 			vector<ColumnIndex> compact_column_ids;
-			compact_column_ids.reserve(source_columns.size());
-			for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
+			compact_column_ids.reserve(selected_types.size());
+			for (idx_t column_idx = 0; column_idx < selected_types.size(); column_idx++) {
 				compact_column_ids.emplace_back(column_idx);
 			}
 			get.returned_types = snapshot_types;
@@ -508,7 +535,7 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 		auto logical_plan = std::move(planner.plan);
 
 		py::dict memory_source_refs;
-		if (ContainsPythonMemoryScan(*logical_plan)) {
+		if (PreparePythonMemoryScansForPruning(*logical_plan)) {
 			// Snapshot only columns referenced by the bound plan. Running this
 			// standard pruning pass before replacing the scans avoids converting
 			// unused Pandas object columns while leaving all other optimizer passes
