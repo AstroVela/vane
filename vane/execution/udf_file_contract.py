@@ -584,7 +584,7 @@ def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundar
 
 
 def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any:
-    """Canonicalize FILE storage while preserving unrelated Arrow children."""
+    """Canonicalize a FILE-bearing Arrow value to its declared stable storage."""
     if isinstance(array, pa.ChunkedArray):
         if not array.chunks:
             normalized_empty = _normalize_file_arrow_array(pa.array([], type=array.type), dtype, boundary=boundary)
@@ -612,20 +612,11 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
             field_index = _optional_struct_field_index(array.type, name, boundary=boundary, path="column")
             if field_index is None:
                 child_array = pa.nulls(len(array))
-                field = pa.field(name, child_array.type)
             else:
                 child_array = array.field(field_index)
-                actual_field = array.type.field(field_index)
-                if _contains_file(child):
-                    child_array = _normalize_file_arrow_array(child_array, child, boundary=boundary)
-                field = pa.field(
-                    name,
-                    child_array.type,
-                    nullable=actual_field.nullable,
-                    metadata=actual_field.metadata,
-                )
+            child_array = _normalize_file_arrow_array(child_array, child, boundary=boundary)
             arrays.append(child_array)
-            fields.append(field)
+            fields.append(pa.field(name, child_array.type))
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
 
     if type_id == "list":
@@ -652,14 +643,21 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
         children = _type_children(dtype)
         keys = array.keys.slice(start, length)
         items = array.items.slice(start, length)
-        if _contains_file(children["key"]):
-            keys = _normalize_file_arrow_array(keys, children["key"], boundary=boundary)
-        if _contains_file(children["value"]):
-            items = _normalize_file_arrow_array(items, children["value"], boundary=boundary)
+        keys = _normalize_file_arrow_array(keys, children["key"], boundary=boundary)
+        items = _normalize_file_arrow_array(items, children["value"], boundary=boundary)
         normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
         return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
 
-    raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}")
+    try:
+        expected = _arrow_type_from_duckdb_pytype(dtype)
+    except Exception:
+        return array
+    if array.type.equals(expected):
+        return array
+    try:
+        return array.cast(expected)
+    except Exception as exc:
+        raise _invalid_input(f"{boundary} value cannot be cast to declared type {dtype}") from exc
 
 
 def validate_file_arrow_array(

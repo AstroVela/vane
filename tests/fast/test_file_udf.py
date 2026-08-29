@@ -528,11 +528,61 @@ def test_map_batches_normalizes_file_storage_across_output_batches():
     ]
 
 
+def test_map_batches_normalizes_file_composite_siblings_across_output_batches():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def emit_documents(_table):
+        import pyarrow as pa
+
+        for identifier, integer_type in ((1, pa.int32()), (2, pa.int64())):
+            payload_type = pa.struct(
+                [
+                    pa.field("document", _file_arrow_type()),
+                    pa.field("id", integer_type),
+                ]
+            )
+            yield pa.table(
+                {
+                    "payload": pa.array(
+                        [{"document": _file_record(url=f"memory://{identifier}"), "id": identifier}],
+                        type=payload_type,
+                    )
+                }
+            )
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(emit_documents),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": "STRUCT(document FILE, id BIGINT)"}],
+            "stream_output": True,
+            "output_batch_size": 2,
+        }
+    )
+    try:
+        executor.submit(pa.table({"input": [1]}))
+        output = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert len(output) == 1
+    payload = output[0].column("payload")
+    assert payload.type.field("id").type == pa.int64()
+    assert payload.to_pylist() == [
+        {"document": _file_record(url="memory://1"), "id": 1},
+        {"document": _file_record(url="memory://2"), "id": 2},
+    ]
+
+
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
     import pyarrow as pa
 
     from vane.execution._udf_runtime import _build_valid_mask
-    from vane.execution.udf_file_contract import validate_file_arrow_array
+    from vane.execution.udf_file_contract import FileUDFContract, validate_file_arrow_array
 
     class ExplodingScalar(pa.ExtensionScalar):
         def as_py(self, *args, **kwargs):
@@ -564,6 +614,14 @@ def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
         boundary="test output",
     )
     assert _build_valid_mask(pa.table({"value": array})) == [True]
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "no-materialization",
+            "output_schema": [{"name": "value", "kind": "duckdb_type", "type": "STRUCT(document FILE, payload BLOB)"}],
+        }
+    )
+    normalized = contract.normalize_output_table(pa.table({"value": array}))
+    assert normalized.column("value").type.field("payload").type == pa.binary()
 
 
 def test_file_composite_arrow_fields_match_case_insensitively():
