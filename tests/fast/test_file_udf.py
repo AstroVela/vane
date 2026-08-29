@@ -1483,7 +1483,8 @@ def test_batch_file_udf_supports_bit_sibling():
             names=["document", "flags"],
         )
 
-    assert build_document.return_arrow_dtype.field("flags").type == pa.binary()
+    bit_type = build_document.return_arrow_dtype.field("flags").type
+    assert bit_type == pa.opaque(pa.binary(), "bit", "DuckDB")
 
     connection = vane.connect()
     result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
@@ -1492,6 +1493,33 @@ def test_batch_file_udf_supports_bit_sibling():
         "memory://bit-sibling",
         "101001",
     )
+
+
+def test_batch_file_udf_preserves_bit_identity_storage():
+    import pyarrow as pa
+
+    connection = vane.connect()
+    bit_storage = connection.execute("SELECT '0101011'::BIT AS flags").to_arrow_table().column("flags").chunk(0)
+    assert bit_storage.type == pa.binary()
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def identity(values):
+        return values
+
+    payload = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            bit_storage,
+        ],
+        names=["document", "flags"],
+    )
+    result = identity(payload)
+
+    assert result.type.field("flags").type == pa.opaque(pa.binary(), "bit", "DuckDB")
+    connection.register("file_bit_identity", pa.table({"payload": result}))
+    assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_identity").fetchone() == ("0101011",)
 
 
 def test_file_output_normalization_preserves_full_intervals():

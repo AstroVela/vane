@@ -230,6 +230,16 @@ def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
     return isinstance(dtype, getattr(pa, "BaseExtensionType", pa.ExtensionType))
 
 
+def _is_duckdb_bit_arrow_type(dtype: pa.DataType) -> bool:
+    return (
+        _is_arrow_extension_type(dtype)
+        and getattr(dtype, "extension_name", None) == "arrow.opaque"
+        and getattr(dtype, "type_name", None) == "bit"
+        and getattr(dtype, "vendor_name", None) == "DuckDB"
+        and _is_arrow_binary_storage(dtype.storage_type)
+    )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -806,6 +816,20 @@ def _normalize_file_arrow_array(
         return pa.chunked_array(chunks)
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
+    if type_id == "bit":
+        source = _mask_inactive(array, active)
+        expected = _expected_arrow_type(dtype, boundary=boundary)
+        if source.type.equals(expected):
+            return source
+        if _is_arrow_binary_storage(source.type):
+            storage = source if source.type.equals(expected.storage_type) else source.cast(expected.storage_type)
+            return pa.ExtensionArray.from_storage(expected, storage)
+        if _is_duckdb_bit_arrow_type(source.type):
+            storage = source.storage
+            if not storage.type.equals(expected.storage_type):
+                storage = storage.cast(expected.storage_type)
+            return pa.ExtensionArray.from_storage(expected, storage)
+        return source
     if type_id == "uuid":
         source = _mask_inactive(array, active)
         values = source.to_pylist()
