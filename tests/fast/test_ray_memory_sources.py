@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pickle
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -246,6 +247,29 @@ def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, m
     runner = runners.get_or_create_runner()
     result = pa.concat_tables(list(runner.run_iter_tables(left.union(right))))
     assert sorted(result.column(0).to_pylist()) == [1, 2, 3, 10, 20, 30]
+
+
+def test_pandas_row_count_scan_does_not_snapshot_uuid_object_column(connection, monkeypatch):
+    from vane.datasource import _memory
+
+    source = pd.DataFrame({"u": pd.Series([uuid.uuid4(), uuid.uuid4(), uuid.uuid4()], dtype=object)})
+    snapshot_columns = []
+    original = _memory._as_arrow_table
+
+    def capture_snapshot(value, source_kind):
+        if source_kind == "pandas":
+            snapshot_columns.append(tuple(value.columns))
+        return original(value, source_kind)
+
+    monkeypatch.setattr(_memory, "_as_arrow_table", capture_snapshot)
+    relation = connection.from_df(source).aggregate("count(*)")
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == [3]
+    assert snapshot_columns == [()]
 
 
 def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connection, monkeypatch):
