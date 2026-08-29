@@ -231,6 +231,12 @@ def test_base_distribution_requires_botocore_1_38_or_newer():
     assert botocore_requirement.specifier == SpecifierSet(">=1.38.0,<2")
 
 
+def test_base_distribution_installs_the_bounded_elf_parser_dependency():
+    pyelftools_requirement = _base_requirements()["pyelftools"]
+
+    assert pyelftools_requirement.specifier == SpecifierSet(">=0.33,<1")
+
+
 def test_artifact_mode_imports_installed_python_packages():
     if os.environ.get("VANE_FAST_TEST_ARTIFACT_MODE") != "1":
         pytest.skip("only applies to artifact-backed fast-test jobs")
@@ -354,6 +360,7 @@ def test_wheel_or_install_contains_primary_and_third_party_license_files():
     assert any(path.endswith("licenses/LICENSE") for path in files)
     assert any(path.endswith("licenses/NOTICE") for path in files)
     assert any(path.endswith("licenses/LICENSES/DuckDB-MIT.txt") for path in files)
+    assert any(path.endswith("licenses/LICENSES/auditwheel-LICENSE.txt") for path in files)
     assert any(path.endswith("licenses/LICENSES/vcpkg-binary-dependencies.txt") for path in files)
     assert any(path.endswith("licenses/vane/experimental/spark/LICENSE") for path in files)
     assert any(path.endswith("compression/alp/algorithm/LICENSE") for path in files)

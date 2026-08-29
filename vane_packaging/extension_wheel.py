@@ -33,6 +33,9 @@ from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from elftools.common.exceptions import ELFError
+from elftools.common.utils import struct_parse
+from elftools.elf.elffile import ELFFile
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -40,6 +43,7 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from packaging.version import InvalidVersion, Version
 
 from vane_packaging.archive_safety import validate_zip_member_count
+from vane_packaging.manylinux_policy import ManylinuxPolicy, manylinux_policy
 
 if TYPE_CHECKING:
     from vane.extensions import DynamicExtensionDependency, DynamicExtensionDescriptor
@@ -116,6 +120,9 @@ _PLATFORM_BUILD_DETAILS_FILENAME = "vane-extension-platform.json"
 _ELF_HEADER_64 = struct.Struct("<16sHHIQQQIHHHHHH")
 _ELF_PROGRAM_HEADER_64 = struct.Struct("<IIQQQQQQ")
 _ELF_DYNAMIC_ENTRY_64 = struct.Struct("<qQ")
+_ELF_DYNAMIC_SYMBOL_64 = struct.Struct("<IBBHQQ")
+_ELF_SYSV_HASH_HEADER = struct.Struct("<II")
+_ELF_GNU_HASH_HEADER = struct.Struct("<IIII")
 _ELF_VERSION_NEEDED_ENTRY_64 = struct.Struct("<HHIII")
 _ELF_VERSION_NEEDED_AUXILIARY_64 = struct.Struct("<IHHII")
 _ELF_LOAD_SEGMENT_TYPE = 1
@@ -123,8 +130,11 @@ _ELF_DYNAMIC_SEGMENT_TYPE = 2
 _ELF_PROGRAM_INTERPRETER_TYPE = 3
 _ELF_DYNAMIC_NULL_TAG = 0
 _ELF_DYNAMIC_NEEDED_TAG = 1
+_ELF_DYNAMIC_HASH_TAG = 4
 _ELF_DYNAMIC_STRING_TABLE_TAG = 5
+_ELF_DYNAMIC_SYMBOL_TABLE_TAG = 6
 _ELF_DYNAMIC_STRING_TABLE_SIZE_TAG = 10
+_ELF_DYNAMIC_SYMBOL_ENTRY_SIZE_TAG = 11
 _ELF_DYNAMIC_SONAME_TAG = 14
 _ELF_DYNAMIC_RPATH_TAG = 15
 _ELF_DYNAMIC_RUNPATH_TAG = 29
@@ -132,6 +142,7 @@ _ELF_DYNAMIC_CONFIG_TAG = 0x6FFFFEFA
 _ELF_DYNAMIC_DEPENDENCY_AUDIT_TAG = 0x6FFFFEFB
 _ELF_DYNAMIC_AUDIT_TAG = 0x6FFFFEFC
 _ELF_DYNAMIC_FLAGS_1_TAG = 0x6FFFFFFB
+_ELF_DYNAMIC_GNU_HASH_TAG = 0x6FFFFEF5
 _ELF_DYNAMIC_VERSION_NEEDED_TAG = 0x6FFFFFFE
 _ELF_DYNAMIC_VERSION_NEEDED_COUNT_TAG = 0x6FFFFFFF
 _ELF_DYNAMIC_AUXILIARY_TAG = 0x7FFFFFFD
@@ -150,6 +161,8 @@ _MAX_ELF_DYNAMIC_ENTRIES = 4096
 _MAX_ELF_LOADER_DEPENDENCIES = 256
 _MAX_ELF_DYNAMIC_STRING_TABLE_BYTES = 1024 * 1024
 _MAX_ELF_LIBRARY_NAME_BYTES = 255
+_MAX_ELF_DYNAMIC_SYMBOLS = 262_144
+_MAX_ELF_SYMBOL_NAME_BYTES = 4096
 _MAX_ELF_VERSION_NEEDED_FILES = 256
 _MAX_ELF_VERSION_REQUIREMENTS = 4096
 _MAX_ELF_VERSION_NAME_BYTES = 255
@@ -255,34 +268,6 @@ _WINDOWS_SYSTEM_LIBRARIES = frozenset(
     }
 )
 _WINDOWS_CPYTHON_RUNTIME_LIBRARIES = frozenset({"vcruntime140.dll", "vcruntime140_1.dll"})
-_MANYLINUX_BASE_EXTERNAL_LIBRARIES = frozenset(
-    {
-        "libatomic.so.1",
-        "libgcc_s.so.1",
-        "libstdc++.so.6",
-        "libm.so.6",
-        "libanl.so.1",
-        "libdl.so.2",
-        "librt.so.1",
-        "libc.so.6",
-        "libnsl.so.1",
-        "libutil.so.1",
-        "libpthread.so.0",
-        "libX11.so.6",
-        "libXext.so.6",
-        "libXrender.so.1",
-        "libICE.so.6",
-        "libSM.so.6",
-        "libGL.so.1",
-        "libgobject-2.0.so.0",
-        "libgthread-2.0.so.0",
-        "libglib-2.0.so.0",
-        "libresolv.so.2",
-        "libz.so.1",
-    }
-)
-_MANYLINUX_2_12_EXTERNAL_LIBRARIES = frozenset({"libexpat.so.1"})
-_MANYLINUX_2_24_EXTERNAL_LIBRARIES = frozenset({"libmvec.so.1"})
 _MANYLINUX_DYNAMIC_LOADER_BY_ARCHITECTURE = {
     "x86_64": "ld-linux-x86-64.so.2",
     "aarch64": "ld-linux-aarch64.so.1",
@@ -290,205 +275,6 @@ _MANYLINUX_DYNAMIC_LOADER_BY_ARCHITECTURE = {
 _MUSLLINUX_LIBC_BY_ARCHITECTURE = {
     "x86_64": "libc.musl-x86_64.so.1",
     "aarch64": "libc.musl-aarch64.so.1",
-}
-# Cumulative x86-64 and AArch64 additions from auditwheel's manylinux policy.
-# Numeric GLIBC requirements are checked directly against the declared tag.
-_MANYLINUX_SYMBOL_VERSION_ADDITIONS = {
-    "x86_64": (
-        (
-            (2, 5),
-            frozenset(
-                {
-                    "CXXABI_1.3",
-                    "CXXABI_1.3.1",
-                    *(
-                        f"GCC_{version}"
-                        for version in ("3.0", "3.3", "3.3.1", "3.4", "3.4.2", "3.4.4", "4.0.0", "4.2.0")
-                    ),
-                    "GLIBCXX_3.4",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(1, 9)),
-                }
-            ),
-        ),
-        (
-            (2, 12),
-            frozenset(
-                {
-                    "CXXABI_1.3.2",
-                    "CXXABI_1.3.3",
-                    "GCC_4.3.0",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(9, 14)),
-                    *(f"ZLIB_{version}" for version in ("1.2.0", "1.2.0.2", "1.2.0.8", "1.2.2", "1.2.2.3", "1.2.2.4")),
-                }
-            ),
-        ),
-        (
-            (2, 17),
-            frozenset(
-                {
-                    *(f"CXXABI_1.3.{version}" for version in range(4, 8)),
-                    "CXXABI_TM_1",
-                    "GCC_4.7.0",
-                    "GCC_4.8.0",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(14, 20)),
-                    *(f"ZLIB_{version}" for version in ("1.2.3.3", "1.2.3.4", "1.2.3.5", "1.2.5.1", "1.2.5.2")),
-                }
-            ),
-        ),
-        (
-            (2, 24),
-            frozenset(
-                {
-                    *(f"CXXABI_1.3.{version}" for version in range(8, 11)),
-                    "CXXABI_FLOAT128",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(20, 23)),
-                    "LIBATOMIC_1.0",
-                    "LIBATOMIC_1.1",
-                    "LIBATOMIC_1.2",
-                }
-            ),
-        ),
-        ((2, 26), frozenset()),
-        (
-            (2, 27),
-            frozenset(
-                {
-                    "CXXABI_1.3.11",
-                    "GCC_7.0.0",
-                    "GLIBCXX_3.4.23",
-                    "GLIBCXX_3.4.24",
-                    "ZLIB_1.2.7.1",
-                    "ZLIB_1.2.9",
-                }
-            ),
-        ),
-        ((2, 28), frozenset()),
-        (
-            (2, 31),
-            frozenset(
-                {
-                    "CXXABI_1.3.12",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(25, 29)),
-                }
-            ),
-        ),
-        ((2, 34), frozenset({"CXXABI_1.3.13", "GLIBCXX_3.4.29"})),
-        ((2, 35), frozenset({"GCC_12.0.0", "GLIBCXX_3.4.30"})),
-        ((2, 36), frozenset({"GLIBC_ABI_DT_RELR"})),
-        ((2, 37), frozenset({"ZLIB_1.2.12"})),
-        ((2, 38), frozenset()),
-        (
-            (2, 39),
-            frozenset(
-                {
-                    "CXXABI_1.3.14",
-                    "CXXABI_1.3.15",
-                    "GCC_13.0.0",
-                    "GCC_14.0.0",
-                    "GLIBCXX_3.4.31",
-                    "GLIBCXX_3.4.32",
-                    "GLIBCXX_3.4.33",
-                }
-            ),
-        ),
-        ((2, 40), frozenset()),
-        ((2, 41), frozenset()),
-    ),
-    "aarch64": (
-        (
-            (2, 17),
-            frozenset(
-                {
-                    "CXXABI_1.3",
-                    *(f"CXXABI_1.3.{version}" for version in range(1, 8)),
-                    "CXXABI_TM_1",
-                    *(
-                        f"GCC_{version}"
-                        for version in (
-                            "3.0",
-                            "3.3",
-                            "3.3.1",
-                            "3.4",
-                            "3.4.2",
-                            "3.4.4",
-                            "4.0.0",
-                            "4.2.0",
-                            "4.3.0",
-                            "4.5.0",
-                            "4.7.0",
-                        )
-                    ),
-                    "GLIBCXX_3.4",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(1, 20)),
-                    "LIBATOMIC_1.0",
-                    *(
-                        f"ZLIB_{version}"
-                        for version in (
-                            "1.2.0",
-                            "1.2.0.2",
-                            "1.2.0.8",
-                            "1.2.2",
-                            "1.2.2.3",
-                            "1.2.2.4",
-                            "1.2.3.3",
-                            "1.2.3.4",
-                            "1.2.3.5",
-                            "1.2.5.1",
-                            "1.2.5.2",
-                        )
-                    ),
-                }
-            ),
-        ),
-        (
-            (2, 24),
-            frozenset(
-                {
-                    *(f"CXXABI_1.3.{version}" for version in range(8, 11)),
-                    *(f"GLIBCXX_3.4.{version}" for version in range(20, 23)),
-                    "LIBATOMIC_1.1",
-                    "LIBATOMIC_1.2",
-                }
-            ),
-        ),
-        (
-            (2, 26),
-            frozenset({"CXXABI_1.3.11", "GCC_7.0.0", "GLIBCXX_3.4.23", "GLIBCXX_3.4.24"}),
-        ),
-        ((2, 27), frozenset({"ZLIB_1.2.7.1", "ZLIB_1.2.9"})),
-        ((2, 28), frozenset()),
-        (
-            (2, 31),
-            frozenset(
-                {
-                    "CXXABI_1.3.12",
-                    *(f"GLIBCXX_3.4.{version}" for version in range(25, 29)),
-                }
-            ),
-        ),
-        ((2, 34), frozenset({"CXXABI_1.3.13", "GCC_11.0", "GLIBCXX_3.4.29"})),
-        ((2, 35), frozenset({"GLIBCXX_3.4.30"})),
-        ((2, 36), frozenset({"GLIBC_ABI_DT_RELR"})),
-        ((2, 37), frozenset({"ZLIB_1.2.12"})),
-        ((2, 38), frozenset()),
-        (
-            (2, 39),
-            frozenset(
-                {
-                    "CXXABI_1.3.14",
-                    "CXXABI_1.3.15",
-                    "GCC_13.0.0",
-                    "GCC_14.0",
-                    "GCC_14.0.0",
-                    "GLIBCXX_3.4.31",
-                    "GLIBCXX_3.4.32",
-                    "GLIBCXX_3.4.33",
-                }
-            ),
-        ),
-        ((2, 40), frozenset()),
-        ((2, 41), frozenset()),
-    ),
 }
 _MUSL_VERSION_RE = re.compile(rb"(?:^|\n)Version ([0-9]+)\.([0-9]+)(?:\.[0-9]+)?(?:\r?\n|$)")
 _MACHO_MAGIC_64 = b"\xcf\xfa\xed\xfe"
@@ -598,6 +384,7 @@ class _ElfDynamicLinkage:
     auxiliaries: tuple[str, ...]
     soname: str | None
     versioned_symbols: tuple[tuple[str, str], ...]
+    undefined_symbols: frozenset[str]
 
     @property
     def loader_dependencies(self) -> tuple[str, ...]:
@@ -1397,6 +1184,7 @@ def _wheel_platform_policy(platform_tag: str) -> _WheelPlatformPolicy:
             policy_floor = _MANYLINUX_POLICY_FLOORS.get(architecture)
             if policy_floor is None or minimum_version < policy_floor:
                 raise ValueError(f"manylinux wheel platform tag {platform_tag!r} is below the supported policy floor")
+            manylinux_policy(minimum_version, architecture)
         if family == "macosx":
             major, minor = minimum_version
             canonical_macos_tag = (architecture == "arm64" and major >= 11 and minor == 0) or (
@@ -1995,10 +1783,23 @@ def _validate_linux_elf_platform(
     if unexpected_libraries:
         raise ValueError(f"{description} requires non-policy ELF shared libraries: {unexpected_libraries}")
 
+    if policy.family == "manylinux":
+        blacklisted_symbols = _manylinux_policy_blacklisted_undefined_symbols(
+            policy,
+            dynamic_linkage.needed,
+            dynamic_linkage.undefined_symbols,
+        )
+        if blacklisted_symbols:
+            raise ValueError(
+                f"{description} requires blacklisted undefined ELF symbols outside platform policy "
+                f"{platform_tag!r}: {blacklisted_symbols}"
+            )
+
     allowed_versioned_symbols = (
         _manylinux_policy_versioned_symbols(policy) if policy.family == "manylinux" else frozenset()
     )
     unsupported_versioned_symbols: set[str] = set()
+    unsupported_glibc_versions: dict[str, tuple[int, ...]] = {}
     actual_floor: tuple[int, int] | None = None
     has_glibc_version_requirement = False
     for _library, versioned_symbol in dynamic_linkage.versioned_symbols:
@@ -2013,9 +1814,18 @@ def _validate_linux_elf_platform(
         components = tuple(match[1].split("."))
         if any(len(component) > _MAX_LIBC_VERSION_COMPONENT_DIGITS for component in components):
             raise ValueError(f"{description} contains an invalid glibc version requirement")
-        requirement = (int(components[0]), int(components[1]))
+        complete_requirement = tuple(int(component) for component in components)
+        requirement = complete_requirement[:2]
         if actual_floor is None or requirement > actual_floor:
             actual_floor = requirement
+        if policy.family == "manylinux" and versioned_symbol not in allowed_versioned_symbols:
+            unsupported_glibc_versions[versioned_symbol] = complete_requirement
+    if unsupported_glibc_versions:
+        highest_requirement = max(unsupported_glibc_versions, key=unsupported_glibc_versions.__getitem__)
+        raise ValueError(
+            f"{description} requires glibc {highest_requirement.removeprefix('GLIBC_')}, which is outside "
+            f"exact platform policy {platform_tag!r}: {tuple(sorted(unsupported_glibc_versions))}"
+        )
     if unsupported_versioned_symbols:
         raise ValueError(
             f"{description} requires versioned ELF symbols outside platform policy {platform_tag!r}: "
@@ -2034,12 +1844,6 @@ def _validate_linux_elf_platform(
     if "libc.so.6" in loader_dependencies and actual_floor is None:
         raise ValueError(f"{description} glibc floor cannot be established from its ELF requirements")
 
-    minimum_version = policy.minimum_version
-    if actual_floor is not None and (minimum_version is None or actual_floor > minimum_version):
-        raise ValueError(
-            f"{description} requires glibc {actual_floor[0]}.{actual_floor[1]}, which exceeds "
-            f"platform tag {platform_tag!r}"
-        )
     return actual_floor
 
 
@@ -2098,7 +1902,14 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
     if len(dynamic_segments) > 1:
         raise ValueError(f"{description} contains more than one ELF dynamic segment")
     if not dynamic_segments:
-        return _ElfDynamicLinkage(needed=(), filters=(), auxiliaries=(), soname=None, versioned_symbols=())
+        return _ElfDynamicLinkage(
+            needed=(),
+            filters=(),
+            auxiliaries=(),
+            soname=None,
+            versioned_symbols=(),
+            undefined_symbols=frozenset(),
+        )
 
     dynamic_offset, dynamic_address, dynamic_size = dynamic_segments[0]
     if dynamic_size == 0 or dynamic_size % _ELF_DYNAMIC_ENTRY_64.size != 0:
@@ -2119,8 +1930,12 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
     needed_offsets: list[int] = []
     filter_offsets: list[int] = []
     auxiliary_offsets: list[int] = []
+    hash_table_addresses: list[int] = []
+    gnu_hash_table_addresses: list[int] = []
     string_table_addresses: list[int] = []
     string_table_sizes: list[int] = []
+    symbol_table_addresses: list[int] = []
+    symbol_entry_sizes: list[int] = []
     soname_offsets: list[int] = []
     version_needed_addresses: list[int] = []
     version_needed_counts: list[int] = []
@@ -2136,10 +1951,18 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
             filter_offsets.append(value)
         elif tag == _ELF_DYNAMIC_AUXILIARY_TAG:
             auxiliary_offsets.append(value)
+        elif tag == _ELF_DYNAMIC_HASH_TAG:
+            hash_table_addresses.append(value)
+        elif tag == _ELF_DYNAMIC_GNU_HASH_TAG:
+            gnu_hash_table_addresses.append(value)
         elif tag == _ELF_DYNAMIC_STRING_TABLE_TAG:
             string_table_addresses.append(value)
         elif tag == _ELF_DYNAMIC_STRING_TABLE_SIZE_TAG:
             string_table_sizes.append(value)
+        elif tag == _ELF_DYNAMIC_SYMBOL_TABLE_TAG:
+            symbol_table_addresses.append(value)
+        elif tag == _ELF_DYNAMIC_SYMBOL_ENTRY_SIZE_TAG:
+            symbol_entry_sizes.append(value)
         elif tag == _ELF_DYNAMIC_SONAME_TAG:
             soname_offsets.append(value)
         elif tag == _ELF_DYNAMIC_VERSION_NEEDED_TAG:
@@ -2156,20 +1979,37 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
     if not terminated:
         raise ValueError(f"{description} ELF dynamic segment has no terminating DT_NULL entry")
     if (
-        len(string_table_addresses) > 1
+        len(hash_table_addresses) > 1
+        or len(gnu_hash_table_addresses) > 1
+        or len(string_table_addresses) > 1
         or len(string_table_sizes) > 1
+        or len(symbol_table_addresses) > 1
+        or len(symbol_entry_sizes) > 1
         or len(soname_offsets) > 1
         or len(version_needed_addresses) > 1
         or len(version_needed_counts) > 1
     ):
-        raise ValueError(f"{description} contains duplicate ELF dynamic string-table metadata")
+        raise ValueError(f"{description} contains duplicate ELF dynamic linkage metadata")
     if bool(version_needed_addresses) != bool(version_needed_counts):
         raise ValueError(f"{description} contains incomplete ELF version-needed metadata")
+    if bool(symbol_table_addresses) != bool(symbol_entry_sizes):
+        raise ValueError(f"{description} contains incomplete ELF dynamic symbol-table metadata")
+    if (hash_table_addresses or gnu_hash_table_addresses) and not symbol_table_addresses:
+        raise ValueError(f"{description} contains an ELF dynamic hash table without a symbol table")
+    if symbol_table_addresses and not (hash_table_addresses or gnu_hash_table_addresses):
+        raise ValueError(f"{description} ELF dynamic symbol table has no bounded hash-table count")
 
     dependency_offsets = (*needed_offsets, *filter_offsets, *auxiliary_offsets)
     string_offsets = (*dependency_offsets, *soname_offsets)
-    if not string_offsets and not version_needed_addresses:
-        return _ElfDynamicLinkage(needed=(), filters=(), auxiliaries=(), soname=None, versioned_symbols=())
+    if not string_offsets and not version_needed_addresses and not symbol_table_addresses:
+        return _ElfDynamicLinkage(
+            needed=(),
+            filters=(),
+            auxiliaries=(),
+            soname=None,
+            versioned_symbols=(),
+            undefined_symbols=frozenset(),
+        )
     if len(string_table_addresses) != 1 or len(string_table_sizes) != 1:
         raise ValueError(f"{description} ELF dynamic strings require exactly one string table and size")
     string_table_size = string_table_sizes[0]
@@ -2212,12 +2052,27 @@ def _parse_elf_dynamic_linkage(contents: bytes, *, description: str) -> _ElfDyna
         if version_needed_addresses
         else ()
     )
+    undefined_symbols = (
+        _parse_elf_undefined_symbols(
+            contents,
+            load_segments,
+            symbol_table_addresses[0],
+            symbol_entry_sizes[0],
+            hash_table_address=hash_table_addresses[0] if hash_table_addresses else None,
+            gnu_hash_table_address=gnu_hash_table_addresses[0] if gnu_hash_table_addresses else None,
+            string_table=string_table,
+            description=description,
+        )
+        if symbol_table_addresses
+        else frozenset()
+    )
     return _ElfDynamicLinkage(
         needed=needed,
         filters=filters,
         auxiliaries=auxiliaries,
         soname=soname,
         versioned_symbols=versioned_symbols,
+        undefined_symbols=undefined_symbols,
     )
 
 
@@ -2238,6 +2093,189 @@ def _elf_file_range_for_virtual_range(
     if len(mappings) != 1:
         raise ValueError(f"{description} ELF {range_description} has no unique file-backed load mapping")
     return next(iter(mappings))
+
+
+def _parse_elf_undefined_symbols(
+    contents: bytes,
+    load_segments: Iterable[tuple[int, int, int]],
+    symbol_table_address: int,
+    symbol_entry_size: int,
+    *,
+    hash_table_address: int | None,
+    gnu_hash_table_address: int | None,
+    string_table: bytes,
+    description: str,
+) -> frozenset[str]:
+    if symbol_entry_size != _ELF_DYNAMIC_SYMBOL_64.size:
+        raise ValueError(f"{description} contains an invalid ELF dynamic symbol-entry size")
+    symbol_counts: list[int] = []
+    if hash_table_address is not None:
+        symbol_counts.append(
+            _elf_sysv_hash_symbol_count(
+                contents,
+                load_segments,
+                hash_table_address,
+                description=description,
+            )
+        )
+    if gnu_hash_table_address is not None:
+        symbol_counts.append(
+            _elf_gnu_hash_symbol_count(
+                contents,
+                load_segments,
+                gnu_hash_table_address,
+                description=description,
+            )
+        )
+    if not symbol_counts or len(set(symbol_counts)) != 1:
+        raise ValueError(f"{description} ELF dynamic hash tables do not provide one exact symbol count")
+    symbol_count = symbol_counts[0]
+    symbol_table_start, _symbol_table_end = _elf_file_range_for_virtual_range(
+        load_segments,
+        symbol_table_address,
+        symbol_count * symbol_entry_size,
+        description=description,
+        range_description="dynamic symbol table",
+    )
+
+    undefined_symbols: set[str] = set()
+    try:
+        elf_file = ELFFile(io.BytesIO(contents))
+        for index in range(symbol_count):
+            symbol = struct_parse(
+                elf_file.structs.Elf_Sym,
+                elf_file.stream,
+                stream_pos=symbol_table_start + index * symbol_entry_size,
+            )
+            symbol_name = _elf_dynamic_symbol_name(
+                string_table,
+                symbol["st_name"],
+                description=description,
+            )
+            if symbol["st_shndx"] == "SHN_UNDEF" and symbol["st_info"]["bind"] != "STB_WEAK" and symbol_name:
+                undefined_symbols.add(symbol_name)
+    except ELFError as exception:
+        raise ValueError(f"{description} contains an invalid ELF dynamic symbol table") from exception
+    return frozenset(undefined_symbols)
+
+
+def _elf_sysv_hash_symbol_count(
+    contents: bytes,
+    load_segments: Iterable[tuple[int, int, int]],
+    hash_table_address: int,
+    *,
+    description: str,
+) -> int:
+    header_start, _header_end = _elf_file_range_for_virtual_range(
+        load_segments,
+        hash_table_address,
+        _ELF_SYSV_HASH_HEADER.size,
+        description=description,
+        range_description="SysV hash header",
+    )
+    bucket_count, symbol_count = _ELF_SYSV_HASH_HEADER.unpack_from(contents, header_start)
+    if not 0 < bucket_count <= _MAX_ELF_DYNAMIC_SYMBOLS or not 0 < symbol_count <= _MAX_ELF_DYNAMIC_SYMBOLS:
+        raise ValueError(f"{description} contains invalid or excessive ELF SysV hash dimensions")
+    table_size = _ELF_SYSV_HASH_HEADER.size + 4 * (bucket_count + symbol_count)
+    table_start, _table_end = _elf_file_range_for_virtual_range(
+        load_segments,
+        hash_table_address,
+        table_size,
+        description=description,
+        range_description="SysV hash table",
+    )
+    indices_start = table_start + _ELF_SYSV_HASH_HEADER.size
+    for index in range(bucket_count + symbol_count):
+        symbol_index = struct.unpack_from("<I", contents, indices_start + index * 4)[0]
+        if symbol_index >= symbol_count:
+            raise ValueError(f"{description} contains an out-of-range ELF SysV hash symbol index")
+    return symbol_count
+
+
+def _elf_gnu_hash_symbol_count(
+    contents: bytes,
+    load_segments: Iterable[tuple[int, int, int]],
+    hash_table_address: int,
+    *,
+    description: str,
+) -> int:
+    header_start, _header_end = _elf_file_range_for_virtual_range(
+        load_segments,
+        hash_table_address,
+        _ELF_GNU_HASH_HEADER.size,
+        description=description,
+        range_description="GNU hash header",
+    )
+    bucket_count, symbol_offset, bloom_size, _bloom_shift = _ELF_GNU_HASH_HEADER.unpack_from(contents, header_start)
+    if (
+        not 0 < bucket_count <= _MAX_ELF_DYNAMIC_SYMBOLS
+        or not 0 < symbol_offset <= _MAX_ELF_DYNAMIC_SYMBOLS
+        or not 0 < bloom_size <= _MAX_ELF_DYNAMIC_SYMBOLS
+    ):
+        raise ValueError(f"{description} contains invalid or excessive ELF GNU hash dimensions")
+    fixed_size = _ELF_GNU_HASH_HEADER.size + 8 * bloom_size + 4 * bucket_count
+    table_start, _table_end = _elf_file_range_for_virtual_range(
+        load_segments,
+        hash_table_address,
+        fixed_size,
+        description=description,
+        range_description="GNU hash table",
+    )
+    buckets_start = table_start + _ELF_GNU_HASH_HEADER.size + 8 * bloom_size
+    buckets = tuple(struct.unpack_from("<I", contents, buckets_start + index * 4)[0] for index in range(bucket_count))
+    if any(bucket != 0 and not symbol_offset <= bucket < _MAX_ELF_DYNAMIC_SYMBOLS for bucket in buckets):
+        raise ValueError(f"{description} contains an out-of-range ELF GNU hash bucket")
+    nonempty_buckets = tuple(bucket for bucket in buckets if bucket)
+    if not nonempty_buckets:
+        return symbol_offset
+
+    last_symbol_start = max(nonempty_buckets)
+    chain_index = last_symbol_start - symbol_offset
+    chain_relative_offset = fixed_size + chain_index * 4
+    if hash_table_address > _ELF_MAX_ADDRESS - chain_relative_offset:
+        raise ValueError(f"{description} contains an out-of-bounds ELF GNU hash chain")
+    chain_start, chain_bytes = _elf_file_offset_and_available_size(
+        load_segments,
+        hash_table_address + chain_relative_offset,
+        description=description,
+        range_description="GNU hash chain",
+    )
+    maximum_chain_entries = min(chain_bytes // 4, _MAX_ELF_DYNAMIC_SYMBOLS - last_symbol_start)
+    for index in range(maximum_chain_entries):
+        chain_value = struct.unpack_from("<I", contents, chain_start + index * 4)[0]
+        if chain_value & 1:
+            return last_symbol_start + index + 1
+    raise ValueError(f"{description} contains an unterminated or excessive ELF GNU hash chain")
+
+
+def _elf_file_offset_and_available_size(
+    load_segments: Iterable[tuple[int, int, int]],
+    virtual_address: int,
+    *,
+    description: str,
+    range_description: str,
+) -> tuple[int, int]:
+    mappings = {
+        (
+            file_offset + virtual_address - segment_address,
+            file_size - (virtual_address - segment_address),
+        )
+        for file_offset, segment_address, file_size in load_segments
+        if segment_address <= virtual_address < segment_address + file_size
+    }
+    if len(mappings) != 1:
+        raise ValueError(f"{description} ELF {range_description} has no unique file-backed load mapping")
+    return next(iter(mappings))
+
+
+def _elf_dynamic_symbol_name(string_table: bytes, offset: int, *, description: str) -> str:
+    if offset >= len(string_table):
+        raise ValueError(f"{description} contains an out-of-bounds ELF dynamic symbol-name offset")
+    bounded_end = min(len(string_table), offset + _MAX_ELF_SYMBOL_NAME_BYTES + 1)
+    terminator = string_table.find(b"\0", offset, bounded_end)
+    if terminator < 0:
+        raise ValueError(f"{description} contains an unterminated or oversized ELF dynamic symbol name")
+    return string_table[offset:terminator].decode("utf-8", errors="surrogateescape")
 
 
 def _parse_elf_version_requirements(
@@ -2390,14 +2428,8 @@ def _elf_dynamic_version_name(string_table: bytes, offset: int, *, description: 
 
 def _linux_policy_external_libraries(policy: _WheelPlatformPolicy) -> frozenset[str]:
     if policy.family == "manylinux":
-        minimum_version = policy.minimum_version
-        if minimum_version is None:
-            raise AssertionError("manylinux platform policy must contain a minimum version")
-        libraries = set(_MANYLINUX_BASE_EXTERNAL_LIBRARIES)
-        if minimum_version >= (2, 12):
-            libraries.update(_MANYLINUX_2_12_EXTERNAL_LIBRARIES)
-        if minimum_version >= (2, 24):
-            libraries.update(_MANYLINUX_2_24_EXTERNAL_LIBRARIES)
+        pinned_policy = _manylinux_policy_data(policy)
+        libraries = set(pinned_policy.external_libraries)
         libraries.add(_MANYLINUX_DYNAMIC_LOADER_BY_ARCHITECTURE[policy.architecture])
         return frozenset(libraries)
     if policy.family == "musllinux":
@@ -2406,14 +2438,31 @@ def _linux_policy_external_libraries(policy: _WheelPlatformPolicy) -> frozenset[
 
 
 def _manylinux_policy_versioned_symbols(policy: _WheelPlatformPolicy) -> frozenset[str]:
+    return _manylinux_policy_data(policy).versioned_symbols
+
+
+def _manylinux_policy_blacklisted_undefined_symbols(
+    policy: _WheelPlatformPolicy,
+    needed_libraries: Iterable[str],
+    undefined_symbols: frozenset[str],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    dependency_names = frozenset(needed_libraries)
+    matches: list[tuple[str, tuple[str, ...]]] = []
+    for library, blacklisted_symbols in _manylinux_policy_data(policy).undefined_symbol_blacklist:
+        if library not in dependency_names:
+            continue
+        matched_symbols = set(undefined_symbols.intersection(blacklisted_symbols))
+        if "*" in blacklisted_symbols:
+            matched_symbols.add("*")
+        if matched_symbols:
+            matches.append((library, tuple(sorted(matched_symbols))))
+    return tuple(matches)
+
+
+def _manylinux_policy_data(policy: _WheelPlatformPolicy) -> ManylinuxPolicy:
     if policy.family != "manylinux" or policy.minimum_version is None:
-        raise AssertionError("versioned-symbol policy requires a versioned manylinux platform")
-    allowed: set[str] = set()
-    for baseline, additions in _MANYLINUX_SYMBOL_VERSION_ADDITIONS[policy.architecture]:
-        if baseline > policy.minimum_version:
-            break
-        allowed.update(additions)
-    return frozenset(allowed)
+        raise AssertionError("manylinux policy data requires a versioned manylinux platform")
+    return manylinux_policy(policy.minimum_version, policy.architecture)
 
 
 def _validate_macos_binary_platform(
