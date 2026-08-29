@@ -484,6 +484,30 @@ def test_pandas_snapshot_preserves_bound_object_integer_type(connection):
     assert result.column(0).to_pylist() == [2, 3, None]
 
 
+def test_pandas_varchar_object_memory_source_matches_pandas_scan(connection):
+    class StringifiedValue:
+        def __str__(self) -> str:
+            return "custom-value"
+
+    source = pd.DataFrame(
+        {
+            "value": pd.Series(
+                [1, "text", StringifiedValue(), None, float("nan"), pd.NA, pd.NaT],
+                dtype=object,
+            )
+        }
+    )
+    expected = [value for (value,) in connection.execute("SELECT value FROM source").fetchall()]
+    relation = connection.from_df(source).project("value")
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert expected == ["1", "text", "custom-value", None, None, None, None]
+    assert result.column(0).to_pylist() == expected
+
+
 @pytest.mark.parametrize("source_kind", ["dataset", "scanner"])
 def test_lazy_arrow_source_requires_explicit_materialization(connection, source_kind):
     dataset = ds.dataset(pa.table({"id": [1, 2, 3]}))
