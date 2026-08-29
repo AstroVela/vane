@@ -89,6 +89,18 @@ def _parse_file_type(type_name: Any, *, field: str) -> Any | None:
     return dtype if _contains_file(dtype) else None
 
 
+def _parse_declared_type(type_name: Any, *, field: str) -> Any | None:
+    if not isinstance(type_name, str):
+        return None
+
+    import vane
+
+    try:
+        return vane.type(type_name)
+    except Exception as exc:
+        raise _invalid_input(f"UDF payload field {field!r} contains an invalid SQL type") from exc
+
+
 def _expected_arrow_type(dtype: Any, *, boundary: str) -> pa.DataType:
     try:
         return _arrow_type_from_duckdb_pytype(dtype)
@@ -719,14 +731,31 @@ class FileUDFContract:
         else:
             output_schema = payload.get("output_schema") or []
             if isinstance(output_schema, (list, tuple)):
+                entries: list[Mapping[str, Any] | None] = []
+                file_types: list[Any | None] = []
                 for entry in output_schema:
                     if not isinstance(entry, Mapping):
-                        output_types.append(None)
+                        entries.append(None)
+                        file_types.append(None)
                         continue
                     kind = str(entry.get("kind") or "duckdb_type").lower()
-                    output_types.append(
+                    entries.append(entry)
+                    file_types.append(
                         _parse_file_type(entry.get("type"), field="output_schema") if kind == "duckdb_type" else None
                     )
+                if any(dtype is not None for dtype in file_types):
+                    output_types.extend(
+                        file_dtype
+                        if file_dtype is not None
+                        else (
+                            _parse_declared_type(entry.get("type"), field="output_schema")
+                            if entry is not None and str(entry.get("kind") or "duckdb_type").lower() == "duckdb_type"
+                            else None
+                        )
+                        for entry, file_dtype in zip(entries, file_types, strict=True)
+                    )
+                else:
+                    output_types.extend(file_types)
 
         return cls(
             udf_name=str(payload.get("udf_name") or "<unknown>"),
@@ -740,7 +769,7 @@ class FileUDFContract:
 
     @property
     def has_file_outputs(self) -> bool:
-        return any(dtype is not None for dtype in self.output_types)
+        return any(dtype is not None and _contains_file(dtype) for dtype in self.output_types)
 
     def _validate_column_count(self, table: pa.Table, types: tuple[Any | None, ...], *, boundary: str) -> None:
         if types and table.num_columns != len(types):
@@ -828,7 +857,7 @@ class FileUDFContract:
         boundary = f"UDF {self.udf_name!r} output"
         self._validate_column_count(table, self.output_types, boundary=boundary)
         for index, dtype in enumerate(self.output_types):
-            if dtype is not None:
+            if dtype is not None and _contains_file(dtype):
                 validate_file_arrow_array(
                     table.column(index),
                     dtype,
@@ -837,7 +866,7 @@ class FileUDFContract:
                 )
 
     def normalize_output_table(self, table: pa.Table) -> pa.Table:
-        """Validate and canonicalize FILE-bearing columns before buffering."""
+        """Validate FILE leaves and stabilize their declared output schema."""
         self.validate_output_table(table)
         if not self.has_file_outputs:
             return table
@@ -856,7 +885,7 @@ class FileUDFContract:
                     boundary=f"{boundary} column {index}",
                 )
             except Exception:
-                raise _invalid_input(f"{boundary} column {index} could not normalize its FILE storage") from None
+                raise _invalid_input(f"{boundary} column {index} could not normalize its declared storage") from None
             normalized_field = pa.field(fields[index].name, normalized.type)
             if normalized.type.equals(columns[index].type, check_metadata=True) and fields[index].equals(
                 normalized_field, check_metadata=True

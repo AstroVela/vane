@@ -528,7 +528,8 @@ def test_map_batches_normalizes_file_storage_across_output_batches():
     ]
 
 
-def test_map_batches_normalizes_file_composite_siblings_across_output_batches():
+@pytest.mark.parametrize("nested", [False, True], ids=["columns", "composite"])
+def test_map_batches_normalizes_file_siblings_across_output_batches(nested):
     import cloudpickle
     import pyarrow as pa
 
@@ -538,27 +539,33 @@ def test_map_batches_normalizes_file_composite_siblings_across_output_batches():
         import pyarrow as pa
 
         for identifier, integer_type in ((1, pa.int32()), (2, pa.int64())):
+            document = pa.array([_file_record(url=f"memory://{identifier}")], type=_file_arrow_type())
+            identifiers = pa.array([identifier], type=integer_type)
+            if not nested:
+                yield pa.table({"document": document, "id": identifiers})
+                continue
             payload_type = pa.struct(
                 [
                     pa.field("document", _file_arrow_type()),
                     pa.field("id", integer_type),
                 ]
             )
-            yield pa.table(
-                {
-                    "payload": pa.array(
-                        [{"document": _file_record(url=f"memory://{identifier}"), "id": identifier}],
-                        type=payload_type,
-                    )
-                }
-            )
+            yield pa.table({"payload": pa.StructArray.from_arrays([document, identifiers], type=payload_type)})
 
+    output_schema = (
+        [{"name": "payload", "kind": "duckdb_type", "type": "STRUCT(document FILE, id BIGINT)"}]
+        if nested
+        else [
+            {"name": "document", "kind": "duckdb_type", "type": "FILE"},
+            {"name": "id", "kind": "duckdb_type", "type": "BIGINT"},
+        ]
+    )
     executor = UDFExecutor(
         {
             "function_pickle": cloudpickle.dumps(emit_documents),
             "call_mode": "map_batches",
             "execution_backend": "subprocess_task",
-            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": "STRUCT(document FILE, id BIGINT)"}],
+            "output_schema": output_schema,
             "stream_output": True,
             "output_batch_size": 2,
         }
@@ -570,12 +577,19 @@ def test_map_batches_normalizes_file_composite_siblings_across_output_batches():
         executor.close()
 
     assert len(output) == 1
-    payload = output[0].column("payload")
-    assert payload.type.field("id").type == pa.int64()
-    assert payload.to_pylist() == [
-        {"document": _file_record(url="memory://1"), "id": 1},
-        {"document": _file_record(url="memory://2"), "id": 2},
-    ]
+    if nested:
+        payload = output[0].column("payload")
+        assert payload.type.field("id").type == pa.int64()
+        assert payload.to_pylist() == [
+            {"document": _file_record(url="memory://1"), "id": 1},
+            {"document": _file_record(url="memory://2"), "id": 2},
+        ]
+    else:
+        assert output[0].column("id").type == pa.int64()
+        assert output[0].column("document").to_pylist() == [
+            _file_record(url="memory://1"),
+            _file_record(url="memory://2"),
+        ]
 
 
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
