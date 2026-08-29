@@ -17,6 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import time as datetime_time
 from typing import Any
+from uuid import UUID
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
@@ -544,6 +545,18 @@ def _canonical_values_to_arrow_array(
                     raise
                 bignum_encoded.append(value)
         return pa.array(bignum_encoded, type=pa.string())
+    if type_id == "uuid":
+        return pa.array(
+            [
+                None
+                if value is None
+                else str(value)
+                if isinstance(value, (UUID, str))
+                else str(UUID(bytes=bytes(value)))
+                for value in values
+            ],
+            type=pa.string(),
+        )
     if type_id == "time with time zone":
         encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
         return pa.array(encoded, type=pa.string())
@@ -653,6 +666,26 @@ def _normalize_file_arrow_array(
             )
             offset += len(chunk)
         return pa.chunked_array(chunks)
+    active = _active_values(array, parent_active)
+    type_id = _type_id(dtype)
+    if type_id == "uuid":
+        source = _mask_inactive(array, active)
+        encoded: list[str | None] = []
+        for value in source.to_pylist():
+            if value is None:
+                encoded.append(None)
+            elif isinstance(value, UUID):
+                encoded.append(str(value))
+            elif isinstance(value, (bytes, bytearray, memoryview)):
+                raw_value = bytes(value)
+                encoded.append(
+                    str(UUID(bytes=raw_value))
+                    if pa.types.is_fixed_size_binary(source.type) and source.type.byte_width == 16
+                    else raw_value.decode()
+                )
+            else:
+                encoded.append(str(value))
+        return pa.array(encoded, type=pa.string())
     if pa.types.is_null(array.type):
         try:
             expected = _expected_arrow_type(dtype, boundary=boundary)
@@ -661,13 +694,11 @@ def _normalize_file_arrow_array(
             # has no canonical Arrow mapping.
             return array
         return pa.nulls(len(array), type=expected)
-    active = _active_values(array, parent_active)
     if _is_file_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
         source = _mask_inactive(array, active)
         return source if source.type.equals(expected) else source.cast(expected)
 
-    type_id = _type_id(dtype)
     if type_id == "struct":
         arrays = []
         fields = []

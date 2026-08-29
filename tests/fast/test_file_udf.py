@@ -753,6 +753,45 @@ def test_map_batches_preserves_duckdb_casts_for_non_file_columns():
     assert result.fetchone() == (vane.File("memory://batch-coercion"), identifier)
 
 
+def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+
+    def emit_documents(_table):
+        import pyarrow as pa
+
+        document = pa.array([_file_record()], type=_file_arrow_type())
+        yield pa.table({"document": document, "identifier": pa.array([identifier])})
+        yield pa.table({"document": document, "identifier": pa.array([str(identifier)])})
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(emit_documents),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "output_schema": [
+                {"name": "document", "kind": "duckdb_type", "type": "FILE"},
+                {"name": "identifier", "kind": "duckdb_type", "type": "UUID"},
+            ],
+            "stream_output": True,
+            "output_batch_size": 2,
+        }
+    )
+    try:
+        executor.submit(pa.table({"input": [1]}))
+        output = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert len(output) == 1
+    assert output[0].column("identifier").type == pa.string()
+    assert output[0].column("identifier").to_pylist() == [str(identifier), str(identifier)]
+
+
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
     import pyarrow as pa
 
