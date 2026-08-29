@@ -166,12 +166,35 @@ static bool IsSameOrChildPathKey(const string &path, const string &prefix) {
 	return path.size() == prefix.size() || StringUtil::EndsWith(prefix, "/") || path[prefix.size()] == '/';
 }
 
+// Registered fsspec protocol identifiers can contain underscores even though
+// RFC URL schemes cannot.
+static optional_idx FindLeadingProtocolSeparator(const string &path) {
+	auto separator = path.find("://");
+	if (separator == string::npos || separator == 0 || !StringUtil::CharacterIsAlpha(path[0])) {
+		return optional_idx();
+	}
+	for (idx_t index = 1; index < separator; index++) {
+		auto character = path[index];
+		if (!StringUtil::CharacterIsAlphaNumeric(character) && character != '+' && character != '-' &&
+		    character != '.' && character != '_') {
+			return optional_idx();
+		}
+	}
+	return optional_idx(separator);
+}
+
+static string URLAuthority(const string &path, idx_t scheme_separator) {
+	auto authority_begin = scheme_separator + 3;
+	auto authority_end = path.find_first_of("/?#", authority_begin);
+	return path.substr(authority_begin, authority_end == string::npos ? string::npos : authority_end - authority_begin);
+}
+
 static bool HasCallerIdentityPrefix(const string &path) {
-	auto scheme_separator = path.find("://");
-	if (scheme_separator == string::npos) {
+	auto scheme_separator = FindLeadingProtocolSeparator(path);
+	if (!scheme_separator.IsValid()) {
 		return true;
 	}
-	auto offset = scheme_separator + 3;
+	auto offset = scheme_separator.GetIndex() + 3;
 	while (offset < path.size() && path[offset] == '/') {
 		offset++;
 	}
@@ -185,9 +208,9 @@ static bool HasCallerIdentityPrefix(const string &path) {
 string PythonFilesystem::RestoreCallerPath(const string &locator, const string &returned_path,
                                            const string &fallback_path, bool glob_pattern) const {
 	D_ASSERT(py::gil_check());
-	auto scheme_separator = returned_path.find("://");
-	if (scheme_separator != string::npos) {
-		auto returned_protocol = returned_path.substr(0, scheme_separator);
+	auto returned_scheme_separator = FindLeadingProtocolSeparator(returned_path);
+	if (returned_scheme_separator.IsValid()) {
+		auto returned_protocol = returned_path.substr(0, returned_scheme_separator.GetIndex());
 		bool supported_protocol = false;
 		for (const auto &protocol : protocols) {
 			if (StringUtil::CIEquals(protocol, returned_protocol)) {
@@ -197,6 +220,15 @@ string PythonFilesystem::RestoreCallerPath(const string &locator, const string &
 		}
 		if (!supported_protocol) {
 			return fallback_path;
+		}
+
+		auto locator_scheme_separator = FindLeadingProtocolSeparator(locator);
+		if (locator_scheme_separator.IsValid()) {
+			auto locator_authority = URLAuthority(locator, locator_scheme_separator.GetIndex());
+			auto returned_authority = URLAuthority(returned_path, returned_scheme_separator.GetIndex());
+			if (!locator_authority.empty() && !returned_authority.empty() && locator_authority != returned_authority) {
+				return fallback_path;
+			}
 		}
 	}
 
@@ -226,7 +258,11 @@ string PythonFilesystem::RestoreCallerPath(const string &locator, const string &
 	if (StringUtil::EndsWith(caller_prefix, "/") && StringUtil::StartsWith(returned_suffix, "/")) {
 		returned_suffix.erase(0, 1);
 	}
-	return caller_prefix + returned_suffix;
+	auto restored_path = caller_prefix + returned_suffix;
+	if (py::str(strip_protocol(py::str(restored_path))).cast<string>() != returned_key) {
+		return fallback_path;
+	}
+	return restored_path;
 }
 
 vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *opener) {
@@ -243,7 +279,7 @@ vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *open
 		for (auto item : returner) {
 			string returned_path = py::str(item);
 			string fallback_path = returned_path;
-			if (returned_path.find("://") == string::npos) {
+			if (!FindLeadingProtocolSeparator(returned_path).IsValid()) {
 				fallback_path = py::str(unstrip_protocol(py::str(item)));
 			}
 			results.emplace_back(RestoreCallerPath(path, returned_path, fallback_path, true));

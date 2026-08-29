@@ -154,35 +154,51 @@ static FileStatValue DeserializeFileStat(Deserializer &deserializer) {
 	return result;
 }
 
+// Registered connector protocol identifiers can contain underscores even
+// though RFC URL schemes cannot.
+static optional_idx FindLeadingProtocolSeparator(const string &path) {
+	auto separator = path.find("://");
+	if (separator == string::npos || separator == 0 || !StringUtil::CharacterIsAlpha(path[0])) {
+		return optional_idx();
+	}
+	for (idx_t index = 1; index < separator; index++) {
+		auto character = path[index];
+		if (!StringUtil::CharacterIsAlphaNumeric(character) && character != '+' && character != '-' &&
+		    character != '.' && character != '_') {
+			return optional_idx();
+		}
+	}
+	return optional_idx(separator);
+}
+
 static bool IsNativePath(const string &path) {
-	auto scheme = path.find("://");
-	return scheme == string::npos || StringUtil::CIStartsWith(path, "file://");
+	return !FindLeadingProtocolSeparator(path).IsValid() || StringUtil::CIStartsWith(path, "file://");
 }
 
 static optional_idx FindURISuffix(const string &path) {
-	auto scheme = path.find("://");
-	if (scheme == string::npos ||
+	auto scheme = FindLeadingProtocolSeparator(path);
+	if (!scheme.IsValid() ||
 	    (!StringUtil::CIStartsWith(path, "http://") && !StringUtil::CIStartsWith(path, "https://"))) {
 		return optional_idx();
 	}
 	// HTTP(S) reserves '?' and '#' for query and fragment components.
 	// Connector URLs such as memory:// and s3:// retain them as path syntax.
-	auto suffix = path.find_first_of("?#", scheme + 3);
+	auto suffix = path.find_first_of("?#", scheme.GetIndex() + 3);
 	return suffix == string::npos ? optional_idx() : optional_idx(suffix);
 }
 
 static idx_t GlobPathBegin(const string &path) {
-	auto scheme = path.find("://");
-	if (scheme == string::npos) {
+	auto scheme = FindLeadingProtocolSeparator(path);
+	if (!scheme.IsValid()) {
 		return 0;
 	}
 	if (StringUtil::CIStartsWith(path, "http://") || StringUtil::CIStartsWith(path, "https://")) {
-		auto authority_end = path.find('/', scheme + 3);
+		auto authority_end = path.find('/', scheme.GetIndex() + 3);
 		return authority_end == string::npos ? path.size() : authority_end;
 	}
 	// Connector URLs commonly use everything after :// as their key rather
 	// than an RFC authority, so glob metacharacters there remain significant.
-	return scheme + 3;
+	return scheme.GetIndex() + 3;
 }
 
 static optional_idx FindPathGlob(const string &path) {
@@ -283,14 +299,20 @@ static string TrimLeadingURLSeparators(const string &path) {
 // restore that spelling when the returned key is still below the caller's
 // stable, non-glob prefix; otherwise the provider result remains authoritative.
 static string NormalizeDiscoveredPath(FileSystem &file_system, const string &locator, const string &discovered_path) {
-	auto scheme_separator = locator.find("://");
-	if (scheme_separator == string::npos) {
+	auto scheme_separator = FindLeadingProtocolSeparator(locator);
+	if (!scheme_separator.IsValid()) {
 		return discovered_path;
 	}
-	auto discovered_scheme_separator = discovered_path.find("://");
-	if (discovered_scheme_separator != string::npos &&
-	    !StringUtil::CIEquals(locator.substr(0, scheme_separator),
-	                          discovered_path.substr(0, discovered_scheme_separator))) {
+	auto discovered_scheme_separator = FindLeadingProtocolSeparator(discovered_path);
+	auto discovered_path_begin = discovered_scheme_separator.IsValid() ? discovered_scheme_separator.GetIndex() + 3 : 0;
+	if (discovered_path.find("://", discovered_path_begin) != string::npos) {
+		// A connector key may itself contain ://. Its slash spelling can be
+		// significant to the provider, so retain the provider's representation.
+		return discovered_path;
+	}
+	if (discovered_scheme_separator.IsValid() &&
+	    !StringUtil::CIEquals(locator.substr(0, scheme_separator.GetIndex()),
+	                          discovered_path.substr(0, discovered_scheme_separator.GetIndex()))) {
 		return discovered_path;
 	}
 
@@ -304,10 +326,10 @@ static string NormalizeDiscoveredPath(FileSystem &file_system, const string &loc
 		prefix_key = file_system.ConvertSeparators(file_system.ExpandPath(prefix));
 		discovered_key = file_system.ConvertSeparators(file_system.ExpandPath(discovered_path));
 	} else {
-		prefix_key = TrimLeadingURLSeparators(prefix.substr(scheme_separator + 3));
-		discovered_key = TrimLeadingURLSeparators(discovered_scheme_separator == string::npos
-		                                              ? discovered_path
-		                                              : discovered_path.substr(discovered_scheme_separator + 3));
+		prefix_key = TrimLeadingURLSeparators(prefix.substr(scheme_separator.GetIndex() + 3));
+		discovered_key = TrimLeadingURLSeparators(
+		    discovered_scheme_separator.IsValid() ? discovered_path.substr(discovered_scheme_separator.GetIndex() + 3)
+		                                          : discovered_path);
 	}
 	if (prefix_key.empty()) {
 		return discovered_path;
@@ -356,10 +378,10 @@ static bool IsNativeSymbolicLink(FileSystem &file_system, const string &path) {
 }
 
 static string ResolveListedPath(FileSystem &file_system, const string &directory, const string &path) {
-	if (path.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(path).IsValid()) {
 		return path;
 	}
-	if (directory.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(directory).IsValid()) {
 		// FileSystem::ListFiles reports direct child names. Registered adapters
 		// may instead return a complete protocol-stripped path, so retain only
 		// its final component and preserve the caller's directory locator.
@@ -576,7 +598,7 @@ static bool IsListedDirectory(FileSystem &file_system, const OpenFileInfo &info)
 
 static vector<string> FileSearchPathCandidates(ClientContext &context, FileSystem &file_system, const string &path) {
 	vector<string> result;
-	if (path.find("://") != string::npos) {
+	if (FindLeadingProtocolSeparator(path).IsValid()) {
 		return result;
 	}
 	auto expanded_path = file_system.ExpandPath(path);

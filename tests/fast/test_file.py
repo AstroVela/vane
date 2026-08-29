@@ -607,6 +607,22 @@ def test_list_files_honors_file_search_path(duckdb_cursor, tmp_path, monkeypatch
         vane.list_files("missing", connection=duckdb_cursor).fetchall()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="colon is not valid in a Windows path component")
+def test_list_files_treats_embedded_scheme_delimiter_as_local_search_path_text(duckdb_cursor, tmp_path, monkeypatch):
+    search_path = tmp_path / "search"
+    directory = search_path / "root" / "http:"
+    directory.mkdir(parents=True)
+    child = directory / "value.txt"
+    child.write_text("value", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    duckdb_cursor.execute("SET file_search_path = ?", [str(search_path)])
+
+    rows = duckdb_cursor.execute("SELECT url FROM list_files('root/http://value.txt')").fetchall()
+
+    assert len(rows) == 1
+    assert os.path.samefile(rows[0][0], child)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="symlink traversal semantics differ on Windows")
 def test_list_files_search_path_preserves_direct_directory_symlink(duckdb_cursor, tmp_path, monkeypatch):
     search_path = tmp_path / "search"
@@ -1023,6 +1039,29 @@ def test_list_files_normalizes_registered_protocol_alias_identity_across_directo
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
 
 
+def test_list_files_recognizes_registered_protocol_identifier_with_underscore(duckdb_cursor):
+    fsspec = pytest.importorskip("fsspec", minversion="2022.11.0")
+    memory_module = pytest.importorskip("fsspec.implementations.memory")
+
+    class UnderscoreProtocolMemoryFileSystem(memory_module.MemoryFileSystem):
+        protocol = "custom_protocol"
+        vane_directory_semantics = True
+        _strip_protocol = classmethod(fsspec.AbstractFileSystem._strip_protocol.__func__)
+
+    filesystem = UnderscoreProtocolMemoryFileSystem(skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+    filesystem.makedirs("root")
+    filesystem.pipe("root/value.txt", b"value")
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('custom_protocol://root')").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("custom_protocol")
+
+    assert rows == [("custom_protocol://root/value.txt",)]
+
+
 def test_list_files_normalizes_registered_authority_identity_across_directory_and_glob(duckdb_cursor):
     pytest.importorskip("fsspec", minversion="2022.11.0")
     ftp_module = pytest.importorskip("fsspec.implementations.ftp")
@@ -1051,6 +1090,54 @@ def test_list_files_normalizes_registered_authority_identity_across_directory_an
     assert direct[0] == glob[0] == "ftp://host/root/value.txt"
     assert direct[1] == glob[1]
     assert duckdb_cursor.execute("SELECT file_same_location(?, ?)", [direct[2], glob[2]]).fetchone() == (True,)
+
+
+def test_list_files_preserves_registered_glob_result_with_different_authority(duckdb_cursor):
+    pytest.importorskip("fsspec", minversion="2022.11.0")
+    ftp_module = pytest.importorskip("fsspec.implementations.ftp")
+    memory_module = pytest.importorskip("fsspec.implementations.memory")
+
+    class DifferentAuthorityFTPFileSystem(memory_module.MemoryFileSystem):
+        protocol = "ftp"
+        _strip_protocol = classmethod(ftp_module.FTPFileSystem._strip_protocol.__func__)
+
+        def glob(self, _path, **_kwargs):
+            return ["ftp://other/root/value.txt"]
+
+    filesystem = DifferentAuthorityFTPFileSystem(skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+    filesystem.pipe("/root/value.txt", b"value")
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('ftp://host/root/*')").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("ftp")
+
+    assert rows == [("ftp://other/root/value.txt",)]
+    assert filesystem.isfile(rows[0][0])
+
+
+def test_list_files_treats_embedded_scheme_delimiter_as_registered_path_text(duckdb_cursor):
+    pytest.importorskip("fsspec", minversion="2022.11.0")
+    memory_module = pytest.importorskip("fsspec.implementations.memory")
+
+    class EmbeddedSchemeMemoryFileSystem(memory_module.MemoryFileSystem):
+        def glob(self, _path, **_kwargs):
+            return ["/root/http://value.txt"]
+
+    filesystem = EmbeddedSchemeMemoryFileSystem(skip_instance_cache=True)
+    filesystem.store = {}
+    filesystem.pseudo_dirs = [""]
+    filesystem.pipe("/root/http://value.txt", b"value")
+    duckdb_cursor.register_filesystem(filesystem)
+    try:
+        rows = duckdb_cursor.execute("SELECT url FROM list_files('memory://root/*')").fetchall()
+    finally:
+        duckdb_cursor.unregister_filesystem("memory")
+
+    assert rows == [("memory:///root/http://value.txt",)]
+    assert filesystem.isfile(rows[0][0])
 
 
 def test_list_files_preserves_unrelated_registered_glob_urls(duckdb_cursor):
