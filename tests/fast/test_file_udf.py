@@ -854,6 +854,49 @@ def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
     ]
 
 
+def test_batch_expression_defers_file_sibling_cast_semantics_to_duckdb():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, text VARCHAR)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def emit_document(values):
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        documents = pa.array(
+            [
+                {
+                    "url": "memory://batch-expression",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+            ]
+            * len(values),
+            type=file_type,
+        )
+        return pa.StructArray.from_arrays(
+            [documents, pa.array([b"\xc3\xa9"] * len(values), type=pa.binary())],
+            names=["document", "text"],
+        )
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(emit_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.text").fetchone() == (
+        "memory://batch-expression",
+        r"\xC3\xA9",
+    )
+
+
 def test_row_actor_rejects_file_inputs_and_outputs():
     import cloudpickle
 
