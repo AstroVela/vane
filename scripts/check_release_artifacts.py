@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import configparser
 import csv
 import hashlib
 import io
 import json
+import os
 import re
 import stat
 import subprocess
@@ -20,11 +22,14 @@ import sys
 import tarfile
 import unicodedata
 import zipfile
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
+from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import (
     InvalidSdistFilename,
@@ -41,9 +46,24 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_ORIGINAL_SYS_PATH = sys.path.copy()
+try:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+    from vane_packaging.archive_safety import validate_tar_member_count, validate_zip_member_count
+finally:
+    sys.path[:] = _ORIGINAL_SYS_PATH
+    del _ORIGINAL_SYS_PATH
+
 PROJECT_METADATA = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 EXPECTED_NAME = str(PROJECT_METADATA["name"])
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
+MAX_ARTIFACT_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_ARTIFACT_MEMBERS = 10_000
+MAX_CORE_METADATA_BYTES = 1024 * 1024
+MAX_CORE_METADATA_HEADERS = 1024
+MAX_CORE_METADATA_LINES = 10_000
+MAX_CORE_METADATA_LINE_BYTES = 64 * 1024
+_RAW_ARCHIVE_SCAN_CHUNK_BYTES = 1024 * 1024
 GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 DUCKDB_FORK_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?:-dirty)?")
 DUCKDB_UPSTREAM_VERSION = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
@@ -51,6 +71,43 @@ CONTENT_RULE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 FORBIDDEN_DISTRIBUTION_ROOTS = {"adbc_driver_duckdb", "duckdb"}
 WHEEL_DISTRIBUTION = re.sub(r"[-_.]+", "_", EXPECTED_NAME)
 EXPECTED_LIBRARY_ROOT = f"{WHEEL_DISTRIBUTION}.libs"
+
+
+def _expected_project_requires_dist() -> tuple[str, ...]:
+    requirements = [Requirement(str(value)) for value in PROJECT_METADATA.get("dependencies", [])]
+    for raw_extra, values in PROJECT_METADATA.get("optional-dependencies", {}).items():
+        extra = canonicalize_name(str(raw_extra))
+        for value in values:
+            requirement = Requirement(str(value))
+            extra_marker = f'extra == "{extra}"'
+            requirement.marker = Marker(
+                extra_marker if requirement.marker is None else f"{requirement.marker} and {extra_marker}"
+            )
+            requirements.append(requirement)
+    return tuple(str(requirement) for requirement in requirements)
+
+
+EXPECTED_REQUIRES_DIST = _expected_project_requires_dist()
+EXPECTED_PROVIDES_EXTRA = tuple(
+    canonicalize_name(str(extra)) for extra in PROJECT_METADATA.get("optional-dependencies", {})
+)
+
+
+def _expected_project_entry_points() -> dict[str, dict[str, str]]:
+    groups: dict[str, dict[str, str]] = {}
+    for project_key, group in (("scripts", "console_scripts"), ("gui-scripts", "gui_scripts")):
+        values = PROJECT_METADATA.get(project_key, {})
+        if values:
+            groups[group] = {str(name): str(reference) for name, reference in values.items()}
+    for group, values in PROJECT_METADATA.get("entry-points", {}).items():
+        group_name = str(group)
+        if group_name in groups:
+            raise ValueError(f"project metadata declares entry-point group {group_name!r} more than once")
+        groups[group_name] = {str(name): str(reference) for name, reference in values.items()}
+    return groups
+
+
+EXPECTED_ENTRY_POINTS = _expected_project_entry_points()
 
 BANNED_PATH_PARTS = (
     "/.git/",
@@ -77,6 +134,8 @@ class Artifact(Protocol):
 
     def names(self) -> list[str]: ...
 
+    def member_sizes(self) -> Iterable[tuple[str, int]]: ...
+
     def read(self, name: str) -> bytes: ...
 
 
@@ -84,6 +143,8 @@ class ContentRule(Protocol):
     rule_id: str
 
     def matches(self, data: bytes) -> bool: ...
+
+    def overlap_bytes(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -118,10 +179,35 @@ class LiteralContentRule:
     def matches(self, data: bytes) -> bool:
         return self.value in data
 
+    def overlap_bytes(self) -> int:
+        return max(len(self.value) - 1, 0)
+
+
+class _TarMetadataContentScanner:
+    def __init__(self, path: Path, rules: tuple[ContentRule, ...]):
+        self.path = path
+        self.rules = rules
+        self.overlap_bytes = max((rule.overlap_bytes() for rule in rules), default=0)
+        self.overlap = b""
+
+    def __call__(self, chunk: bytes, new_region: bool) -> None:
+        if new_region:
+            self.overlap = b""
+        window = self.overlap + chunk
+        for rule in self.rules:
+            if rule.matches(window):
+                raise ValueError(f"{self.path}: content rule {rule.rule_id!r} matched decompressed TAR metadata")
+        self.overlap = window[-self.overlap_bytes :] if self.overlap_bytes else b""
+
 
 class WheelArtifact:
     def __init__(self, path: Path):
         self.path = path
+        validate_zip_member_count(
+            path,
+            max_members=MAX_ARTIFACT_MEMBERS,
+            description="wheel",
+        )
         self.archive = zipfile.ZipFile(path)
         self.all_members = self.archive.infolist()
         for info in self.all_members:
@@ -136,6 +222,9 @@ class WheelArtifact:
     def names(self) -> list[str]:
         return self.members
 
+    def member_sizes(self) -> Iterable[tuple[str, int]]:
+        return ((info.filename, info.file_size) for info in self.all_members)
+
     def read(self, name: str) -> bytes:
         return self.archive.read(name)
 
@@ -144,8 +233,18 @@ class WheelArtifact:
 
 
 class SdistArtifact:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, content_rules: tuple[ContentRule, ...] = ()):
         self.path = path
+        metadata_scanner = _TarMetadataContentScanner(path, content_rules)
+        validate_tar_member_count(
+            path,
+            max_members=MAX_ARTIFACT_MEMBERS,
+            max_member_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
+            max_total_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
+            uncompressed_limit_description="the project's 100 MiB uncompressed limit",
+            description="sdist",
+            metadata_chunk_callback=metadata_scanner if content_rules else None,
+        )
         self.archive = tarfile.open(path, mode="r:gz")
         self.all_members = self.archive.getmembers()
         for member in self.all_members:
@@ -159,6 +258,9 @@ class SdistArtifact:
 
     def names(self) -> list[str]:
         return list(self.members)
+
+    def member_sizes(self) -> Iterable[tuple[str, int]]:
+        return ((member.name, member.size) for member in self.all_members)
 
     def read(self, name: str) -> bytes:
         extracted = self.archive.extractfile(self.members[name])
@@ -284,6 +386,41 @@ def _check_internal_content(
         )
 
 
+def _detect_raw_archive_content(
+    path: Path,
+    content_rules: tuple[ContentRule, ...],
+) -> ContentMatch | None:
+    if not content_rules:
+        return None
+    overlap_bytes = max(rule.overlap_bytes() for rule in content_rules)
+    try:
+        with path.open("rb") as archive_file:
+            metadata = os.fstat(archive_file.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"artifact must be a regular file: {path}")
+            if metadata.st_size > MAX_ARTIFACT_BYTES:
+                raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
+            overlap = b""
+            total_size = 0
+            while chunk := archive_file.read(_RAW_ARCHIVE_SCAN_CHUNK_BYTES):
+                total_size += len(chunk)
+                if total_size > MAX_ARTIFACT_BYTES:
+                    raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
+                window = overlap + chunk
+                for rule in content_rules:
+                    if rule.matches(window):
+                        return ContentMatch(rule_id=rule.rule_id, member_name="raw archive bytes")
+                overlap = window[-overlap_bytes:] if overlap_bytes else b""
+    except OSError as exception:
+        raise ValueError(f"could not scan artifact contents: {path}") from exception
+    return None
+
+
+def _check_raw_archive_content(path: Path, match: ContentMatch | None) -> None:
+    if match is not None:
+        raise ValueError(f"{path}: content rule {match.rule_id!r} matched {match.member_name}")
+
+
 def _parse_content_rule_manifest(
     raw_manifest: str,
     *,
@@ -358,7 +495,53 @@ def _load_content_rule_manifest(
 
 def _metadata(artifact: Artifact, path: str):
     name = _require_exact_path(artifact.names(), path, artifact.path)
-    return BytesParser().parsebytes(artifact.read(name))
+    member_sizes = [size for member_name, size in artifact.member_sizes() if member_name == name]
+    if len(member_sizes) != 1 or member_sizes[0] > MAX_CORE_METADATA_BYTES:
+        raise ValueError(f"{artifact.path}: core metadata exceeds its bounded 1 MiB limit")
+    contents = artifact.read(name)
+    _validate_core_metadata_shape(contents, artifact=artifact.path)
+    return BytesParser().parsebytes(contents)
+
+
+def _validate_core_metadata_shape(contents: bytes, *, artifact: Path) -> None:
+    line_count = 0
+    header_count = 0
+    in_headers = True
+    have_header = False
+    for line in _core_metadata_lines(contents):
+        line_count += 1
+        if line_count > MAX_CORE_METADATA_LINES:
+            raise ValueError(f"{artifact}: core metadata contains more than {MAX_CORE_METADATA_LINES} lines")
+        if len(line) > MAX_CORE_METADATA_LINE_BYTES:
+            raise ValueError(f"{artifact}: core metadata contains an overlong line")
+        if not in_headers:
+            continue
+        if not line:
+            in_headers = False
+        elif line.startswith((b" ", b"\t")):
+            if not have_header:
+                raise ValueError(f"{artifact}: core metadata starts with an invalid continuation line")
+        else:
+            have_header = True
+            header_count += 1
+            if header_count > MAX_CORE_METADATA_HEADERS:
+                raise ValueError(f"{artifact}: core metadata contains more than {MAX_CORE_METADATA_HEADERS} headers")
+
+
+def _core_metadata_lines(contents: bytes) -> Iterable[bytes]:
+    line_start = 0
+    offset = 0
+    while offset < len(contents):
+        if contents[offset] not in (10, 13):
+            offset += 1
+            continue
+        yield contents[line_start:offset]
+        if contents[offset] == 13 and offset + 1 < len(contents) and contents[offset + 1] == 10:
+            offset += 1
+        offset += 1
+        line_start = offset
+    if line_start < len(contents):
+        yield contents[line_start:]
 
 
 def _check_metadata(artifact: Artifact, path: str, layout: DistributionLayout):
@@ -381,6 +564,73 @@ def _check_no_official_duckdb_dependency(artifact: Artifact, metadata) -> None:
             raise ValueError(f"{artifact.path}: invalid Requires-Dist metadata {raw_requirement!r}") from None
         if canonicalize_name(requirement.name) == "duckdb":
             raise ValueError(f"{artifact.path}: vane-ai must not depend on the official duckdb distribution")
+
+
+def _check_project_dependency_metadata(artifact: Artifact, metadata) -> None:
+    raw_requirements = tuple(str(value) for value in metadata.get_all("Requires-Dist", []))
+    try:
+        requirements = tuple(str(Requirement(value)) for value in raw_requirements)
+    except InvalidRequirement:
+        raise ValueError(f"{artifact.path}: invalid Requires-Dist metadata") from None
+    actual_requirements = Counter(requirements)
+    expected_requirements = Counter(EXPECTED_REQUIRES_DIST)
+    if actual_requirements != expected_requirements:
+        missing = sorted((expected_requirements - actual_requirements).elements())
+        unexpected = sorted((actual_requirements - expected_requirements).elements())
+        raise ValueError(
+            f"{artifact.path}: Requires-Dist must match project metadata exactly: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    actual_extras = Counter(str(value) for value in metadata.get_all("Provides-Extra", []))
+    expected_extras = Counter(EXPECTED_PROVIDES_EXTRA)
+    if actual_extras != expected_extras:
+        missing = sorted((expected_extras - actual_extras).elements())
+        unexpected = sorted((actual_extras - expected_extras).elements())
+        raise ValueError(
+            f"{artifact.path}: Provides-Extra must match project metadata exactly: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
+def _check_project_entry_points(artifact: WheelArtifact, layout: DistributionLayout) -> None:
+    entry_points_path = f"{layout.dist_info_root}/entry_points.txt"
+    matches = [name for name in artifact.names() if name.casefold() == entry_points_path.casefold()]
+    if not EXPECTED_ENTRY_POINTS:
+        if matches:
+            raise ValueError(
+                f"{artifact.path}: wheel must not contain entry_points.txt because project metadata "
+                "declares no entry points"
+            )
+        return
+    if matches != [entry_points_path]:
+        raise ValueError(
+            f"{artifact.path}: expected one exact entry-point metadata member {entry_points_path!r}, found {matches}"
+        )
+
+    try:
+        contents = artifact.read(entry_points_path).decode("utf-8")
+    except UnicodeError:
+        raise ValueError(f"{artifact.path}: entry_points.txt is not valid UTF-8") from None
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        delimiters=("=",),
+        strict=True,
+        empty_lines_in_values=False,
+    )
+    parser.optionxform = str
+    try:
+        parser.read_string(contents)
+    except configparser.Error:
+        raise ValueError(f"{artifact.path}: entry_points.txt is not valid entry-point metadata") from None
+    if parser.defaults():
+        raise ValueError(f"{artifact.path}: entry_points.txt must not contain default entries")
+    actual = {section: dict(parser.items(section, raw=True)) for section in parser.sections()}
+    if actual != EXPECTED_ENTRY_POINTS:
+        raise ValueError(
+            f"{artifact.path}: entry_points.txt must match project metadata exactly: "
+            f"expected={EXPECTED_ENTRY_POINTS}, actual={actual}"
+        )
 
 
 def _check_sdist_license_files(artifact: SdistArtifact, metadata) -> None:
@@ -466,12 +716,17 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "external/duckdb/LICENSE",
         "build_backend.py",
         "vane_packaging/__init__.py",
+        "vane_packaging/archive_safety.py",
+        "vane_packaging/extension_wheel.py",
         "vane_packaging/setuptools_scm_version.py",
+        "scripts/build_extension_wheel.py",
+        "scripts/check_release_artifacts.py",
         "scripts/resolve_duckdb_fork_version.py",
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
         "scripts/verify_duckdb_coexistence.py",
+        "scripts/verify_extension_wheel.py",
         "tests/ray_test_profile.py",
         "tests/fast/test_package_metadata.py",
         "tests/fast/test_ray_test_profile.py",
@@ -519,6 +774,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
 
     metadata = _check_metadata(artifact, f"{layout.archive_root}/PKG-INFO", layout)
     _check_no_official_duckdb_dependency(artifact, metadata)
+    _check_project_dependency_metadata(artifact, metadata)
     _check_sdist_license_files(artifact, metadata)
 
 
@@ -566,6 +822,12 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
             continue
         raise ValueError(f"{artifact.path}: Vane wheel contains conflicting Python package path {name!r}")
 
+    optional_artifacts = [name for name in names if name.casefold().endswith(".duckdb_extension")]
+    if optional_artifacts:
+        raise ValueError(
+            f"{artifact.path}: base Vane wheel must not contain optional extension artifacts: {optional_artifacts}"
+        )
+
     native_extensions = [
         name
         for name in names
@@ -594,8 +856,62 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
         _require_exact_path(names, required_path, artifact.path)
     metadata = _check_metadata(artifact, f"{layout.dist_info_root}/METADATA", layout)
     _check_no_official_duckdb_dependency(artifact, metadata)
+    _check_project_dependency_metadata(artifact, metadata)
+    _check_project_entry_points(artifact, layout)
     _check_wheel_license_files(artifact, metadata, layout)
     _check_wheel_record(artifact, layout)
+
+
+def _validate_artifact_size(path: Path) -> None:
+    if path.stat().st_size > MAX_ARTIFACT_BYTES:
+        raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
+
+
+def _validate_artifact_contents_size(artifact: Artifact) -> None:
+    total_size = 0
+    for member_name, member_size in artifact.member_sizes():
+        if member_size < 0:
+            raise ValueError(f"{artifact.path}: archive member {member_name!r} has an invalid negative size")
+        if member_size > MAX_ARTIFACT_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"{artifact.path}: archive member {member_name!r} exceeds the project's 100 MiB uncompressed limit"
+            )
+        total_size += member_size
+        if total_size > MAX_ARTIFACT_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"{artifact.path}: archive decompressed contents exceed the project's 100 MiB uncompressed limit"
+            )
+
+
+def _open_artifact(
+    path: Path,
+    *,
+    content_rules: tuple[ContentRule, ...] = (),
+) -> SdistArtifact | WheelArtifact:
+    if path.name.endswith(".tar.gz"):
+        return SdistArtifact(path, content_rules=content_rules)
+    if path.suffix == ".whl":
+        return WheelArtifact(path)
+    raise ValueError(f"unsupported artifact type: {path}")
+
+
+def check_artifact_contents(
+    path: Path,
+    *,
+    content_rules: tuple[ContentRule, ...] = (),
+    text_content_rules: tuple[ContentRule, ...] = (),
+) -> None:
+    """Validate generic publication limits, paths, and private-content rules."""
+    _validate_artifact_size(path)
+    raw_content_match = _detect_raw_archive_content(path, content_rules)
+    artifact = _open_artifact(path, content_rules=content_rules)
+    try:
+        _validate_artifact_contents_size(artifact)
+        _check_paths(artifact)
+        _check_internal_content(artifact, content_rules, text_content_rules)
+        _check_raw_archive_content(path, raw_content_match)
+    finally:
+        artifact.close()
 
 
 def check_artifact(
@@ -612,22 +928,19 @@ def check_artifact(
         raise ValueError(
             f"{path}: expected version {layout.version}, found {artifact_version} in distribution filename"
         )
-    if path.stat().st_size > MAX_ARTIFACT_BYTES:
-        raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
-
-    if path.name.endswith(".tar.gz"):
-        artifact: SdistArtifact | WheelArtifact = SdistArtifact(path)
-        specific_check = _check_sdist
-    elif path.suffix == ".whl":
-        artifact = WheelArtifact(path)
-        specific_check = _check_wheel
-    else:
-        raise ValueError(f"unsupported artifact type: {path}")
+    _validate_artifact_size(path)
+    raw_content_match = _detect_raw_archive_content(path, content_rules)
+    artifact = _open_artifact(path, content_rules=content_rules)
 
     try:
+        _validate_artifact_contents_size(artifact)
         _check_paths(artifact)
         _check_internal_content(artifact, content_rules, text_content_rules)
-        specific_check(artifact, layout)
+        _check_raw_archive_content(path, raw_content_match)
+        if isinstance(artifact, SdistArtifact):
+            _check_sdist(artifact, layout)
+        else:
+            _check_wheel(artifact, layout)
     finally:
         artifact.close()
 
@@ -654,22 +967,38 @@ def main() -> int:
         type=_canonical_version_argument,
         help="require every artifact to carry this canonical PEP 440 version",
     )
+    parser.add_argument(
+        "--scan-contents-only",
+        action="store_true",
+        help="check generic publication limits, archive paths, and private-content rules only",
+    )
     parser.add_argument("artifacts", nargs="+", type=Path)
     args = parser.parse_args()
+    if args.scan_contents_only and args.expected_version is not None:
+        parser.error("--scan-contents-only cannot be combined with --expected-version")
 
     content_rules: tuple[ContentRule, ...] = ()
     text_content_rules: tuple[ContentRule, ...] = ()
     if args.content_rules_manifest is not None:
         content_rules, text_content_rules = _load_content_rule_manifest(args.content_rules_manifest)
 
-    expected_version = args.expected_version or _artifact_version(args.artifacts[0])
+    expected_version = (
+        None if args.scan_contents_only else args.expected_version or _artifact_version(args.artifacts[0])
+    )
     for artifact in args.artifacts:
-        check_artifact(
-            artifact,
-            expected_version=expected_version,
-            content_rules=content_rules,
-            text_content_rules=text_content_rules,
-        )
+        if expected_version is None:
+            check_artifact_contents(
+                artifact,
+                content_rules=content_rules,
+                text_content_rules=text_content_rules,
+            )
+        else:
+            check_artifact(
+                artifact,
+                expected_version=expected_version,
+                content_rules=content_rules,
+                text_content_rules=text_content_rules,
+            )
         print(f"validated {artifact}")
     return 0
 

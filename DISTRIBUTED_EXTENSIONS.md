@@ -119,6 +119,32 @@ records it only after `DynamicExtensionResolver.load()` verifies the local
 artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
 another route makes snapshot capture fail closed.
 
+Optional platform wheels are the offline deployment transport for these local
+providers. Each wheel contains exactly one self-contained artifact, its
+canonical descriptor, required license files, and one provider entry point,
+while declaring an exact dependency on the matching `vane-ai` version and on
+separately packaged dependency-extension wheels. Each extension-wheel package
+version contains the Vane release stage and the complete SHA-256 fingerprint of
+its immutable descriptor split across bounded numeric components. Those
+dependency-extension requirements therefore select the exact artifact identity
+instead of merely another build for the same Vane release. The provider module
+path is content-addressed too, so distinct artifacts do not overwrite each
+other's installed files. Each extension wheel is tagged for the active
+supported CPython minor, matching the native base wheel selected for that
+runtime instead of claiming cross-interpreter availability. The base Vane wheel
+contains no optional extension artifact.
+Release tooling binds the wheel tag to inspected ELF or Mach-O requirements,
+records the exact musl build baseline when applicable, and requires publishers
+to explicitly allowlist every unique dependency signer rather than deriving
+trust from the supplied graph.
+Every Ray node installs the same selected extension wheels before queries
+start; worker preparation never invokes Python packaging or transfers a wheel.
+Deployments select the base and extension files from one trusted, hash-locked
+artifact set. A Python distribution requirement cannot encode a wheel build
+tag or content hash, so the runtime also requires the descriptor's exact
+DuckDB SourceID and fails before loading when the installed base artifact does
+not match.
+
 Coordinator progress-topology inspection clones each fragment with an isolated
 cursor from the resolver-owned planning DatabaseInstance. It reuses the
 already-verified extension state and does not require a provider entry point on
