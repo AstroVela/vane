@@ -32,6 +32,8 @@
 #include "vane_python/pybind11/conversions/python_csv_line_terminator_enum.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
+#include <atomic>
+
 namespace duckdb {
 struct BoundParameterData;
 
@@ -341,6 +343,8 @@ public:
 	void Close();
 
 	void Interrupt();
+	uint64_t InterruptGeneration() const;
+	bool InterruptInProgress() const;
 
 	double QueryProgress();
 
@@ -413,6 +417,8 @@ public:
 	static unique_ptr<QueryResult> CompletePendingQuery(PendingQueryResult &pending_query);
 
 private:
+	std::atomic<uint64_t> interrupt_generation {0};
+	std::atomic<uint64_t> interrupts_in_progress {0};
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<Relation> rel);
 	unique_ptr<DuckDBPyRelation> CreateRelation(shared_ptr<DuckDBPyResult> result);
 	PathLike GetPathLike(const py::object &object);

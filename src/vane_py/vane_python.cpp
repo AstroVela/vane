@@ -14,6 +14,7 @@
 #include "vane_python/python_objects.hpp"
 #include "vane_python/dynamic_extension.hpp"
 #include "vane_python/file.hpp"
+#include "vane_python/file_reader.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyrelation.hpp"
@@ -1119,6 +1120,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	    .export_values();
 
 	PythonFile::Initialize(m);
+	PythonFileReaderHandle::Initialize(m);
 	DuckDBPyTyping::Initialize(m);
 	DuckDBPyFunctional::Initialize(m);
 	DuckDBPyExpression::Initialize(m);

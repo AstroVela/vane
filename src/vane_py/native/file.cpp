@@ -143,6 +143,24 @@ void PythonFile::Initialize(py::handle &m) {
 	         py::arg("connection") = py::none());
 	file.def("mime_type", &PythonFile::MimeType, "Return the MIME type selected by SQL file_mime_type",
 	         py::arg("detect") = "metadata", py::kw_only(), py::arg("connection") = py::none());
+	file.def(
+	    "open",
+	    [](const PythonFile &value, const py::object &buffer_size, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._file")
+		        .attr("_file_open")(py::cast(value, py::return_value_policy::copy), buffer_size,
+		                            py::arg("connection") = std::move(connection));
+	    },
+	    "Open this FILE as a read-only VaneFileReader", py::arg("buffer_size") = py::none(), py::kw_only(),
+	    py::arg("connection") = py::none());
+	file.def(
+	    "to_tempfile",
+	    [](const PythonFile &value, const py::object &buffer_size, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._file")
+		        .attr("_file_to_tempfile")(py::cast(value, py::return_value_policy::copy), buffer_size,
+		                                   py::arg("connection") = std::move(connection));
+	    },
+	    "Copy this FILE's logical view into a temporary binary file", py::arg("buffer_size") = 1024 * 1024,
+	    py::kw_only(), py::arg("connection") = py::none());
 	file.def("__str__", &PythonFile::ToString);
 	file.def("__repr__", &PythonFile::Repr);
 	file.def("__eq__", &PythonFile::Equals, py::arg("other"), py::is_operator());

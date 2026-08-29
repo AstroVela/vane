@@ -27,6 +27,7 @@ from vane._env import EnvRegistry, env
 from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
 from vane._file import (
+    VaneFileReader,
     file,
     file_content_id,
     file_enrich,
@@ -41,6 +42,7 @@ from vane._file import (
     from_files,
     guess_mime_type,
     list_files,
+    open_file,
     to_file,
     try_to_file,
 )
@@ -454,6 +456,7 @@ __all__: list[str] = [
     "UnsignedLongValue",
     "UnsignedShortValue",
     "Value",
+    "VaneFileReader",
     "Warning",
     "WriteContext",
     "WriteOutcome",
@@ -540,6 +543,7 @@ __all__: list[str] = [
     "load_extension",
     "map_type",
     "order",
+    "open_file",
     "paramstyle",
     "pl",
     "project",
