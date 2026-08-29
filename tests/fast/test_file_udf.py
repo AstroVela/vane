@@ -363,9 +363,15 @@ def test_scalar_file_udf_preserves_non_file_composite_siblings():
     assert payload["created_at"].astimezone(timezone.utc) == created_at
 
 
-def test_scalar_file_udf_preserves_full_uhugeint_sibling():
-    wide = 2**127
-    output_type = vane.type("STRUCT(document FILE, wide UHUGEINT)")
+@pytest.mark.parametrize(
+    ("integer_type", "wide"),
+    [
+        ("HUGEINT", 2**127 - 1),
+        ("UHUGEINT", 2**127),
+    ],
+)
+def test_scalar_file_udf_preserves_full_128_bit_integer_sibling(integer_type, wide):
+    output_type = vane.type(f"STRUCT(document FILE, wide {integer_type})")
 
     @vane.func(return_dtype=output_type)
     def build_document(_value):
@@ -556,6 +562,28 @@ def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
         vane.type("STRUCT(document FILE, payload BLOB)"),
         boundary="test output",
     )
+
+
+def test_file_composite_arrow_fields_match_case_insensitively():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "case-insensitive",
+            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": 'STRUCT("Document" FILE)'}],
+        }
+    )
+    lower_case = pa.StructArray.from_arrays(
+        [pa.array([_file_record()], type=_file_arrow_type())],
+        names=["document"],
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": lower_case}))
+
+    assert normalized.column("payload").type.field(0).name == "Document"
+    assert normalized.column("payload").to_pylist() == [{"Document": _file_record()}]
 
 
 def test_batch_file_udf_types_all_null_output_as_file():

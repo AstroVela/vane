@@ -96,6 +96,22 @@ def _expected_arrow_type(dtype: Any, *, boundary: str) -> pa.DataType:
         raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}") from exc
 
 
+def _struct_field_index(
+    actual: pa.StructType,
+    name: str,
+    *,
+    boundary: str,
+    path: str,
+) -> int:
+    folded_name = name.casefold()
+    matches = [index for index, field in enumerate(actual) if field.name.casefold() == folded_name]
+    if not matches:
+        raise _invalid_input(f"{boundary} STRUCT at {path} is missing FILE-bearing field {name!r}")
+    if len(matches) > 1:
+        raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {name!r}")
+    return matches[0]
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -159,9 +175,7 @@ def _validate_arrow_storage_type(
         for name, child in dtype.children:
             if not _contains_file(child):
                 continue
-            field_index = actual.get_field_index(name)
-            if field_index < 0:
-                raise _invalid_input(f"{boundary} STRUCT at {path} is missing FILE-bearing field {name!r}")
+            field_index = _struct_field_index(actual, name, boundary=boundary, path=path)
             _validate_arrow_storage_type(
                 actual.field(field_index).type,
                 child,
@@ -261,8 +275,9 @@ def _validate_file_arrow_values(
     if type_id == "struct":
         for name, child in dtype.children:
             if _contains_file(child):
+                field_index = _struct_field_index(array.type, name, boundary=boundary, path=path)
                 _validate_file_arrow_values(
-                    array.field(name),
+                    array.field(field_index),
                     child,
                     boundary=boundary,
                     path=f"{path}.{name}",
@@ -451,15 +466,20 @@ def _canonical_values_to_arrow_array(
     """Encode canonical values while typing only branches that contain FILE."""
     if _is_file_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
-    if _type_id(dtype) == "uhugeint":
+    type_id = _type_id(dtype)
+    if type_id in ("hugeint", "uhugeint"):
         encoded: list[str | None] = []
         for value in values:
             if value is None:
                 encoded.append(None)
                 continue
             integer = operator.index(value)
-            if integer < 0 or integer >= 1 << 128:
-                raise ValueError("UHUGEINT output is outside the unsigned 128-bit range")
+            if type_id == "hugeint":
+                in_range = -(1 << 127) <= integer < 1 << 127
+            else:
+                in_range = 0 <= integer < 1 << 128
+            if not in_range:
+                raise ValueError(f"{type_id.upper()} output is outside its 128-bit range")
             encoded.append(str(integer))
         return pa.array(encoded, type=pa.string())
     if not _contains_file(dtype):
@@ -557,17 +577,22 @@ def _normalize_file_arrow_array(array: Any, dtype: Any, *, boundary: str) -> Any
 
     type_id = _type_id(dtype)
     if type_id == "struct":
-        declared_children = _type_children(dtype)
+        file_children: dict[int, tuple[str, Any]] = {}
+        for name, child in dtype.children:
+            if _contains_file(child):
+                field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
+                file_children[field_index] = (name, child)
         arrays = []
         fields = []
         for index, field in enumerate(array.type):
             child_array = array.field(index)
-            child_dtype = declared_children.get(field.name)
-            file_child = child_dtype is not None and _contains_file(child_dtype)
-            if file_child:
+            file_child = file_children.get(index)
+            if file_child is not None:
+                declared_name, child_dtype = file_child
                 child_array = _normalize_file_arrow_array(child_array, child_dtype, boundary=boundary)
+                field = pa.field(declared_name, child_array.type)
             arrays.append(child_array)
-            fields.append(pa.field(field.name, child_array.type) if file_child else field)
+            fields.append(field)
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
 
     if type_id == "list":
