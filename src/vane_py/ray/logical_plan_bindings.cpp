@@ -270,12 +270,13 @@ static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 		if (snapshot_types[column_idx] == expected_types[column_idx]) {
 			continue;
 		}
-		// Arrow dictionary schemas describe their value type but not the values
-		// required to reconstruct a DuckDB ENUM. Preserve Pandas categorical
-		// semantics with an explicit VARCHAR-to-ENUM projection above the scan.
+		// Some Python-backed logical types use VARCHAR for their non-lossless
+		// Arrow representation. Preserve their bound DuckDB identity with an
+		// explicit projection above the replacement scan.
 		if ((source_kind == "pandas" || source_kind == "numpy") &&
-		    expected_types[column_idx].id() == LogicalTypeId::ENUM &&
-		    snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR) {
+		    snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR &&
+		    (expected_types[column_idx].id() == LogicalTypeId::ENUM ||
+		     expected_types[column_idx].id() == LogicalTypeId::UUID)) {
 			requires_type_projection = true;
 			continue;
 		}
@@ -394,9 +395,13 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		snapshot_types.push_back(LogicalType::BOOLEAN);
 		snapshot_names.push_back(prepared.row_count_column_name);
 	}
+	py::tuple logical_type_ids(snapshot_types.size());
+	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
+		logical_type_ids[column_idx] = py::str(LogicalTypeIdToString(snapshot_types[column_idx].id()));
+	}
 	auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, snapshot_types, snapshot_names);
 	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
-	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, column_indices,
+	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, logical_type_ids, column_indices,
 	    py::bool_(prepared.requires_row_count_column));
 	if (!py::isinstance<py::tuple>(prepared_obj)) {
 		throw InternalException("Python memory snapshot helper must return a tuple");

@@ -508,6 +508,45 @@ def test_pandas_varchar_object_memory_source_matches_pandas_scan(connection):
     assert result.column(0).to_pylist() == expected
 
 
+@pytest.mark.parametrize("source_kind", ["pandas", "numpy"])
+def test_uuid_object_memory_source_preserves_bound_type(connection, source_kind):
+    values = [uuid.UUID("00000000-0000-0000-0000-000000000001"), None, uuid.UUID(int=2)]
+    if source_kind == "pandas":
+        source = pd.DataFrame({"u": pd.Series(values, dtype=object)})
+        relation = connection.from_df(source).project("CAST(u AS VARCHAR) AS u")
+    else:
+        source = {"u": np.array(values, dtype=object)}  # noqa: F841 - resolved by DuckDB's replacement scan
+        relation = connection.sql("SELECT CAST(u AS VARCHAR) AS u FROM source")
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == [str(values[0]), None, str(values[2])]
+
+
+def test_pandas_map_object_memory_source_preserves_bound_type(connection):
+    source = pd.DataFrame(
+        {
+            "attributes": pd.Series(
+                [
+                    {"key": ["a", "b"], "value": [1, 2]},
+                    None,
+                    {"key": [], "value": []},
+                ],
+                dtype=object,
+            )
+        }
+    )
+    relation = connection.from_df(source).project("attributes")
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == [[("a", 1), ("b", 2)], None, []]
+
+
 @pytest.mark.parametrize("source_kind", ["dataset", "scanner"])
 def test_lazy_arrow_source_requires_explicit_materialization(connection, source_kind):
     dataset = ds.dataset(pa.table({"id": [1, 2, 3]}))
