@@ -492,6 +492,33 @@ def test_file_arrow_struct_outputs_require_exact_fields(malformed):
         contract.normalize_output_table(pa.table({"payload": value}))
 
 
+@pytest.mark.parametrize("malformed", ["missing", "extra"])
+def test_file_arrow_nested_non_file_struct_outputs_require_exact_fields(malformed):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "strict-nested-arrow-struct",
+            "method_return_type": "STRUCT(document FILE, meta STRUCT(id INTEGER, label VARCHAR))",
+        }
+    )
+    meta_arrays = [pa.array([1])]
+    meta_names = ["id"]
+    if malformed == "extra":
+        meta_arrays.extend([pa.array(["declared"]), pa.array(["discarded"])])
+        meta_names.extend(["label", "extra"])
+    meta = pa.StructArray.from_arrays(meta_arrays, names=meta_names)
+    value = pa.StructArray.from_arrays(
+        [pa.array([_file_record()], type=_file_arrow_type()), meta],
+        names=["document", "meta"],
+    )
+
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields"):
+        contract.normalize_output_table(pa.table({"payload": value}))
+
+
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
     local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
@@ -507,6 +534,33 @@ def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
 
     assert result.project("payload.local_time::VARCHAR AS local_time").fetchone() == ("03:04:05+02:30",)
+
+
+def test_scalar_file_udf_preserves_time_with_time_zone_storage_provenance():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "time-zone-provenance",
+            "method_return_type": "STRUCT(document FILE, local_time TIME WITH TIME ZONE)",
+        }
+    )
+    outputs = [
+        {
+            "document": vane.File("memory://time-zone-blob"),
+            "local_time": b"03:04:05+02:00",
+        },
+        {
+            "document": vane.File("memory://time-zone-text"),
+            "local_time": "03:04:05+02:00",
+        },
+    ]
+
+    arrays = contract.scalar_outputs_to_arrays(outputs)
+
+    assert [array.type.field("local_time").type for array in arrays] == [pa.binary(), pa.string()]
 
 
 @pytest.mark.parametrize(
@@ -2026,6 +2080,24 @@ def test_file_output_contract_uses_resolved_type_instead_of_serialized_alias():
 
     assert contract.has_file_outputs
     assert str(contract.output_types[0]) == "STRUCT(document FILE, flags BIT)"
+
+
+def test_file_input_contract_precedes_catalog_local_alias_text():
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "resolved-input-alias",
+            "input_types": ['"source file"'],
+            "input_contract_types": ["VARCHAR"],
+            "method_return_type": "FILE",
+            "output_contract_types": ["FILE"],
+        }
+    )
+
+    assert not contract.has_file_inputs
+    assert contract.has_file_outputs
+    assert str(contract.input_types[0]) == "VARCHAR"
 
 
 def test_scalar_file_output_supports_connection_local_file_bearing_alias():

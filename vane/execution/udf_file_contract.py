@@ -489,8 +489,6 @@ def _validate_arrow_storage_type(
         if len(set(declared_names)) != len(declared_names) or set(actual_names) != set(declared_names):
             raise _invalid_input(f"{boundary} STRUCT at {path} must contain exactly the declared fields")
         for name, child in dtype.children:
-            if not _contains_file(child):
-                continue
             field_index = _struct_field_index(actual, name, boundary=boundary, path=path)
             _validate_arrow_storage_type(
                 actual.field(field_index).type,
@@ -504,25 +502,25 @@ def _validate_arrow_storage_type(
         if not pa.types.is_map(actual):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow MAP type")
         children = _type_children(dtype)
-        if _contains_file(children["key"]):
-            _validate_arrow_storage_type(
-                actual.key_type,
-                children["key"],
-                boundary=boundary,
-                path=f"{path}.key",
-                allow_untyped_null=allow_untyped_null,
-            )
-        if _contains_file(children["value"]):
-            _validate_arrow_storage_type(
-                actual.item_type,
-                children["value"],
-                boundary=boundary,
-                path=f"{path}.value",
-                allow_untyped_null=allow_untyped_null,
-            )
+        _validate_arrow_storage_type(
+            actual.key_type,
+            children["key"],
+            boundary=boundary,
+            path=f"{path}.key",
+            allow_untyped_null=allow_untyped_null,
+        )
+        _validate_arrow_storage_type(
+            actual.item_type,
+            children["value"],
+            boundary=boundary,
+            path=f"{path}.value",
+            allow_untyped_null=allow_untyped_null,
+        )
         return
     if type_id == "union":
-        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        if _contains_file(dtype):
+            raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
+        return
 
 
 def _file_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
@@ -891,8 +889,16 @@ def _canonical_values_to_arrow_array(
             type=pa.string(),
         )
     if type_id == "time with time zone":
-        encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
-        return pa.array(encoded, type=pa.string())
+        textual_non_null = [isinstance(value, (datetime_time, str)) for value in values if value is not None]
+        if all(textual_non_null):
+            encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
+            return pa.array(encoded, type=pa.string())
+        if any(textual_non_null):
+            # Keep values with different DuckDB cast provenance in separate
+            # Arrow pieces rather than allowing inference to coerce one into
+            # the storage family of another.
+            raise TypeError("TIME WITH TIME ZONE output mixes textual and non-textual storage")
+        return pa.array(values)
     if not _requires_native_output_encoding(dtype):
         try:
             return pa.array(values)
@@ -1247,7 +1253,20 @@ class FileUDFContract:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> FileUDFContract:
         raw_inputs = payload.get("input_types") or []
-        if isinstance(raw_inputs, (list, tuple)):
+        raw_input_contracts = payload.get("input_contract_types")
+        parsed_input_contracts: tuple[Any | None, ...] | None = None
+        if isinstance(raw_inputs, (list, tuple)) and isinstance(raw_input_contracts, (list, tuple)):
+            if len(raw_input_contracts) != len(raw_inputs):
+                raise _invalid_input("UDF payload input contract count does not match its input type count")
+            parsed_input_contracts = tuple(
+                _parse_declared_type(type_name, field="input_contract_types") if isinstance(type_name, str) else None
+                for type_name in raw_input_contracts
+            )
+            file_input_types = tuple(
+                dtype if dtype is not None and _contains_file(dtype) else None for dtype in parsed_input_contracts
+            )
+            input_types = file_input_types
+        elif isinstance(raw_inputs, (list, tuple)):
             file_input_types = tuple(_parse_file_type(type_name, field="input_types") for type_name in raw_inputs)
             input_types = file_input_types
         else:
@@ -1317,15 +1336,6 @@ class FileUDFContract:
                 else:
                     output_types.extend(file_types)
 
-        raw_input_contracts = payload.get("input_contract_types")
-        parsed_input_contracts: tuple[Any | None, ...] | None = None
-        if isinstance(raw_inputs, (list, tuple)) and isinstance(raw_input_contracts, (list, tuple)):
-            if len(raw_input_contracts) != len(raw_inputs):
-                raise _invalid_input("UDF payload input contract count does not match its input type count")
-            parsed_input_contracts = tuple(
-                _parse_declared_type(type_name, field="input_contract_types") if isinstance(type_name, str) else None
-                for type_name in raw_input_contracts
-            )
         has_file_contract = (
             any(dtype is not None for dtype in file_input_types)
             or any(dtype is not None and _contains_file(dtype) for dtype in parsed_input_contracts or ())
