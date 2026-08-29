@@ -149,6 +149,122 @@ bool PythonFilesystem::Exists(const string &filename, const char *func_name) con
 		                              func_name);
 	}
 }
+
+static string StablePathKeyPrefix(const string &path, bool glob_pattern) {
+	auto glob = glob_pattern ? path.find_first_of("*?[") : string::npos;
+	if (glob == string::npos) {
+		return path;
+	}
+	auto separator = path.rfind('/', glob);
+	return separator == string::npos ? string() : path.substr(0, separator + 1);
+}
+
+static bool IsSameOrChildPathKey(const string &path, const string &prefix) {
+	if (prefix.empty() || !StringUtil::StartsWith(path, prefix)) {
+		return false;
+	}
+	return path.size() == prefix.size() || StringUtil::EndsWith(prefix, "/") || path[prefix.size()] == '/';
+}
+
+// Registered fsspec protocol identifiers can contain underscores even though
+// RFC URL schemes cannot.
+static optional_idx FindLeadingProtocolSeparator(const string &path) {
+	auto separator = path.find("://");
+	if (separator == string::npos || separator == 0 || !StringUtil::CharacterIsAlpha(path[0])) {
+		return optional_idx();
+	}
+	for (idx_t index = 1; index < separator; index++) {
+		auto character = path[index];
+		if (!StringUtil::CharacterIsAlphaNumeric(character) && character != '+' && character != '-' &&
+		    character != '.' && character != '_') {
+			return optional_idx();
+		}
+	}
+	return optional_idx(separator);
+}
+
+static string URLAuthority(const string &path, idx_t scheme_separator) {
+	auto authority_begin = scheme_separator + 3;
+	auto authority_end = path.find_first_of("/?#", authority_begin);
+	return path.substr(authority_begin, authority_end == string::npos ? string::npos : authority_end - authority_begin);
+}
+
+static bool HasCallerIdentityPrefix(const string &path) {
+	auto scheme_separator = FindLeadingProtocolSeparator(path);
+	if (!scheme_separator.IsValid()) {
+		return true;
+	}
+	auto offset = scheme_separator.GetIndex() + 3;
+	while (offset < path.size() && path[offset] == '/') {
+		offset++;
+	}
+	return offset < path.size();
+}
+
+// fsspec unstrip_protocol() always selects the provider's first protocol and
+// can omit an authority owned by the configured instance. Compare paths in the
+// provider's stripped key space, then restore only the caller's stable locator
+// prefix. Results outside that prefix retain the provider representation.
+string PythonFilesystem::RestoreCallerPath(const string &locator, const string &returned_path,
+                                           const string &fallback_path, bool glob_pattern) const {
+	D_ASSERT(py::gil_check());
+	auto returned_scheme_separator = FindLeadingProtocolSeparator(returned_path);
+	if (returned_scheme_separator.IsValid()) {
+		auto returned_protocol = returned_path.substr(0, returned_scheme_separator.GetIndex());
+		bool supported_protocol = false;
+		for (const auto &protocol : protocols) {
+			if (StringUtil::CIEquals(protocol, returned_protocol)) {
+				supported_protocol = true;
+				break;
+			}
+		}
+		if (!supported_protocol) {
+			return fallback_path;
+		}
+
+		auto locator_scheme_separator = FindLeadingProtocolSeparator(locator);
+		if (locator_scheme_separator.IsValid()) {
+			auto locator_authority = URLAuthority(locator, locator_scheme_separator.GetIndex());
+			auto returned_authority = URLAuthority(returned_path, returned_scheme_separator.GetIndex());
+			if (!locator_authority.empty() && !returned_authority.empty() && locator_authority != returned_authority) {
+				return fallback_path;
+			}
+		}
+	}
+
+	auto strip_protocol = filesystem.attr("_strip_protocol");
+	string locator_key = py::str(strip_protocol(py::str(locator)));
+	string returned_key = py::str(strip_protocol(py::str(returned_path)));
+	if (locator_key.empty()) {
+		return fallback_path;
+	}
+	auto stable_prefix = StablePathKeyPrefix(locator_key, glob_pattern);
+	if (!IsSameOrChildPathKey(returned_key, stable_prefix)) {
+		return fallback_path;
+	}
+
+	auto caller_prefix = locator;
+	if (stable_prefix.size() < locator_key.size()) {
+		auto pattern_suffix = locator_key.substr(stable_prefix.size());
+		if (!StringUtil::EndsWith(locator, pattern_suffix)) {
+			return fallback_path;
+		}
+		caller_prefix.resize(locator.size() - pattern_suffix.size());
+	}
+	if (stable_prefix == "/" && !HasCallerIdentityPrefix(caller_prefix)) {
+		return fallback_path;
+	}
+	auto returned_suffix = returned_key.substr(stable_prefix.size());
+	if (StringUtil::EndsWith(caller_prefix, "/") && StringUtil::StartsWith(returned_suffix, "/")) {
+		returned_suffix.erase(0, 1);
+	}
+	auto restored_path = caller_prefix + returned_suffix;
+	if (py::str(strip_protocol(py::str(restored_path))).cast<string>() != returned_key) {
+		return fallback_path;
+	}
+	return restored_path;
+}
+
 vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *opener) {
 	PythonGILWrapper gil;
 
@@ -161,8 +277,12 @@ vector<OpenFileInfo> PythonFilesystem::Glob(const string &path, FileOpener *open
 		vector<OpenFileInfo> results;
 		auto unstrip_protocol = filesystem.attr("unstrip_protocol");
 		for (auto item : returner) {
-			string file_path = py::str(unstrip_protocol(py::str(item)));
-			results.emplace_back(file_path);
+			string returned_path = py::str(item);
+			string fallback_path = returned_path;
+			if (!FindLeadingProtocolSeparator(returned_path).IsValid()) {
+				fallback_path = py::str(unstrip_protocol(py::str(item)));
+			}
+			results.emplace_back(RestoreCallerPath(path, returned_path, fallback_path, true));
 		}
 		return results;
 	} catch (const py::error_already_set &error) {
@@ -253,7 +373,8 @@ bool PythonFilesystem::ListFiles(const string &directory, const std::function<vo
 	try {
 		for (auto item : filesystem.attr("ls")(py::str(directory), py::arg("detail") = true)) {
 			bool is_dir = py::cast<std::string>(item["type"]) == "directory";
-			callback(py::str(item["name"]), is_dir);
+			string returned_path = py::str(item["name"]);
+			callback(RestoreCallerPath(directory, returned_path, returned_path, false), is_dir);
 		}
 	} catch (const py::error_already_set &error) {
 		if (!error.matches(PyExc_NotImplementedError)) {
