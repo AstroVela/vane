@@ -1452,6 +1452,48 @@ def test_batch_file_udf_supports_time_ns_sibling():
     assert result.to_pylist() == [{"document": _file_record(), "precise": precise}]
 
 
+def test_batch_file_udf_supports_bit_sibling():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        document = {
+            "url": "memory://bit-sibling",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        }
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([document] * len(values), type=file_type),
+                pa.array(["101001"] * len(values), type=pa.string()),
+            ],
+            names=["document", "flags"],
+        )
+
+    assert build_document.return_arrow_dtype.field("flags").type == pa.binary()
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://bit-sibling",
+        "101001",
+    )
+
+
 def test_file_output_normalization_preserves_full_intervals():
     import pyarrow as pa
 

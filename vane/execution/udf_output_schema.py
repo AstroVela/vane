@@ -81,6 +81,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "double": pa.float64,
         "boolean": pa.bool_,
         "blob": pa.binary,
+        "bit": pa.binary,
         "timestamp": lambda: pa.timestamp("us"),
         "timestamp_s": lambda: pa.timestamp("s"),
         "timestamp_ms": lambda: pa.timestamp("ms"),
