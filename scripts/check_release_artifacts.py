@@ -19,11 +19,10 @@ import re
 import stat
 import subprocess
 import sys
-import tarfile
 import unicodedata
-import zipfile
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -49,7 +48,12 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _ORIGINAL_SYS_PATH = sys.path.copy()
 try:
     sys.path.insert(0, str(REPOSITORY_ROOT))
-    from vane_packaging.archive_safety import validate_tar_member_count, validate_zip_member_count
+    from vane_packaging.archive_safety import (
+        ArchiveSnapshot,
+        open_tar_snapshot,
+        open_zip_snapshot,
+        snapshot_archive,
+    )
 finally:
     sys.path[:] = _ORIGINAL_SYS_PATH
     del _ORIGINAL_SYS_PATH
@@ -129,6 +133,7 @@ BANNED_PATH_SUFFIXES = (
 
 class Artifact(Protocol):
     path: Path
+    raw_content_match: ContentMatch | None
 
     def path_names(self) -> list[str]: ...
 
@@ -201,20 +206,37 @@ class _TarMetadataContentScanner:
 
 
 class WheelArtifact:
-    def __init__(self, path: Path):
-        self.path = path
-        validate_zip_member_count(
-            path,
-            max_members=MAX_ARTIFACT_MEMBERS,
-            description="wheel",
-        )
-        self.archive = zipfile.ZipFile(path)
-        self.all_members = self.archive.infolist()
-        for info in self.all_members:
-            if stat.S_ISLNK(info.external_attr >> 16):
-                self.archive.close()
-                raise ValueError(f"{path}: symbolic links are not allowed in wheels: {info.filename}")
-        self.members = [info.filename for info in self.all_members if not info.is_dir()]
+    def __init__(self, archive_input: Path | ArchiveSnapshot, *, content_rules: tuple[ContentRule, ...] = ()):
+        self.path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
+        self._resources = ExitStack()
+        try:
+            if isinstance(archive_input, ArchiveSnapshot):
+                self.snapshot = archive_input
+            else:
+                self.snapshot = self._resources.enter_context(
+                    snapshot_archive(
+                        archive_input,
+                        max_bytes=MAX_ARTIFACT_BYTES,
+                        description="artifact",
+                        size_limit_description="the project's 100 MiB publication limit",
+                    )
+                )
+            self.raw_content_match = _detect_raw_archive_content(self.snapshot, content_rules)
+            self.archive = self._resources.enter_context(
+                open_zip_snapshot(
+                    self.snapshot,
+                    max_members=MAX_ARTIFACT_MEMBERS,
+                    description="wheel",
+                )
+            )
+            self.all_members = self.archive.infolist()
+            for info in self.all_members:
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise ValueError(f"{self.path}: symbolic links are not allowed in wheels: {info.filename}")
+            self.members = [info.filename for info in self.all_members if not info.is_dir()]
+        except BaseException:
+            self._resources.close()
+            raise
 
     def path_names(self) -> list[str]:
         return [info.filename for info in self.all_members]
@@ -229,29 +251,47 @@ class WheelArtifact:
         return self.archive.read(name)
 
     def close(self) -> None:
-        self.archive.close()
+        self._resources.close()
 
 
 class SdistArtifact:
-    def __init__(self, path: Path, *, content_rules: tuple[ContentRule, ...] = ()):
-        self.path = path
-        metadata_scanner = _TarMetadataContentScanner(path, content_rules)
-        validate_tar_member_count(
-            path,
-            max_members=MAX_ARTIFACT_MEMBERS,
-            max_member_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
-            max_total_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
-            uncompressed_limit_description="the project's 100 MiB uncompressed limit",
-            description="sdist",
-            metadata_chunk_callback=metadata_scanner if content_rules else None,
-        )
-        self.archive = tarfile.open(path, mode="r:gz")
-        self.all_members = self.archive.getmembers()
-        for member in self.all_members:
-            if not member.isfile() and not member.isdir():
-                self.archive.close()
-                raise ValueError(f"{path}: unsupported tar member type for {member.name}")
-        self.members = {member.name: member for member in self.all_members if member.isfile()}
+    def __init__(self, archive_input: Path | ArchiveSnapshot, *, content_rules: tuple[ContentRule, ...] = ()):
+        self.path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
+        self._resources = ExitStack()
+        try:
+            if isinstance(archive_input, ArchiveSnapshot):
+                self.snapshot = archive_input
+            else:
+                self.snapshot = self._resources.enter_context(
+                    snapshot_archive(
+                        archive_input,
+                        max_bytes=MAX_ARTIFACT_BYTES,
+                        description="artifact",
+                        size_limit_description="the project's 100 MiB publication limit",
+                    )
+                )
+            self.raw_content_match = _detect_raw_archive_content(self.snapshot, content_rules)
+            metadata_scanner = _TarMetadataContentScanner(self.path, content_rules)
+            self.archive = self._resources.enter_context(
+                open_tar_snapshot(
+                    self.snapshot,
+                    max_members=MAX_ARTIFACT_MEMBERS,
+                    max_member_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
+                    max_total_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
+                    uncompressed_limit_description="the project's 100 MiB uncompressed limit",
+                    description="sdist",
+                    metadata_chunk_callback=metadata_scanner if content_rules else None,
+                    mode="r:gz",
+                )
+            )
+            self.all_members = self.archive.getmembers()
+            for member in self.all_members:
+                if not member.isfile() and not member.isdir():
+                    raise ValueError(f"{self.path}: unsupported tar member type for {member.name}")
+            self.members = {member.name: member for member in self.all_members if member.isfile()}
+        except BaseException:
+            self._resources.close()
+            raise
 
     def path_names(self) -> list[str]:
         return [member.name for member in self.all_members]
@@ -269,7 +309,7 @@ class SdistArtifact:
         return extracted.read()
 
     def close(self) -> None:
-        self.archive.close()
+        self._resources.close()
 
 
 def _artifact_version(path: Path) -> Version:
@@ -387,30 +427,29 @@ def _check_internal_content(
 
 
 def _detect_raw_archive_content(
-    path: Path,
+    snapshot: ArchiveSnapshot,
     content_rules: tuple[ContentRule, ...],
 ) -> ContentMatch | None:
     if not content_rules:
         return None
+    path = snapshot.source_path
     overlap_bytes = max(rule.overlap_bytes() for rule in content_rules)
     try:
-        with path.open("rb") as archive_file:
-            metadata = os.fstat(archive_file.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(f"artifact must be a regular file: {path}")
-            if metadata.st_size > MAX_ARTIFACT_BYTES:
+        metadata = os.fstat(snapshot.file.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != snapshot.size:
+            raise ValueError(f"{path}: private artifact snapshot changed before content scanning")
+        snapshot.file.seek(0)
+        overlap = b""
+        total_size = 0
+        while chunk := snapshot.file.read(_RAW_ARCHIVE_SCAN_CHUNK_BYTES):
+            total_size += len(chunk)
+            if total_size > MAX_ARTIFACT_BYTES:
                 raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
-            overlap = b""
-            total_size = 0
-            while chunk := archive_file.read(_RAW_ARCHIVE_SCAN_CHUNK_BYTES):
-                total_size += len(chunk)
-                if total_size > MAX_ARTIFACT_BYTES:
-                    raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
-                window = overlap + chunk
-                for rule in content_rules:
-                    if rule.matches(window):
-                        return ContentMatch(rule_id=rule.rule_id, member_name="raw archive bytes")
-                overlap = window[-overlap_bytes:] if overlap_bytes else b""
+            window = overlap + chunk
+            for rule in content_rules:
+                if rule.matches(window):
+                    return ContentMatch(rule_id=rule.rule_id, member_name="raw archive bytes")
+            overlap = window[-overlap_bytes:] if overlap_bytes else b""
     except OSError as exception:
         raise ValueError(f"could not scan artifact contents: {path}") from exception
     return None
@@ -865,11 +904,6 @@ def _check_wheel(artifact: WheelArtifact, layout: DistributionLayout) -> None:
     _check_wheel_record(artifact, layout)
 
 
-def _validate_artifact_size(path: Path) -> None:
-    if path.stat().st_size > MAX_ARTIFACT_BYTES:
-        raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
-
-
 def _validate_artifact_contents_size(artifact: Artifact) -> None:
     total_size = 0
     for member_name, member_size in artifact.member_sizes():
@@ -887,59 +921,58 @@ def _validate_artifact_contents_size(artifact: Artifact) -> None:
 
 
 def _open_artifact(
-    path: Path,
+    archive_input: Path | ArchiveSnapshot,
     *,
     content_rules: tuple[ContentRule, ...] = (),
 ) -> SdistArtifact | WheelArtifact:
+    path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
     if path.name.endswith(".tar.gz"):
-        return SdistArtifact(path, content_rules=content_rules)
+        return SdistArtifact(archive_input, content_rules=content_rules)
     if path.suffix == ".whl":
-        return WheelArtifact(path)
+        return WheelArtifact(archive_input, content_rules=content_rules)
     raise ValueError(f"unsupported artifact type: {path}")
 
 
 def check_artifact_contents(
-    path: Path,
+    archive_input: Path | ArchiveSnapshot,
     *,
     content_rules: tuple[ContentRule, ...] = (),
     text_content_rules: tuple[ContentRule, ...] = (),
 ) -> None:
     """Validate generic publication limits, paths, and private-content rules."""
-    _validate_artifact_size(path)
-    raw_content_match = _detect_raw_archive_content(path, content_rules)
-    artifact = _open_artifact(path, content_rules=content_rules)
+    path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
+    artifact = _open_artifact(archive_input, content_rules=content_rules)
     try:
         _validate_artifact_contents_size(artifact)
         _check_paths(artifact)
         _check_internal_content(artifact, content_rules, text_content_rules)
-        _check_raw_archive_content(path, raw_content_match)
+        _check_raw_archive_content(path, artifact.raw_content_match)
     finally:
         artifact.close()
 
 
 def check_artifact(
-    path: Path,
+    archive_input: Path | ArchiveSnapshot,
     *,
     expected_version: Version | str,
     content_rules: tuple[ContentRule, ...] = (),
     text_content_rules: tuple[ContentRule, ...] = (),
 ) -> None:
     """Validate one sdist or wheel."""
+    path = archive_input.source_path if isinstance(archive_input, ArchiveSnapshot) else archive_input
     layout = distribution_layout(expected_version)
     artifact_version = _artifact_version(path)
     if artifact_version != layout.version:
         raise ValueError(
             f"{path}: expected version {layout.version}, found {artifact_version} in distribution filename"
         )
-    _validate_artifact_size(path)
-    raw_content_match = _detect_raw_archive_content(path, content_rules)
-    artifact = _open_artifact(path, content_rules=content_rules)
+    artifact = _open_artifact(archive_input, content_rules=content_rules)
 
     try:
         _validate_artifact_contents_size(artifact)
         _check_paths(artifact)
         _check_internal_content(artifact, content_rules, text_content_rules)
-        _check_raw_archive_content(path, raw_content_match)
+        _check_raw_archive_content(path, artifact.raw_content_match)
         if isinstance(artifact, SdistArtifact):
             _check_sdist(artifact, layout)
         else:

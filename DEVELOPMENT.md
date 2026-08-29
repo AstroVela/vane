@@ -213,10 +213,24 @@ contents exceed that limit. The preflight runs before reading
 dependency, root, or base wheel members. Before constructing Python's ZIP
 reader, every supplied wheel also receives a streaming central-directory
 preflight capped at 10,000 members. Archives with comments, spanning, ZIP64 end records, or
-internally inconsistent counts and bounds are rejected. Extension-wheel
-METADATA is capped at 1 MiB, 1,024 headers, 10,000 lines, and bounded line
-length before the email metadata parser is constructed. The same bounds apply
-to dependency, root, base-wheel, and generic release metadata parsing.
+internally inconsistent counts and bounds are rejected. Untrusted release and
+extension-wheel archive paths are opened once, confirmed to name regular
+files, and copied with an explicit byte bound into a private temporary
+directory. On POSIX the completed snapshot is made read-only. Raw-content
+scanning, ZIP or TAR preflight, and the standard-library semantic parser
+consume that same snapshot; clean extension verification also installs the
+snapshotted root, dependency, and base wheels.
+Clean verification retains at most 1 GiB of snapshot bytes across the complete
+root, dependency, and base-wheel set. It validates the root and base snapshots,
+then snapshots and validates each dependency in order, so an invalid earlier
+artifact stops the verifier before later artifacts consume temporary storage.
+The source path is never reopened after the snapshot boundary, so replacing it
+cannot change the bytes being approved or installed. Snapshot files and their
+private directories are closed and removed on success and on every failure
+path. Their METADATA is capped at 1 MiB, 1,024 headers, 10,000 lines, and
+bounded line length before the email metadata parser is constructed. The same
+bounds apply to dependency, root, base-wheel, and generic release metadata
+parsing.
 Extension descriptors are capped at 64 KiB and receive bounded JSON nesting,
 separator, string, scalar, and dependency-object preflights before a JSON
 object is constructed; each packaged graph is limited to 256 dependency

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from packaging.version import Version
 
 import scripts.verify_extension_wheel as verify_extension_wheel_module
 import vane
+import vane_packaging.archive_safety as archive_safety_module
 import vane_packaging.extension_wheel as extension_wheel_module
 import vane_packaging.manylinux_policy as manylinux_policy_module
 from scripts import check_release_artifacts
@@ -3067,14 +3069,7 @@ def test_platform_wheel_rejects_oversized_dependency_wheels(
         license_expression="Apache-2.0",
         license_files=[REPOSITORY_ROOT / "LICENSE"],
     )
-    validate_size = extension_wheel_module._validate_extension_wheel_size
-
-    def reject_dependency(path):
-        if Path(path) == dependency.path:
-            raise ValueError("extension wheel exceeds the project's 100 MiB publication limit")
-        validate_size(path)
-
-    monkeypatch.setattr(extension_wheel_module, "_validate_extension_wheel_size", reject_dependency)
+    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_BYTES", 0)
 
     with pytest.raises(ValueError, match="100 MiB publication limit"):
         _build_sample_wheel(tmp_path, output_name="root-dist", dependencies=(dependency.path,))
@@ -4382,6 +4377,210 @@ def test_clean_verifier_invokes_pip_in_isolated_mode(
         assert environment["PYTHONSAFEPATH"] == "1"
 
 
+def test_clean_verifier_validates_and_installs_private_snapshots(
+    tmp_path,
+    monkeypatch,
+    synthetic_descriptor_factory,
+):
+    dependency = build_extension_wheel(
+        artifact=_write_artifact(tmp_path / "dependency.duckdb_extension", b"dependency"),
+        extension_name="dependency",
+        output_directory=tmp_path / "dependency-dist",
+        platform_tag=_wheel_platform_tag(),
+        trust_identity=TEST_TRUST_IDENTITY,
+        license_expression="Apache-2.0",
+        license_files=[REPOSITORY_ROOT / "LICENSE"],
+    )
+    root = _build_sample_wheel(tmp_path, dependencies=(dependency.path,))
+    base = _write_minimal_base_wheel(tmp_path)
+    source_paths = {base, root.path, dependency.path}
+    recorded_snapshots: list[Path] = []
+    installed_snapshots: list[Path] = []
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
+
+    @contextmanager
+    def snapshot_then_replace(path, **kwargs):
+        source_path = Path(path)
+        with snapshot_archive(source_path, **kwargs) as snapshot:
+            recorded_snapshots.append(snapshot.path)
+            replacement = source_path.with_name(f"replacement-{source_path.name}")
+            replacement.write_bytes(b"replacement after snapshot")
+            replacement.replace(source_path)
+            yield snapshot
+
+    def inspect_command(command, *, cwd, environment=None):
+        if "install" not in command:
+            return
+        installed_snapshots.extend(Path(argument) for argument in command if argument.endswith(".whl"))
+        for snapshot_path in installed_snapshots:
+            assert snapshot_path.is_file()
+            assert snapshot_path.read_bytes() != b"replacement after snapshot"
+            with zipfile.ZipFile(snapshot_path) as wheel:
+                assert wheel.namelist()
+
+    def reject_release_resnapshot(*_args, **_kwargs):
+        raise AssertionError("base-wheel release validation must reuse the verifier snapshot")
+
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", snapshot_then_replace)
+    monkeypatch.setattr(check_release_artifacts, "snapshot_archive", reject_release_resnapshot)
+    monkeypatch.setattr(verify_extension_wheel_module, "_run", inspect_command)
+
+    verify_extension_wheel(
+        base_wheel=base,
+        extension_wheel=root.path,
+        extension_name="sample",
+        trust_identity=TEST_TRUST_IDENTITY,
+        dependency_wheels=(dependency.path,),
+        dependency_trust_identities=(TEST_TRUST_IDENTITY,),
+    )
+
+    assert len(recorded_snapshots) == 3
+    assert set(installed_snapshots) == set(recorded_snapshots)
+    assert all(path.read_bytes() == b"replacement after snapshot" for path in source_paths)
+    assert all(not path.exists() and not path.parent.exists() for path in recorded_snapshots)
+
+
+def test_clean_verifier_bounds_aggregate_snapshot_storage_and_cleans_prior_snapshots(
+    tmp_path,
+    monkeypatch,
+    synthetic_descriptor_factory,
+):
+    dependency = build_extension_wheel(
+        artifact=_write_artifact(tmp_path / "dependency.duckdb_extension", b"dependency"),
+        extension_name="dependency",
+        output_directory=tmp_path / "dependency-dist",
+        platform_tag=_wheel_platform_tag(),
+        trust_identity=TEST_TRUST_IDENTITY,
+        license_expression="Apache-2.0",
+        license_files=[REPOSITORY_ROOT / "LICENSE"],
+    )
+    root = _build_sample_wheel(tmp_path)
+    base = _write_minimal_base_wheel(tmp_path)
+    snapshot_attempts: list[tuple[Path, int, str]] = []
+    retained_snapshot_paths: list[Path] = []
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
+
+    @contextmanager
+    def record_snapshot(path, **kwargs):
+        snapshot_attempts.append((Path(path), kwargs["max_bytes"], kwargs["size_limit_description"]))
+        with snapshot_archive(path, **kwargs) as snapshot:
+            retained_snapshot_paths.append(snapshot.path)
+            yield snapshot
+
+    monkeypatch.setattr(
+        verify_extension_wheel_module,
+        "_MAX_CLEAN_VERIFICATION_SNAPSHOT_BYTES",
+        root.path.stat().st_size + base.stat().st_size,
+    )
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", record_snapshot)
+
+    with pytest.raises(RuntimeError, match="aggregate 1 GiB snapshot limit"):
+        verify_extension_wheel(
+            base_wheel=base,
+            extension_wheel=root.path,
+            extension_name="sample",
+            trust_identity=TEST_TRUST_IDENTITY,
+            dependency_wheels=(dependency.path,),
+            dependency_trust_identities=(TEST_TRUST_IDENTITY,),
+        )
+
+    assert [attempt[0] for attempt in snapshot_attempts] == [root.path, base, dependency.path]
+    assert snapshot_attempts[-1][1:] == (0, "the clean verifier's aggregate 1 GiB snapshot limit")
+    assert len(retained_snapshot_paths) == 2
+    assert all(not path.exists() and not path.parent.exists() for path in retained_snapshot_paths)
+
+
+def test_clean_verifier_validates_each_dependency_before_snapshotting_the_next(
+    tmp_path,
+    monkeypatch,
+    synthetic_descriptor_factory,
+):
+    first_dependency = build_extension_wheel(
+        artifact=_write_artifact(tmp_path / "dependency.duckdb_extension", b"dependency"),
+        extension_name="dependency",
+        output_directory=tmp_path / "dependency-dist",
+        platform_tag=_wheel_platform_tag(),
+        trust_identity=TEST_TRUST_IDENTITY,
+        license_expression="Apache-2.0",
+        license_files=[REPOSITORY_ROOT / "LICENSE"],
+    )
+    later_dependency = tmp_path / f"later-{first_dependency.path.name}"
+    later_dependency.write_bytes(first_dependency.path.read_bytes())
+    root = _build_sample_wheel(tmp_path)
+    base = _write_minimal_base_wheel(tmp_path)
+    attempted_sources: list[Path] = []
+    retained_snapshot_paths: list[Path] = []
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
+    extension_name_from_artifact_path = verify_extension_wheel_module._extension_name_from_artifact_path
+
+    @contextmanager
+    def record_snapshot(path, **kwargs):
+        attempted_sources.append(Path(path))
+        with snapshot_archive(path, **kwargs) as snapshot:
+            retained_snapshot_paths.append(snapshot.path)
+            yield snapshot
+
+    def reject_first_dependency(snapshot):
+        if snapshot.source_path == first_dependency.path:
+            raise RuntimeError("first dependency is invalid")
+        return extension_name_from_artifact_path(snapshot)
+
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", record_snapshot)
+    monkeypatch.setattr(
+        verify_extension_wheel_module,
+        "_extension_name_from_artifact_path",
+        reject_first_dependency,
+    )
+
+    with pytest.raises(RuntimeError, match="first dependency is invalid"):
+        verify_extension_wheel(
+            base_wheel=base,
+            extension_wheel=root.path,
+            extension_name="sample",
+            trust_identity=TEST_TRUST_IDENTITY,
+            dependency_wheels=(first_dependency.path, later_dependency),
+            dependency_trust_identities=(TEST_TRUST_IDENTITY,),
+        )
+
+    assert attempted_sources == [root.path, base, first_dependency.path]
+    assert later_dependency not in attempted_sources
+    assert all(not path.exists() and not path.parent.exists() for path in retained_snapshot_paths)
+
+
+def test_clean_verifier_removes_snapshots_when_environment_setup_fails(
+    tmp_path,
+    monkeypatch,
+    synthetic_descriptor_factory,
+):
+    root = _build_sample_wheel(tmp_path)
+    base = _write_minimal_base_wheel(tmp_path)
+    recorded_snapshots: list[Path] = []
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
+
+    @contextmanager
+    def record_snapshot(path, **kwargs):
+        with snapshot_archive(path, **kwargs) as snapshot:
+            recorded_snapshots.append(snapshot.path)
+            yield snapshot
+
+    def fail_environment_setup(*_args, **_kwargs):
+        raise RuntimeError("environment setup failed")
+
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", record_snapshot)
+    monkeypatch.setattr(verify_extension_wheel_module, "_run", fail_environment_setup)
+
+    with pytest.raises(RuntimeError, match="environment setup failed"):
+        verify_extension_wheel(
+            base_wheel=base,
+            extension_wheel=root.path,
+            extension_name="sample",
+            trust_identity=TEST_TRUST_IDENTITY,
+        )
+
+    assert len(recorded_snapshots) == 2
+    assert all(not path.exists() and not path.parent.exists() for path in recorded_snapshots)
+
+
 def test_platform_wheel_rejects_an_artifact_changed_after_descriptor_creation(tmp_path, monkeypatch):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
 
@@ -4586,12 +4785,9 @@ def test_platform_wheel_rejects_oversized_decompressed_dependency_before_reading
         license_files=[REPOSITORY_ROOT / "LICENSE"],
     )
     root_artifact = _write_artifact(tmp_path / "sample.duckdb_extension", b"root")
-    read_member = extension_wheel_module.zipfile.ZipFile.read
 
     def require_size_check_before_read(wheel, *args, **kwargs):
-        if Path(wheel.filename) == dependency.path:
-            raise AssertionError("oversized dependency member was read before validation")
-        return read_member(wheel, *args, **kwargs)
+        raise AssertionError("oversized dependency member was read before validation")
 
     monkeypatch.setattr(
         extension_wheel_module,
@@ -4635,6 +4831,42 @@ def test_platform_wheel_rejects_too_many_dependency_members_before_opening_the_w
 
     with pytest.raises(ValueError, match="dependency extension wheel contains more than 1 archive members"):
         _build_sample_wheel(tmp_path, output_name="root-dist", dependencies=(dependency.path,))
+
+
+def test_platform_wheel_dependency_preflight_and_parser_use_the_same_snapshot(
+    tmp_path,
+    synthetic_descriptor_factory,
+    monkeypatch,
+):
+    dependency = build_extension_wheel(
+        artifact=_write_artifact(tmp_path / "dependency.duckdb_extension", b"dependency"),
+        extension_name="dependency",
+        output_directory=tmp_path / "dependency-dist",
+        platform_tag=_wheel_platform_tag(),
+        trust_identity=TEST_TRUST_IDENTITY,
+        license_expression="Apache-2.0",
+        license_files=[REPOSITORY_ROOT / "LICENSE"],
+    )
+    validate_snapshot = archive_safety_module.validate_zip_member_count
+    replacement = dependency.path.with_name(f"replacement-{dependency.path.name}")
+    replacement.write_bytes(b"replacement after preflight")
+    replaced = False
+
+    def validate_then_replace(*args, **kwargs):
+        nonlocal replaced
+        member_count = validate_snapshot(*args, **kwargs)
+        if kwargs["description"] == "dependency extension wheel" and not replaced:
+            replacement.replace(dependency.path)
+            replaced = True
+        return member_count
+
+    monkeypatch.setattr(archive_safety_module, "validate_zip_member_count", validate_then_replace)
+
+    built = _build_sample_wheel(tmp_path, output_name="root-dist", dependencies=(dependency.path,))
+
+    assert built.path.is_file()
+    assert replaced
+    assert dependency.path.read_bytes() == b"replacement after preflight"
 
 
 def test_platform_wheel_bounds_dependency_wheel_count_before_reading_wheels(
@@ -4689,7 +4921,8 @@ def test_platform_wheel_bounds_dependency_descriptor_before_json_parsing(
     read_member = extension_wheel_module.zipfile.ZipFile.read
 
     def reject_whole_descriptor_read(wheel, member, *args, **kwargs):
-        if Path(wheel.filename) == tampered_dependency and member == descriptor_member:
+        member_name = member.filename if isinstance(member, zipfile.ZipInfo) else member
+        if member_name == descriptor_member:
             raise AssertionError("oversized dependency descriptor was whole-read before its byte bound")
         return read_member(wheel, member, *args, **kwargs)
 
@@ -4793,7 +5026,16 @@ def test_clean_verifier_rejects_an_oversized_extension_wheel(
     monkeypatch,
 ):
     built = _build_sample_wheel(tmp_path)
-    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_BYTES", 0)
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
+
+    @contextmanager
+    def reject_extension(path, **kwargs):
+        if kwargs["description"] == "extension wheel":
+            raise ValueError("extension wheel exceeds the project's 100 MiB publication limit")
+        with snapshot_archive(path, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_extension)
 
     with pytest.raises(RuntimeError, match="100 MiB publication limit"):
         verify_extension_wheel(
@@ -4856,7 +5098,8 @@ def test_clean_verifier_bounds_descriptor_before_json_parsing(
     read_member = verify_extension_wheel_module.zipfile.ZipFile.read
 
     def reject_whole_descriptor_read(wheel, member, *args, **kwargs):
-        if Path(wheel.filename) == tampered_wheel and member == descriptor_member:
+        member_name = member.filename if isinstance(member, zipfile.ZipInfo) else member
+        if member_name == descriptor_member:
             raise AssertionError("oversized root descriptor was whole-read before its byte bound")
         return read_member(wheel, member, *args, **kwargs)
 
@@ -4894,21 +5137,16 @@ def test_clean_verifier_rejects_an_oversized_base_wheel_before_opening_it(
 ):
     root = _build_sample_wheel(tmp_path)
     base_wheel = _write_minimal_base_wheel(tmp_path)
-    validate_size = verify_extension_wheel_module._validate_extension_wheel_size
-    open_wheel = verify_extension_wheel_module.zipfile.ZipFile
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
 
-    def reject_base(path, *, description="extension wheel"):
-        if Path(path) == base_wheel:
+    @contextmanager
+    def reject_base(path, **kwargs):
+        if kwargs["description"] == "base Vane wheel":
             raise ValueError("base Vane wheel exceeds the project's 100 MiB publication limit")
-        validate_size(path, description=description)
+        with snapshot_archive(path, **kwargs) as snapshot:
+            yield snapshot
 
-    def require_size_check_before_open(path, *args, **kwargs):
-        if Path(path) == base_wheel:
-            raise AssertionError("oversized base wheel was opened before validation")
-        return open_wheel(path, *args, **kwargs)
-
-    monkeypatch.setattr(verify_extension_wheel_module, "_validate_extension_wheel_size", reject_base)
-    monkeypatch.setattr(verify_extension_wheel_module.zipfile, "ZipFile", require_size_check_before_open)
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_base)
 
     with pytest.raises(RuntimeError, match="base Vane wheel exceeds.*100 MiB publication limit"):
         verify_extension_wheel(
@@ -4934,21 +5172,16 @@ def test_clean_verifier_rejects_an_oversized_dependency_before_opening_it(
         license_expression="Apache-2.0",
         license_files=[REPOSITORY_ROOT / "LICENSE"],
     )
-    validate_size = verify_extension_wheel_module._validate_extension_wheel_size
-    open_wheel = verify_extension_wheel_module.zipfile.ZipFile
+    snapshot_archive = verify_extension_wheel_module.snapshot_archive
 
-    def reject_dependency(path, *, description="extension wheel"):
-        if Path(path) == dependency.path:
-            raise ValueError("extension wheel exceeds the project's 100 MiB publication limit")
-        validate_size(path, description=description)
+    @contextmanager
+    def reject_dependency(path, **kwargs):
+        if kwargs["description"] == "dependency extension wheel":
+            raise ValueError("dependency extension wheel exceeds the project's 100 MiB publication limit")
+        with snapshot_archive(path, **kwargs) as snapshot:
+            yield snapshot
 
-    def require_size_check_before_open(path, *args, **kwargs):
-        if Path(path) == dependency.path:
-            raise AssertionError("oversized dependency wheel was opened before validation")
-        return open_wheel(path, *args, **kwargs)
-
-    monkeypatch.setattr(verify_extension_wheel_module, "_validate_extension_wheel_size", reject_dependency)
-    monkeypatch.setattr(verify_extension_wheel_module.zipfile, "ZipFile", require_size_check_before_open)
+    monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_dependency)
 
     with pytest.raises(RuntimeError, match="100 MiB publication limit"):
         verify_extension_wheel(

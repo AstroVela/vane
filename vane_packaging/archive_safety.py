@@ -10,10 +10,14 @@ import os
 import stat
 import struct
 import tarfile
+import tempfile
+import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 _END_OF_CENTRAL_DIRECTORY = struct.Struct("<4s4H2LH")
 _CENTRAL_DIRECTORY_HEADER = struct.Struct("<4s6H3L5H2L")
@@ -32,36 +36,197 @@ _PAX_HEADER_TYPES = frozenset({tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS
 _GNU_LONG_HEADER_TYPES = frozenset({tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK})
 _REGULAR_TAR_MEMBER_TYPES = frozenset({tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE})
 _ALLOWED_TAR_MEMBER_TYPES = _REGULAR_TAR_MEMBER_TYPES | {tarfile.DIRTYPE}
+_ARCHIVE_SNAPSHOT_CHUNK_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ArchiveSnapshot:
+    """One private, bounded copy of an untrusted archive input."""
+
+    source_path: Path
+    path: Path
+    size: int
+    file: BinaryIO = field(repr=False, compare=False)
+
+    def validate_named_path(self, *, description: str) -> None:
+        """Require the private path to still name the retained snapshot file."""
+        try:
+            path_metadata = self.path.lstat()
+            file_metadata = os.fstat(self.file.fileno())
+        except OSError as exception:
+            raise ValueError(
+                f"private {description} snapshot is no longer available: {self.source_path}"
+            ) from exception
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or path_metadata.st_nlink != 1
+            or path_metadata.st_size != self.size
+            or not os.path.samestat(path_metadata, file_metadata)
+        ):
+            raise ValueError(f"private {description} snapshot changed after validation: {self.source_path}")
+
+
+@contextmanager
+def snapshot_archive(
+    path: str | Path,
+    *,
+    max_bytes: int,
+    description: str,
+    size_limit_description: str,
+) -> Iterator[ArchiveSnapshot]:
+    """Copy one regular input into a private file that outlives all readers."""
+    archive_path = Path(path)
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+
+    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+    snapshot_file: BinaryIO | None = None
+    try:
+        source_path_metadata = archive_path.lstat()
+        if not stat.S_ISREG(source_path_metadata.st_mode):
+            raise ValueError(f"{description} must be a regular file: {archive_path}")
+        source_flags = os.O_RDONLY
+        for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NONBLOCK", "O_NOFOLLOW"):
+            source_flags |= getattr(os, flag_name, 0)
+        source_descriptor = os.open(archive_path, source_flags)
+        with _binary_file_from_descriptor(source_descriptor, "rb") as source_file:
+            metadata = os.fstat(source_file.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or not os.path.samestat(source_path_metadata, metadata):
+                raise ValueError(f"{description} must be a regular file: {archive_path}")
+            if metadata.st_size > max_bytes:
+                raise ValueError(f"{archive_path}: {description} exceeds {size_limit_description}")
+
+            temporary_directory = tempfile.TemporaryDirectory(prefix="vane-archive-snapshot-")
+            snapshot_directory = Path(temporary_directory.name)
+            snapshot_directory_metadata = snapshot_directory.lstat()
+            if not stat.S_ISDIR(snapshot_directory_metadata.st_mode) or (
+                os.name != "nt" and stat.S_IMODE(snapshot_directory_metadata.st_mode) & 0o077
+            ):
+                raise ValueError(f"could not create a private snapshot directory for {description}: {archive_path}")
+            snapshot_path = snapshot_directory / archive_path.name
+            destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            for flag_name in ("O_BINARY", "O_CLOEXEC"):
+                destination_flags |= getattr(os, flag_name, 0)
+            destination_descriptor = os.open(snapshot_path, destination_flags, 0o600)
+            with _binary_file_from_descriptor(destination_descriptor, "wb") as destination_file:
+                snapshot_size = _copy_archive_snapshot(
+                    source_file,
+                    destination_file,
+                    archive_path=archive_path,
+                    max_bytes=max_bytes,
+                    description=description,
+                    size_limit_description=size_limit_description,
+                )
+                destination_file.flush()
+                if os.name != "nt":
+                    os.fchmod(destination_file.fileno(), 0o400)
+                written_snapshot_metadata = os.fstat(destination_file.fileno())
+
+        snapshot_file = _binary_file_from_descriptor(os.open(snapshot_path, source_flags), "rb")
+        snapshot_metadata = snapshot_path.lstat()
+        retained_snapshot_metadata = os.fstat(snapshot_file.fileno())
+        if (
+            not stat.S_ISREG(snapshot_metadata.st_mode)
+            or not stat.S_ISREG(retained_snapshot_metadata.st_mode)
+            or snapshot_metadata.st_nlink != 1
+            or snapshot_metadata.st_size != snapshot_size
+            or retained_snapshot_metadata.st_size != snapshot_size
+            or not os.path.samestat(written_snapshot_metadata, retained_snapshot_metadata)
+            or not os.path.samestat(snapshot_metadata, retained_snapshot_metadata)
+            or (os.name != "nt" and stat.S_IMODE(retained_snapshot_metadata.st_mode) != 0o400)
+        ):
+            raise ValueError(f"could not create a private regular snapshot for {description}: {archive_path}")
+        snapshot = ArchiveSnapshot(
+            source_path=archive_path,
+            path=snapshot_path,
+            size=snapshot_size,
+            file=snapshot_file,
+        )
+    except OSError as exception:
+        try:
+            if snapshot_file is not None:
+                snapshot_file.close()
+        finally:
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+        raise ValueError(f"could not snapshot {description}: {archive_path}") from exception
+    except BaseException:
+        try:
+            if snapshot_file is not None:
+                snapshot_file.close()
+        finally:
+            if temporary_directory is not None:
+                temporary_directory.cleanup()
+        raise
+
+    try:
+        yield snapshot
+    finally:
+        if temporary_directory is None:  # pragma: no cover - assigned before every successful yield
+            raise RuntimeError("archive snapshot lost its temporary-directory owner")
+        try:
+            snapshot.file.close()
+        finally:
+            temporary_directory.cleanup()
+
+
+def _binary_file_from_descriptor(descriptor: int, mode: str) -> BinaryIO:
+    try:
+        return cast(BinaryIO, os.fdopen(descriptor, mode))
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_archive_snapshot(
+    source_file: BinaryIO,
+    destination_file: BinaryIO,
+    *,
+    archive_path: Path,
+    max_bytes: int,
+    description: str,
+    size_limit_description: str,
+) -> int:
+    copied_bytes = 0
+    while True:
+        remaining_with_overflow = max_bytes - copied_bytes + 1
+        chunk = source_file.read(min(_ARCHIVE_SNAPSHOT_CHUNK_BYTES, remaining_with_overflow))
+        if not chunk:
+            return copied_bytes
+        copied_bytes += len(chunk)
+        if copied_bytes > max_bytes:
+            raise ValueError(f"{archive_path}: {description} exceeds {size_limit_description}")
+        destination_file.write(chunk)
 
 
 def validate_zip_member_count(
-    path: str | Path,
+    archive_file: BinaryIO,
     *,
+    archive_path: str | Path,
+    file_size: int,
     max_members: int,
     description: str,
 ) -> int:
     """Validate and count central-directory entries without creating ``ZipInfo`` objects."""
-    archive_path = Path(path)
+    archive_path = Path(archive_path)
     if max_members < 0:
         raise ValueError("max_members must be non-negative")
     try:
-        with archive_path.open("rb") as archive_file:
-            metadata = os.fstat(archive_file.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(f"{description} must be a regular file: {archive_path}")
-            return _validate_zip_central_directory(
-                archive_file,
-                file_size=metadata.st_size,
-                max_members=max_members,
-                description=description,
-            )
+        archive_file.seek(0)
+        return _validate_zip_central_directory(
+            archive_file,
+            file_size=file_size,
+            max_members=max_members,
+            description=description,
+        )
     except OSError as exception:
         raise ValueError(f"could not inspect {description}: {archive_path}") from exception
 
 
 def validate_tar_member_count(
-    path: str | Path,
+    archive_file: BinaryIO,
     *,
+    archive_path: str | Path,
     max_members: int,
     max_member_bytes: int,
     max_total_bytes: int,
@@ -75,40 +240,85 @@ def validate_tar_member_count(
     payload chunks. Its second argument is true when a header starts a new,
     physically contiguous metadata region.
     """
-    archive_path = Path(path)
+    archive_path = Path(archive_path)
     if max_members < 0 or max_member_bytes < 0 or max_total_bytes < 0:
         raise ValueError("TAR member and size limits must be non-negative")
     try:
-        with archive_path.open("rb") as archive_file:
-            metadata = os.fstat(archive_file.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(f"{description} must be a regular file: {archive_path}")
-            magic = archive_file.read(2)
-            archive_file.seek(0)
-            if magic == b"\x1f\x8b":
-                with gzip.GzipFile(fileobj=archive_file, mode="rb") as tar_stream:
-                    return _validate_tar_stream(
-                        tar_stream,
-                        archive_path=archive_path,
-                        max_members=max_members,
-                        max_member_bytes=max_member_bytes,
-                        max_total_bytes=max_total_bytes,
-                        uncompressed_limit_description=uncompressed_limit_description,
-                        description=description,
-                        metadata_chunk_callback=metadata_chunk_callback,
-                    )
-            return _validate_tar_stream(
-                archive_file,
-                archive_path=archive_path,
-                max_members=max_members,
-                max_member_bytes=max_member_bytes,
-                max_total_bytes=max_total_bytes,
-                uncompressed_limit_description=uncompressed_limit_description,
-                description=description,
-                metadata_chunk_callback=metadata_chunk_callback,
-            )
+        archive_file.seek(0)
+        magic = archive_file.read(2)
+        archive_file.seek(0)
+        if magic == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=archive_file, mode="rb") as tar_stream:
+                return _validate_tar_stream(
+                    tar_stream,
+                    archive_path=archive_path,
+                    max_members=max_members,
+                    max_member_bytes=max_member_bytes,
+                    max_total_bytes=max_total_bytes,
+                    uncompressed_limit_description=uncompressed_limit_description,
+                    description=description,
+                    metadata_chunk_callback=metadata_chunk_callback,
+                )
+        return _validate_tar_stream(
+            archive_file,
+            archive_path=archive_path,
+            max_members=max_members,
+            max_member_bytes=max_member_bytes,
+            max_total_bytes=max_total_bytes,
+            uncompressed_limit_description=uncompressed_limit_description,
+            description=description,
+            metadata_chunk_callback=metadata_chunk_callback,
+        )
     except (EOFError, OSError, tarfile.TarError, zlib.error) as exception:
         raise ValueError(f"could not inspect {description}: {archive_path}") from exception
+
+
+@contextmanager
+def open_zip_snapshot(
+    snapshot: ArchiveSnapshot,
+    *,
+    max_members: int,
+    description: str,
+) -> Iterator[zipfile.ZipFile]:
+    """Preflight and parse one ZIP from the same snapshotted file descriptor."""
+    validate_zip_member_count(
+        snapshot.file,
+        archive_path=snapshot.source_path,
+        file_size=snapshot.size,
+        max_members=max_members,
+        description=description,
+    )
+    snapshot.file.seek(0)
+    with zipfile.ZipFile(snapshot.file) as archive:
+        yield archive
+
+
+@contextmanager
+def open_tar_snapshot(
+    snapshot: ArchiveSnapshot,
+    *,
+    max_members: int,
+    max_member_bytes: int,
+    max_total_bytes: int,
+    uncompressed_limit_description: str,
+    description: str,
+    metadata_chunk_callback: Callable[[bytes, bool], None] | None = None,
+    mode: str = "r:*",
+) -> Iterator[tarfile.TarFile]:
+    """Preflight and parse one TAR from the same snapshotted file descriptor."""
+    validate_tar_member_count(
+        snapshot.file,
+        archive_path=snapshot.source_path,
+        max_members=max_members,
+        max_member_bytes=max_member_bytes,
+        max_total_bytes=max_total_bytes,
+        uncompressed_limit_description=uncompressed_limit_description,
+        description=description,
+        metadata_chunk_callback=metadata_chunk_callback,
+    )
+    snapshot.file.seek(0)
+    with tarfile.open(fileobj=snapshot.file, mode=mode) as archive:
+        yield archive
 
 
 def _validate_tar_stream(
@@ -424,4 +634,11 @@ def _read_exact(archive_file: BinaryIO, size: int, *, description: str) -> bytes
     return contents
 
 
-__all__ = ["validate_tar_member_count", "validate_zip_member_count"]
+__all__ = [
+    "ArchiveSnapshot",
+    "open_tar_snapshot",
+    "open_zip_snapshot",
+    "snapshot_archive",
+    "validate_tar_member_count",
+    "validate_zip_member_count",
+]

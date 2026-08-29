@@ -5,6 +5,7 @@ import base64
 import gzip
 import io
 import json
+import os
 import secrets
 import string
 import subprocess
@@ -13,6 +14,7 @@ import tarfile
 import traceback
 import zipfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from email.message import Message
 from pathlib import Path
 
@@ -103,6 +105,20 @@ def _write_archive_members(path: Path, members: dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         for member_name, data in members.items():
             archive.writestr(member_name, data)
+
+
+def _validate_tar_member_count(path: Path, **kwargs) -> int:
+    with archive_safety.snapshot_archive(
+        path,
+        max_bytes=100 * 1024 * 1024,
+        description="sdist",
+        size_limit_description="the test archive limit",
+    ) as snapshot:
+        return archive_safety.validate_tar_member_count(
+            snapshot.file,
+            archive_path=path,
+            **kwargs,
+        )
 
 
 def _pax_record(key: bytes, value: bytes) -> bytes:
@@ -654,7 +670,7 @@ def test_content_scan_validates_raw_wheel_directory_before_constructing_zip_read
         raise AssertionError("wheel ZIP reader was constructed before its member-count preflight")
 
     monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_MEMBERS", member_limit)
-    monkeypatch.setattr(check_release_artifacts.zipfile, "ZipFile", reject_zip_reader_construction)
+    monkeypatch.setattr(archive_safety.zipfile, "ZipFile", reject_zip_reader_construction)
 
     with pytest.raises(ValueError, match=expected_message):
         check_release_artifacts.check_artifact_contents(artifact)
@@ -674,10 +690,233 @@ def test_content_scan_bounds_sdist_members_before_materializing_tar_metadata(tmp
         raise AssertionError("sdist members were materialized before their streaming count preflight")
 
     monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_MEMBERS", 1)
-    monkeypatch.setattr(check_release_artifacts.tarfile.TarFile, "getmembers", reject_member_materialization)
+    monkeypatch.setattr(archive_safety.tarfile.TarFile, "getmembers", reject_member_materialization)
 
     with pytest.raises(ValueError, match="sdist contains more than 1 archive members"):
         check_release_artifacts.check_artifact_contents(artifact)
+
+
+def test_archive_snapshot_is_private_read_only_and_removed(tmp_path):
+    artifact = tmp_path / "artifact.whl"
+    artifact.write_bytes(b"bounded snapshot")
+
+    with archive_safety.snapshot_archive(
+        artifact,
+        max_bytes=len(b"bounded snapshot"),
+        description="artifact",
+        size_limit_description="the test limit",
+    ) as snapshot:
+        snapshot_path = snapshot.path
+        snapshot_directory = snapshot_path.parent
+        snapshot_file = snapshot.file
+        assert snapshot.source_path == artifact
+        assert snapshot_path.name == artifact.name
+        assert snapshot_path.read_bytes() == b"bounded snapshot"
+        if os.name != "nt":
+            assert snapshot_path.stat().st_mode & 0o777 == 0o400
+            assert snapshot_directory.stat().st_mode & 0o077 == 0
+
+    assert snapshot_file.closed
+    assert not snapshot_path.exists()
+    assert not snapshot_directory.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows rejects replacing an open snapshot file")
+def test_archive_snapshot_detects_replacement_of_its_private_named_path(tmp_path):
+    artifact = tmp_path / "artifact.whl"
+    artifact.write_bytes(b"bounded snapshot")
+
+    with archive_safety.snapshot_archive(
+        artifact,
+        max_bytes=len(b"bounded snapshot"),
+        description="artifact",
+        size_limit_description="the test limit",
+    ) as snapshot:
+        replacement = snapshot.path.with_name("replacement")
+        replacement.write_bytes(b"bounded snapshot")
+        replacement.replace(snapshot.path)
+
+        with pytest.raises(ValueError, match="private artifact snapshot changed after validation"):
+            snapshot.validate_named_path(description="artifact")
+        snapshot.file.seek(0)
+        assert snapshot.file.read() == b"bounded snapshot"
+
+
+def test_archive_snapshot_rejects_non_regular_inputs_before_allocating_storage(tmp_path, monkeypatch):
+    def reject_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("non-regular input reached snapshot allocation")
+
+    monkeypatch.setattr(archive_safety.tempfile, "TemporaryDirectory", reject_temporary_directory)
+    with pytest.raises(ValueError, match="(?:must be a regular file|could not snapshot artifact)"):
+        with archive_safety.snapshot_archive(
+            tmp_path,
+            max_bytes=1024,
+            description="artifact",
+            size_limit_description="the test limit",
+        ):
+            pass
+
+
+def test_archive_snapshot_rejects_oversized_inputs_before_allocating_storage(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.whl"
+    artifact.write_bytes(b"too large")
+
+    def reject_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("oversized input reached snapshot allocation")
+
+    monkeypatch.setattr(archive_safety.tempfile, "TemporaryDirectory", reject_temporary_directory)
+    with pytest.raises(ValueError, match="artifact exceeds the test limit"):
+        with archive_safety.snapshot_archive(
+            artifact,
+            max_bytes=len(b"too large") - 1,
+            description="artifact",
+            size_limit_description="the test limit",
+        ):
+            pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symbolic-link creation is not generally available on Windows")
+def test_archive_snapshot_rejects_symbolic_links_before_allocating_storage(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.whl"
+    artifact.write_bytes(b"archive")
+    link = tmp_path / "linked.whl"
+    link.symlink_to(artifact)
+
+    def reject_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("symbolic-link input reached snapshot allocation")
+
+    monkeypatch.setattr(archive_safety.tempfile, "TemporaryDirectory", reject_temporary_directory)
+    with pytest.raises(ValueError, match="must be a regular file"):
+        with archive_safety.snapshot_archive(
+            link,
+            max_bytes=1024,
+            description="artifact",
+            size_limit_description="the test limit",
+        ):
+            pass
+
+
+@pytest.mark.skipif(os.name == "nt", reason="named pipes are POSIX filesystem objects")
+def test_archive_snapshot_rejects_named_pipes_before_allocating_storage(tmp_path, monkeypatch):
+    pipe = tmp_path / "artifact.whl"
+    os.mkfifo(pipe)
+
+    def reject_temporary_directory(*_args, **_kwargs):
+        raise AssertionError("named-pipe input reached snapshot allocation")
+
+    monkeypatch.setattr(archive_safety.tempfile, "TemporaryDirectory", reject_temporary_directory)
+    with pytest.raises(ValueError, match="must be a regular file"):
+        with archive_safety.snapshot_archive(
+            pipe,
+            max_bytes=1024,
+            description="artifact",
+            size_limit_description="the test limit",
+        ):
+            pass
+
+
+@pytest.mark.parametrize("suffix", [".whl", ".tar.gz"], ids=["zip", "compressed-tar"])
+def test_release_preflight_and_parser_use_the_same_snapshot(tmp_path, monkeypatch, suffix):
+    artifact = _artifact_path(tmp_path, suffix, "original")
+    replacement = _artifact_path(tmp_path, suffix, "replacement")
+    original_member = "project/original"
+    _write_archive(artifact, original_member, b"original")
+    _write_archive_members(
+        replacement,
+        {
+            "project/replacement-one": b"replacement",
+            "project/replacement-two": b"replacement",
+        },
+    )
+    validator_name = "validate_tar_member_count" if suffix == ".tar.gz" else "validate_zip_member_count"
+    validate_snapshot = getattr(archive_safety, validator_name)
+    replaced = False
+
+    def validate_then_replace(*args, **kwargs):
+        nonlocal replaced
+        member_count = validate_snapshot(*args, **kwargs)
+        if not replaced:
+            replacement.replace(artifact)
+            replaced = True
+        return member_count
+
+    monkeypatch.setattr(archive_safety, validator_name, validate_then_replace)
+    monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_MEMBERS", 1)
+    artifact_type = (
+        check_release_artifacts.SdistArtifact if suffix == ".tar.gz" else check_release_artifacts.WheelArtifact
+    )
+
+    inspected = artifact_type(artifact)
+    try:
+        assert inspected.names() == [original_member]
+        assert inspected.read(original_member) == b"original"
+    finally:
+        inspected.close()
+    assert replaced
+
+
+def test_uncompressed_tar_preflight_and_parser_use_the_same_snapshot(tmp_path, monkeypatch):
+    artifact = tmp_path / "original.tar"
+    replacement = tmp_path / "replacement.tar"
+    with tarfile.open(artifact, mode="w:") as archive:
+        member = tarfile.TarInfo("project/original")
+        member.size = len(b"original")
+        archive.addfile(member, io.BytesIO(b"original"))
+    with tarfile.open(replacement, mode="w:") as archive:
+        for name in ("project/replacement-one", "project/replacement-two"):
+            member = tarfile.TarInfo(name)
+            archive.addfile(member, io.BytesIO())
+
+    validate_snapshot = archive_safety.validate_tar_member_count
+
+    def validate_then_replace(*args, **kwargs):
+        member_count = validate_snapshot(*args, **kwargs)
+        replacement.replace(artifact)
+        return member_count
+
+    monkeypatch.setattr(archive_safety, "validate_tar_member_count", validate_then_replace)
+    with archive_safety.snapshot_archive(
+        artifact,
+        max_bytes=1024 * 1024,
+        description="test TAR",
+        size_limit_description="the test limit",
+    ) as snapshot:
+        with archive_safety.open_tar_snapshot(
+            snapshot,
+            max_members=1,
+            max_member_bytes=1024,
+            max_total_bytes=1024,
+            uncompressed_limit_description="the test limit",
+            description="test TAR",
+        ) as archive:
+            members = archive.getmembers()
+            assert [member.name for member in members] == ["project/original"]
+            assert archive.extractfile(members[0]).read() == b"original"
+
+
+def test_failed_archive_construction_removes_its_snapshot(tmp_path, monkeypatch):
+    artifact = _artifact_path(tmp_path, ".whl", "cleanup")
+    _write_archive(artifact, "project/member", b"content")
+    snapshot_paths: list[Path] = []
+    snapshot_files = []
+    snapshot_archive = check_release_artifacts.snapshot_archive
+
+    @contextmanager
+    def record_snapshot(*args, **kwargs):
+        with snapshot_archive(*args, **kwargs) as snapshot:
+            snapshot_paths.append(snapshot.path)
+            snapshot_files.append(snapshot.file)
+            yield snapshot
+
+    monkeypatch.setattr(check_release_artifacts, "snapshot_archive", record_snapshot)
+    monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_MEMBERS", 0)
+    with pytest.raises(ValueError, match="wheel contains more than 0 archive members"):
+        check_release_artifacts.WheelArtifact(artifact)
+
+    assert len(snapshot_paths) == 1
+    assert snapshot_files[0].closed
+    assert not snapshot_paths[0].exists()
+    assert not snapshot_paths[0].parent.exists()
 
 
 def test_sdist_streaming_preflight_normalizes_corrupt_deflate_errors(tmp_path, monkeypatch):
@@ -697,7 +936,7 @@ def test_sdist_streaming_preflight_normalizes_corrupt_deflate_errors(tmp_path, m
     monkeypatch.setattr(archive_safety.gzip, "GzipFile", lambda **_kwargs: CorruptGzipStream())
 
     with pytest.raises(ValueError, match="could not inspect sdist"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -731,7 +970,7 @@ def test_sdist_streaming_preflight_rejects_oversized_header_before_advancing(
     monkeypatch.setattr(archive_safety, "_read_tar_payload", reject_payload_read)
 
     with pytest.raises(ValueError, match="archive member.*uncompressed test limit"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=512,
@@ -758,7 +997,7 @@ def test_sdist_streaming_preflight_bounds_extension_header_payloads(tmp_path, mo
     monkeypatch.setattr(archive_safety, "_read_tar_payload", reject_payload_read)
 
     with pytest.raises(ValueError, match="TAR extension header.*bounded 1 MiB metadata limit"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -782,7 +1021,7 @@ def test_sdist_streaming_preflight_rejects_gnu_sparse_before_special_parsing(tmp
     monkeypatch.setattr(archive_safety, "_read_tar_payload", reject_payload_read)
 
     with pytest.raises(ValueError, match="unsupported TAR member type"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -804,7 +1043,7 @@ def test_sdist_streaming_preflight_matches_tarfile_for_nonzero_directory_sizes(t
         compressed.write(b"\0" * (2 * tarfile.BLOCKSIZE))
 
     assert (
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -834,7 +1073,7 @@ def test_sdist_streaming_preflight_matches_tarfile_local_pax_size_precedence(tmp
         compressed.write(b"\0" * (2 * tarfile.BLOCKSIZE))
 
     assert (
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -857,7 +1096,7 @@ def test_sdist_streaming_preflight_rejects_ambiguous_global_pax_size(tmp_path):
         compressed.write(b"\0" * (2 * tarfile.BLOCKSIZE))
 
     with pytest.raises(ValueError, match="unsupported global PAX size override"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -875,7 +1114,7 @@ def test_sdist_streaming_preflight_rejects_a_concatenated_gzip_payload_after_the
     artifact.write_bytes(gzip.compress(first_stream) + gzip.compress(_runtime_sentinel()))
 
     with pytest.raises(ValueError, match="nonzero data after its TAR terminator"):
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,
@@ -897,7 +1136,7 @@ def test_sdist_streaming_preflight_accepts_bounded_zero_padding_after_the_termin
     artifact.write_bytes(gzip.compress(stream))
 
     assert (
-        archive_safety.validate_tar_member_count(
+        _validate_tar_member_count(
             artifact,
             max_members=10,
             max_member_bytes=2048,

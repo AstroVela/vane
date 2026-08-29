@@ -16,7 +16,8 @@ import sys
 import tempfile
 import textwrap
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
@@ -31,9 +32,12 @@ _ORIGINAL_SYS_PATH = sys.path.copy()
 try:
     sys.path.insert(0, str(REPOSITORY_ROOT))
     from scripts.check_release_artifacts import check_artifact as _check_release_artifact
+    from vane_packaging.archive_safety import ArchiveSnapshot, open_zip_snapshot, snapshot_archive
     from vane_packaging.extension_wheel import (
         _ELF_MAGIC,
         _MAX_EXTENSION_DESCRIPTOR_DEPENDENCIES,
+        _MAX_EXTENSION_WHEEL_BYTES,
+        _MAX_EXTENSION_WHEEL_MEMBERS,
         _PE_DOS_MAGIC,
         _PLATFORM_BUILD_DETAILS_FILENAME,
         ENTRY_POINT_GROUP,
@@ -52,8 +56,6 @@ try:
         _validate_dependency_platform_tag,
         _validate_exact_requirements,
         _validate_extension_wheel_archive_size,
-        _validate_extension_wheel_member_count,
-        _validate_extension_wheel_size,
         _validate_linux_elf_platform,
         _validate_macos_wheel_binary_platform,
         _validate_metadata_license_expression,
@@ -77,6 +79,8 @@ _EXTENSION_ARTIFACT_RE = re.compile(
     r"(?P<digest>[0-9a-f]{64})/(?P=name)\.duckdb_extension$"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MAX_CLEAN_VERIFICATION_SNAPSHOT_BYTES = 1024 * 1024 * 1024
+_CLEAN_VERIFICATION_SNAPSHOT_LIMIT_DESCRIPTION = "the clean verifier's aggregate 1 GiB snapshot limit"
 _GENERIC_LINUX_BASE_TAG_RE = re.compile(r"^linux_(?:x86_64|aarch64)$")
 _LEGACY_MANYLINUX_BASE_TAG_RE = re.compile(
     r"^(?P<policy>manylinux1|manylinux2010|manylinux2014)_(?P<architecture>x86_64|aarch64)$"
@@ -87,6 +91,24 @@ _LEGACY_MANYLINUX_MINIMUMS = {
     "manylinux2010": (2, 12),
     "manylinux2014": (2, 17),
 }
+
+
+@contextmanager
+def _wheel_snapshot(
+    wheel: Path | ArchiveSnapshot,
+    *,
+    description: str,
+) -> Iterator[ArchiveSnapshot]:
+    if isinstance(wheel, ArchiveSnapshot):
+        yield wheel
+        return
+    with snapshot_archive(
+        wheel,
+        max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
+        description=description,
+        size_limit_description="the project's 100 MiB publication limit",
+    ) as snapshot:
+        yield snapshot
 
 
 @dataclass(frozen=True)
@@ -200,17 +222,32 @@ def _base_windows_policy_tag(platform_tag: str) -> str | None:
 
 
 def _assert_base_wheel(
-    base_wheel: Path,
+    base_wheel: Path | ArchiveSnapshot,
     *,
     expected_vane_version: str,
     required_interpreter_tag: str,
     required_platform_tag: str,
 ) -> None:
     try:
-        _validate_extension_wheel_size(base_wheel, description="base Vane wheel")
-        _validate_extension_wheel_member_count(base_wheel, description="base Vane wheel")
+        with _wheel_snapshot(base_wheel, description="base Vane wheel") as snapshot:
+            _assert_base_wheel_snapshot(
+                snapshot,
+                expected_vane_version=expected_vane_version,
+                required_interpreter_tag=required_interpreter_tag,
+                required_platform_tag=required_platform_tag,
+            )
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
+
+
+def _assert_base_wheel_snapshot(
+    snapshot: ArchiveSnapshot,
+    *,
+    expected_vane_version: str,
+    required_interpreter_tag: str,
+    required_platform_tag: str,
+) -> None:
+    base_wheel = snapshot.source_path
     try:
         filename_name, filename_version, build_tag, filename_tags = parse_wheel_filename(base_wheel.name)
     except InvalidWheelFilename as exception:
@@ -271,7 +308,11 @@ def _assert_base_wheel(
     base_elf_members: tuple[tuple[str, bytes], ...] = ()
     base_macho_members: tuple[tuple[str, bytes], ...] = ()
     base_pe_members: tuple[tuple[str, bytes], ...] = ()
-    with zipfile.ZipFile(base_wheel) as wheel:
+    with open_zip_snapshot(
+        snapshot,
+        max_members=_MAX_EXTENSION_WHEEL_MEMBERS,
+        description="base Vane wheel",
+    ) as wheel:
         _assert_bounded_wheel_contents(wheel, description="base Vane wheel")
         names = wheel.namelist()
         artifacts = [name for name in names if name.casefold().endswith(".duckdb_extension")]
@@ -443,7 +484,7 @@ def _assert_base_wheel(
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
     try:
-        _check_release_artifact(base_wheel, expected_version=expected_vane_version)
+        _check_release_artifact(snapshot, expected_version=expected_vane_version)
     except (ValueError, zipfile.BadZipFile) as exception:
         raise RuntimeError(f"base Vane wheel failed release-artifact validation: {exception}") from exception
 
@@ -510,15 +551,29 @@ def _extension_wheel_tag(
     return filename_tag
 
 
-def _assert_extension_wheel_layout(extension_wheel: Path, extension_name: str) -> _ExtensionWheelLayout:
+def _assert_extension_wheel_layout(
+    extension_wheel: Path | ArchiveSnapshot,
+    extension_name: str,
+) -> _ExtensionWheelLayout:
     if _EXTENSION_NAME_RE.fullmatch(extension_name) is None:
         raise ValueError("extension_name must use wheel-safe lowercase ASCII snake_case with single underscores")
     try:
-        _validate_extension_wheel_size(extension_wheel)
-        _validate_extension_wheel_member_count(extension_wheel)
+        with _wheel_snapshot(extension_wheel, description="extension wheel") as snapshot:
+            return _assert_extension_wheel_snapshot_layout(snapshot, extension_name)
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
-    with zipfile.ZipFile(extension_wheel) as wheel:
+
+
+def _assert_extension_wheel_snapshot_layout(
+    snapshot: ArchiveSnapshot,
+    extension_name: str,
+) -> _ExtensionWheelLayout:
+    extension_wheel = snapshot.source_path
+    with open_zip_snapshot(
+        snapshot,
+        max_members=_MAX_EXTENSION_WHEEL_MEMBERS,
+        description="extension wheel",
+    ) as wheel:
         _assert_bounded_wheel_contents(wheel, description="extension wheel")
         names = wheel.namelist()
         try:
@@ -588,7 +643,8 @@ def _assert_extension_wheel_layout(extension_wheel: Path, extension_name: str) -
         _validate_artifact_platform_tag(artifact_platform, platform_tag)
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
-    with zipfile.ZipFile(extension_wheel) as wheel:
+    snapshot.file.seek(0)
+    with zipfile.ZipFile(snapshot.file) as wheel:
         _assert_bounded_wheel_contents(wheel, description="extension wheel")
         try:
             metadata = _read_core_metadata(
@@ -652,7 +708,8 @@ def _assert_extension_wheel_layout(extension_wheel: Path, extension_name: str) -
     expected_wheel_metadata = f"{distribution_root}.dist-info/WHEEL"
     expected_entry_points = f"{distribution_root}.dist-info/entry_points.txt"
     expected_record = f"{distribution_root}.dist-info/RECORD"
-    with zipfile.ZipFile(extension_wheel) as wheel:
+    snapshot.file.seek(0)
+    with zipfile.ZipFile(snapshot.file) as wheel:
         _assert_bounded_wheel_contents(wheel, description="extension wheel")
         if wheel.read(expected_wheel_metadata) != _wheel_metadata(str(filename_tag)).encode("utf-8"):
             raise RuntimeError("extension wheel must contain its exact generated WHEEL metadata")
@@ -736,13 +793,20 @@ def _assert_extension_requirements(
         raise RuntimeError(str(exception)) from exception
 
 
-def _extension_name_from_artifact_path(extension_wheel: Path) -> str:
+def _extension_name_from_artifact_path(extension_wheel: Path | ArchiveSnapshot) -> str:
     try:
-        _validate_extension_wheel_size(extension_wheel, description="dependency extension wheel")
-        _validate_extension_wheel_member_count(extension_wheel, description="dependency extension wheel")
+        with _wheel_snapshot(extension_wheel, description="dependency extension wheel") as snapshot:
+            return _extension_name_from_snapshot_artifact_path(snapshot)
     except ValueError as exception:
         raise RuntimeError(str(exception)) from exception
-    with zipfile.ZipFile(extension_wheel) as wheel:
+
+
+def _extension_name_from_snapshot_artifact_path(snapshot: ArchiveSnapshot) -> str:
+    with open_zip_snapshot(
+        snapshot,
+        max_members=_MAX_EXTENSION_WHEEL_MEMBERS,
+        description="dependency extension wheel",
+    ) as wheel:
         _assert_bounded_wheel_contents(wheel, description="dependency extension wheel")
         artifacts = [name for name in wheel.namelist() if name.casefold().endswith(".duckdb_extension")]
     if len(artifacts) != 1:
@@ -753,9 +817,13 @@ def _extension_name_from_artifact_path(extension_wheel: Path) -> str:
     return match["name"]
 
 
-def _extension_name_from_wheel(extension_wheel: Path) -> str:
-    extension_name = _extension_name_from_artifact_path(extension_wheel)
-    return _assert_extension_wheel_layout(extension_wheel, extension_name).name
+def _extension_name_from_wheel(extension_wheel: Path | ArchiveSnapshot) -> str:
+    try:
+        with _wheel_snapshot(extension_wheel, description="dependency extension wheel") as snapshot:
+            extension_name = _extension_name_from_artifact_path(snapshot)
+            return _assert_extension_wheel_layout(snapshot, extension_name).name
+    except ValueError as exception:
+        raise RuntimeError(str(exception)) from exception
 
 
 def _explicit_dependency_trust_identities(
@@ -798,6 +866,30 @@ def _assert_musl_verification_runtime(layout: _ExtensionWheelLayout) -> None:
         )
 
 
+def _enter_verification_snapshot(
+    snapshot_stack: ExitStack,
+    wheel: Path,
+    *,
+    description: str,
+    remaining_bytes: int,
+) -> tuple[ArchiveSnapshot, int]:
+    max_bytes = min(_MAX_EXTENSION_WHEEL_BYTES, remaining_bytes)
+    size_limit_description = (
+        "the project's 100 MiB publication limit"
+        if max_bytes == _MAX_EXTENSION_WHEEL_BYTES
+        else _CLEAN_VERIFICATION_SNAPSHOT_LIMIT_DESCRIPTION
+    )
+    snapshot = snapshot_stack.enter_context(
+        snapshot_archive(
+            wheel,
+            max_bytes=max_bytes,
+            description=description,
+            size_limit_description=size_limit_description,
+        )
+    )
+    return snapshot, remaining_bytes - snapshot.size
+
+
 def verify_extension_wheel(
     *,
     base_wheel: str | Path,
@@ -826,25 +918,82 @@ def verify_extension_wheel(
     resolved_dependency_wheels = tuple(
         Path(dependency_wheel).expanduser().resolve(strict=True) for dependency_wheel in unresolved_dependency_wheels
     )
-    root_layout = _assert_extension_wheel_layout(resolved_extension_wheel, extension_name)
-    if root_layout.trust_identity != trust_identity:
-        raise RuntimeError(
-            f"root extension trust identity must be {trust_identity!r}, not {root_layout.trust_identity!r}"
-        )
-    dependency_layouts = tuple(
-        _assert_extension_wheel_layout(wheel, _extension_name_from_artifact_path(wheel))
-        for wheel in resolved_dependency_wheels
-    )
+    try:
+        with ExitStack() as snapshot_stack:
+            remaining_snapshot_bytes = _MAX_CLEAN_VERIFICATION_SNAPSHOT_BYTES
+            root_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
+                snapshot_stack,
+                resolved_extension_wheel,
+                description="extension wheel",
+                remaining_bytes=remaining_snapshot_bytes,
+            )
+            root_layout = _assert_extension_wheel_layout(root_snapshot, extension_name)
+            if root_layout.trust_identity != trust_identity:
+                raise RuntimeError(
+                    f"root extension trust identity must be {trust_identity!r}, not {root_layout.trust_identity!r}"
+                )
+            _assert_musl_verification_runtime(root_layout)
+
+            base_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
+                snapshot_stack,
+                resolved_base_wheel,
+                description="base Vane wheel",
+                remaining_bytes=remaining_snapshot_bytes,
+            )
+            _assert_base_wheel(
+                base_snapshot,
+                expected_vane_version=root_layout.vane_version,
+                required_interpreter_tag=root_layout.interpreter_tag,
+                required_platform_tag=root_layout.platform_tag,
+            )
+
+            dependency_snapshots = []
+            dependency_layouts = []
+            for dependency_wheel in resolved_dependency_wheels:
+                dependency_snapshot, remaining_snapshot_bytes = _enter_verification_snapshot(
+                    snapshot_stack,
+                    dependency_wheel,
+                    description="dependency extension wheel",
+                    remaining_bytes=remaining_snapshot_bytes,
+                )
+                dependency_snapshots.append(dependency_snapshot)
+                dependency_layouts.append(
+                    _assert_extension_wheel_layout(
+                        dependency_snapshot,
+                        _extension_name_from_artifact_path(dependency_snapshot),
+                    )
+                )
+            _verify_extension_wheel_snapshots(
+                base_wheel=base_snapshot,
+                extension_wheel=root_snapshot,
+                extension_name=extension_name,
+                trust_identity=trust_identity,
+                root_layout=root_layout,
+                dependency_wheels=tuple(dependency_snapshots),
+                dependency_layouts=tuple(dependency_layouts),
+                dependency_trust_identities=dependency_trust_identities,
+            )
+    except ValueError as exception:
+        raise RuntimeError(str(exception)) from exception
+
+
+def _verify_extension_wheel_snapshots(
+    *,
+    base_wheel: ArchiveSnapshot,
+    extension_wheel: ArchiveSnapshot,
+    extension_name: str,
+    trust_identity: str,
+    root_layout: _ExtensionWheelLayout,
+    dependency_wheels: tuple[ArchiveSnapshot, ...],
+    dependency_layouts: tuple[_ExtensionWheelLayout, ...],
+    dependency_trust_identities: Iterable[str],
+) -> None:
+    resolved_base_wheel = base_wheel
+    resolved_extension_wheel = extension_wheel
+    resolved_dependency_wheels = dependency_wheels
     trusted_dependency_identities = _explicit_dependency_trust_identities(
         dependency_trust_identities,
         dependency_layouts,
-    )
-    _assert_musl_verification_runtime(root_layout)
-    _assert_base_wheel(
-        resolved_base_wheel,
-        expected_vane_version=root_layout.vane_version,
-        required_interpreter_tag=root_layout.interpreter_tag,
-        required_platform_tag=root_layout.platform_tag,
     )
     dependency_names = tuple(layout.name for layout in dependency_layouts)
     all_extension_names = (extension_name, *dependency_names)
@@ -877,14 +1026,18 @@ def verify_extension_wheel(
             environment=environment,
         )
         python = _python_path(environment_directory)
+        resolved_base_wheel.validate_named_path(description="base Vane wheel")
+        resolved_extension_wheel.validate_named_path(description="extension wheel")
+        for dependency_wheel in resolved_dependency_wheels:
+            dependency_wheel.validate_named_path(description="dependency extension wheel")
         _run(
             _pip_command(
                 python,
                 "--disable-pip-version-check",
                 "install",
-                str(resolved_base_wheel),
-                *(str(dependency_wheel) for dependency_wheel in resolved_dependency_wheels),
-                str(resolved_extension_wheel),
+                str(resolved_base_wheel.path),
+                *(str(dependency_wheel.path) for dependency_wheel in resolved_dependency_wheels),
+                str(resolved_extension_wheel.path),
             ),
             cwd=workspace,
             environment=environment,
