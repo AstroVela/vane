@@ -222,8 +222,8 @@ static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object
 		if (!get.bind_data) {
 			throw InvalidInputException("Python Pandas scan is missing bind data");
 		}
-		result.source_kind = "pandas";
 		result.source = PandasScanFunction::GetDataFrame(*get.bind_data);
+		result.source_kind = py::isinstance<py::dict>(result.source) ? "numpy" : "pandas";
 		result.source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
 		result.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
 		return true;
@@ -270,7 +270,8 @@ static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 		// Arrow dictionary schemas describe their value type but not the values
 		// required to reconstruct a DuckDB ENUM. Preserve Pandas categorical
 		// semantics with an explicit VARCHAR-to-ENUM projection above the scan.
-		if (source_kind == "pandas" && expected_types[column_idx].id() == LogicalTypeId::ENUM &&
+		if ((source_kind == "pandas" || source_kind == "numpy") &&
+		    expected_types[column_idx].id() == LogicalTypeId::ENUM &&
 		    snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR) {
 			requires_type_projection = true;
 			continue;
