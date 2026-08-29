@@ -941,6 +941,7 @@ def _normalize_file_arrow_array(
     *,
     boundary: str,
     parent_active: Sequence[bool] | None = None,
+    normalize_value_dependent: bool = True,
 ) -> Any:
     """Canonicalize a FILE-bearing Arrow value to its declared stable storage."""
     if isinstance(array, pa.ChunkedArray):
@@ -950,6 +951,7 @@ def _normalize_file_arrow_array(
                 dtype,
                 boundary=boundary,
                 parent_active=parent_active,
+                normalize_value_dependent=normalize_value_dependent,
             )
             return pa.chunked_array([], type=normalized_empty.type)
         chunks = []
@@ -962,6 +964,7 @@ def _normalize_file_arrow_array(
                     dtype,
                     boundary=boundary,
                     parent_active=chunk_active,
+                    normalize_value_dependent=normalize_value_dependent,
                 )
             )
             offset += len(chunk)
@@ -970,20 +973,26 @@ def _normalize_file_arrow_array(
             return pa.chunked_array(chunks, type=normalized_type)
 
         # Some safe casts, notably temporal downcasts, depend on the values.
-        # Retry the logical column as one array so every leaf makes one
-        # all-or-nothing decision, then restore the caller's chunk boundaries.
-        normalized = _normalize_file_arrow_array(
-            pa.concat_arrays(array.chunks),
-            dtype,
-            boundary=boundary,
-            parent_active=parent_active,
-        )
-        rechunked = []
+        # Retry every original chunk without those casts so the whole logical
+        # column keeps one schema without concatenating or materializing it.
+        stable_chunks = []
         offset = 0
         for chunk in array.chunks:
-            rechunked.append(normalized.slice(offset, len(chunk)))
+            chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
+            stable_chunks.append(
+                _normalize_file_arrow_array(
+                    chunk,
+                    dtype,
+                    boundary=boundary,
+                    parent_active=chunk_active,
+                    normalize_value_dependent=False,
+                )
+            )
             offset += len(chunk)
-        return pa.chunked_array(rechunked, type=normalized.type)
+        stable_type = stable_chunks[0].type
+        if any(not chunk.type.equals(stable_type, check_metadata=True) for chunk in stable_chunks[1:]):
+            raise RuntimeError("FILE normalization could not stabilize a chunked Arrow column")
+        return pa.chunked_array(stable_chunks, type=stable_type)
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
     if type_id == "bit":
@@ -1003,6 +1012,8 @@ def _normalize_file_arrow_array(
         return source
     if type_id == "uuid":
         source = _mask_inactive(array, active)
+        if not normalize_value_dependent:
+            return source
         values = source.to_pylist()
         if _is_arrow_binary_storage(source.type) and any(
             value is not None and len(bytes(value)) != 16 for value in values
@@ -1046,6 +1057,7 @@ def _normalize_file_arrow_array(
                 child,
                 boundary=boundary,
                 parent_active=active,
+                normalize_value_dependent=normalize_value_dependent,
             )
             arrays.append(child_array)
             fields.append(pa.field(name, child_array.type))
@@ -1061,6 +1073,7 @@ def _normalize_file_arrow_array(
             pc.list_flatten(source),
             _sequence_child(dtype),
             boundary=boundary,
+            normalize_value_dependent=normalize_value_dependent,
         )
         return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=source.is_null())
 
@@ -1080,6 +1093,7 @@ def _normalize_file_arrow_array(
             _sequence_child(dtype),
             boundary=boundary,
             parent_active=[is_active for is_active in active for _ in range(array_size)],
+            normalize_value_dependent=normalize_value_dependent,
         )
         normalized_storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=source.is_null())
         if type_id == "array":
@@ -1099,8 +1113,18 @@ def _normalize_file_arrow_array(
         selection = pa.array(selected_indices, type=pa.int64())
         keys = array.keys.slice(start, offsets[-1] - start).take(selection)
         items = array.items.slice(start, offsets[-1] - start).take(selection)
-        keys = _normalize_file_arrow_array(keys, children["key"], boundary=boundary)
-        items = _normalize_file_arrow_array(items, children["value"], boundary=boundary)
+        keys = _normalize_file_arrow_array(
+            keys,
+            children["key"],
+            boundary=boundary,
+            normalize_value_dependent=normalize_value_dependent,
+        )
+        items = _normalize_file_arrow_array(
+            items,
+            children["value"],
+            boundary=boundary,
+            normalize_value_dependent=normalize_value_dependent,
+        )
         return pa.MapArray.from_arrays(
             pa.array(normalized_offsets, type=pa.int32()),
             keys,
@@ -1109,6 +1133,8 @@ def _normalize_file_arrow_array(
         )
 
     source = _mask_inactive(array, active)
+    if not normalize_value_dependent:
+        return source
     try:
         expected = _arrow_type_from_duckdb_pytype(dtype)
     except Exception:
@@ -1224,6 +1250,14 @@ class FileUDFContract:
                 else:
                     output_types.extend(file_types)
 
+        if isinstance(raw_inputs, (list, tuple)) and any(
+            dtype is not None and _contains_file(dtype) for dtype in output_types
+        ):
+            # A FILE output can return an input BIT unchanged. Retain every
+            # declared input type so BIT provenance is available even when no
+            # input itself contains FILE.
+            input_types = tuple(_parse_declared_type(type_name, field="input_types") for type_name in raw_inputs)
+
         return cls(
             udf_name=str(payload.get("udf_name") or "<unknown>"),
             input_types=input_types,
@@ -1238,6 +1272,14 @@ class FileUDFContract:
     def has_file_outputs(self) -> bool:
         return any(dtype is not None and _contains_file(dtype) for dtype in self.output_types)
 
+    @property
+    def has_bit_inputs(self) -> bool:
+        return any(dtype is not None and _contains_bit(dtype) for dtype in self.input_types)
+
+    @property
+    def requires_input_materialization(self) -> bool:
+        return self.has_file_inputs or self.has_bit_inputs
+
     def _validate_column_count(self, table: pa.Table, types: tuple[Any | None, ...], *, boundary: str) -> None:
         if types and table.num_columns != len(types):
             raise _invalid_input(
@@ -1245,7 +1287,7 @@ class FileUDFContract:
             )
 
     def validate_input_table(self, table: pa.Table) -> None:
-        if not self.has_file_inputs:
+        if not self.requires_input_materialization:
             return
         boundary = f"UDF {self.udf_name!r} input"
         self._validate_column_count(table, self.input_types, boundary=boundary)
@@ -1256,7 +1298,7 @@ class FileUDFContract:
     def prepare_input_table(self, table: pa.Table) -> pa.Table:
         """Validate FILE inputs and mark DuckDB-produced BIT storage before user code runs."""
         self.validate_input_table(table)
-        if not self.has_file_inputs:
+        if not self.has_bit_inputs:
             return table
 
         boundary = f"UDF {self.udf_name!r} input"
@@ -1288,7 +1330,7 @@ class FileUDFContract:
         return pa.Table.from_arrays(columns, schema=pa.schema(fields, metadata=table.schema.metadata))
 
     def materialize_scalar_inputs(self, table: pa.Table) -> list[list[Any]]:
-        if not self.has_file_inputs:
+        if not self.requires_input_materialization:
             return [column.to_pylist() for column in table.columns]
         table = self.prepare_input_table(table)
         boundary = f"UDF {self.udf_name!r} input"

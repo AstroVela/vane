@@ -1735,6 +1735,76 @@ def test_map_batches_marks_top_level_bit_sibling_input():
     )
 
 
+def test_batch_file_output_preserves_bit_only_input_identity():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def attach_document(flags):
+        assert flags.type.extension_name == "arrow.opaque"
+        assert flags.type.type_name == "bit"
+        assert flags.type.vendor_name == "DuckDB"
+        documents = pa.array(
+            [_file_record(url="memory://bit-only-input")] * len(flags),
+            type=_file_arrow_type(),
+        )
+        return pa.StructArray.from_arrays([documents, flags], names=["document", "flags"])
+
+    connection = vane.connect()
+    source = connection.sql("SELECT '0101011'::BIT AS flags")
+    result = source.select(attach_document(vane.col("flags")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://bit-only-input",
+        "0101011",
+    )
+
+
+def test_scalar_file_output_materializes_bit_only_input_as_text():
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func(return_dtype=output_type)
+    def attach_document(flags):
+        assert flags == "0101011"
+        return {"document": vane.File("memory://scalar-bit-only-input"), "flags": flags}
+
+    connection = vane.connect()
+    source = connection.sql("SELECT '0101011'::BIT AS flags")
+    result = source.select(attach_document(vane.col("flags")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://scalar-bit-only-input",
+        "0101011",
+    )
+
+
+def test_flat_map_file_output_materializes_bit_only_input_as_text():
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    def attach_document(row):
+        assert row["flags"] == "0101011"
+        return {
+            "payload": {
+                "document": vane.File("memory://flat-map-bit-only-input"),
+                "flags": row["flags"],
+            }
+        }
+
+    connection = vane.connect()
+    source = connection.sql("SELECT '0101011'::BIT AS flags")
+    result = source.flat_map(
+        attach_document,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://flat-map-bit-only-input",
+        "0101011",
+    )
+
+
 def test_batch_file_udf_preserves_blob_to_bit_cast_semantics():
     import pyarrow as pa
 

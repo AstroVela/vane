@@ -777,7 +777,7 @@ class UDFExecutor:
 
         for batch in batches:
             input_rows: Iterable[dict[str, Any]]
-            if self._file_contract.has_file_inputs:
+            if self._file_contract.requires_input_materialization:
                 columns = self._file_contract.materialize_scalar_inputs(batch)
                 names = batch.schema.names
                 input_rows = (
