@@ -122,45 +122,91 @@ def _select_memory_source_columns(source: Any, source_kind: str, column_indices:
     return source
 
 
-def _pandas_scan_varchar_value(value: Any) -> str | None:
-    """Match the native pandas_scan VARCHAR fallback for one object value."""
-
+def _is_pandas_scan_null(value: Any) -> bool:
     import math
 
     import pandas as pd
 
     if value is None or value is pd.NA or value is pd.NaT:
-        return None
-    if isinstance(value, float) and math.isnan(value):
+        return True
+    return isinstance(value, float) and math.isnan(value)
+
+
+def _pandas_scan_varchar_value(value: Any) -> str | None:
+    """Match the native pandas_scan VARCHAR fallback for one object value."""
+
+    if _is_pandas_scan_null(value):
         return None
     if isinstance(value, str):
         return value
     return str(value)
 
 
-def _coerce_object_varchar_columns(source: Any, source_kind: str, expected_schema: Any) -> Any:
-    """Apply bound VARCHAR semantics before Arrow attempts object inference."""
+def _is_arrow_string_type(data_type: Any) -> bool:
+    import pyarrow as pa
+
+    is_string_view = getattr(pa.types, "is_string_view", None)
+    return (
+        pa.types.is_string(data_type)
+        or pa.types.is_large_string(data_type)
+        or (is_string_view is not None and is_string_view(data_type))
+    )
+
+
+def _pandas_scan_map_value(value: Any) -> Any:
+    if _is_pandas_scan_null(value):
+        return None
+    if not isinstance(value, dict):
+        return value
+
+    if len(value) == 2 and "key" in value and "value" in value:
+        keys = value["key"]
+        items = value["value"]
+        keys_are_sequence = keys is None or (hasattr(keys, "__getitem__") and hasattr(keys, "__len__"))
+        items_are_sequence = items is None or (hasattr(items, "__getitem__") and hasattr(items, "__len__"))
+        if keys_are_sequence and items_are_sequence:
+            if keys is None or items is None:
+                return None
+            if len(keys) == len(items):
+                return list(zip(keys, items, strict=True))
+    return list(value.items())
+
+
+def _pandas_scan_map_array(values: Any, data_type: Any) -> Any:
+    import pyarrow as pa
+
+    return pa.array([_pandas_scan_map_value(value) for value in values], type=data_type, from_pandas=True)
+
+
+def _coerce_object_columns(
+    source: Any,
+    source_kind: str,
+    expected_schema: Any,
+    logical_type_ids: tuple[str, ...],
+) -> Any:
+    """Apply bound pandas_scan semantics before Arrow attempts object inference."""
 
     import pandas as pd
     import pyarrow as pa
 
-    def is_varchar_type(data_type: Any) -> bool:
-        is_string_view = getattr(pa.types, "is_string_view", None)
-        return (
-            pa.types.is_string(data_type)
-            or pa.types.is_large_string(data_type)
-            or (is_string_view is not None and is_string_view(data_type))
-        )
-
     if source_kind == "pandas":
         converted = None
         for column_index, dtype in enumerate(source.dtypes):
-            if not pd.api.types.is_object_dtype(dtype) or not is_varchar_type(expected_schema.field(column_index).type):
+            if not pd.api.types.is_object_dtype(dtype):
+                continue
+            expected_type = expected_schema.field(column_index).type
+            logical_type_id = logical_type_ids[column_index]
+            if logical_type_id == "VARCHAR" or (logical_type_id == "UUID" and _is_arrow_string_type(expected_type)):
+                column = source.iloc[:, column_index].map(_pandas_scan_varchar_value)
+            elif logical_type_id == "MAP" and pa.types.is_map(expected_type):
+                map_array = _pandas_scan_map_array(source.iloc[:, column_index], expected_type)
+                column = pd.Series(map_array, dtype=pd.ArrowDtype(expected_type), index=source.index)
+            else:
                 continue
             if converted is None:
                 converted = source.copy(deep=False)
             column_name = source.columns[column_index]
-            converted[column_name] = source.iloc[:, column_index].map(_pandas_scan_varchar_value)
+            converted[column_name] = column
         return source if converted is None else converted
 
     if source_kind == "numpy":
@@ -168,13 +214,19 @@ def _coerce_object_varchar_columns(source: Any, source_kind: str, expected_schem
             raise TypeError(f"NumPy memory source must be normalized to a dict, got {type(source).__name__}")
         converted = None
         for column_index, (column_name, column) in enumerate(source.items()):
-            if getattr(getattr(column, "dtype", None), "kind", None) != "O" or not is_varchar_type(
-                expected_schema.field(column_index).type
-            ):
+            if getattr(getattr(column, "dtype", None), "kind", None) != "O":
+                continue
+            expected_type = expected_schema.field(column_index).type
+            logical_type_id = logical_type_ids[column_index]
+            if logical_type_id == "VARCHAR" or (logical_type_id == "UUID" and _is_arrow_string_type(expected_type)):
+                converted_column = [_pandas_scan_varchar_value(value) for value in column]
+            elif logical_type_id == "MAP" and pa.types.is_map(expected_type):
+                converted_column = _pandas_scan_map_array(column, expected_type)
+            else:
                 continue
             if converted is None:
                 converted = dict(source)
-            converted[column_name] = [_pandas_scan_varchar_value(value) for value in column]
+            converted[column_name] = converted_column
         return source if converted is None else converted
 
     return source
@@ -282,6 +334,7 @@ def _snapshot_and_put_memory_source(
     source: Any,
     source_kind: str,
     expected_schema: Any,
+    logical_type_ids: tuple[str, ...],
     column_indices: tuple[int, ...],
     include_row_count_column: bool,
 ) -> tuple[Any, list[Any]]:
@@ -295,9 +348,13 @@ def _snapshot_and_put_memory_source(
 
     if not isinstance(expected_schema, pa.Schema):
         raise TypeError(f"Expected a pyarrow.Schema for a Python memory source, got {type(expected_schema).__name__}")
+    if len(logical_type_ids) != len(expected_schema):
+        raise ValueError(
+            f"Python memory source has {len(logical_type_ids)} bound types, expected {len(expected_schema)}"
+        )
     row_count = _memory_source_row_count(source, source_kind) if include_row_count_column else None
     source = _select_memory_source_columns(source, source_kind, column_indices)
-    source = _coerce_object_varchar_columns(source, source_kind, expected_schema)
+    source = _coerce_object_columns(source, source_kind, expected_schema, logical_type_ids)
     table = _as_arrow_table(source, source_kind)
     expected_names = expected_schema.names
     if row_count is not None:
