@@ -531,6 +531,19 @@ def _canonical_values_to_arrow_array(
                 raise ValueError(f"{type_id.upper()} output is outside its 128-bit range")
             encoded.append(str(integer))
         return pa.array(encoded, type=pa.string())
+    if type_id == "bignum":
+        bignum_encoded: list[str | None] = []
+        for value in values:
+            if value is None:
+                bignum_encoded.append(None)
+                continue
+            try:
+                bignum_encoded.append(str(operator.index(value)))
+            except TypeError:
+                if not isinstance(value, str):
+                    raise
+                bignum_encoded.append(value)
+        return pa.array(bignum_encoded, type=pa.string())
     if type_id == "time with time zone":
         encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
         return pa.array(encoded, type=pa.string())
@@ -726,8 +739,10 @@ def _normalize_file_arrow_array(
         return _mask_inactive(array, active)
     try:
         return _mask_inactive(array, active).cast(expected)
-    except Exception as exc:
-        raise _invalid_input(f"{boundary} value cannot be cast to declared type {dtype}") from exc
+    except Exception:
+        # DuckDB accepts coercions that Arrow does not model (for example,
+        # VARCHAR to UUID). Preserve that storage for the engine's final cast.
+        return _mask_inactive(array, active)
 
 
 def validate_file_arrow_array(

@@ -476,6 +476,35 @@ def test_scalar_file_udf_preserves_full_128_bit_integer_sibling(integer_type, wi
     assert int(returned_wide) == wide
 
 
+def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():
+    import pyarrow as pa
+
+    wide = 10**100
+    output_type = vane.type("STRUCT(document FILE, wide BIGNUM)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {"document": vane.File("memory://bignum"), "wide": wide}
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert result.project("payload.wide::VARCHAR AS wide").fetchone() == (str(wide),)
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_documents(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array([str(wide)] * len(values)),
+            ],
+            names=["document", "wide"],
+        )
+
+    batch_result = build_documents(pa.array([1], type=pa.int32()))
+    assert batch_result.type.field("wide").type == pa.string()
+    assert batch_result.to_pylist() == [{"document": _file_record(), "wide": str(wide)}]
+
+
 def test_empty_flat_map_file_udf_preserves_composite_output_type():
     output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, wide UHUGEINT)")
 
@@ -678,6 +707,50 @@ def test_map_batches_normalizes_file_siblings_across_output_batches(nested):
             _file_record(url="memory://1"),
             _file_record(url="memory://2"),
         ]
+
+
+def test_map_batches_preserves_duckdb_casts_for_non_file_columns():
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+
+    def build_output(table):
+        import pyarrow as pa
+
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        return pa.table(
+            {
+                "document": pa.array(
+                    [
+                        {
+                            "url": "memory://batch-coercion",
+                            "content_type": None,
+                            "position": None,
+                            "size": None,
+                            "checksum": None,
+                        }
+                    ]
+                    * table.num_rows,
+                    type=file_type,
+                ),
+                "identifier": pa.array(["00112233-4455-6677-8899-aabbccddeeff"] * table.num_rows),
+            }
+        )
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").map_batches(
+        build_output,
+        schema={"document": vane.file_type(), "identifier": vane.sqltypes.UUID},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.fetchone() == (vane.File("memory://batch-coercion"), identifier)
 
 
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
