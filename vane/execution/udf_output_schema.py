@@ -111,6 +111,12 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     if type_id == "array":
         children = dict(dt.children)
         return pa.list_(_arrow_type_from_duckdb_pytype(children["child"]), list_size=int(children["size"]))
+    if type_id == "tensor":
+        children = dict(dt.children)
+        return pa.fixed_shape_tensor(
+            _arrow_type_from_duckdb_pytype(children["dtype"]),
+            tuple(int(dimension) for dimension in children["shape"]),
+        )
     if type_id == "struct":
         return pa.struct([(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children])
     if type_id == "map":

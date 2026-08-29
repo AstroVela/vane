@@ -486,6 +486,13 @@ struct DistributedArrowStreamOwner {
 			        py::cast<string>(expected_type.attr("vendor_name"))) {
 				return false;
 			}
+		} else if (extension_name == "arrow.fixed_shape_tensor") {
+			for (const auto *attribute : {"shape", "permutation", "dim_names"}) {
+				if (!py::hasattr(actual_type, attribute) || !py::hasattr(expected_type, attribute) ||
+				    !py::cast<bool>(actual_type.attr(attribute).attr("__eq__")(expected_type.attr(attribute)))) {
+					return false;
+				}
+			}
 		} else if (extension_name != "arrow.json") {
 			return false;
 		}

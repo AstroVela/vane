@@ -795,6 +795,115 @@ def test_map_batches_normalizes_file_siblings_across_output_batches(nested):
         ]
 
 
+def test_map_batches_normalizes_lossless_temporal_siblings_across_batches():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    occurred_at = datetime(2024, 1, 2, 3, 4, 5, 123000)
+
+    def emit_documents(_table):
+        document = pa.array([_file_record()], type=_file_arrow_type())
+        for unit in ("ms", "us"):
+            yield pa.table(
+                {
+                    "document": document,
+                    "occurred_at": pa.array([occurred_at], type=pa.timestamp(unit)),
+                }
+            )
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(emit_documents),
+            "call_mode": "map_batches",
+            "execution_backend": "subprocess_task",
+            "output_schema": [
+                {"name": "document", "kind": "duckdb_type", "type": "FILE"},
+                {"name": "occurred_at", "kind": "duckdb_type", "type": "TIMESTAMP"},
+            ],
+            "stream_output": True,
+            "output_batch_size": 2,
+        }
+    )
+    try:
+        executor.submit(pa.table({"input": [1]}))
+        output = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert len(output) == 1
+    assert output[0].column("occurred_at").type == pa.timestamp("us")
+    assert output[0].column("occurred_at").to_pylist() == [occurred_at, occurred_at]
+
+
+def test_file_tensor_output_contract_normalizes_and_validates_file_elements():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "file-tensor",
+            "output_schema": [
+                {
+                    "name": "documents",
+                    "kind": "tensor",
+                    "dtype": "FILE",
+                    "shape": [2],
+                }
+            ],
+        }
+    )
+    assert contract.has_file_outputs
+    assert str(contract.output_types[0].id) == "tensor"
+
+    file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+
+    def file_tensor(records):
+        files = pa.array(records, type=file_type)
+        storage = pa.FixedSizeListArray.from_arrays(files, 2)
+        return pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(file_type, (2,)), storage)
+
+    records = [
+        _file_record(url="memory://first"),
+        _file_record(url="memory://second"),
+    ]
+    normalized = contract.normalize_output_table(pa.table({"documents": file_tensor(records)}))
+
+    assert normalized.column("documents").type == pa.fixed_shape_tensor(_file_arrow_type(), (2,))
+    assert normalized.column("documents").to_pylist() == [records]
+
+    invalid_records = [records[0], _file_record(url="memory://invalid", position=1, size=None)]
+    with pytest.raises(vane.InvalidInputException, match="position and size"):
+        contract.normalize_output_table(pa.table({"documents": file_tensor(invalid_records)}))
+
+    files = pa.array(records, type=file_type)
+    wrong_shape = pa.ExtensionArray.from_storage(
+        pa.fixed_shape_tensor(file_type, (1, 2)),
+        pa.FixedSizeListArray.from_arrays(files, 2),
+    )
+    with pytest.raises(vane.InvalidInputException, match="declared Arrow tensor metadata"):
+        contract.normalize_output_table(pa.table({"documents": wrong_shape}))
+
+    method_contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "file-tensor-method",
+            "method_return_type": "TENSOR(FILE, [2])",
+        }
+    )
+    assert method_contract.has_file_outputs
+    assert str(method_contract.output_types[0]) == "TENSOR(FILE, [2])"
+
+
 @pytest.mark.parametrize("raw_uuid_bytes", [False, True], ids=["varchar", "blob"])
 def test_map_batches_preserves_duckdb_casts_for_non_file_columns(raw_uuid_bytes):
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")

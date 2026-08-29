@@ -25,6 +25,7 @@ import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, u
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
+_TENSOR_TYPE_PATTERN = re.compile(r"^TENSOR\((.*),\s*\[([0-9,\s]+)\]\)$", flags=re.IGNORECASE)
 
 
 def _invalid_input(message: str) -> Exception:
@@ -47,7 +48,21 @@ def _type_children(dtype: Any) -> dict[str, Any]:
 
 
 def _sequence_child(dtype: Any) -> Any:
-    return _type_children(dtype)["child"]
+    children = _type_children(dtype)
+    return children["dtype"] if _type_id(dtype) == "tensor" else children["child"]
+
+
+def _tensor_shape(dtype: Any) -> tuple[int, ...]:
+    return tuple(int(dimension) for dimension in _type_children(dtype)["shape"])
+
+
+def _fixed_sequence_size(dtype: Any) -> int:
+    if _type_id(dtype) != "tensor":
+        return int(_type_children(dtype)["size"])
+    size = 1
+    for dimension in _tensor_shape(dtype):
+        size *= dimension
+    return size
 
 
 def _contains_file(dtype: Any | None) -> bool:
@@ -56,7 +71,7 @@ def _contains_file(dtype: Any | None) -> bool:
     if _is_file_type(dtype):
         return True
     type_id = _type_id(dtype)
-    if type_id in ("list", "array"):
+    if type_id in ("list", "array", "tensor"):
         return _contains_file(_sequence_child(dtype))
     if type_id in ("struct", "union", "map"):
         return any(_contains_file(child) for _, child in dtype.children)
@@ -67,7 +82,7 @@ def _native_map_key_is_hashable(dtype: Any) -> bool:
     if _is_file_type(dtype):
         return True
     type_id = _type_id(dtype)
-    if type_id in ("list", "struct", "map", "union"):
+    if type_id in ("list", "struct", "map", "tensor", "union"):
         return False
     if type_id == "array":
         return _native_map_key_is_hashable(_sequence_child(dtype))
@@ -82,13 +97,7 @@ def contains_file_type(dtype: Any) -> bool:
 def _parse_file_type(type_name: Any, *, field: str) -> Any | None:
     if not isinstance(type_name, str) or re.search(r"\bFILE\b", type_name, flags=re.IGNORECASE) is None:
         return None
-
-    import vane
-
-    try:
-        dtype = vane.type(type_name)
-    except Exception as exc:
-        raise _invalid_input(f"UDF payload field {field!r} contains an invalid SQL type") from exc
+    dtype = _parse_declared_type(type_name, field=field)
     return dtype if _contains_file(dtype) else None
 
 
@@ -101,7 +110,43 @@ def _parse_declared_type(type_name: Any, *, field: str) -> Any | None:
     try:
         return vane.type(type_name)
     except Exception as exc:
-        raise _invalid_input(f"UDF payload field {field!r} contains an invalid SQL type") from exc
+        tensor_match = _TENSOR_TYPE_PATTERN.fullmatch(type_name.strip())
+        if tensor_match is None:
+            raise _invalid_input(f"UDF payload field {field!r} contains an invalid SQL type") from exc
+        child = _parse_declared_type(tensor_match.group(1).strip(), field=field)
+        if child is None:
+            raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR dtype") from exc
+        try:
+            shape = tuple(int(dimension.strip()) for dimension in tensor_match.group(2).split(","))
+            return vane.tensor_type(child, shape)
+        except Exception as tensor_error:
+            raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR type") from tensor_error
+
+
+def _parse_tensor_type(
+    entry: Mapping[str, Any],
+    *,
+    field: str,
+    file_only: bool = False,
+) -> Any | None:
+    child = (
+        _parse_file_type(entry.get("dtype"), field=field)
+        if file_only
+        else _parse_declared_type(entry.get("dtype"), field=field)
+    )
+    if child is None:
+        if file_only:
+            return None
+        raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR dtype")
+    raw_shape = entry.get("shape")
+    if not isinstance(raw_shape, (list, tuple)) or not raw_shape:
+        raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR shape")
+    if any(isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0 for dimension in raw_shape):
+        raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR shape")
+
+    import vane
+
+    return vane.tensor_type(child, tuple(raw_shape))
 
 
 def _expected_arrow_type(dtype: Any, *, boundary: str) -> pa.DataType:
@@ -181,6 +226,10 @@ def _is_arrow_list_storage(dtype: pa.DataType) -> bool:
     )
 
 
+def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
+    return isinstance(dtype, getattr(pa, "BaseExtensionType", pa.ExtensionType))
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -224,14 +273,24 @@ def _validate_arrow_storage_type(
             allow_untyped_null=allow_untyped_null,
         )
         return
-    if type_id == "array":
-        if not pa.types.is_fixed_size_list(actual):
+    if type_id in ("array", "tensor"):
+        actual_storage = actual
+        if type_id == "tensor" and _is_arrow_extension_type(actual):
+            if (
+                actual.extension_name != "arrow.fixed_shape_tensor"
+                or tuple(actual.shape) != _tensor_shape(dtype)
+                or getattr(actual, "permutation", None) is not None
+                or getattr(actual, "dim_names", None) is not None
+            ):
+                raise _invalid_input(f"{boundary} value at {path} must use its declared Arrow tensor metadata")
+            actual_storage = actual.storage_type
+        if not pa.types.is_fixed_size_list(actual_storage):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow fixed-size list type")
-        expected_size = int(_type_children(dtype)["size"])
-        if actual.list_size != expected_size:
+        expected_size = _fixed_sequence_size(dtype)
+        if actual_storage.list_size != expected_size:
             raise _invalid_input(f"{boundary} value at {path} must have fixed size {expected_size}")
         _validate_arrow_storage_type(
-            actual.value_type,
+            actual_storage.value_type,
             _sequence_child(dtype),
             boundary=boundary,
             path=f"{path}[]",
@@ -318,7 +377,7 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
     """Return whether Arrow can only change storage, not DuckDB cast semantics."""
     if actual.equals(expected):
         return True
-    if isinstance(actual, pa.ExtensionType) and actual.storage_type.equals(expected):
+    if _is_arrow_extension_type(actual) and actual.storage_type.equals(expected):
         return True
     if _is_arrow_string_storage(actual) and _is_arrow_string_storage(expected):
         return True
@@ -332,6 +391,14 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
         return expected.bit_width > actual.bit_width
     if pa.types.is_float32(actual) and pa.types.is_float64(expected):
         return True
+    if pa.types.is_timestamp(actual) and pa.types.is_timestamp(expected):
+        return (actual.tz is None) == (expected.tz is None)
+    if pa.types.is_time(actual) and pa.types.is_time(expected):
+        return True
+    if pa.types.is_date(actual) and pa.types.is_date(expected):
+        return True
+    if pa.types.is_decimal(actual) and pa.types.is_decimal(expected):
+        return actual.scale == expected.scale and actual.precision <= expected.precision
     return _type_id(dtype) in ("bignum", "hugeint", "uhugeint") and pa.types.is_integer(actual)
 
 
@@ -390,11 +457,12 @@ def _validate_file_arrow_values(
             path=f"{path}[]",
         )
         return
-    if type_id == "array":
-        array_size = int(_type_children(dtype)["size"])
+    if type_id in ("array", "tensor"):
+        storage = array.storage if type_id == "tensor" and isinstance(array, pa.ExtensionArray) else array
+        array_size = _fixed_sequence_size(dtype)
         child_active = [is_active for is_active in active for _ in range(array_size)]
         _validate_file_arrow_values(
-            array.values.slice(array.offset * array_size, len(array) * array_size),
+            storage.values.slice(storage.offset * array_size, len(storage) * array_size),
             _sequence_child(dtype),
             boundary=boundary,
             path=f"{path}[]",
@@ -435,13 +503,13 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
         return _file_from_arrow_value(value, boundary=boundary, path=path)
 
     type_id = _type_id(dtype)
-    if type_id in ("list", "array"):
+    if type_id in ("list", "array", "tensor"):
         child = _sequence_child(dtype)
         values = [
             _materialize_native_value(item, child, boundary=boundary, path=f"{path}[{index}]")
             for index, item in enumerate(value)
         ]
-        return tuple(values) if type_id == "array" else values
+        return tuple(values) if type_id in ("array", "tensor") else values
     if type_id == "struct":
         result = {}
         for name, child in dtype.children:
@@ -482,11 +550,11 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         return {field: getattr(value, field) for field in _FILE_FIELDS}
 
     type_id = _type_id(dtype)
-    if type_id in ("list", "array"):
+    if type_id in ("list", "array", "tensor"):
         if not isinstance(value, (list, tuple)):
             raise _invalid_input(f"{boundary} value at {path} must be a sequence")
-        if type_id == "array":
-            expected_size = int(_type_children(dtype)["size"])
+        if type_id in ("array", "tensor"):
+            expected_size = _fixed_sequence_size(dtype)
             if len(value) != expected_size:
                 raise _invalid_input(f"{boundary} value at {path} must have fixed size {expected_size}")
         child = _sequence_child(dtype)
@@ -639,14 +707,18 @@ def _canonical_values_to_arrow_array(
         child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
         return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=null_mask)
 
-    if type_id == "array":
+    if type_id in ("array", "tensor"):
         child = _sequence_child(dtype)
-        array_size = int(_type_children(dtype)["size"])
+        array_size = _fixed_sequence_size(dtype)
         flattened = []
         for value in values:
             flattened.extend([None] * array_size if value is None else value)
         child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
-        return pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=null_mask)
+        storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=null_mask)
+        if type_id == "array":
+            return storage
+        tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
+        return pa.ExtensionArray.from_storage(tensor_type, storage)
 
     if type_id == "map":
         offsets = [0]
@@ -774,15 +846,28 @@ def _normalize_file_arrow_array(
         )
         return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=source.is_null())
 
-    if type_id == "array":
-        array_size = int(_type_children(dtype)["size"])
+    if type_id in ("array", "tensor"):
+        source = _mask_inactive(array, active)
+        if type_id == "tensor":
+            _validate_arrow_storage_type(
+                source.type,
+                dtype,
+                boundary=boundary,
+                path="column",
+            )
+        storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
+        array_size = _fixed_sequence_size(dtype)
         child_array = _normalize_file_arrow_array(
-            array.values.slice(array.offset * array_size, len(array) * array_size),
+            storage.values.slice(storage.offset * array_size, len(storage) * array_size),
             _sequence_child(dtype),
             boundary=boundary,
             parent_active=[is_active for is_active in active for _ in range(array_size)],
         )
-        return pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=array.is_null())
+        normalized_storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=source.is_null())
+        if type_id == "array":
+            return normalized_storage
+        tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
+        return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
 
     if type_id == "map":
         start, _, offsets = _child_window(array)
@@ -888,10 +973,14 @@ class FileUDFContract:
                         entries.append(None)
                         file_types.append(None)
                         continue
-                    kind = str(entry.get("kind") or "duckdb_type").lower()
+                    kind = str(entry.get("kind") or "duckdb_type").strip().lower()
                     entries.append(entry)
                     file_types.append(
-                        _parse_file_type(entry.get("type"), field="output_schema") if kind == "duckdb_type" else None
+                        _parse_file_type(entry.get("type"), field="output_schema")
+                        if kind == "duckdb_type"
+                        else _parse_tensor_type(entry, field="output_schema", file_only=True)
+                        if kind == "tensor"
+                        else None
                     )
                 if any(dtype is not None for dtype in file_types):
                     output_types.extend(
@@ -899,7 +988,10 @@ class FileUDFContract:
                         if file_dtype is not None
                         else (
                             _parse_declared_type(entry.get("type"), field="output_schema")
-                            if entry is not None and str(entry.get("kind") or "duckdb_type").lower() == "duckdb_type"
+                            if entry is not None
+                            and str(entry.get("kind") or "duckdb_type").strip().lower() == "duckdb_type"
+                            else _parse_tensor_type(entry, field="output_schema")
+                            if entry is not None and str(entry.get("kind") or "duckdb_type").strip().lower() == "tensor"
                             else None
                         )
                         for entry, file_dtype in zip(entries, file_types, strict=True)
