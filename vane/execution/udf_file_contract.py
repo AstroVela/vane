@@ -112,6 +112,20 @@ def _struct_field_index(
     return matches[0]
 
 
+def _mapping_field_value(
+    value: Mapping[Any, Any],
+    name: str,
+    *,
+    boundary: str,
+    path: str,
+) -> Any:
+    folded_name = name.casefold()
+    matches = [key for key in value if isinstance(key, str) and key.casefold() == folded_name]
+    if len(matches) > 1:
+        raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {name!r}")
+    return value[matches[0]] if matches else None
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -350,12 +364,14 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
         ]
         return tuple(values) if type_id == "array" else values
     if type_id == "struct":
-        result = dict(value)
+        result = {}
         for name, child in dtype.children:
-            if _contains_file(child):
-                result[name] = _materialize_native_value(
-                    value.get(name), child, boundary=boundary, path=f"{path}.{name}"
-                )
+            child_value = _mapping_field_value(value, name, boundary=boundary, path=path)
+            result[name] = (
+                _materialize_native_value(child_value, child, boundary=boundary, path=f"{path}.{name}")
+                if _contains_file(child)
+                else child_value
+            )
         return result
     if type_id == "map":
         children = _type_children(dtype)
@@ -402,12 +418,14 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
     if type_id == "struct":
         if not isinstance(value, Mapping):
             raise _invalid_input(f"{boundary} value at {path} must be a mapping")
-        result = dict(value)
+        result = {}
         for name, child in dtype.children:
-            if _contains_file(child):
-                result[name] = _canonicalize_native_output(
-                    value.get(name), child, boundary=boundary, path=f"{path}.{name}"
-                )
+            child_value = _mapping_field_value(value, name, boundary=boundary, path=path)
+            result[name] = (
+                _canonicalize_native_output(child_value, child, boundary=boundary, path=f"{path}.{name}")
+                if _contains_file(child)
+                else child_value
+            )
         return result
     if type_id == "map":
         children = _type_children(dtype)

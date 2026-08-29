@@ -586,6 +586,42 @@ def test_file_composite_arrow_fields_match_case_insensitively():
     assert normalized.column("payload").to_pylist() == [{"Document": _file_record()}]
 
 
+def test_file_composite_native_values_match_fields_case_insensitively():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    logical_type = 'STRUCT("Document" FILE, "Label" VARCHAR)'
+    input_contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "case-insensitive-input",
+            "input_types": [logical_type],
+        }
+    )
+    lower_case = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            pa.array(["report"]),
+        ],
+        names=["document", "label"],
+    )
+
+    columns = input_contract.materialize_scalar_inputs(pa.table({"payload": lower_case}))
+
+    assert columns == [[{"Document": vane.File(**_file_record()), "Label": "report"}]]
+
+    output_contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "case-insensitive-output",
+            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": logical_type}],
+        }
+    )
+    output = output_contract.scalar_outputs_to_array([{"document": vane.File(**_file_record()), "label": "report"}])
+
+    assert output.type.names == ["Document", "Label"]
+    assert output.to_pylist() == [{"Document": _file_record(), "Label": "report"}]
+
+
 def test_batch_file_udf_types_all_null_output_as_file():
     import pyarrow as pa
 
