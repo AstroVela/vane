@@ -277,6 +277,30 @@ def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connectio
     assert sum(partition.get_total_buffer_size() for partition in put_partitions) == source.get_total_buffer_size()
 
 
+def test_single_partition_arrow_slice_drops_unreferenced_backing_buffers(connection, monkeypatch):
+    source = pa.table({"value": pa.array(range(1_000_000), type=pa.int64())}).slice(500_000, 3)
+    put_partitions = []
+    original_put = ray.put
+
+    def capture_partition(value):
+        if isinstance(value, pa.Table):
+            put_partitions.append(value)
+        return original_put(value)
+
+    monkeypatch.setattr(ray, "put", capture_partition)
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        connection.from_arrow(source), "materialized-single-arrow-partition"
+    )
+
+    assert logical._memory_source_ref_count_for_test() == 1
+    assert len(put_partitions) == 1
+    partition = put_partitions[0]
+    assert partition.column(0).chunk(0).offset == 0
+    assert partition.get_total_buffer_size() == 3 * pa.int64().bit_width // 8
+    assert partition.column(0).chunk(0).buffers()[1].address != source.column(0).chunk(0).buffers()[1].address
+
+
 def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, monkeypatch):
     from vane.datasource import _memory
 
@@ -320,6 +344,23 @@ def test_pandas_memory_scan_rewrite_preserves_join_cardinality(connection):
 
     cardinalities = physical._datasource_scan_cardinalities_for_test()
     assert cardinalities[("large_id", "payload")] == 10_000
+
+
+def test_pandas_categorical_memory_source_preserves_enum_semantics(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    source = pd.DataFrame(
+        {"category": pd.Categorical(["red", "blue", None, "red"], categories=["red", "blue", "unused"], ordered=True)}
+    )
+    relation = connection.from_df(source).filter("category != 'unused'").project("category")
+
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert sorted(value for value in result.column(0).to_pylist() if value is not None) == [
+        "blue",
+        "red",
+        "red",
+    ]
 
 
 def test_pandas_and_arrow_memory_relations_execute_through_ray(connection):

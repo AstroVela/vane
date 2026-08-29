@@ -159,13 +159,13 @@ def _snapshot_and_put_memory_source(
 
     object_refs = []
     for offset, row_count in partition_ranges:
-        if len(partition_ranges) == 1:
-            partition = table
-        else:
-            sliced = table.slice(offset, row_count)
-            partition = pa.Table.from_arrays(
-                [_materialize_partition_column(column) for column in sliced.columns], schema=table.schema
-            )
+        sliced = table.slice(offset, row_count)
+        # A small table can still be a zero-copy view over much larger buffers.
+        # Materializing at the Ray ownership boundary prevents every ObjectRef
+        # from retaining or serializing bytes outside its partition.
+        partition = pa.Table.from_arrays(
+            [_materialize_partition_column(column) for column in sliced.columns], schema=table.schema
+        )
         object_refs.append(ray.put(partition))
     return table.schema, object_refs
 

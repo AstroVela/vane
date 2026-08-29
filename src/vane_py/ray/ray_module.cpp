@@ -88,6 +88,8 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/common/types/value.hpp>
 #include <duckdb/common/vector_size.hpp>
 #include <duckdb/common/algorithm.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_columnref_expression.hpp>
 #include <duckdb/parallel/interrupt.hpp>
 #include <duckdb/parallel/thread_context.hpp>
 #include <duckdb/parallel/task_scheduler.hpp>
@@ -106,6 +108,7 @@ static inline int DuckdbGetEnvIntMs(const char *name) {
 #include <duckdb/planner/filter/constant_filter.hpp>
 #include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
+#include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/execution/operator/projection/physical_tableinout_function.hpp>
 #include <duckdb/execution/operator/projection/physical_udf_inout.hpp>
 #include <duckdb/function/scalar/udf_functions.hpp>
