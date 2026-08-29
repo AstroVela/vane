@@ -119,11 +119,15 @@ the dependency closure exactly; neither the builder nor clean verifier derives
 trust from the wheels being checked.
 For Linux wheels, the builder independently inspects every root and dependency
 extension ELF header, bounded program and dynamic tables, `DT_NEEDED` library
-names, GNU version-needed entries, and linked libc requirements. The ELF
-machine must match the declared architecture, a manylinux tag must cover the
-highest glibc requirement and the audited `GLIBCXX`, `CXXABI`, `GCC`,
-`LIBATOMIC`, and `ZLIB` symbol policy, every other versioned-symbol namespace
-is rejected, and glibc and musl artifacts cannot be relabeled as each other.
+names, dynamic symbols, GNU version-needed entries, and linked libc
+requirements. pyelftools interprets the preflight-bounded dynamic symbol
+entries using the same undefined/non-weak semantics as auditwheel. The ELF
+machine must match the declared architecture. A manylinux object must satisfy
+the exact complete-version symbol allowlist and each `DT_NEEDED` library's
+undefined-symbol blacklist from the pinned auditwheel policy; the highest
+major/minor glibc requirement is computed separately for display/compatibility
+reporting. Unknown versioned-symbol namespaces are rejected, and glibc and
+musl artifacts cannot be relabeled as each other.
 Every external library must be allowed by the exact
 manylinux or musllinux policy; extension wheels cannot rely on private
 libraries present only on the publisher host.
@@ -169,6 +173,18 @@ to a host-specific library. CI
 repairs its test-only base wheel with auditwheel before clean
 extension verification; release base wheels already come from the configured
 manylinux build.
+
+The manylinux allowlists are an unmodified snapshot of auditwheel 6.8.1 from
+commit `94e0693e0fcb444c7fe50f09a8a635e791be6174`. The bundled
+`vane_packaging/_vendor/auditwheel/manylinux-policy.json` must have SHA-256
+`104863eb197685edf6407a51ccde6cbd906be736efb959a991a60d102f1ccf96`.
+To update it, copy the policy and license from one immutable auditwheel tag,
+update the version, commit, and digest constants in
+`vane_packaging/manylinux_policy.py`, review the complete policy diff, and run
+the policy parity and Linux extension-wheel tests. Never edit the snapshot to
+make a particular artifact pass; choose a truthful tag or update to a reviewed
+upstream auditwheel policy instead.
+
 macOS 11 and later tags must use a zero minor version, Arm64 tags require macOS
 11 or later, and x86-64 macOS 10 tags are limited to the architecture-specific
 tags emitted for 10.4 through 10.16. The builder and verifier inspect each

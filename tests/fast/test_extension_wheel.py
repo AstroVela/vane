@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import platform as platform_module
 import re
@@ -27,6 +28,7 @@ from packaging.version import Version
 import scripts.verify_extension_wheel as verify_extension_wheel_module
 import vane
 import vane_packaging.extension_wheel as extension_wheel_module
+import vane_packaging.manylinux_policy as manylinux_policy_module
 from scripts import check_release_artifacts
 from scripts.verify_extension_wheel import _extension_name_from_wheel, verify_extension_wheel
 from vane.extensions import DynamicExtensionDependency, DynamicExtensionDescriptor
@@ -89,6 +91,9 @@ def _synthetic_elf(
     auxiliaries: tuple[str, ...] = (),
     soname: str | None = "synthetic.so",
     versioned_symbols: dict[str, tuple[str, ...]] | None = None,
+    undefined_symbols: tuple[str, ...] = (),
+    weak_undefined_symbols: tuple[str, ...] = (),
+    hash_style: str = "sysv",
 ) -> bytes:
     resolved_architecture = architecture
     if resolved_architecture is None:
@@ -125,6 +130,8 @@ def _synthetic_elf(
         add_string(library)
         for version in versions:
             add_string(version)
+    for symbol_name in (*undefined_symbols, *weak_undefined_symbols):
+        add_string(symbol_name)
 
     elf_header_size = 64
     program_header_size = 56
@@ -137,6 +144,7 @@ def _synthetic_elf(
         + 3
         + (soname_offset is not None)
         + (2 if requirements else 0)
+        + (3 if undefined_symbols or weak_undefined_symbols else 0)
     )
     dynamic_size = dynamic_entry_count * 16
     string_table_offset = dynamic_offset + dynamic_size
@@ -157,6 +165,33 @@ def _synthetic_elf(
             )
             version_index += 1
 
+    dynamic_symbol_padding = b"\0" * (-(version_table_offset + len(version_table)) % 8)
+    dynamic_symbol_table_offset = version_table_offset + len(version_table) + len(dynamic_symbol_padding)
+    dynamic_symbol_table = bytearray(struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0))
+    for symbol_name in undefined_symbols:
+        dynamic_symbol_table.extend(struct.pack("<IBBHQQ", string_offsets[symbol_name], 1 << 4, 0, 0, 0, 0))
+    for symbol_name in weak_undefined_symbols:
+        dynamic_symbol_table.extend(struct.pack("<IBBHQQ", string_offsets[symbol_name], 2 << 4, 0, 0, 0, 0))
+    hash_table_offset = dynamic_symbol_table_offset + len(dynamic_symbol_table)
+    symbol_count = 1 + len(undefined_symbols) + len(weak_undefined_symbols)
+    if hash_style == "sysv":
+        hash_table_tag = 4
+        hash_table = (
+            struct.pack("<II", 1, symbol_count)
+            + struct.pack("<I", 1 if symbol_count > 1 else 0)
+            + b"\0" * (4 * symbol_count)
+        )
+    elif hash_style == "gnu":
+        hash_table_tag = 0x6FFFFEF5
+        hash_table = (
+            struct.pack("<IIIIQ", 1, 1, 1, 0, 0)
+            + struct.pack("<I", 1)
+            + b"\0" * (4 * (symbol_count - 2))
+            + struct.pack("<I", 1)
+        )
+    else:
+        raise ValueError(f"unsupported synthetic ELF hash style: {hash_style}")
+
     dynamic_entries = [*(struct.pack("<qQ", 1, offset) for offset in needed_offsets)]
     dynamic_entries.extend(struct.pack("<qQ", 0x7FFFFFFF, offset) for offset in filter_offsets)
     dynamic_entries.extend(struct.pack("<qQ", 0x7FFFFFFD, offset) for offset in auxiliary_offsets)
@@ -171,8 +206,23 @@ def _synthetic_elf(
     if requirements:
         dynamic_entries.append(struct.pack("<qQ", 0x6FFFFFFE, version_table_offset))
         dynamic_entries.append(struct.pack("<qQ", 0x6FFFFFFF, len(requirements)))
+    if undefined_symbols or weak_undefined_symbols:
+        dynamic_entries.append(struct.pack("<qQ", hash_table_tag, hash_table_offset))
+        dynamic_entries.append(struct.pack("<qQ", 6, dynamic_symbol_table_offset))
+        dynamic_entries.append(struct.pack("<qQ", 11, 24))
     dynamic_entries.append(struct.pack("<qQ", 0, 0))
-    body = b"".join(dynamic_entries) + bytes(string_table) + version_table_padding + bytes(version_table) + payload
+    body = (
+        b"".join(dynamic_entries)
+        + bytes(string_table)
+        + version_table_padding
+        + bytes(version_table)
+        + (
+            dynamic_symbol_padding + bytes(dynamic_symbol_table) + hash_table
+            if undefined_symbols or weak_undefined_symbols
+            else b""
+        )
+        + payload
+    )
     file_size = dynamic_offset + len(body)
     header = struct.pack(
         "<16sHHIQQQIHHHHHH",
@@ -445,6 +495,8 @@ def _write_artifact(
     filters: tuple[str, ...] = (),
     auxiliaries: tuple[str, ...] = (),
     versioned_symbols: dict[str, tuple[str, ...]] | None = None,
+    undefined_symbols: tuple[str, ...] = (),
+    weak_undefined_symbols: tuple[str, ...] = (),
     windows_forwarded_exports: tuple[str, ...] = (),
     windows_imports: tuple[str, ...] = (),
     windows_delay_imports: tuple[str, ...] = (),
@@ -479,6 +531,8 @@ def _write_artifact(
                 filters=filters,
                 auxiliaries=auxiliaries,
                 versioned_symbols=versioned_symbols,
+                undefined_symbols=undefined_symbols,
+                weak_undefined_symbols=weak_undefined_symbols,
             )
         )
     return path
@@ -501,6 +555,8 @@ def _write_minimal_base_wheel(
     native_filters: tuple[str, ...] = (),
     native_auxiliaries: tuple[str, ...] = (),
     native_versioned_symbols: dict[str, tuple[str, ...]] | None = None,
+    native_undefined_symbols: tuple[str, ...] = (),
+    native_weak_undefined_symbols: tuple[str, ...] = (),
     native_macos_version: tuple[int, int, int] | None = None,
     native_macos_dynamic_libraries: tuple[str, ...] = (),
     native_macos_rpaths: tuple[str, ...] = (),
@@ -564,6 +620,8 @@ def _write_minimal_base_wheel(
             filters=native_filters,
             auxiliaries=native_auxiliaries,
             versioned_symbols=native_versioned_symbols,
+            undefined_symbols=native_undefined_symbols,
+            weak_undefined_symbols=native_weak_undefined_symbols,
         )
     entries = {
         "vane/py.typed": b"",
@@ -2044,6 +2102,61 @@ def test_platform_wheel_accepts_manylinux_tags_at_supported_architecture_floors(
     extension_wheel_module._validate_artifact_platform_tag(artifact_platform, platform_tag)
 
 
+@pytest.mark.parametrize(
+    ("artifact_platform", "platform_tag"),
+    [
+        ("linux_amd64", "manylinux_2_16_x86_64"),
+        ("linux_amd64", "manylinux_2_42_x86_64"),
+        ("linux_arm64", "manylinux_2_18_aarch64"),
+    ],
+)
+def test_platform_wheel_rejects_manylinux_tags_without_a_pinned_auditwheel_policy(
+    artifact_platform,
+    platform_tag,
+):
+    with pytest.raises(ValueError, match="not present in the pinned auditwheel 6.8.1 policy"):
+        extension_wheel_module._validate_artifact_platform_tag(artifact_platform, platform_tag)
+
+
+def test_manylinux_policy_snapshot_matches_every_pinned_auditwheel_policy():
+    policy_path = manylinux_policy_module.AUDITWHEEL_MANYLINUX_POLICY_PATH
+    contents = policy_path.read_bytes()
+    assert hashlib.sha256(contents).hexdigest() == manylinux_policy_module.AUDITWHEEL_MANYLINUX_POLICY_SHA256
+    upstream_policies = json.loads(contents)
+
+    expected: dict[tuple[str, tuple[int, int]], dict[str, object]] = {}
+    for raw_policy in upstream_policies:
+        if raw_policy["name"] == "linux":
+            continue
+        _family, major, minor = raw_policy["name"].split("_")
+        minimum_version = (int(major), int(minor))
+        for architecture in ("x86_64", "aarch64"):
+            if architecture not in raw_policy["symbol_versions"]:
+                continue
+            exact_symbols = frozenset(
+                f"{namespace}_{version}"
+                for namespace, versions in raw_policy["symbol_versions"][architecture].items()
+                for version in versions
+            )
+            expected[(architecture, minimum_version)] = {
+                "external_libraries": frozenset(raw_policy["lib_whitelist"]),
+                "versioned_symbols": exact_symbols,
+                "undefined_symbol_blacklist": tuple(
+                    sorted((library, frozenset(symbols)) for library, symbols in raw_policy["blacklist"].items())
+                ),
+            }
+
+    assert len(expected) == 30
+    assert manylinux_policy_module.manylinux_policy_combinations() == tuple(
+        sorted(expected, key=lambda item: (item[0], item[1]))
+    )
+    for (architecture, minimum_version), expected_policy in expected.items():
+        actual_policy = manylinux_policy_module.manylinux_policy(minimum_version, architecture)
+        assert actual_policy.external_libraries == expected_policy["external_libraries"]
+        assert actual_policy.versioned_symbols == expected_policy["versioned_symbols"]
+        assert actual_policy.undefined_symbol_blacklist == expected_policy["undefined_symbol_blacklist"]
+
+
 def test_platform_wheel_rejects_an_artifact_built_for_newer_glibc(tmp_path, monkeypatch):
     artifact = _write_artifact(
         tmp_path / "sample.duckdb_extension",
@@ -2130,6 +2243,90 @@ def test_linux_platform_policy_tracks_only_the_highest_glibc_requirement():
         "manylinux_2_39_x86_64",
         description="test artifact",
     ) == (2, 39)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "platform_tag", "glibc_version"),
+    [
+        ("x86_64", "manylinux_2_17_x86_64", "2.17.999"),
+        ("x86_64", "manylinux_2_5_x86_64", "2.1"),
+    ],
+)
+def test_linux_platform_policy_requires_exact_glibc_symbol_membership(
+    architecture,
+    platform_tag,
+    glibc_version,
+):
+    contents = _synthetic_elf(
+        architecture=architecture,
+        glibc_version=glibc_version,
+    )
+
+    with pytest.raises(ValueError, match=rf"glibc {re.escape(glibc_version)}.*exact platform policy"):
+        extension_wheel_module._validate_linux_elf_platform(
+            contents,
+            platform_tag,
+            description="test artifact",
+        )
+
+
+def test_linux_platform_policy_computes_the_glibc_floor_separately_from_exact_membership():
+    contents = _synthetic_elf(
+        architecture="aarch64",
+        glibc_version="2.18",
+    )
+
+    assert extension_wheel_module._validate_linux_elf_platform(
+        contents,
+        "manylinux_2_17_aarch64",
+        description="test artifact",
+    ) == (2, 18)
+
+
+@pytest.mark.parametrize("hash_style", ["sysv", "gnu"])
+def test_linux_platform_policy_rejects_auditwheel_blacklisted_undefined_symbols(hash_style):
+    contents = _synthetic_elf(
+        architecture="x86_64",
+        needed=("libz.so.1",),
+        undefined_symbols=("_dist_code",),
+        hash_style=hash_style,
+    )
+
+    with pytest.raises(ValueError, match=r"blacklisted undefined ELF symbols.*libz\.so\.1.*_dist_code"):
+        extension_wheel_module._validate_linux_elf_platform(
+            contents,
+            "manylinux_2_17_x86_64",
+            description="test artifact",
+        )
+
+
+def test_linux_platform_policy_ignores_weak_and_unprovided_blacklisted_symbols():
+    weak_contents = _synthetic_elf(
+        architecture="x86_64",
+        needed=("libz.so.1",),
+        weak_undefined_symbols=("_dist_code",),
+    )
+    assert (
+        extension_wheel_module._validate_linux_elf_platform(
+            weak_contents,
+            "manylinux_2_17_x86_64",
+            description="test artifact",
+        )
+        is None
+    )
+
+    unrelated_contents = _synthetic_elf(
+        architecture="x86_64",
+        undefined_symbols=("_dist_code",),
+    )
+    assert (
+        extension_wheel_module._validate_linux_elf_platform(
+            unrelated_contents,
+            "manylinux_2_17_x86_64",
+            description="test artifact",
+        )
+        is None
+    )
 
 
 def test_linux_platform_policy_allows_only_policy_shared_libraries():
@@ -2310,6 +2507,65 @@ def test_linux_platform_policy_rejects_an_out_of_bounds_needed_name():
         )
 
 
+def test_linux_platform_policy_bounds_the_sysv_dynamic_symbol_count():
+    contents = bytearray(
+        _synthetic_elf(
+            architecture="x86_64",
+            undefined_symbols=("_dist_code",),
+        )
+    )
+    dynamic_offset = 64 + 2 * 56
+    for entry_offset in range(dynamic_offset, len(contents), 16):
+        tag, value = struct.unpack_from("<qQ", contents, entry_offset)
+        if tag == 4:
+            struct.pack_into("<I", contents, value + 4, extension_wheel_module._MAX_ELF_DYNAMIC_SYMBOLS + 1)
+            break
+    else:
+        raise AssertionError("synthetic ELF has no DT_HASH entry")
+
+    with pytest.raises(ValueError, match="invalid or excessive ELF SysV hash dimensions"):
+        extension_wheel_module._validate_linux_elf_platform(
+            bytes(contents),
+            "manylinux_2_17_x86_64",
+            description="test artifact",
+        )
+
+
+def test_linux_platform_policy_bounds_the_gnu_dynamic_symbol_chain():
+    contents = bytearray(
+        _synthetic_elf(
+            architecture="x86_64",
+            undefined_symbols=("_dist_code",),
+            hash_style="gnu",
+        )
+    )
+    dynamic_offset = 64 + 2 * 56
+    for entry_offset in range(dynamic_offset, len(contents), 16):
+        tag, hash_table_offset = struct.unpack_from("<qQ", contents, entry_offset)
+        if tag == 0x6FFFFEF5:
+            bucket_count, symbol_offset, bloom_size, _bloom_shift = struct.unpack_from(
+                "<IIII",
+                contents,
+                hash_table_offset,
+            )
+            buckets_offset = hash_table_offset + 16 + 8 * bloom_size
+            last_symbol = max(
+                struct.unpack_from("<I", contents, buckets_offset + index * 4)[0] for index in range(bucket_count)
+            )
+            chain_offset = buckets_offset + 4 * bucket_count + 4 * (last_symbol - symbol_offset)
+            struct.pack_into("<I", contents, chain_offset, 0)
+            break
+    else:
+        raise AssertionError("synthetic ELF has no DT_GNU_HASH entry")
+
+    with pytest.raises(ValueError, match="unterminated or excessive ELF GNU hash chain"):
+        extension_wheel_module._validate_linux_elf_platform(
+            bytes(contents),
+            "manylinux_2_17_x86_64",
+            description="test artifact",
+        )
+
+
 def test_linux_platform_policy_bounds_the_version_needed_file_count():
     contents = bytearray(
         _synthetic_elf(
@@ -2358,6 +2614,71 @@ def test_platform_wheel_rejects_an_unbundled_private_elf_dependency(tmp_path, mo
             tmp_path,
             artifact_path=artifact,
             platform_tag="manylinux_2_17_x86_64",
+        )
+
+
+def test_platform_wheel_rejects_a_blacklisted_undefined_symbol(tmp_path, monkeypatch):
+    artifact = _write_artifact(
+        tmp_path / "sample.duckdb_extension",
+        architecture="x86_64",
+        needed=("libz.so.1",),
+        undefined_symbols=("_dist_code",),
+    )
+
+    def create_descriptor(path, *, name, trust_identity, dependencies):
+        return _descriptor(
+            path,
+            name=name,
+            trust_identity=trust_identity,
+            platform="linux_amd64",
+            dependencies=dependencies,
+        )
+
+    monkeypatch.setattr(extension_wheel_module, "_create_descriptor", create_descriptor)
+
+    with pytest.raises(ValueError, match=r"blacklisted undefined ELF symbols.*libz\.so\.1.*_dist_code"):
+        _build_sample_wheel(
+            tmp_path,
+            artifact_path=artifact,
+            platform_tag="manylinux_2_17_x86_64",
+        )
+
+
+def test_platform_wheel_revalidates_blacklisted_symbols_in_dependency_artifacts(tmp_path, monkeypatch):
+    def create_descriptor(path, *, name, trust_identity, dependencies):
+        return _descriptor(
+            path,
+            name=name,
+            trust_identity=trust_identity,
+            platform="linux_amd64",
+            dependencies=dependencies,
+        )
+
+    monkeypatch.setattr(extension_wheel_module, "_create_descriptor", create_descriptor)
+    dependency_artifact = _write_artifact(
+        tmp_path / "dependency.duckdb_extension",
+        b"dependency",
+        architecture="x86_64",
+        needed=("libz.so.1",),
+        undefined_symbols=("_dist_code",),
+    )
+    with monkeypatch.context() as bypass:
+        bypass.setattr(extension_wheel_module, "_validate_linux_elf_platform", lambda *_args, **_kwargs: None)
+        dependency = build_extension_wheel(
+            artifact=dependency_artifact,
+            extension_name="dependency",
+            output_directory=tmp_path / "dependency-dist",
+            platform_tag="manylinux_2_17_x86_64",
+            trust_identity=TEST_TRUST_IDENTITY,
+            license_expression="Apache-2.0",
+            license_files=[REPOSITORY_ROOT / "LICENSE"],
+        )
+
+    with pytest.raises(ValueError, match=r"blacklisted undefined ELF symbols.*libz\.so\.1.*_dist_code"):
+        _build_sample_wheel(
+            tmp_path,
+            platform_tag="manylinux_2_17_x86_64",
+            dependencies=(dependency.path,),
         )
 
 
@@ -3288,6 +3609,23 @@ def test_clean_verifier_rejects_an_unbundled_private_base_elf_dependency(tmp_pat
         )
 
 
+def test_clean_verifier_rejects_a_blacklisted_undefined_symbol_in_a_base_member(tmp_path):
+    base_wheel = _write_minimal_base_wheel(
+        tmp_path,
+        platform_tag="manylinux_2_17_x86_64",
+        native_needed=("libz.so.1",),
+        native_undefined_symbols=("_dist_code",),
+    )
+
+    with pytest.raises(RuntimeError, match=r"blacklisted undefined ELF symbols.*libz\.so\.1.*_dist_code"):
+        verify_extension_wheel_module._assert_base_wheel(
+            base_wheel,
+            expected_vane_version=vane.__version__,
+            required_interpreter_tag=_extension_interpreter_tag(),
+            required_platform_tag="manylinux_2_17_x86_64",
+        )
+
+
 def test_clean_verifier_rejects_a_newer_base_elf_symbol_policy(tmp_path):
     base_wheel = _write_minimal_base_wheel(
         tmp_path,
@@ -3474,7 +3812,6 @@ def test_clean_verifier_requires_a_matching_native_base_interpreter_tag(tmp_path
         ("manylinux_2_28_x86_64", "manylinux_2_17_x86_64", False),
         ("manylinux_2_17_x86_64", "manylinux_2_28_x86_64", True),
         ("manylinux2014_x86_64", "manylinux_2_17_x86_64", True),
-        ("manylinux2014_x86_64", "manylinux_2_16_x86_64", False),
         ("musllinux_1_1_x86_64", "musllinux_1_2_x86_64", False),
         ("musllinux_1_2_x86_64", "musllinux_1_1_x86_64", False),
         ("musllinux_1_2_x86_64", "musllinux_2_0_x86_64", False),
