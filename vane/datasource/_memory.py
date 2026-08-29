@@ -88,6 +88,13 @@ def _as_arrow_table(source: Any, source_kind: str) -> Any:
 
     if source_kind == "pandas":
         return pa.Table.from_pandas(source, preserve_index=False)
+    if source_kind == "numpy":
+        if not isinstance(source, dict):
+            raise TypeError(f"NumPy memory source must be normalized to a dict, got {type(source).__name__}")
+        return pa.Table.from_arrays(
+            [pa.array(column, from_pandas=True) for column in source.values()],
+            names=[str(name) for name in source],
+        )
     if source_kind != "arrow":
         raise ValueError(f"Unsupported Python memory source kind: {source_kind!r}")
 
@@ -107,9 +114,82 @@ def _select_memory_source_columns(source: Any, source_kind: str, column_indices:
 
     if source_kind == "pandas":
         return source.iloc[:, list(column_indices)]
+    if source_kind == "numpy":
+        source_names = tuple(source)
+        return {source_names[column_index]: source[source_names[column_index]] for column_index in column_indices}
     if isinstance(source, (pa.Table, pa.RecordBatch)):
         return source.select(column_indices)
     return source
+
+
+def _truncating_integer_divide(values: Any, divisor: int) -> Any:
+    import numpy as np
+
+    quotient = np.abs(values) // divisor
+    return np.where(values < 0, -quotient, quotient)
+
+
+def _duration_to_month_day_nano(column: Any) -> Any:
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    array = column.combine_chunks()
+    validity = pc.is_valid(array).to_numpy(zero_copy_only=False)
+    values = pc.fill_null(array.view(pa.int64()), 0).to_numpy(zero_copy_only=False)
+    if array.type.unit == "ns":
+        microseconds = _truncating_integer_divide(values, 1_000)
+    elif array.type.unit == "us":
+        microseconds = values
+    elif array.type.unit == "ms":
+        microseconds = values * 1_000
+    elif array.type.unit == "s":
+        microseconds = values * 1_000_000
+    else:
+        raise TypeError(f"Unsupported duration unit for a Python memory source: {array.type.unit!r}")
+
+    microseconds_per_day = 24 * 60 * 60 * 1_000_000
+    days = _truncating_integer_divide(microseconds, microseconds_per_day)
+    remaining_microseconds = microseconds - days * microseconds_per_day
+    months = _truncating_integer_divide(days, 30)
+    remaining_days = days - months * 30
+
+    intervals: Any = np.empty(
+        len(array),
+        dtype=[("months", np.int32), ("days", np.int32), ("nanoseconds", np.int64)],
+    )
+    intervals["months"] = months
+    intervals["days"] = remaining_days
+    intervals["nanoseconds"] = remaining_microseconds * 1_000
+    validity_buffer = None
+    if not validity.all():
+        validity_buffer = pa.py_buffer(np.packbits(validity, bitorder="little"))
+    return pa.Array.from_buffers(
+        pa.month_day_nano_interval(),
+        len(array),
+        [validity_buffer, pa.py_buffer(intervals)],
+        null_count=int(len(array) - validity.sum()),
+    )
+
+
+def _coerce_pandas_scan_table(table: Any, expected_schema: Any) -> Any:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    columns = []
+    for column_index, column in enumerate(table.columns):
+        expected_type = expected_schema.field(column_index).type
+        if pa.types.is_duration(column.type) and expected_type == pa.month_day_nano_interval():
+            column = _duration_to_month_day_nano(column)
+        elif (
+            pa.types.is_timestamp(column.type) and pa.types.is_timestamp(expected_type) and column.type != expected_type
+        ):
+            # pandas_scan intentionally stores TIMESTAMP_TZ at microsecond
+            # precision. Match its truncation semantics for finer input units.
+            column = pc.cast(column, expected_type, safe=False)
+        columns.append(column)
+    normalized = pa.Table.from_arrays(columns, names=table.column_names)
+    return normalized.cast(expected_schema, safe=True)
 
 
 def _materialize_partition_column(column: Any) -> Any:
@@ -144,8 +224,8 @@ def _snapshot_and_put_memory_source(
         )
     if table.column_names != expected_names:
         table = table.rename_columns(expected_names)
-    if source_kind == "pandas":
-        table = table.cast(expected_schema, safe=True)
+    if source_kind in {"pandas", "numpy"}:
+        table = _coerce_pandas_scan_table(table, expected_schema)
 
     if table.num_rows == 0:
         partition_ranges = [(0, 0)]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pickle
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -360,6 +361,80 @@ def test_pandas_categorical_memory_source_preserves_enum_semantics(connection):
         "blue",
         "red",
         "red",
+    ]
+
+
+def test_numpy_memory_source_uses_normalized_dictionary_columns(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    source = {  # noqa: F841 - resolved by DuckDB's replacement scan
+        "id": np.array([1, 2, 3]),
+        "label": np.array(["b", "a", "b"]),
+        "metric": np.array([1.0, np.nan, 3.0]),
+    }
+    relation = connection.sql("SELECT id, label, metric FROM source")
+
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    rows = list(
+        zip(
+            result.column(0).to_pylist(),
+            result.column(1).to_pylist(),
+            result.column(2).to_pylist(),
+            strict=True,
+        )
+    )
+
+    assert rows == [(1, "b", 1.0), (2, "a", None), (3, "b", 3.0)]
+
+
+def test_pandas_timezone_memory_source_truncates_nanoseconds_like_pandas_scan(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    connection.execute("SET TimeZone = 'UTC'")
+    base = pd.Timestamp("2024-01-01T00:00:00Z")
+    before_epoch = pd.Timestamp("1970-01-01T00:00:00Z") - pd.Timedelta(1_999, unit="ns")
+    source = pd.DataFrame(
+        {
+            "event_time": pd.Series(
+                [before_epoch, base + pd.Timedelta(1, unit="ns"), base + pd.Timedelta(1_999, unit="ns"), pd.NaT],
+                dtype="datetime64[ns, UTC]",
+            )
+        }
+    )
+    relation = connection.from_df(source).project("event_time")
+
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+    values = result.column(0).combine_chunks().cast(pa.int64()).to_pylist()
+
+    assert result.column(0).type == pa.timestamp("us", tz="UTC")
+    assert values == [-1, base.value // 1_000, (base.value + 1_999) // 1_000, None]
+
+
+def test_pandas_timedelta_memory_source_matches_duckdb_interval_normalization(connection):
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    source = pd.DataFrame(
+        {
+            "duration": pd.Series(
+                [
+                    pd.Timedelta(1, unit="ns"),
+                    pd.Timedelta(days=31, microseconds=5, nanoseconds=999),
+                    pd.Timedelta(-1_001, unit="ns"),
+                    pd.NaT,
+                ],
+                dtype="timedelta64[ns]",
+            )
+        }
+    )
+    relation = connection.from_df(source).project("duration")
+
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == [
+        pa.MonthDayNano((0, 0, 0)),
+        pa.MonthDayNano((1, 1, 5_000)),
+        pa.MonthDayNano((0, 0, -1_000)),
+        None,
     ]
 
 
