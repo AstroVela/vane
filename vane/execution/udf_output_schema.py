@@ -95,7 +95,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "hugeint": pa.string,
         "uhugeint": pa.string,
         "bignum": pa.string,
-        "uuid": lambda: pa.binary(16),
+        "uuid": pa.string,
         "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
         "time with time zone": pa.string,
     }

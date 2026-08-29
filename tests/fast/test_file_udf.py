@@ -792,6 +792,28 @@ def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
     assert output[0].column("identifier").to_pylist() == [str(identifier), str(identifier)]
 
 
+def test_eager_batch_file_udf_uses_stable_uuid_sibling_transport():
+    import pyarrow as pa
+
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+    output_type = vane.type("STRUCT(document FILE, identifier UUID)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array([identifier] * len(values)),
+            ],
+            names=["document", "identifier"],
+        )
+
+    result = build_document(pa.array([1], type=pa.int32()))
+
+    assert result.type.field("identifier").type == pa.string()
+    assert result.to_pylist() == [{"document": _file_record(), "identifier": str(identifier)}]
+
+
 def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
     import pyarrow as pa
 
