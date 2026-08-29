@@ -125,16 +125,48 @@ def test_repeated_pandas_source_is_snapshotted_once(connection, monkeypatch):
     assert sorted(len(batches) for batches in physical.scan_split_batch_map().values()) == [1, 1]
 
 
-def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connection):
+def test_rebound_mutated_pandas_source_preserves_each_snapshot(connection, monkeypatch):
+    from vane.datasource import _memory
+
+    source = pd.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
+    left = connection.from_df(source).set_alias("left_source")
+    source["value"] = [100, 200, 300]
+    right = connection.from_df(source).set_alias("right_source")
+    snapshots = []
+    original = _memory._as_arrow_table
+
+    def capture_snapshot(value, source_kind):
+        if source_kind == "pandas":
+            snapshots.append(tuple(value["value"]))
+        return original(value, source_kind)
+
+    monkeypatch.setattr(_memory, "_as_arrow_table", capture_snapshot)
+    relation = left.union(right)
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "versioned-pandas-memory-source")
+
+    assert snapshots == [(10, 20, 30), (100, 200, 300)]
+    assert logical._memory_source_ref_count_for_test() == 2
+
+
+def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connection, monkeypatch):
     row_count = 1_200_000
-    relation = connection.from_arrow(
-        pa.table(
-            {
-                "id": pa.array(range(row_count), type=pa.int64()),
-                "value": pa.array(range(row_count), type=pa.int64()),
-            }
-        )
+    source = pa.table(
+        {
+            "id": pa.array(range(row_count), type=pa.int64()),
+            "value": pa.array(range(row_count), type=pa.int64()),
+        }
     )
+    relation = connection.from_arrow(source)
+    put_partitions = []
+    original_put = ray.put
+
+    def capture_partition(value):
+        if isinstance(value, pa.Table):
+            put_partitions.append(value)
+        return original_put(value)
+
+    monkeypatch.setattr(ray, "put", capture_partition)
 
     logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "partitioned-arrow-memory-source")
     physical = logical.to_physical_plan(connection)
@@ -143,6 +175,8 @@ def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connectio
     assert logical._memory_source_ref_count_for_test() == 2
     assert physical._memory_source_ref_count_for_test() == 2
     assert [len(batches) for batches in physical.scan_split_batch_map().values()] == [2]
+    assert len(put_partitions) == 2
+    assert sum(partition.get_total_buffer_size() for partition in put_partitions) == source.get_total_buffer_size()
 
 
 def test_pandas_and_arrow_memory_relations_execute_through_ray(connection):

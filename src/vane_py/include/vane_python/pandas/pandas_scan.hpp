@@ -66,6 +66,11 @@ public:
 	//! planner uses this object to deduplicate snapshots by source identity.
 	static py::object GetDataFrameSourceIdentity(const FunctionData &bind_data);
 
+	//! Return a process-local fingerprint of the buffers retained by this
+	//! binding. Equal fingerprints mean separate shallow copies are known to
+	//! scan the same DataFrame version.
+	static string GetDataFrameSourceVersion(const FunctionData &bind_data);
+
 	static void PandasBackendScanSwitch(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out);
 
 	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,

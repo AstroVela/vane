@@ -261,6 +261,58 @@ py::object PandasScanFunction::GetDataFrameSourceIdentity(const FunctionData &bi
 	return py::reinterpret_borrow<py::object>(python_dependency->object->obj);
 }
 
+static void AppendPandasSourceVersionUInt64(string &result, uint64_t value) {
+	for (idx_t byte_idx = 0; byte_idx < sizeof(value); byte_idx++) {
+		result.push_back(static_cast<char>((value >> (byte_idx * 8)) & 0xff));
+	}
+}
+
+static void AppendPandasSourceVersionString(string &result, const string &value) {
+	AppendPandasSourceVersionUInt64(result, value.size());
+	result.append(value);
+}
+
+static void AppendPandasSourceVersionArray(string &result, const py::array &array) {
+	AppendPandasSourceVersionUInt64(result, reinterpret_cast<uintptr_t>(array.data()));
+	AppendPandasSourceVersionUInt64(result, array.ndim());
+	AppendPandasSourceVersionUInt64(result, array.itemsize());
+	for (py::ssize_t dimension = 0; dimension < array.ndim(); dimension++) {
+		AppendPandasSourceVersionUInt64(result, array.shape(dimension));
+		AppendPandasSourceVersionUInt64(result, array.strides(dimension));
+	}
+	AppendPandasSourceVersionString(result, string(py::str(array.dtype())));
+}
+
+string PandasScanFunction::GetDataFrameSourceVersion(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	string result;
+	AppendPandasSourceVersionUInt64(result, data.row_count);
+
+	auto column_names = py::list(data.df.attr("keys")());
+	AppendPandasSourceVersionUInt64(result, column_names.size());
+	for (auto column_name : column_names) {
+		AppendPandasSourceVersionString(result, string(py::str(column_name)));
+	}
+	for (auto &sql_type : data.sql_types) {
+		AppendPandasSourceVersionString(result, sql_type.ToString());
+	}
+
+	AppendPandasSourceVersionUInt64(result, data.pandas_bind_data.size());
+	for (auto &column : data.pandas_bind_data) {
+		auto numpy_column = dynamic_cast<PandasNumpyColumn *>(column.pandas_col.get());
+		if (!numpy_column) {
+			throw InternalException("Pandas scan source version requires a NumPy-backed column");
+		}
+		AppendPandasSourceVersionArray(result, numpy_column->array);
+		AppendPandasSourceVersionUInt64(result, column.mask ? 1 : 0);
+		if (column.mask) {
+			AppendPandasSourceVersionArray(result, column.mask->numpy_array);
+		}
+	}
+	return result;
+}
+
 void PandasScanFunction::PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                                          const TableFunction &function) {
 	throw NotImplementedException("PandasScan function cannot be serialized");
