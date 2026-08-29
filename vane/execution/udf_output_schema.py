@@ -176,7 +176,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         if _duckdb_pytype_contains_file(dt):
             raise ValueError("UNION values containing FILE are not supported at Python UDF boundaries")
         return pa.union(
-            [pa.field(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children],
+            [pa.field(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children if name],
             mode="sparse",
         )
     if type_id == "map":

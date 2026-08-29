@@ -2257,7 +2257,10 @@ def test_file_output_contract_uses_resolved_type_instead_of_serialized_alias():
     )
 
     assert contract.has_file_outputs
-    assert str(contract.output_types[0]) == "STRUCT(document FILE, flags BIT)"
+    assert [(name, str(dtype)) for name, dtype in contract.output_types[0].children] == [
+        ("document", "FILE"),
+        ("flags", "BIT"),
+    ]
 
 
 def test_file_input_contract_precedes_catalog_local_alias_text():

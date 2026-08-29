@@ -2677,6 +2677,9 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::FlatMap(
 
 	// Single column or no schema: keep the original behavior
 	project_exprs.push_back(std::move(func_expr));
+	if (output_names.size() == 1) {
+		aliases.push_back(output_names[0]);
+	}
 	auto relation = make_uniq<DuckDBPyRelation>(rel->Project(std::move(project_exprs), aliases));
 	relation->connection_owner = connection_owner;
 	auto rel_dependency = make_uniq<ExternalDependency>();
