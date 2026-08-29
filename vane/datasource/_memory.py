@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 _TARGET_PARTITION_BYTES = 16 * 1024 * 1024
@@ -17,7 +18,7 @@ class _ArrowStreamCapsule:
     def __init__(self, capsule: Any) -> None:
         self._capsule = capsule
 
-    def __arrow_c_stream__(self, requested_schema=None):
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         del requested_schema
         return self._capsule
 
@@ -29,7 +30,7 @@ class _RayMemorySourceTask:
         self.source_id = str(source_id)
         self.object_ref = object_ref
 
-    def execute(self):
+    def execute(self) -> Iterator[Any]:
         import pyarrow as pa
         import ray
 
@@ -41,7 +42,7 @@ class _RayMemorySourceTask:
         yield from partition.to_batches()
 
 
-def _as_arrow_table(source: Any, source_kind: str):
+def _as_arrow_table(source: Any, source_kind: str) -> Any:
     import pyarrow as pa
 
     if source_kind == "pandas":
@@ -85,7 +86,9 @@ def _as_arrow_table(source: Any, source_kind: str):
     return table
 
 
-def _snapshot_and_put_memory_source(source: Any, source_kind: str, source_id: str, expected_schema: Any):
+def _snapshot_and_put_memory_source(
+    source: Any, source_kind: str, source_id: str, expected_schema: Any
+) -> tuple[Any, list[Any], list[_RayMemorySourceTask]]:
     """Materialize one canonical Arrow snapshot and put it in Ray exactly once."""
 
     import pyarrow as pa
