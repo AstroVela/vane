@@ -213,6 +213,44 @@ def test_rebound_mutated_arrow_backed_pandas_source_preserves_each_snapshot(conn
     assert logical._memory_source_ref_count_for_test() == 2
 
 
+def test_rebound_mutated_nested_dictionary_arrow_backed_pandas_preserves_each_snapshot(connection, monkeypatch):
+    from vane.datasource import _memory
+
+    indices = pa.array([0, 1], type=pa.int8())
+    offsets = pa.array([0, 1, 2], type=pa.int32())
+
+    def nested_dictionary(values):
+        dictionary = pa.DictionaryArray.from_arrays(indices, pa.array(values))
+        return pa.ListArray.from_arrays(offsets, dictionary)
+
+    original_array = nested_dictionary(["old-a", "old-b"])
+    updated_array = nested_dictionary(["new-a", "new-b"])
+    assert original_array.buffers() == updated_array.buffers()
+
+    arrow_type = pd.ArrowDtype(original_array.type)
+    source = pd.DataFrame({"value": pd.Series(original_array, dtype=arrow_type)})
+    left = connection.from_df(source).set_alias("left_source")
+    source["value"] = pd.Series(updated_array, dtype=arrow_type)
+    right = connection.from_df(source).set_alias("right_source")
+    snapshots = []
+    original = _memory._as_arrow_table
+
+    def capture_snapshot(value, source_kind):
+        if source_kind == "arrow":
+            snapshots.append(value["value"].to_pylist())
+        return original(value, source_kind)
+
+    monkeypatch.setattr(_memory, "_as_arrow_table", capture_snapshot)
+    relation = left.union(right)
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
+        relation, "versioned-nested-dictionary-arrow-backed-pandas-memory-source"
+    )
+
+    assert snapshots == [[["old-a"], ["old-b"]], [["new-a"], ["new-b"]]]
+    assert logical._memory_source_ref_count_for_test() == 2
+
+
 def test_pandas_snapshot_prunes_unreferenced_unconvertible_columns(connection, monkeypatch):
     from vane.datasource import _memory
 
@@ -354,6 +392,36 @@ def test_dictionary_arrow_partitions_trim_unused_dictionary_values(connection, m
     assert [
         partition_dictionary[0].as_py() for partition_dictionary in partition_dictionaries
     ] == dictionary.to_pylist()
+
+
+@pytest.mark.parametrize("container_kind", ["list", "struct", "map"])
+def test_nested_dictionary_partition_materialization_trims_unused_values(container_kind):
+    from vane.datasource import _memory
+
+    dictionary = pa.array([f"category-{index}-" + "x" * 64 for index in range(3)])
+    values = pa.DictionaryArray.from_arrays(pa.array(range(3), type=pa.int8()), dictionary)
+    if container_kind == "list":
+        array = pa.ListArray.from_arrays(pa.array(range(4), type=pa.int32()), values)
+    elif container_kind == "struct":
+        array = pa.StructArray.from_arrays([values], names=["category"])
+    else:
+        array = pa.MapArray.from_arrays(
+            pa.array(range(4), type=pa.int32()),
+            pa.array([f"key-{index}" for index in range(3)]),
+            values,
+        )
+
+    column = pa.chunked_array([array])
+    materialized = [_memory._materialize_partition_column(column.slice(index, 1)) for index in range(3)]
+    if container_kind == "list":
+        dictionaries = [item.values.dictionary for item in materialized]
+    elif container_kind == "struct":
+        dictionaries = [item.field("category").dictionary for item in materialized]
+    else:
+        dictionaries = [item.items.dictionary for item in materialized]
+
+    assert [len(item) for item in dictionaries] == [1, 1, 1]
+    assert [item[0].as_py() for item in dictionaries] == dictionary.to_pylist()
 
 
 def test_pandas_memory_scan_rewrite_preserves_join_cardinality(connection):
@@ -545,6 +613,22 @@ def test_pandas_map_object_memory_source_preserves_bound_type(connection):
     result = pa.concat_tables(list(runner.run_iter_tables(relation)))
 
     assert result.column(0).to_pylist() == [[("a", 1), ("b", 2)], None, []]
+
+
+def test_pandas_file_object_memory_source_preserves_bound_type(connection):
+    values = [
+        vane.File("memory://first", "text/plain", 1, 2, "sha256:first"),
+        None,
+        vane.File("memory://second"),
+    ]
+    source = pd.DataFrame({"file": pd.Series(values, dtype=object)})
+    relation = connection.from_df(source).project("file_path(file) AS path")
+
+    runners.set_runner_ray(noop_if_initialized=True)
+    runner = runners.get_or_create_runner()
+    result = pa.concat_tables(list(runner.run_iter_tables(relation)))
+
+    assert result.column(0).to_pylist() == ["memory://first", None, "memory://second"]
 
 
 @pytest.mark.parametrize("source_kind", ["dataset", "scanner"])
