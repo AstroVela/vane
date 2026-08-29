@@ -151,6 +151,15 @@ def _mapping_field_value(
     return value[matches[0]] if matches else None
 
 
+def _is_arrow_string_storage(dtype: pa.DataType) -> bool:
+    is_string_view = getattr(pa.types, "is_string_view", None)
+    return (
+        pa.types.is_string(dtype)
+        or pa.types.is_large_string(dtype)
+        or (callable(is_string_view) and is_string_view(dtype))
+    )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -170,7 +179,7 @@ def _validate_arrow_storage_type(
                     valid_file_type = False
                     break
                 if name in ("url", "content_type", "checksum"):
-                    field_matches = pa.types.is_string(field.type) or pa.types.is_large_string(field.type)
+                    field_matches = _is_arrow_string_storage(field.type)
                 else:
                     field_matches = pa.types.is_int64(field.type)
                 if not field_matches:
@@ -290,9 +299,7 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
         return True
     if isinstance(actual, pa.ExtensionType) and actual.storage_type.equals(expected):
         return True
-    if (pa.types.is_string(actual) or pa.types.is_large_string(actual)) and (
-        pa.types.is_string(expected) or pa.types.is_large_string(expected)
-    ):
+    if _is_arrow_string_storage(actual) and _is_arrow_string_storage(expected):
         return True
     if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
         pa.types.is_binary(expected) or pa.types.is_large_binary(expected)
@@ -703,11 +710,7 @@ def _normalize_file_arrow_array(
                 encoded.append(str(value))
             elif isinstance(value, (bytes, bytearray, memoryview)):
                 raw_value = bytes(value)
-                encoded.append(
-                    str(UUID(bytes=raw_value))
-                    if pa.types.is_fixed_size_binary(source.type) and source.type.byte_width == 16
-                    else raw_value.decode()
-                )
+                encoded.append(str(UUID(bytes=raw_value)) if len(raw_value) == 16 else raw_value.decode())
             else:
                 encoded.append(str(value))
         return pa.array(encoded, type=pa.string())

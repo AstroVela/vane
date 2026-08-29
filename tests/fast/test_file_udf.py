@@ -600,6 +600,33 @@ def test_batch_file_udf_accepts_chunked_eager_output():
     assert result.to_pylist() == values.to_pylist()
 
 
+def test_batch_file_udf_accepts_string_view_storage():
+    import pyarrow as pa
+
+    string_view = getattr(pa, "string_view", None)
+    if string_view is None:
+        pytest.skip("PyArrow does not expose string_view")
+    file_type = pa.struct(
+        [
+            pa.field("url", string_view()),
+            pa.field("content_type", string_view()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", string_view()),
+        ]
+    )
+
+    @vane.func.batch(return_dtype=vane.file_type())
+    def identity(values):
+        return values
+
+    values = pa.array([_file_record()], type=file_type)
+    result = identity(values)
+
+    assert result.type.equals(_file_arrow_type())
+    assert result.to_pylist() == values.to_pylist()
+
+
 def test_map_batches_normalizes_file_storage_across_output_batches():
     import cloudpickle
     import pyarrow as pa
@@ -709,7 +736,8 @@ def test_map_batches_normalizes_file_siblings_across_output_batches(nested):
         ]
 
 
-def test_map_batches_preserves_duckdb_casts_for_non_file_columns():
+@pytest.mark.parametrize("raw_uuid_bytes", [False, True], ids=["varchar", "blob"])
+def test_map_batches_preserves_duckdb_casts_for_non_file_columns(raw_uuid_bytes):
     identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
 
     def build_output(table):
@@ -739,7 +767,10 @@ def test_map_batches_preserves_duckdb_casts_for_non_file_columns():
                     * table.num_rows,
                     type=file_type,
                 ),
-                "identifier": pa.array(["00112233-4455-6677-8899-aabbccddeeff"] * table.num_rows),
+                "identifier": pa.array(
+                    [identifier.bytes if raw_uuid_bytes else str(identifier)] * table.num_rows,
+                    type=pa.binary() if raw_uuid_bytes else pa.string(),
+                ),
             }
         )
 
