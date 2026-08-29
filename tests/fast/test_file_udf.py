@@ -627,6 +627,65 @@ def test_batch_file_udf_accepts_string_view_storage():
     assert result.to_pylist() == values.to_pylist()
 
 
+def test_batch_file_udf_accepts_list_view_storage():
+    import pyarrow as pa
+
+    list_view_array = getattr(pa, "ListViewArray", None)
+    if list_view_array is None:
+        pytest.skip("PyArrow does not expose ListViewArray")
+    files = pa.array(
+        [
+            _file_record(url="memory://first"),
+            _file_record(url="memory://second"),
+            _file_record(url="memory://third"),
+        ],
+        type=_file_arrow_type(),
+    )
+    views = list_view_array.from_arrays(
+        pa.array([1, 0, 0], type=pa.int32()),
+        pa.array([2, 2, 1], type=pa.int32()),
+        files,
+        mask=pa.array([False, True, False]),
+    )
+
+    @vane.func.batch(return_dtype=vane.list_type(vane.file_type()))
+    def identity(_values):
+        return views
+
+    result = identity(pa.array([1, 2, 3], type=pa.int32()))
+
+    assert result.type.equals(pa.list_(_file_arrow_type()))
+    assert result.to_pylist() == [
+        [_file_record(url="memory://second"), _file_record(url="memory://third")],
+        None,
+        [_file_record(url="memory://first")],
+    ]
+
+
+def test_batch_file_udf_accepts_binary_view_sibling_storage():
+    import pyarrow as pa
+
+    binary_view = getattr(pa, "binary_view", None)
+    if binary_view is None:
+        pytest.skip("PyArrow does not expose binary_view")
+    output_type = vane.type("STRUCT(document FILE, payload BLOB)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array([b"payload"] * len(values), type=binary_view()),
+            ],
+            names=["document", "payload"],
+        )
+
+    result = build_document(pa.array([1], type=pa.int32()))
+
+    assert result.type.field("payload").type == pa.binary()
+    assert result.to_pylist() == [{"document": _file_record(), "payload": b"payload"}]
+
+
 def test_map_batches_normalizes_file_storage_across_output_batches():
     import cloudpickle
     import pyarrow as pa

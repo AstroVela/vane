@@ -20,6 +20,7 @@ from typing import Any
 from uuid import UUID
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
+import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
@@ -160,6 +161,26 @@ def _is_arrow_string_storage(dtype: pa.DataType) -> bool:
     )
 
 
+def _is_arrow_binary_storage(dtype: pa.DataType) -> bool:
+    is_binary_view = getattr(pa.types, "is_binary_view", None)
+    return (
+        pa.types.is_binary(dtype)
+        or pa.types.is_large_binary(dtype)
+        or (callable(is_binary_view) and is_binary_view(dtype))
+    )
+
+
+def _is_arrow_list_storage(dtype: pa.DataType) -> bool:
+    is_list_view = getattr(pa.types, "is_list_view", None)
+    is_large_list_view = getattr(pa.types, "is_large_list_view", None)
+    return (
+        pa.types.is_list(dtype)
+        or pa.types.is_large_list(dtype)
+        or (callable(is_list_view) and is_list_view(dtype))
+        or (callable(is_large_list_view) and is_large_list_view(dtype))
+    )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -193,7 +214,7 @@ def _validate_arrow_storage_type(
 
     type_id = _type_id(dtype)
     if type_id == "list":
-        if not (pa.types.is_list(actual) or pa.types.is_large_list(actual)):
+        if not _is_arrow_list_storage(actual):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow list type")
         _validate_arrow_storage_type(
             actual.value_type,
@@ -301,9 +322,7 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
         return True
     if _is_arrow_string_storage(actual) and _is_arrow_string_storage(expected):
         return True
-    if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
-        pa.types.is_binary(expected) or pa.types.is_large_binary(expected)
-    ):
+    if _is_arrow_binary_storage(actual) and _is_arrow_binary_storage(expected):
         return True
     if pa.types.is_signed_integer(actual) and pa.types.is_signed_integer(expected):
         return expected.bit_width >= actual.bit_width
@@ -363,16 +382,12 @@ def _validate_file_arrow_values(
                 )
         return
     if type_id == "list":
-        start, length, offsets = _child_window(array)
-        child_active = [
-            is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
-        ]
+        source = _mask_inactive(array, active)
         _validate_file_arrow_values(
-            array.values.slice(start, length),
+            pc.list_flatten(source),
             _sequence_child(dtype),
             boundary=boundary,
             path=f"{path}[]",
-            parent_active=child_active,
         )
         return
     if type_id == "array":
@@ -747,17 +762,17 @@ def _normalize_file_arrow_array(
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
 
     if type_id == "list":
-        start, length, offsets = _child_window(array)
+        source = _mask_inactive(array, active)
+        lengths = [0 if length is None else int(length) for length in pc.list_value_length(source).to_pylist()]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
         child_array = _normalize_file_arrow_array(
-            array.values.slice(start, length),
+            pc.list_flatten(source),
             _sequence_child(dtype),
             boundary=boundary,
-            parent_active=[
-                is_active for index, is_active in enumerate(active) for _ in range(offsets[index + 1] - offsets[index])
-            ],
         )
-        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
-        return pa.ListArray.from_arrays(normalized_offsets, child_array, mask=array.is_null())
+        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=source.is_null())
 
     if type_id == "array":
         array_size = int(_type_children(dtype)["size"])
@@ -795,6 +810,8 @@ def _normalize_file_arrow_array(
         expected = _arrow_type_from_duckdb_pytype(dtype)
     except Exception:
         return source
+    if source.null_count == len(source):
+        return pa.nulls(len(source), type=expected)
     if not _arrow_cast_preserves_values(source.type, expected, dtype):
         # Cross-type casts belong to DuckDB. Arrow may accept a cast while
         # assigning it different semantics (for example BLOB to VARCHAR).
