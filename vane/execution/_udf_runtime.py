@@ -735,6 +735,7 @@ class UDFExecutor:
 
     def _iter_flat_map_output_tables(self, args: pa.Table) -> Iterable[pa.Table]:
         args = self._rename_args(args)
+        self._file_contract.validate_input_table(args)
         output_rows: list[dict[str, Any]] = []
         output_row_bytes = 0
         output_buffer = RuntimeOutputBuffer(self._output_batch_size, self._output_target_max_bytes)
@@ -759,7 +760,17 @@ class UDFExecutor:
                 yield from flush_output_rows()
 
         for batch in batches:
-            for row_dict in _iter_table_row_dicts(batch):
+            input_rows: Iterable[dict[str, Any]]
+            if self._file_contract.has_file_inputs:
+                columns = self._file_contract.materialize_scalar_inputs(batch)
+                names = batch.schema.names
+                input_rows = (
+                    {name: column[row_idx] for name, column in zip(names, columns, strict=True)}
+                    for row_idx in range(batch.num_rows)
+                )
+            else:
+                input_rows = _iter_table_row_dicts(batch)
+            for row_dict in input_rows:
                 result = ensure_synchronous_udf_result(self._map_fn(row_dict))
                 if result is None:
                     continue
@@ -787,9 +798,10 @@ class UDFExecutor:
 
     def _flat_map_rows_to_table(self, rows: list[dict[str, Any]]) -> pa.Table:
         if self._output_names:
-            arrays = {name: [row.get(name) for row in rows] for name in self._output_names}
-            return pa.table(arrays)
-        return pa.Table.from_pylist(rows)
+            return self._file_contract.native_output_rows_to_table(rows, self._output_names)
+        table = pa.Table.from_pylist(rows)
+        self._file_contract.validate_output_table(table)
+        return table
 
     def _default_null_handling(self) -> bool:
         return self._null_handling == _DEFAULT_NULL_HANDLING

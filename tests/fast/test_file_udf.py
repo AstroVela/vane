@@ -216,6 +216,94 @@ def test_batch_file_udf_rejects_invalid_input_before_user_code(tmp_path):
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("mode", ["map_batches", "flat_map"])
+def test_relation_table_file_udf_rejects_invalid_input_before_user_code(tmp_path, mode):
+    marker = tmp_path / "called"
+
+    def observe_batch(table):
+        Path(marker).write_text("called", encoding="utf-8")
+        import pyarrow as pa
+
+        return pa.table({"result": [1] * table.num_rows})
+
+    def observe_row(_row):
+        Path(marker).write_text("called", encoding="utf-8")
+        return {"result": 1}
+
+    connection = vane.connect()
+    connection.execute("CREATE TABLE invalid_relation_file_udf_input(value FILE)")
+    connection.execute(
+        """
+        INSERT INTO invalid_relation_file_udf_input
+        SELECT struct_pack(
+            url := NULL::VARCHAR,
+            content_type := NULL::VARCHAR,
+            "position" := NULL::BIGINT,
+            size := NULL::BIGINT,
+            checksum := NULL::VARCHAR
+        )
+        """
+    )
+    source = connection.table("invalid_relation_file_udf_input")
+    if mode == "map_batches":
+        result = source.map_batches(
+            observe_batch,
+            schema={"result": vane.sqltypes.INTEGER},
+            execution_backend="subprocess_task",
+        )
+    else:
+        result = source.flat_map(
+            observe_row,
+            schema={"result": vane.sqltypes.INTEGER},
+            execution_backend="subprocess_task",
+        )
+
+    with pytest.raises(Exception, match=r"invalid FILE value"):
+        result.fetchall()
+    assert not marker.exists()
+
+
+def test_flat_map_file_udf_materializes_and_returns_file_values():
+    def copy_file(row):
+        assert isinstance(row["value"], vane.File)
+        return {"value": row["value"]}
+
+    connection = vane.connect()
+    source = connection.sql("SELECT file('memory://flat-map', NULL, NULL, NULL, NULL) AS value")
+    result = source.flat_map(
+        copy_file,
+        schema={"value": vane.file_type()},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.types[0].is_file()
+    assert result.fetchall() == [(vane.File("memory://flat-map"),)]
+
+
+def test_flat_map_file_udf_rejects_structural_output_fallback():
+    def invalid_output(_row):
+        return {
+            "value": {
+                "url": "memory://udf",
+                "content_type": "application/octet-stream",
+                "position": 0,
+                "size": 3,
+                "checksum": "sha256:abc",
+            }
+        }
+
+    connection = vane.connect()
+    source = connection.sql("SELECT 1 AS value")
+    result = source.flat_map(
+        invalid_output,
+        schema={"value": vane.file_type()},
+        execution_backend="subprocess_task",
+    )
+
+    with pytest.raises(Exception, match=r"must be vane\.File or NULL"):
+        result.fetchall()
+
+
 def test_batch_file_udf_accepts_chunked_eager_output():
     import pyarrow as pa
 

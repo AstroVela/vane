@@ -470,6 +470,41 @@ class FileUDFContract:
         except Exception:
             raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
 
+    def native_output_rows_to_table(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        output_names: Sequence[str],
+    ) -> pa.Table:
+        """Encode row-native outputs while preserving declared FILE leaves."""
+        if not self.has_file_outputs:
+            return pa.table({name: [row.get(name) for row in rows] for name in output_names})
+
+        boundary = f"UDF {self.udf_name!r} output"
+        if len(output_names) != len(self.output_types):
+            raise _invalid_input(
+                f"{boundary} declares {len(self.output_types)} columns but has {len(output_names)} output names"
+            )
+
+        arrays: dict[str, Any] = {}
+        for index, name in enumerate(output_names):
+            values = [row.get(name) for row in rows]
+            dtype = self.output_types[index]
+            if dtype is None:
+                arrays[name] = values
+                continue
+            canonical = [
+                _canonicalize_native_output(value, dtype, boundary=boundary, path=f"row {row_index}")
+                for row_index, value in enumerate(values)
+            ]
+            try:
+                arrays[name] = pa.array(canonical, type=_expected_arrow_type(dtype, boundary=boundary))
+            except Exception:
+                raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
+
+        table = pa.table(arrays)
+        self.validate_output_table(table)
+        return table
+
     def validate_output_table(self, table: pa.Table) -> None:
         if not self.has_file_outputs:
             return

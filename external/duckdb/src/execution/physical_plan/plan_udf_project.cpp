@@ -152,8 +152,9 @@ static vector<Value> UDFLogicalTypesToStringValues(const vector<LogicalType> &ty
 	return values;
 }
 
-static Value AddUDFLayoutPayload(const Value &payload, const vector<LogicalType> &argument_types,
-                                 const vector<LogicalType> &passthrough_types, const LogicalType &return_type) {
+static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &argument_types,
+                               const vector<LogicalType> &passthrough_types, const LogicalType &return_type,
+                               bool include_row_preserving_layout) {
 	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
 		throw InternalException("udf layout payload must be a struct");
 	}
@@ -177,7 +178,10 @@ static Value AddUDFLayoutPayload(const Value &payload, const vector<LogicalType>
 	auto &children = StructValue::GetChildren(payload);
 	auto &payload_type = payload.type();
 	child_list_t<Value> new_children;
-	vector<string> fields {"scalar_arg_count", "input_types", "ref_output_types"};
+	vector<string> fields {"input_types"};
+	if (include_row_preserving_layout) {
+		fields = {"scalar_arg_count", "input_types", "ref_output_types"};
+	}
 
 	for (idx_t i = 0; i < StructType::GetChildCount(payload_type); i++) {
 		auto child_name = StructType::GetChildName(payload_type, i);
@@ -362,15 +366,15 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalUDFProject &op) {
 	bind_data.payload = RequireUDFStreamingOutput(std::move(bind_data.payload));
 
 	auto &plan = CreatePlan(*op.children[0]);
-	if (op.is_scalar_map || op.is_row_preserving_batch) {
-		auto child_types = plan.GetTypes();
-		vector<LogicalType> argument_types;
-		argument_types.reserve(bound.children.size());
-		for (auto &child : bound.children) {
-			argument_types.push_back(child->return_type);
-		}
-		bind_data.payload = AddUDFLayoutPayload(bind_data.payload, argument_types, child_types, bind_data.return_type);
+	auto child_types = plan.GetTypes();
+	vector<LogicalType> argument_types;
+	argument_types.reserve(bound.children.size());
+	for (auto &child : bound.children) {
+		argument_types.push_back(child->return_type);
 	}
+	const bool include_row_preserving_layout = op.is_scalar_map || op.is_row_preserving_batch;
+	bind_data.payload = AddUDFTypePayload(bind_data.payload, argument_types, child_types, bind_data.return_type,
+	                                      include_row_preserving_layout);
 
 	// Build the serializable TableFunction descriptor consumed by
 	// PhysicalStreamingUDF.
