@@ -12,7 +12,7 @@ row UDFs without changing generic STRUCT behavior.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +57,17 @@ def _contains_file(dtype: Any | None) -> bool:
     if type_id in ("struct", "union", "map"):
         return any(_contains_file(child) for _, child in dtype.children)
     return False
+
+
+def _native_map_key_is_hashable(dtype: Any) -> bool:
+    if _is_file_type(dtype):
+        return True
+    type_id = _type_id(dtype)
+    if type_id in ("list", "struct", "map", "union"):
+        return False
+    if type_id == "array":
+        return _native_map_key_is_hashable(_sequence_child(dtype))
+    return True
 
 
 def contains_file_type(dtype: Any) -> bool:
@@ -288,6 +299,10 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
     if type_id in ("list", "array"):
         if not isinstance(value, (list, tuple)):
             raise _invalid_input(f"{boundary} value at {path} must be a sequence")
+        if type_id == "array":
+            expected_size = int(_type_children(dtype)["size"])
+            if len(value) != expected_size:
+                raise _invalid_input(f"{boundary} value at {path} must have fixed size {expected_size}")
         child = _sequence_child(dtype)
         return [
             _canonicalize_native_output(item, child, boundary=boundary, path=f"{path}[{index}]")
@@ -304,28 +319,132 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
                 )
         return result
     if type_id == "map":
-        if not isinstance(value, Mapping):
-            raise _invalid_input(f"{boundary} MAP value at {path} must be a mapping")
         children = _type_children(dtype)
-        entries: Iterable[tuple[Any, Any]]
+        entries: Any
         if (
-            set(value) == {"key", "value"}
+            isinstance(value, Mapping)
+            and set(value) == {"key", "value"}
             and isinstance(value["key"], (list, tuple))
             and isinstance(value["value"], (list, tuple))
+            and not _native_map_key_is_hashable(children["key"])
         ):
-            entries = zip(value["key"], value["value"], strict=True)
-        else:
+            keys = value["key"]
+            items = value["value"]
+            if len(keys) != len(items):
+                raise _invalid_input(f"{boundary} MAP value at {path} must contain equally sized key/value lists")
+            entries = zip(keys, items)
+        elif isinstance(value, Mapping):
             entries = value.items()
-        return [
-            (
-                _canonicalize_native_output(key, children["key"], boundary=boundary, path=f"{path}[{index}].key"),
-                _canonicalize_native_output(item, children["value"], boundary=boundary, path=f"{path}[{index}].value"),
+        elif isinstance(value, (list, tuple)):
+            entries = value
+        else:
+            raise _invalid_input(f"{boundary} MAP value at {path} must be a mapping or sequence of pairs")
+        canonical_pairs: list[tuple[Any, Any]] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, Sequence) or isinstance(entry, (str, bytes, bytearray)) or len(entry) != 2:
+                raise _invalid_input(f"{boundary} MAP value at {path} must contain key/value pairs")
+            key, item = entry
+            canonical_pairs.append(
+                (
+                    _canonicalize_native_output(
+                        key,
+                        children["key"],
+                        boundary=boundary,
+                        path=f"{path}[{index}].key",
+                    ),
+                    _canonicalize_native_output(
+                        item,
+                        children["value"],
+                        boundary=boundary,
+                        path=f"{path}[{index}].value",
+                    ),
+                )
             )
-            for index, (key, item) in enumerate(entries)
-        ]
+        return canonical_pairs
     if type_id == "union":
         raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
     return value
+
+
+def _canonical_values_to_arrow_array(
+    values: Sequence[Any],
+    dtype: Any,
+    *,
+    boundary: str,
+) -> pa.Array:
+    """Encode canonical values while typing only branches that contain FILE."""
+    if _is_file_type(dtype):
+        return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
+    if not _contains_file(dtype):
+        try:
+            expected_type = _arrow_type_from_duckdb_pytype(dtype)
+        except Exception:
+            return pa.array(values)
+        return pa.array(values, type=expected_type)
+
+    type_id = _type_id(dtype)
+    null_mask = pa.array([value is None for value in values], type=pa.bool_())
+    if type_id == "struct":
+        arrays = []
+        names = []
+        for name, child in dtype.children:
+            names.append(name)
+            child_values = [None if value is None else value.get(name) for value in values]
+            arrays.append(_canonical_values_to_arrow_array(child_values, child, boundary=boundary))
+        return pa.StructArray.from_arrays(arrays, names=names, mask=null_mask)
+
+    if type_id == "list":
+        offsets = [0]
+        flattened = []
+        for value in values:
+            if value is not None:
+                flattened.extend(value)
+            offsets.append(len(flattened))
+        child = _sequence_child(dtype)
+        child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
+        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=null_mask)
+
+    if type_id == "array":
+        child = _sequence_child(dtype)
+        array_size = int(_type_children(dtype)["size"])
+        flattened = []
+        for value in values:
+            flattened.extend([None] * array_size if value is None else value)
+        child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
+        return pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=null_mask)
+
+    if type_id == "map":
+        offsets = [0]
+        keys = []
+        items = []
+        for value in values:
+            if value is not None:
+                for key, item in value:
+                    keys.append(key)
+                    items.append(item)
+            offsets.append(len(keys))
+        children = _type_children(dtype)
+        key_array = _canonical_values_to_arrow_array(keys, children["key"], boundary=boundary)
+        item_array = _canonical_values_to_arrow_array(items, children["value"], boundary=boundary)
+        return pa.MapArray.from_arrays(
+            pa.array(offsets, type=pa.int32()),
+            key_array,
+            item_array,
+            mask=null_mask,
+        )
+
+    raise _invalid_input(f"{boundary} uses an unsupported type containing FILE: {dtype}")
+
+
+def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundary: str) -> pa.Array:
+    canonical = [
+        _canonicalize_native_output(value, dtype, boundary=boundary, path=f"row {row_index}")
+        for row_index, value in enumerate(values)
+    ]
+    try:
+        return _canonical_values_to_arrow_array(canonical, dtype, boundary=boundary)
+    except Exception:
+        raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
 
 
 def validate_file_arrow_array(
@@ -461,14 +580,7 @@ class FileUDFContract:
             raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
         dtype = self.output_types[0]
         boundary = f"UDF {self.udf_name!r} output"
-        canonical = [
-            _canonicalize_native_output(value, dtype, boundary=boundary, path=f"row {row}")
-            for row, value in enumerate(outputs)
-        ]
-        try:
-            return pa.array(canonical, type=_expected_arrow_type(dtype, boundary=boundary))
-        except Exception:
-            raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
+        return _native_outputs_to_arrow_array(outputs, dtype, boundary=boundary)
 
     def native_output_rows_to_table(
         self,
@@ -492,14 +604,7 @@ class FileUDFContract:
             if dtype is None:
                 arrays[name] = values
                 continue
-            canonical = [
-                _canonicalize_native_output(value, dtype, boundary=boundary, path=f"row {row_index}")
-                for row_index, value in enumerate(values)
-            ]
-            try:
-                arrays[name] = pa.array(canonical, type=_expected_arrow_type(dtype, boundary=boundary))
-            except Exception:
-                raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
+            arrays[name] = _native_outputs_to_arrow_array(values, dtype, boundary=boundary)
 
         table = pa.table(arrays)
         self.validate_output_table(table)

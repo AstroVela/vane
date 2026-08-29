@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -302,6 +304,128 @@ def test_flat_map_file_udf_rejects_structural_output_fallback():
 
     with pytest.raises(Exception, match=r"must be vane\.File or NULL"):
         result.fetchall()
+
+
+def test_flat_map_file_udf_infers_non_file_composite_siblings():
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+    created_at = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    output_type = vane.type(
+        "STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, empty_id UUID, empty_created_at TIMESTAMPTZ)"
+    )
+
+    def build_document(_row):
+        return {
+            "payload": {
+                "document": vane.File("memory://composite"),
+                "id": identifier,
+                "created_at": created_at,
+                "empty_id": None,
+                "empty_created_at": None,
+            }
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").flat_map(
+        build_document,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+
+    payload = result.fetchone()[0]
+    assert dict(result.types[0].children)["document"].is_file()
+    assert payload["document"] == vane.File("memory://composite")
+    assert payload["id"] == identifier
+    assert payload["created_at"].astimezone(timezone.utc) == created_at
+    assert payload["empty_id"] is None
+    assert payload["empty_created_at"] is None
+
+
+def test_scalar_file_udf_preserves_non_file_composite_siblings():
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+    created_at = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://scalar-composite"),
+            "id": identifier,
+            "created_at": created_at,
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    payload = result.fetchone()[0]
+    assert dict(result.types[0].children)["document"].is_file()
+    assert payload["document"] == vane.File("memory://scalar-composite")
+    assert payload["id"] == identifier
+    assert payload["created_at"].astimezone(timezone.utc) == created_at
+
+
+def test_empty_flat_map_file_udf_preserves_composite_output_type():
+    output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, wide UHUGEINT)")
+
+    def emit_nothing(_row):
+        return None
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").flat_map(
+        emit_nothing,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+
+    assert dict(result.types[0].children)["document"].is_file()
+    assert result.fetchall() == []
+
+
+def test_flat_map_file_udf_preserves_map_keys_named_key_and_value():
+    output_type = vane.map_type(vane.sqltypes.VARCHAR, vane.list_type(vane.file_type()))
+
+    def build_map(_row):
+        return {
+            "files": {
+                "key": [vane.File("memory://key")],
+                "value": [vane.File("memory://value")],
+            }
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").flat_map(
+        build_map,
+        schema={"files": output_type},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.fetchone()[0] == {
+        "key": [vane.File("memory://key")],
+        "value": [vane.File("memory://value")],
+    }
+
+
+def test_flat_map_file_udf_roundtrips_parallel_map_representation():
+    output_type = vane.map_type(vane.list_type(vane.file_type()), vane.sqltypes.VARCHAR)
+
+    def copy_map(row):
+        assert row["files"] == {
+            "key": [[vane.File("memory://key")]],
+            "value": ["document"],
+        }
+        return {"files": row["files"]}
+
+    connection = vane.connect()
+    source = connection.sql("SELECT map([[file('memory://key', NULL, NULL, NULL, NULL)]], ['document']) AS files")
+    result = source.flat_map(
+        copy_map,
+        schema={"files": output_type},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.fetchone()[0] == {
+        "key": [[vane.File("memory://key")]],
+        "value": ["document"],
+    }
 
 
 def test_batch_file_udf_accepts_chunked_eager_output():

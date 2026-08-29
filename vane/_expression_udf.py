@@ -165,6 +165,15 @@ def _canonicalize_dtype(dtype: Any) -> tuple[Any, Any]:
         raise _invalid_input(
             f"dtype must be a SQL type string, DuckDBPyType, or supported pyarrow.DataType; got {type(dtype).__name__}"
         )
+    from vane.execution.udf_file_contract import contains_file_type
+
+    if contains_file_type(duckdb_type):
+        from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
+
+        try:
+            return duckdb_type, _arrow_type_from_duckdb_pytype(duckdb_type)
+        except Exception as exc:
+            raise _unsupported_dtype(dtype) from exc
     return duckdb_type, _duckdb_to_arrow_type(duckdb_type, original=dtype)
 
 

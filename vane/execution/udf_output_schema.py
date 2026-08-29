@@ -90,6 +90,8 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "interval": lambda: pa.duration("us"),
         "json": pa.string,
         "hugeint": lambda: pa.decimal128(38, 0),
+        "uuid": lambda: pa.binary(16),
+        "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
     }
     factory = basic.get(type_id)
     if factory is not None:
@@ -131,12 +133,35 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
 def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
     if not output_schema:
         raise ValueError("empty UDF output requires payload.output_schema")
-    arrays = {}
-    for entry in output_schema:
+    entries = list(output_schema)
+    for entry in entries:
         if not isinstance(entry, dict):
             raise ValueError("payload.output_schema entries must be dicts")
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    file_contract = FileUDFContract.from_payload({"udf_name": "<empty>", "output_schema": entries})
+    output_names = [str(entry.get("name") or "") for entry in entries]
+    file_table = file_contract.native_output_rows_to_table([], output_names) if file_contract.has_file_outputs else None
+
+    arrays = {}
+    for index, entry in enumerate(entries):
         name = str(entry.get("name") or "")
-        arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
+        if file_table is not None and file_contract.output_types[index] is not None:
+            arrays[name] = file_table.column(index)
+            continue
+        try:
+            arrays[name] = pa.array([], type=_arrow_type_from_output_schema_entry(entry))
+        except Exception:
+            if file_table is None:
+                raise
+            kind = str(entry.get("kind") or "duckdb_type").strip().lower()
+            if kind != "duckdb_type":
+                raise
+            import vane
+
+            vane.type(str(entry.get("type") or ""))
+            arrays[name] = file_table.column(index)
     return pa.table(arrays)
 
 
