@@ -742,6 +742,29 @@ struct PyPhysicalPlanWrapper {
 		auto level = simple ? duckdb::distributed::DisplayLevel::Compact : duckdb::distributed::DisplayLevel::Default;
 		return duckdb::distributed::viz_distributed_pipeline_mermaid(pipeline_node, level, bottom_up, "");
 	}
+	py::dict datasource_scan_cardinalities_for_test() const {
+		if (!IsInitialized() || !plan_ || !plan_->physical_plan() || !plan_->physical_plan()->HasRoot()) {
+			throw duckdb::InternalException("DistributedPhysicalPlan has no physical plan root");
+		}
+		py::dict result;
+		std::function<void(const PhysicalOperator &)> collect = [&](const PhysicalOperator &op) {
+			if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+				auto &scan = op.Cast<PhysicalTableScan>();
+				if (scan.function.name == "datasource_scan") {
+					py::tuple names(scan.names.size());
+					for (idx_t name_idx = 0; name_idx < scan.names.size(); name_idx++) {
+						names[name_idx] = py::str(scan.names[name_idx]);
+					}
+					result[names] = py::int_(op.estimated_cardinality);
+				}
+			}
+			for (auto &child : op.GetInputChildren()) {
+				collect(child.get());
+			}
+		};
+		collect(plan_->physical_plan()->Root());
+		return result;
+	}
 	py::dict scan_split_batch_map() const {
 		py::dict out;
 		if (!IsInitialized()) {

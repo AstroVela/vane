@@ -134,11 +134,6 @@ struct SerializedLogicalPlanResult {
 	py::object memory_source_refs = py::none();
 };
 
-struct PreparedPythonMemorySource {
-	py::object object_refs;
-	unique_ptr<DataSourceScanBindData> bind_data;
-};
-
 struct PythonMemorySourceCacheKey {
 	PyObject *source_identity;
 	string source_version;
@@ -148,6 +143,25 @@ struct PythonMemorySourceCacheKey {
 	}
 };
 
+struct PythonMemoryScanSource {
+	string source_kind;
+	py::object source = py::none();
+	py::object source_identity = py::none();
+	string source_version;
+};
+
+struct PreparedPythonMemorySource {
+	string source_kind;
+	py::object source = py::none();
+	py::object source_identity = py::none();
+	vector<LogicalType> source_types;
+	vector<string> source_names;
+	std::set<idx_t> required_columns;
+	vector<idx_t> snapshot_columns;
+	py::object snapshot_schema = py::none();
+	py::object object_refs = py::none();
+};
+
 struct PythonMemorySourceCacheKeyHash {
 	size_t operator()(const PythonMemorySourceCacheKey &key) const {
 		auto identity_hash = std::hash<PyObject *> {}(key.source_identity);
@@ -155,6 +169,10 @@ struct PythonMemorySourceCacheKeyHash {
 		return identity_hash ^ (version_hash + 0x9e3779b9 + (identity_hash << 6) + (identity_hash >> 2));
 	}
 };
+
+using PythonMemorySourceGroups = std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
+                                                    PythonMemorySourceCacheKeyHash>;
+using PythonMemoryScanGroups = std::unordered_map<LogicalGet *, PreparedPythonMemorySource *>;
 
 static idx_t PythonMemorySourceObjectRefCount(const py::object &memory_source_refs) {
 	if (memory_source_refs.is_none()) {
@@ -170,7 +188,7 @@ static idx_t PythonMemorySourceObjectRefCount(const py::object &memory_source_re
 	return count;
 }
 
-static py::object PythonArrowScanSource(const LogicalGet &get) {
+static RegisteredArrow &PythonArrowScanRegisteredSource(const LogicalGet &get) {
 	if (!get.bind_data) {
 		throw InvalidInputException("Python Arrow scan is missing bind data");
 	}
@@ -183,93 +201,249 @@ static py::object PythonArrowScanSource(const LogicalGet &get) {
 	if (!registered_arrow || registered_arrow->obj.is_none()) {
 		throw InvalidInputException("Ray cannot snapshot an Arrow scan without its registered Python object");
 	}
-	return py::reinterpret_borrow<py::object>(registered_arrow->obj);
+	return *registered_arrow;
 }
 
-static py::object PythonMemorySourceExpectedArrowSchema(ClientContext &context, const LogicalGet &get) {
+static string PythonMemorySourceVersionBytes(const py::object &version) {
+	if (!py::isinstance<py::bytes>(version)) {
+		throw InternalException("Python memory source version helper must return bytes");
+	}
+	char *data = nullptr;
+	Py_ssize_t size = 0;
+	if (PyBytes_AsStringAndSize(version.ptr(), &data, &size) != 0) {
+		throw py::error_already_set();
+	}
+	return string(data, NumericCast<idx_t>(size));
+}
+
+static bool TryGetPythonMemoryScanSource(const LogicalGet &get, const py::object &memory_module,
+                                         PythonMemoryScanSource &result) {
+	if (get.function.name == "pandas_scan") {
+		if (!get.bind_data) {
+			throw InvalidInputException("Python Pandas scan is missing bind data");
+		}
+		result.source_kind = "pandas";
+		result.source = PandasScanFunction::GetDataFrame(*get.bind_data);
+		result.source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
+		result.source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
+		return true;
+	}
+	if (get.function.name != "arrow_scan" && get.function.name != "arrow_scan_dumb") {
+		return false;
+	}
+
+	result.source_kind = "arrow";
+	auto &registered_arrow = PythonArrowScanRegisteredSource(get);
+	result.source = py::reinterpret_borrow<py::object>(registered_arrow.obj);
+	if (registered_arrow.source_identity.is_none()) {
+		result.source_identity = result.source;
+	} else {
+		result.source_identity = py::reinterpret_borrow<py::object>(registered_arrow.source_identity);
+		result.source_version =
+		    PythonMemorySourceVersionBytes(memory_module.attr("_arrow_source_version")(result.source));
+	}
+	return true;
+}
+
+static py::object PythonMemorySourceExpectedArrowSchema(ClientContext &context, const vector<LogicalType> &types,
+                                                        const vector<string> &names) {
 	ArrowSchema arrow_schema;
 	auto client_properties = context.GetClientProperties();
-	ArrowConverter::ToArrowSchema(&arrow_schema, get.returned_types, get.names, client_properties);
+	ArrowConverter::ToArrowSchema(&arrow_schema, types, names, client_properties);
 	auto pyarrow_lib = py::module_::import("pyarrow").attr("lib");
 	return pyarrow_lib.attr("Schema").attr("_import_from_c")(reinterpret_cast<uint64_t>(&arrow_schema));
 }
 
-static void ValidateMemorySourceSnapshotTypes(const LogicalGet &get, DataSourceScanBindData &bind_data,
+static void ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expected_types,
+                                              const vector<string> &expected_names, DataSourceScanBindData &bind_data,
                                               const string &source_kind) {
 	auto snapshot_types = bind_data.arrow_table.GetTypes();
-	if (snapshot_types.size() != get.returned_types.size()) {
+	if (snapshot_types.size() != expected_types.size()) {
 		throw InvalidInputException("Ray %s memory snapshot produced %llu columns, expected %llu", source_kind,
-		                            snapshot_types.size(), get.returned_types.size());
+		                            snapshot_types.size(), expected_types.size());
 	}
 	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
-		if (snapshot_types[column_idx] == get.returned_types[column_idx]) {
+		if (snapshot_types[column_idx] == expected_types[column_idx]) {
 			continue;
 		}
 		throw InvalidInputException(
 		    "Ray %s memory snapshot changed column '%s' from %s to %s; convert the source to a PyArrow table with an "
 		    "explicit schema before distributed execution",
-		    source_kind, get.names[column_idx], get.returned_types[column_idx].ToString(),
+		    source_kind, expected_names[column_idx], expected_types[column_idx].ToString(),
 		    snapshot_types[column_idx].ToString());
 	}
 }
 
-static void
-RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &memory_source_refs,
-                         std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
-                                            PythonMemorySourceCacheKeyHash> &prepared_sources) {
+static bool ContainsPythonMemoryScan(const LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
-		string source_kind;
-		py::object source = py::none();
-		py::object source_identity = py::none();
-		string source_version;
-		if (get.function.name == "pandas_scan") {
-			if (!get.bind_data) {
-				throw InvalidInputException("Python Pandas scan is missing bind data");
-			}
-			source_kind = "pandas";
-			source = PandasScanFunction::GetDataFrame(*get.bind_data);
-			source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
-			source_version = PandasScanFunction::GetDataFrameSourceVersion(*get.bind_data);
-		} else if (get.function.name == "arrow_scan" || get.function.name == "arrow_scan_dumb") {
-			source_kind = "arrow";
-			source = PythonArrowScanSource(get);
-			source_identity = source;
+		if (get.function.name == "pandas_scan" || get.function.name == "arrow_scan" ||
+		    get.function.name == "arrow_scan_dumb") {
+			return true;
 		}
+	}
+	for (auto &child : op.children) {
+		if (ContainsPythonMemoryScan(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
 
-		if (!source_kind.empty()) {
-			PythonMemorySourceCacheKey source_key {source_identity.ptr(), std::move(source_version)};
-			auto prepared_entry = prepared_sources.find(source_key);
-			if (prepared_entry == prepared_sources.end()) {
-				auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
-				auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, get);
-				auto memory_module = py::module_::import("vane.datasource._memory");
-				auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
-				    source, py::str(source_kind), py::str(source_id), expected_arrow_schema);
-				if (!py::isinstance<py::tuple>(prepared_obj)) {
-					throw InternalException("Python memory snapshot helper must return a tuple");
-				}
-				auto prepared_tuple = prepared_obj.cast<py::tuple>();
-				if (prepared_tuple.size() != 3) {
-					throw InternalException("Python memory snapshot helper must return schema, ObjectRefs, and tasks");
-				}
-				auto arrow_schema = py::reinterpret_borrow<py::object>(prepared_tuple[0]);
-				auto object_refs = py::reinterpret_borrow<py::object>(prepared_tuple[1]);
-				auto tasks = py::reinterpret_borrow<py::object>(prepared_tuple[2]);
-				auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, arrow_schema, tasks);
-				ValidateMemorySourceSnapshotTypes(get, *bind_data, source_kind);
+static vector<idx_t> PythonMemoryScanColumnIds(const LogicalGet &get) {
+	vector<idx_t> result;
+	auto &column_ids = get.GetColumnIds();
+	if (column_ids.empty()) {
+		result.push_back(get.GetAnyColumn());
+		return result;
+	}
+	result.reserve(column_ids.size());
+	for (auto &column_id : column_ids) {
+		if (!column_id.HasPrimaryIndex() || column_id.IsVirtualColumn() || column_id.IsPushdownExtract()) {
+			throw NotImplementedException(
+			    "Ray Python memory snapshots do not support virtual or pushed-down nested columns");
+		}
+		auto source_column_id = column_id.GetPrimaryIndex();
+		if (source_column_id >= get.returned_types.size()) {
+			throw InternalException("Python memory scan column index is out of range");
+		}
+		result.push_back(source_column_id);
+	}
+	return result;
+}
 
+static void CollectPythonMemoryScans(LogicalOperator &op, const py::object &memory_module,
+                                     PythonMemorySourceGroups &source_groups, PythonMemoryScanGroups &scan_groups) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		PythonMemoryScanSource source;
+		if (TryGetPythonMemoryScanSource(get, memory_module, source)) {
+			PythonMemorySourceCacheKey source_key {source.source_identity.ptr(), source.source_version};
+			auto source_entry = source_groups.find(source_key);
+			if (source_entry == source_groups.end()) {
 				auto prepared = make_uniq<PreparedPythonMemorySource>();
-				prepared->object_refs = std::move(object_refs);
-				prepared->bind_data = std::move(bind_data);
-				memory_source_refs[py::str(source_id)] = prepared->object_refs;
-				prepared_entry = prepared_sources.emplace(std::move(source_key), std::move(prepared)).first;
-			} else {
-				ValidateMemorySourceSnapshotTypes(get, *prepared_entry->second->bind_data, source_kind);
+				prepared->source_kind = source.source_kind;
+				prepared->source = std::move(source.source);
+				prepared->source_identity = std::move(source.source_identity);
+				prepared->source_types = get.returned_types;
+				prepared->source_names = get.names;
+				source_entry = source_groups.emplace(std::move(source_key), std::move(prepared)).first;
+			} else if (source_entry->second->source_kind != source.source_kind ||
+			           source_entry->second->source_types != get.returned_types ||
+			           source_entry->second->source_names != get.names) {
+				throw InvalidInputException("Repeated Python memory source bindings have incompatible schemas");
 			}
 
+			auto source_columns = PythonMemoryScanColumnIds(get);
+			for (auto source_column : source_columns) {
+				source_entry->second->required_columns.insert(source_column);
+			}
+			scan_groups.emplace(&get, source_entry->second.get());
+		}
+	}
+
+	for (auto &child : op.children) {
+		CollectPythonMemoryScans(*child, memory_module, source_groups, scan_groups);
+	}
+}
+
+static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, ClientContext &context,
+                                      const py::object &memory_module, py::dict &memory_source_refs) {
+	if (!prepared.object_refs.is_none()) {
+		return;
+	}
+	prepared.snapshot_columns.assign(prepared.required_columns.begin(), prepared.required_columns.end());
+	if (prepared.snapshot_columns.empty()) {
+		throw InternalException("Python memory source snapshot has no referenced columns");
+	}
+
+	vector<LogicalType> snapshot_types;
+	vector<string> snapshot_names;
+	py::tuple column_indices(prepared.snapshot_columns.size());
+	for (idx_t column_idx = 0; column_idx < prepared.snapshot_columns.size(); column_idx++) {
+		auto source_column = prepared.snapshot_columns[column_idx];
+		snapshot_types.push_back(prepared.source_types[source_column]);
+		snapshot_names.push_back(prepared.source_names[source_column]);
+		column_indices[column_idx] = py::int_(source_column);
+	}
+	auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, snapshot_types, snapshot_names);
+	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
+	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, column_indices);
+	if (!py::isinstance<py::tuple>(prepared_obj)) {
+		throw InternalException("Python memory snapshot helper must return a tuple");
+	}
+	auto prepared_tuple = prepared_obj.cast<py::tuple>();
+	if (prepared_tuple.size() != 2) {
+		throw InternalException("Python memory snapshot helper must return schema and ObjectRefs");
+	}
+	prepared.snapshot_schema = py::reinterpret_borrow<py::object>(prepared_tuple[0]);
+	prepared.object_refs = py::reinterpret_borrow<py::object>(prepared_tuple[1]);
+	auto retention_id = UUID::ToString(UUID::GenerateRandomUUID());
+	memory_source_refs[py::str(retention_id)] = prepared.object_refs;
+}
+
+static optional_idx PythonMemoryScanCardinality(LogicalGet &get, ClientContext &context) {
+	if (get.has_estimated_cardinality) {
+		return optional_idx(get.estimated_cardinality);
+	}
+	if (!get.function.cardinality) {
+		return optional_idx();
+	}
+	auto statistics = get.function.cardinality(context, get.bind_data.get());
+	if (statistics && statistics->has_estimated_cardinality) {
+		return optional_idx(statistics->estimated_cardinality);
+	}
+	return optional_idx();
+}
+
+static void RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, const py::object &memory_module,
+                                     py::dict &memory_source_refs, const PythonMemoryScanGroups &scan_groups) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto scan_entry = scan_groups.find(&get);
+		if (scan_entry != scan_groups.end()) {
+			auto &prepared = *scan_entry->second;
+			PreparePythonMemorySource(prepared, context, memory_module, memory_source_refs);
+			auto source_columns = PythonMemoryScanColumnIds(get);
+			vector<LogicalType> selected_types;
+			vector<string> selected_names;
+			py::tuple projected_columns(source_columns.size());
+			for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
+				auto source_column = source_columns[column_idx];
+				auto snapshot_entry =
+				    std::lower_bound(prepared.snapshot_columns.begin(), prepared.snapshot_columns.end(), source_column);
+				if (snapshot_entry == prepared.snapshot_columns.end() || *snapshot_entry != source_column) {
+					throw InternalException("Python memory scan column is missing from its shared snapshot");
+				}
+				projected_columns[column_idx] = py::int_(snapshot_entry - prepared.snapshot_columns.begin());
+				selected_types.push_back(prepared.source_types[source_column]);
+				selected_names.push_back(prepared.source_names[source_column]);
+			}
+
+			auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
+			auto tasks =
+			    memory_module.attr("_memory_source_tasks")(py::str(source_id), prepared.object_refs, projected_columns);
+			auto selected_arrow_schema =
+			    memory_module.attr("_memory_source_schema")(prepared.snapshot_schema, projected_columns);
+			auto estimated_cardinality = PythonMemoryScanCardinality(get, context);
+			auto bind_data = CreateRayMemoryDataSourceScanBind(context, source_id, selected_arrow_schema, tasks);
+			bind_data->estimated_cardinality = estimated_cardinality;
+			ValidateMemorySourceSnapshotTypes(selected_types, selected_names, *bind_data, prepared.source_kind);
+			if (estimated_cardinality.IsValid()) {
+				get.SetEstimatedCardinality(estimated_cardinality.GetIndex());
+			}
+
+			vector<ColumnIndex> compact_column_ids;
+			compact_column_ids.reserve(source_columns.size());
+			for (idx_t column_idx = 0; column_idx < source_columns.size(); column_idx++) {
+				compact_column_ids.emplace_back(column_idx);
+			}
+			get.returned_types = std::move(selected_types);
+			get.names = std::move(selected_names);
+			get.SetColumnIds(std::move(compact_column_ids));
+			get.virtual_columns.clear();
 			get.function = DataSourceScanFunction::GetFunction();
-			get.bind_data = prepared_entry->second->bind_data->Copy();
+			get.bind_data = std::move(bind_data);
 			get.parameters.clear();
 			get.named_parameters.clear();
 			get.input_table_types.clear();
@@ -279,7 +453,7 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 	}
 
 	for (auto &child : op.children) {
-		RewritePythonMemoryScans(*child, context, memory_source_refs, prepared_sources);
+		RewritePythonMemoryScans(*child, context, memory_module, memory_source_refs, scan_groups);
 	}
 }
 
@@ -297,10 +471,23 @@ static SerializedLogicalPlanResult SerializeLogicalPlanFromRelation(const duckdb
 		auto logical_plan = std::move(planner.plan);
 
 		py::dict memory_source_refs;
-		std::unordered_map<PythonMemorySourceCacheKey, unique_ptr<PreparedPythonMemorySource>,
-		                   PythonMemorySourceCacheKeyHash>
-		    prepared_sources;
-		RewritePythonMemoryScans(*logical_plan, *client_context, memory_source_refs, prepared_sources);
+		if (ContainsPythonMemoryScan(*logical_plan)) {
+			// Snapshot only columns referenced by the bound plan. Running this
+			// standard pruning pass before replacing the scans avoids converting
+			// unused Pandas object columns while leaving all other optimizer passes
+			// for the distributed planning connection.
+			Optimizer column_pruner(*planner.binder, *client_context);
+			RemoveUnusedColumns unused_columns(column_pruner);
+			unused_columns.VisitOperator(*logical_plan);
+			logical_plan->ResolveOperatorTypes();
+
+			auto memory_module = py::module_::import("vane.datasource._memory");
+			PythonMemorySourceGroups source_groups;
+			PythonMemoryScanGroups scan_groups;
+			CollectPythonMemoryScans(*logical_plan, memory_module, source_groups, scan_groups);
+			RewritePythonMemoryScans(*logical_plan, *client_context, memory_module, memory_source_refs, scan_groups);
+			logical_plan->ResolveOperatorTypes();
+		}
 		if (py::len(memory_source_refs) > 0) {
 			result.memory_source_refs = std::move(memory_source_refs);
 		}

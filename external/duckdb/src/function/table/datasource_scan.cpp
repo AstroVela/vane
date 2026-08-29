@@ -288,6 +288,7 @@ static void DataSourceScanSerialize(Serializer &serializer, const optional_ptr<F
 	serializer.WriteProperty(100, "pickled_tasks", bind_data.pickled_tasks);
 	serializer.WriteProperty(101, "pickled_source", bind_data.pickled_source);
 	serializer.WriteProperty(102, "query_id", bind_data.query_id);
+	serializer.WritePropertyWithDefault<optional_idx>(103, "estimated_cardinality", bind_data.estimated_cardinality);
 }
 
 static unique_ptr<FunctionData> DataSourceScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -295,10 +296,19 @@ static unique_ptr<FunctionData> DataSourceScanDeserialize(Deserializer &deserial
 	result->pickled_tasks = deserializer.ReadProperty<vector<string>>(100, "pickled_tasks");
 	result->pickled_source = deserializer.ReadProperty<string>(101, "pickled_source");
 	result->query_id = deserializer.ReadProperty<string>(102, "query_id");
+	result->estimated_cardinality = deserializer.ReadPropertyWithDefault<optional_idx>(103, "estimated_cardinality");
 	// Restore produce_stream from global callback (set by Python module on load)
 	result->produce_stream = g_global_produce_stream.load();
 	RequireProduceStream(result->produce_stream);
 	return std::move(result);
+}
+
+static unique_ptr<NodeStatistics> DataSourceScanCardinality(ClientContext &, const FunctionData *bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<DataSourceScanBindData>();
+	if (!bind_data.estimated_cardinality.IsValid()) {
+		return nullptr;
+	}
+	return make_uniq<NodeStatistics>(bind_data.estimated_cardinality.GetIndex());
 }
 
 // ── Registration ───────────────────────────────────────────────────
@@ -311,6 +321,7 @@ TableFunction DataSourceScanFunction::GetFunction() {
 	    DataSourceScanGetData, DataSourceScanBind, DataSourceScanInitGlobal, DataSourceScanInitLocal);
 	func.serialize = DataSourceScanSerialize;
 	func.deserialize = DataSourceScanDeserialize;
+	func.cardinality = DataSourceScanCardinality;
 	TableFunctionDistributedScanCallbacks distributed_scan;
 	distributed_scan.protocol_version = 1;
 	distributed_scan.split_codec = {DATASOURCE_SPLIT_CODEC, 1};
