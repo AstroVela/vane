@@ -48,6 +48,8 @@ struct DataSourceScanBindData : public TableFunctionData {
 	datasource_produce_stream_t produce_stream;
 	//! Arrow schema metadata
 	ArrowTableSchema arrow_table;
+	//! Optional source cardinality captured by a planner-side rewrite.
+	optional_idx estimated_cardinality;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DataSourceScanBindData>();
@@ -56,6 +58,7 @@ struct DataSourceScanBindData : public TableFunctionData {
 		result->query_id = query_id;
 		result->produce_stream = produce_stream;
 		result->arrow_table = arrow_table;
+		result->estimated_cardinality = estimated_cardinality;
 		return std::move(result);
 	}
 };

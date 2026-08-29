@@ -2538,10 +2538,6 @@ unique_ptr<DuckDBPyRelation> DuckDBPyConnection::TableFunction(const string &fna
 unique_ptr<DuckDBPyRelation> DuckDBPyConnection::FromDF(const PandasDataFrame &value) {
 	auto &connection = con.GetConnection();
 	string name = "df_" + StringUtil::GenerateRandomName();
-	if (PandasDataFrame::IsPyArrowBacked(value)) {
-		auto table = PandasDataFrame::ToArrowTable(value);
-		return DuckDBPyConnection::FromArrow(table);
-	}
 	auto tableref = PythonReplacementScan::ReplacementObject(value, name, *connection.context);
 	D_ASSERT(tableref);
 	auto rel = make_shared_ptr<ViewRelation>(connection.context, std::move(tableref), name);

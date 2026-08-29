@@ -46,6 +46,7 @@
 #include <duckdb/common/set.hpp>
 #include <duckdb/common/types/uuid.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/optimizer/remove_unused_columns.hpp>
 
 #include <exception>
 #include <optional>
@@ -973,6 +974,7 @@ void register_ray_bindings(py::module_ &mod) {
 	    .def("num_partitions", &PyPhysicalPlanWrapper::num_partitions)
 	    .def("repr_ascii", &PyPhysicalPlanWrapper::repr_ascii)
 	    .def("repr_mermaid", &PyPhysicalPlanWrapper::repr_mermaid)
+	    .def("_datasource_scan_cardinalities_for_test", &PyPhysicalPlanWrapper::datasource_scan_cardinalities_for_test)
 	    .def("scan_split_batch_map", &PyPhysicalPlanWrapper::scan_split_batch_map)
 	    .def("collect_query_resource_graph_metadata", &PyPhysicalPlanWrapper::collect_query_resource_graph_metadata,
 	         py::arg("conn") = py::none())
