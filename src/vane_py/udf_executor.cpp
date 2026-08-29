@@ -982,6 +982,10 @@ static bool HasStructField(const Value &payload, const string &name) {
 static vector<LogicalType> ParseStringListTypesField(const Value &payload, const string &name);
 
 static vector<LogicalType> ParseExpectedOutputTypes(const Value &payload) {
+	auto output_contract_types = ParseStringListTypesField(payload, "output_contract_types");
+	if (!output_contract_types.empty()) {
+		return output_contract_types;
+	}
 	auto return_type = GetStructStringField(payload, "method_return_type");
 	if (return_type.first && !return_type.second.empty()) {
 		vector<LogicalType> output_types;

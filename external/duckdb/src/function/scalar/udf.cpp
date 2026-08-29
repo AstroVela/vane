@@ -36,6 +36,59 @@ bool UDFFunctionData::Equals(const FunctionData &other_p) const {
 
 namespace udf_helpers {
 
+LogicalType SerializableContractType(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return FileLogicalType::Create();
+	}
+	if (type.IsJSONType()) {
+		return LogicalType::JSON();
+	}
+	if (TensorType::IsTensor(type)) {
+		return TensorType::Create(SerializableContractType(TensorType::GetChildType(type)), TensorType::GetShape(type));
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		for (auto &child : StructType::GetChildTypes(type)) {
+			children.emplace_back(child.first, SerializableContractType(child.second));
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	case LogicalTypeId::UNION: {
+		child_list_t<LogicalType> members;
+		for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
+			members.emplace_back(UnionType::GetMemberName(type, index),
+			                     SerializableContractType(UnionType::GetMemberType(type, index)));
+		}
+		return LogicalType::UNION(std::move(members));
+	}
+	case LogicalTypeId::LIST:
+		return LogicalType::LIST(SerializableContractType(ListType::GetChildType(type)));
+	case LogicalTypeId::ARRAY: {
+		auto size = ArrayType::IsAnySize(type) ? optional_idx() : optional_idx(ArrayType::GetSize(type));
+		return LogicalType::ARRAY(SerializableContractType(ArrayType::GetChildType(type)), size);
+	}
+	case LogicalTypeId::MAP:
+		return LogicalType::MAP(SerializableContractType(MapType::KeyType(type)),
+		                        SerializableContractType(MapType::ValueType(type)));
+	case LogicalTypeId::ENUM: {
+		auto size = EnumType::GetSize(type);
+		Vector values(LogicalType::VARCHAR, size);
+		auto data = FlatVector::GetData<string_t>(values);
+		for (idx_t index = 0; index < size; index++) {
+			data[index] = StringVector::AddString(values, EnumType::GetString(type, index));
+		}
+		return LogicalType::ENUM(values, size);
+	}
+	default: {
+		auto result = type.DeepCopy();
+		result.SetAlias(string());
+		return result;
+	}
+	}
+}
+
 void ThrowIfNotConstant(const Expression &arg, const string &name) {
 	if (!arg.IsFoldable()) {
 		throw BinderException("udf: argument '%s' must be constant", name);
@@ -114,7 +167,29 @@ vector<idx_t> ParseOutputSchemaTensorShape(const Value &entry) {
 	return shape;
 }
 
-child_list_t<LogicalType> ParseOutputSchemaChildren(const Value &payload) {
+static vector<LogicalType> ParseOutputContractTypes(const Value &payload) {
+	auto field = GetStructField(payload, "output_contract_types");
+	if (!field || field->IsNull()) {
+		return {};
+	}
+	if (field->type().id() != LogicalTypeId::LIST) {
+		throw BinderException("udf: payload field 'output_contract_types' must be a LIST");
+	}
+	vector<LogicalType> result;
+	for (auto &entry : ListValue::GetChildren(*field)) {
+		if (entry.IsNull() || entry.type().id() != LogicalTypeId::VARCHAR) {
+			throw BinderException("udf: payload field 'output_contract_types' must contain VARCHAR values");
+		}
+		result.push_back(DBConfig::ParseLogicalType(StringValue::Get(entry)));
+	}
+	if (result.empty()) {
+		throw BinderException("udf: payload field 'output_contract_types' cannot be empty");
+	}
+	return result;
+}
+
+child_list_t<LogicalType> ParseOutputSchemaChildren(const Value &payload,
+                                                    const vector<LogicalType> *contract_types = nullptr) {
 	auto field = GetStructField(payload, "output_schema");
 	if (!field || field->IsNull()) {
 		return {};
@@ -124,6 +199,9 @@ child_list_t<LogicalType> ParseOutputSchemaChildren(const Value &payload) {
 	}
 	child_list_t<LogicalType> output_children;
 	auto &entries = ListValue::GetChildren(*field);
+	if (contract_types && contract_types->size() != entries.size()) {
+		throw BinderException("udf: output contract count does not match output_schema");
+	}
 	output_children.reserve(entries.size());
 	for (idx_t i = 0; i < entries.size(); i++) {
 		auto &entry = entries[i];
@@ -141,7 +219,8 @@ child_list_t<LogicalType> ParseOutputSchemaChildren(const Value &payload) {
 			if (!TryGetStructStringField(entry, "type", type_name) || type_name.empty()) {
 				throw BinderException("udf: output_schema duckdb_type entry is missing type");
 			}
-			output_children.emplace_back(name, DBConfig::ParseLogicalType(type_name));
+			output_children.emplace_back(name,
+			                             contract_types ? (*contract_types)[i] : DBConfig::ParseLogicalType(type_name));
 			continue;
 		}
 		if (StringUtil::CIEquals(kind, "tensor")) {
@@ -150,7 +229,9 @@ child_list_t<LogicalType> ParseOutputSchemaChildren(const Value &payload) {
 				throw BinderException("udf: output_schema tensor entry is missing dtype");
 			}
 			auto shape = ParseOutputSchemaTensorShape(entry);
-			output_children.emplace_back(name, TensorType::Create(DBConfig::ParseLogicalType(dtype), shape));
+			output_children.emplace_back(name, contract_types
+			                                       ? (*contract_types)[i]
+			                                       : TensorType::Create(DBConfig::ParseLogicalType(dtype), shape));
 			continue;
 		}
 		throw BinderException("udf: unsupported output_schema kind '%s'", kind);
@@ -171,12 +252,19 @@ static void ValidatePayloadVersion(const Value &payload) {
 
 LogicalType ResolvePayloadReturnType(const Value &payload) {
 	ValidatePayloadVersion(payload);
+	auto contract_types = ParseOutputContractTypes(payload);
 	auto return_type_field = udf_helpers::GetStructField(payload, "method_return_type");
 	if (return_type_field && !return_type_field->IsNull()) {
+		if (!contract_types.empty()) {
+			if (contract_types.size() != 1) {
+				throw BinderException("udf: method return contract must contain exactly one type");
+			}
+			return contract_types[0];
+		}
 		auto return_type_str = StringValue::Get(*return_type_field);
 		return DBConfig::ParseLogicalType(return_type_str);
 	}
-	auto output_children = ParseOutputSchemaChildren(payload);
+	auto output_children = ParseOutputSchemaChildren(payload, contract_types.empty() ? nullptr : &contract_types);
 	if (!output_children.empty()) {
 		if (output_children.size() == 1) {
 			return output_children[0].second;

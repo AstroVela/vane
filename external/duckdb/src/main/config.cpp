@@ -572,6 +572,9 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 
 	auto upper_type = StringUtil::Upper(type);
+	if (upper_type == LogicalType::JSON_TYPE_NAME) {
+		return LogicalType::JSON();
+	}
 	if (upper_type == FileLogicalType::TYPE_NAME) {
 		return FileLogicalType::Create();
 	}
@@ -591,46 +594,13 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
 		string tensor_args = type.substr(7, type.size() - 8);
-		idx_t split_idx = string::npos;
-		idx_t paren_depth = 0;
-		idx_t bracket_depth = 0;
-		for (idx_t i = 0; i < tensor_args.size(); i++) {
-			auto ch = tensor_args[i];
-			switch (ch) {
-			case '(':
-				paren_depth++;
-				break;
-			case ')':
-				if (paren_depth == 0) {
-					throw InternalException("Ill formatted tensor type: '%s'", type);
-				}
-				paren_depth--;
-				break;
-			case '[':
-				bracket_depth++;
-				break;
-			case ']':
-				if (bracket_depth == 0) {
-					throw InternalException("Ill formatted tensor type: '%s'", type);
-				}
-				bracket_depth--;
-				break;
-			case ',':
-				if (paren_depth == 0 && bracket_depth == 0) {
-					split_idx = i;
-					i = tensor_args.size();
-				}
-				break;
-			default:
-				break;
-			}
-		}
-		if (split_idx == string::npos || paren_depth != 0 || bracket_depth != 0) {
+		auto tensor_args_vect = SplitSerializedTypeArguments(tensor_args, type);
+		if (tensor_args_vect.size() != 2) {
 			throw InternalException("Ill formatted tensor type: '%s'", type);
 		}
 
-		auto child_type_str = tensor_args.substr(0, split_idx);
-		auto shape_str = tensor_args.substr(split_idx + 1);
+		auto child_type_str = std::move(tensor_args_vect[0]);
+		auto shape_str = std::move(tensor_args_vect[1]);
 		StringUtil::Trim(child_type_str);
 		StringUtil::Trim(shape_str);
 		if (child_type_str.empty() || shape_str.size() < 2 || shape_str.front() != '[' || shape_str.back() != ']') {

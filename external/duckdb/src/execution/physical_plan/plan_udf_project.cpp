@@ -134,6 +134,24 @@ static pair<bool, idx_t> PayloadIdxField(const Value &payload, const string &nam
 	return make_pair(false, idx_t(0));
 }
 
+static pair<bool, idx_t> PayloadListSizeField(const Value &payload, const string &name) {
+	if (payload.IsNull() || payload.type().id() != LogicalTypeId::STRUCT) {
+		return make_pair(false, idx_t(0));
+	}
+	auto &children = StructValue::GetChildren(payload);
+	auto child_count = StructType::GetChildCount(payload.type());
+	for (idx_t i = 0; i < child_count; i++) {
+		if (StructType::GetChildName(payload.type(), i) != name || i >= children.size() || children[i].IsNull()) {
+			continue;
+		}
+		if (children[i].type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException("UDF payload field '%s' must be a LIST", name);
+		}
+		return make_pair(true, ListValue::GetChildren(children[i]).size());
+	}
+	return make_pair(false, idx_t(0));
+}
+
 static bool IsRowPreservingUDFPayload(const Value &payload) {
 	return UDFModePreservesRows(ClassifyUDFMode(payload));
 }
@@ -150,6 +168,37 @@ static vector<Value> UDFLogicalTypesToStringValues(const vector<LogicalType> &ty
 		values.emplace_back(Value(type.ToString()));
 	}
 	return values;
+}
+
+static vector<Value> UDFLogicalContractValues(const vector<LogicalType> &types) {
+	vector<Value> values;
+	values.reserve(types.size());
+	for (auto &type : types) {
+		values.emplace_back(Value(udf_helpers::SerializableContractType(type).ToString()));
+	}
+	return values;
+}
+
+static vector<Value> UDFLogicalOutputContractValues(const Value &payload, const LogicalType &return_type) {
+	if (PayloadHasField(payload, "method_return_type")) {
+		return UDFLogicalContractValues(vector<LogicalType> {return_type});
+	}
+	auto output_count = PayloadListSizeField(payload, "output_schema");
+	if (!output_count.first || output_count.second == 0) {
+		throw InvalidInputException("UDF payload is missing output type information");
+	}
+	if (output_count.second == 1) {
+		return UDFLogicalContractValues(vector<LogicalType> {return_type});
+	}
+	if (return_type.id() != LogicalTypeId::STRUCT || StructType::GetChildCount(return_type) != output_count.second) {
+		throw InternalException("UDF output_schema does not match its bound return type");
+	}
+	vector<LogicalType> output_types;
+	output_types.reserve(output_count.second);
+	for (auto &child : StructType::GetChildTypes(return_type)) {
+		output_types.push_back(child.second);
+	}
+	return UDFLogicalContractValues(output_types);
 }
 
 static bool UDFTypeContainsSupportedBit(const LogicalType &type) {
@@ -289,8 +338,11 @@ static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &
 		if (name == "input_contract_types") {
 			return Value::LIST(LogicalType::VARCHAR, UDFLogicalInputContractValues(argument_types));
 		}
+		if (name == "output_contract_types") {
+			return Value::LIST(LogicalType::VARCHAR, UDFLogicalOutputContractValues(payload, return_type));
+		}
 		if (name == "ref_output_types") {
-			return Value::LIST(LogicalType::VARCHAR, UDFLogicalTypesToStringValues(ref_output_types));
+			return Value::LIST(LogicalType::VARCHAR, UDFLogicalContractValues(ref_output_types));
 		}
 		throw InternalException("unknown udf layout payload field");
 	};
@@ -298,9 +350,10 @@ static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &
 	auto &children = StructValue::GetChildren(payload);
 	auto &payload_type = payload.type();
 	child_list_t<Value> new_children;
-	vector<string> fields {"input_types", "input_contract_types"};
+	vector<string> fields {"input_types", "input_contract_types", "output_contract_types"};
 	if (include_row_preserving_layout) {
-		fields = {"scalar_arg_count", "input_types", "input_contract_types", "ref_output_types"};
+		fields = {"scalar_arg_count", "input_types", "input_contract_types", "output_contract_types",
+		          "ref_output_types"};
 	}
 
 	for (idx_t i = 0; i < StructType::GetChildCount(payload_type); i++) {

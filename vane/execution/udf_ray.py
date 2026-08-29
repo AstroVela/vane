@@ -826,15 +826,14 @@ def _iter_materialized_task_outputs(
 
         if str(stream_payload.get("call_mode") or "") == "map_batches_rows":
             for raw_table in tables:
-                for block, metadata in emit(
-                    _execute_row_preserving_batch_layout(
-                        stream_payload,
-                        _ensure_table(raw_table),
-                        executor,
-                    )
+                for fused in _execute_row_preserving_batch_layout(
+                    stream_payload,
+                    _ensure_table(raw_table),
+                    executor,
                 ):
-                    yield block
-                    yield metadata
+                    for block, metadata in emit(fused):
+                        yield block
+                        yield metadata
             executor.finished_submitting()
             return
 
@@ -856,18 +855,23 @@ def _execute_row_preserving_batch_layout(
     payload: dict[str, Any],
     table: pa.Table,
     executor: RuntimeUDFExecutor,
-) -> pa.Table:
+) -> list[pa.Table]:
     from vane.execution.udf_row_preserving import (
-        fuse_row_preserving_output,
+        fuse_row_preserving_outputs,
         split_row_preserving_input,
     )
 
+    expected_rows = table.num_rows
     args, passthrough = split_row_preserving_input(payload, _ensure_table(table))
     executor.submit(args)
     outputs = executor.drain_outputs()
-    if len(outputs) != 1:
-        raise RuntimeError("map_batches_rows task produced %d outputs, expected exactly 1" % len(outputs))
-    return fuse_row_preserving_output(payload, passthrough, _ensure_table(outputs[0]))
+    return fuse_row_preserving_outputs(
+        payload,
+        passthrough,
+        [_ensure_table(output) for output in outputs],
+        expected_rows=expected_rows,
+        mode="map_batches_rows task",
+    )
 
 
 def _build_bundle_stream_remote(
@@ -1015,13 +1019,16 @@ def _iter_ref_bundle_task_outputs(
         executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
         configure_loaded_torch_threads()
         try:
-            fused = _execute_row_preserving_batch_layout(payload, table, executor)
+            fused_outputs = _execute_row_preserving_batch_layout(payload, table, executor)
             executor.finished_submitting()
         finally:
             executor.close()
-        for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
-            yield block
-            yield make_stream_block_metadata(block, payload, output_index=output_index)
+        output_index = 0
+        for fused in fused_outputs:
+            for block in iter_bounded_stream_blocks(fused, payload):
+                yield block
+                yield make_stream_block_metadata(block, payload, output_index=output_index)
+                output_index += 1
         return
 
     if call_mode != "map":

@@ -31,7 +31,6 @@ from vane.execution.ref_bundle import (
     release_local_shm_ref_bundle_descriptor,
 )
 from vane.execution.udf_row_preserving import (
-    fuse_row_preserving_output,
     fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
@@ -524,20 +523,13 @@ def _execute_submit(
         executor.finished_submitting()
     output_tables = _drain_executor_outputs(executor)
     if row_preserving:
-        if call_mode == "map":
-            output_tables = fuse_row_preserving_outputs(
-                payload,
-                passthrough_table,
-                output_tables,
-                expected_rows=expected_rows,
-                mode="map subprocess",
-            )
-        else:
-            if len(output_tables) != 1:
-                raise RuntimeError(
-                    "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
-                )
-            output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
+        output_tables = fuse_row_preserving_outputs(
+            payload,
+            passthrough_table,
+            output_tables,
+            expected_rows=expected_rows,
+            mode=f"{call_mode} subprocess",
+        )
     if produce_ref_bundle_output:
         required = sum(_ipc_response_size(output_table) for output_table in output_tables)
         grant_id = _request_output_grant(

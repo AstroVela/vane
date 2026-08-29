@@ -9125,16 +9125,18 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
     assert request_payload["size_bytes"] >= sum(meta["ipc_size_bytes"] for meta in descriptor["metadata"])
 
 
-def test_subprocess_worker_scalar_map_fuses_heterogeneous_output_pieces(monkeypatch):
+@pytest.mark.parametrize("call_mode", ["map", "map_batches_rows"])
+def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(monkeypatch, call_mode):
     import vane.execution.udf_subprocess_worker as worker
     from vane import pickle as vane_pickle
 
     class FakeExecutor:
-        _payload = {
-            "call_mode": "map",
-            "scalar_arg_count": 1,
-            "output_schema": [{"name": "value"}],
-        }
+        def __init__(self):
+            self._payload = {
+                "call_mode": call_mode,
+                "scalar_arg_count": 1,
+                "output_schema": [{"name": "value"}],
+            }
 
         def submit(self, table):
             assert table.to_pydict() == {"identifier": [0, None, 1]}

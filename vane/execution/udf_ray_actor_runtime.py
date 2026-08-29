@@ -289,25 +289,27 @@ def _actor_class(
             self,
             table: pa.Table,
             effective_payload: dict[str, Any],
-        ) -> pa.Table:
+        ) -> list[pa.Table]:
             from vane.execution.udf_row_preserving import (
-                fuse_row_preserving_output,
+                fuse_row_preserving_outputs,
                 split_row_preserving_input,
             )
 
             executor = self._ensure_executor(effective_payload)
+            expected_rows = table.num_rows
             args, passthrough = split_row_preserving_input(effective_payload, table)
             if args.num_rows == 0:
                 output = _empty_output_table_from_payload(effective_payload)
-                return fuse_row_preserving_output(effective_payload, passthrough, output)
-            executor.submit(args)
-            outputs = executor.drain_outputs()
-            if len(outputs) != 1:
-                raise RuntimeError("map_batches_rows actor produced %d outputs, expected exactly 1" % len(outputs))
-            return fuse_row_preserving_output(
+                outputs = [output]
+            else:
+                executor.submit(args)
+                outputs = executor.drain_outputs()
+            return fuse_row_preserving_outputs(
                 effective_payload,
                 passthrough,
-                _ensure_table(outputs[0]),
+                [_ensure_table(output) for output in outputs],
+                expected_rows=expected_rows,
+                mode="map_batches_rows actor",
             )
 
         def _run_block_stream_impl(
@@ -353,12 +355,13 @@ def _actor_class(
                 )
                 return
             if str(effective_payload.get("call_mode") or "") == "map_batches_rows":
-                yield from emit(self._run_row_preserving_batch(args, effective_payload))
+                for table in self._run_row_preserving_batch(args, effective_payload):
+                    yield from emit(table)
                 _actor_debug_log(
                     "run_block_stream_submit_done",
                     effective_payload,
                     rows=args.num_rows,
-                    outputs=1,
+                    outputs=output_count,
                 )
                 return
             for result in executor.iter_submit(args):

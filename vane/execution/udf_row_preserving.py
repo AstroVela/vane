@@ -5,7 +5,8 @@
 
 A row-preserving layout table contains ``scalar_arg_count`` UDF argument columns
 followed by passthrough columns. Workers feed only the argument columns to the
-UDF, then fuse the single output column back onto the passthrough columns.
+UDF, then fuse each consecutive output piece back onto its matching passthrough
+slice.
 """
 
 from __future__ import annotations

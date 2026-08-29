@@ -181,7 +181,7 @@ def _arrow_type_from_output_schema_entry(entry: dict[str, Any]) -> pa.DataType:
     return _arrow_type_from_name(str(entry.get("type") or ""))
 
 
-def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
+def empty_output_table_from_schema(output_schema: Any, *, output_contract_types: Any = None) -> pa.Table:
     if not output_schema:
         raise ValueError("empty UDF output requires payload.output_schema")
     entries = list(output_schema)
@@ -191,7 +191,10 @@ def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
 
     from vane.execution.udf_file_contract import FileUDFContract
 
-    file_contract = FileUDFContract.from_payload({"udf_name": "<empty>", "output_schema": entries})
+    contract_payload = {"udf_name": "<empty>", "output_schema": entries}
+    if output_contract_types is not None:
+        contract_payload["output_contract_types"] = output_contract_types
+    file_contract = FileUDFContract.from_payload(contract_payload)
     output_names = [str(entry.get("name") or "") for entry in entries]
     file_table = file_contract.native_output_rows_to_table([], output_names) if file_contract.has_file_outputs else None
 
@@ -218,7 +221,10 @@ def empty_output_table_from_schema(output_schema: Any) -> pa.Table:
 
 def empty_output_table_from_payload(payload: dict[str, Any] | None) -> pa.Table:
     payload = payload or {}
-    return empty_output_table_from_schema(payload.get("output_schema"))
+    return empty_output_table_from_schema(
+        payload.get("output_schema"),
+        output_contract_types=payload.get("output_contract_types"),
+    )
 
 
 __all__ = ["empty_output_table_from_payload", "empty_output_table_from_schema"]

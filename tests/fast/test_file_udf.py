@@ -469,6 +469,29 @@ def test_file_native_struct_outputs_require_exact_fields(payload):
         contract.scalar_outputs_to_array([payload])
 
 
+@pytest.mark.parametrize("malformed", ["missing", "extra"])
+def test_file_arrow_struct_outputs_require_exact_fields(malformed):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "strict-arrow-struct",
+            "method_return_type": "STRUCT(document FILE, id INTEGER)",
+        }
+    )
+    arrays = [pa.array([_file_record()], type=_file_arrow_type())]
+    names = ["document"]
+    if malformed == "extra":
+        arrays.extend([pa.array([1]), pa.array(["discarded"])])
+        names.extend(["id", "extra"])
+    value = pa.StructArray.from_arrays(arrays, names=names)
+
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields"):
+        contract.normalize_output_table(pa.table({"payload": value}))
+
+
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
     local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
@@ -509,6 +532,23 @@ def test_scalar_file_udf_preserves_full_128_bit_integer_sibling(integer_type, wi
     document, returned_wide = result.project("payload.document AS document, payload.wide::VARCHAR AS wide").fetchone()
     assert document == vane.File("memory://wide-composite")
     assert int(returned_wide) == wide
+
+
+@pytest.mark.parametrize("integer_type", ["HUGEINT", "UHUGEINT"])
+def test_scalar_file_udf_accepts_textual_128_bit_integer_sibling(integer_type):
+    output_type = vane.type(f"STRUCT(document FILE, wide {integer_type})")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://textual-wide-composite"),
+            "wide": "42",
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.wide::VARCHAR").fetchone() == ("42",)
 
 
 def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():
@@ -572,6 +612,44 @@ def test_native_file_udfs_encode_special_leaves_inside_non_file_composites():
         str(wide),
         "43",
     )
+
+
+def test_native_file_udfs_split_mixed_sibling_storage_for_duckdb_casts():
+    output_type = vane.type("STRUCT(document FILE, id BIGINT)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(value):
+        return {
+            "document": vane.File(f"memory://mixed-scalar-{value}"),
+            "id": value if value == 1 else str(value),
+        }
+
+    connection = vane.connect()
+    source = connection.sql("SELECT i AS value FROM range(1, 3) AS t(i)")
+    scalar_result = source.select(build_document(vane.col("value")).alias("payload"))
+    assert scalar_result.project("payload.document.url, payload.id").fetchall() == [
+        ("memory://mixed-scalar-1", 1),
+        ("memory://mixed-scalar-2", 2),
+    ]
+
+    def build_row(row):
+        value = row["value"]
+        return {
+            "payload": {
+                "document": vane.File(f"memory://mixed-flat-map-{value}"),
+                "id": value if value == 1 else str(value),
+            }
+        }
+
+    flat_map_result = source.flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.project("payload.document.url, payload.id").fetchall() == [
+        ("memory://mixed-flat-map-1", 1),
+        ("memory://mixed-flat-map-2", 2),
+    ]
 
 
 def test_empty_flat_map_file_udf_preserves_composite_output_type():
@@ -1389,6 +1467,36 @@ def test_batch_expression_defers_file_sibling_cast_semantics_to_duckdb():
     )
 
 
+def test_row_preserving_batch_file_output_fuses_heterogeneous_pieces():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, text VARCHAR)")
+
+    @vane.func.batch(return_dtype=output_type, batch_size=1)
+    def emit_document(values):
+        identifier = values[0].as_py()
+        text = pa.array([b"\xc3\xa9"], type=pa.binary()) if identifier == 0 else pa.array(["second"])
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(
+                    [_file_record(url=f"memory://row-preserving-{identifier}")],
+                    type=_file_arrow_type(),
+                ),
+                text,
+            ],
+            names=["document", "text"],
+        )
+
+    connection = vane.connect()
+    source = connection.sql("SELECT i FROM range(2) AS t(i)")
+    result = source.select(emit_document(vane.col("i")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.text").fetchall() == [
+        ("memory://row-preserving-0", r"\xC3\xA9"),
+        ("memory://row-preserving-1", "second"),
+    ]
+
+
 def test_row_actor_rejects_file_inputs_and_outputs():
     import cloudpickle
 
@@ -1903,6 +2011,77 @@ def test_batch_file_output_uses_resolved_contract_for_connection_local_aliases()
         "memory://local-aliases",
         "0101011",
     )
+
+
+def test_file_output_contract_uses_resolved_type_instead_of_serialized_alias():
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "resolved-output-alias",
+            "method_return_type": "local_document_payload",
+            "output_contract_types": ["STRUCT(document FILE, flags BIT)"],
+        }
+    )
+
+    assert contract.has_file_outputs
+    assert str(contract.output_types[0]) == "STRUCT(document FILE, flags BIT)"
+
+
+def test_scalar_file_output_supports_connection_local_file_bearing_alias():
+    connection = vane.connect()
+    connection.execute("CREATE TYPE local_document_payload AS STRUCT(document FILE, flags BIT)")
+    output_type = vane.type("local_document_payload", connection=connection)
+
+    @vane.func(return_dtype=output_type)
+    def attach_document(_value):
+        return {
+            "document": vane.File("memory://local-output-alias"),
+            "flags": "0101011",
+        }
+
+    result = connection.sql("SELECT 1 AS value").select(attach_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://local-output-alias",
+        "0101011",
+    )
+
+
+def test_map_batches_file_output_supports_connection_local_sibling_alias():
+    import pyarrow as pa
+
+    def attach_document(table):
+        return pa.table(
+            {
+                "document": pa.array(
+                    [_file_record(url="memory://local-output-sibling")] * table.num_rows,
+                    type=_file_arrow_type(),
+                ),
+                "mood": ["happy"] * table.num_rows,
+            }
+        )
+
+    connection = vane.connect()
+    connection.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+    mood_type = vane.type("mood", connection=connection)
+    result = connection.sql("SELECT 1 AS value").map_batches(
+        attach_document,
+        schema={"document": vane.file_type(), "mood": mood_type},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.project("document.url, mood::VARCHAR").fetchone() == (
+        "memory://local-output-sibling",
+        "happy",
+    )
+
+    empty_result = connection.sql("SELECT 1 AS value WHERE FALSE").map_batches(
+        attach_document,
+        schema={"document": vane.file_type(), "mood": mood_type},
+        execution_backend="subprocess_task",
+    )
+    assert empty_result.fetchall() == []
 
 
 def test_scalar_file_output_leaves_union_bit_input_unmaterialized():

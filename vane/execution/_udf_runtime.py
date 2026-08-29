@@ -789,10 +789,11 @@ class UDFExecutor:
             nonlocal output_rows, output_row_bytes
             if not output_rows:
                 return
-            table = self._flat_map_rows_to_table(output_rows)
+            tables = self._flat_map_rows_to_tables(output_rows)
             output_rows = []
             output_row_bytes = 0
-            yield from output_buffer.append(table)
+            for table in tables:
+                yield from output_buffer.append(table)
 
         def append_output_row(row: dict[str, Any]) -> Iterable[pa.Table]:
             nonlocal output_row_bytes
@@ -840,12 +841,12 @@ class UDFExecutor:
         if not emitted:
             self._queue.append(_empty_output_table_from_payload(self._payload))
 
-    def _flat_map_rows_to_table(self, rows: list[dict[str, Any]]) -> pa.Table:
+    def _flat_map_rows_to_tables(self, rows: list[dict[str, Any]]) -> list[pa.Table]:
         if self._output_names:
-            return self._file_contract.native_output_rows_to_table(rows, self._output_names)
+            return self._file_contract.native_output_rows_to_tables(rows, self._output_names)
         table = pa.Table.from_pylist(rows)
         self._file_contract.validate_output_table(table)
-        return table
+        return [table]
 
     def _default_null_handling(self) -> bool:
         return self._null_handling == _DEFAULT_NULL_HANDLING
@@ -853,7 +854,7 @@ class UDFExecutor:
     def _return_null_on_error(self) -> bool:
         return self._exception_handling == _RETURN_NULL
 
-    def _execute_scalar_native(self, args: pa.Table) -> pa.Array:
+    def _execute_scalar_native(self, args: pa.Table) -> list[Any]:
         row_count = args.num_rows
         columns = self._file_contract.materialize_scalar_inputs(args)
         outputs: list[Any] = []
@@ -876,7 +877,7 @@ class UDFExecutor:
             if self._default_null_handling() and result is None:
                 raise ValueError(_NULL_HANDLING_ERROR)
             outputs.append(result)
-        return self._file_contract.scalar_outputs_to_array(outputs)
+        return self._file_contract.scalar_outputs_to_arrays(outputs)
 
     def _execute_scalar_arrow(self, args: pa.Table) -> list[Any]:
         row_count = args.num_rows
@@ -958,7 +959,7 @@ class UDFExecutor:
         if self._scalar_udf_type == "arrow":
             outputs = self._execute_scalar_arrow(args)
         else:
-            outputs = [self._execute_scalar_native(args)]
+            outputs = self._execute_scalar_native(args)
         for output in outputs:
             self._queue.append(pa.table({self._scalar_output_name: output}))
 

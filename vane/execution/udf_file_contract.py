@@ -482,6 +482,12 @@ def _validate_arrow_storage_type(
     if type_id == "struct":
         if not pa.types.is_struct(actual):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow STRUCT type")
+        actual_names = [field.name.casefold() for field in actual]
+        declared_names = [name.casefold() for name, _ in dtype.children]
+        if len(set(actual_names)) != len(actual_names):
+            raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names")
+        if len(set(declared_names)) != len(declared_names) or set(actual_names) != set(declared_names):
+            raise _invalid_input(f"{boundary} STRUCT at {path} must contain exactly the declared fields")
         for name, child in dtype.children:
             if not _contains_file(child):
                 continue
@@ -847,6 +853,9 @@ def _canonical_values_to_arrow_array(
             if value is None:
                 encoded.append(None)
                 continue
+            if isinstance(value, str):
+                encoded.append(value)
+                continue
             integer = operator.index(value)
             if type_id == "hugeint":
                 in_range = -(1 << 127) <= integer < 1 << 127
@@ -963,6 +972,22 @@ def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundar
         raise _invalid_input(f"{boundary} could not be encoded using its declared FILE type") from None
 
 
+def _native_outputs_to_arrow_arrays(values: Sequence[Any], dtype: Any, *, boundary: str) -> list[Any]:
+    """Encode native rows, splitting only when Arrow cannot hold one lossless schema."""
+    try:
+        return [_native_outputs_to_arrow_array(values, dtype, boundary=boundary)]
+    except Exception:
+        row_arrays = [_native_outputs_to_arrow_array([value], dtype, boundary=boundary) for value in values]
+
+    groups: list[list[pa.Array]] = []
+    for array in row_arrays:
+        if groups and array.type.equals(groups[-1][0].type):
+            groups[-1].append(array)
+        else:
+            groups.append([array])
+    return [group[0] if len(group) == 1 else pa.concat_arrays(group) for group in groups]
+
+
 def _normalize_file_arrow_array(
     array: Any,
     dtype: Any,
@@ -1075,11 +1100,8 @@ def _normalize_file_arrow_array(
         arrays = []
         fields = []
         for name, child in dtype.children:
-            field_index = _optional_struct_field_index(array.type, name, boundary=boundary, path="column")
-            if field_index is None:
-                child_array = pa.nulls(len(array))
-            else:
-                child_array = array.field(field_index)
+            field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
+            child_array = array.field(field_index)
             child_array = _normalize_file_arrow_array(
                 child_array,
                 child,
@@ -1232,12 +1254,35 @@ class FileUDFContract:
             file_input_types = ()
             input_types = ()
 
-        output_types: list[Any | None] = []
         method_return_type = payload.get("method_return_type")
-        if method_return_type is not None:
+        output_schema = payload.get("output_schema") or []
+        raw_output_contracts = payload.get("output_contract_types")
+        output_types: list[Any | None] = []
+        if raw_output_contracts is not None:
+            if not isinstance(raw_output_contracts, (list, tuple)):
+                raise _invalid_input("UDF payload output_contract_types must be a list")
+            if method_return_type is None and not isinstance(output_schema, (list, tuple)):
+                raise _invalid_input("UDF payload output_schema must be a list")
+            expected_output_count = 1 if method_return_type is not None else len(output_schema)
+            if expected_output_count == 0 or len(raw_output_contracts) != expected_output_count:
+                raise _invalid_input("UDF payload output contract count does not match its declared outputs")
+            file_output_types: list[Any | None] = []
+            for type_name in raw_output_contracts:
+                if not isinstance(type_name, str):
+                    raise _invalid_input("UDF payload output_contract_types must contain SQL type strings")
+                file_output_types.append(_parse_file_type(type_name, field="output_contract_types"))
+            if any(dtype is not None for dtype in file_output_types):
+                output_types.extend(
+                    file_dtype
+                    if file_dtype is not None
+                    else _parse_declared_type(type_name, field="output_contract_types")
+                    for type_name, file_dtype in zip(raw_output_contracts, file_output_types, strict=True)
+                )
+            else:
+                output_types.extend(file_output_types)
+        elif method_return_type is not None:
             output_types.append(_parse_file_type(method_return_type, field="method_return_type"))
         else:
-            output_schema = payload.get("output_schema") or []
             if isinstance(output_schema, (list, tuple)):
                 entries: list[Mapping[str, Any] | None] = []
                 file_types: list[Any | None] = []
@@ -1399,6 +1444,18 @@ class FileUDFContract:
         boundary = f"UDF {self.udf_name!r} output"
         return _native_outputs_to_arrow_array(outputs, dtype, boundary=boundary)
 
+    def scalar_outputs_to_arrays(self, outputs: list[Any]) -> list[Any]:
+        """Encode scalar rows into the minimum number of Arrow-compatible pieces."""
+        if not self.has_file_outputs:
+            return [pa.array(outputs)]
+        if len(self.output_types) != 1 or self.output_types[0] is None:
+            raise _invalid_input(f"UDF {self.udf_name!r} scalar FILE output contract must declare one column")
+        return _native_outputs_to_arrow_arrays(
+            outputs,
+            self.output_types[0],
+            boundary=f"UDF {self.udf_name!r} output",
+        )
+
     def normalize_scalar_arrow_output(self, output: Any) -> Any:
         if not self.has_file_outputs:
             return output
@@ -1426,18 +1483,53 @@ class FileUDFContract:
                 f"{boundary} declares {len(self.output_types)} columns but has {len(output_names)} output names"
             )
 
+        declared_names = {name.casefold(): name for name in output_names}
+        if len(declared_names) != len(output_names):
+            raise _invalid_input(f"{boundary} has ambiguous output names")
+        column_values: dict[str, list[Any]] = {name: [] for name in output_names}
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                raise _invalid_input(f"{boundary} row {row_index} must be a mapping")
+            actual_names: dict[str, Any] = {}
+            for name in row:
+                if not isinstance(name, str) or name.casefold() in actual_names:
+                    raise _invalid_input(f"{boundary} row {row_index} has ambiguous output names")
+                actual_names[name.casefold()] = name
+            if set(actual_names) != set(declared_names):
+                raise _invalid_input(f"{boundary} row {row_index} must contain exactly the declared output fields")
+            for folded_name, declared_name in declared_names.items():
+                column_values[declared_name].append(row[actual_names[folded_name]])
+
         arrays: dict[str, Any] = {}
         for index, name in enumerate(output_names):
-            values = [row.get(name) for row in rows]
             dtype = self.output_types[index]
             if dtype is None:
-                arrays[name] = values
+                arrays[name] = column_values[name]
                 continue
-            arrays[name] = _native_outputs_to_arrow_array(values, dtype, boundary=boundary)
+            arrays[name] = _native_outputs_to_arrow_array(column_values[name], dtype, boundary=boundary)
 
         table = pa.table(arrays)
         self.validate_output_table(table)
         return table
+
+    def native_output_rows_to_tables(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        output_names: Sequence[str],
+    ) -> list[pa.Table]:
+        """Encode row outputs, retaining separate schemas for DuckDB casts."""
+        try:
+            return [self.native_output_rows_to_table(rows, output_names)]
+        except Exception:
+            row_tables = [self.native_output_rows_to_table([row], output_names) for row in rows]
+
+        groups: list[list[pa.Table]] = []
+        for table in row_tables:
+            if groups and table.schema.equals(groups[-1][0].schema):
+                groups[-1].append(table)
+            else:
+                groups.append([table])
+        return [group[0] if len(group) == 1 else pa.concat_tables(group) for group in groups]
 
     def validate_output_table(self, table: pa.Table) -> None:
         if not self.has_file_outputs:
