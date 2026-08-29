@@ -353,9 +353,19 @@ provider retains the coordinator half of that state. This extension-owned
 handle, not Vane's query ID, is what finalization and pre-finalize abort use to
 identify the write.
 
+After read-only validation, translation, and coordinator setup complete, Vane
+invokes `PrepareDistributedWrite` at most once immediately before worker
+execution can start. The hook may create coordinator-owned state that workers
+must observe, such as an empty catalog table whose schema is loaded by the
+format writer. Whether that state is externally visible or retained after a
+known failure is part of the extension's prepare/abort contract. The write plan
+and worker bind are already frozen at this point, so prepared state must be
+addressable through identifiers already present in that immutable bind.
+
 `PlanRunner` validates the capability, codec, provider, and worker callback
-contract before translation, task selection, or artifact creation. There is no
-mode inference: the physical shape must exactly match the declared mode.
+contract before translation, task selection, preparation, or artifact creation.
+There is no mode inference: the physical shape must exactly match the declared
+mode.
 
 Python relation INSERT, UPDATE, DELETE, and CTAS mutations follow the selected
 backend strictly. This includes `insert_into`, row-value `insert`, `update`,
@@ -434,20 +444,30 @@ Both modes use the same coordinator sequence:
 
 1. Validate the complete provider and worker protocol before physical source
    translation, task enumeration, or side effects.
-2. Execute worker sinks and select successful task attempts.
-3. Validate and aggregate their opaque result envelopes.
-4. Call `FinalizeDistributedWrite` once with exactly the selected envelopes
+2. Translate the physical source, validate the exact sink shape, and complete
+   coordinator-only setup that cannot invoke workers.
+3. Call `PrepareDistributedWrite` at most once.
+4. Execute worker sinks and select successful task attempts.
+5. Validate and aggregate their opaque result envelopes.
+6. Call `FinalizeDistributedWrite` once with exactly the selected envelopes
    inside Vane's active coordinator transaction.
-5. Require the provider's affected-row count to match the envelope total.
-6. Commit through DuckDB's transaction manager.
+7. Require the provider's affected-row count to match the envelope total and
+   commit through DuckDB's transaction manager.
 
 `AbortDistributedWrite` is mandatory. Once the current attempt may have
-created worker or file output, Vane invokes abort once for a known failure only
-while coordinator finalization has not started. The provider uses its own
-coordinator state and extension-planned artifact namespace to locate output from
-this execution.
-Validation, translation, and setup failures before output is possible do not
-invoke abort.
+created coordinator state during preparation or worker/file output, Vane
+invokes abort once for a known failure only while coordinator finalization has
+not started. This includes an exception from `PrepareDistributedWrite` and a
+failure with no selected worker envelope. The provider uses its own coordinator
+state and extension-planned artifact namespace to locate output from this
+execution and applies its format-specific cleanup or retention policy.
+Validation, translation, and setup failures before preparation do not invoke
+prepare or abort.
+
+After worker execution may have started, Vane invokes extension abort only
+after the worker-manager quiescence barrier succeeds. If that barrier fails or
+throws, current-execution output and prepared extension state are retained, and
+Vane does not race a possibly live writer with extension cleanup.
 
 Once `FinalizeDistributedWrite` starts, Vane never invokes abort, deletes
 selected artifacts, or retries finalization. A provider exception, an affected
@@ -461,11 +481,14 @@ boundary; an explicit caller-managed transaction is rejected before workers
 start. This check also applies when `Runner.run_write` is called directly.
 
 A worker or provider failure known to precede catalog commit rolls back the
-transaction. Once current-attempt output may exist, that failure also invokes
-explicit cleanup. Failures before that side-effect boundary return without
-aborting durable state. If the catalog commit call itself fails, Vane retains
-the artifacts and reports an unknown outcome: a remote catalog may have
-committed before its response was lost.
+transaction. Once preparation starts, that failure also invokes explicit
+extension failure handling; file-artifact mode additionally runs Vane's owned
+output cleanup. A callback extension may intentionally retain prepared catalog
+state or uncommitted files when its format delegates cleanup to orphan-file GC.
+Failures before that side-effect boundary return without aborting durable state.
+If the catalog commit call itself fails, Vane retains the artifacts and reports
+an unknown outcome: a remote catalog may have committed before its response was
+lost.
 
 ## Extension author contract
 
@@ -493,14 +516,21 @@ For every distributed write provider:
   physical provider;
 - keep `ValidateDistributedWrite` read-only and limit it to catalog and output
   precondition checks before workers start;
+- implement `PrepareDistributedWrite` only when workers require
+  coordinator-created state, recheck mutable catalog preconditions while
+  establishing it, and treat invocation as the start of the extension-owned
+  side-effect boundary;
+- make prepared state addressable through the already frozen worker bind; the
+  preparation hook cannot replace or mutate the translated write plan;
 - accept only the selected task-result envelopes during finalization;
 - use the extension catalog's own transaction and ACID mechanism in
   `FinalizeDistributedWrite` and do not depend on Vane retrying that call;
 - register or commit exactly the selected files or opaque fragments from that
   one coordinator invocation;
 - return the exact affected row count;
-- implement `AbortDistributedWrite` for known failures before finalization
-  starts, including an empty selected-result set;
+- implement `AbortDistributedWrite` for known failures after preparation starts
+  and before finalization starts, including preparation failures and an empty
+  selected-result set;
 - retain immutable artifacts when a remote catalog commit response is
   ambiguous; never interpret a commit exception as proof of rollback;
 - never require query or task-attempt IDs to be durable idempotency keys.

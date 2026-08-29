@@ -39,6 +39,15 @@ public:
 	//! callback can run. This hook must not create artifacts.
 	virtual void ValidateDistributedWrite(ClientContext &context) const = 0;
 
+	//! Create coordinator-owned state required before worker callbacks can run.
+	//! Vane invokes this hook at most once after translation and coordinator setup.
+	//! WritePlan is already frozen, so prepared state must be addressable through
+	//! its immutable worker bind. Once invocation starts, a known failure before
+	//! coordinator finalization invokes AbortDistributedWrite, including when no
+	//! worker envelope exists.
+	virtual void PrepareDistributedWrite(ClientContext &context) const {
+	}
+
 	//! Commit the selected task results in the active coordinator transaction.
 	//! Vane invokes this hook at most once and never retries it. Once invocation
 	//! starts, any failure is terminal with an unknown commit outcome and Vane
@@ -47,9 +56,10 @@ public:
 	virtual idx_t FinalizeDistributedWrite(ClientContext &context,
 	                                       const vector<DistributedWriteTaskResult> &results) const = 0;
 
-	//! Remove artifacts after a failure that is known to precede coordinator
-	//! finalization. This hook is never called once FinalizeDistributedWrite has
-	//! started. It must support cleanup when no worker envelope was returned.
+	//! Handle a failure that is known to precede coordinator finalization. The
+	//! extension decides whether its catalog contract cleans, compensates, or
+	//! retains prepared state and artifacts. This hook is never called once
+	//! FinalizeDistributedWrite has started and must accept an empty result set.
 	virtual void AbortDistributedWrite(ClientContext &context,
 	                                   const vector<DistributedWriteTaskResult> &selected_results) const = 0;
 };
