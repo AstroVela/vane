@@ -15,7 +15,8 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 	SECTION("simple types") {
 		REQUIRE(DBConfig::ParseLogicalType("integer") == LogicalType::INTEGER);
 		REQUIRE(DBConfig::ParseLogicalType("any") == LogicalType::ANY);
-		REQUIRE(DBConfig::ParseLogicalType(LogicalType::SQLNULL.ToString()) == LogicalType::SQLNULL);
+		auto sqlnull = LogicalType(LogicalType::SQLNULL);
+		REQUIRE(DBConfig::ParseLogicalType(sqlnull.ToString()) == sqlnull);
 	}
 
 	SECTION("nested types") {

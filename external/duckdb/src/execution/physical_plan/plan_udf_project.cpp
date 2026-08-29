@@ -152,6 +152,123 @@ static vector<Value> UDFLogicalTypesToStringValues(const vector<LogicalType> &ty
 	return values;
 }
 
+static bool UDFTypeContainsSupportedBit(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::BIT) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (UDFTypeContainsSupportedBit(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::LIST:
+		return UDFTypeContainsSupportedBit(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return UDFTypeContainsSupportedBit(ArrayType::GetChildType(type));
+	case LogicalTypeId::MAP:
+		return UDFTypeContainsSupportedBit(MapType::KeyType(type)) ||
+		       UDFTypeContainsSupportedBit(MapType::ValueType(type));
+	case LogicalTypeId::UNION:
+		// Python FILE contracts do not yet materialize UNION tags, so leave
+		// generic UNION inputs unchanged rather than partially annotating them.
+		return false;
+	default:
+		return false;
+	}
+}
+
+static bool UDFTypeContainsFile(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT:
+		for (auto &child : StructType::GetChildTypes(type)) {
+			if (UDFTypeContainsFile(child.second)) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::UNION:
+		for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
+			if (UDFTypeContainsFile(UnionType::GetMemberType(type, index))) {
+				return true;
+			}
+		}
+		return false;
+	case LogicalTypeId::LIST:
+		return UDFTypeContainsFile(ListType::GetChildType(type));
+	case LogicalTypeId::ARRAY:
+		return UDFTypeContainsFile(ArrayType::GetChildType(type));
+	case LogicalTypeId::MAP:
+		return UDFTypeContainsFile(MapType::KeyType(type)) || UDFTypeContainsFile(MapType::ValueType(type));
+	default:
+		return false;
+	}
+}
+
+static LogicalType UDFInputContractType(const LogicalType &type) {
+	if (FileLogicalType::IsFile(type)) {
+		return FileLogicalType::Create();
+	}
+	if (type.id() == LogicalTypeId::BIT) {
+		return LogicalType::BIT;
+	}
+	// Only FILE and supported BIT positions matter to the Python boundary.
+	// Collapsing unrelated subtrees makes the descriptor catalog-independent.
+	if (!UDFTypeContainsFile(type) && !UDFTypeContainsSupportedBit(type)) {
+		return LogicalType::VARCHAR;
+	}
+	if (TensorType::IsTensor(type)) {
+		return TensorType::Create(UDFInputContractType(TensorType::GetChildType(type)), TensorType::GetShape(type));
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		for (auto &child : StructType::GetChildTypes(type)) {
+			children.emplace_back(child.first, UDFInputContractType(child.second));
+		}
+		return LogicalType::STRUCT(std::move(children));
+	}
+	case LogicalTypeId::UNION: {
+		child_list_t<LogicalType> members;
+		for (idx_t index = 0; index < UnionType::GetMemberCount(type); index++) {
+			members.emplace_back(UnionType::GetMemberName(type, index),
+			                     UDFInputContractType(UnionType::GetMemberType(type, index)));
+		}
+		return LogicalType::UNION(std::move(members));
+	}
+	case LogicalTypeId::LIST:
+		return LogicalType::LIST(UDFInputContractType(ListType::GetChildType(type)));
+	case LogicalTypeId::ARRAY: {
+		auto size = ArrayType::IsAnySize(type) ? optional_idx() : optional_idx(ArrayType::GetSize(type));
+		return LogicalType::ARRAY(UDFInputContractType(ArrayType::GetChildType(type)), size);
+	}
+	case LogicalTypeId::MAP:
+		return LogicalType::MAP(UDFInputContractType(MapType::KeyType(type)),
+		                        UDFInputContractType(MapType::ValueType(type)));
+	default:
+		return LogicalType::VARCHAR;
+	}
+}
+
+static vector<Value> UDFLogicalInputContractValues(const vector<LogicalType> &types) {
+	vector<Value> values;
+	values.reserve(types.size());
+	for (auto &type : types) {
+		if (!UDFTypeContainsFile(type) && !UDFTypeContainsSupportedBit(type)) {
+			values.emplace_back(LogicalType::VARCHAR);
+			continue;
+		}
+		values.emplace_back(UDFInputContractType(type).ToString());
+	}
+	return values;
+}
+
 static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &argument_types,
                                const vector<LogicalType> &passthrough_types, const LogicalType &return_type,
                                bool include_row_preserving_layout) {
@@ -169,6 +286,9 @@ static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &
 		if (name == "input_types") {
 			return Value::LIST(LogicalType::VARCHAR, UDFLogicalTypesToStringValues(argument_types));
 		}
+		if (name == "input_contract_types") {
+			return Value::LIST(LogicalType::VARCHAR, UDFLogicalInputContractValues(argument_types));
+		}
 		if (name == "ref_output_types") {
 			return Value::LIST(LogicalType::VARCHAR, UDFLogicalTypesToStringValues(ref_output_types));
 		}
@@ -178,9 +298,9 @@ static Value AddUDFTypePayload(const Value &payload, const vector<LogicalType> &
 	auto &children = StructValue::GetChildren(payload);
 	auto &payload_type = payload.type();
 	child_list_t<Value> new_children;
-	vector<string> fields {"input_types"};
+	vector<string> fields {"input_types", "input_contract_types"};
 	if (include_row_preserving_layout) {
-		fields = {"scalar_arg_count", "input_types", "ref_output_types"};
+		fields = {"scalar_arg_count", "input_types", "input_contract_types", "ref_output_types"};
 	}
 
 	for (idx_t i = 0; i < StructType::GetChildCount(payload_type); i++) {

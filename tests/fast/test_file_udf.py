@@ -914,6 +914,36 @@ def test_file_output_normalizes_chunked_temporal_siblings_atomically():
     assert normalized.column("payload").type.field("document").type == _file_arrow_type()
 
 
+def test_arrow_scalar_file_output_normalizes_temporal_batches_atomically():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, occurred_at TIMESTAMP)")
+
+    @vane.func.batch(return_dtype=output_type, batch_size=1)
+    def build_document(identifiers):
+        identifier = identifiers[0].as_py()
+        nanoseconds = 1_000 if identifier == 0 else 1_001
+        return pa.StructArray.from_arrays(
+            [
+                pa.array(
+                    [_file_record(url=f"memory://temporal-{identifier}")],
+                    type=_file_arrow_type(),
+                ),
+                pa.array([nanoseconds], type=pa.timestamp("ns")),
+            ],
+            names=["document", "occurred_at"],
+        )
+
+    connection = vane.connect()
+    source = connection.sql("SELECT i FROM range(2) AS t(i)")
+    result = source.select(build_document(vane.col("i")).alias("payload"))
+
+    assert result.project("payload.document.url, epoch_ns(payload.occurred_at)").fetchall() == [
+        ("memory://temporal-0", 1_000),
+        ("memory://temporal-1", 1_000),
+    ]
+
+
 def test_file_tensor_output_contract_normalizes_and_validates_file_elements():
     import pyarrow as pa
 
@@ -1761,6 +1791,45 @@ def test_batch_file_output_preserves_bit_only_input_identity():
     )
 
 
+def test_batch_file_output_uses_resolved_contract_for_connection_local_aliases():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def attach_document(flags, _moods):
+        assert flags.type.extension_name == "arrow.opaque"
+        assert flags.type.type_name == "bit"
+        documents = pa.array(
+            [_file_record(url="memory://local-aliases")] * len(flags),
+            type=_file_arrow_type(),
+        )
+        return pa.StructArray.from_arrays([documents, flags], names=["document", "flags"])
+
+    connection = vane.connect()
+    connection.execute("CREATE TYPE local_flags AS BIT")
+    connection.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+    source = connection.sql("SELECT '0101011'::local_flags AS flags, 'happy'::mood AS mood")
+    result = source.select(attach_document(vane.col("flags"), vane.col("mood")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://local-aliases",
+        "0101011",
+    )
+
+
+def test_scalar_file_output_leaves_union_bit_input_unmaterialized():
+    @vane.func(return_dtype=vane.file_type())
+    def build_document(_value):
+        return vane.File("memory://union-bit-input")
+
+    connection = vane.connect()
+    source = connection.sql("SELECT union_value(bits := '0101011'::BIT) AS value")
+    result = source.select(build_document(vane.col("value")).alias("document"))
+
+    assert result.fetchone() == (vane.File("memory://union-bit-input"),)
+
+
 def test_scalar_file_output_materializes_bit_only_input_as_text():
     output_type = vane.type("STRUCT(document FILE, flags BIT)")
 
@@ -1827,6 +1896,30 @@ def test_batch_file_udf_preserves_blob_to_bit_cast_semantics():
     connection.register("file_bit_blob", pa.table({"payload": result}))
     assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_blob").fetchone() == (
         "0000000110101011",
+    )
+
+
+def test_batch_file_udf_preserves_bit_to_blob_cast_semantics():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, data BLOB)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def attach_document(flags):
+        assert flags.type.extension_name == "arrow.opaque"
+        documents = pa.array(
+            [_file_record(url="memory://bit-to-blob")] * len(flags),
+            type=_file_arrow_type(),
+        )
+        return pa.StructArray.from_arrays([documents, flags], names=["document", "data"])
+
+    connection = vane.connect()
+    source = connection.sql("SELECT '0101011'::BIT AS flags")
+    result = source.select(attach_document(vane.col("flags")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.data").fetchone() == (
+        "memory://bit-to-blob",
+        b"+",
     )
 
 

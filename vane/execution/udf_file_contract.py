@@ -86,8 +86,10 @@ def _contains_bit(dtype: Any | None) -> bool:
         return True
     if type_id in ("list", "array", "tensor"):
         return _contains_bit(_sequence_child(dtype))
-    if type_id in ("struct", "union", "map"):
+    if type_id in ("struct", "map"):
         return any(_contains_bit(child) for _, child in dtype.children)
+    # UNION tags are not materialized at the Python boundary yet. Treat the
+    # whole UNION as opaque instead of annotating only some member storage.
     return False
 
 
@@ -535,7 +537,10 @@ def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dty
     if actual.equals(expected):
         return True
     if _is_arrow_extension_type(actual) and actual.storage_type.equals(expected):
-        return True
+        # DuckDB BIT storage includes a padding byte that its BIT-to-BLOB cast
+        # removes. Stripping the extension in Arrow would expose internal
+        # bytes instead of preserving that declared cast.
+        return not _is_duckdb_bit_arrow_type(actual)
     if _is_arrow_string_storage(actual) and _is_arrow_string_storage(expected):
         return True
     if _is_arrow_binary_storage(actual) and _is_arrow_binary_storage(expected):
@@ -1199,15 +1204,9 @@ class FileUDFContract:
         raw_inputs = payload.get("input_types") or []
         if isinstance(raw_inputs, (list, tuple)):
             file_input_types = tuple(_parse_file_type(type_name, field="input_types") for type_name in raw_inputs)
-            input_types = (
-                tuple(
-                    file_dtype if file_dtype is not None else _parse_declared_type(type_name, field="input_types")
-                    for type_name, file_dtype in zip(raw_inputs, file_input_types, strict=True)
-                )
-                if any(dtype is not None for dtype in file_input_types)
-                else file_input_types
-            )
+            input_types = file_input_types
         else:
+            file_input_types = ()
             input_types = ()
 
         output_types: list[Any | None] = []
@@ -1250,13 +1249,22 @@ class FileUDFContract:
                 else:
                     output_types.extend(file_types)
 
-        if isinstance(raw_inputs, (list, tuple)) and any(
-            dtype is not None and _contains_file(dtype) for dtype in output_types
-        ):
-            # A FILE output can return an input BIT unchanged. Retain every
-            # declared input type so BIT provenance is available even when no
-            # input itself contains FILE.
-            input_types = tuple(_parse_declared_type(type_name, field="input_types") for type_name in raw_inputs)
+        raw_input_contracts = payload.get("input_contract_types")
+        parsed_input_contracts: tuple[Any | None, ...] | None = None
+        if isinstance(raw_inputs, (list, tuple)) and isinstance(raw_input_contracts, (list, tuple)):
+            if len(raw_input_contracts) != len(raw_inputs):
+                raise _invalid_input("UDF payload input contract count does not match its input type count")
+            parsed_input_contracts = tuple(
+                _parse_declared_type(type_name, field="input_contract_types") if isinstance(type_name, str) else None
+                for type_name in raw_input_contracts
+            )
+        has_file_contract = (
+            any(dtype is not None for dtype in file_input_types)
+            or any(dtype is not None and _contains_file(dtype) for dtype in parsed_input_contracts or ())
+            or any(dtype is not None and _contains_file(dtype) for dtype in output_types)
+        )
+        if has_file_contract and parsed_input_contracts is not None:
+            input_types = parsed_input_contracts
 
         return cls(
             udf_name=str(payload.get("udf_name") or "<unknown>"),

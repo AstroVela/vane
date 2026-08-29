@@ -877,17 +877,26 @@ class UDFExecutor:
                     raise
             result = ensure_synchronous_udf_result(result)
             output = _coerce_scalar_array(result, batch.num_rows)
-            outputs.append(self._file_contract.normalize_scalar_arrow_output(output))
+            outputs.append(output)
 
         if outputs:
             if len(outputs) == 1:
-                result_array = outputs[0]
+                result_array = self._file_contract.normalize_scalar_arrow_output(outputs[0])
+            elif self._file_contract.has_file_outputs and all(
+                output.type.equals(outputs[0].type, check_metadata=True) for output in outputs[1:]
+            ):
+                # Value-dependent FILE sibling normalization must see every
+                # internal scalar batch before choosing one output schema.
+                result_array = self._file_contract.normalize_scalar_arrow_output(
+                    pa.chunked_array(outputs, type=outputs[0].type)
+                )
             else:
+                normalized_outputs = [self._file_contract.normalize_scalar_arrow_output(output) for output in outputs]
                 try:
-                    result_array = pa.concat_arrays(outputs)
+                    result_array = pa.concat_arrays(normalized_outputs)
                 except pa.ArrowInvalid as exc:
                     if "offset overflow" in str(exc):
-                        result_array = pa.chunked_array(outputs)
+                        result_array = pa.chunked_array(normalized_outputs)
                     else:
                         raise
         else:
