@@ -872,6 +872,48 @@ def test_map_batches_normalizes_lossless_temporal_siblings_across_batches():
     assert output[0].column("occurred_at").to_pylist() == [occurred_at, occurred_at]
 
 
+def test_file_output_normalizes_chunked_temporal_siblings_atomically():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    logical_type = "STRUCT(document FILE, occurred_at TIMESTAMP)"
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "chunked-temporal",
+            "output_schema": [{"name": "payload", "kind": "duckdb_type", "type": logical_type}],
+        }
+    )
+
+    file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+
+    def make_chunk(nanoseconds):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()], type=file_type),
+                pa.array([nanoseconds], type=pa.timestamp("ns")),
+            ],
+            names=["document", "occurred_at"],
+        )
+
+    payload = pa.chunked_array([make_chunk(1_000), make_chunk(1_001)])
+    table = pa.table({"payload": payload})
+
+    normalized = contract.normalize_output_table(table)
+
+    assert normalized.column("payload").num_chunks == 2
+    assert normalized.column("payload").type.field("occurred_at").type == pa.timestamp("ns")
+    assert normalized.column("payload").type.field("document").type == _file_arrow_type()
+
+
 def test_file_tensor_output_contract_normalizes_and_validates_file_elements():
     import pyarrow as pa
 
@@ -1487,7 +1529,10 @@ def test_batch_file_udf_supports_bit_sibling():
         )
 
     bit_type = build_document.return_arrow_dtype.field("flags").type
-    assert bit_type == pa.opaque(pa.binary(), "bit", "DuckDB")
+    assert bit_type.extension_name == "arrow.opaque"
+    assert bit_type.type_name == "bit"
+    assert bit_type.vendor_name == "DuckDB"
+    assert bit_type.storage_type == pa.binary()
 
     connection = vane.connect()
     result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
@@ -1524,35 +1569,201 @@ def test_batch_file_udf_supports_enum_sibling():
     )
 
 
-def test_batch_file_udf_preserves_bit_identity_storage():
+def test_batch_file_udf_supports_sqlnull_sibling():
     import pyarrow as pa
 
+    output_type = vane.struct_type(
+        {
+            "document": vane.file_type(),
+            "missing": vane.sqltypes.SQLNULL,
+        }
+    )
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.nulls(len(values)),
+            ],
+            names=["document", "missing"],
+        )
+
+    assert build_document.return_arrow_dtype.field("missing").type == pa.null()
+    assert build_document(pa.array([1], type=pa.int32())).to_pylist() == [{"document": _file_record(), "missing": None}]
+
     connection = vane.connect()
-    bit_storage = connection.execute("SELECT '0101011'::BIT AS flags").to_arrow_table().column("flags").chunk(0)
-    assert bit_storage.type == pa.binary()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert result.project("payload.document.url, payload.missing").fetchone() == ("memory://udf", None)
+
+
+def test_batch_file_udf_preserves_bit_identity_storage():
+    import pyarrow as pa
 
     output_type = vane.type("STRUCT(document FILE, flags BIT)")
 
     @vane.func.batch(return_dtype=output_type)
     def identity(values):
+        flags_type = values.type.field("flags").type
+        assert flags_type.extension_name == "arrow.opaque"
+        assert flags_type.type_name == "bit"
+        assert flags_type.vendor_name == "DuckDB"
+        assert flags_type.storage_type == pa.binary()
         return values
 
+    connection = vane.connect()
+    source = connection.sql(
+        """
+        SELECT struct_pack(
+            document := file('memory://bit-identity', NULL, NULL, NULL, NULL),
+            flags := '0101011'::BIT
+        ) AS payload
+        """
+    )
+    result = source.select(identity(vane.col("payload")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://bit-identity",
+        "0101011",
+    )
+
+
+def test_scalar_file_udf_materializes_bit_sibling_as_text():
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func(return_dtype=output_type)
+    def identity(value):
+        assert isinstance(value["document"], vane.File)
+        assert value["flags"] == "0101011"
+        return value
+
+    connection = vane.connect()
+    source = connection.sql(
+        """
+        SELECT struct_pack(
+            document := file('memory://scalar-bit-identity', NULL, NULL, NULL, NULL),
+            flags := '0101011'::BIT
+        ) AS payload
+        """
+    )
+    result = source.select(identity(vane.col("payload")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.flags::VARCHAR").fetchone() == (
+        "memory://scalar-bit-identity",
+        "0101011",
+    )
+
+
+def test_file_contract_marks_sliced_nested_bit_inputs():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    bit_storage = pa.array([b"\x01\xab"] * 4, type=pa.binary())
+    flags = pa.ListArray.from_arrays(pa.array([0, 2, 4], type=pa.int32()), bit_storage)
+    fixed = pa.FixedSizeListArray.from_arrays(bit_storage, 2)
+    lookup = pa.MapArray.from_arrays(
+        pa.array([0, 1, 2], type=pa.int32()),
+        pa.array(["first", "second"]),
+        bit_storage.slice(0, 2),
+    )
     payload = pa.StructArray.from_arrays(
         [
-            pa.array([_file_record()], type=_file_arrow_type()),
-            bit_storage,
+            pa.array(
+                [_file_record(url="memory://first"), _file_record(url="memory://second")], type=_file_arrow_type()
+            ),
+            flags,
+            fixed,
+            lookup,
         ],
-        names=["document", "flags"],
+        names=["document", "flags", "fixed", "lookup"],
     )
-    result = identity(payload)
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "nested-bit-input",
+            "input_types": ["STRUCT(document FILE, flags BIT[], fixed BIT[2], lookup MAP(VARCHAR, BIT))"],
+        }
+    )
 
-    assert result.type.field("flags").type == pa.opaque(pa.binary(), "bit", "DuckDB")
-    connection.register("file_bit_identity", pa.table({"payload": result}))
-    assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_identity").fetchone() == ("0101011",)
+    sliced = pa.table({"payload": payload}).slice(1, 1)
+    prepared = contract.prepare_input_table(sliced).column("payload").chunk(0)
+
+    for child in (prepared.field("flags").values, prepared.field("fixed").values, prepared.field("lookup").items):
+        assert child.type.extension_name == "arrow.opaque"
+        assert child.type.type_name == "bit"
+        assert child.type.vendor_name == "DuckDB"
+    assert contract.materialize_scalar_inputs(sliced) == [
+        [
+            {
+                "document": vane.File(**_file_record(url="memory://second")),
+                "flags": ["0101011", "0101011"],
+                "fixed": ("0101011", "0101011"),
+                "lookup": {"second": "0101011"},
+            }
+        ]
+    ]
+
+
+def test_map_batches_marks_top_level_bit_sibling_input():
+    import pyarrow as pa
+
+    def identity(table):
+        flags_type = table.column("flags").type
+        assert flags_type.extension_name == "arrow.opaque"
+        assert flags_type.type_name == "bit"
+        assert flags_type.vendor_name == "DuckDB"
+        assert flags_type.storage_type == pa.binary()
+        return table
+
+    connection = vane.connect()
+    source = connection.sql(
+        """
+        SELECT
+            file('memory://batch-bit-identity', NULL, NULL, NULL, NULL) AS document,
+            '0101011'::BIT AS flags
+        """
+    )
+    result = source.map_batches(
+        identity,
+        schema={"document": vane.file_type(), "flags": vane.sqltypes.BIT},
+        execution_backend="subprocess_task",
+    )
+
+    assert result.project("document.url, flags::VARCHAR").fetchone() == (
+        "memory://batch-bit-identity",
+        "0101011",
+    )
+
+
+def test_batch_file_udf_preserves_blob_to_bit_cast_semantics():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array([b"\x01\xab"] * len(values), type=pa.binary()),
+            ],
+            names=["document", "flags"],
+        )
+
+    result = build_document(pa.array([1], type=pa.int32()))
+
+    assert result.type.field("flags").type == pa.binary()
+    connection = vane.connect()
+    connection.register("file_bit_blob", pa.table({"payload": result}))
+    assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_blob").fetchone() == (
+        "0000000110101011",
+    )
 
 
 def test_batch_file_udf_uses_opaque_compat_without_pyarrow_opaque(monkeypatch):
     import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
 
     connection = vane.connect()
     bit_storage = connection.execute("SELECT '0101011'::BIT AS flags").to_arrow_table().column("flags").chunk(0)
@@ -1571,7 +1782,9 @@ def test_batch_file_udf_uses_opaque_compat_without_pyarrow_opaque(monkeypatch):
         ],
         names=["document", "flags"],
     )
-    result = identity(payload)
+    contract = FileUDFContract.from_payload({"input_types": [str(output_type)]})
+    prepared = contract.prepare_input_table(pa.table({"payload": payload})).column("payload").chunk(0)
+    result = identity(prepared)
 
     flags_type = identity.return_arrow_dtype.field("flags").type
     assert flags_type.extension_name == "arrow.opaque"

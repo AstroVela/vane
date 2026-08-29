@@ -694,7 +694,7 @@ class UDFExecutor:
             self._queue.append(_empty_output_table_from_payload(self._payload))
 
     def _execute_map_batches(self, args: pa.Table) -> None:
-        self._file_contract.validate_input_table(args)
+        args = self._file_contract.prepare_input_table(args)
         args = self._rename_args(args)
         self._execute_map_batches_compute_batches(self._iter_map_batches_compute_batches(args))
 
@@ -710,7 +710,7 @@ class UDFExecutor:
             return
 
         if self._is_map_batches and self._stream_output:
-            self._file_contract.validate_input_table(args)
+            args = self._file_contract.prepare_input_table(args)
             args = self._rename_args(args)
             batches = self._iter_map_batches_compute_batches(args)
             saw_compute_batch = False
@@ -853,7 +853,7 @@ class UDFExecutor:
     def _execute_scalar_arrow(self, args: pa.Table) -> pa.Array:
         row_count = args.num_rows
         exception_occurred = False
-        self._file_contract.validate_input_table(args)
+        args = self._file_contract.prepare_input_table(args)
 
         if self._default_null_handling():
             valid_mask = _build_valid_mask(args)

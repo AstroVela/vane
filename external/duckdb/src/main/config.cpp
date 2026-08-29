@@ -542,6 +542,9 @@ static string ParseSerializedStringLiteral(const string &input, const string &fu
 }
 
 LogicalType DBConfig::ParseLogicalType(const string &type) {
+	if (StringUtil::CIEquals(type, "\"NULL\"") || StringUtil::CIEquals(type, "NULL")) {
+		return LogicalType::SQLNULL;
+	}
 	if (StringUtil::EndsWith(type, "[]")) {
 		// list - recurse
 		auto child_type = ParseLogicalType(type.substr(0, type.size() - 2));

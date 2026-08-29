@@ -78,6 +78,19 @@ def _contains_file(dtype: Any | None) -> bool:
     return False
 
 
+def _contains_bit(dtype: Any | None) -> bool:
+    if dtype is None:
+        return False
+    type_id = _type_id(dtype)
+    if type_id == "bit":
+        return True
+    if type_id in ("list", "array", "tensor"):
+        return _contains_bit(_sequence_child(dtype))
+    if type_id in ("struct", "union", "map"):
+        return any(_contains_bit(child) for _, child in dtype.children)
+    return False
+
+
 def _native_map_key_is_hashable(dtype: Any) -> bool:
     if _is_file_type(dtype):
         return True
@@ -238,6 +251,140 @@ def _is_duckdb_bit_arrow_type(dtype: pa.DataType) -> bool:
         and getattr(dtype, "vendor_name", None) == "DuckDB"
         and _is_arrow_binary_storage(dtype.storage_type)
     )
+
+
+def _decode_duckdb_bit_bytes(value: bytes) -> str:
+    if len(value) < 2:
+        raise ValueError("BIT storage must contain padding metadata and at least one data byte")
+    padding = value[0]
+    if padding >= 8:
+        raise ValueError("BIT storage has invalid padding metadata")
+    if padding:
+        padding_mask = ((1 << padding) - 1) << (8 - padding)
+        if value[1] & padding_mask != padding_mask:
+            raise ValueError("BIT storage has invalid padding bits")
+    bits = "".join(f"{byte:08b}" for byte in value[1:])
+    return bits[padding:]
+
+
+def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
+    """Attach BIT provenance to DuckDB-produced binary input without touching siblings."""
+    if not _contains_bit(dtype):
+        return array
+    if isinstance(array, pa.ChunkedArray):
+        if not array.chunks:
+            return array
+        return pa.chunked_array([_annotate_duckdb_bit_input(chunk, dtype, boundary=boundary) for chunk in array.chunks])
+
+    type_id = _type_id(dtype)
+    if type_id == "bit":
+        expected = _expected_arrow_type(dtype, boundary=boundary)
+        if array.type.equals(expected):
+            return array
+        if pa.types.is_null(array.type):
+            return pa.nulls(len(array), type=expected)
+        if _is_duckdb_bit_arrow_type(array.type):
+            storage = array.storage
+        elif _is_arrow_binary_storage(array.type):
+            storage = array
+        else:
+            return array
+        if not storage.type.equals(expected.storage_type):
+            storage = storage.cast(expected.storage_type)
+        return pa.ExtensionArray.from_storage(expected, storage)
+
+    if type_id == "struct":
+        arrays = [array.field(index) for index in range(array.type.num_fields)]
+        fields = list(array.type)
+        changed = False
+        for name, child in dtype.children:
+            if not _contains_bit(child):
+                continue
+            field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
+            annotated = _annotate_duckdb_bit_input(arrays[field_index], child, boundary=boundary)
+            if annotated.type.equals(arrays[field_index].type, check_metadata=True):
+                continue
+            arrays[field_index] = annotated
+            field = fields[field_index]
+            fields[field_index] = pa.field(
+                field.name,
+                annotated.type,
+                nullable=field.nullable,
+                metadata=field.metadata,
+            )
+            changed = True
+        return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null()) if changed else array
+
+    if type_id == "list":
+        if pa.types.is_list(array.type):
+            offset_type = pa.int32()
+            constructor = pa.ListArray.from_arrays
+        if pa.types.is_large_list(array.type):
+            offset_type = pa.int64()
+            constructor = pa.LargeListArray.from_arrays
+        if pa.types.is_list(array.type) or pa.types.is_large_list(array.type):
+            offsets = [int(offset) for offset in array.offsets.to_pylist()]
+            start = offsets[0]
+            values = array.values.slice(start, offsets[-1] - start)
+            annotated = _annotate_duckdb_bit_input(values, _sequence_child(dtype), boundary=boundary)
+            if annotated.type.equals(values.type, check_metadata=True):
+                return array
+            normalized_offsets = pa.array([offset - start for offset in offsets], type=offset_type)
+            return constructor(normalized_offsets, annotated, mask=array.is_null())
+        is_list_view = getattr(pa.types, "is_list_view", None)
+        if callable(is_list_view) and is_list_view(array.type):
+            values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
+            if values.type.equals(array.values.type, check_metadata=True):
+                return array
+            return pa.ListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
+        is_large_list_view = getattr(pa.types, "is_large_list_view", None)
+        if callable(is_large_list_view) and is_large_list_view(array.type):
+            values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
+            if values.type.equals(array.values.type, check_metadata=True):
+                return array
+            return pa.LargeListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
+        return array
+
+    if type_id in ("array", "tensor"):
+        storage = array.storage if type_id == "tensor" and _is_arrow_extension_type(array.type) else array
+        array_size = storage.type.list_size
+        values = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
+        annotated = _annotate_duckdb_bit_input(values, _sequence_child(dtype), boundary=boundary)
+        if annotated.type.equals(values.type, check_metadata=True):
+            return array
+        normalized_storage = pa.FixedSizeListArray.from_arrays(
+            annotated,
+            array_size,
+            mask=storage.is_null(),
+        )
+        if type_id == "array":
+            return normalized_storage
+        tensor_type = pa.fixed_shape_tensor(annotated.type, _tensor_shape(dtype))
+        return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
+
+    if type_id == "map":
+        children = _type_children(dtype)
+        start, length, offsets = _child_window(array)
+        source_keys = array.keys.slice(start, length)
+        source_items = array.items.slice(start, length)
+        keys = (
+            _annotate_duckdb_bit_input(source_keys, children["key"], boundary=boundary)
+            if _contains_bit(children["key"])
+            else source_keys
+        )
+        items = (
+            _annotate_duckdb_bit_input(source_items, children["value"], boundary=boundary)
+            if _contains_bit(children["value"])
+            else source_items
+        )
+        if keys.type.equals(source_keys.type, check_metadata=True) and items.type.equals(
+            source_items.type, check_metadata=True
+        ):
+            return array
+        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
+        return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
+
+    return array
 
 
 def _validate_arrow_storage_type(
@@ -513,6 +660,11 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
         return _file_from_arrow_value(value, boundary=boundary, path=path)
 
     type_id = _type_id(dtype)
+    if type_id == "bit" and isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            return _decode_duckdb_bit_bytes(bytes(value))
+        except ValueError as exc:
+            raise _invalid_input(f"{boundary} contains invalid BIT storage at {path}: {exc}") from exc
     if type_id in ("list", "array", "tensor"):
         child = _sequence_child(dtype)
         values = [
@@ -526,7 +678,7 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
             child_value = _mapping_field_value(value, name, boundary=boundary, path=path)
             result[name] = (
                 _materialize_native_value(child_value, child, boundary=boundary, path=f"{path}.{name}")
-                if _contains_file(child)
+                if _contains_file(child) or _contains_bit(child)
                 else child_value
             )
         return result
@@ -813,7 +965,25 @@ def _normalize_file_arrow_array(
                 )
             )
             offset += len(chunk)
-        return pa.chunked_array(chunks)
+        normalized_type = chunks[0].type
+        if all(chunk.type.equals(normalized_type, check_metadata=True) for chunk in chunks[1:]):
+            return pa.chunked_array(chunks, type=normalized_type)
+
+        # Some safe casts, notably temporal downcasts, depend on the values.
+        # Retry the logical column as one array so every leaf makes one
+        # all-or-nothing decision, then restore the caller's chunk boundaries.
+        normalized = _normalize_file_arrow_array(
+            pa.concat_arrays(array.chunks),
+            dtype,
+            boundary=boundary,
+            parent_active=parent_active,
+        )
+        rechunked = []
+        offset = 0
+        for chunk in array.chunks:
+            rechunked.append(normalized.slice(offset, len(chunk)))
+            offset += len(chunk)
+        return pa.chunked_array(rechunked, type=normalized.type)
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
     if type_id == "bit":
@@ -823,14 +993,13 @@ def _normalize_file_arrow_array(
             return source
         if pa.types.is_null(source.type):
             return pa.nulls(len(source), type=expected)
-        if _is_arrow_binary_storage(source.type):
-            storage = source if source.type.equals(expected.storage_type) else source.cast(expected.storage_type)
-            return pa.ExtensionArray.from_storage(expected, storage)
         if _is_duckdb_bit_arrow_type(source.type):
             storage = source.storage
             if not storage.type.equals(expected.storage_type):
                 storage = storage.cast(expected.storage_type)
             return pa.ExtensionArray.from_storage(expected, storage)
+        # Ordinary binary is a BLOB value returned by user code. Leave it
+        # unannotated so DuckDB performs its normal BLOB-to-BIT cast.
         return source
     if type_id == "uuid":
         source = _mask_inactive(array, active)
@@ -1002,11 +1171,18 @@ class FileUDFContract:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> FileUDFContract:
         raw_inputs = payload.get("input_types") or []
-        input_types = (
-            tuple(_parse_file_type(type_name, field="input_types") for type_name in raw_inputs)
-            if isinstance(raw_inputs, (list, tuple))
-            else ()
-        )
+        if isinstance(raw_inputs, (list, tuple)):
+            file_input_types = tuple(_parse_file_type(type_name, field="input_types") for type_name in raw_inputs)
+            input_types = (
+                tuple(
+                    file_dtype if file_dtype is not None else _parse_declared_type(type_name, field="input_types")
+                    for type_name, file_dtype in zip(raw_inputs, file_input_types, strict=True)
+                )
+                if any(dtype is not None for dtype in file_input_types)
+                else file_input_types
+            )
+        else:
+            input_types = ()
 
         output_types: list[Any | None] = []
         method_return_type = payload.get("method_return_type")
@@ -1056,7 +1232,7 @@ class FileUDFContract:
 
     @property
     def has_file_inputs(self) -> bool:
-        return any(dtype is not None for dtype in self.input_types)
+        return any(dtype is not None and _contains_file(dtype) for dtype in self.input_types)
 
     @property
     def has_file_outputs(self) -> bool:
@@ -1074,25 +1250,61 @@ class FileUDFContract:
         boundary = f"UDF {self.udf_name!r} input"
         self._validate_column_count(table, self.input_types, boundary=boundary)
         for index, dtype in enumerate(self.input_types):
-            if dtype is not None:
+            if dtype is not None and _contains_file(dtype):
                 validate_file_arrow_array(table.column(index), dtype, boundary=f"{boundary} column {index}")
+
+    def prepare_input_table(self, table: pa.Table) -> pa.Table:
+        """Validate FILE inputs and mark DuckDB-produced BIT storage before user code runs."""
+        self.validate_input_table(table)
+        if not self.has_file_inputs:
+            return table
+
+        boundary = f"UDF {self.udf_name!r} input"
+        columns = list(table.columns)
+        fields = list(table.schema)
+        changed = False
+        for index, dtype in enumerate(self.input_types):
+            if dtype is None or not _contains_bit(dtype):
+                continue
+            annotated = _annotate_duckdb_bit_input(
+                columns[index],
+                dtype,
+                boundary=f"{boundary} column {index}",
+            )
+            if annotated.type.equals(columns[index].type, check_metadata=True):
+                continue
+            columns[index] = annotated
+            field = fields[index]
+            fields[index] = pa.field(
+                field.name,
+                annotated.type,
+                nullable=field.nullable,
+                metadata=field.metadata,
+            )
+            changed = True
+
+        if not changed:
+            return table
+        return pa.Table.from_arrays(columns, schema=pa.schema(fields, metadata=table.schema.metadata))
 
     def materialize_scalar_inputs(self, table: pa.Table) -> list[list[Any]]:
         if not self.has_file_inputs:
             return [column.to_pylist() for column in table.columns]
+        table = self.prepare_input_table(table)
         boundary = f"UDF {self.udf_name!r} input"
         self._validate_column_count(table, self.input_types, boundary=boundary)
         columns: list[list[Any]] = []
         for index, column in enumerate(table.columns):
             values = column.to_pylist()
             dtype = self.input_types[index]
-            if dtype is not None:
-                _validate_arrow_storage_type(
-                    column.type,
-                    dtype,
-                    boundary=f"{boundary} column {index}",
-                    path="column",
-                )
+            if dtype is not None and (_contains_file(dtype) or _contains_bit(dtype)):
+                if _contains_file(dtype):
+                    _validate_arrow_storage_type(
+                        column.type,
+                        dtype,
+                        boundary=f"{boundary} column {index}",
+                        path="column",
+                    )
                 values = [
                     _materialize_native_value(
                         value,

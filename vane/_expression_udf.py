@@ -347,7 +347,6 @@ def _normalize_batch_result(
     output_arrow_type: Any,
     expected_length: int,
     udf_name: str,
-    defer_file_output_cast: bool = False,
 ) -> Any:
     import pyarrow as pa
 
@@ -369,14 +368,11 @@ def _normalize_batch_result(
         )
     if not result.type.equals(output_arrow_type):
         if file_output:
-            if defer_file_output_cast:
-                return result
-            try:
-                return result.cast(output_arrow_type)
-            except Exception as exc:
-                raise _invalid_input(
-                    f"batch UDF {udf_name!r} could not normalize its FILE output to {output_arrow_type}"
-                ) from exc
+            # Any mismatch left by FILE normalization is an intentional
+            # DuckDB-specific cast (for example BLOB -> BIT/VARCHAR). Eager
+            # calls expose that storage unchanged; expression calls hand it
+            # to the engine's declared return-type boundary.
+            return result
         try:
             result = result.cast(output_arrow_type)
         except Exception as exc:
@@ -396,7 +392,6 @@ def _execute_batch_callable(
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
-    defer_file_output_cast: bool = False,
 ) -> Any:
     import pyarrow as pa
 
@@ -410,7 +405,6 @@ def _execute_batch_callable(
         output_arrow_type=output_arrow_type,
         expected_length=expected_length,
         udf_name=udf_name,
-        defer_file_output_cast=defer_file_output_cast,
     )
     return pa.table({output_column: normalized})
 
@@ -478,7 +472,6 @@ def _build_batch_function_adapter(
             output_arrow_type=output_arrow_type,
             output_column=output_column,
             udf_name=udf_name,
-            defer_file_output_cast=True,
         )
 
     return batch_adapter
@@ -754,7 +747,6 @@ def _build_batch_actor_class(
                 output_arrow_type=output_arrow_type,
                 output_column=output_column,
                 udf_name=udf_name,
-                defer_file_output_cast=True,
             )
 
     _VaneBatchActorAdapter.__name__ = f"_{_class_name(user_class)}BatchActor"

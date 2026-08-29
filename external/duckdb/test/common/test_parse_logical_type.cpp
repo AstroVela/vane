@@ -15,6 +15,7 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 	SECTION("simple types") {
 		REQUIRE(DBConfig::ParseLogicalType("integer") == LogicalType::INTEGER);
 		REQUIRE(DBConfig::ParseLogicalType("any") == LogicalType::ANY);
+		REQUIRE(DBConfig::ParseLogicalType(LogicalType::SQLNULL.ToString()) == LogicalType::SQLNULL);
 	}
 
 	SECTION("nested types") {
@@ -116,6 +117,13 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 
 		child_list_t<LogicalType> struct_children;
 		struct_children.emplace_back(make_pair("status", enum_type));
+		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
+		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
+	}
+
+	SECTION("SQLNULL nested type round trip") {
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("missing", LogicalType::SQLNULL));
 		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
 		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
 	}
