@@ -61,6 +61,11 @@ public:
 	//! Used by the Ray planner to create a process-independent Arrow snapshot.
 	static py::object GetDataFrame(const FunctionData &bind_data);
 
+	//! Return the original replacement-scan object when available.
+	//! Separate bindings create distinct shallow DataFrame copies, so the Ray
+	//! planner uses this object to deduplicate snapshots by source identity.
+	static py::object GetDataFrameSourceIdentity(const FunctionData &bind_data);
+
 	static void PandasBackendScanSwitch(PandasColumnBindData &bind_data, idx_t count, idx_t offset, Vector &out);
 
 	static void PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,

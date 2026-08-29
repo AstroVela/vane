@@ -7,6 +7,7 @@ import pickle
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pytest
 
 try:
@@ -99,6 +100,31 @@ def test_repeated_arrow_source_is_snapshotted_once(connection, monkeypatch):
     assert sorted(len(batches) for batches in physical.scan_split_batch_map().values()) == [1, 1]
 
 
+def test_repeated_pandas_source_is_snapshotted_once(connection, monkeypatch):
+    from vane.datasource import _memory
+
+    source = pd.DataFrame({"id": [1, 2, 3], "value": [10, 20, 30]})
+    snapshot_calls = 0
+    original = _memory._as_arrow_table
+
+    def count_snapshot(value, source_kind):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original(value, source_kind)
+
+    monkeypatch.setattr(_memory, "_as_arrow_table", count_snapshot)
+    left = connection.from_df(source).set_alias("left_source")
+    right = connection.from_df(source).set_alias("right_source")
+    relation = left.join(right, "left_source.id = right_source.id")
+
+    logical = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, "deduplicated-pandas-memory-source")
+
+    assert snapshot_calls == 1
+    assert logical._memory_source_ref_count_for_test() == 1
+    physical = logical.to_physical_plan(connection)
+    assert sorted(len(batches) for batches in physical.scan_split_batch_map().values()) == [1, 1]
+
+
 def test_large_arrow_memory_source_is_partitioned_without_growing_plan(connection):
     row_count = 1_200_000
     relation = connection.from_arrow(
@@ -141,11 +167,11 @@ def test_pandas_snapshot_preserves_bound_object_integer_type(connection):
     assert result.column(0).to_pylist() == [2, 3, None]
 
 
-def test_bare_arrow_stream_capsule_executes_through_ray(connection):
-    runners.set_runner_ray(noop_if_initialized=True)
-    runner = runners.get_or_create_runner()
-    source = pa.table({"id": [1, 2, 3]}).__arrow_c_stream__()
+@pytest.mark.parametrize("source_kind", ["dataset", "scanner"])
+def test_lazy_arrow_source_requires_explicit_materialization(connection, source_kind):
+    dataset = ds.dataset(pa.table({"id": [1, 2, 3]}))
+    source = dataset if source_kind == "dataset" else dataset.scanner()
+    relation = connection.from_arrow(source)
 
-    result = pa.concat_tables(list(runner.run_iter_tables(connection.from_arrow(source))))
-
-    assert result.column(0).to_pylist() == [1, 2, 3]
+    with pytest.raises(TypeError, match="Materialize lazy or streaming Arrow sources explicitly"):
+        vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(relation, f"lazy-arrow-{source_kind}")

@@ -12,17 +12,6 @@ _TARGET_PARTITION_BYTES = 16 * 1024 * 1024
 _MAX_PARTITION_ROWS = 1_000_000
 
 
-class _ArrowStreamCapsule:
-    """Adapt a bare Arrow C stream capsule to the PyCapsule protocol."""
-
-    def __init__(self, capsule: Any) -> None:
-        self._capsule = capsule
-
-    def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
-        del requested_schema
-        return self._capsule
-
-
 class _RayMemorySourceTask:
     """Resolve one query-owned Arrow table and expose it as record batches."""
 
@@ -54,36 +43,11 @@ def _as_arrow_table(source: Any, source_kind: str) -> Any:
         return source
     if isinstance(source, pa.RecordBatch):
         return pa.Table.from_batches([source])
-    if isinstance(source, pa.RecordBatchReader):
-        return source.read_all()
-
-    to_table = getattr(source, "to_table", None)
-    if callable(to_table):
-        table = to_table()
-        if isinstance(table, pa.Table):
-            return table
-
-    to_arrow = getattr(source, "to_arrow", None)
-    if callable(to_arrow):
-        table = to_arrow()
-        if isinstance(table, pa.Table):
-            return table
-
-    collect = getattr(source, "collect", None)
-    if callable(collect):
-        collected = collect()
-        to_arrow = getattr(collected, "to_arrow", None)
-        if callable(to_arrow):
-            table = to_arrow()
-            if isinstance(table, pa.Table):
-                return table
-
-    if type(source).__name__ == "PyCapsule":
-        source = _ArrowStreamCapsule(source)
-    table = pa.table(source)
-    if not isinstance(table, pa.Table):  # pragma: no cover - defensive PyArrow contract check
-        raise TypeError(f"Arrow source converted to {type(table).__name__}, expected pyarrow.Table")
-    return table
+    raise TypeError(
+        "Ray distributed execution only snapshots in-memory pyarrow.Table or pyarrow.RecordBatch sources; "
+        f"got {type(source).__name__}. Materialize lazy or streaming Arrow sources explicitly before calling "
+        "from_arrow()."
+    )
 
 
 def _snapshot_and_put_memory_source(

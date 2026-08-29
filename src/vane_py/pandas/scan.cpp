@@ -15,6 +15,7 @@
 #include "vane_python/pandas/column/pandas_numpy_column.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
+#include "vane_python/python_dependency.hpp"
 
 #include "duckdb/common/atomic.hpp"
 
@@ -22,9 +23,11 @@ namespace duckdb {
 
 struct PandasScanFunctionData : public TableFunctionData {
 	PandasScanFunctionData(py::handle df, idx_t row_count, vector<PandasColumnBindData> pandas_bind_data,
-	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> dependency)
+	                       vector<LogicalType> sql_types, shared_ptr<DependencyItem> copied_df_p,
+	                       shared_ptr<DependencyItem> source_identity_p)
 	    : df(df), row_count(row_count), lines_read(0), pandas_bind_data(std::move(pandas_bind_data)),
-	      sql_types(std::move(sql_types)), copied_df(std::move(dependency)) {
+	      sql_types(std::move(sql_types)), copied_df(std::move(copied_df_p)),
+	      source_identity(std::move(source_identity_p)) {
 	}
 	py::handle df;
 	idx_t row_count;
@@ -32,6 +35,7 @@ struct PandasScanFunctionData : public TableFunctionData {
 	vector<PandasColumnBindData> pandas_bind_data;
 	vector<LogicalType> sql_types;
 	shared_ptr<DependencyItem> copied_df;
+	shared_ptr<DependencyItem> source_identity;
 
 	~PandasScanFunctionData() override {
 		try {
@@ -103,19 +107,22 @@ unique_ptr<FunctionData> PandasScanFunction::PandasScanBind(ClientContext &conte
 
 	auto &ref = input.ref;
 
-	shared_ptr<DependencyItem> dependency_item;
+	shared_ptr<DependencyItem> copied_df;
+	shared_ptr<DependencyItem> source_identity;
 	if (ref.external_dependency) {
+		source_identity = ref.external_dependency->GetDependency("replacement_cache");
 		// This was created during the replacement scan if this was a pandas DataFrame (see python_replacement_scan.cpp)
-		dependency_item = ref.external_dependency->GetDependency("copy");
-		if (!dependency_item) {
+		copied_df = ref.external_dependency->GetDependency("copy");
+		if (!copied_df) {
 			// This was created during the replacement if this was a numpy scan
-			dependency_item = ref.external_dependency->GetDependency("data");
+			copied_df = ref.external_dependency->GetDependency("data");
 		}
 	}
 
 	auto get_fun = df.attr("__getitem__");
 	idx_t row_count = py::len(get_fun(df_columns[0]));
-	return make_uniq<PandasScanFunctionData>(df, row_count, std::move(pandas_bind_data), return_types, dependency_item);
+	return make_uniq<PandasScanFunctionData>(df, row_count, std::move(pandas_bind_data), return_types,
+	                                         std::move(copied_df), std::move(source_identity));
 }
 
 unique_ptr<GlobalTableFunctionState> PandasScanFunction::PandasScanInitGlobal(ClientContext &context,
@@ -242,6 +249,16 @@ py::object PandasScanFunction::GetDataFrame(const FunctionData &bind_data) {
 	PythonGILWrapper acquire;
 	auto &data = bind_data.Cast<PandasScanFunctionData>();
 	return py::reinterpret_borrow<py::object>(data.df);
+}
+
+py::object PandasScanFunction::GetDataFrameSourceIdentity(const FunctionData &bind_data) {
+	PythonGILWrapper acquire;
+	auto &data = bind_data.Cast<PandasScanFunctionData>();
+	auto python_dependency = dynamic_cast<PythonDependencyItem *>(data.source_identity.get());
+	if (!python_dependency || !python_dependency->object || python_dependency->object->obj.is_none()) {
+		return py::reinterpret_borrow<py::object>(data.df);
+	}
+	return py::reinterpret_borrow<py::object>(python_dependency->object->obj);
 }
 
 void PandasScanFunction::PandasSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,

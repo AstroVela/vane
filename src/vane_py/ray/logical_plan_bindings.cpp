@@ -203,19 +203,22 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 		auto &get = op.Cast<LogicalGet>();
 		string source_kind;
 		py::object source = py::none();
+		py::object source_identity = py::none();
 		if (get.function.name == "pandas_scan") {
 			if (!get.bind_data) {
 				throw InvalidInputException("Python Pandas scan is missing bind data");
 			}
 			source_kind = "pandas";
 			source = PandasScanFunction::GetDataFrame(*get.bind_data);
+			source_identity = PandasScanFunction::GetDataFrameSourceIdentity(*get.bind_data);
 		} else if (get.function.name == "arrow_scan" || get.function.name == "arrow_scan_dumb") {
 			source_kind = "arrow";
 			source = PythonArrowScanSource(get);
+			source_identity = source;
 		}
 
 		if (!source_kind.empty()) {
-			auto prepared_entry = prepared_sources.find(source.ptr());
+			auto prepared_entry = prepared_sources.find(source_identity.ptr());
 			if (prepared_entry == prepared_sources.end()) {
 				auto source_id = UUID::ToString(UUID::GenerateRandomUUID());
 				auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, get);
@@ -239,7 +242,7 @@ RewritePythonMemoryScans(LogicalOperator &op, ClientContext &context, py::dict &
 				prepared->object_refs = std::move(object_refs);
 				prepared->bind_data = std::move(bind_data);
 				memory_source_refs[py::str(source_id)] = prepared->object_refs;
-				prepared_entry = prepared_sources.emplace(source.ptr(), std::move(prepared)).first;
+				prepared_entry = prepared_sources.emplace(source_identity.ptr(), std::move(prepared)).first;
 			} else {
 				ValidateMemorySourceSnapshotTypes(get, *prepared_entry->second->bind_data, source_kind);
 			}
