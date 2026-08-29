@@ -813,15 +813,14 @@ def _iter_materialized_task_outputs(
     try:
         if str(stream_payload.get("call_mode") or "") == "map":
             for raw_table in tables:
-                for block, metadata in emit(
-                    _execute_scalar_map_layout(
-                        stream_payload,
-                        _ensure_table(raw_table),
-                        executor,
-                    )
+                for fused in _execute_scalar_map_layout(
+                    stream_payload,
+                    _ensure_table(raw_table),
+                    executor,
                 ):
-                    yield block
-                    yield metadata
+                    for block, metadata in emit(fused):
+                        yield block
+                        yield metadata
             executor.finished_submitting()
             return
 
@@ -1031,12 +1030,15 @@ def _iter_ref_bundle_task_outputs(
     executor = RuntimeUDFExecutor(payload, cache_callable=_callable_cache_enabled(payload))
     configure_loaded_torch_threads()
     try:
-        fused = _execute_scalar_map_layout(payload, table, executor)
+        fused_outputs = _execute_scalar_map_layout(payload, table, executor)
     finally:
         executor.close()
-    for output_index, block in enumerate(iter_bounded_stream_blocks(fused, payload)):
-        yield block
-        yield make_stream_block_metadata(block, payload, output_index=output_index)
+    output_index = 0
+    for fused in fused_outputs:
+        for block in iter_bounded_stream_blocks(fused, payload):
+            yield block
+            yield make_stream_block_metadata(block, payload, output_index=output_index)
+            output_index += 1
 
 
 def _build_ref_bundle_stream_remote(

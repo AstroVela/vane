@@ -343,13 +343,13 @@ def _actor_class(
                     output_count += 1
 
             if str(effective_payload.get("call_mode") or "") == "map":
-                table = execute_scalar_map_layout(effective_payload, args, executor)
-                yield from emit(table)
+                for table in execute_scalar_map_layout(effective_payload, args, executor):
+                    yield from emit(table)
                 _actor_debug_log(
                     "run_block_stream_submit_done",
                     effective_payload,
                     rows=args.num_rows,
-                    outputs=1,
+                    outputs=output_count,
                 )
                 return
             if str(effective_payload.get("call_mode") or "") == "map_batches_rows":

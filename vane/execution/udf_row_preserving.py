@@ -3,9 +3,9 @@
 
 """Shared split/fuse helpers for row-preserving UDF layouts.
 
-A ``map_batches_rows`` layout table contains ``scalar_arg_count`` UDF argument
-columns followed by passthrough columns. Workers feed only the argument columns
-to the UDF, then fuse the single output column back onto the passthrough columns.
+A row-preserving layout table contains ``scalar_arg_count`` UDF argument columns
+followed by passthrough columns. Workers feed only the argument columns to the
+UDF, then fuse the single output column back onto the passthrough columns.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
 _MISSING_ARG_COUNT = "map_batches_rows requires scalar_arg_count > 0"
-_BAD_OUTPUT_COLUMN_COUNT = "map_batches_rows output must have exactly one column"
 
 
 def row_preserving_arg_count(payload: dict[str, Any]) -> int:
@@ -58,17 +57,52 @@ def fuse_row_preserving_output(
     payload: dict[str, Any],
     passthrough: pa.Table | None,
     output: pa.Table,
+    *,
+    mode: str = "map_batches_rows",
 ) -> pa.Table:
     """Fuse one output column onto passthrough columns for row-preserving UDFs."""
     if output.num_columns != 1:
-        raise RuntimeError(_BAD_OUTPUT_COLUMN_COUNT)
+        raise RuntimeError(f"{mode} output must have exactly one column")
     output_name = row_preserving_output_name(payload, output)
     if passthrough is None:
         return pa.table([output.column(0)], names=[output_name])
     if output.num_rows != passthrough.num_rows:
-        msg = f"map_batches_rows output rows {output.num_rows} do not match input rows {passthrough.num_rows}"
+        msg = f"{mode} output rows {output.num_rows} do not match input rows {passthrough.num_rows}"
         raise RuntimeError(msg)
     return pa.table(
         [*list(passthrough.columns), output.column(0)],
         names=[*list(passthrough.schema.names), output_name],
     )
+
+
+def fuse_row_preserving_outputs(
+    payload: dict[str, Any],
+    passthrough: pa.Table | None,
+    outputs: list[pa.Table],
+    *,
+    expected_rows: int,
+    mode: str,
+) -> list[pa.Table]:
+    """Fuse output pieces onto matching consecutive passthrough slices."""
+    if not outputs:
+        raise RuntimeError(f"{mode} produced no output")
+    output_rows = sum(output.num_rows for output in outputs)
+    if output_rows != expected_rows:
+        raise RuntimeError(f"{mode} output rows {output_rows} do not match input rows {expected_rows}")
+    if passthrough is not None and passthrough.num_rows != expected_rows:
+        raise RuntimeError(f"{mode} passthrough rows {passthrough.num_rows} do not match input rows {expected_rows}")
+
+    fused: list[pa.Table] = []
+    row_offset = 0
+    for output in outputs:
+        output_passthrough = None if passthrough is None else passthrough.slice(row_offset, output.num_rows)
+        fused.append(
+            fuse_row_preserving_output(
+                payload,
+                output_passthrough,
+                output,
+                mode=mode,
+            )
+        )
+        row_offset += output.num_rows
+    return fused

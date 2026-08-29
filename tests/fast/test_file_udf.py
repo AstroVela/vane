@@ -540,6 +540,40 @@ def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():
     assert batch_result.to_pylist() == [{"document": _file_record(), "wide": str(wide)}]
 
 
+def test_native_file_udfs_encode_special_leaves_inside_non_file_composites():
+    wide = 10**100
+    output_type = vane.type("STRUCT(document FILE, meta STRUCT(wide BIGNUM, label VARCHAR))")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://nested-bignum-scalar"),
+            "meta": {"wide": wide, "label": 42},
+        }
+
+    connection = vane.connect()
+    scalar_result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert scalar_result.project("payload.meta.wide::VARCHAR, payload.meta.label").fetchone() == (str(wide), "42")
+
+    def build_row(_row):
+        return {
+            "payload": {
+                "document": vane.File("memory://nested-bignum-flat-map"),
+                "meta": {"wide": wide, "label": 43},
+            }
+        }
+
+    flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.project("payload.meta.wide::VARCHAR, payload.meta.label").fetchone() == (
+        str(wide),
+        "43",
+    )
+
+
 def test_empty_flat_map_file_udf_preserves_composite_output_type():
     output_type = vane.type("STRUCT(document FILE, id UUID, created_at TIMESTAMPTZ, wide UHUGEINT)")
 
@@ -941,6 +975,59 @@ def test_arrow_scalar_file_output_normalizes_temporal_batches_atomically():
     assert result.project("payload.document.url, epoch_ns(payload.occurred_at)").fetchall() == [
         ("memory://temporal-0", 1_000),
         ("memory://temporal-1", 1_000),
+    ]
+
+
+def test_arrow_scalar_file_output_keeps_cross_type_batches_and_null_rows_separate():
+    import cloudpickle
+    import pyarrow as pa
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    def build_document(identifiers):
+        identifier = identifiers[0].as_py()
+        text = pa.array([b"\xc3\xa9"], type=pa.binary()) if identifier == 0 else pa.array(["second"], type=pa.string())
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record(url=f"memory://heterogeneous-{identifier}")], type=_file_arrow_type()),
+                text,
+            ],
+            names=["document", "text"],
+        )
+
+    executor = UDFExecutor(
+        {
+            "function_pickle": cloudpickle.dumps(build_document),
+            "call_mode": "map",
+            "execution_backend": "subprocess_task",
+            "scalar_udf_type": "arrow",
+            "batch_size": 1,
+            "method_return_type": "STRUCT(document FILE, text VARCHAR)",
+        }
+    )
+    try:
+        executor.submit(pa.table({"identifier": pa.array([0, None, 1], type=pa.int64())}))
+        outputs = executor.drain_outputs()
+    finally:
+        executor.close()
+
+    assert [output.num_rows for output in outputs] == [2, 1]
+    assert [output.column("value").type.field("text").type for output in outputs] == [
+        pa.binary(),
+        pa.string(),
+    ]
+    assert outputs[0].column("value").to_pylist() == [
+        {
+            "document": _file_record(url="memory://heterogeneous-0"),
+            "text": b"\xc3\xa9",
+        },
+        None,
+    ]
+    assert outputs[1].column("value").to_pylist() == [
+        {
+            "document": _file_record(url="memory://heterogeneous-1"),
+            "text": "second",
+        }
     ]
 
 

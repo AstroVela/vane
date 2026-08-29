@@ -32,6 +32,7 @@ from vane.execution.ref_bundle import (
 )
 from vane.execution.udf_row_preserving import (
     fuse_row_preserving_output,
+    fuse_row_preserving_outputs,
     split_row_preserving_input,
 )
 from vane.execution.udf_threading import configure_loaded_torch_threads
@@ -514,6 +515,7 @@ def _execute_submit(
     row_preserving = call_mode == "map_batches_rows" or (
         call_mode == "map" and payload.get("scalar_arg_count") is not None
     )
+    expected_rows = input_table.num_rows
     passthrough_table = None
     if row_preserving:
         input_table, passthrough_table = split_row_preserving_input(payload, input_table)
@@ -522,11 +524,20 @@ def _execute_submit(
         executor.finished_submitting()
     output_tables = _drain_executor_outputs(executor)
     if row_preserving:
-        if len(output_tables) != 1:
-            raise RuntimeError(
-                "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
+        if call_mode == "map":
+            output_tables = fuse_row_preserving_outputs(
+                payload,
+                passthrough_table,
+                output_tables,
+                expected_rows=expected_rows,
+                mode="map subprocess",
             )
-        output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
+        else:
+            if len(output_tables) != 1:
+                raise RuntimeError(
+                    "%s subprocess produced %d outputs, expected exactly 1" % (call_mode, len(output_tables))
+                )
+            output_tables = [fuse_row_preserving_output(payload, passthrough_table, output_tables[0])]
     if produce_ref_bundle_output:
         required = sum(_ipc_response_size(output_table) for output_table in output_tables)
         grant_id = _request_output_grant(

@@ -26,6 +26,13 @@ from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 _TENSOR_TYPE_PATTERN = re.compile(r"^TENSOR\((.*),\s*\[([0-9,\s]+)\]\)$", flags=re.IGNORECASE)
+_NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
+    "bignum",
+    "hugeint",
+    "time with time zone",
+    "uhugeint",
+    "uuid",
+}
 
 
 def _invalid_input(message: str) -> Exception:
@@ -90,6 +97,24 @@ def _contains_bit(dtype: Any | None) -> bool:
         return any(_contains_bit(child) for _, child in dtype.children)
     # UNION tags are not materialized at the Python boundary yet. Treat the
     # whole UNION as opaque instead of annotating only some member storage.
+    return False
+
+
+def _requires_native_output_encoding(dtype: Any | None) -> bool:
+    """Return whether native output needs recursive Arrow-safe encoding."""
+    if dtype is None:
+        return False
+    if _is_file_type(dtype):
+        return True
+    type_id = _type_id(dtype)
+    if type_id in _NATIVE_OUTPUT_ENCODED_TYPE_IDS:
+        return True
+    if type_id in ("list", "array", "tensor"):
+        return _requires_native_output_encoding(_sequence_child(dtype))
+    if type_id in ("struct", "map"):
+        return any(_requires_native_output_encoding(child) for _, child in dtype.children)
+    # UNION tags are not materialized at the Python boundary yet. Keep the
+    # entire value opaque, matching FILE/BIT input handling.
     return False
 
 
@@ -756,7 +781,7 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         for (name, child), child_value in zip(struct_children, child_values, strict=True):
             result[name] = (
                 _canonicalize_native_output(child_value, child, boundary=boundary, path=f"{path}.{name}")
-                if _contains_file(child)
+                if _requires_native_output_encoding(child)
                 else child_value
             )
         return result
@@ -814,7 +839,7 @@ def _canonical_values_to_arrow_array(
     *,
     boundary: str,
 ) -> pa.Array:
-    """Encode canonical values while typing only branches that contain FILE."""
+    """Encode FILE and Python-only special leaves without typing ordinary leaves."""
     if _is_file_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
     type_id = _type_id(dtype)
@@ -861,7 +886,7 @@ def _canonical_values_to_arrow_array(
     if type_id == "time with time zone":
         encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
         return pa.array(encoded, type=pa.string())
-    if not _contains_file(dtype):
+    if not _requires_native_output_encoding(dtype):
         try:
             return pa.array(values)
         except Exception as inference_error:

@@ -173,6 +173,34 @@ def _build_valid_mask(table: pa.Table) -> list[bool]:
     return mask
 
 
+def _restore_filtered_scalar_outputs(
+    outputs: list[Any],
+    valid_indices: list[int],
+    row_count: int,
+) -> list[Any]:
+    """Restore DEFAULT-null rows without merging heterogeneous output pieces."""
+    output_row_count = sum(len(output) for output in outputs)
+    if output_row_count != len(valid_indices):
+        raise ValueError("map output row count does not match filtered input")
+    if not outputs:
+        return [pa.nulls(row_count)]
+
+    restored: list[Any] = []
+    valid_offset = 0
+    input_offset = 0
+    for output in outputs:
+        next_valid_offset = valid_offset + len(output)
+        output_input_indices = valid_indices[valid_offset:next_valid_offset]
+        input_end = valid_indices[next_valid_offset] if next_valid_offset < len(valid_indices) else row_count
+        take_indices: list[int | None] = [None] * (input_end - input_offset)
+        for output_index, input_index in enumerate(output_input_indices):
+            take_indices[input_index - input_offset] = output_index
+        restored.append(output.take(pa.array(take_indices, type=pa.int64())))
+        valid_offset = next_valid_offset
+        input_offset = input_end
+    return restored
+
+
 # ── Stream output utilities ──────────────────────────────────────────────────
 
 
@@ -850,7 +878,7 @@ class UDFExecutor:
             outputs.append(result)
         return self._file_contract.scalar_outputs_to_array(outputs)
 
-    def _execute_scalar_arrow(self, args: pa.Table) -> pa.Array:
+    def _execute_scalar_arrow(self, args: pa.Table) -> list[Any]:
         row_count = args.num_rows
         exception_occurred = False
         args = self._file_contract.prepare_input_table(args)
@@ -879,50 +907,63 @@ class UDFExecutor:
             output = _coerce_scalar_array(result, batch.num_rows)
             outputs.append(output)
 
+        result_arrays: list[Any]
         if outputs:
             if len(outputs) == 1:
-                result_array = self._file_contract.normalize_scalar_arrow_output(outputs[0])
+                result_arrays = [self._file_contract.normalize_scalar_arrow_output(outputs[0])]
             elif self._file_contract.has_file_outputs and all(
                 output.type.equals(outputs[0].type, check_metadata=True) for output in outputs[1:]
             ):
                 # Value-dependent FILE sibling normalization must see every
                 # internal scalar batch before choosing one output schema.
-                result_array = self._file_contract.normalize_scalar_arrow_output(
-                    pa.chunked_array(outputs, type=outputs[0].type)
-                )
+                result_arrays = [
+                    self._file_contract.normalize_scalar_arrow_output(pa.chunked_array(outputs, type=outputs[0].type))
+                ]
             else:
                 normalized_outputs = [self._file_contract.normalize_scalar_arrow_output(output) for output in outputs]
-                try:
-                    result_array = pa.concat_arrays(normalized_outputs)
-                except pa.ArrowInvalid as exc:
-                    if "offset overflow" in str(exc):
-                        result_array = pa.chunked_array(normalized_outputs)
-                    else:
-                        raise
+                homogeneous = all(
+                    output.type.equals(normalized_outputs[0].type, check_metadata=True)
+                    for output in normalized_outputs[1:]
+                )
+                if self._file_contract.has_file_outputs and not homogeneous:
+                    # DuckDB must cast cross-type siblings independently. Arrow
+                    # cannot represent those batches as one logical array.
+                    result_arrays = normalized_outputs
+                else:
+                    try:
+                        result_arrays = [pa.concat_arrays(normalized_outputs)]
+                    except pa.ArrowInvalid as exc:
+                        if "offset overflow" in str(exc):
+                            result_arrays = [pa.chunked_array(normalized_outputs)]
+                        else:
+                            raise
         else:
-            result_array = pa.array([])
+            result_arrays = []
 
-        if self._default_null_handling() and not exception_occurred and result_array.null_count > 0:
+        if (
+            self._default_null_handling()
+            and not exception_occurred
+            and any(result_array.null_count > 0 for result_array in result_arrays)
+        ):
             raise ValueError(_NULL_HANDLING_ERROR)
 
         if valid_indices is not None:
-            if len(result_array) != len(valid_indices):
-                raise ValueError("map output row count does not match filtered input")
-            take_indices: list[int | None] = [None] * row_count
-            for output_index, input_index in enumerate(valid_indices):
-                take_indices[input_index] = output_index
-            result_array = result_array.take(pa.array(take_indices, type=pa.int64()))
+            result_arrays = _restore_filtered_scalar_outputs(result_arrays, valid_indices, row_count)
+        elif not result_arrays:
+            result_arrays = [pa.array([])]
 
-        self._file_contract.validate_output_table(pa.table({self._scalar_output_name: result_array}))
+        for result_array in result_arrays:
+            self._file_contract.validate_output_table(pa.table({self._scalar_output_name: result_array}))
 
-        return result_array
+        return result_arrays
 
     def _execute_map(self, args: pa.Table) -> None:
         if self._scalar_udf_type == "arrow":
             outputs = self._execute_scalar_arrow(args)
         else:
-            outputs = self._execute_scalar_native(args)
-        self._queue.append(pa.table({self._scalar_output_name: outputs}))
+            outputs = [self._execute_scalar_native(args)]
+        for output in outputs:
+            self._queue.append(pa.table({self._scalar_output_name: output}))
 
     def submit(self, args: pa.Table) -> None:
         if self._closed or self._close_started:

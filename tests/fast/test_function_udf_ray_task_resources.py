@@ -380,6 +380,70 @@ def test_materialized_scalar_task_fuses_passthrough_columns_into_block_stream():
     assert outputs[1]["task_lease_id"] == "lease-scalar"
 
 
+def test_materialized_scalar_task_streams_heterogeneous_file_output_pieces():
+    import vane.execution.udf_ray as fur
+    from vane import pickle as vane_pickle
+
+    def build_document(identifiers):
+        identifier = identifiers[0].as_py()
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        document = pa.array(
+            [
+                {
+                    "url": f"memory://heterogeneous-{identifier}",
+                    "content_type": None,
+                    "position": None,
+                    "size": None,
+                    "checksum": None,
+                }
+            ],
+            type=file_type,
+        )
+        text = pa.array([b"first"], type=pa.binary()) if identifier == 0 else pa.array(["second"], type=pa.string())
+        return pa.StructArray.from_arrays([document, text], names=["document", "text"])
+
+    payload = _distributed_payload(
+        function_pickle=vane_pickle.dumps(build_document),
+        call_mode="map",
+        scalar_arg_count=1,
+        scalar_udf_type="arrow",
+        batch_size=1,
+        method_return_type="STRUCT(document FILE, text VARCHAR)",
+        task_lease_id="lease-heterogeneous-scalar",
+        attempt_id="attempt-heterogeneous-scalar",
+    )
+    layout = pa.table(
+        {
+            "identifier": pa.array([0, None, 1], type=pa.int64()),
+            "keep": ["a", "b", "c"],
+        }
+    )
+
+    outputs = list(fur._iter_materialized_task_outputs(payload, [layout]))
+    blocks = outputs[0::2]
+    metadata = outputs[1::2]
+
+    assert len(blocks) == 2
+    assert [block.num_rows for block in blocks] == [2, 1]
+    assert [block.column("value").type.field("text").type for block in blocks] == [
+        pa.binary(),
+        pa.string(),
+    ]
+    assert [block.column("keep").to_pylist() for block in blocks] == [["a", "b"], ["c"]]
+    assert [item["block_id"] for item in metadata] == [
+        "block:lease-heterogeneous-scalar:0",
+        "block:lease-heterogeneous-scalar:1",
+    ]
+
+
 def test_materialized_task_splits_every_block_before_generator_publication():
     import vane.execution.udf_ray as fur
     from vane import pickle as vane_pickle
