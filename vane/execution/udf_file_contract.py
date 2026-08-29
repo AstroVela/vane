@@ -12,7 +12,7 @@ row UDFs without changing generic STRUCT behavior.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -307,8 +307,11 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         if not isinstance(value, Mapping):
             raise _invalid_input(f"{boundary} MAP value at {path} must be a mapping")
         children = _type_children(dtype)
-        if set(value) == {"key", "value"} and isinstance(value["key"], (list, tuple)) and isinstance(
-            value["value"], (list, tuple)
+        entries: Iterable[tuple[Any, Any]]
+        if (
+            set(value) == {"key", "value"}
+            and isinstance(value["key"], (list, tuple))
+            and isinstance(value["value"], (list, tuple))
         ):
             entries = zip(value["key"], value["value"], strict=True)
         else:
@@ -391,9 +394,7 @@ class FileUDFContract:
                         continue
                     kind = str(entry.get("kind") or "duckdb_type").lower()
                     output_types.append(
-                        _parse_file_type(entry.get("type"), field="output_schema")
-                        if kind == "duckdb_type"
-                        else None
+                        _parse_file_type(entry.get("type"), field="output_schema") if kind == "duckdb_type" else None
                     )
 
         return cls(

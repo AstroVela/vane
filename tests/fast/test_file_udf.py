@@ -78,9 +78,7 @@ def test_scalar_file_udf_materializes_nested_files():
         return values
 
     connection = vane.connect()
-    source = connection.sql(
-        "SELECT [file('memory://nested', NULL, NULL, NULL, NULL), NULL::FILE] AS values"
-    )
+    source = connection.sql("SELECT [file('memory://nested', NULL, NULL, NULL, NULL), NULL::FILE] AS values")
     result = source.select(copy_files(vane.col("values")).alias("values"))
 
     assert str(result.types[0]) == "FILE[]"
@@ -100,9 +98,7 @@ def test_scalar_file_udf_reads_strict_file_view_on_worker(tmp_path):
             return reader.read()
 
     connection = vane.connect()
-    source = connection.sql(
-        f"SELECT file('{escaped_path}', NULL, 7, 11, NULL) AS value"
-    )
+    source = connection.sql(f"SELECT file('{escaped_path}', NULL, 7, 11, NULL) AS value")
 
     assert source.select(read_view(vane.col("value"))).fetchone() == (payload[7:18],)
 
@@ -448,9 +444,7 @@ def test_empty_file_udf_relation_retains_declared_type(mode):
     identity = scalar_identity if mode == "scalar" else batch_identity
 
     connection = vane.connect()
-    source = connection.sql(
-        "SELECT file('memory://empty', NULL, NULL, NULL, NULL) AS value WHERE FALSE"
-    )
+    source = connection.sql("SELECT file('memory://empty', NULL, NULL, NULL, NULL) AS value WHERE FALSE")
     result = source.select(identity(vane.col("value")).alias("value"))
 
     assert result.types[0].is_file()
