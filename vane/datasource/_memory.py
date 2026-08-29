@@ -10,6 +10,7 @@ from typing import Any
 
 _TARGET_PARTITION_BYTES = 16 * 1024 * 1024
 _MAX_PARTITION_ROWS = 1_000_000
+_FILE_FIELD_NAMES = ("url", "content_type", "position", "size", "checksum")
 
 
 class _RayMemorySourceTask:
@@ -43,21 +44,51 @@ def _append_version_bytes(version: bytearray, value: bytes) -> None:
     version.extend(value)
 
 
-def _append_arrow_array_version(version: bytearray, value: Any) -> None:
+def _arrow_array_children(value: Any) -> tuple[Any, ...]:
+    """Return logical child arrays, including storage outside Array.buffers()."""
+
     import pyarrow as pa
 
+    if isinstance(value, pa.ExtensionArray):
+        return (value.storage,)
+    if pa.types.is_dictionary(value.type):
+        # Dictionary values are stored outside the index buffers returned by
+        # Array.buffers(), so they must be visited explicitly.
+        return (value.dictionary,)
+    is_list_view = getattr(pa.types, "is_list_view", lambda _: False)
+    is_large_list_view = getattr(pa.types, "is_large_list_view", lambda _: False)
+    if (
+        pa.types.is_list(value.type)
+        or pa.types.is_large_list(value.type)
+        or pa.types.is_fixed_size_list(value.type)
+        or is_list_view(value.type)
+        or is_large_list_view(value.type)
+        or pa.types.is_map(value.type)
+    ):
+        return (value.values,)
+    if pa.types.is_struct(value.type) or pa.types.is_union(value.type):
+        return tuple(value.field(index) for index in range(value.type.num_fields))
+    is_run_end_encoded = getattr(pa.types, "is_run_end_encoded", lambda _: False)
+    if is_run_end_encoded(value.type):
+        return (value.run_ends, value.values)
+    return ()
+
+
+def _append_arrow_array_version(version: bytearray, value: Any) -> None:
     _append_version_bytes(version, str(value.type).encode())
     _append_version_integer(version, len(value))
     _append_version_integer(version, value.offset)
-    buffers = value.buffers()
+    # Container Array.buffers() flattens descendant buffers. Record only this
+    # node's layout; the recursion below visits every logical child exactly once.
+    buffers = value.buffers()[: value.type.num_buffers]
     _append_version_integer(version, len(buffers))
     for buffer in buffers:
         _append_version_integer(version, buffer is not None)
         if buffer is not None:
             _append_version_integer(version, buffer.address)
             _append_version_integer(version, buffer.size)
-    if pa.types.is_dictionary(value.type):
-        _append_arrow_array_version(version, value.dictionary)
+    for child in _arrow_array_children(value):
+        _append_arrow_array_version(version, child)
 
 
 def _arrow_source_version(source: Any) -> bytes:
@@ -178,11 +209,23 @@ def _pandas_scan_map_array(values: Any, data_type: Any) -> Any:
     return pa.array([_pandas_scan_map_value(value) for value in values], type=data_type, from_pandas=True)
 
 
+def _pandas_scan_file_value(value: Any) -> dict[str, Any] | None:
+    if _is_pandas_scan_null(value):
+        return None
+    return {field_name: getattr(value, field_name) for field_name in _FILE_FIELD_NAMES}
+
+
+def _pandas_scan_file_array(values: Any, data_type: Any) -> Any:
+    import pyarrow as pa
+
+    return pa.array([_pandas_scan_file_value(value) for value in values], type=data_type, from_pandas=True)
+
+
 def _coerce_object_columns(
     source: Any,
     source_kind: str,
     expected_schema: Any,
-    logical_type_ids: tuple[str, ...],
+    logical_type_tags: tuple[str, ...],
 ) -> Any:
     """Apply bound pandas_scan semantics before Arrow attempts object inference."""
 
@@ -195,12 +238,15 @@ def _coerce_object_columns(
             if not pd.api.types.is_object_dtype(dtype):
                 continue
             expected_type = expected_schema.field(column_index).type
-            logical_type_id = logical_type_ids[column_index]
-            if logical_type_id == "VARCHAR" or (logical_type_id == "UUID" and _is_arrow_string_type(expected_type)):
+            logical_type_tag = logical_type_tags[column_index]
+            if logical_type_tag == "VARCHAR" or (logical_type_tag == "UUID" and _is_arrow_string_type(expected_type)):
                 column = source.iloc[:, column_index].map(_pandas_scan_varchar_value)
-            elif logical_type_id == "MAP" and pa.types.is_map(expected_type):
+            elif logical_type_tag == "MAP" and pa.types.is_map(expected_type):
                 map_array = _pandas_scan_map_array(source.iloc[:, column_index], expected_type)
                 column = pd.Series(map_array, dtype=pd.ArrowDtype(expected_type), index=source.index)
+            elif logical_type_tag == "FILE" and pa.types.is_struct(expected_type):
+                file_array = _pandas_scan_file_array(source.iloc[:, column_index], expected_type)
+                column = pd.Series(file_array, dtype=pd.ArrowDtype(expected_type), index=source.index)
             else:
                 continue
             if converted is None:
@@ -217,11 +263,13 @@ def _coerce_object_columns(
             if getattr(getattr(column, "dtype", None), "kind", None) != "O":
                 continue
             expected_type = expected_schema.field(column_index).type
-            logical_type_id = logical_type_ids[column_index]
-            if logical_type_id == "VARCHAR" or (logical_type_id == "UUID" and _is_arrow_string_type(expected_type)):
+            logical_type_tag = logical_type_tags[column_index]
+            if logical_type_tag == "VARCHAR" or (logical_type_tag == "UUID" and _is_arrow_string_type(expected_type)):
                 converted_column = [_pandas_scan_varchar_value(value) for value in column]
-            elif logical_type_id == "MAP" and pa.types.is_map(expected_type):
+            elif logical_type_tag == "MAP" and pa.types.is_map(expected_type):
                 converted_column = _pandas_scan_map_array(column, expected_type)
+            elif logical_type_tag == "FILE" and pa.types.is_struct(expected_type):
+                converted_column = _pandas_scan_file_array(column, expected_type)
             else:
                 continue
             if converted is None:
@@ -324,17 +372,42 @@ def _materialize_partition_column(column: Any) -> Any:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    if pa.types.is_dictionary(column.type):
-        decoded = pc.dictionary_decode(column)
-        column = pc.dictionary_encode(decoded).cast(column.type)
-    return column.combine_chunks()
+    def reencode_dictionary_descendants(value: Any) -> Any:
+        if isinstance(value, pa.ExtensionArray):
+            storage = value.storage
+            normalized_storage = reencode_dictionary_descendants(storage)
+            if normalized_storage is storage:
+                return value
+            return pa.ExtensionArray.from_storage(value.type, normalized_storage)
+        if pa.types.is_dictionary(value.type):
+            decoded = pc.dictionary_decode(value)
+            reencoded = pc.dictionary_encode(decoded).cast(value.type)
+            dictionary = reencode_dictionary_descendants(reencoded.dictionary)
+            return pa.DictionaryArray.from_arrays(reencoded.indices, dictionary, ordered=value.type.ordered)
+
+        children = _arrow_array_children(value)
+        if not children:
+            return value
+        normalized_children = tuple(reencode_dictionary_descendants(child) for child in children)
+        if all(normalized is original for normalized, original in zip(normalized_children, children, strict=True)):
+            return value
+        return pa.Array.from_buffers(
+            value.type,
+            len(value),
+            value.buffers()[: value.type.num_buffers],
+            null_count=value.null_count,
+            offset=value.offset,
+            children=normalized_children,
+        )
+
+    return reencode_dictionary_descendants(column.combine_chunks())
 
 
 def _snapshot_and_put_memory_source(
     source: Any,
     source_kind: str,
     expected_schema: Any,
-    logical_type_ids: tuple[str, ...],
+    logical_type_tags: tuple[str, ...],
     column_indices: tuple[int, ...],
     include_row_count_column: bool,
 ) -> tuple[Any, list[Any]]:
@@ -348,13 +421,13 @@ def _snapshot_and_put_memory_source(
 
     if not isinstance(expected_schema, pa.Schema):
         raise TypeError(f"Expected a pyarrow.Schema for a Python memory source, got {type(expected_schema).__name__}")
-    if len(logical_type_ids) != len(expected_schema):
+    if len(logical_type_tags) != len(expected_schema):
         raise ValueError(
-            f"Python memory source has {len(logical_type_ids)} bound types, expected {len(expected_schema)}"
+            f"Python memory source has {len(logical_type_tags)} bound types, expected {len(expected_schema)}"
         )
     row_count = _memory_source_row_count(source, source_kind) if include_row_count_column else None
     source = _select_memory_source_columns(source, source_kind, column_indices)
-    source = _coerce_object_columns(source, source_kind, expected_schema, logical_type_ids)
+    source = _coerce_object_columns(source, source_kind, expected_schema, logical_type_tags)
     table = _as_arrow_table(source, source_kind)
     expected_names = expected_schema.names
     if row_count is not None:

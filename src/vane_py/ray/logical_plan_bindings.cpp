@@ -257,6 +257,21 @@ static py::object PythonMemorySourceExpectedArrowSchema(ClientContext &context, 
 	return pyarrow_lib.attr("Schema").attr("_import_from_c")(reinterpret_cast<uint64_t>(&arrow_schema));
 }
 
+static bool IsFileMemorySnapshotType(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
+	    StructType::GetChildCount(type) != FileLogicalType::FIELD_COUNT) {
+		return false;
+	}
+	auto file_type = FileLogicalType::Create();
+	for (idx_t field_idx = 0; field_idx < FileLogicalType::FIELD_COUNT; field_idx++) {
+		if (StructType::GetChildName(type, field_idx) != StructType::GetChildName(file_type, field_idx) ||
+		    StructType::GetChildType(type, field_idx) != StructType::GetChildType(file_type, field_idx)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expected_types,
                                               const vector<string> &expected_names, DataSourceScanBindData &bind_data,
                                               const string &source_kind) {
@@ -270,11 +285,18 @@ static bool ValidateMemorySourceSnapshotTypes(const vector<LogicalType> &expecte
 		if (snapshot_types[column_idx] == expected_types[column_idx]) {
 			continue;
 		}
+		auto pandas_backed = source_kind == "pandas" || source_kind == "numpy";
+		// Arrow omits Vane's FILE alias from its canonical STRUCT storage.
+		// Restore the bound identity with an explicit projection above the scan.
+		if (pandas_backed && FileLogicalType::IsFile(expected_types[column_idx]) &&
+		    IsFileMemorySnapshotType(snapshot_types[column_idx])) {
+			requires_type_projection = true;
+			continue;
+		}
 		// Some Python-backed logical types use VARCHAR for their non-lossless
-		// Arrow representation. Preserve their bound DuckDB identity with an
-		// explicit projection above the replacement scan.
-		if ((source_kind == "pandas" || source_kind == "numpy") &&
-		    snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR &&
+		// Arrow representation. Preserve their bound DuckDB identity in the same
+		// projection.
+		if (pandas_backed && snapshot_types[column_idx].id() == LogicalTypeId::VARCHAR &&
 		    (expected_types[column_idx].id() == LogicalTypeId::ENUM ||
 		     expected_types[column_idx].id() == LogicalTypeId::UUID)) {
 			requires_type_projection = true;
@@ -395,13 +417,16 @@ static void PreparePythonMemorySource(PreparedPythonMemorySource &prepared, Clie
 		snapshot_types.push_back(LogicalType::BOOLEAN);
 		snapshot_names.push_back(prepared.row_count_column_name);
 	}
-	py::tuple logical_type_ids(snapshot_types.size());
+	py::tuple logical_type_tags(snapshot_types.size());
 	for (idx_t column_idx = 0; column_idx < snapshot_types.size(); column_idx++) {
-		logical_type_ids[column_idx] = py::str(LogicalTypeIdToString(snapshot_types[column_idx].id()));
+		auto type_tag = FileLogicalType::IsFile(snapshot_types[column_idx])
+		                    ? string(FileLogicalType::TYPE_NAME)
+		                    : LogicalTypeIdToString(snapshot_types[column_idx].id());
+		logical_type_tags[column_idx] = py::str(type_tag);
 	}
 	auto expected_arrow_schema = PythonMemorySourceExpectedArrowSchema(context, snapshot_types, snapshot_names);
 	auto prepared_obj = memory_module.attr("_snapshot_and_put_memory_source")(
-	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, logical_type_ids, column_indices,
+	    prepared.source, py::str(prepared.source_kind), expected_arrow_schema, logical_type_tags, column_indices,
 	    py::bool_(prepared.requires_row_count_column));
 	if (!py::isinstance<py::tuple>(prepared_obj)) {
 		throw InternalException("Python memory snapshot helper must return a tuple");
