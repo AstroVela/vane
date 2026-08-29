@@ -519,6 +519,31 @@ def test_file_arrow_nested_non_file_struct_outputs_require_exact_fields(malforme
         contract.normalize_output_table(pa.table({"payload": value}))
 
 
+def test_file_arrow_non_file_array_sibling_preserves_list_cast_input():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "list-to-array-sibling",
+            "method_return_type": "STRUCT(document FILE, coords INTEGER[2])",
+        }
+    )
+    value = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            pa.array([[1, 2]], type=pa.list_(pa.int32())),
+        ],
+        names=["document", "coords"],
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": value}))
+
+    assert normalized.column("payload").type.field("coords").type == pa.list_(pa.int32(), list_size=2)
+    assert normalized.column("payload").to_pylist()[0]["coords"] == [1, 2]
+
+
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
     output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
     local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
@@ -1846,6 +1871,22 @@ def test_batch_file_udf_supports_enum_sibling():
         "memory://udf",
         "open",
     )
+
+
+def test_batch_file_udf_supports_non_file_union_sibling():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, choice UNION(s VARCHAR, i BIGINT))")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return values
+
+    choice_type = build_document.return_arrow_dtype.field("choice").type
+    assert pa.types.is_union(choice_type)
+    assert choice_type.mode == "sparse"
+    assert [field.name for field in choice_type] == ["s", "i"]
+    assert [field.type for field in choice_type] == [pa.string(), pa.int64()]
 
 
 def test_batch_file_udf_supports_sqlnull_sibling():

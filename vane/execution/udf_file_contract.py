@@ -412,6 +412,65 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
     return array
 
 
+def _validate_nested_struct_field_sets(
+    actual: pa.DataType,
+    dtype: Any,
+    *,
+    boundary: str,
+    path: str,
+) -> None:
+    """Reject lossy STRUCT rebuilding without constraining DuckDB source casts."""
+    if pa.types.is_null(actual) or _is_file_type(dtype):
+        return
+
+    type_id = _type_id(dtype)
+    if type_id == "struct":
+        if not pa.types.is_struct(actual):
+            return
+        actual_names = [field.name.casefold() for field in actual]
+        declared_names = [name.casefold() for name, _ in dtype.children]
+        if len(set(actual_names)) != len(actual_names):
+            raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names")
+        if len(set(declared_names)) != len(declared_names) or set(actual_names) != set(declared_names):
+            raise _invalid_input(f"{boundary} STRUCT at {path} must contain exactly the declared fields")
+        for name, child in dtype.children:
+            field_index = _struct_field_index(actual, name, boundary=boundary, path=path)
+            _validate_nested_struct_field_sets(
+                actual.field(field_index).type,
+                child,
+                boundary=boundary,
+                path=f"{path}.{name}",
+            )
+        return
+
+    if type_id in ("list", "array", "tensor"):
+        actual_storage = actual.storage_type if _is_arrow_extension_type(actual) else actual
+        if not (_is_arrow_list_storage(actual_storage) or pa.types.is_fixed_size_list(actual_storage)):
+            return
+        _validate_nested_struct_field_sets(
+            actual_storage.value_type,
+            _sequence_child(dtype),
+            boundary=boundary,
+            path=f"{path}[]",
+        )
+        return
+
+    if type_id == "map" and pa.types.is_map(actual):
+        children = _type_children(dtype)
+        _validate_nested_struct_field_sets(
+            actual.key_type,
+            children["key"],
+            boundary=boundary,
+            path=f"{path}.key",
+        )
+        _validate_nested_struct_field_sets(
+            actual.item_type,
+            children["value"],
+            boundary=boundary,
+            path=f"{path}.value",
+        )
+
+
 def _validate_arrow_storage_type(
     actual: pa.DataType,
     dtype: Any,
@@ -489,6 +548,8 @@ def _validate_arrow_storage_type(
         if len(set(declared_names)) != len(declared_names) or set(actual_names) != set(declared_names):
             raise _invalid_input(f"{boundary} STRUCT at {path} must contain exactly the declared fields")
         for name, child in dtype.children:
+            if not _contains_file(child):
+                continue
             field_index = _struct_field_index(actual, name, boundary=boundary, path=path)
             _validate_arrow_storage_type(
                 actual.field(field_index).type,
@@ -502,25 +563,25 @@ def _validate_arrow_storage_type(
         if not pa.types.is_map(actual):
             raise _invalid_input(f"{boundary} value at {path} must use an Arrow MAP type")
         children = _type_children(dtype)
-        _validate_arrow_storage_type(
-            actual.key_type,
-            children["key"],
-            boundary=boundary,
-            path=f"{path}.key",
-            allow_untyped_null=allow_untyped_null,
-        )
-        _validate_arrow_storage_type(
-            actual.item_type,
-            children["value"],
-            boundary=boundary,
-            path=f"{path}.value",
-            allow_untyped_null=allow_untyped_null,
-        )
+        if _contains_file(children["key"]):
+            _validate_arrow_storage_type(
+                actual.key_type,
+                children["key"],
+                boundary=boundary,
+                path=f"{path}.key",
+                allow_untyped_null=allow_untyped_null,
+            )
+        if _contains_file(children["value"]):
+            _validate_arrow_storage_type(
+                actual.item_type,
+                children["value"],
+                boundary=boundary,
+                path=f"{path}.value",
+                allow_untyped_null=allow_untyped_null,
+            )
         return
     if type_id == "union":
-        if _contains_file(dtype):
-            raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
-        return
+        raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
 
 
 def _file_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
@@ -1215,6 +1276,12 @@ def validate_file_arrow_array(
     allow_untyped_null: bool = False,
 ) -> None:
     """Validate one Arrow array governed by a logical type containing FILE."""
+    _validate_nested_struct_field_sets(
+        array.type,
+        dtype,
+        boundary=boundary,
+        path="column",
+    )
     _validate_arrow_storage_type(
         array.type,
         dtype,

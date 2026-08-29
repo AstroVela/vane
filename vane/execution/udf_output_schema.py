@@ -100,6 +100,20 @@ def _arrow_type_from_duckdb_type(type_name: str) -> pa.DataType:
     return _arrow_type_from_duckdb_pytype(vane.type(type_name))
 
 
+def _duckdb_pytype_contains_file(dt: Any) -> bool:
+    is_file = getattr(dt, "is_file", None)
+    if callable(is_file) and is_file():
+        return True
+    type_id = str(dt.id)
+    if type_id in ("list", "array", "tensor"):
+        children = dict(dt.children)
+        child = children["dtype"] if type_id == "tensor" else children["child"]
+        return _duckdb_pytype_contains_file(child)
+    if type_id in ("struct", "union", "map"):
+        return any(_duckdb_pytype_contains_file(child) for _, child in dt.children)
+    return False
+
+
 def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
     type_id = str(dt.id)
     basic = {
@@ -158,6 +172,13 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         )
     if type_id == "struct":
         return pa.struct([(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children])
+    if type_id == "union":
+        if _duckdb_pytype_contains_file(dt):
+            raise ValueError("UNION values containing FILE are not supported at Python UDF boundaries")
+        return pa.union(
+            [pa.field(name, _arrow_type_from_duckdb_pytype(child_dt)) for name, child_dt in dt.children],
+            mode="sparse",
+        )
     if type_id == "map":
         children = dict(dt.children)
         return pa.map_(
