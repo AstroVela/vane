@@ -912,7 +912,7 @@ class UDFExecutor:
             if len(outputs) == 1:
                 result_arrays = [self._file_contract.normalize_scalar_arrow_output(outputs[0])]
             elif self._file_contract.has_file_outputs and all(
-                output.type.equals(outputs[0].type, check_metadata=True) for output in outputs[1:]
+                output.type.equals(outputs[0].type) for output in outputs[1:]
             ):
                 # Value-dependent FILE sibling normalization must see every
                 # internal scalar batch before choosing one output schema.
@@ -921,10 +921,7 @@ class UDFExecutor:
                 ]
             else:
                 normalized_outputs = [self._file_contract.normalize_scalar_arrow_output(output) for output in outputs]
-                homogeneous = all(
-                    output.type.equals(normalized_outputs[0].type, check_metadata=True)
-                    for output in normalized_outputs[1:]
-                )
+                homogeneous = all(output.type.equals(normalized_outputs[0].type) for output in normalized_outputs[1:])
                 if self._file_contract.has_file_outputs and not homogeneous:
                     # DuckDB must cast cross-type siblings independently. Arrow
                     # cannot represent those batches as one logical array.

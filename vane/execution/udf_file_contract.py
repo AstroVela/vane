@@ -329,7 +329,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
                 continue
             field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
             annotated = _annotate_duckdb_bit_input(arrays[field_index], child, boundary=boundary)
-            if annotated.type.equals(arrays[field_index].type, check_metadata=True):
+            if annotated.type.equals(arrays[field_index].type):
                 continue
             arrays[field_index] = annotated
             field = fields[field_index]
@@ -354,20 +354,20 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
             start = offsets[0]
             values = array.values.slice(start, offsets[-1] - start)
             annotated = _annotate_duckdb_bit_input(values, _sequence_child(dtype), boundary=boundary)
-            if annotated.type.equals(values.type, check_metadata=True):
+            if annotated.type.equals(values.type):
                 return array
             normalized_offsets = pa.array([offset - start for offset in offsets], type=offset_type)
             return constructor(normalized_offsets, annotated, mask=array.is_null())
         is_list_view = getattr(pa.types, "is_list_view", None)
         if callable(is_list_view) and is_list_view(array.type):
             values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
-            if values.type.equals(array.values.type, check_metadata=True):
+            if values.type.equals(array.values.type):
                 return array
             return pa.ListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
         is_large_list_view = getattr(pa.types, "is_large_list_view", None)
         if callable(is_large_list_view) and is_large_list_view(array.type):
             values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
-            if values.type.equals(array.values.type, check_metadata=True):
+            if values.type.equals(array.values.type):
                 return array
             return pa.LargeListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
         return array
@@ -377,7 +377,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
         array_size = storage.type.list_size
         values = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
         annotated = _annotate_duckdb_bit_input(values, _sequence_child(dtype), boundary=boundary)
-        if annotated.type.equals(values.type, check_metadata=True):
+        if annotated.type.equals(values.type):
             return array
         normalized_storage = pa.FixedSizeListArray.from_arrays(
             annotated,
@@ -404,9 +404,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
             if _contains_bit(children["value"])
             else source_items
         )
-        if keys.type.equals(source_keys.type, check_metadata=True) and items.type.equals(
-            source_items.type, check_metadata=True
-        ):
+        if keys.type.equals(source_keys.type) and items.type.equals(source_items.type):
             return array
         normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
         return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
@@ -999,7 +997,7 @@ def _normalize_file_arrow_array(
             )
             offset += len(chunk)
         normalized_type = chunks[0].type
-        if all(chunk.type.equals(normalized_type, check_metadata=True) for chunk in chunks[1:]):
+        if all(chunk.type.equals(normalized_type) for chunk in chunks[1:]):
             return pa.chunked_array(chunks, type=normalized_type)
 
         # Some safe casts, notably temporal downcasts, depend on the values.
@@ -1020,7 +1018,7 @@ def _normalize_file_arrow_array(
             )
             offset += len(chunk)
         stable_type = stable_chunks[0].type
-        if any(not chunk.type.equals(stable_type, check_metadata=True) for chunk in stable_chunks[1:]):
+        if any(not chunk.type.equals(stable_type) for chunk in stable_chunks[1:]):
             raise RuntimeError("FILE normalization could not stabilize a chunked Arrow column")
         return pa.chunked_array(stable_chunks, type=stable_type)
     active = _active_values(array, parent_active)
@@ -1346,7 +1344,7 @@ class FileUDFContract:
                 dtype,
                 boundary=f"{boundary} column {index}",
             )
-            if annotated.type.equals(columns[index].type, check_metadata=True):
+            if annotated.type.equals(columns[index].type):
                 continue
             columns[index] = annotated
             field = fields[index]
@@ -1477,7 +1475,7 @@ class FileUDFContract:
             except Exception:
                 raise _invalid_input(f"{boundary} column {index} could not normalize its declared storage") from None
             normalized_field = pa.field(fields[index].name, normalized.type)
-            if normalized.type.equals(columns[index].type, check_metadata=True) and fields[index].equals(
+            if normalized.type.equals(columns[index].type) and fields[index].equals(
                 normalized_field, check_metadata=True
             ):
                 continue
