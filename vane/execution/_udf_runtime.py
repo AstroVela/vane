@@ -34,6 +34,7 @@ from vane.execution._common import (
 )
 from vane.execution._diagnostics import bounded_utf8_text, exception_message_from_args, safe_exception_type_name
 from vane.execution._udf_validation import ensure_synchronous_udf_result, validate_synchronous_udf_callable
+from vane.execution.udf_file_contract import FileUDFContract
 from vane.execution.udf_output_schema import empty_output_table_from_payload as _empty_output_table_from_payload
 from vane.execution.udf_ray_config import stream_output_enabled as _stream_output_enabled
 from vane.udf import FunctionNullHandling
@@ -468,6 +469,7 @@ class UDFExecutor:
         self._call_mode = str(payload.get("call_mode") or "")
         if self._call_mode not in ("map_batches", "map_batches_rows", "flat_map", "map"):
             raise ValueError("UDF payload.call_mode must be one of: map_batches, map_batches_rows, flat_map, map")
+        self._file_contract = FileUDFContract.from_payload(payload)
 
         if self._call_mode == "map":
             self._init_scalar(payload, cache_callable=cache_callable, cache_max_entries=cache_max_entries)
@@ -586,6 +588,7 @@ class UDFExecutor:
             tables = _iter_output_tables(result)
             for table in tables:
                 if table is not None:
+                    self._file_contract.validate_output_table(table)
                     yield table
             return
         except TypeError as exc:
@@ -615,6 +618,7 @@ class UDFExecutor:
             )
         if self._output_names and len(self._output_names) == 1 and table.num_columns != 1:
             raise ValueError(f"row-preserving map_batches output must have exactly 1 column, got {table.num_columns}")
+        self._file_contract.validate_output_table(table)
         return table
 
     def _iter_map_batches_compute_batches(self, args: pa.Table) -> Iterable[pa.Table]:
@@ -674,6 +678,7 @@ class UDFExecutor:
             self._queue.append(_empty_output_table_from_payload(self._payload))
 
     def _execute_map_batches(self, args: pa.Table) -> None:
+        self._file_contract.validate_input_table(args)
         args = self._rename_args(args)
         self._execute_map_batches_compute_batches(self._iter_map_batches_compute_batches(args))
 
@@ -689,6 +694,7 @@ class UDFExecutor:
             return
 
         if self._is_map_batches and self._stream_output:
+            self._file_contract.validate_input_table(args)
             args = self._rename_args(args)
             batches = self._iter_map_batches_compute_batches(args)
             saw_compute_batch = False
@@ -793,7 +799,7 @@ class UDFExecutor:
 
     def _execute_scalar_native(self, args: pa.Table) -> pa.Array:
         row_count = args.num_rows
-        columns = [column.to_pylist() for column in args.columns]
+        columns = self._file_contract.materialize_scalar_inputs(args)
         outputs: list[Any] = []
 
         for row_idx in range(row_count):
@@ -814,11 +820,12 @@ class UDFExecutor:
             if self._default_null_handling() and result is None:
                 raise ValueError(_NULL_HANDLING_ERROR)
             outputs.append(result)
-        return pa.array(outputs)
+        return self._file_contract.scalar_outputs_to_array(outputs)
 
     def _execute_scalar_arrow(self, args: pa.Table) -> pa.Array:
         row_count = args.num_rows
         exception_occurred = False
+        self._file_contract.validate_input_table(args)
 
         if self._default_null_handling():
             valid_mask = _build_valid_mask(args)
@@ -871,7 +878,13 @@ class UDFExecutor:
             full_values: list[Any] = [None] * row_count
             for idx, value in zip(valid_indices, values, strict=False):
                 full_values[idx] = value
-            result_array = pa.array(full_values)
+            result_array = (
+                pa.array(full_values, type=result_array.type)
+                if self._file_contract.has_file_outputs
+                else pa.array(full_values)
+            )
+
+        self._file_contract.validate_output_table(pa.table({self._scalar_output_name: result_array}))
 
         return result_array
 

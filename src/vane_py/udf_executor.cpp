@@ -336,6 +336,18 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 			}
 		}
 	}
+	auto cast_to_expected = [&](DataChunk &source) {
+		DataChunk cast_chunk;
+		cast_chunk.Initialize(context, expected_types, source.size());
+		cast_chunk.SetCardinality(source.size());
+		for (idx_t i = 0; i < source.ColumnCount(); i++) {
+			VectorOperations::Cast(context, source.data[i], cast_chunk.data[i], source.size());
+			cast_chunk.data[i].Verify(source.size());
+		}
+		auto output = make_uniq<DataChunk>();
+		output->Move(cast_chunk);
+		return output;
+	};
 
 	vector<column_t> column_ids;
 	column_ids.reserve(return_types.size());
@@ -356,6 +368,9 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 
 	if (first_chunk.size() == 0) {
 		// Empty table
+		if (needs_cast) {
+			return cast_to_expected(first_chunk);
+		}
 		auto output = make_uniq<DataChunk>();
 		output->Initialize(context, return_types, 0);
 		output->SetCardinality(0);
@@ -373,16 +388,7 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 		// buffers (zero-copy). ArrowAuxiliaryData on vector buffers keeps the
 		// Arrow memory alive after scan state is destroyed.
 		if (needs_cast) {
-			DataChunk cast_chunk;
-			cast_chunk.Initialize(context, expected_types, first_chunk.size());
-			cast_chunk.SetCardinality(first_chunk.size());
-			for (idx_t i = 0; i < first_chunk.ColumnCount(); i++) {
-				VectorOperations::Cast(context, first_chunk.data[i], cast_chunk.data[i], first_chunk.size());
-				cast_chunk.data[i].Verify(first_chunk.size());
-			}
-			auto output = make_uniq<DataChunk>();
-			output->Move(cast_chunk);
-			return output;
+			return cast_to_expected(first_chunk);
 		}
 		auto output = make_uniq<DataChunk>();
 		output->Move(first_chunk);
@@ -412,16 +418,7 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 	}
 
 	if (needs_cast) {
-		DataChunk cast_chunk;
-		cast_chunk.Initialize(context, expected_types, result.size());
-		cast_chunk.SetCardinality(result.size());
-		for (idx_t i = 0; i < result.ColumnCount(); i++) {
-			VectorOperations::Cast(context, result.data[i], cast_chunk.data[i], result.size());
-			cast_chunk.data[i].Verify(result.size());
-		}
-		auto output = make_uniq<DataChunk>();
-		output->Move(cast_chunk);
-		return output;
+		return cast_to_expected(result);
 	}
 
 	auto output = make_uniq<DataChunk>();

@@ -77,3 +77,50 @@ def test_default_ray_discovers_connection_registered_filesystem_on_coordinator(m
         (vane.File("memory://root/a.txt", "text/plain"),),
         (vane.File("memory://root/b.json", "application/json"),),
     ]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_executes_scalar_and_batch_file_udfs(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    @vane.func(return_dtype=vane.file_type())
+    def scalar_identity(value):
+        assert isinstance(value, vane.File)
+        return value
+
+    @vane.func.batch(return_dtype=vane.file_type(), batch_size=2)
+    def batch_identity(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        return values
+
+    @vane.func(return_dtype=vane.list_type(vane.file_type()))
+    def nested_identity(values):
+        assert isinstance(values[0], vane.File)
+        assert values[1] is None
+        return values
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(
+            """
+            SELECT
+                i,
+                file('memory://ray-udf/' || i::VARCHAR, NULL, NULL, NULL, NULL) AS value,
+                [file('memory://ray-udf/' || i::VARCHAR, NULL, NULL, NULL, NULL), NULL::FILE] AS values
+            FROM range(4) AS t(i)
+            """
+        )
+        scalar_rows = source.select(vane.col("i"), scalar_identity(vane.col("value")).alias("value")).fetchall()
+        batch_rows = source.select(vane.col("i"), batch_identity(vane.col("value")).alias("value")).fetchall()
+        nested_rows = source.select(vane.col("i"), nested_identity(vane.col("values")).alias("values")).fetchall()
+    finally:
+        connection.close()
+
+    expected = [(index, vane.File(f"memory://ray-udf/{index}")) for index in range(4)]
+    assert sorted(scalar_rows) == expected
+    assert sorted(batch_rows) == expected
+    assert sorted(nested_rows) == [(index, [vane.File(f"memory://ray-udf/{index}"), None]) for index in range(4)]

@@ -548,6 +548,9 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 
 	auto upper_type = StringUtil::Upper(type);
+	if (upper_type == FileLogicalType::TYPE_NAME) {
+		return FileLogicalType::Create();
+	}
 	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
 		string tensor_args = type.substr(7, type.size() - 8);
 		idx_t split_idx = string::npos;

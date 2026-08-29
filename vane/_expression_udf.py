@@ -334,6 +334,7 @@ def _invoke_batch_callable(
 def _normalize_batch_result(
     result: Any,
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     expected_length: int,
     udf_name: str,
@@ -346,7 +347,31 @@ def _normalize_batch_result(
         )
     if len(result) != expected_length:
         raise _invalid_input(f"batch UDF {udf_name!r} returned {len(result)} rows for {expected_length} input rows")
+    from vane.execution.udf_file_contract import contains_file_type, validate_file_arrow_storage_type
+
+    file_output = contains_file_type(output_logical_type)
+    if file_output:
+        validate_file_arrow_storage_type(
+            result.type,
+            output_logical_type,
+            boundary=f"batch UDF {udf_name!r} output",
+            allow_untyped_null=True,
+        )
     if not result.type.equals(output_arrow_type):
+        if file_output:
+            if pa.types.is_null(result.type):
+                try:
+                    return pa.array([None] * len(result), type=output_arrow_type)
+                except Exception as exc:
+                    raise _invalid_input(
+                        f"batch UDF {udf_name!r} could not type its NULL output as {output_arrow_type}"
+                    ) from exc
+            try:
+                return result.cast(output_arrow_type)
+            except Exception as exc:
+                raise _invalid_input(
+                    f"batch UDF {udf_name!r} could not normalize its FILE output to {output_arrow_type}"
+                ) from exc
         try:
             result = result.cast(output_arrow_type)
         except Exception as exc:
@@ -362,6 +387,7 @@ def _execute_batch_callable(
     layout: _BatchCallLayout,
     columns: list[Any],
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
@@ -374,6 +400,7 @@ def _execute_batch_callable(
     result = ensure_synchronous_udf_result(_invoke_batch_callable(fn, layout, columns))
     normalized = _normalize_batch_result(
         result,
+        output_logical_type=output_logical_type,
         output_arrow_type=output_arrow_type,
         expected_length=expected_length,
         udf_name=udf_name,
@@ -387,6 +414,7 @@ def _call_batch_eager(
     args: tuple[Any, ...],
     kwargs: Mapping[str, Any],
     *,
+    output_logical_type: Any,
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
@@ -407,11 +435,16 @@ def _call_batch_eager(
         fn,
         layout,
         columns,
+        output_logical_type=output_logical_type,
         output_arrow_type=output_arrow_type,
         output_column=output_column,
         udf_name=udf_name,
     )
     result = result_table.column(output_column)
+    from vane.execution.udf_file_contract import contains_file_type, validate_file_arrow_array
+
+    if contains_file_type(output_logical_type):
+        validate_file_arrow_array(result, output_logical_type, boundary=f"batch UDF {udf_name!r} output")
     if result.num_chunks == 1:
         return result.chunk(0)
     return result
@@ -421,6 +454,7 @@ def _build_batch_function_adapter(
     fn: Callable[..., Any],
     layout: _BatchCallLayout,
     output_column: str,
+    output_logical_type: Any,
     output_arrow_type: Any,
     udf_name: str,
 ) -> Callable[[Any], Any]:
@@ -433,6 +467,7 @@ def _build_batch_function_adapter(
             fn,
             layout,
             columns,
+            output_logical_type=output_logical_type,
             output_arrow_type=output_arrow_type,
             output_column=output_column,
             udf_name=udf_name,
@@ -688,6 +723,7 @@ def _build_batch_actor_class(
     init_kwargs: Mapping[str, Any],
     layout: _BatchCallLayout,
     output_column: str,
+    output_logical_type: Any,
     output_arrow_type: Any,
     udf_name: str,
 ) -> type:
@@ -704,6 +740,7 @@ def _build_batch_actor_class(
                 self._instance,
                 layout,
                 columns,
+                output_logical_type=output_logical_type,
                 output_arrow_type=output_arrow_type,
                 output_column=output_column,
                 udf_name=udf_name,
@@ -860,6 +897,7 @@ class VaneBatchFunction:
             self.python_function,
             layout,
             self.sql_name,
+            self.return_dtype,
             self.return_arrow_dtype,
             self.sql_name,
         )
@@ -872,6 +910,7 @@ class VaneBatchFunction:
                 self.signature,
                 args,
                 kwargs,
+                output_logical_type=self.return_dtype,
                 output_arrow_type=self.return_arrow_dtype,
                 output_column=self.sql_name,
                 udf_name=self.sql_name,
@@ -1177,6 +1216,7 @@ class VaneClassBatchInstance:
             self._init_kwargs,
             layout,
             self.sql_name,
+            self.return_dtype,
             self.return_arrow_dtype,
             self.sql_name,
         )
@@ -1189,6 +1229,7 @@ class VaneClassBatchInstance:
                 self.signature,
                 args,
                 kwargs,
+                output_logical_type=self.return_dtype,
                 output_arrow_type=self.return_arrow_dtype,
                 output_column=self.sql_name,
                 udf_name=self.sql_name,
