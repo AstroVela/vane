@@ -917,7 +917,9 @@ class FileUDFContract:
                 continue
             arrays[name] = _native_outputs_to_arrow_array(values, dtype, boundary=boundary)
 
-        return self.normalize_output_table(pa.table(arrays))
+        table = pa.table(arrays)
+        self.validate_output_table(table)
+        return table
 
     def validate_output_table(self, table: pa.Table) -> None:
         if not self.has_file_outputs:

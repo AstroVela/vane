@@ -399,29 +399,39 @@ def test_scalar_file_udf_preserves_non_file_composite_siblings():
 
 
 def test_native_file_udfs_preserve_duckdb_sibling_coercions():
-    output_type = vane.type("STRUCT(document FILE, id BIGINT)")
+    identifier = UUID("00112233-4455-6677-8899-aabbccddeeff")
+    output_type = vane.type("STRUCT(document FILE, id BIGINT, identifier UUID)")
 
     @vane.func(return_dtype=output_type)
     def build_document(_value):
         return {
             "document": vane.File("memory://coercion"),
             "id": "42",
+            "identifier": str(identifier),
         }
 
     connection = vane.connect()
     result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
 
-    assert result.fetchone() == ({"document": vane.File("memory://coercion"), "id": 42},)
+    assert result.fetchone() == ({"document": vane.File("memory://coercion"), "id": 42, "identifier": identifier},)
 
     def build_row(_row):
-        return {"payload": {"document": vane.File("memory://flat-map-coercion"), "id": "43"}}
+        return {
+            "payload": {
+                "document": vane.File("memory://flat-map-coercion"),
+                "id": "43",
+                "identifier": str(identifier),
+            }
+        }
 
     flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
         build_row,
         schema={"payload": output_type},
         execution_backend="subprocess_task",
     )
-    assert flat_map_result.fetchone() == ({"document": vane.File("memory://flat-map-coercion"), "id": 43},)
+    assert flat_map_result.fetchone() == (
+        {"document": vane.File("memory://flat-map-coercion"), "id": 43, "identifier": identifier},
+    )
 
 
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
