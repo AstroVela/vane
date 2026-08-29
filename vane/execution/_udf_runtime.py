@@ -677,10 +677,19 @@ class UDFExecutor:
             for output in shared_output_buffer.flush():
                 self._queue.append(output)
         if results:
-            if len(results) == 1:
-                self._queue.append(results[0])
-            else:
-                self._queue.append(pa.concat_tables(results, promote_options="default"))
+            compatible: list[pa.Table] = []
+            for table in results:
+                if compatible and not compatible[0].schema.equals(table.schema):
+                    self._queue.append(
+                        compatible[0]
+                        if len(compatible) == 1
+                        else pa.concat_tables(compatible, promote_options="default")
+                    )
+                    compatible = []
+                compatible.append(table)
+            self._queue.append(
+                compatible[0] if len(compatible) == 1 else pa.concat_tables(compatible, promote_options="default")
+            )
         elif saw_compute_batch and not saw_output:
             self._queue.append(_empty_output_table_from_payload(self._payload))
 

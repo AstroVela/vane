@@ -1066,7 +1066,8 @@ def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
     assert output[0].column("identifier").to_pylist() == [str(identifier), str(identifier)]
 
 
-def test_map_batches_keeps_cross_type_file_sibling_batches_separate():
+@pytest.mark.parametrize("stream_output", [False, True], ids=["non-stream", "stream"])
+def test_map_batches_keeps_cross_type_file_sibling_batches_separate(stream_output):
     import cloudpickle
     import pyarrow as pa
 
@@ -1108,7 +1109,7 @@ def test_map_batches_keeps_cross_type_file_sibling_batches_separate():
                 {"name": "document", "kind": "duckdb_type", "type": "FILE"},
                 {"name": "text", "kind": "duckdb_type", "type": "VARCHAR"},
             ],
-            "stream_output": True,
+            "stream_output": stream_output,
             "output_batch_size": 2,
         }
     )
@@ -1170,6 +1171,7 @@ def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
             type=file_type,
         )
         yield pa.table({"document": document, "text": pa.array([b"\xc3\xa9"], type=pa.binary())})
+        yield pa.table({"document": document, "text": pa.array(["second"], type=pa.string())})
 
     connection = vane.connect()
     result = connection.sql("SELECT 1 AS value").map_batches(
@@ -1181,6 +1183,7 @@ def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
 
     assert result.project("document.url, text").fetchall() == [
         ("memory://udf", r"\xC3\xA9"),
+        ("memory://udf", "second"),
     ]
 
 
@@ -1495,6 +1498,32 @@ def test_batch_file_udf_supports_bit_sibling():
     )
 
 
+def test_batch_file_udf_supports_enum_sibling():
+    import pyarrow as pa
+
+    output_type = vane.type("STRUCT(document FILE, status ENUM('open', 'closed'))")
+
+    @vane.func.batch(return_dtype=output_type)
+    def build_document(values):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([_file_record()] * len(values), type=_file_arrow_type()),
+                pa.array(["open"] * len(values), type=pa.string()),
+            ],
+            names=["document", "status"],
+        )
+
+    assert build_document.return_arrow_dtype.field("status").type == pa.string()
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.document.url, payload.status::VARCHAR").fetchone() == (
+        "memory://udf",
+        "open",
+    )
+
+
 def test_batch_file_udf_preserves_bit_identity_storage():
     import pyarrow as pa
 
@@ -1520,6 +1549,38 @@ def test_batch_file_udf_preserves_bit_identity_storage():
     assert result.type.field("flags").type == pa.opaque(pa.binary(), "bit", "DuckDB")
     connection.register("file_bit_identity", pa.table({"payload": result}))
     assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_identity").fetchone() == ("0101011",)
+
+
+def test_batch_file_udf_uses_opaque_compat_without_pyarrow_opaque(monkeypatch):
+    import pyarrow as pa
+
+    connection = vane.connect()
+    bit_storage = connection.execute("SELECT '0101011'::BIT AS flags").to_arrow_table().column("flags").chunk(0)
+    monkeypatch.setattr(pa, "opaque", None)
+
+    output_type = vane.type("STRUCT(document FILE, flags BIT)")
+
+    @vane.func.batch(return_dtype=output_type)
+    def identity(values):
+        return values
+
+    payload = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            bit_storage,
+        ],
+        names=["document", "flags"],
+    )
+    result = identity(payload)
+
+    flags_type = identity.return_arrow_dtype.field("flags").type
+    assert flags_type.extension_name == "arrow.opaque"
+    assert flags_type.type_name == "bit"
+    assert flags_type.vendor_name == "DuckDB"
+    assert result.field("flags").type.equals(flags_type)
+    assert result.field("flags").storage.to_pylist() == bit_storage.to_pylist()
+    connection.register("file_bit_fallback", pa.table({"payload": result}))
+    assert connection.execute("SELECT payload.flags::BIT::VARCHAR FROM file_bit_fallback").fetchone() == ("0101011",)
 
 
 def test_file_output_normalization_preserves_full_intervals():

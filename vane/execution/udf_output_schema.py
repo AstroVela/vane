@@ -3,10 +3,45 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
+
+
+class _ArrowOpaqueCompatType(pa.ExtensionType):
+    """Backport Arrow's canonical opaque type for supported older PyArrow releases."""
+
+    def __init__(self, storage_type: pa.DataType, type_name: str, vendor_name: str) -> None:
+        self.type_name = type_name
+        self.vendor_name = vendor_name
+        super().__init__(storage_type, "arrow.opaque")
+
+    def __arrow_ext_serialize__(self) -> bytes:
+        return json.dumps(
+            {"type_name": self.type_name, "vendor_name": self.vendor_name},
+            separators=(",", ":"),
+        ).encode()
+
+    @classmethod
+    def __arrow_ext_deserialize__(
+        cls,
+        storage_type: pa.DataType,
+        serialized: bytes,
+    ) -> _ArrowOpaqueCompatType:
+        metadata = json.loads(serialized.decode())
+        return cls(storage_type, metadata["type_name"], metadata["vendor_name"])
+
+    def __reduce__(self) -> tuple[Any, tuple[pa.DataType, str, str]]:
+        return type(self), (self.storage_type, self.type_name, self.vendor_name)
+
+
+def _duckdb_bit_arrow_type() -> pa.DataType:
+    opaque = getattr(pa, "opaque", None)
+    if callable(opaque):
+        return opaque(pa.binary(), "bit", "DuckDB")
+    return _ArrowOpaqueCompatType(pa.binary(), "bit", "DuckDB")
 
 
 def _arrow_type_from_name(type_name: str) -> pa.DataType:
@@ -81,7 +116,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "double": pa.float64,
         "boolean": pa.bool_,
         "blob": pa.binary,
-        "bit": lambda: pa.opaque(pa.binary(), "bit", "DuckDB"),
+        "bit": _duckdb_bit_arrow_type,
         "timestamp": lambda: pa.timestamp("us"),
         "timestamp_s": lambda: pa.timestamp("s"),
         "timestamp_ms": lambda: pa.timestamp("ms"),
@@ -100,6 +135,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "uuid": pa.string,
         "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
         "time with time zone": pa.string,
+        "enum": pa.string,
     }
     factory = basic.get(type_id)
     if factory is not None:

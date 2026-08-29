@@ -520,6 +520,27 @@ static pair<string, string> ParseSerializedNamedType(const string &input, const 
 	return make_pair(std::move(name), std::move(value_type));
 }
 
+static string ParseSerializedStringLiteral(const string &input, const string &full_type) {
+	string literal = input;
+	StringUtil::Trim(literal);
+	if (literal.size() < 2 || literal.front() != '\'' || literal.back() != '\'') {
+		throw InternalException("Ill formatted string literal in type: '%s'", full_type);
+	}
+	string result;
+	for (idx_t i = 1; i + 1 < literal.size(); i++) {
+		if (literal[i] != '\'') {
+			result += literal[i];
+			continue;
+		}
+		if (i + 1 >= literal.size() - 1 || literal[i + 1] != '\'') {
+			throw InternalException("Ill formatted string literal in type: '%s'", full_type);
+		}
+		result += '\'';
+		i++;
+	}
+	return result;
+}
+
 LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (StringUtil::EndsWith(type, "[]")) {
 		// list - recurse
@@ -550,6 +571,20 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	auto upper_type = StringUtil::Upper(type);
 	if (upper_type == FileLogicalType::TYPE_NAME) {
 		return FileLogicalType::Create();
+	}
+	if (StringUtil::StartsWith(upper_type, "ENUM(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto enum_values_str = type.substr(5, type.size() - 6);
+		auto enum_values = SplitSerializedTypeArguments(enum_values_str, type);
+		if (enum_values.empty()) {
+			throw InternalException("ENUM type requires at least one value: '%s'", type);
+		}
+		Vector ordered_values(LogicalType::VARCHAR, enum_values.size());
+		auto ordered_data = FlatVector::GetData<string_t>(ordered_values);
+		for (idx_t i = 0; i < enum_values.size(); i++) {
+			auto value = ParseSerializedStringLiteral(enum_values[i], type);
+			ordered_data[i] = StringVector::AddString(ordered_values, value);
+		}
+		return LogicalType::ENUM(ordered_values, enum_values.size());
 	}
 	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
 		string tensor_args = type.substr(7, type.size() - 8);

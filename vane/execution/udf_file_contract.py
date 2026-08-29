@@ -821,6 +821,8 @@ def _normalize_file_arrow_array(
         expected = _expected_arrow_type(dtype, boundary=boundary)
         if source.type.equals(expected):
             return source
+        if pa.types.is_null(source.type):
+            return pa.nulls(len(source), type=expected)
         if _is_arrow_binary_storage(source.type):
             storage = source if source.type.equals(expected.storage_type) else source.cast(expected.storage_type)
             return pa.ExtensionArray.from_storage(expected, storage)

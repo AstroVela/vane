@@ -103,4 +103,20 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 		auto union_type = LogicalType::UNION(std::move(union_members));
 		REQUIRE(DBConfig::ParseLogicalType(union_type.ToString()) == union_type);
 	}
+
+	SECTION("enum values round trip") {
+		auto enum_type = DBConfig::ParseLogicalType("ENUM('open', 'comma,value', 'quote''value', '')");
+		REQUIRE(enum_type.id() == LogicalTypeId::ENUM);
+		REQUIRE(EnumType::GetSize(enum_type) == 4);
+		REQUIRE(EnumType::GetString(enum_type, 0).GetString() == "open");
+		REQUIRE(EnumType::GetString(enum_type, 1).GetString() == "comma,value");
+		REQUIRE(EnumType::GetString(enum_type, 2).GetString() == "quote'value");
+		REQUIRE(EnumType::GetString(enum_type, 3).GetString().empty());
+		REQUIRE(DBConfig::ParseLogicalType(enum_type.ToString()) == enum_type);
+
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("status", enum_type));
+		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
+		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
+	}
 }
