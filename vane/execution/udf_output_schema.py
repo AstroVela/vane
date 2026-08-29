@@ -96,6 +96,7 @@ def _arrow_type_from_duckdb_pytype(dt: Any) -> pa.DataType:
         "uhugeint": pa.string,
         "uuid": lambda: pa.binary(16),
         "timestamp with time zone": lambda: pa.timestamp("us", tz="UTC"),
+        "time with time zone": pa.string,
     }
     factory = basic.get(type_id)
     if factory is not None:

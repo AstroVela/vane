@@ -15,6 +15,7 @@ import operator
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import time as datetime_time
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -530,12 +531,18 @@ def _canonical_values_to_arrow_array(
                 raise ValueError(f"{type_id.upper()} output is outside its 128-bit range")
             encoded.append(str(integer))
         return pa.array(encoded, type=pa.string())
+    if type_id == "time with time zone":
+        encoded = [value.isoformat() if isinstance(value, datetime_time) else value for value in values]
+        return pa.array(encoded, type=pa.string())
     if not _contains_file(dtype):
         try:
-            expected_type = _arrow_type_from_duckdb_pytype(dtype)
-        except Exception:
             return pa.array(values)
-        return pa.array(values, type=expected_type)
+        except Exception as inference_error:
+            try:
+                expected_type = _arrow_type_from_duckdb_pytype(dtype)
+            except Exception:
+                raise inference_error
+            return pa.array(values, type=expected_type)
 
     type_id = _type_id(dtype)
     null_mask = pa.array([value is None for value in values], type=pa.bool_())
@@ -910,9 +917,7 @@ class FileUDFContract:
                 continue
             arrays[name] = _native_outputs_to_arrow_array(values, dtype, boundary=boundary)
 
-        table = pa.table(arrays)
-        self.validate_output_table(table)
-        return table
+        return self.normalize_output_table(pa.table(arrays))
 
     def validate_output_table(self, table: pa.Table) -> None:
         if not self.has_file_outputs:

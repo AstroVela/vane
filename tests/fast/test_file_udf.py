@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -396,6 +396,49 @@ def test_scalar_file_udf_preserves_non_file_composite_siblings():
     assert payload["document"] == vane.File("memory://scalar-composite")
     assert payload["id"] == identifier
     assert payload["created_at"].astimezone(timezone.utc) == created_at
+
+
+def test_native_file_udfs_preserve_duckdb_sibling_coercions():
+    output_type = vane.type("STRUCT(document FILE, id BIGINT)")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://coercion"),
+            "id": "42",
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.fetchone() == ({"document": vane.File("memory://coercion"), "id": 42},)
+
+    def build_row(_row):
+        return {"payload": {"document": vane.File("memory://flat-map-coercion"), "id": "43"}}
+
+    flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.fetchone() == ({"document": vane.File("memory://flat-map-coercion"), "id": 43},)
+
+
+def test_scalar_file_udf_preserves_time_with_time_zone_offset():
+    output_type = vane.type("STRUCT(document FILE, local_time TIME WITH TIME ZONE)")
+    local_time = time(3, 4, 5, tzinfo=timezone(timedelta(hours=2, minutes=30)))
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://time-zone"),
+            "local_time": local_time,
+        }
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.local_time::VARCHAR AS local_time").fetchone() == ("03:04:05+02:30",)
 
 
 @pytest.mark.parametrize(
