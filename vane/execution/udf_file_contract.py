@@ -284,6 +284,31 @@ def _child_window(array: Any) -> tuple[int, int, list[int]]:
     return start, offsets[-1] - start, offsets
 
 
+def _arrow_cast_preserves_values(actual: pa.DataType, expected: pa.DataType, dtype: Any) -> bool:
+    """Return whether Arrow can only change storage, not DuckDB cast semantics."""
+    if actual.equals(expected):
+        return True
+    if isinstance(actual, pa.ExtensionType) and actual.storage_type.equals(expected):
+        return True
+    if (pa.types.is_string(actual) or pa.types.is_large_string(actual)) and (
+        pa.types.is_string(expected) or pa.types.is_large_string(expected)
+    ):
+        return True
+    if (pa.types.is_binary(actual) or pa.types.is_large_binary(actual)) and (
+        pa.types.is_binary(expected) or pa.types.is_large_binary(expected)
+    ):
+        return True
+    if pa.types.is_signed_integer(actual) and pa.types.is_signed_integer(expected):
+        return expected.bit_width >= actual.bit_width
+    if pa.types.is_unsigned_integer(actual) and pa.types.is_unsigned_integer(expected):
+        return expected.bit_width >= actual.bit_width
+    if pa.types.is_unsigned_integer(actual) and pa.types.is_signed_integer(expected):
+        return expected.bit_width > actual.bit_width
+    if pa.types.is_float32(actual) and pa.types.is_float64(expected):
+        return True
+    return _type_id(dtype) in ("bignum", "hugeint", "uhugeint") and pa.types.is_integer(actual)
+
+
 def _validate_file_arrow_values(
     array: Any,
     dtype: Any,
@@ -762,18 +787,19 @@ def _normalize_file_arrow_array(
             mask=array.is_null(),
         )
 
+    source = _mask_inactive(array, active)
     try:
         expected = _arrow_type_from_duckdb_pytype(dtype)
     except Exception:
-        return array
-    if array.type.equals(expected):
-        return _mask_inactive(array, active)
+        return source
+    if not _arrow_cast_preserves_values(source.type, expected, dtype):
+        # Cross-type casts belong to DuckDB. Arrow may accept a cast while
+        # assigning it different semantics (for example BLOB to VARCHAR).
+        return source
     try:
-        return _mask_inactive(array, active).cast(expected)
+        return source.cast(expected)
     except Exception:
-        # DuckDB accepts coercions that Arrow does not model (for example,
-        # VARCHAR to UUID). Preserve that storage for the engine's final cast.
-        return _mask_inactive(array, active)
+        return source
 
 
 def validate_file_arrow_array(

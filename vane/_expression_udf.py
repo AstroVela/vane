@@ -347,6 +347,7 @@ def _normalize_batch_result(
     output_arrow_type: Any,
     expected_length: int,
     udf_name: str,
+    defer_file_output_cast: bool = False,
 ) -> Any:
     import pyarrow as pa
 
@@ -368,6 +369,8 @@ def _normalize_batch_result(
         )
     if not result.type.equals(output_arrow_type):
         if file_output:
+            if defer_file_output_cast:
+                return result
             try:
                 return result.cast(output_arrow_type)
             except Exception as exc:
@@ -393,6 +396,7 @@ def _execute_batch_callable(
     output_arrow_type: Any,
     output_column: str,
     udf_name: str,
+    defer_file_output_cast: bool = False,
 ) -> Any:
     import pyarrow as pa
 
@@ -406,6 +410,7 @@ def _execute_batch_callable(
         output_arrow_type=output_arrow_type,
         expected_length=expected_length,
         udf_name=udf_name,
+        defer_file_output_cast=defer_file_output_cast,
     )
     return pa.table({output_column: normalized})
 
@@ -473,6 +478,7 @@ def _build_batch_function_adapter(
             output_arrow_type=output_arrow_type,
             output_column=output_column,
             udf_name=udf_name,
+            defer_file_output_cast=True,
         )
 
     return batch_adapter
@@ -695,6 +701,8 @@ def _build_row_actor_class(
     captured_input_names = list(input_names)
 
     class _VaneRowActorAdapter:
+        _vane_row_actor_adapter = True
+
         def __init__(self) -> None:
             self._instance = ensure_synchronous_udf_result(user_class(*init_args, **captured_init_kwargs))
 
@@ -746,6 +754,7 @@ def _build_batch_actor_class(
                 output_arrow_type=output_arrow_type,
                 output_column=output_column,
                 udf_name=udf_name,
+                defer_file_output_cast=True,
             )
 
     _VaneBatchActorAdapter.__name__ = f"_{_class_name(user_class)}BatchActor"
@@ -968,6 +977,10 @@ class VaneClass:
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
+        from vane.execution.udf_file_contract import contains_file_type
+
+        if contains_file_type(normalized_return_dtype):
+            raise _invalid_input("vane.cls row UDFs do not support FILE outputs; use vane.func or vane.cls.batch")
         self._class = class_
         self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
@@ -1621,6 +1634,10 @@ def _preflight_vane_class_instance(
         parameters,
         "parameters is required for SQL vane.cls registration",
     )
+    from vane.execution.udf_file_contract import contains_file_type
+
+    if any(contains_file_type(parameter) for parameter in normalized_parameters):
+        raise _invalid_input("vane.cls row UDFs do not support FILE inputs; use vane.func or vane.cls.batch")
     explicit_input_names = None if input_names is None else _normalize_sql_input_names(input_names)
     if explicit_input_names is not None and len(explicit_input_names) != len(normalized_parameters):
         raise _invalid_input("input_names count must match parameters count")

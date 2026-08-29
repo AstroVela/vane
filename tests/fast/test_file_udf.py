@@ -792,6 +792,82 @@ def test_map_batches_stabilizes_uuid_sibling_transport_across_batches():
     assert output[0].column("identifier").to_pylist() == [str(identifier), str(identifier)]
 
 
+def test_map_batches_defers_non_file_cast_semantics_to_duckdb():
+    import pyarrow as pa
+
+    def emit_documents(_table):
+        file_type = pa.struct(
+            [
+                pa.field("url", pa.string()),
+                pa.field("content_type", pa.string()),
+                pa.field("position", pa.int64()),
+                pa.field("size", pa.int64()),
+                pa.field("checksum", pa.string()),
+            ]
+        )
+        document = pa.array(
+            [
+                {
+                    "url": "memory://udf",
+                    "content_type": "application/octet-stream",
+                    "position": 0,
+                    "size": 3,
+                    "checksum": "sha256:abc",
+                }
+            ],
+            type=file_type,
+        )
+        yield pa.table({"document": document, "text": pa.array([b"\xc3\xa9"], type=pa.binary())})
+
+    connection = vane.connect()
+    result = connection.sql("SELECT 1 AS value").map_batches(
+        emit_documents,
+        schema={"document": vane.file_type(), "text": vane.sqltypes.VARCHAR},
+        execution_backend="subprocess_task",
+        output_batch_size=2,
+    )
+
+    assert result.project("document.url, text").fetchall() == [
+        ("memory://udf", r"\xC3\xA9"),
+    ]
+
+
+def test_row_actor_rejects_file_inputs_and_outputs():
+    import cloudpickle
+
+    from vane.execution._udf_runtime import UDFExecutor
+
+    class ReadFile:
+        def __call__(self, value):
+            return value.url
+
+    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*FILE outputs"):
+        vane.cls(ReadFile, actor_number=1, return_dtype=vane.file_type())
+
+    row_class = vane.cls(ReadFile, actor_number=1, return_dtype="VARCHAR")()
+    connection = vane.connect()
+    with pytest.raises(vane.InvalidInputException, match=r"vane\.cls.*FILE inputs"):
+        vane.attach_function(
+            row_class,
+            connection=connection,
+            alias="read_file_actor",
+            parameters=[vane.file_type()],
+        )
+
+    actor = row_class.actor_class(["value"])
+    with pytest.raises(ValueError, match=r"vane\.cls.*FILE inputs"):
+        UDFExecutor(
+            {
+                "function_pickle": cloudpickle.dumps(actor),
+                "call_mode": "map_batches_rows",
+                "execution_backend": "subprocess_actor",
+                "actor_number": 1,
+                "input_types": ["FILE"],
+                "output_schema": [{"name": "value", "kind": "duckdb_type", "type": "VARCHAR"}],
+            }
+        )
+
+
 def test_file_arrow_validation_does_not_materialize_non_file_struct_siblings():
     import pyarrow as pa
 

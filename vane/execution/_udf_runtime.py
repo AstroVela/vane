@@ -72,6 +72,7 @@ def _load_runtime_callable(
     *,
     cache_callable: bool = False,
     cache_max_entries: int | None = None,
+    has_file_inputs: bool = False,
 ) -> Any:
     if cache_callable:
         udf = load_udf_from_payload_cached(payload, max_entries=cache_max_entries)
@@ -79,6 +80,8 @@ def _load_runtime_callable(
         udf = load_udf_from_payload(payload)
 
     validate_synchronous_udf_callable(udf)
+    if has_file_inputs and getattr(udf, "_vane_row_actor_adapter", False):
+        raise ValueError("vane.cls row UDFs do not support FILE inputs; use vane.func or vane.cls.batch")
 
     backend = str(payload.get("execution_backend") or "").strip().lower()
     is_actor_backend = backend in ("subprocess_actor", "ray_actor")
@@ -494,6 +497,7 @@ class UDFExecutor:
             payload,
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
+            has_file_inputs=self._file_contract.has_file_inputs,
         )
         self._bind_async_runtime()
         self._mode = self._call_mode
@@ -550,6 +554,7 @@ class UDFExecutor:
             payload,
             cache_callable=cache_callable,
             cache_max_entries=cache_max_entries,
+            has_file_inputs=self._file_contract.has_file_inputs,
         )
         self._bind_async_runtime()
 
