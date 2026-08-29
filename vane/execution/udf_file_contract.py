@@ -469,6 +469,13 @@ def _validate_nested_struct_field_sets(
             boundary=boundary,
             path=f"{path}.value",
         )
+        return
+
+    if type_id == "union" and pa.types.is_union(actual):
+        if actual.mode != "sparse":
+            raise _invalid_input(f"{boundary} UNION at {path} must use sparse Arrow storage")
+        if actual.type_codes != list(range(len(actual))):
+            raise _invalid_input(f"{boundary} UNION at {path} type codes must match child ordinals")
 
 
 def _validate_arrow_storage_type(
@@ -1164,11 +1171,15 @@ def _normalize_file_arrow_array(
         return source if source.type.equals(expected) else source.cast(expected)
 
     if type_id == "struct":
+        source = _mask_inactive(array, active)
+        if not pa.types.is_struct(source.type):
+            return source
+
         arrays = []
         fields = []
         for name, child in dtype.children:
-            field_index = _struct_field_index(array.type, name, boundary=boundary, path="column")
-            child_array = array.field(field_index)
+            field_index = _struct_field_index(source.type, name, boundary=boundary, path="column")
+            child_array = source.field(field_index)
             child_array = _normalize_file_arrow_array(
                 child_array,
                 child,
@@ -1178,10 +1189,13 @@ def _normalize_file_arrow_array(
             )
             arrays.append(child_array)
             fields.append(pa.field(name, child_array.type))
-        return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null())
+        return pa.StructArray.from_arrays(arrays, fields=fields, mask=source.is_null())
 
     if type_id == "list":
         source = _mask_inactive(array, active)
+        if not _is_arrow_list_storage(source.type):
+            return source
+
         lengths = [0 if length is None else int(length) for length in pc.list_value_length(source).to_pylist()]
         offsets = [0]
         for length in lengths:
@@ -1196,17 +1210,42 @@ def _normalize_file_arrow_array(
 
     if type_id in ("array", "tensor"):
         source = _mask_inactive(array, active)
-        if type_id == "tensor":
-            _validate_arrow_storage_type(
-                source.type,
-                dtype,
-                boundary=boundary,
-                path="column",
-            )
-        storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
+        storage = source
+        if type_id == "tensor" and isinstance(source, pa.ExtensionArray):
+            if (
+                source.type.extension_name != "arrow.fixed_shape_tensor"
+                or tuple(source.type.shape) != _tensor_shape(dtype)
+                or getattr(source.type, "permutation", None) is not None
+                or getattr(source.type, "dim_names", None) is not None
+            ):
+                return source
+            storage = source.storage
         array_size = _fixed_sequence_size(dtype)
+        child_source: Any
+        if _is_arrow_list_storage(storage.type):
+            lengths = pc.list_value_length(storage).to_pylist()
+            if any(length is not None and int(length) != array_size for length in lengths):
+                raise _invalid_input(f"{boundary} ARRAY value must have fixed size {array_size}")
+
+            flattened = pc.list_flatten(storage)
+            flattened_index = 0
+            child_indices: list[int | None] = []
+            for length in lengths:
+                if length is None:
+                    child_indices.extend([None] * array_size)
+                    continue
+                child_indices.extend(range(flattened_index, flattened_index + array_size))
+                flattened_index += int(length)
+            child_source = flattened.take(pa.array(child_indices, type=pa.int64()))
+        elif pa.types.is_fixed_size_list(storage.type):
+            if storage.type.list_size != array_size:
+                raise _invalid_input(f"{boundary} ARRAY value must have fixed size {array_size}")
+            child_source = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
+        else:
+            return source
+
         child_array = _normalize_file_arrow_array(
-            storage.values.slice(storage.offset * array_size, len(storage) * array_size),
+            child_source,
             _sequence_child(dtype),
             boundary=boundary,
             parent_active=[is_active for is_active in active for _ in range(array_size)],
@@ -1219,7 +1258,11 @@ def _normalize_file_arrow_array(
         return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
 
     if type_id == "map":
-        start, _, offsets = _child_window(array)
+        source = _mask_inactive(array, active)
+        if not pa.types.is_map(source.type):
+            return source
+
+        start, _, offsets = _child_window(source)
         children = _type_children(dtype)
         selected_indices: list[int] = []
         normalized_offsets = [0]
@@ -1228,8 +1271,8 @@ def _normalize_file_arrow_array(
                 selected_indices.extend(range(offsets[index] - start, offsets[index + 1] - start))
             normalized_offsets.append(len(selected_indices))
         selection = pa.array(selected_indices, type=pa.int64())
-        keys = array.keys.slice(start, offsets[-1] - start).take(selection)
-        items = array.items.slice(start, offsets[-1] - start).take(selection)
+        keys = source.keys.slice(start, offsets[-1] - start).take(selection)
+        items = source.items.slice(start, offsets[-1] - start).take(selection)
         keys = _normalize_file_arrow_array(
             keys,
             children["key"],
@@ -1246,7 +1289,7 @@ def _normalize_file_arrow_array(
             pa.array(normalized_offsets, type=pa.int32()),
             keys,
             items,
-            mask=array.is_null(),
+            mask=source.is_null(),
         )
 
     source = _mask_inactive(array, active)

@@ -530,10 +530,11 @@ def test_file_arrow_non_file_array_sibling_preserves_list_cast_input():
             "method_return_type": "STRUCT(document FILE, coords INTEGER[2])",
         }
     )
+    coords = pa.array([[9, 8, 7], [1, 2]], type=pa.list_(pa.int32())).slice(1, 1)
     value = pa.StructArray.from_arrays(
         [
             pa.array([_file_record()], type=_file_arrow_type()),
-            pa.array([[1, 2]], type=pa.list_(pa.int32())),
+            coords,
         ],
         names=["document", "coords"],
     )
@@ -542,6 +543,116 @@ def test_file_arrow_non_file_array_sibling_preserves_list_cast_input():
 
     assert normalized.column("payload").type.field("coords").type == pa.list_(pa.int32(), list_size=2)
     assert normalized.column("payload").to_pylist()[0]["coords"] == [1, 2]
+
+
+def test_file_arrow_non_file_array_sibling_respects_list_view_offsets():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "list-view-to-array-sibling",
+            "method_return_type": "STRUCT(document FILE, coords INTEGER[2])",
+        }
+    )
+    coords = pa.ListViewArray.from_arrays(
+        pa.array([2], type=pa.int32()),
+        pa.array([2], type=pa.int32()),
+        pa.array([9, 8, 1, 2], type=pa.int32()),
+    )
+    value = pa.StructArray.from_arrays(
+        [pa.array([_file_record()], type=_file_arrow_type()), coords],
+        names=["document", "coords"],
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": value}))
+
+    assert normalized.column("payload").to_pylist()[0]["coords"] == [1, 2]
+
+
+def test_file_arrow_non_file_array_sibling_rejects_uneven_list_rows():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "uneven-list-to-array-sibling",
+            "method_return_type": "STRUCT(document FILE, coords INTEGER[2])",
+        }
+    )
+    value = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record(), _file_record()], type=_file_arrow_type()),
+            pa.array([[1], [2, 3, 4]], type=pa.list_(pa.int32())),
+        ],
+        names=["document", "coords"],
+    )
+
+    with pytest.raises(vane.InvalidInputException, match="could not normalize its declared storage"):
+        contract.normalize_output_table(pa.table({"payload": value}))
+
+
+def test_file_arrow_non_file_map_sibling_preserves_string_cast_input():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "string-to-map-sibling",
+            "method_return_type": "STRUCT(document FILE, attrs MAP(VARCHAR, INTEGER))",
+        }
+    )
+    value = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            pa.array(["{a=1}"], type=pa.string()),
+        ],
+        names=["document", "attrs"],
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": value}))
+
+    assert normalized.column("payload").type.field("attrs").type == pa.string()
+    assert normalized.column("payload").to_pylist()[0]["attrs"] == "{a=1}"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "declared_type", "source_value"),
+    [
+        ("items", "INTEGER[]", "[1, 2]"),
+        ("meta", "STRUCT(id INTEGER)", "{'id': 1}"),
+    ],
+)
+def test_file_arrow_non_file_composite_sibling_preserves_string_cast_input(
+    field_name,
+    declared_type,
+    source_value,
+):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": f"string-to-{field_name}-sibling",
+            "method_return_type": f"STRUCT(document FILE, {field_name} {declared_type})",
+        }
+    )
+    value = pa.StructArray.from_arrays(
+        [
+            pa.array([_file_record()], type=_file_arrow_type()),
+            pa.array([source_value], type=pa.string()),
+        ],
+        names=["document", field_name],
+    )
+
+    normalized = contract.normalize_output_table(pa.table({"payload": value}))
+
+    assert normalized.column("payload").type.field(field_name).type == pa.string()
+    assert normalized.column("payload").to_pylist()[0][field_name] == source_value
 
 
 def test_scalar_file_udf_preserves_time_with_time_zone_offset():
@@ -1887,6 +1998,32 @@ def test_batch_file_udf_supports_non_file_union_sibling():
     assert choice_type.mode == "sparse"
     assert [field.name for field in choice_type] == ["s", "i"]
     assert [field.type for field in choice_type] == [pa.string(), pa.int64()]
+
+
+def test_file_arrow_non_file_union_sibling_rejects_nonordinal_type_codes():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "nonordinal-union-sibling",
+            "method_return_type": "STRUCT(document FILE, choice UNION(s VARCHAR, i BIGINT))",
+        }
+    )
+    choice = pa.UnionArray.from_sparse(
+        pa.array([1], type=pa.int8()),
+        [pa.array(["selected"]), pa.array([None], type=pa.int64())],
+        field_names=["s", "i"],
+        type_codes=[1, 0],
+    )
+    value = pa.StructArray.from_arrays(
+        [pa.array([_file_record()], type=_file_arrow_type()), choice],
+        names=["document", "choice"],
+    )
+
+    with pytest.raises(vane.InvalidInputException, match="type codes must match child ordinals"):
+        contract.normalize_output_table(pa.table({"payload": value}))
 
 
 def test_batch_file_udf_supports_sqlnull_sibling():
