@@ -407,6 +407,25 @@ def _map_array_from_offsets(
     )
 
 
+def _canonical_file_struct_storage(source: pa.StructArray, expected: pa.StructType) -> pa.StructArray:
+    """Canonicalize FILE child storage without replacing its Arrow fields."""
+    arrays = []
+    fields = []
+    changed = False
+    for index in range(len(_FILE_FIELDS)):
+        source_field = source.type.field(index)
+        child = source.field(index)
+        expected_type = expected.field(index).type
+        if not child.type.equals(expected_type):
+            child = child.cast(expected_type)
+            changed = True
+        arrays.append(child)
+        fields.append(source_field.with_type(child.type))
+    if not changed:
+        return source
+    return pa.StructArray.from_arrays(arrays, fields=fields, mask=source.is_null())
+
+
 def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
     return isinstance(dtype, getattr(pa, "BaseExtensionType", pa.ExtensionType))
 
@@ -1564,7 +1583,7 @@ def _normalize_file_arrow_array(
     if _is_file_type(dtype):
         expected = _expected_arrow_type(dtype, boundary=boundary)
         source = _mask_inactive(array, active)
-        return source if source.type.equals(expected) else source.cast(expected)
+        return _canonical_file_struct_storage(source, expected)
 
     if type_id == "struct":
         source = _mask_inactive(array, active)

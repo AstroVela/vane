@@ -876,15 +876,14 @@ def test_file_arrow_output_normalization_preserves_field_properties():
 
     from vane.execution.udf_file_contract import FileUDFContract
 
-    source_file_type = pa.struct(
-        [
-            pa.field("url", pa.large_string()),
-            pa.field("content_type", pa.large_string()),
-            pa.field("position", pa.int64()),
-            pa.field("size", pa.int64()),
-            pa.field("checksum", pa.large_string()),
-        ]
-    )
+    source_file_fields = [
+        pa.field("url", pa.large_string(), nullable=False, metadata={b"file-url": b"preserved"}),
+        pa.field("content_type", pa.large_string(), nullable=False, metadata={b"file-type": b"preserved"}),
+        pa.field("position", pa.int64(), nullable=False, metadata={b"file-position": b"preserved"}),
+        pa.field("size", pa.int64(), nullable=False, metadata={b"file-size": b"preserved"}),
+        pa.field("checksum", pa.large_string(), nullable=False, metadata={b"file-checksum": b"preserved"}),
+    ]
+    source_file_type = pa.struct(source_file_fields)
     files = pa.array([_file_record()], type=source_file_type)
     documents = pa.ListArray.from_arrays(
         pa.array([0, 1], type=pa.int32()),
@@ -938,19 +937,16 @@ def test_file_arrow_output_normalization_preserves_field_properties():
         field = payload_type.field(name)
         assert not field.nullable
         assert field.metadata == {name.encode(): b"preserved"}
-    assert payload_type.field("document").type == _file_arrow_type()
 
     list_field = payload_type.field("documents").type.value_field
     assert list_field.name == "document_item"
     assert not list_field.nullable
     assert list_field.metadata == {b"list-item": b"preserved"}
-    assert list_field.type == _file_arrow_type()
 
     fixed_field = payload_type.field("fixed").type.value_field
     assert fixed_field.name == "fixed_item"
     assert not fixed_field.nullable
     assert fixed_field.metadata == {b"fixed-item": b"preserved"}
-    assert fixed_field.type == _file_arrow_type()
 
     map_type = payload_type.field("lookup").type
     assert map_type.keys_sorted
@@ -958,7 +954,21 @@ def test_file_arrow_output_normalization_preserves_field_properties():
     assert map_type.key_field.metadata == {b"map-key": b"preserved"}
     assert map_type.item_field.name == "lookup_value"
     assert map_type.item_field.metadata == {b"map-value": b"preserved"}
-    assert map_type.item_field.type == _file_arrow_type()
+
+    normalized_file_types = [
+        payload_type.field("document").type,
+        list_field.type,
+        fixed_field.type,
+        map_type.item_field.type,
+    ]
+    for normalized_file_type in normalized_file_types:
+        for index, source_field in enumerate(source_file_fields):
+            normalized_file_field = normalized_file_type.field(index)
+            assert normalized_file_field.name == source_field.name
+            assert normalized_file_field.nullable == source_field.nullable
+            assert normalized_file_field.metadata == source_field.metadata
+            expected_type = pa.string() if source_field.name in ("url", "content_type", "checksum") else pa.int64()
+            assert normalized_file_field.type == expected_type
 
 
 def test_file_tensor_normalization_uses_canonical_extension_storage():
@@ -966,15 +976,14 @@ def test_file_tensor_normalization_uses_canonical_extension_storage():
 
     from vane.execution.udf_file_contract import FileUDFContract
 
-    source_file_type = pa.struct(
-        [
-            pa.field("url", pa.large_string()),
-            pa.field("content_type", pa.large_string()),
-            pa.field("position", pa.int64()),
-            pa.field("size", pa.int64()),
-            pa.field("checksum", pa.large_string()),
-        ]
-    )
+    source_file_fields = [
+        pa.field("url", pa.large_string(), nullable=False, metadata={b"file-url": b"preserved"}),
+        pa.field("content_type", pa.large_string(), metadata={b"file-type": b"preserved"}),
+        pa.field("position", pa.int64(), metadata={b"file-position": b"preserved"}),
+        pa.field("size", pa.int64(), metadata={b"file-size": b"preserved"}),
+        pa.field("checksum", pa.large_string(), metadata={b"file-checksum": b"preserved"}),
+    ]
+    source_file_type = pa.struct(source_file_fields)
     files = pa.array(
         [_file_record(url="memory://first"), _file_record(url="memory://second")],
         type=source_file_type,
@@ -1006,7 +1015,17 @@ def test_file_tensor_normalization_uses_canonical_extension_storage():
     assert not field.nullable
     assert field.metadata == {b"field": b"preserved"}
     assert normalized.schema.metadata == {b"schema": b"preserved"}
-    assert field.type == pa.fixed_shape_tensor(_file_arrow_type(), (2,))
+    assert field.type.extension_name == "arrow.fixed_shape_tensor"
+    assert tuple(field.type.shape) == (2,)
+    assert field.type.storage_type.value_field.name == "item"
+    normalized_file_type = field.type.storage_type.value_type
+    for index, source_field in enumerate(source_file_fields):
+        normalized_file_field = normalized_file_type.field(index)
+        assert normalized_file_field.name == source_field.name
+        assert normalized_file_field.nullable == source_field.nullable
+        assert normalized_file_field.metadata == source_field.metadata
+        expected_type = pa.string() if source_field.name in ("url", "content_type", "checksum") else pa.int64()
+        assert normalized_file_field.type == expected_type
     assert normalized.column("documents").to_pylist() == [
         [_file_record(url="memory://first"), _file_record(url="memory://second")]
     ]
