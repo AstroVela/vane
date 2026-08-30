@@ -223,6 +223,7 @@ include = [
     "/scripts/resolve_duckdb_fork_version.py",
     "/scripts/sync_duckdb_source_id.py",
     "/scripts/sync_vcpkg_licenses.py",
+    "/scripts/validate_testpypi_candidate.py",
     "/scripts/verify_base_install.py",
     "/scripts/verify_duckdb_coexistence.py",
     "/scripts/verify_extension_wheel.py",

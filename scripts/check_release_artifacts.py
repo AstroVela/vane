@@ -767,6 +767,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "scripts/run_installed_pytest.sh",
         "scripts/run_release_tests.sh",
         "scripts/sync_duckdb_source_id.py",
+        "scripts/validate_testpypi_candidate.py",
         "scripts/verify_duckdb_coexistence.py",
         "scripts/verify_extension_wheel.py",
         "tests/ray_test_profile.py",
