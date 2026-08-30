@@ -11,8 +11,11 @@ import pytest
 from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai.providers._mime import ImageMimePolicy, detect_image_mime_type
 from vane.ai.providers.anthropic import _IMAGE_MIME_POLICY as _ANTHROPIC_IMAGE_MIME_POLICY
+from vane.ai.providers.anthropic import AnthropicPrompterDescriptor
 from vane.ai.providers.google import _IMAGE_MIME_POLICY as _GOOGLE_IMAGE_MIME_POLICY
+from vane.ai.providers.google import GooglePrompterDescriptor
 from vane.ai.providers.openai import _IMAGE_MIME_POLICY as _OPENAI_IMAGE_MIME_POLICY
+from vane.ai.providers.openai import OpenAIPrompterDescriptor
 
 
 def _ftyp(
@@ -276,6 +279,16 @@ def test_provider_image_mime_policy_matches_documented_formats(
         else:
             with pytest.raises(ValueError, match=f"not supported by {policy.provider_name}"):
                 policy.require_supported(data)
+
+
+def test_provider_descriptors_expose_only_closed_file_mime_policies():
+    openai = OpenAIPrompterDescriptor()
+    anthropic = AnthropicPrompterDescriptor(model_name="claude-test", options={"max_tokens": 1})
+    google = GooglePrompterDescriptor(model_name="gemini-test")
+
+    assert openai.supported_media_mime_types() == _OPENAI_IMAGE_MIME_POLICY.supported_mime_types
+    assert anthropic.supported_media_mime_types() == _ANTHROPIC_IMAGE_MIME_POLICY.supported_mime_types
+    assert google.supported_media_mime_types() is None
 
 
 @pytest.mark.parametrize(

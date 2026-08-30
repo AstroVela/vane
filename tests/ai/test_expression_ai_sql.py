@@ -1524,6 +1524,9 @@ def test_ai_sql_helper_builds_prompt_specs_without_execution():
         "image/webp",
     ]
 
+    google_file_spec = build_ai_prompt_sql_spec("google", model="gemini-test", input_kind="file")
+    assert google_file_spec["supported_media_mime_types"] == []
+
 
 def test_ai_sql_helper_builds_closed_native_vllm_spec():
     from vane.ai._sql import build_ai_prompt_sql_spec

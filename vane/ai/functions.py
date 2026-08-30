@@ -1870,7 +1870,7 @@ _PROMPT_PACKED_INPUT_COLUMN = "__vane_prompt_messages"
 
 
 def _supported_prompt_media_mime_types(descriptor: Any) -> tuple[str, ...]:
-    """Return the normalized, deterministic native FILE media allowlist."""
+    """Return the normalized closed FILE allowlist; empty defers MIME policy to the provider."""
     values = descriptor.supported_media_mime_types()
     if values is None:
         return ()

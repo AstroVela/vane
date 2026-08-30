@@ -568,8 +568,10 @@ class GooglePrompterDescriptor(PrompterDescriptor):
     def get_options(self) -> Options:
         return dict(self.options)
 
-    def supported_media_mime_types(self) -> frozenset[str]:
-        return _IMAGE_MIME_POLICY.supported_mime_types
+    def supported_media_mime_types(self) -> None:
+        # FILE inputs also include audio, video, and documents. Google's
+        # effective set varies by model, so the SDK/provider owns validation.
+        return None
 
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)

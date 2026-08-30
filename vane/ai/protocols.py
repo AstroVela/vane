@@ -67,7 +67,7 @@ class PrompterDescriptor(Descriptor["Prompter"]):
         return True
 
     def supported_media_mime_types(self) -> frozenset[str] | None:
-        """Return a non-empty Prompt MIME allowlist, or ``None`` to allow any valid MIME."""
+        """Return a closed Prompt MIME allowlist, or ``None`` when support is provider/model-dynamic."""
         return None
 
 
