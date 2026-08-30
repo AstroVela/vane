@@ -768,6 +768,34 @@ def test_ai_prompt_sql_named_untyped_null_file_selects_exact_overload(file_argum
     assert rows == [("topic:describe",)]
 
 
+@pytest.mark.parametrize(
+    ("type_sql", "file_argument"),
+    [
+        (
+            "CREATE TYPE __VANE_AI_PROMPT_NULL_FILE AS TIMESTAMP",
+            "file := TIMESTAMP '2026-01-01'::__VANE_AI_PROMPT_NULL_FILE",
+        ),
+        (
+            "CREATE TYPE __VANE_AI_PROMPT_NULL_FILES AS TIMESTAMP_MS",
+            "files := TIMESTAMP '2026-01-01'::__VANE_AI_PROMPT_NULL_FILES",
+        ),
+        (
+            "CREATE TYPE __VANE_AI_PROMPT_EMPTY_FILE_ELEMENT AS TIMESTAMP_NS",
+            "files := [TIMESTAMP '2026-01-01'::__VANE_AI_PROMPT_EMPTY_FILE_ELEMENT]",
+        ),
+    ],
+)
+def test_ai_prompt_sql_rejects_nonempty_values_forging_file_fallback_aliases(type_sql, file_argument):
+    connection = vane.connect()
+    connection.execute(type_sql)
+
+    # Primitive CREATE TYPE aliases are currently stripped before macro
+    # overload resolution, while the hidden binder independently validates any
+    # exact sentinel value that reaches it. Either boundary must reject data.
+    with pytest.raises(vane.BinderException, match="does not support|only accepts"):
+        connection.sql(f"SELECT ai_prompt('describe', {file_argument}, provider := 'mock_ai_sql')")
+
+
 @pytest.mark.parametrize("media_argument", ["NULL", "[]"])
 def test_ai_prompt_sql_untyped_positional_media_keeps_blob_overload_unambiguous(media_argument):
     rows = (

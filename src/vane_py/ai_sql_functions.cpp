@@ -263,6 +263,23 @@ static bool IsPromptNullFilesSentinel(const LogicalType &type) {
 	return type == PromptNullFilesSentinelType() || type == PromptEmptyFilesSentinelType();
 }
 
+static void ValidatePromptFileSentinel(ClientContext &context, Expression &expression) {
+	if (expression.HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	if (!expression.IsFoldable()) {
+		throw BinderException("ai_prompt FILE fallback only accepts a foldable NULL or empty list");
+	}
+	auto value = ExpressionExecutor::EvaluateScalar(context, expression);
+	if (expression.return_type == PromptEmptyFilesSentinelType()) {
+		if (value.IsNull() || !ListValue::GetChildren(value).empty()) {
+			throw BinderException("ai_prompt FILE-list fallback only accepts an empty list");
+		}
+	} else if (!value.IsNull()) {
+		throw BinderException("ai_prompt FILE fallback only accepts NULL");
+	}
+}
+
 struct MaterializedPromptFileInput {
 	Value value;
 	bool has_error;
@@ -819,8 +836,10 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		} else if (IsPromptFileList(media_type)) {
 			prompt_input_kind = PromptInputKind::FILE_LIST;
 		} else if (IsPromptNullFileSentinel(media_type)) {
+			ValidatePromptFileSentinel(context, *arguments[1]);
 			prompt_input_kind = PromptInputKind::FILE;
 		} else if (IsPromptNullFilesSentinel(media_type)) {
+			ValidatePromptFileSentinel(context, *arguments[1]);
 			prompt_input_kind = PromptInputKind::FILE_LIST;
 		} else {
 			throw BinderException("ai_prompt media argument must be BLOB, BLOB[], FILE, or FILE[]");

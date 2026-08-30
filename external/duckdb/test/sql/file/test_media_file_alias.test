@@ -171,6 +171,25 @@ LIMIT 1
 ----
 VIDEOFILE
 
+# Internal CSV formatting preserves FILE-family export without admitting a
+# user-visible FILE-to-VARCHAR cast, including for nested values.
+statement ok
+COPY (
+	SELECT
+		file('generic.csv', NULL, NULL, NULL, NULL) AS generic_file,
+		image_file('image.png') AS image_file,
+		[audio_file('audio.mp3')] AS audio_files
+) TO '__TEST_DIR__/media_files.csv' (FORMAT CSV, HEADER)
+
+query III
+SELECT
+	contains(generic_file, 'generic.csv'),
+	contains(image_file, 'image.png'),
+	contains(audio_files, 'audio.mp3')
+FROM read_csv('__TEST_DIR__/media_files.csv', header = TRUE, all_varchar = TRUE)
+----
+true	true	true
+
 # Generic FILE-family functions accept all specializations. Value-returning
 # enrichment preserves its input alias, while identity functions compare
 # family members explicitly.
