@@ -254,6 +254,33 @@ def test_media_file_constructor_accepts_bound_string_parameter(duckdb_cursor):
     assert row == (vane.ImageFile("memory://parameter"),)
 
 
+def test_file_family_values_render_in_relation_boxes(duckdb_cursor, capsys):
+    query = """
+        SELECT
+            file('generic-' || i, NULL, NULL, NULL, NULL) AS generic_file,
+            image_file('image-' || i) AS image_file,
+            [audio_file('audio-' || i)] AS nested_audio_files
+        FROM range(3) AS source(i)
+    """
+
+    rendered = str(duckdb_cursor.sql(query))
+    assert "generic-0" in rendered
+    assert "generic-2" in rendered
+    assert "image-0" in rendered
+    assert "image-2" in rendered
+    assert "audio-0" in rendered
+    assert "audio-2" in rendered
+
+    duckdb_cursor.sql(query).show(max_rows=2)
+    shown = capsys.readouterr().out
+    assert "generic-0" in shown
+    assert "generic-2" in shown
+    assert "image-0" in shown
+    assert "image-2" in shown
+    assert "audio-0" in shown
+    assert "audio-2" in shown
+
+
 def test_media_file_expression_and_generic_file_functions(duckdb_cursor):
     image = vane.ImageFile("memory://image.png", "image/png", 2, 4, "sha256:image")
     row = duckdb_cursor.sql(
