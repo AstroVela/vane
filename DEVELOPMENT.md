@@ -345,6 +345,14 @@ Python 3.12 wheel used to build the test artifact explicitly enables
 `VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY`; the option is off by default and must
 never be enabled for release artifacts.
 
+No-tag TestPyPI development candidates instead enable
+`VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY`. That key is independent of the
+public integration-test key; official artifacts enable it only in
+`testpypi-dev` base wheels. It must never be enabled for a tagged release or
+build-only qualification. Its private key belongs only in the protected
+provider-publishing environment; source, logs, workflow artifacts, and Vane's
+release environments contain only the public key.
+
 ## Native C++ tests
 
 The complete native gate builds DuckDB, distributed exchange, and the test

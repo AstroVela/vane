@@ -217,6 +217,8 @@ option(FORCE_WARN_UNUSED "Unused code objects lead to compiler warnings." FALSE)
 option(ENABLE_EXTENSION_AUTOLOADING "Enable extension auto-loading by default." FALSE)
 option(ENABLE_EXTENSION_AUTOINSTALL "Enable extension auto-installing by default." FALSE)
 option(EXTENSION_TESTS_ONLY "Only load the tests for extensions, don't actually build them; useful for testing loadable extensions" FALSE)
+option(VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY
+       "Trust AstroVela's candidate-only TestPyPI extension signing key." FALSE)
 option(VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY
        "Trust DuckDB's committed test key for Vane integration fixtures." FALSE)
 set(EXTENSION_DIRECTORIES "~/.duckdb/extensions" CACHE STRING "Default extension directories (;-separated list on win, : on unix)")
