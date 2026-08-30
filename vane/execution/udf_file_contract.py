@@ -339,11 +339,72 @@ def _list_array_from_offsets(
     *,
     mask: Any,
     force_large: bool = False,
+    value_field: pa.Field | None = None,
 ) -> Any:
     use_large = force_large or offsets[-1] > _ARROW_LIST_OFFSET_MAX
     offset_type = pa.int64() if use_large else pa.int32()
     constructor = pa.LargeListArray.from_arrays if use_large else pa.ListArray.from_arrays
-    return constructor(pa.array(offsets, type=offset_type), values, mask=mask)
+    target_type = None
+    if value_field is not None:
+        normalized_field = value_field.with_type(values.type)
+        target_type = pa.large_list(normalized_field) if use_large else pa.list_(normalized_field)
+    return constructor(pa.array(offsets, type=offset_type), values, type=target_type, mask=mask)
+
+
+def _null_bitmap_from_mask(mask: Any) -> tuple[Any | None, int]:
+    nulls = [bool(value) for value in mask.to_pylist()]
+    null_count = sum(nulls)
+    if not null_count:
+        return None, 0
+    validity = pa.array([not is_null for is_null in nulls], type=pa.bool_())
+    return validity.buffers()[1], null_count
+
+
+def _fixed_size_list_array(
+    values: Any,
+    list_size: int,
+    *,
+    mask: Any,
+    value_field: pa.Field | None = None,
+) -> Any:
+    # PyArrow 14 has no mask argument on FixedSizeListArray.from_arrays.
+    # Build the exact field-bearing type from its validity and child buffers.
+    normalized_field = pa.field("item", values.type) if value_field is None else value_field.with_type(values.type)
+    target_type = pa.list_(normalized_field, list_size=list_size)
+    null_bitmap, null_count = _null_bitmap_from_mask(mask)
+    return pa.Array.from_buffers(
+        target_type,
+        len(mask),
+        [null_bitmap],
+        null_count=null_count,
+        children=[values],
+    )
+
+
+def _map_array_from_offsets(
+    offsets: Sequence[int],
+    keys: Any,
+    items: Any,
+    *,
+    mask: Any,
+    map_type: pa.MapType | None = None,
+) -> Any:
+    # PyArrow 14 has neither type nor mask arguments on MapArray.from_arrays.
+    # The buffer constructor preserves both the parent validity and child fields.
+    target_type = pa.map_(keys.type, items.type) if map_type is None else map_type
+    entries = pa.StructArray.from_arrays(
+        [keys, items],
+        fields=[target_type.key_field, target_type.item_field],
+    )
+    offset_array = pa.array(offsets, type=pa.int32())
+    null_bitmap, null_count = _null_bitmap_from_mask(mask)
+    return pa.Array.from_buffers(
+        target_type,
+        len(mask),
+        [null_bitmap, offset_array.buffers()[1]],
+        null_count=null_count,
+        children=[entries],
+    )
 
 
 def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
@@ -413,12 +474,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
                 continue
             arrays[field_index] = annotated
             field = fields[field_index]
-            fields[field_index] = pa.field(
-                field.name,
-                annotated.type,
-                nullable=field.nullable,
-                metadata=field.metadata,
-            )
+            fields[field_index] = field.with_type(annotated.type)
             changed = True
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null()) if changed else array
 
@@ -437,19 +493,35 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
             if annotated.type.equals(values.type):
                 return array
             normalized_offsets = pa.array([offset - start for offset in offsets], type=offset_type)
-            return constructor(normalized_offsets, annotated, mask=array.is_null())
+            normalized_field = array.type.value_field.with_type(annotated.type)
+            normalized_type = (
+                pa.large_list(normalized_field) if pa.types.is_large_list(array.type) else pa.list_(normalized_field)
+            )
+            return constructor(normalized_offsets, annotated, type=normalized_type, mask=array.is_null())
         is_list_view = getattr(pa.types, "is_list_view", None)
         if callable(is_list_view) and is_list_view(array.type):
             values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
             if values.type.equals(array.values.type):
                 return array
-            return pa.ListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
+            return pa.ListViewArray.from_arrays(
+                array.offsets,
+                array.sizes,
+                values,
+                type=pa.list_view(array.type.value_field.with_type(values.type)),
+                mask=array.is_null(),
+            )
         is_large_list_view = getattr(pa.types, "is_large_list_view", None)
         if callable(is_large_list_view) and is_large_list_view(array.type):
             values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
             if values.type.equals(array.values.type):
                 return array
-            return pa.LargeListViewArray.from_arrays(array.offsets, array.sizes, values, mask=array.is_null())
+            return pa.LargeListViewArray.from_arrays(
+                array.offsets,
+                array.sizes,
+                values,
+                type=pa.large_list_view(array.type.value_field.with_type(values.type)),
+                mask=array.is_null(),
+            )
         return array
 
     if type_id in ("array", "tensor"):
@@ -459,14 +531,20 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
         annotated = _annotate_duckdb_bit_input(values, _sequence_child(dtype), boundary=boundary)
         if annotated.type.equals(values.type):
             return array
-        normalized_storage = pa.FixedSizeListArray.from_arrays(
+        if type_id == "array":
+            return _fixed_size_list_array(
+                annotated,
+                array_size,
+                mask=storage.is_null(),
+                value_field=storage.type.value_field,
+            )
+        tensor_type = pa.fixed_shape_tensor(annotated.type, _tensor_shape(dtype))
+        normalized_storage = _fixed_size_list_array(
             annotated,
             array_size,
             mask=storage.is_null(),
+            value_field=tensor_type.storage_type.value_field,
         )
-        if type_id == "array":
-            return normalized_storage
-        tensor_type = pa.fixed_shape_tensor(annotated.type, _tensor_shape(dtype))
         return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
 
     if type_id == "map":
@@ -486,8 +564,19 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
         )
         if keys.type.equals(source_keys.type) and items.type.equals(source_items.type):
             return array
-        normalized_offsets = pa.array([offset - start for offset in offsets], type=pa.int32())
-        return pa.MapArray.from_arrays(normalized_offsets, keys, items, mask=array.is_null())
+        normalized_offsets = [offset - start for offset in offsets]
+        normalized_type = pa.map_(
+            array.type.key_field.with_type(keys.type),
+            array.type.item_field.with_type(items.type),
+            keys_sorted=array.type.keys_sorted,
+        )
+        return _map_array_from_offsets(
+            normalized_offsets,
+            keys,
+            items,
+            mask=array.is_null(),
+            map_type=normalized_type,
+        )
 
     return array
 
@@ -1214,7 +1303,7 @@ def _canonical_values_to_arrow_array(
         for value in values:
             flattened.extend([None] * array_size if value is None else value)
         child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
-        storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=null_mask)
+        storage = _fixed_size_list_array(child_array, array_size, mask=null_mask)
         if type_id == "array":
             return storage
         tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
@@ -1233,8 +1322,8 @@ def _canonical_values_to_arrow_array(
         children = _type_children(dtype)
         key_array = _canonical_values_to_arrow_array(keys, children["key"], boundary=boundary)
         item_array = _canonical_values_to_arrow_array(items, children["value"], boundary=boundary)
-        return pa.MapArray.from_arrays(
-            pa.array(offsets, type=pa.int32()),
+        return _map_array_from_offsets(
+            offsets,
             key_array,
             item_array,
             mask=null_mask,
@@ -1486,6 +1575,7 @@ def _normalize_file_arrow_array(
         fields = []
         for child_index, (name, child) in enumerate(dtype.children):
             field_index = _struct_field_index(source.type, name, boundary=boundary, path="column")
+            source_field = source.type.field(field_index)
             child_array = source.field(field_index)
             child_array = _normalize_file_arrow_array(
                 child_array,
@@ -1497,7 +1587,7 @@ def _normalize_file_arrow_array(
                 logical_path=(*logical_path, child_index),
             )
             arrays.append(child_array)
-            fields.append(pa.field(name, child_array.type))
+            fields.append(source_field.with_name(name).with_type(child_array.type))
         return pa.StructArray.from_arrays(arrays, fields=fields, mask=source.is_null())
 
     if type_id == "list":
@@ -1523,6 +1613,7 @@ def _normalize_file_arrow_array(
             child_array,
             mask=source.is_null(),
             force_large=force_large or logical_path in force_large_list_paths,
+            value_field=source.type.value_field,
         )
 
     if type_id in ("array", "tensor"):
@@ -1551,10 +1642,20 @@ def _normalize_file_arrow_array(
             force_large_list_paths=force_large_list_paths,
             logical_path=(*logical_path, 0),
         )
-        normalized_storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=source.is_null())
         if type_id == "array":
-            return normalized_storage
+            return _fixed_size_list_array(
+                child_array,
+                array_size,
+                mask=source.is_null(),
+                value_field=storage.type.value_field,
+            )
         tensor_type = pa.fixed_shape_tensor(child_array.type, _tensor_shape(dtype))
+        normalized_storage = _fixed_size_list_array(
+            child_array,
+            array_size,
+            mask=source.is_null(),
+            value_field=tensor_type.storage_type.value_field,
+        )
         return pa.ExtensionArray.from_storage(tensor_type, normalized_storage)
 
     if type_id == "map":
@@ -1589,11 +1690,17 @@ def _normalize_file_arrow_array(
             force_large_list_paths=force_large_list_paths,
             logical_path=(*logical_path, 1),
         )
-        return pa.MapArray.from_arrays(
-            pa.array(normalized_offsets, type=pa.int32()),
+        normalized_map_type = pa.map_(
+            source.type.key_field.with_type(keys.type),
+            source.type.item_field.with_type(items.type),
+            keys_sorted=source.type.keys_sorted,
+        )
+        return _map_array_from_offsets(
+            normalized_offsets,
             keys,
             items,
             mask=source.is_null(),
+            map_type=normalized_map_type,
         )
 
     source = _mask_inactive(array, active)
@@ -1816,13 +1923,7 @@ class FileUDFContract:
             if annotated.type.equals(columns[index].type):
                 continue
             columns[index] = annotated
-            field = fields[index]
-            fields[index] = pa.field(
-                field.name,
-                annotated.type,
-                nullable=field.nullable,
-                metadata=field.metadata,
-            )
+            fields[index] = fields[index].with_type(annotated.type)
             changed = True
 
         if not changed:
@@ -1990,7 +2091,7 @@ class FileUDFContract:
                 )
             except Exception:
                 raise _invalid_input(f"{boundary} column {index} could not normalize its declared storage") from None
-            normalized_field = pa.field(fields[index].name, normalized.type)
+            normalized_field = fields[index].with_type(normalized.type)
             if normalized.type.equals(columns[index].type) and fields[index].equals(
                 normalized_field, check_metadata=True
             ):

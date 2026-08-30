@@ -871,6 +871,147 @@ def test_file_list_normalization_accepts_fixed_size_list_storage():
     assert normalized.to_pylist() == [records]
 
 
+def test_file_arrow_output_normalization_preserves_field_properties():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    source_file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+    files = pa.array([_file_record()], type=source_file_type)
+    documents = pa.ListArray.from_arrays(
+        pa.array([0, 1], type=pa.int32()),
+        files,
+        type=pa.list_(
+            pa.field("document_item", source_file_type, nullable=False, metadata={b"list-item": b"preserved"})
+        ),
+    )
+    fixed = pa.FixedSizeListArray.from_arrays(
+        files,
+        type=pa.list_(
+            pa.field("fixed_item", source_file_type, nullable=False, metadata={b"fixed-item": b"preserved"}),
+            list_size=1,
+        ),
+    )
+    lookup_type = pa.map_(
+        pa.field("lookup_key", pa.string(), nullable=False, metadata={b"map-key": b"preserved"}),
+        pa.field("lookup_value", source_file_type, metadata={b"map-value": b"preserved"}),
+        keys_sorted=True,
+    )
+    lookup = pa.array([[("document", _file_record())]], type=lookup_type)
+    payload_fields = [
+        pa.field("document", source_file_type, nullable=False, metadata={b"document": b"preserved"}),
+        pa.field("documents", documents.type, nullable=False, metadata={b"documents": b"preserved"}),
+        pa.field("fixed", fixed.type, nullable=False, metadata={b"fixed": b"preserved"}),
+        pa.field("lookup", lookup.type, nullable=False, metadata={b"lookup": b"preserved"}),
+    ]
+    payload = pa.StructArray.from_arrays([files, documents, fixed, lookup], fields=payload_fields)
+    table = pa.Table.from_arrays(
+        [payload],
+        schema=pa.schema(
+            [pa.field("payload", payload.type, nullable=False, metadata={b"top-field": b"preserved"})],
+            metadata={b"schema": b"preserved"},
+        ),
+    )
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "field-properties",
+            "method_return_type": ("STRUCT(document FILE, documents FILE[], fixed FILE[1], lookup MAP(VARCHAR, FILE))"),
+        }
+    )
+
+    normalized = contract.normalize_output_table(table)
+
+    top_field = normalized.schema.field("payload")
+    assert not top_field.nullable
+    assert top_field.metadata == {b"top-field": b"preserved"}
+    assert normalized.schema.metadata == {b"schema": b"preserved"}
+    payload_type = top_field.type
+    for name in ("document", "documents", "fixed", "lookup"):
+        field = payload_type.field(name)
+        assert not field.nullable
+        assert field.metadata == {name.encode(): b"preserved"}
+    assert payload_type.field("document").type == _file_arrow_type()
+
+    list_field = payload_type.field("documents").type.value_field
+    assert list_field.name == "document_item"
+    assert not list_field.nullable
+    assert list_field.metadata == {b"list-item": b"preserved"}
+    assert list_field.type == _file_arrow_type()
+
+    fixed_field = payload_type.field("fixed").type.value_field
+    assert fixed_field.name == "fixed_item"
+    assert not fixed_field.nullable
+    assert fixed_field.metadata == {b"fixed-item": b"preserved"}
+    assert fixed_field.type == _file_arrow_type()
+
+    map_type = payload_type.field("lookup").type
+    assert map_type.keys_sorted
+    assert map_type.key_field.name == "lookup_key"
+    assert map_type.key_field.metadata == {b"map-key": b"preserved"}
+    assert map_type.item_field.name == "lookup_value"
+    assert map_type.item_field.metadata == {b"map-value": b"preserved"}
+    assert map_type.item_field.type == _file_arrow_type()
+
+
+def test_file_tensor_normalization_uses_canonical_extension_storage():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    source_file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+    files = pa.array(
+        [_file_record(url="memory://first"), _file_record(url="memory://second")],
+        type=source_file_type,
+    )
+    storage = pa.FixedSizeListArray.from_arrays(
+        files,
+        type=pa.list_(
+            pa.field("custom_item", source_file_type, nullable=False, metadata={b"item": b"source"}),
+            list_size=2,
+        ),
+    )
+    table = pa.Table.from_arrays(
+        [storage],
+        schema=pa.schema(
+            [pa.field("documents", storage.type, nullable=False, metadata={b"field": b"preserved"})],
+            metadata={b"schema": b"preserved"},
+        ),
+    )
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "tensor-storage",
+            "method_return_type": "TENSOR(FILE, [2])",
+        }
+    )
+
+    normalized = contract.normalize_output_table(table)
+
+    field = normalized.schema.field("documents")
+    assert not field.nullable
+    assert field.metadata == {b"field": b"preserved"}
+    assert normalized.schema.metadata == {b"schema": b"preserved"}
+    assert field.type == pa.fixed_shape_tensor(_file_arrow_type(), (2,))
+    assert normalized.column("documents").to_pylist() == [
+        [_file_record(url="memory://first"), _file_record(url="memory://second")]
+    ]
+
+
 def test_file_arrow_non_file_map_sibling_preserves_string_cast_input():
     import pyarrow as pa
 
@@ -2568,13 +2709,33 @@ def test_file_contract_marks_sliced_nested_bit_inputs():
     from vane.execution.udf_file_contract import FileUDFContract
 
     bit_storage = pa.array([b"\x01\xab"] * 4, type=pa.binary())
-    flags = pa.ListArray.from_arrays(pa.array([0, 2, 4], type=pa.int32()), bit_storage)
-    fixed = pa.FixedSizeListArray.from_arrays(bit_storage, 2)
-    lookup = pa.MapArray.from_arrays(
-        pa.array([0, 1, 2], type=pa.int32()),
-        pa.array(["first", "second"]),
-        bit_storage.slice(0, 2),
+    flags = pa.ListArray.from_arrays(
+        pa.array([0, 2, 4], type=pa.int32()),
+        bit_storage,
+        type=pa.list_(pa.field("flag", pa.binary(), nullable=False, metadata={b"flag-item": b"preserved"})),
     )
+    fixed = pa.FixedSizeListArray.from_arrays(
+        bit_storage,
+        type=pa.list_(
+            pa.field("fixed_flag", pa.binary(), nullable=False, metadata={b"fixed-item": b"preserved"}),
+            list_size=2,
+        ),
+    )
+    lookup_type = pa.map_(
+        pa.field("lookup_key", pa.string(), nullable=False, metadata={b"map-key": b"preserved"}),
+        pa.field("lookup_value", pa.binary(), metadata={b"map-value": b"preserved"}),
+        keys_sorted=True,
+    )
+    lookup = pa.array(
+        [[("first", b"\x01\xab")], [("second", b"\x01\xab")]],
+        type=lookup_type,
+    )
+    payload_fields = [
+        pa.field("document", _file_arrow_type()),
+        pa.field("flags", flags.type, nullable=False, metadata={b"flags": b"preserved"}),
+        pa.field("fixed", fixed.type, nullable=False, metadata={b"fixed": b"preserved"}),
+        pa.field("lookup", lookup.type, nullable=False, metadata={b"lookup": b"preserved"}),
+    ]
     payload = pa.StructArray.from_arrays(
         [
             pa.array(
@@ -2584,7 +2745,7 @@ def test_file_contract_marks_sliced_nested_bit_inputs():
             fixed,
             lookup,
         ],
-        names=["document", "flags", "fixed", "lookup"],
+        fields=payload_fields,
     )
     contract = FileUDFContract.from_payload(
         {
@@ -2600,6 +2761,16 @@ def test_file_contract_marks_sliced_nested_bit_inputs():
         assert child.type.extension_name == "arrow.opaque"
         assert child.type.type_name == "bit"
         assert child.type.vendor_name == "DuckDB"
+    for name in ("flags", "fixed", "lookup"):
+        field = prepared.type.field(name)
+        assert not field.nullable
+        assert field.metadata == {name.encode(): b"preserved"}
+    assert prepared.type.field("flags").type.value_field.metadata == {b"flag-item": b"preserved"}
+    assert prepared.type.field("fixed").type.value_field.metadata == {b"fixed-item": b"preserved"}
+    prepared_map = prepared.type.field("lookup").type
+    assert prepared_map.keys_sorted
+    assert prepared_map.key_field.metadata == {b"map-key": b"preserved"}
+    assert prepared_map.item_field.metadata == {b"map-value": b"preserved"}
     assert contract.materialize_scalar_inputs(sliced) == [
         [
             {
