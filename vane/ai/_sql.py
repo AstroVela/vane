@@ -16,6 +16,7 @@ from vane.ai.functions import (
     _gpus_or_zero,
     _prepare_embed_call,
     _prepare_prompt_call,
+    _PROMPT_PACKED_INPUT_COLUMN,
     _PromptBatch,
     _resolve_ai_batch_size,
     _ValidateStructuredOutputBatch,
@@ -134,6 +135,7 @@ def build_ai_prompt_sql_spec(
         raise ValueError(f"AI_PROMPT input_kind must be one of: {allowed}")
     media_input = input_kind != "text"
     blob_input = input_kind in {"blob", "blob_list"}
+    file_input = input_kind in {"file", "file_list"}
     opts = _normalize_sql_options(options)
     if isinstance(return_format, str):
         try:
@@ -208,10 +210,11 @@ def build_ai_prompt_sql_spec(
             "does not support Prompt image inputs"
         )
 
-    input_names = ["message_0", "message_1"] if media_input else ["message_0"]
+    message_columns = ["message_0", "message_1"] if media_input else ["message_0"]
+    packed_input_column = _PROMPT_PACKED_INPUT_COLUMN if file_input else None
     wrapper = _PromptBatch(
         descriptor,
-        input_names,
+        message_columns,
         "response",
         udf_opts.max_concurrency_per_actor,
         single_message=True,
@@ -220,6 +223,7 @@ def build_ai_prompt_sql_spec(
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
         supports_media_inputs=supports_media_inputs,
+        packed_input_column=packed_input_column,
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
@@ -231,7 +235,7 @@ def build_ai_prompt_sql_spec(
         "return_type": (
             structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
         ),
-        "input_names": input_names,
+        "input_names": [packed_input_column] if packed_input_column is not None else message_columns,
         "schema": {"response": "VARCHAR"},
         "batch_size": _resolve_ai_batch_size(udf_opts),
         "row_preserving": True,

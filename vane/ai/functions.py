@@ -1103,12 +1103,16 @@ class _PromptBatch:
         max_retries: int = 3,
         on_error: _OnError = "raise",
         supports_media_inputs: bool | None = None,
+        packed_input_column: str | None = None,
     ) -> None:
         if not message_columns:
             raise ValueError("Prompt message_columns cannot be empty")
+        if packed_input_column is not None and (not isinstance(packed_input_column, str) or not packed_input_column):
+            raise ValueError("Prompt packed_input_column must be a non-empty string or None")
         _validate_on_error(on_error)
         self._descriptor = descriptor
         self._message_columns = list(message_columns)
+        self._packed_input_column = packed_input_column
         self._output_column = output_column
         self._max_concurrency_per_actor = max_concurrency_per_actor
         self._single_message = single_message
@@ -1266,11 +1270,20 @@ class _PromptBatch:
         )
 
     def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
-        if self._single_message and columns[0][index] is None:
+        if self._packed_input_column is not None:
+            packed = columns[0][index]
+            if packed is None:
+                return None
+            if not isinstance(packed, Mapping) or set(packed) != set(self._message_columns):
+                raise TypeError("Prompt messages did not cross the native pack boundary")
+            values = [packed[name] for name in self._message_columns]
+        else:
+            values = [column[index] for column in columns]
+        if self._single_message and values[0] is None:
             return None
         parts: list[Any] = []
-        for column in columns:
-            self._append_message_value(parts, column[index])
+        for value in values:
+            self._append_message_value(parts, value)
         return tuple(parts) if parts else None
 
     def _validate_result(self, result: Any) -> str | None:
@@ -1287,7 +1300,8 @@ class _PromptBatch:
         )
 
     def __call__(self, table: pa.Table) -> pa.Table:
-        columns = [table.column(name).to_pylist() for name in self._message_columns]
+        input_columns = [self._packed_input_column] if self._packed_input_column is not None else self._message_columns
+        columns = [table.column(name).to_pylist() for name in input_columns]
         row_count = table.num_rows
         results: list[str | None] = [None] * row_count
         row_messages: dict[int, tuple[Any, ...]] = {}
@@ -1836,7 +1850,7 @@ def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[st
 
 
 def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "file", "text"] = "all") -> Expression:
-    """Add a bind-only Prompt guard; FILE inputs lower to native materialization."""
+    """Add a bind-only Prompt type guard that is removed during planning."""
     if media_policy == "text":
         # The hidden BOOLEAN overload uses TRUE for strict text-only native plans.
         return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(True))
@@ -1844,6 +1858,21 @@ def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "fil
         # FALSE permits text plus FILE while continuing to reject eager BLOB input.
         return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(False))
     return vane.FunctionExpression("__vane_ai_prompt", message)
+
+
+_PROMPT_PACKED_INPUT_COLUMN = "__vane_prompt_messages"
+
+
+def _packed_prompt_messages(
+    messages: list[Expression], *, supports_media_inputs: bool, single_message: bool
+) -> Expression:
+    """Pack every message so all FILE inputs share one native byte budget."""
+    return vane.FunctionExpression(
+        "__vane_ai_prompt_pack",
+        vane.ConstantExpression(supports_media_inputs),
+        vane.ConstantExpression(single_message),
+        *messages,
+    )
 
 
 def _build_native_vllm_expression(messages: list[Any], descriptor: NativeInferencePlan) -> vane.Expression:
@@ -1953,10 +1982,22 @@ def _prompt_relation(
         )
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
-    media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
-    validated_messages = [
-        _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
-    ]
+    has_file_inputs = any(value in {"FILE", "FILE[]"} for value in message_types)
+    packed_input_column = _PROMPT_PACKED_INPUT_COLUMN if has_file_inputs else None
+    if has_file_inputs:
+        udf_inputs = {
+            _PROMPT_PACKED_INPUT_COLUMN: _packed_prompt_messages(
+                message_expressions,
+                supports_media_inputs=supports_media_inputs,
+                single_message=single_message,
+            )
+        }
+    else:
+        media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
+        validated_messages = [
+            _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
+        ]
+        udf_inputs = dict(zip(input_names, validated_messages, strict=True))
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -1968,10 +2009,11 @@ def _prompt_relation(
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
         supports_media_inputs=supports_media_inputs,
+        packed_input_column=packed_input_column,
     )
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, validated_messages, strict=True)),
+        inputs=udf_inputs,
         output_column=output_column,
         output_type="VARCHAR",
         udf_opts=udf_options,
@@ -2040,10 +2082,11 @@ def _prompt_expression(
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
     supports_media_inputs = bool(descriptor.supports_image_inputs())
-    media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
-    validated_messages = [
-        _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
-    ]
+    packed_messages = _packed_prompt_messages(
+        message_expressions,
+        supports_media_inputs=supports_media_inputs,
+        single_message=single_message,
+    )
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -2055,10 +2098,11 @@ def _prompt_expression(
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
         supports_media_inputs=supports_media_inputs,
+        packed_input_column=_PROMPT_PACKED_INPUT_COLUMN,
     )
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, validated_messages, strict=True)),
+        inputs={_PROMPT_PACKED_INPUT_COLUMN: packed_messages},
         output_column="response",
         output_type="VARCHAR",
         udf_opts=udf_options,

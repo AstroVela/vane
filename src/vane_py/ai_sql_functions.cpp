@@ -14,6 +14,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/nested_functions.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
 #include "duckdb/function/scalar/vllm_functions.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
@@ -38,7 +39,10 @@ enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
-static constexpr const char *HIDDEN_PROMPT_MEDIA_FUNCTION = "__vane_ai_prompt_media";
+static constexpr const char *HIDDEN_PROMPT_PACK_FUNCTION = "__vane_ai_prompt_pack";
+static constexpr idx_t PROMPT_PACK_MEDIA_SUPPORTED_INDEX = 0;
+static constexpr idx_t PROMPT_PACK_SINGLE_MESSAGE_INDEX = 1;
+static constexpr idx_t PROMPT_PACK_MESSAGE_OFFSET = 2;
 
 // Prompt providers receive media inline. Keep both an individual FILE and the
 // materialized input vector bounded before allocating its bytes. The vector
@@ -183,6 +187,11 @@ static void PreparePromptMedia(ClientContext &context, const Value &value, bool 
 			result.resolved.reset();
 			return;
 		}
+		if (result.size > MAX_PROMPT_MEDIA_VECTOR_BYTES - vector_bytes) {
+			result.error = PROMPT_MEDIA_ERROR_VECTOR_TOO_LARGE;
+			result.resolved.reset();
+			return;
+		}
 		if (!file.has_content_type) {
 			result.has_content_type = result.resolved->GuessMimeType(result.content_type);
 			if (!result.has_content_type) {
@@ -190,11 +199,6 @@ static void PreparePromptMedia(ClientContext &context, const Value &value, bool 
 				result.resolved.reset();
 				return;
 			}
-		}
-		if (result.size > MAX_PROMPT_MEDIA_VECTOR_BYTES - vector_bytes) {
-			result.error = PROMPT_MEDIA_ERROR_VECTOR_TOO_LARGE;
-			result.resolved.reset();
-			return;
 		}
 		vector_bytes += result.size;
 	} catch (const std::exception &exception) {
@@ -207,39 +211,188 @@ static void PreparePromptMedia(ClientContext &context, const Value &value, bool 
 	}
 }
 
-template <bool IS_LIST>
-static void PromptMediaFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	result.SetVectorType(VectorType::FLAT_VECTOR);
+static bool IsPromptFileList(const LogicalType &type);
+
+struct MaterializedPromptFileInput {
+	Value value;
+	bool has_error;
+};
+
+static MaterializedPromptFileInput MaterializePromptFileInput(ClientContext &context, const Value &value,
+                                                              const LogicalType &input_type, bool media_supported,
+                                                              uint64_t &vector_bytes) {
 	auto media_type = PromptMediaLogicalType();
-	auto return_type = IS_LIST ? LogicalType::LIST(media_type) : media_type;
-	uint64_t vector_bytes = 0;
-	for (idx_t row_index = 0; row_index < args.size(); row_index++) {
-		auto value = args.data[0].GetValue(row_index);
-		if (value.IsNull()) {
-			result.SetValue(row_index, Value(return_type));
-			continue;
-		}
-		auto media_supported_value = args.data[1].GetValue(row_index);
-		if (media_supported_value.IsNull()) {
-			throw InvalidInputException("ai_prompt media policy cannot be NULL");
-		}
-		auto media_supported = BooleanValue::Get(media_supported_value);
-		if (IS_LIST) {
-			auto &children = ListValue::GetChildren(value);
-			vector<Value> values;
-			values.reserve(children.size());
-			for (auto &child : children) {
-				PreparedPromptMedia item;
-				PreparePromptMedia(state.GetContext(), child, media_supported, vector_bytes, item);
-				values.push_back(item.Materialize());
+	if (value.IsNull()) {
+		return {Value(FileLogicalType::IsFile(input_type) ? media_type : LogicalType::LIST(media_type)), false};
+	}
+	if (FileLogicalType::IsFile(input_type)) {
+		PreparedPromptMedia item;
+		PreparePromptMedia(context, value, media_supported, vector_bytes, item);
+		auto materialized = item.Materialize();
+		return {std::move(materialized), !item.error.empty()};
+	}
+	if (!IsPromptFileList(input_type)) {
+		throw InternalException("ai_prompt pack received an unexpected input type");
+	}
+
+	auto &children = ListValue::GetChildren(value);
+	vector<Value> values;
+	values.reserve(children.size());
+	for (auto &child : children) {
+		PreparedPromptMedia item;
+		PreparePromptMedia(context, child, media_supported, vector_bytes, item);
+		values.push_back(item.Materialize());
+		if (!item.error.empty()) {
+			// Only the first error is observable by the row wrapper. Drop bytes
+			// already read for this list and do not open its remaining FILEs.
+			for (idx_t index = 0; index + 1 < values.size(); index++) {
+				values[index] = Value(media_type);
 			}
-			result.SetValue(row_index, Value::LIST(media_type, std::move(values)));
-		} else {
-			PreparedPromptMedia item;
-			PreparePromptMedia(state.GetContext(), value, media_supported, vector_bytes, item);
-			result.SetValue(row_index, item.Materialize());
+			while (values.size() < children.size()) {
+				values.push_back(Value(media_type));
+			}
+			return {Value::LIST(media_type, std::move(values)), true};
 		}
 	}
+	return {Value::LIST(media_type, std::move(values)), false};
+}
+
+static bool PromptPackBooleanArgument(DataChunk &args, idx_t argument_index, idx_t row_index,
+                                      const char *argument_name) {
+	auto value = args.data[argument_index].GetValue(row_index);
+	if (value.IsNull()) {
+		throw InvalidInputException("ai_prompt %s cannot be NULL", argument_name);
+	}
+	return BooleanValue::Get(value);
+}
+
+static void PromptPackFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expression = state.expr.Cast<BoundFunctionExpression>();
+	if (!expression.bind_info) {
+		throw InternalException("ai_prompt pack is missing bind data");
+	}
+	auto &bind_data = expression.bind_info->Cast<VariableReturnBindData>();
+	auto &return_children = StructType::GetChildTypes(bind_data.stype);
+	if (args.ColumnCount() < PROMPT_PACK_MESSAGE_OFFSET + 1 ||
+	    return_children.size() != args.ColumnCount() - PROMPT_PACK_MESSAGE_OFFSET) {
+		throw InternalException("ai_prompt pack received an invalid argument envelope");
+	}
+	auto input_types = args.GetTypes();
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	uint64_t vector_bytes = 0;
+	for (idx_t row_index = 0; row_index < args.size(); row_index++) {
+		auto media_supported =
+		    PromptPackBooleanArgument(args, PROMPT_PACK_MEDIA_SUPPORTED_INDEX, row_index, "media policy");
+		auto single_message =
+		    PromptPackBooleanArgument(args, PROMPT_PACK_SINGLE_MESSAGE_INDEX, row_index, "single-message policy");
+		auto first_value = args.data[PROMPT_PACK_MESSAGE_OFFSET].GetValue(row_index);
+		if (single_message && first_value.IsNull()) {
+			// SQL FILE overloads treat the text prompt as the primary input. A
+			// row-varying NULL must short-circuit before any sibling FILE opens.
+			result.SetValue(row_index, Value(bind_data.stype));
+			continue;
+		}
+
+		auto row_start_bytes = vector_bytes;
+		vector<Value> fields;
+		fields.reserve(return_children.size());
+		vector<idx_t> successful_file_fields;
+		bool row_has_media_error = false;
+		for (idx_t argument_index = PROMPT_PACK_MESSAGE_OFFSET; argument_index < args.ColumnCount(); argument_index++) {
+			auto value = argument_index == PROMPT_PACK_MESSAGE_OFFSET ? std::move(first_value)
+			                                                          : args.data[argument_index].GetValue(row_index);
+			auto &input_type = input_types[argument_index];
+			if (FileLogicalType::IsFile(input_type) || IsPromptFileList(input_type)) {
+				auto field_index = fields.size();
+				if (row_has_media_error) {
+					fields.push_back(Value(return_children[field_index].second));
+					continue;
+				}
+				auto materialized =
+				    MaterializePromptFileInput(state.GetContext(), value, input_type, media_supported, vector_bytes);
+				fields.push_back(std::move(materialized.value));
+				if (materialized.has_error) {
+					// A failed row never reaches the provider. Release successful
+					// FILE payloads from this row and restore their vector budget so
+					// later rows are not rejected because of discarded bytes.
+					for (auto successful_index : successful_file_fields) {
+						fields[successful_index] = Value(return_children[successful_index].second);
+					}
+					vector_bytes = row_start_bytes;
+					row_has_media_error = true;
+				} else {
+					successful_file_fields.push_back(field_index);
+				}
+			} else {
+				fields.push_back(std::move(value));
+			}
+		}
+		result.SetValue(row_index, Value::STRUCT(bind_data.stype, std::move(fields)));
+	}
+}
+
+static unique_ptr<FunctionData> PromptPackBind(ClientContext &context, ScalarFunction &bound_function,
+                                               vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() < PROMPT_PACK_MESSAGE_OFFSET + 1) {
+		throw BinderException("ai_prompt pack requires at least one message");
+	}
+	for (idx_t policy_index = 0; policy_index < PROMPT_PACK_MESSAGE_OFFSET; policy_index++) {
+		auto &policy = *arguments[policy_index];
+		if (!policy.IsFoldable()) {
+			throw BinderException("ai_prompt pack policies must be constant BOOLEAN values");
+		}
+		if (policy.HasParameter()) {
+			throw ParameterNotResolvedException();
+		}
+		auto value = ExpressionExecutor::EvaluateScalar(context, policy);
+		if (value.IsNull() || value.type().id() != LogicalTypeId::BOOLEAN) {
+			throw BinderException("ai_prompt pack policies must be non-NULL BOOLEAN values");
+		}
+	}
+	auto media_supported =
+	    BooleanValue::Get(ExpressionExecutor::EvaluateScalar(context, *arguments[PROMPT_PACK_MEDIA_SUPPORTED_INDEX]));
+
+	child_list_t<LogicalType> fields;
+	fields.reserve(arguments.size() - PROMPT_PACK_MESSAGE_OFFSET);
+	for (idx_t argument_index = PROMPT_PACK_MESSAGE_OFFSET; argument_index < arguments.size(); argument_index++) {
+		auto &argument = arguments[argument_index];
+		auto input_type = argument->return_type;
+		if (input_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+		if (input_type.id() == LogicalTypeId::SQLNULL) {
+			argument = BoundCastExpression::AddCastToType(context, std::move(argument), LogicalType::VARCHAR);
+			input_type = LogicalType::VARCHAR;
+		}
+
+		LogicalType output_type;
+		if (input_type == LogicalType::VARCHAR) {
+			output_type = LogicalType::VARCHAR;
+		} else if (input_type == LogicalType::BLOB) {
+			if (!media_supported) {
+				throw BinderException("Prompt messages for this provider must have type VARCHAR, FILE, or FILE[]");
+			}
+			output_type = LogicalType::BLOB;
+		} else if (input_type == LogicalType::LIST(LogicalType::BLOB)) {
+			if (!media_supported) {
+				throw BinderException("Prompt messages for this provider must have type VARCHAR, FILE, or FILE[]");
+			}
+			output_type = input_type;
+		} else if (FileLogicalType::IsFile(input_type)) {
+			output_type = PromptMediaLogicalType();
+		} else if (IsPromptFileList(input_type)) {
+			output_type = LogicalType::LIST(PromptMediaLogicalType());
+		} else {
+			throw BinderException("Prompt messages must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]");
+		}
+		fields.emplace_back(StringUtil::Format("message_%d", argument_index - PROMPT_PACK_MESSAGE_OFFSET),
+		                    std::move(output_type));
+	}
+
+	auto return_type = LogicalType::STRUCT(std::move(fields));
+	bound_function.SetReturnType(return_type);
+	return make_uniq<VariableReturnBindData>(std::move(return_type));
 }
 
 static bool IsPromptFileList(const LogicalType &type) {
@@ -468,13 +621,16 @@ static unique_ptr<Expression> BindScalarFunction(ClientContext &context, const s
 	return result;
 }
 
-static unique_ptr<Expression> BindPromptMedia(ClientContext &context, unique_ptr<Expression> file,
-                                              bool media_supported) {
+static unique_ptr<Expression> BindPromptPack(ClientContext &context, vector<unique_ptr<Expression>> messages,
+                                             bool media_supported, bool single_message) {
 	vector<unique_ptr<Expression>> children;
-	children.reserve(2);
-	children.push_back(std::move(file));
+	children.reserve(PROMPT_PACK_MESSAGE_OFFSET + messages.size());
 	children.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(media_supported)));
-	return BindScalarFunction(context, HIDDEN_PROMPT_MEDIA_FUNCTION, std::move(children));
+	children.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(single_message)));
+	for (auto &message : messages) {
+		children.push_back(std::move(message));
+	}
+	return BindScalarFunction(context, HIDDEN_PROMPT_PACK_FUNCTION, std::move(children));
 }
 
 static unique_ptr<Expression> CastPromptOutput(ClientContext &context, unique_ptr<Expression> result,
@@ -601,8 +757,14 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
 			arguments[1] = BoundCastExpression::AddCastToType(context, std::move(arguments[1]), target_type);
 		}
-		arguments[1] = BindPromptMedia(context, std::move(arguments[1]), supports_prompt_media);
-		bound_function.arguments[1] = arguments[1]->return_type;
+		vector<unique_ptr<Expression>> messages;
+		messages.reserve(2);
+		messages.push_back(std::move(arguments[0]));
+		messages.push_back(std::move(arguments[1]));
+		arguments[0] = BindPromptPack(context, std::move(messages), supports_prompt_media, true);
+		bound_function.arguments[0] = arguments[0]->return_type;
+		Function::EraseArgument(bound_function, arguments, 1);
+		runtime_argument_count = 1;
 	}
 
 	if (native_vllm) {
@@ -626,8 +788,8 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 			Function::EraseArgument(bound_function, arguments, index);
 		}
 	} else {
-		// Prompt call-level constants are consumed by the binder. Only the
-		// prompt and optional media expression become row inputs.
+		// Prompt call-level constants are consumed by the binder. FILE inputs
+		// are one packed runtime value; eager BLOB inputs remain two columns.
 		for (idx_t index = arguments.size(); index-- > runtime_argument_count;) {
 			Function::EraseArgument(bound_function, arguments, index);
 		}
@@ -725,9 +887,6 @@ static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &in
 	    !IsPromptFileList(input_type)) {
 		throw BinderException("Prompt messages must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]");
 	}
-	if (FileLogicalType::IsFile(input_type) || IsPromptFileList(input_type)) {
-		return BindPromptMedia(input.context, std::move(message), true);
-	}
 	return std::move(message);
 }
 
@@ -756,28 +915,22 @@ static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput
 		}
 		throw BinderException("Prompt messages for this provider must have type VARCHAR, FILE, or FILE[]");
 	}
-	if (FileLogicalType::IsFile(message->return_type) || IsPromptFileList(message->return_type)) {
-		return BindPromptMedia(input.context, std::move(message), false);
-	}
 	return std::move(message);
 }
 
 } // namespace
 
-ScalarFunctionSet AISQLFunction::GetPromptMediaFunctions() {
-	ScalarFunctionSet set(HIDDEN_PROMPT_MEDIA_FUNCTION);
-	auto file_type = FileLogicalType::Create();
-	auto media_type = PromptMediaLogicalType();
-	auto add_function = [&](LogicalType input_type, LogicalType return_type, scalar_function_t function) {
-		auto materialize =
-		    ScalarFunction({std::move(input_type), LogicalType::BOOLEAN}, std::move(return_type), std::move(function));
-		materialize.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-		materialize.SetStability(FunctionStability::VOLATILE);
-		materialize.SetFallible();
-		set.AddFunction(std::move(materialize));
-	};
-	add_function(file_type, media_type, PromptMediaFunction<false>);
-	add_function(LogicalType::LIST(file_type), LogicalType::LIST(media_type), PromptMediaFunction<true>);
+ScalarFunctionSet AISQLFunction::GetPromptPackFunctions() {
+	ScalarFunctionSet set(HIDDEN_PROMPT_PACK_FUNCTION);
+	auto pack = ScalarFunction({LogicalType::BOOLEAN, LogicalType::BOOLEAN}, LogicalTypeId::STRUCT, PromptPackFunction,
+	                           PromptPackBind);
+	pack.varargs = LogicalType::ANY;
+	pack.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	pack.SetStability(FunctionStability::VOLATILE);
+	pack.SetFallible();
+	pack.SetSerializeCallback(VariableReturnBindData::Serialize);
+	pack.SetDeserializeCallback(VariableReturnBindData::Deserialize);
+	set.AddFunction(std::move(pack));
 	return set;
 }
 

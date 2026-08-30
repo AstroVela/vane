@@ -782,6 +782,31 @@ def test_ai_prompt_sql_file_read_errors_obey_on_error(tmp_path):
     """).fetchall() == [(None,)]
 
 
+def test_ai_prompt_sql_null_prompt_skips_file_materialization(tmp_path):
+    valid_path = tmp_path / "valid.bin"
+    valid_path.write_bytes(b"media")
+    valid_sql = str(valid_path).replace("'", "''")
+    missing_sql = str(tmp_path / "missing.bin").replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT ai_prompt(
+            prompt,
+            media,
+            provider := 'mock_ai_sql'
+        )
+        FROM (VALUES
+            (NULL::VARCHAR, file('{missing_sql}', 'image/png', NULL, NULL, NULL)),
+            ('describe', file('{valid_sql}', 'image/png', NULL, NULL, NULL))
+        ) AS source(prompt, media)
+    """)
+        .fetchall()
+    )
+
+    assert rows == [(None,), ("topic:describe:image/png=6d65646961",)]
+
+
 def test_ai_prompt_sql_inconclusive_file_mime_obeys_on_error(tmp_path):
     path = tmp_path / "unknown.bin"
     path.write_bytes(b"not-a-recognized-media-format")
@@ -856,6 +881,44 @@ def test_ai_prompt_sql_rejects_file_larger_than_the_materialization_limit(tmp_pa
             on_error := 'ignore'
         )
     """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_pack_enforces_vector_limit_across_file_columns_and_rows(tmp_path):
+    path = tmp_path / "aggregate-limit.bin"
+    with path.open("wb") as file:
+        file.truncate(19 * 1024 * 1024)
+    path_sql = str(path).replace("'", "''")
+    file_value = f"file('{path_sql}', 'image/png', NULL, NULL, NULL)"
+    column_names = [f"message_{index}" for index in range(7)]
+    packed_arguments = ", ".join(column_names)
+    oversized_row = ",\n".join(file_value for _ in column_names)
+    valid_row = ",\n".join([file_value, *("NULL::FILE" for _ in column_names[1:])])
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT
+            row_id,
+            packed.message_6.error,
+            octet_length(packed.message_0.data)
+        FROM (
+            SELECT
+                row_id,
+                __vane_ai_prompt_pack(TRUE, FALSE, {packed_arguments}) AS packed
+            FROM (VALUES
+                (0, {oversized_row}),
+                (1, {valid_row})
+            ) AS source(row_id, {packed_arguments})
+        )
+        ORDER BY row_id
+    """)
+        .fetchall()
+    )
+
+    assert rows == [
+        (0, "vector_too_large", None),
+        (1, None, 19 * 1024 * 1024),
+    ]
 
 
 def test_ai_prompt_sql_file_capability_error_obeys_on_error_before_io():
@@ -1038,10 +1101,11 @@ def test_ai_prompt_sql_file_materialization_boundary_survives_plan_round_trip(tm
     table = _execute_ai_physical_plan(target, physical)
 
     assert table.column(0).to_pylist() == ["round-trip-file:describe:image/png=6d65646961"]
-    assert node["payload"]["input_names"] == ["message_0", "message_1"]
-    assert node["payload"]["input_types"][0] == "VARCHAR"
-    assert node["payload"]["input_types"][1] == 'STRUCT(content_type VARCHAR, "data" BLOB, "error" VARCHAR)'
-    assert node["payload"]["input_contract_types"] == [None, None]
+    assert node["payload"]["input_names"] == ["__vane_prompt_messages"]
+    assert node["payload"]["input_types"] == [
+        'STRUCT(message_0 VARCHAR, message_1 STRUCT(content_type VARCHAR, "data" BLOB, "error" VARCHAR))'
+    ]
+    assert node["payload"]["input_contract_types"] == [None]
     assert b"prefix-media-suffix" not in serialized
     assert 0 < len(serialized) < 1_000_000
 
@@ -1403,6 +1467,9 @@ def test_ai_sql_helper_builds_prompt_specs_without_execution():
     assert spec["actor_number"] == 2
     assert spec["batch_size"] == 4
     assert spec["gpus"] == 0
+
+    file_spec = build_ai_prompt_sql_spec("mock_ai_sql", input_kind="file")
+    assert file_spec["input_names"] == ["__vane_prompt_messages"]
 
 
 def test_ai_sql_helper_builds_closed_native_vllm_spec():

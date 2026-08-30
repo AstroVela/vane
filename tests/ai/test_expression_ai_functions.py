@@ -1527,6 +1527,28 @@ def test_ai_prompt_expression_reads_strict_file_views_and_preserves_order(tmp_pa
     )
 
 
+def test_ai_prompt_expression_packs_multiple_file_columns_once(tmp_path):
+    first = tmp_path / "first-column.bin"
+    second = tmp_path / "second-column.bin"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    first_sql = str(first).replace("'", "''")
+    second_sql = str(second).replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT
+            'describe'::VARCHAR AS prompt,
+            file('{first_sql}', 'image/png', NULL, NULL, NULL) AS first,
+            file('{second_sql}', 'audio/wav', NULL, NULL, NULL) AS second
+    """)
+
+    expression = vane.ai.prompt(
+        [vane.col("prompt"), vane.col("first"), vane.col("second")],
+        provider=MockProvider(),
+    ).alias("response")
+
+    assert relation.select(expression).fetchone() == ("topic:describe:image/png=6669727374:audio/wav=7365636f6e64",)
+
+
 def test_ai_prompt_expression_sniffs_missing_file_mime_type(tmp_path):
     path = tmp_path / "payload.bin"
     payload = b"\x89PNG\r\n\x1a\nimage"
