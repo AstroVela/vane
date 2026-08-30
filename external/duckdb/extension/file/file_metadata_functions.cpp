@@ -399,12 +399,14 @@ static ScalarFunction MakeScalarFunction(const string &name, vector<LogicalType>
 	return result;
 }
 
-static const LogicalType &BindFileFamilyArgument(ScalarFunction &bound_function,
-                                                 vector<unique_ptr<Expression>> &arguments, idx_t index,
-                                                 const string &function_name) {
-	auto &input_type = arguments[index]->return_type;
+static LogicalType BindFileFamilyArgument(ScalarFunction &bound_function, vector<unique_ptr<Expression>> &arguments,
+                                          idx_t index, const string &function_name) {
+	auto input_type = arguments[index]->return_type;
 	if (input_type.id() == LogicalTypeId::UNKNOWN) {
-		throw ParameterNotResolvedException();
+		// ANY keeps known media specializations intact. An unresolved prepared
+		// parameter has no specialization to preserve, so retain the original
+		// generic FILE inference contract.
+		input_type = FileLogicalType::Create();
 	}
 	if (input_type.id() != LogicalTypeId::SQLNULL && !FileLogicalType::IsFile(input_type)) {
 		throw BinderException("%s() requires a FILE-family value, not %s", function_name, input_type.ToString());
@@ -421,7 +423,7 @@ static unique_ptr<FunctionData> BindFileFamilyUnary(ClientContext &, ScalarFunct
 
 static unique_ptr<FunctionData> BindFileEnrich(ClientContext &, ScalarFunction &bound_function,
                                                vector<unique_ptr<Expression>> &arguments) {
-	auto &input_type = BindFileFamilyArgument(bound_function, arguments, 0, bound_function.name);
+	auto input_type = BindFileFamilyArgument(bound_function, arguments, 0, bound_function.name);
 	bound_function.SetReturnType(FileLogicalType::IsFile(input_type) ? input_type : FileLogicalType::Create());
 	return nullptr;
 }

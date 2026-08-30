@@ -19,6 +19,48 @@ SELECT file_mime_type(file('missing.txt', NULL, NULL, NULL, NULL))
 ----
 text/plain
 
+# ANY-based FILE-family binders preserve known media specializations while
+# unresolved prepared parameters retain the generic FILE inference contract.
+statement ok
+PREPARE generic_file_metadata AS SELECT
+	file_path($1),
+	file_size($1),
+	file_mime_type($1),
+	file_exists($1),
+	file_stat($1).object_size,
+	file_locator_id($1) IS NOT NULL,
+	file_content_id($1) IS NOT NULL
+
+query TITIIII
+EXECUTE generic_file_metadata(
+	file('test/sql/table_function/files/one.txt', 'text/plain', 0, 12, 'sha256:abc')
+)
+----
+test/sql/table_function/files/one.txt	12	text/plain	true	12	true	true
+
+statement ok
+PREPARE generic_file_enrich AS SELECT
+	typeof(file_enrich($1, [])),
+	file_path(file_enrich($1, []))
+
+query TT
+EXECUTE generic_file_enrich(file('prepared.txt', NULL, NULL, NULL, NULL))
+----
+FILE	prepared.txt
+
+statement ok
+PREPARE generic_file_identity AS SELECT
+	file_same_location($1, $2),
+	file_same_content($1, $2)
+
+query II
+EXECUTE generic_file_identity(
+	file('left', NULL, 0, 3, 'sha256:abc'),
+	file('left', NULL, 0, 3, 'SHA256:abc')
+)
+----
+true	true
+
 # Conversion opens the object and materializes the complete logical window.
 query TTIIT
 SELECT typeof(value), value.url, value.position, value.size, value.content_type
