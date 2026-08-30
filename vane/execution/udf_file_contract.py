@@ -25,6 +25,7 @@ import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, u
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
+_FILE_TYPE_PATTERN = re.compile(r"\b(?:FILE|IMAGEFILE|AUDIOFILE|VIDEOFILE)\b", flags=re.IGNORECASE)
 _TENSOR_TYPE_PATTERN = re.compile(r"\bTENSOR\s*\(", flags=re.IGNORECASE)
 _ARROW_LIST_OFFSET_MAX = (1 << 31) - 1
 _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
@@ -151,7 +152,7 @@ def contains_file_type(dtype: Any) -> bool:
 
 
 def _parse_file_type(type_name: Any, *, field: str) -> Any | None:
-    if not isinstance(type_name, str) or re.search(r"\bFILE\b", type_name, flags=re.IGNORECASE) is None:
+    if not isinstance(type_name, str) or _FILE_TYPE_PATTERN.search(type_name) is None:
         return None
     dtype = _parse_declared_type(type_name, field=field)
     return dtype if _contains_file(dtype) else None
@@ -802,16 +803,29 @@ def _validate_arrow_storage_type(
         raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
 
 
-def _file_from_arrow_value(value: Any, *, boundary: str, path: str) -> Any:
+def _file_value_class(dtype: Any) -> type[Any]:
+    import vane
+
+    file_classes = {
+        "FILE": vane.File,
+        "IMAGEFILE": vane.ImageFile,
+        "AUDIOFILE": vane.AudioFile,
+        "VIDEOFILE": vane.VideoFile,
+    }
+    try:
+        return file_classes[str(dtype).upper()]
+    except KeyError as exc:
+        raise _invalid_input(f"unsupported FILE-family logical type {dtype}") from exc
+
+
+def _file_from_arrow_value(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
     if not isinstance(value, Mapping):
         raise _invalid_input(f"{boundary} FILE value at {path} must be an Arrow STRUCT")
     if len(value) != len(_FILE_FIELDS) or set(value) != set(_FILE_FIELDS):
         raise _invalid_input(f"{boundary} FILE value at {path} must contain exactly the five FILE fields")
 
-    import vane
-
     try:
-        return vane.File(*(value[field] for field in _FILE_FIELDS))
+        return _file_value_class(dtype)(*(value[field] for field in _FILE_FIELDS))
     except (TypeError, ValueError, OverflowError) as exc:
         raise _invalid_input(f"{boundary} contains an invalid FILE value at {path}: {exc}") from exc
 
@@ -899,7 +913,7 @@ def _validate_file_arrow_values(
         for index, value in enumerate(array.to_pylist()):
             if value is None or (parent_active is not None and not parent_active[index]):
                 continue
-            _file_from_arrow_value(value, boundary=boundary, path=f"{path}[{index}]")
+            _file_from_arrow_value(value, dtype, boundary=boundary, path=f"{path}[{index}]")
         return
 
     active = _active_values(array, parent_active)
@@ -975,7 +989,7 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
     if value is None:
         return None
     if _is_file_type(dtype):
-        return _file_from_arrow_value(value, boundary=boundary, path=path)
+        return _file_from_arrow_value(value, dtype, boundary=boundary, path=path)
 
     type_id = _type_id(dtype)
     if type_id == "bit" and isinstance(value, (bytes, bytearray, memoryview)):
@@ -1136,10 +1150,9 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
     if value is None:
         return None
     if _is_file_type(dtype):
-        import vane
-
-        if not isinstance(value, vane.File):
-            raise _invalid_input(f"{boundary} FILE value at {path} must be vane.File or NULL")
+        expected_class = _file_value_class(dtype)
+        if type(value) is not expected_class:
+            raise _invalid_input(f"{boundary} {dtype} value at {path} must be vane.{expected_class.__name__} or NULL")
         return {field: getattr(value, field) for field in _FILE_FIELDS}
 
     type_id = _type_id(dtype)

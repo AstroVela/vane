@@ -245,6 +245,41 @@ def file(
     )
 
 
+def _media_file(
+    name: str,
+    value: str | vane.File | vane.Expression,
+    verify: bool | vane.Expression,
+) -> vane.Expression:
+    arguments = [as_expression(value)]
+    if verify is not False:
+        arguments.append(as_expression(verify))
+    return vane.FunctionExpression(name, *arguments)
+
+
+def image_file(
+    url_or_file: str | vane.File | vane.Expression,
+    verify: bool | vane.Expression = False,
+) -> vane.Expression:
+    """Declare an IMAGEFILE expression, optionally verifying bounded content."""
+    return _media_file("image_file", url_or_file, verify)
+
+
+def audio_file(
+    url_or_file: str | vane.File | vane.Expression,
+    verify: bool | vane.Expression = False,
+) -> vane.Expression:
+    """Declare an AUDIOFILE expression, optionally verifying bounded content."""
+    return _media_file("audio_file", url_or_file, verify)
+
+
+def video_file(
+    url_or_file: str | vane.File | vane.Expression,
+    verify: bool | vane.Expression = False,
+) -> vane.Expression:
+    """Declare a VIDEOFILE expression, optionally verifying bounded content."""
+    return _media_file("video_file", url_or_file, verify)
+
+
 def to_file(path: str | vane.Expression) -> vane.Expression:
     """Convert a path to a FILE expression when the expression is executed."""
     return _file_function("to_file", path)
@@ -336,6 +371,7 @@ def from_files(
 
 __all__ = [
     "VaneFileReader",
+    "audio_file",
     "file",
     "file_content_id",
     "file_enrich",
@@ -349,8 +385,10 @@ __all__ = [
     "file_stat",
     "from_files",
     "guess_mime_type",
+    "image_file",
     "list_files",
     "open_file",
     "to_file",
     "try_to_file",
+    "video_file",
 ]

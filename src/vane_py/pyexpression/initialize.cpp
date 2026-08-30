@@ -6,6 +6,7 @@
 
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/expression/pyexpression.hpp"
+#include "vane_python/file.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/vector.hpp"
 #include "vane_python/python_conversion.hpp"
@@ -443,8 +444,19 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	docs = "";
 	expression.def("collate", &DuckDBPyExpression::Collate, py::arg("collation"), docs);
 
-	expression.def("as_file", &DuckDBPyExpression::AsFile,
-	               "Construct a FILE expression using this expression as its URL");
+	expression.def(
+	    "as_file",
+	    [](const DuckDBPyExpression &self, const py::object &media_type) {
+		    auto native_media_type = FileMediaType::UNKNOWN;
+		    if (!media_type.is_none()) {
+			    if (!py::isinstance<PythonFileMediaType>(media_type)) {
+				    throw py::type_error("media_type must be vane.MediaType");
+			    }
+			    native_media_type = py::cast<PythonFileMediaType>(media_type).Type();
+		    }
+		    return self.AsFile(native_media_type);
+	    },
+	    "Construct a FILE-family expression using this expression as its URL", py::arg("media_type") = py::none());
 	expression.def_property_readonly("url", [](const DuckDBPyExpression &self) { return self.FileField("url"); });
 	expression.def_property_readonly("content_type",
 	                                 [](const DuckDBPyExpression &self) { return self.FileField("content_type"); });

@@ -12,6 +12,12 @@ import pytest
 
 import vane
 
+MEDIA_FILE_UDF_CASES = (
+    (vane.MediaType.image(), "IMAGEFILE", vane.ImageFile, "image_file"),
+    (vane.MediaType.audio(), "AUDIOFILE", vane.AudioFile, "audio_file"),
+    (vane.MediaType.video(), "VIDEOFILE", vane.VideoFile, "video_file"),
+)
+
 
 def _file_arrow_type():
     import pyarrow as pa
@@ -71,6 +77,92 @@ def test_scalar_file_udf_materializes_and_returns_file_values():
     ]
 
 
+@pytest.mark.parametrize(("media_type", "type_name", "value_class", "constructor"), MEDIA_FILE_UDF_CASES)
+def test_scalar_media_file_udf_preserves_exact_specialization(media_type, type_name, value_class, constructor):
+    dtype = vane.file_type(media_type)
+
+    @vane.func(return_dtype=dtype)
+    def copy_media(value):
+        assert type(value) is value_class
+        return value_class(value.url, value.content_type, value.position, value.size, value.checksum)
+
+    connection = vane.connect()
+    source = connection.sql(
+        f"""
+        SELECT * FROM (
+            VALUES (0, {constructor}('memory://media')), (1, NULL::{type_name})
+        ) AS source(id, value)
+        ORDER BY id
+        """
+    )
+    result = source.select(vane.col("id"), copy_media(vane.col("value")).alias("value"))
+
+    assert str(result.types[1]) == type_name
+    assert result.fetchall() == [(0, value_class("memory://media")), (1, None)]
+
+
+@pytest.mark.parametrize(("media_type", "type_name", "value_class", "constructor"), MEDIA_FILE_UDF_CASES)
+def test_batch_media_file_udf_restores_declared_specialization(media_type, type_name, value_class, constructor):
+    import pyarrow as pa
+
+    @vane.func.batch(return_dtype=vane.file_type(media_type))
+    def identity_media(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        assert values.type.equals(_file_arrow_type())
+        return values
+
+    connection = vane.connect()
+    source = connection.sql(
+        f"""
+        SELECT * FROM (
+            VALUES (0, {constructor}('memory://media')), (1, NULL::{type_name})
+        ) AS source(id, value)
+        ORDER BY id
+        """
+    )
+    result = source.select(vane.col("id"), identity_media(vane.col("value")).alias("value"))
+
+    assert str(result.types[1]) == type_name
+    assert result.fetchall() == [(0, value_class("memory://media")), (1, None)]
+
+
+def test_empty_batch_media_file_udf_retains_declared_specialization():
+    @vane.func.batch(return_dtype=vane.file_type(vane.MediaType.image()))
+    def identity_image(values):
+        return values
+
+    connection = vane.connect()
+    source = connection.sql("SELECT image_file('memory://empty') AS value WHERE FALSE")
+    result = source.select(identity_image(vane.col("value")).alias("value"))
+
+    assert str(result.types[0]) == "IMAGEFILE"
+    assert result.fetchall() == []
+
+
+def test_scalar_media_file_udf_rejects_generic_file_output():
+    @vane.func(return_dtype=vane.file_type(vane.MediaType.image()))
+    def invalid_media_output(_value):
+        return vane.File("memory://generic")
+
+    connection = vane.connect()
+    source = connection.sql("SELECT 1 AS value")
+
+    with pytest.raises(Exception, match=r"must be vane\.ImageFile or NULL"):
+        source.select(invalid_media_output(vane.col("value"))).fetchall()
+
+
+def test_scalar_media_file_udf_rejects_different_specialization_output():
+    @vane.func(return_dtype=vane.file_type(vane.MediaType.video()))
+    def invalid_media_output(_value):
+        return vane.AudioFile("memory://audio")
+
+    connection = vane.connect()
+    source = connection.sql("SELECT 1 AS value")
+
+    with pytest.raises(Exception, match=r"must be vane\.VideoFile or NULL"):
+        source.select(invalid_media_output(vane.col("value"))).fetchall()
+
+
 def test_scalar_file_udf_materializes_nested_files():
     nested_type = vane.list_type(vane.file_type())
 
@@ -126,7 +218,8 @@ def test_scalar_file_udf_rejects_structural_output_fallbacks(fallback):
         source.select(invalid_output(vane.col("value"))).fetchall()
 
 
-def test_file_udf_rejects_invalid_input_before_user_code(tmp_path):
+@pytest.mark.parametrize("logical_type", ["FILE", "IMAGEFILE"])
+def test_file_udf_rejects_invalid_input_before_user_code(tmp_path, logical_type):
     marker = tmp_path / "called"
 
     @vane.func(return_dtype="INTEGER")
@@ -135,10 +228,11 @@ def test_file_udf_rejects_invalid_input_before_user_code(tmp_path):
         return 1
 
     connection = vane.connect()
-    connection.execute("CREATE TABLE invalid_file_udf_input(value FILE)")
+    table_name = f"invalid_{logical_type.lower()}_udf_input"
+    connection.execute(f"CREATE TABLE {table_name}(value {logical_type})")
     connection.execute(
-        """
-        INSERT INTO invalid_file_udf_input
+        f"""
+        INSERT INTO {table_name}
         SELECT struct_pack(
             url := NULL::VARCHAR,
             content_type := NULL::VARCHAR,
@@ -150,7 +244,7 @@ def test_file_udf_rejects_invalid_input_before_user_code(tmp_path):
     )
 
     with pytest.raises(Exception, match=r"invalid FILE value"):
-        connection.table("invalid_file_udf_input").select(observe(vane.col("value"))).fetchall()
+        connection.table(table_name).select(observe(vane.col("value"))).fetchall()
     assert not marker.exists()
 
 
@@ -316,6 +410,23 @@ def test_flat_map_file_udf_materializes_and_returns_file_values():
 
     assert result.types[0].is_file()
     assert result.fetchall() == [(vane.File("memory://flat-map"),)]
+
+
+def test_flat_map_media_file_udf_preserves_specialization_in_subprocess():
+    def copy_audio(row):
+        assert type(row["value"]) is vane.AudioFile
+        return {"value": row["value"]}
+
+    connection = vane.connect()
+    source = connection.sql("SELECT audio_file('memory://flat-map-audio') AS value")
+    result = source.flat_map(
+        copy_audio,
+        schema={"value": vane.file_type(vane.MediaType.audio())},
+        execution_backend="subprocess_task",
+    )
+
+    assert str(result.types[0]) == "AUDIOFILE"
+    assert result.fetchall() == [(vane.AudioFile("memory://flat-map-audio"),)]
 
 
 def test_flat_map_file_udf_rejects_structural_output_fallback():
@@ -3366,6 +3477,43 @@ def test_registered_batch_file_udf_preserves_type():
 
     assert result.types[0].is_file()
     assert result.fetchone() == (vane.File("memory://batch-sql"),)
+
+
+def test_registered_media_file_udfs_preserve_exact_types_and_reject_mismatches():
+    image_type = vane.file_type(vane.MediaType.image())
+    audio_type = vane.file_type(vane.MediaType.audio())
+
+    @vane.func(return_dtype=image_type)
+    def image_identity(value):
+        assert type(value) is vane.ImageFile
+        return value
+
+    @vane.func.batch(return_dtype=audio_type)
+    def audio_identity(values):
+        return values
+
+    connection = vane.connect()
+    vane.attach_function(image_identity, connection=connection, alias="identity_image_sql", parameters=[image_type])
+    vane.attach_function(audio_identity, connection=connection, alias="identity_audio_sql", parameters=[audio_type])
+
+    row = connection.sql(
+        """
+        SELECT
+            typeof(identity_image_sql(image_file('memory://image'))),
+            identity_image_sql(image_file('memory://image')),
+            typeof(identity_audio_sql(audio_file('memory://audio'))),
+            identity_audio_sql(audio_file('memory://audio'))
+        """
+    ).fetchone()
+
+    assert row == (
+        "IMAGEFILE",
+        vane.ImageFile("memory://image"),
+        "AUDIOFILE",
+        vane.AudioFile("memory://audio"),
+    )
+    with pytest.raises(vane.BinderException, match=r"No function matches"):
+        connection.sql("SELECT identity_image_sql(audio_file('memory://audio'))")
 
 
 @pytest.mark.parametrize(

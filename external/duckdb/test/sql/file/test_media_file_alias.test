@@ -1,0 +1,142 @@
+# name: test/sql/file/test_media_file_alias.test
+# description: Test media-specialized FILE aliases, pure conversion, and family functions
+# group: [file]
+
+require file
+
+load __TEST_DIR__/media_file.db
+
+statement ok
+PRAGMA enable_verification
+
+query TTTTTT
+SELECT
+	typeof(image_file('missing.png')),
+	typeof(audio_file('missing.mp3')),
+	typeof(video_file('missing.mp4')),
+	typeof(NULL::IMAGEFILE[]),
+	typeof(NULL::AUDIOFILE[]),
+	typeof(NULL::VIDEOFILE[])
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE	IMAGEFILE[]	AUDIOFILE[]	VIDEOFILE[]
+
+# Unverified construction and specialization are pure and preserve all fields.
+query TTTIIT
+SELECT typeof(value), value.url, value.content_type, value.position, value.size, value.checksum
+FROM (
+	SELECT image_file(file('memory://image', 'image/png', 2, 4, 'sha256:image')) AS value
+)
+----
+IMAGEFILE	memory://image	image/png	2	4	sha256:image
+
+query TTT
+SELECT
+	typeof(image_file(image_file('memory://image'))),
+	typeof(audio_file(file('memory://audio', NULL, NULL, NULL, NULL))),
+	typeof(video_file(file('memory://video', NULL, NULL, NULL, NULL)))
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE
+
+statement error
+SELECT image_file(audio_file('memory://audio'))
+----
+<REGEX>:.*image_file.*requires VARCHAR, FILE, or IMAGEFILE.*AUDIOFILE.*
+
+statement error
+SELECT audio_file(video_file('memory://video'))
+----
+<REGEX>:.*audio_file.*requires VARCHAR, FILE, or AUDIOFILE.*VIDEOFILE.*
+
+# The optional verification path uses bounded content inspection.
+query TT
+SELECT
+	typeof(image_file('logo/DuckDB_Logo-stacked.png', TRUE)),
+	image_file('logo/DuckDB_Logo-stacked.png', TRUE).content_type
+----
+IMAGEFILE	image/png
+
+statement error
+SELECT image_file('test/sql/table_function/files/one.txt', TRUE)
+----
+<REGEX>:.*could not verify IMAGEFILE content.*
+
+statement error
+SELECT video_file('test/sql/table_function/files/does-not-exist', TRUE)
+----
+<REGEX>:.*(Cannot open file|could not open).*
+
+query IIIII
+SELECT
+	image = image,
+	image != image,
+	partial = partial,
+	partial != partial,
+	NULL::IMAGEFILE = image
+FROM (
+	SELECT
+		image_file(file('x', 'image/png', 1, 2, 'sha256:x')) AS image,
+		image_file(file('x', NULL, NULL, NULL, NULL)) AS partial
+)
+----
+true	false	NULL	NULL	NULL
+
+statement error
+SELECT image_file('x') = file('x', NULL, NULL, NULL, NULL)
+----
+<REGEX>:.*Cannot compare values of type IMAGEFILE and type FILE.*
+
+statement error
+SELECT image_file('x') = audio_file('x')
+----
+<REGEX>:.*Cannot compare values of type IMAGEFILE and type AUDIOFILE.*
+
+# Generic FILE-family functions accept all specializations. Value-returning
+# enrichment preserves its input alias, while identity functions compare
+# family members explicitly.
+query TTTTII
+SELECT
+	typeof(file_enrich(image_file('image.png'), [])),
+	typeof(file_enrich(audio_file('audio.mp3'), [])),
+	typeof(file_enrich(video_file('video.mp4'), [])),
+	file_path(image_file('image.png')),
+	file_same_location(image_file('same'), audio_file('same')),
+	file_same_content(
+		image_file(file('a', NULL, 0, 3, 'sha256:abc')),
+		video_file(file('b', NULL, 7, 3, 'SHA256:abc'))
+	)
+----
+IMAGEFILE	AUDIOFILE	VIDEOFILE	image.png	true	true
+
+statement ok
+CREATE TABLE media_files(
+	image IMAGEFILE,
+	audio AUDIOFILE,
+	video VIDEOFILE
+)
+
+statement ok
+INSERT INTO media_files VALUES (
+	image_file('stored.png'),
+	audio_file('stored.mp3'),
+	video_file('stored.mp4')
+)
+
+query TTTTTT
+SELECT
+	typeof(image), image.url,
+	typeof(audio), audio.url,
+	typeof(video), video.url
+FROM media_files
+----
+IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4
+
+restart
+
+query TTTTTT
+SELECT
+	typeof(image), image.url,
+	typeof(audio), audio.url,
+	typeof(video), video.url
+FROM media_files
+----
+IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4

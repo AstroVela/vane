@@ -76,9 +76,50 @@ static std::optional<int64_t> OptionalIntegerFromReference(bool has_value, int64
 
 static FileReference MakeReference(const string &url, const std::optional<string> &content_type,
                                    const std::optional<int64_t> &position, const std::optional<int64_t> &size,
-                                   const std::optional<string> &checksum) {
+                                   const std::optional<string> &checksum, FileMediaType media_type) {
 	return FileReference::FromFields(Value(url), OptionalStringValue(content_type), OptionalIntegerValue(position),
-	                                 OptionalIntegerValue(size), OptionalStringValue(checksum), "File");
+	                                 OptionalIntegerValue(size), OptionalStringValue(checksum), "File", media_type);
+}
+
+template <class FILE_TYPE>
+static FILE_TYPE FileFromPython(const py::handle &url, const py::handle &content_type, const py::handle &position,
+                                const py::handle &size, const py::handle &checksum) {
+	auto url_value = RequireString(url, "url");
+	auto content_type_value = OptionalString(content_type, "content_type");
+	auto position_value = OptionalInteger(position, "position");
+	auto size_value = OptionalInteger(size, "size");
+	auto checksum_value = OptionalString(checksum, "checksum");
+	try {
+		return FILE_TYPE(std::move(url_value), std::move(content_type_value), position_value, size_value,
+		                 std::move(checksum_value));
+	} catch (const InvalidInputException &error) {
+		auto error_data = ErrorData(error);
+		throw py::value_error(error_data.RawMessage());
+	}
+}
+
+template <class FILE_TYPE>
+static FILE_TYPE FileFromPickleState(const py::tuple &state, const char *class_name) {
+	if (state.size() != FileLogicalType::FIELD_COUNT) {
+		throw py::value_error(StringUtil::Format("Invalid %s pickle state", class_name));
+	}
+	return FileFromPython<FILE_TYPE>(state[FileLogicalType::URL], state[FileLogicalType::CONTENT_TYPE],
+	                                 state[FileLogicalType::POSITION], state[FileLogicalType::SIZE],
+	                                 state[FileLogicalType::CHECKSUM]);
+}
+
+template <class FILE_TYPE>
+static void BindMediaFileClass(py::handle &m, const char *class_name) {
+	auto file = py::class_<FILE_TYPE, PythonFile>(m, class_name, py::module_local(), py::is_final());
+	file.def(py::init([](const py::object &url, const py::object &content_type, const py::object &position,
+	                     const py::object &size, const py::object &checksum) {
+		         return FileFromPython<FILE_TYPE>(url, content_type, position, size, checksum);
+	         }),
+	         py::arg("url"), py::arg("content_type") = py::none(), py::arg("position") = py::none(),
+	         py::arg("size") = py::none(), py::arg("checksum") = py::none());
+	file.def(
+	    py::pickle([](const FILE_TYPE &value) { return value.State(); },
+	               [class_name](const py::tuple &state) { return FileFromPickleState<FILE_TYPE>(state, class_name); }));
 }
 
 static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
@@ -117,15 +158,70 @@ static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyC
 
 } // namespace
 
+PythonFileMediaType::PythonFileMediaType(FileMediaType media_type_p) : media_type(media_type_p) {
+}
+
+PythonFileMediaType PythonFileMediaType::Unknown() {
+	return PythonFileMediaType(FileMediaType::UNKNOWN);
+}
+
+PythonFileMediaType PythonFileMediaType::Image() {
+	return PythonFileMediaType(FileMediaType::IMAGE);
+}
+
+PythonFileMediaType PythonFileMediaType::Audio() {
+	return PythonFileMediaType(FileMediaType::AUDIO);
+}
+
+PythonFileMediaType PythonFileMediaType::Video() {
+	return PythonFileMediaType(FileMediaType::VIDEO);
+}
+
+FileMediaType PythonFileMediaType::Type() const {
+	return media_type;
+}
+
+string PythonFileMediaType::Repr() const {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return "MediaType.unknown()";
+	case FileMediaType::IMAGE:
+		return "MediaType.image()";
+	case FileMediaType::AUDIO:
+		return "MediaType.audio()";
+	case FileMediaType::VIDEO:
+		return "MediaType.video()";
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+bool PythonFileMediaType::Equals(const PythonFileMediaType &other) const {
+	return media_type == other.media_type;
+}
+
+Py_hash_t PythonFileMediaType::Hash() const {
+	return py::hash(py::int_(static_cast<int>(media_type)));
+}
+
 PythonFile::PythonFile(string url_p, std::optional<string> content_type_p, std::optional<int64_t> position_p,
-                       std::optional<int64_t> size_p, std::optional<string> checksum_p)
-    : url(std::move(url_p)), content_type(std::move(content_type_p)), position(position_p), size(size_p),
-      checksum(std::move(checksum_p)) {
-	MakeReference(url, content_type, position, size, checksum);
+                       std::optional<int64_t> size_p, std::optional<string> checksum_p, FileMediaType media_type_p)
+    : media_type(media_type_p), url(std::move(url_p)), content_type(std::move(content_type_p)), position(position_p),
+      size(size_p), checksum(std::move(checksum_p)) {
+	MakeReference(url, content_type, position, size, checksum, media_type);
 }
 
 void PythonFile::Initialize(py::handle &m) {
-	auto file = py::class_<PythonFile>(m, "File", py::module_local(), py::is_final());
+	auto media_type = py::class_<PythonFileMediaType>(m, "MediaType", py::module_local(), py::is_final());
+	media_type.def_static("unknown", &PythonFileMediaType::Unknown);
+	media_type.def_static("image", &PythonFileMediaType::Image);
+	media_type.def_static("audio", &PythonFileMediaType::Audio);
+	media_type.def_static("video", &PythonFileMediaType::Video);
+	media_type.def("__repr__", &PythonFileMediaType::Repr);
+	media_type.def("__eq__", &PythonFileMediaType::Equals, py::arg("other"), py::is_operator());
+	media_type.def("__hash__", &PythonFileMediaType::Hash);
+
+	auto file = py::class_<PythonFile>(m, "File", py::module_local());
 	file.def(py::init([](const py::object &url, const py::object &content_type, const py::object &position,
 	                     const py::object &size, const py::object &checksum) {
 		         return PythonFile::FromPython(url, content_type, position, size, checksum);
@@ -167,44 +263,47 @@ void PythonFile::Initialize(py::handle &m) {
 	file.def("__ne__", &PythonFile::NotEquals, py::arg("other"), py::is_operator());
 	file.def("__hash__", &PythonFile::Hash);
 	file.def(py::pickle([](const PythonFile &value) { return value.State(); },
-	                    [](const py::tuple &state) {
-		                    if (state.size() != FileLogicalType::FIELD_COUNT) {
-			                    throw py::value_error("Invalid File pickle state");
-		                    }
-		                    return PythonFile::FromPython(
-		                        state[FileLogicalType::URL], state[FileLogicalType::CONTENT_TYPE],
-		                        state[FileLogicalType::POSITION], state[FileLogicalType::SIZE],
-		                        state[FileLogicalType::CHECKSUM]);
-	                    }));
+	                    [](const py::tuple &state) { return FileFromPickleState<PythonFile>(state, "File"); }));
+	BindMediaFileClass<PythonImageFile>(m, "ImageFile");
+	BindMediaFileClass<PythonAudioFile>(m, "AudioFile");
+	BindMediaFileClass<PythonVideoFile>(m, "VideoFile");
+
+	// Native media subclasses are registered above; keep the public hierarchy
+	// closed so user-defined subclasses cannot add state to governed values.
+	reinterpret_cast<PyTypeObject *>(file.ptr())->tp_flags &= ~Py_TPFLAGS_BASETYPE;
 }
 
 PythonFile PythonFile::FromPython(const py::handle &url, const py::handle &content_type, const py::handle &position,
                                   const py::handle &size, const py::handle &checksum) {
-	auto url_value = RequireString(url, "url");
-	auto content_type_value = OptionalString(content_type, "content_type");
-	auto position_value = OptionalInteger(position, "position");
-	auto size_value = OptionalInteger(size, "size");
-	auto checksum_value = OptionalString(checksum, "checksum");
-	try {
-		return PythonFile(std::move(url_value), std::move(content_type_value), position_value, size_value,
-		                  std::move(checksum_value));
-	} catch (const InvalidInputException &error) {
-		auto error_data = ErrorData(error);
-		throw py::value_error(error_data.RawMessage());
+	return FileFromPython<PythonFile>(url, content_type, position, size, checksum);
+}
+
+py::object PythonFile::FromValue(const Value &value) {
+	auto reference = FileReference::FromValue(value, "FILE materialization");
+	auto content_type = OptionalStringFromReference(reference.has_content_type, reference.content_type);
+	auto position = OptionalIntegerFromReference(reference.has_range, reference.position);
+	auto size = OptionalIntegerFromReference(reference.has_range, reference.size);
+	auto checksum = OptionalStringFromReference(reference.has_checksum, reference.checksum);
+	switch (reference.media_type) {
+	case FileMediaType::UNKNOWN:
+		return py::cast(
+		    PythonFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::IMAGE:
+		return py::cast(
+		    PythonImageFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::AUDIO:
+		return py::cast(
+		    PythonAudioFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	case FileMediaType::VIDEO:
+		return py::cast(
+		    PythonVideoFile(std::move(reference.url), std::move(content_type), position, size, std::move(checksum)));
+	default:
+		throw InternalException("Unknown FILE media type");
 	}
 }
 
-PythonFile PythonFile::FromValue(const Value &value) {
-	auto reference = FileReference::FromValue(value, "FILE materialization");
-	return PythonFile(std::move(reference.url),
-	                  OptionalStringFromReference(reference.has_content_type, reference.content_type),
-	                  OptionalIntegerFromReference(reference.has_range, reference.position),
-	                  OptionalIntegerFromReference(reference.has_range, reference.size),
-	                  OptionalStringFromReference(reference.has_checksum, reference.checksum));
-}
-
 Value PythonFile::ToValue() const {
-	return MakeReference(url, content_type, position, size, checksum).ToValue();
+	return MakeReference(url, content_type, position, size, checksum, media_type).ToValue();
 }
 
 string PythonFile::ToString() const {
@@ -213,7 +312,24 @@ string PythonFile::ToString() const {
 
 string PythonFile::Repr() const {
 	auto state = State();
-	return "File(url=" + py::repr(state[FileLogicalType::URL]).cast<string>() +
+	string class_name;
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		class_name = "File";
+		break;
+	case FileMediaType::IMAGE:
+		class_name = "ImageFile";
+		break;
+	case FileMediaType::AUDIO:
+		class_name = "AudioFile";
+		break;
+	case FileMediaType::VIDEO:
+		class_name = "VideoFile";
+		break;
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+	return class_name + "(url=" + py::repr(state[FileLogicalType::URL]).cast<string>() +
 	       ", content_type=" + py::repr(state[FileLogicalType::CONTENT_TYPE]).cast<string>() +
 	       ", position=" + py::repr(state[FileLogicalType::POSITION]).cast<string>() +
 	       ", size=" + py::repr(state[FileLogicalType::SIZE]).cast<string>() +
@@ -221,8 +337,8 @@ string PythonFile::Repr() const {
 }
 
 bool PythonFile::Equals(const PythonFile &other) const {
-	return url == other.url && content_type == other.content_type && position == other.position && size == other.size &&
-	       checksum == other.checksum;
+	return media_type == other.media_type && url == other.url && content_type == other.content_type &&
+	       position == other.position && size == other.size && checksum == other.checksum;
 }
 
 bool PythonFile::NotEquals(const PythonFile &other) const {
@@ -230,7 +346,7 @@ bool PythonFile::NotEquals(const PythonFile &other) const {
 }
 
 Py_hash_t PythonFile::Hash() const {
-	return py::hash(State());
+	return py::hash(py::make_tuple(static_cast<int>(media_type), url, content_type, position, size, checksum));
 }
 
 py::tuple PythonFile::State() const {
@@ -270,6 +386,25 @@ const std::optional<int64_t> &PythonFile::Size() const {
 
 const std::optional<string> &PythonFile::Checksum() const {
 	return checksum;
+}
+
+FileMediaType PythonFile::MediaType() const {
+	return media_type;
+}
+
+PythonImageFile::PythonImageFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
+                                 std::optional<int64_t> size, std::optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::IMAGE) {
+}
+
+PythonAudioFile::PythonAudioFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
+                                 std::optional<int64_t> size, std::optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::AUDIO) {
+}
+
+PythonVideoFile::PythonVideoFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
+                                 std::optional<int64_t> size, std::optional<string> checksum)
+    : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::VIDEO) {
 }
 
 } // namespace duckdb

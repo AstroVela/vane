@@ -15,6 +15,11 @@ import vane
 
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 FILE_METHODS = ("exists", "mime_type", "open", "stat", "to_tempfile")
+MEDIA_FILE_CASES = (
+    ("image", "IMAGEFILE", vane.ImageFile, vane.image_file),
+    ("audio", "AUDIOFILE", vane.AudioFile, vane.audio_file),
+    ("video", "VIDEOFILE", vane.VideoFile, vane.video_file),
+)
 
 
 def test_file_value_contract():
@@ -140,6 +145,251 @@ def test_file_data_type_contract():
     ]
     assert dtype.url == vane.sqltypes.VARCHAR
     assert pickle.loads(pickle.dumps(dtype)).is_file()
+
+
+def test_media_type_contract():
+    values = (
+        vane.MediaType.unknown(),
+        vane.MediaType.image(),
+        vane.MediaType.audio(),
+        vane.MediaType.video(),
+    )
+
+    assert [repr(value) for value in values] == [
+        "MediaType.unknown()",
+        "MediaType.image()",
+        "MediaType.audio()",
+        "MediaType.video()",
+    ]
+    assert len(set(values)) == 4
+    assert vane.MediaType.image() == vane.MediaType.image()
+    with pytest.raises(TypeError):
+        vane.MediaType()
+
+
+@pytest.mark.parametrize(("media", "type_name", "value_class", "_constructor"), MEDIA_FILE_CASES)
+def test_media_file_data_type_contract(media, type_name, value_class, _constructor):
+    media_type = getattr(vane.MediaType, media)()
+    dtype = vane.file_type(media_type)
+
+    assert str(dtype) == type_name
+    assert dtype.id == "struct"
+    assert dtype.is_file()
+    assert dtype == vane.sqltype(type_name)
+    assert dtype != vane.file_type()
+    assert pickle.loads(pickle.dumps(dtype)) == dtype
+    assert issubclass(value_class, vane.File)
+
+
+@pytest.mark.parametrize(("media", "type_name", "value_class", "_constructor"), MEDIA_FILE_CASES)
+def test_media_file_python_value_contract(media, type_name, value_class, _constructor):
+    value = value_class(
+        f"memory://{media}",
+        f"{media}/test",
+        1,
+        2,
+        f"sha256:{media}",
+    )
+
+    assert isinstance(value, vane.File)
+    assert type(value) is value_class
+    assert tuple(getattr(value, field) for field in FILE_FIELDS) == (
+        f"memory://{media}",
+        f"{media}/test",
+        1,
+        2,
+        f"sha256:{media}",
+    )
+    assert repr(value).startswith(f"{value_class.__name__}(url=")
+    assert pickle.loads(pickle.dumps(value)) == value
+    assert type(pickle.loads(pickle.dumps(value))) is value_class
+    generic = vane.File(value.url, value.content_type, value.position, value.size, value.checksum)
+    assert value != generic
+    assert len({value, generic}) == 2
+    assert {name for name in dir(value) if not name.startswith("_")} == set(FILE_FIELDS + FILE_METHODS)
+
+
+def test_media_file_value_inherits_reader_and_metadata_behavior(tmp_path):
+    path = tmp_path / "image.bin"
+    path.write_bytes(b"prefix-image-suffix")
+    value = vane.ImageFile(str(path), "image/png", 7, 5, "sha256:image")
+
+    assert value.exists()
+    assert value.stat()["url"] == str(path)
+    assert value.mime_type() == "image/png"
+    with value.open(buffer_size=2) as reader:
+        assert reader.read() == b"image"
+    with value.to_tempfile(buffer_size=2) as temporary:
+        assert temporary.read() == b"image"
+
+
+@pytest.mark.parametrize(("media", "type_name", "value_class", "constructor"), MEDIA_FILE_CASES)
+def test_media_file_expression_constructor_is_pure_and_materializes_exact_type(
+    duckdb_cursor,
+    media,
+    type_name,
+    value_class,
+    constructor,
+):
+    value = (
+        duckdb_cursor.sql("SELECT 1").select(constructor("memory://missing", verify=False).alias("value")).fetchone()[0]
+    )
+
+    assert type(value) is value_class
+    assert value == value_class("memory://missing")
+    assert str(duckdb_cursor.sql("SELECT 1").select(constructor("memory://missing")).types[0]) == type_name
+
+    from_method = (
+        duckdb_cursor.sql("SELECT 'memory://method' AS url")
+        .select(vane.col("url").as_file(getattr(vane.MediaType, media)()))
+        .fetchone()[0]
+    )
+    assert type(from_method) is value_class
+    assert from_method == value_class("memory://method")
+
+
+def test_media_file_constructor_accepts_bound_string_parameter(duckdb_cursor):
+    row = duckdb_cursor.execute("SELECT image_file(?)", ["memory://parameter"]).fetchone()
+
+    assert row == (vane.ImageFile("memory://parameter"),)
+
+
+def test_media_file_expression_and_generic_file_functions(duckdb_cursor):
+    image = vane.ImageFile("memory://image.png", "image/png", 2, 4, "sha256:image")
+    row = duckdb_cursor.sql(
+        """
+        SELECT
+            image_file(file('memory://image.png', 'image/png', 2, 4, 'sha256:image')) AS image,
+            [audio_file('memory://audio.mp3'), NULL::AUDIOFILE] AS audio,
+            struct_pack(video := video_file('memory://video.mp4')) AS nested,
+            typeof(file_enrich(image_file('memory://image.png'), [])) AS enriched_type,
+            file_path(image_file('memory://image.png')) AS path,
+            file_same_location(image_file('memory://same'), video_file('memory://same')) AS same_location
+        """
+    ).fetchone()
+
+    assert row == (
+        image,
+        [vane.AudioFile("memory://audio.mp3"), None],
+        {"video": vane.VideoFile("memory://video.mp4")},
+        "IMAGEFILE",
+        "memory://image.png",
+        True,
+    )
+
+
+def test_file_family_functions_keep_untyped_null_calls_unambiguous(duckdb_cursor):
+    row = duckdb_cursor.sql(
+        """
+        SELECT
+            typeof(file_enrich(NULL, [])),
+            file_path(NULL),
+            file_mime_type(NULL),
+            file_same_location(NULL, image_file('memory://image')),
+            file_same_content(video_file('memory://video'), NULL)
+        """
+    ).fetchone()
+
+    assert row == ("FILE", None, None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("value", "dtype", "expected_type"),
+    [
+        (
+            [vane.ImageFile("memory://image"), None],
+            vane.list_type(vane.file_type(vane.MediaType.image())),
+            "IMAGEFILE[]",
+        ),
+        (
+            [vane.AudioFile("memory://audio")],
+            vane.array_type(vane.file_type(vane.MediaType.audio()), 1),
+            "AUDIOFILE[1]",
+        ),
+        (
+            {"media": vane.VideoFile("memory://video")},
+            vane.struct_type({"media": vane.file_type(vane.MediaType.video())}),
+            "STRUCT(media VIDEOFILE)",
+        ),
+        (
+            {"image": vane.ImageFile("memory://image")},
+            vane.map_type(vane.sqltypes.VARCHAR, vane.file_type(vane.MediaType.image())),
+            "MAP(VARCHAR, IMAGEFILE)",
+        ),
+        (
+            [vane.AudioFile("memory://audio")],
+            vane.tensor_type(vane.file_type(vane.MediaType.audio()), (1,)),
+            "TENSOR(AUDIOFILE, [1])",
+        ),
+    ],
+)
+def test_declared_nested_media_file_types_preserve_specialization(duckdb_cursor, value, dtype, expected_type):
+    actual_type, actual = duckdb_cursor.execute("SELECT typeof($1), $1", [vane.Value(value, dtype)]).fetchone()
+
+    assert actual_type == expected_type
+    if isinstance(value, list) and expected_type.endswith("[1]"):
+        assert actual == tuple(value)
+    elif expected_type.startswith("TENSOR"):
+        assert actual == tuple(value)
+    else:
+        assert actual == value
+
+
+def test_declared_media_file_value_requires_matching_python_subclass(duckdb_cursor):
+    image_type = vane.file_type(vane.MediaType.image())
+
+    for value in (vane.File("memory://generic"), vane.AudioFile("memory://audio")):
+        with pytest.raises(vane.InvalidInputException, match="cannot be converted to IMAGEFILE"):
+            duckdb_cursor.execute("SELECT $1", [vane.Value(value, image_type)]).fetchone()
+
+
+def test_media_file_direct_comparison_requires_matching_specialization(duckdb_cursor):
+    with pytest.raises(vane.BinderException, match="IMAGEFILE.*AUDIOFILE"):
+        duckdb_cursor.sql("SELECT image_file('x') = audio_file('x')")
+    with pytest.raises(vane.BinderException, match="IMAGEFILE.*FILE"):
+        duckdb_cursor.sql("SELECT image_file('x') = file('x', NULL, NULL, NULL, NULL)")
+    with pytest.raises(vane.BinderException, match=r"image_file\(\).*AUDIOFILE"):
+        duckdb_cursor.sql("SELECT image_file(audio_file('x'))")
+    with pytest.raises(vane.BinderException, match=r"image_file\(\).*JSON"):
+        duckdb_cursor.sql("SELECT image_file(json '\"memory://image\"')")
+
+
+@pytest.mark.parametrize(
+    ("constructor", "value_class", "suffix", "payload", "content_type"),
+    [
+        (vane.image_file, vane.ImageFile, ".png", bytes.fromhex("89504e470d0a1a0a"), "image/png"),
+        (vane.audio_file, vane.AudioFile, ".mp3", bytes.fromhex("fffb9064"), "audio/mpeg"),
+        (vane.video_file, vane.VideoFile, ".mpg", bytes.fromhex("000001ba"), "video/mpeg"),
+    ],
+)
+def test_media_file_verify_uses_bounded_content_detection(
+    duckdb_cursor,
+    tmp_path,
+    constructor,
+    value_class,
+    suffix,
+    payload,
+    content_type,
+):
+    path = tmp_path / f"media{suffix}"
+    prefix = b"prefix"
+    path.write_bytes(prefix + payload + b"suffix")
+
+    source = vane.file(str(path), position=len(prefix), size=len(payload))
+    value = duckdb_cursor.sql("SELECT 1").select(constructor(source, verify=True)).fetchone()[0]
+
+    assert type(value) is value_class
+    assert value.content_type == content_type
+    assert (value.position, value.size) == (len(prefix), len(payload))
+
+
+def test_pandas_media_file_columns_preserve_specialization(duckdb_cursor):
+    values = [vane.ImageFile("memory://first"), None, vane.ImageFile("memory://second", "image/png")]
+    relation = duckdb_cursor.from_df(pd.DataFrame({"value": values}))
+
+    assert str(relation.types[0]) == "IMAGEFILE"
+    assert relation.types[0].is_file()
+    assert [row[0] for row in relation.fetchall()] == values
 
 
 def test_local_file_results_materialize_recursively(duckdb_cursor):
@@ -1232,7 +1482,7 @@ def test_file_does_not_implicitly_convert_to_plain_struct():
             "checksum": vane.sqltypes.VARCHAR,
         }
     )
-    with pytest.raises(vane.InvalidInputException, match="only be converted to FILE"):
+    with pytest.raises(vane.InvalidInputException, match="cannot be converted to STRUCT"):
         vane.ConstantExpression(vane.Value(vane.File("memory://value"), plain_struct))
 
 

@@ -38,7 +38,7 @@ namespace udf_helpers {
 
 LogicalType SerializableContractType(const LogicalType &type) {
 	if (FileLogicalType::IsFile(type)) {
-		return FileLogicalType::Create();
+		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}
 	if (type.IsJSONType()) {
 		return LogicalType::JSON();

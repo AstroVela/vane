@@ -1683,7 +1683,60 @@ LogicalType LogicalType::STRUCT(child_list_t<LogicalType> children) {
 	return LogicalType(LogicalTypeId::STRUCT, std::move(info));
 }
 
-LogicalType FileLogicalType::Create() {
+const FileMediaType FileLogicalType::MEDIA_TYPES[] = {FileMediaType::UNKNOWN, FileMediaType::IMAGE,
+                                                      FileMediaType::AUDIO, FileMediaType::VIDEO};
+
+const char *FileLogicalType::GetTypeName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return TYPE_NAME;
+	case FileMediaType::IMAGE:
+		return IMAGE_TYPE_NAME;
+	case FileMediaType::AUDIO:
+		return AUDIO_TYPE_NAME;
+	case FileMediaType::VIDEO:
+		return VIDEO_TYPE_NAME;
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+const char *FileLogicalType::GetConstructorName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return "file";
+	case FileMediaType::IMAGE:
+		return "image_file";
+	case FileMediaType::AUDIO:
+		return "audio_file";
+	case FileMediaType::VIDEO:
+		return "video_file";
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+bool FileLogicalType::TryParseTypeName(const string &type_name, FileMediaType &media_type) {
+	if (StringUtil::CIEquals(type_name, TYPE_NAME)) {
+		media_type = FileMediaType::UNKNOWN;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, IMAGE_TYPE_NAME)) {
+		media_type = FileMediaType::IMAGE;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, AUDIO_TYPE_NAME)) {
+		media_type = FileMediaType::AUDIO;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, VIDEO_TYPE_NAME)) {
+		media_type = FileMediaType::VIDEO;
+		return true;
+	}
+	return false;
+}
+
+LogicalType FileLogicalType::Create(FileMediaType media_type) {
 	child_list_t<LogicalType> children;
 	children.reserve(FIELD_COUNT);
 	children.emplace_back("url", LogicalType::VARCHAR);
@@ -1693,14 +1746,15 @@ LogicalType FileLogicalType::Create() {
 	children.emplace_back("checksum", LogicalType::VARCHAR);
 
 	auto result = LogicalType::STRUCT(std::move(children));
-	result.SetAlias(TYPE_NAME);
+	result.SetAlias(GetTypeName(media_type));
 	return result;
 }
 
 bool FileLogicalType::IsFile(const LogicalType &type) {
+	FileMediaType media_type;
 	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
 	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
-	    type.GetAlias() != TYPE_NAME) {
+	    !TryParseTypeName(type.GetAlias(), media_type) || type.GetAlias() != GetTypeName(media_type)) {
 		return false;
 	}
 	auto &children = StructType::GetChildTypes(type);
@@ -1712,6 +1766,14 @@ bool FileLogicalType::IsFile(const LogicalType &type) {
 	       children[POSITION].first == "position" && children[POSITION].second == LogicalType::BIGINT &&
 	       children[SIZE].first == "size" && children[SIZE].second == LogicalType::BIGINT &&
 	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
+}
+
+FileMediaType FileLogicalType::GetMediaType(const LogicalType &type) {
+	FileMediaType media_type;
+	if (!IsFile(type) || !TryParseTypeName(type.GetAlias(), media_type)) {
+		throw InternalException("Expected a canonical FILE-family logical type, got %s", type.ToString());
+	}
+	return media_type;
 }
 
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT

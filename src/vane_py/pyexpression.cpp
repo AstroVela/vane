@@ -109,14 +109,16 @@ shared_ptr<DuckDBPyExpression> DuckDBPyExpression::Collate(const string &collati
 	return make_shared_ptr<DuckDBPyExpression>(std::move(collation_expression));
 }
 
-shared_ptr<DuckDBPyExpression> DuckDBPyExpression::AsFile() const {
+shared_ptr<DuckDBPyExpression> DuckDBPyExpression::AsFile(FileMediaType media_type) const {
 	vector<unique_ptr<ParsedExpression>> children;
-	children.reserve(FileLogicalType::FIELD_COUNT);
 	children.push_back(GetExpression().Copy());
-	for (idx_t index = 1; index < FileLogicalType::FIELD_COUNT; index++) {
-		children.push_back(make_uniq<duckdb::ConstantExpression>(Value()));
+	if (media_type == FileMediaType::UNKNOWN) {
+		children.reserve(FileLogicalType::FIELD_COUNT);
+		for (idx_t index = 1; index < FileLogicalType::FIELD_COUNT; index++) {
+			children.push_back(make_uniq<duckdb::ConstantExpression>(Value()));
+		}
 	}
-	return InternalFunctionExpression("file", std::move(children));
+	return InternalFunctionExpression(FileLogicalType::GetConstructorName(media_type), std::move(children));
 }
 
 shared_ptr<DuckDBPyExpression> DuckDBPyExpression::FileField(const string &field) const {

@@ -237,6 +237,32 @@ static void PreparePromptMedia(ClientContext &context, const Value &value, bool 
 
 static bool IsPromptFileList(const LogicalType &type);
 
+static LogicalType PromptNullFileSentinelType() {
+	LogicalType result(LogicalTypeId::TIMESTAMP);
+	result.SetAlias("__VANE_AI_PROMPT_NULL_FILE");
+	return result;
+}
+
+static LogicalType PromptNullFilesSentinelType() {
+	LogicalType result(LogicalTypeId::TIMESTAMP_MS);
+	result.SetAlias("__VANE_AI_PROMPT_NULL_FILES");
+	return result;
+}
+
+static LogicalType PromptEmptyFilesSentinelType() {
+	LogicalType child(LogicalTypeId::TIMESTAMP_NS);
+	child.SetAlias("__VANE_AI_PROMPT_EMPTY_FILE_ELEMENT");
+	return LogicalType::LIST(child);
+}
+
+static bool IsPromptNullFileSentinel(const LogicalType &type) {
+	return type == PromptNullFileSentinelType();
+}
+
+static bool IsPromptNullFilesSentinel(const LogicalType &type) {
+	return type == PromptNullFilesSentinelType() || type == PromptEmptyFilesSentinelType();
+}
+
 struct MaterializedPromptFileInput {
 	Value value;
 	bool has_error;
@@ -784,9 +810,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	if (has_media_input) {
 		auto media_type = arguments[1]->return_type;
-		if (media_type.id() == LogicalTypeId::SQLNULL && bound_function.arguments.size() > 1) {
-			media_type = bound_function.arguments[1];
-		}
 		if (media_type == LogicalType::BLOB) {
 			prompt_input_kind = PromptInputKind::BLOB;
 		} else if (media_type == LogicalType::LIST(LogicalType::BLOB)) {
@@ -794,6 +817,10 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		} else if (FileLogicalType::IsFile(media_type)) {
 			prompt_input_kind = PromptInputKind::FILE;
 		} else if (IsPromptFileList(media_type)) {
+			prompt_input_kind = PromptInputKind::FILE_LIST;
+		} else if (IsPromptNullFileSentinel(media_type)) {
+			prompt_input_kind = PromptInputKind::FILE;
+		} else if (IsPromptNullFilesSentinel(media_type)) {
 			prompt_input_kind = PromptInputKind::FILE_LIST;
 		} else {
 			throw BinderException("ai_prompt media argument must be BLOB, BLOB[], FILE, or FILE[]");
@@ -843,7 +870,8 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 	}
 	if (prompt_input_kind == PromptInputKind::FILE || prompt_input_kind == PromptInputKind::FILE_LIST) {
-		if (arguments[1]->return_type.id() == LogicalTypeId::SQLNULL) {
+		if (IsPromptNullFileSentinel(arguments[1]->return_type) ||
+		    IsPromptNullFilesSentinel(arguments[1]->return_type)) {
 			auto file_type = FileLogicalType::Create();
 			auto target_type =
 			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
@@ -1057,11 +1085,22 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::JSON(),
 	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                    LogicalType::VARCHAR, LogicalType::ANY});
-	auto file_type = FileLogicalType::Create();
-	add_implementation({LogicalType::VARCHAR, file_type, LogicalType::JSON(), LogicalType::VARCHAR,
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_type = FileLogicalType::Create(media_type);
+		add_implementation({LogicalType::VARCHAR, file_type, LogicalType::JSON(), LogicalType::VARCHAR,
+		                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+		                    LogicalType::ANY});
+		add_implementation({LogicalType::VARCHAR, LogicalType::LIST(file_type), LogicalType::JSON(),
+		                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
+		                    LogicalType::VARCHAR, LogicalType::ANY});
+	}
+	add_implementation({LogicalType::VARCHAR, PromptNullFileSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
 	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
 	                    LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(file_type), LogicalType::JSON(), LogicalType::VARCHAR,
+	add_implementation({LogicalType::VARCHAR, PromptNullFilesSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                    LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, PromptEmptyFilesSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
 	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
 	                    LogicalType::ANY});
 	return set;
@@ -1123,10 +1162,21 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	info->macros.push_back(make_function(&blob_type, "image"));
 	auto blob_list_type = LogicalType::LIST(LogicalType::BLOB);
 	info->macros.push_back(make_function(&blob_list_type, "images"));
-	auto file_type = FileLogicalType::Create();
-	info->macros.push_back(make_function(&file_type, "file"));
-	auto file_list_type = LogicalType::LIST(file_type);
-	info->macros.push_back(make_function(&file_list_type, "files"));
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_type = FileLogicalType::Create(media_type);
+		info->macros.push_back(make_function(&file_type, "file"));
+		auto file_list_type = LogicalType::LIST(file_type);
+		info->macros.push_back(make_function(&file_list_type, "files"));
+	}
+	// The four FILE-family aliases have equal cast cost from untyped NULLs. These
+	// internal aliases select the named fallbacks without admitting non-FILE
+	// values or tying the pre-existing positional BLOB/BLOB[] overloads.
+	auto null_file_type = PromptNullFileSentinelType();
+	info->macros.push_back(make_function(&null_file_type, "file"));
+	auto null_files_type = PromptNullFilesSentinelType();
+	info->macros.push_back(make_function(&null_files_type, "files"));
+	auto null_list_type = PromptEmptyFilesSentinelType();
+	info->macros.push_back(make_function(&null_list_type, "files"));
 	return info;
 }
 

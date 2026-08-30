@@ -16,8 +16,10 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/planner/expression.hpp"
 
 #include <cerrno>
 
@@ -254,7 +256,7 @@ static void FileEnrichFunction(DataChunk &args, ExpressionState &state, Vector &
 		FileReference file;
 		auto fields_value = args.data[1].GetValue(row);
 		if (!TryGetFile(args, 0, row, "file_enrich", file) || fields_value.IsNull()) {
-			result.SetValue(row, NullValue(FileLogicalType::Create()));
+			result.SetValue(row, NullValue(result.GetType()));
 			continue;
 		}
 		bool enrich_size = false;
@@ -386,14 +388,49 @@ static void FileContentIdFunction(DataChunk &args, ExpressionState &, Vector &re
 }
 
 static ScalarFunction MakeScalarFunction(const string &name, vector<LogicalType> arguments, LogicalType return_type,
-                                         scalar_function_t function, bool accesses_storage = false) {
-	ScalarFunction result(name, std::move(arguments), std::move(return_type), std::move(function));
+                                         scalar_function_t function, bool accesses_storage = false,
+                                         bind_scalar_function_t bind = nullptr) {
+	ScalarFunction result(name, std::move(arguments), std::move(return_type), std::move(function), std::move(bind));
 	result.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	result.SetFallible();
 	if (accesses_storage) {
 		result.SetStability(FunctionStability::VOLATILE);
 	}
 	return result;
+}
+
+static const LogicalType &BindFileFamilyArgument(ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments, idx_t index,
+                                                 const string &function_name) {
+	auto &input_type = arguments[index]->return_type;
+	if (input_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+	if (input_type.id() != LogicalTypeId::SQLNULL && !FileLogicalType::IsFile(input_type)) {
+		throw BinderException("%s() requires a FILE-family value, not %s", function_name, input_type.ToString());
+	}
+	bound_function.arguments[index] = input_type;
+	return input_type;
+}
+
+static unique_ptr<FunctionData> BindFileFamilyUnary(ClientContext &, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	BindFileFamilyArgument(bound_function, arguments, 0, bound_function.name);
+	return nullptr;
+}
+
+static unique_ptr<FunctionData> BindFileEnrich(ClientContext &, ScalarFunction &bound_function,
+                                               vector<unique_ptr<Expression>> &arguments) {
+	auto &input_type = BindFileFamilyArgument(bound_function, arguments, 0, bound_function.name);
+	bound_function.SetReturnType(FileLogicalType::IsFile(input_type) ? input_type : FileLogicalType::Create());
+	return nullptr;
+}
+
+static unique_ptr<FunctionData> BindFileIdentity(ClientContext &, ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	BindFileFamilyArgument(bound_function, arguments, 0, bound_function.name);
+	BindFileFamilyArgument(bound_function, arguments, 1, bound_function.name);
+	return nullptr;
 }
 
 } // namespace
@@ -403,23 +440,30 @@ vector<ScalarFunction> FileMetadataFunctions::GetFunctions() {
 	vector<ScalarFunction> result;
 	result.push_back(MakeScalarFunction("to_file", {LogicalType::VARCHAR}, file_type, ToFileFunction<false>, true));
 	result.push_back(MakeScalarFunction("try_to_file", {LogicalType::VARCHAR}, file_type, ToFileFunction<true>, true));
-	result.push_back(MakeScalarFunction("file_enrich", {file_type, LogicalType::LIST(LogicalType::VARCHAR)}, file_type,
-	                                    FileEnrichFunction, true));
-	result.push_back(MakeScalarFunction("file_path", {file_type}, LogicalType::VARCHAR, FilePathFunction));
-	result.push_back(MakeScalarFunction("file_size", {file_type}, LogicalType::UBIGINT, FileSizeFunction, true));
-	result.push_back(MakeScalarFunction("file_exists", {file_type}, LogicalType::BOOLEAN, FileExistsFunction, true));
-	result.push_back(MakeScalarFunction("file_stat", {file_type}, FileStatValue::Type(), FileStatFunction, true));
-	result.push_back(MakeScalarFunction("file_mime_type", {file_type}, LogicalType::VARCHAR, FileMimeTypeFunction));
-	result.push_back(MakeScalarFunction("file_mime_type", {file_type, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                                    FileMimeTypeFunction, true));
 	result.push_back(
 	    MakeScalarFunction("guess_mime_type", {LogicalType::BLOB}, LogicalType::VARCHAR, GuessMimeTypeFunction));
-	result.push_back(MakeScalarFunction("file_same_location", {file_type, file_type}, LogicalType::BOOLEAN,
-	                                    FileSameLocationFunction));
-	result.push_back(
-	    MakeScalarFunction("file_same_content", {file_type, file_type}, LogicalType::BOOLEAN, FileSameContentFunction));
-	result.push_back(MakeScalarFunction("file_locator_id", {file_type}, LogicalType::VARCHAR, FileLocatorIdFunction));
-	result.push_back(MakeScalarFunction("file_content_id", {file_type}, LogicalType::VARCHAR, FileContentIdFunction));
+	result.push_back(MakeScalarFunction("file_enrich", {LogicalType::ANY, LogicalType::LIST(LogicalType::VARCHAR)},
+	                                    file_type, FileEnrichFunction, true, BindFileEnrich));
+	result.push_back(MakeScalarFunction("file_path", {LogicalType::ANY}, LogicalType::VARCHAR, FilePathFunction, false,
+	                                    BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_size", {LogicalType::ANY}, LogicalType::UBIGINT, FileSizeFunction, true,
+	                                    BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_exists", {LogicalType::ANY}, LogicalType::BOOLEAN, FileExistsFunction,
+	                                    true, BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_stat", {LogicalType::ANY}, FileStatValue::Type(), FileStatFunction, true,
+	                                    BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_mime_type", {LogicalType::ANY}, LogicalType::VARCHAR,
+	                                    FileMimeTypeFunction, false, BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_mime_type", {LogicalType::ANY, LogicalType::VARCHAR},
+	                                    LogicalType::VARCHAR, FileMimeTypeFunction, true, BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_locator_id", {LogicalType::ANY}, LogicalType::VARCHAR,
+	                                    FileLocatorIdFunction, false, BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_content_id", {LogicalType::ANY}, LogicalType::VARCHAR,
+	                                    FileContentIdFunction, false, BindFileFamilyUnary));
+	result.push_back(MakeScalarFunction("file_same_location", {LogicalType::ANY, LogicalType::ANY},
+	                                    LogicalType::BOOLEAN, FileSameLocationFunction, false, BindFileIdentity));
+	result.push_back(MakeScalarFunction("file_same_content", {LogicalType::ANY, LogicalType::ANY}, LogicalType::BOOLEAN,
+	                                    FileSameContentFunction, false, BindFileIdentity));
 	return result;
 }
 
