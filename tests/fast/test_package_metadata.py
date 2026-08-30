@@ -43,6 +43,7 @@ def test_vane_public_exports_are_unique_and_resolvable():
         "file_type",
         "func",
         "lit",
+        "load_installed_extension",
         "sql_expr",
     }
     assert expected_vane_exports <= set(vane.__all__)

@@ -566,31 +566,11 @@ def _load_installed_dynamic_extension_providers(
     descriptor_by_name = {descriptor.name: descriptor for descriptor in descriptors}
     if not descriptor_by_name:
         return ()
-    try:
-        installed_entry_points = tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
-    except Exception as exception:
-        raise DynamicExtensionError(
-            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
-        ) from exception
+    installed_entry_points = _installed_dynamic_extension_provider_entry_points()
 
     providers: list[LocalExtensionProvider] = []
     for name, descriptor in sorted(descriptor_by_name.items()):
-        matches = [installed for installed in installed_entry_points if installed.name == name]
-        if not matches:
-            _fail("PROVIDER_NOT_FOUND", f"no installed local provider entry point exists for {name}")
-        if len(matches) != 1:
-            _fail("PROVIDER_AMBIGUOUS", f"multiple installed local provider entry points exist for {name}")
-        try:
-            provider_factory = matches[0].load()
-            provider = provider_factory()
-        except DynamicExtensionError:
-            raise
-        except Exception as exception:
-            raise DynamicExtensionError(
-                "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
-            ) from exception
-        if not isinstance(provider, LocalExtensionProvider):
-            _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+        provider = _load_installed_dynamic_extension_provider(name, installed_entry_points)
         artifact = provider.find(descriptor.identity)
         if artifact is None or artifact.descriptor != descriptor:
             _fail(
@@ -608,6 +588,136 @@ def _load_installed_dynamic_extension_providers(
             )
         )
     return tuple(providers)
+
+
+def _installed_dynamic_extension_provider_entry_points() -> tuple[object, ...]:
+    """Enumerate installed provider metadata without initializing providers."""
+    try:
+        return tuple(entry_points(group=_DYNAMIC_EXTENSION_PROVIDER_ENTRY_POINT_GROUP))
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_DISCOVERY_FAILED", "could not enumerate installed dynamic extension providers"
+        ) from exception
+
+
+def _load_installed_dynamic_extension_provider(
+    name: str,
+    installed_entry_points: tuple[object, ...],
+) -> LocalExtensionProvider:
+    """Initialize the one installed provider authorized for a canonical name."""
+    matches = [installed for installed in installed_entry_points if getattr(installed, "name", None) == name]
+    if not matches:
+        _fail("PROVIDER_NOT_FOUND", f"no installed local provider entry point exists for {name}")
+    if len(matches) != 1:
+        _fail("PROVIDER_AMBIGUOUS", f"multiple installed local provider entry points exist for {name}")
+    try:
+        provider_factory = matches[0].load()  # type: ignore[attr-defined]
+        provider = provider_factory()
+    except DynamicExtensionError:
+        raise
+    except Exception as exception:
+        raise DynamicExtensionError(
+            "PROVIDER_INVALID", f"could not initialize installed local provider for {name}"
+        ) from exception
+    if not isinstance(provider, LocalExtensionProvider):
+        _fail("PROVIDER_INVALID", f"installed local provider for {name} did not return LocalExtensionProvider")
+    return provider
+
+
+def load_installed_extension(
+    name: str,
+    *,
+    connection: DuckDBPyConnection,
+) -> ResolvedDynamicExtension:
+    """Load one named installed provider and its exact dependency closure.
+
+    Provider discovery is limited to the canonical entry-point name and the
+    dependency identities declared by its descriptor. The installed provider
+    packages form the local trust boundary; this helper performs no repository,
+    directory, download, compatibility, or fallback lookup.
+    """
+    canonical_name = _validate_extension_name(name, "provider name")
+    installed_entry_points = _installed_dynamic_extension_provider_entry_points()
+    provider_by_name: dict[str, LocalExtensionProvider] = {}
+
+    def installed_provider(provider_name: str) -> LocalExtensionProvider:
+        provider = provider_by_name.get(provider_name)
+        if provider is None:
+            provider = _load_installed_dynamic_extension_provider(provider_name, installed_entry_points)
+            provider_by_name[provider_name] = provider
+        return provider
+
+    root_provider = installed_provider(canonical_name)
+    root_artifacts = tuple(
+        artifact
+        for artifact in root_provider._artifact_by_identity.values()
+        if artifact.descriptor.name == canonical_name
+    )
+    if not root_artifacts:
+        _fail(
+            "PROVIDER_DESCRIPTOR_MISMATCH",
+            f"installed local provider entry point {canonical_name} does not provide that extension",
+        )
+    if len(root_artifacts) != 1:
+        _fail(
+            "PROVIDER_AMBIGUOUS",
+            f"installed local provider entry point {canonical_name} provides multiple artifact identities",
+        )
+
+    root_descriptor = root_artifacts[0].descriptor
+    descriptor_by_identity: dict[str, DynamicExtensionDescriptor] = {}
+    descriptor_by_name: dict[str, DynamicExtensionDescriptor] = {}
+    scoped_provider_by_identity: dict[str, LocalExtensionProvider] = {}
+    pending = [root_descriptor]
+    while pending:
+        descriptor = pending.pop()
+        existing_identity = descriptor_by_identity.get(descriptor.identity)
+        if existing_identity is not None:
+            if existing_identity != descriptor:
+                _fail(
+                    "RESOLVED_IDENTITY_CONFLICT",
+                    f"{descriptor.identity} resolves to conflicting descriptors",
+                )
+            continue
+        existing_name = descriptor_by_name.get(descriptor.name)
+        if existing_name is not None and existing_name.identity != descriptor.identity:
+            _fail(
+                "RESOLVED_NAME_CONFLICT",
+                f"dependency graph resolves {descriptor.name} as both "
+                f"{existing_name.identity} and {descriptor.identity}",
+            )
+
+        provider = installed_provider(descriptor.name)
+        artifact = provider.find(descriptor.identity)
+        if artifact is None or artifact.descriptor != descriptor:
+            _fail(
+                "PROVIDER_DESCRIPTOR_MISMATCH",
+                f"installed local provider descriptor does not exactly match {descriptor.identity}",
+            )
+        descriptor_by_identity[descriptor.identity] = descriptor
+        descriptor_by_name[descriptor.name] = descriptor
+        scoped_provider_by_identity[descriptor.identity] = LocalExtensionProvider(
+            provider.trust_identity,
+            (artifact,),
+        )
+
+        dependency_descriptors: list[DynamicExtensionDescriptor] = []
+        for dependency in descriptor.dependencies:
+            dependency_provider = installed_provider(dependency.name)
+            dependency_artifact = dependency_provider.find(dependency.identity)
+            if dependency_artifact is None:
+                _fail(
+                    "DEPENDENCY_NOT_FOUND",
+                    f"installed local provider does not contain {dependency.identity}",
+                )
+            dependency_descriptors.append(dependency_artifact.descriptor)
+        pending.extend(reversed(dependency_descriptors))
+
+    resolver = DynamicExtensionResolver(
+        trusted_identities={descriptor.trust_identity for descriptor in descriptor_by_identity.values()},
+        providers=tuple(scoped_provider_by_identity.values()),
+    )
+    return resolver.load(connection, root_descriptor)
 
 
 def _prepare_dynamic_extension_snapshot(connection: DuckDBPyConnection, snapshot: object) -> None:
@@ -1477,4 +1587,5 @@ __all__ = [
     "LocalExtensionProvider",
     "ResolvedDynamicExtension",
     "create_dynamic_extension_descriptor",
+    "load_installed_extension",
 ]

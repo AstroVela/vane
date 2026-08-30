@@ -265,36 +265,24 @@ size-checked before it is compared with the generated wheel in bounded chunks.
 The complete generated member set is checked against the total uncompressed
 limit before a temporary wheel is created, including a second check after its
 RECORD is generated.
-Load locally by passing the wheel's provider explicitly to
-`DynamicExtensionResolver`:
+Load an installed provider and its exact dependency closure by canonical
+extension name:
 
 ```python
-from importlib import import_module
-from importlib.metadata import entry_points
-
 import vane
-from vane.extensions import DynamicExtensionResolver
 
-matches = [
-    candidate
-    for candidate in entry_points(group="vane.dynamic_extension_providers")
-    if candidate.name == "<extension>"
-]
-if len(matches) != 1:
-    raise RuntimeError(f"expected one installed provider, found {matches!r}")
-installed_extension = import_module(matches[0].module)
-local_provider = matches[0].load()()
 connection = vane.connect()
-DynamicExtensionResolver(
-    trusted_identities={local_provider.trust_identity},
-    providers=(local_provider,),
-).load(connection, installed_extension.descriptor())
+vane.load_installed_extension("<extension>", connection=connection)
 ```
 
-For an extension with dependencies, resolve each dependency provider through
-the same entry-point group and include all of them in `providers` and
-`trusted_identities`. Pass the same complete dependency-wheel closure to the
-verifier in load order with repeated `--dependency-wheel` arguments.
+The named entry point must provide exactly one root artifact. Vane initializes
+only that provider and the providers named by its exact descriptor dependency
+identities, verifies the complete closure before loading native code, and
+records dependencies before the root in the connection manifest. Advanced
+callers that already hold explicit descriptors and trust policy can continue to
+use `DynamicExtensionResolver` directly. Pass the same complete
+dependency-wheel closure to the verifier in load order with repeated
+`--dependency-wheel` arguments.
 
 The installed provider and resolver perform no network lookup at runtime.
 Package installation remains standard pip behavior; for an offline deployment,
@@ -326,12 +314,13 @@ extension loading. `tpch` remains an in-tree build/test artifact only: its
 source has additional redistribution terms and it must not be published as an
 extension wheel. #619 tracks the first release-approved Iceberg wheel.
 
-Applications load a trusted local artifact through
-`DynamicExtensionResolver.load()`. After DuckDB accepts the verified cache
-snapshot, Vane records the artifact's canonical `DynamicExtensionDescriptor`
-on the connection session. Ray snapshots preserve that ordered descriptor
-manifest, including each SHA-256 digest and dependency identity, but never a
-local artifact path or binary payload.
+Applications normally load a named installed provider through
+`load_installed_extension()`; callers with an explicit descriptor and trust
+policy can use `DynamicExtensionResolver.load()` directly. After DuckDB accepts
+the verified cache snapshot, Vane records the artifact's canonical
+`DynamicExtensionDescriptor` on the connection session. Ray snapshots preserve
+that ordered descriptor manifest, including each SHA-256 digest and dependency
+identity, but never a local artifact path or binary payload.
 
 Every Ray node must install the same platform extension wheels before queries
 start. Each wheel supplies one provider entry point under

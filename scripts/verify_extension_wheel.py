@@ -1051,7 +1051,6 @@ def _verify_extension_wheel_snapshots(
             from pathlib import Path
 
             import vane
-            from vane.extensions import DynamicExtensionResolver
 
             installed_entry_points = tuple(entry_points(group={ENTRY_POINT_GROUP!r}))
             provider_by_name = {{}}
@@ -1098,13 +1097,11 @@ def _verify_extension_wheel_snapshots(
 
             assert set(descriptor_by_name) == set({all_extension_names!r})
 
-            connection = vane.connect()
+            connection = vane.connect(
+                config={{"extension_directory": str(Path.cwd() / "duckdb-extensions")}}
+            )
             try:
-                resolved = DynamicExtensionResolver(
-                    trusted_identities={trusted_identities!r},
-                    providers=tuple(provider_by_name.values()),
-                    cache_directory=Path.cwd() / "extension-cache",
-                ).load(connection, descriptor)
+                resolved = vane.load_installed_extension({extension_name!r}, connection=connection)
                 assert resolved.identity == descriptor.identity
                 assert connection.execute(
                     "SELECT loaded FROM duckdb_extensions() WHERE extension_name = ?", [descriptor.name]
