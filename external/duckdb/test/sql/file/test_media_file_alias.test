@@ -37,6 +37,24 @@ SELECT
 ----
 IMAGEFILE	AUDIOFILE	VIDEOFILE
 
+# VARCHAR aliases retain ordinary VARCHAR function compatibility.
+statement ok
+CREATE TYPE media_url_alias AS VARCHAR
+
+query TTTTTT
+SELECT
+	typeof(image_file('image.png'::media_url_alias)), image_file('image.png'::media_url_alias).url,
+	typeof(audio_file('audio.mp3'::media_url_alias)), audio_file('audio.mp3'::media_url_alias).url,
+	typeof(video_file('video.mp4'::media_url_alias)), video_file('video.mp4'::media_url_alias).url
+----
+IMAGEFILE	image.png	AUDIOFILE	audio.mp3	VIDEOFILE	video.mp4
+
+# JSON is a semantic VARCHAR alias, not a file locator alias.
+statement error
+SELECT image_file(json '"image.png"')
+----
+<REGEX>:.*image_file.*requires VARCHAR, FILE, or IMAGEFILE.*JSON.*
+
 statement error
 SELECT image_file(audio_file('memory://audio'))
 ----

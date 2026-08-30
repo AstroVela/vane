@@ -1648,6 +1648,23 @@ string Value::ToSQLString() const {
 	if (IsNull()) {
 		return ToString();
 	}
+	if (FileLogicalType::IsFile(type_)) {
+		auto &children = StructValue::GetChildren(*this);
+		string file_expression = "file(";
+		for (idx_t index = 0; index < children.size(); index++) {
+			if (index > 0) {
+				file_expression += ", ";
+			}
+			file_expression += children[index].ToSQLString();
+		}
+		file_expression += ")";
+
+		auto media_type = FileLogicalType::GetMediaType(type_);
+		if (media_type == FileMediaType::UNKNOWN) {
+			return file_expression;
+		}
+		return string(FileLogicalType::GetConstructorName(media_type)) + "(" + file_expression + ")";
+	}
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:
 	case LogicalTypeId::DATE:

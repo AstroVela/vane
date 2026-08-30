@@ -118,7 +118,7 @@ static unique_ptr<FunctionData> BindMediaFileConstructor(ClientContext &, Scalar
 	if (input_type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
-	auto valid_input = (input_type.id() == LogicalTypeId::VARCHAR && !input_type.HasAlias()) ||
+	auto valid_input = (input_type.id() == LogicalTypeId::VARCHAR && !input_type.IsJSONType()) ||
 	                   input_type.id() == LogicalTypeId::STRING_LITERAL || input_type.id() == LogicalTypeId::SQLNULL;
 	if (FileLogicalType::IsFile(input_type)) {
 		auto input_media_type = FileLogicalType::GetMediaType(input_type);

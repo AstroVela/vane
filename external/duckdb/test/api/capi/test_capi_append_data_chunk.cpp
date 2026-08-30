@@ -93,6 +93,25 @@ TEST_CASE("FILE values are governed at C value and appender boundaries", "[capi]
 	REQUIRE(rendered);
 	REQUIRE(StringUtil::Contains(rendered, "image.png"));
 	duckdb_free(rendered);
+	REQUIRE(duckdb_get_int64(valid_file) == NumericLimits<int64_t>::Minimum());
+	auto invalid_bignum = duckdb_get_bignum(valid_file);
+	REQUIRE(!invalid_bignum.data);
+	REQUIRE(invalid_bignum.size == 0);
+	auto invalid_blob = duckdb_get_blob(valid_file);
+	REQUIRE(!invalid_blob.data);
+	REQUIRE(invalid_blob.size == 0);
+	auto invalid_bit = duckdb_get_bit(valid_file);
+	REQUIRE(!invalid_bit.data);
+	REQUIRE(invalid_bit.size == 0);
+
+	auto sql_string = duckdb_value_to_string(valid_file);
+	REQUIRE(sql_string);
+	REQUIRE(StringUtil::Contains(sql_string, "image_file(file("));
+	auto roundtrip_result = tester.Query("SELECT typeof(" + string(sql_string) + "), (" + string(sql_string) + ").url");
+	REQUIRE_NO_FAIL(*roundtrip_result);
+	REQUIRE(roundtrip_result->Fetch<string>(0, 0) == "IMAGEFILE");
+	REQUIRE(roundtrip_result->Fetch<string>(1, 0) == "image.png");
+	duckdb_free(sql_string);
 
 	// C value construction rejects every governed field invariant before the
 	// invalid logical value can reach an appender.
