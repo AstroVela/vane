@@ -236,11 +236,30 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 		return false;
 	}
 	auto &entries = ListValue::GetChildren(output_schema);
+	vector<LogicalType> contract_types;
+	Value output_contracts;
+	if (GetStructValueField(payload, "output_contract_types", output_contracts)) {
+		if (output_contracts.type().id() != LogicalTypeId::LIST) {
+			throw InvalidInputException("python_udf output_contract_types must be a LIST<VARCHAR>");
+		}
+		auto &contracts = ListValue::GetChildren(output_contracts);
+		if (contracts.size() != entries.size()) {
+			throw InvalidInputException("python_udf output contract count does not match output_schema");
+		}
+		contract_types.reserve(contracts.size());
+		for (auto &contract : contracts) {
+			if (contract.IsNull() || contract.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("python_udf output_contract_types must contain VARCHAR values");
+			}
+			contract_types.push_back(DBConfig::ParseLogicalType(StringValue::Get(contract)));
+		}
+	}
 	output_names.clear();
 	output_types.clear();
 	output_names.reserve(entries.size());
 	output_types.reserve(entries.size());
-	for (auto &entry : entries) {
+	for (idx_t index = 0; index < entries.size(); index++) {
+		auto &entry = entries[index];
 		if (entry.IsNull() || entry.type().id() != LogicalTypeId::STRUCT) {
 			throw InvalidInputException("python_udf output_schema entries must be STRUCT values");
 		}
@@ -255,7 +274,8 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema duckdb_type entry is missing type");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(DBConfig::ParseLogicalType(entry_type.second));
+			output_types.push_back(contract_types.empty() ? DBConfig::ParseLogicalType(entry_type.second)
+			                                              : contract_types[index]);
 			continue;
 		}
 		if (StringUtil::CIEquals(entry_kind.second, "tensor")) {
@@ -268,7 +288,9 @@ static bool TryParsePayloadOutputSchema(const Value &payload, vector<string> &ou
 				throw InvalidInputException("python_udf output_schema tensor entry is missing shape");
 			}
 			output_names.push_back(entry_name.second);
-			output_types.push_back(TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape));
+			output_types.push_back(contract_types.empty()
+			                           ? TensorType::Create(DBConfig::ParseLogicalType(entry_dtype.second), shape)
+			                           : contract_types[index]);
 			continue;
 		}
 		throw InvalidInputException("Unsupported python_udf output_schema kind '%s'", entry_kind.second);

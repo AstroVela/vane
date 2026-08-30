@@ -520,7 +520,51 @@ static pair<string, string> ParseSerializedNamedType(const string &input, const 
 	return make_pair(std::move(name), std::move(value_type));
 }
 
+static string ParseSerializedStringLiteral(const string &input, const string &full_type) {
+	string literal = input;
+	StringUtil::Trim(literal);
+	if (literal.size() < 2 || literal.front() != '\'' || literal.back() != '\'') {
+		throw InternalException("Ill formatted string literal in type: '%s'", full_type);
+	}
+	string result;
+	for (idx_t i = 1; i + 1 < literal.size(); i++) {
+		if (literal[i] != '\'') {
+			result += literal[i];
+			continue;
+		}
+		if (i + 1 >= literal.size() - 1 || literal[i + 1] != '\'') {
+			throw InternalException("Ill formatted string literal in type: '%s'", full_type);
+		}
+		result += '\'';
+		i++;
+	}
+	return result;
+}
+
+static uint8_t ParseSerializedDecimalParameter(const string &input, const string &full_type) {
+	string parameter = input;
+	StringUtil::Trim(parameter);
+	if (parameter.empty()) {
+		throw InternalException("Ill formatted decimal type: '%s'", full_type);
+	}
+
+	idx_t result = 0;
+	for (auto ch : parameter) {
+		if (!StringUtil::CharacterIsDigit(ch)) {
+			throw InternalException("Ill formatted decimal type: '%s'", full_type);
+		}
+		result = result * 10 + static_cast<idx_t>(ch - '0');
+		if (result > DecimalType::MaxWidth()) {
+			throw InternalException("Invalid decimal width or scale: '%s'", full_type);
+		}
+	}
+	return NumericCast<uint8_t>(result);
+}
+
 LogicalType DBConfig::ParseLogicalType(const string &type) {
+	if (StringUtil::CIEquals(type, "\"NULL\"") || StringUtil::CIEquals(type, "NULL")) {
+		return LogicalType::SQLNULL;
+	}
 	if (StringUtil::EndsWith(type, "[]")) {
 		// list - recurse
 		auto child_type = ParseLogicalType(type.substr(0, type.size() - 2));
@@ -548,48 +592,48 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 
 	auto upper_type = StringUtil::Upper(type);
+	if (upper_type == LogicalType::JSON_TYPE_NAME) {
+		return LogicalType::JSON();
+	}
+	if (upper_type == FileLogicalType::TYPE_NAME) {
+		return FileLogicalType::Create();
+	}
+	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto decimal_args_str = type.substr(8, type.size() - 9);
+		auto decimal_args = SplitSerializedTypeArguments(decimal_args_str, type);
+		if (decimal_args.size() != 2) {
+			throw InternalException("Ill formatted decimal type: '%s'", type);
+		}
+		auto width = ParseSerializedDecimalParameter(decimal_args[0], type);
+		auto scale = ParseSerializedDecimalParameter(decimal_args[1], type);
+		if (width == 0 || scale > width) {
+			throw InternalException("Invalid decimal width or scale: '%s'", type);
+		}
+		return LogicalType::DECIMAL(width, scale);
+	}
+	if (StringUtil::StartsWith(upper_type, "ENUM(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto enum_values_str = type.substr(5, type.size() - 6);
+		auto enum_values = SplitSerializedTypeArguments(enum_values_str, type);
+		if (enum_values.empty()) {
+			throw InternalException("ENUM type requires at least one value: '%s'", type);
+		}
+		Vector ordered_values(LogicalType::VARCHAR, enum_values.size());
+		auto ordered_data = FlatVector::GetData<string_t>(ordered_values);
+		for (idx_t i = 0; i < enum_values.size(); i++) {
+			auto value = ParseSerializedStringLiteral(enum_values[i], type);
+			ordered_data[i] = StringVector::AddString(ordered_values, value);
+		}
+		return LogicalType::ENUM(ordered_values, enum_values.size());
+	}
 	if (StringUtil::StartsWith(upper_type, "TENSOR(") && StringUtil::EndsWith(upper_type, ")")) {
 		string tensor_args = type.substr(7, type.size() - 8);
-		idx_t split_idx = string::npos;
-		idx_t paren_depth = 0;
-		idx_t bracket_depth = 0;
-		for (idx_t i = 0; i < tensor_args.size(); i++) {
-			auto ch = tensor_args[i];
-			switch (ch) {
-			case '(':
-				paren_depth++;
-				break;
-			case ')':
-				if (paren_depth == 0) {
-					throw InternalException("Ill formatted tensor type: '%s'", type);
-				}
-				paren_depth--;
-				break;
-			case '[':
-				bracket_depth++;
-				break;
-			case ']':
-				if (bracket_depth == 0) {
-					throw InternalException("Ill formatted tensor type: '%s'", type);
-				}
-				bracket_depth--;
-				break;
-			case ',':
-				if (paren_depth == 0 && bracket_depth == 0) {
-					split_idx = i;
-					i = tensor_args.size();
-				}
-				break;
-			default:
-				break;
-			}
-		}
-		if (split_idx == string::npos || paren_depth != 0 || bracket_depth != 0) {
+		auto tensor_args_vect = SplitSerializedTypeArguments(tensor_args, type);
+		if (tensor_args_vect.size() != 2) {
 			throw InternalException("Ill formatted tensor type: '%s'", type);
 		}
 
-		auto child_type_str = tensor_args.substr(0, split_idx);
-		auto shape_str = tensor_args.substr(split_idx + 1);
+		auto child_type_str = std::move(tensor_args_vect[0]);
+		auto shape_str = std::move(tensor_args_vect[1]);
 		StringUtil::Trim(child_type_str);
 		StringUtil::Trim(shape_str);
 		if (child_type_str.empty() || shape_str.size() < 2 || shape_str.front() != '[' || shape_str.back() != ']') {

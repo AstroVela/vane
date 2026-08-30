@@ -651,6 +651,59 @@ def test_distributed_result_normalizes_arrow_offset_widths(monkeypatch, query, t
     assert vane.connect().sql(query).fetchall() == expected
 
 
+def test_distributed_result_normalizes_file_tensor_storage(monkeypatch):
+    file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+    records = [
+        {
+            "url": "memory://first",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        },
+        {
+            "url": "memory://second",
+            "content_type": None,
+            "position": None,
+            "size": None,
+            "checksum": None,
+        },
+    ]
+    files = pa.array(records, type=file_type)
+    storage = pa.FixedSizeListArray.from_arrays(files, 2)
+    tensor = pa.ExtensionArray.from_storage(pa.fixed_shape_tensor(file_type, (2,)), storage)
+    runner = _FakeRayRunner([pa.table({"c0": tensor})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def unused(table):
+        return table
+
+    relation = (
+        vane.connect()
+        .sql("SELECT 1 AS value")
+        .map_batches(
+            unused,
+            schema={"documents": vane.tensor_type(vane.file_type(), (2,))},
+            execution_backend="subprocess_task",
+        )
+    )
+
+    assert relation.fetchone() == (
+        (
+            vane.File("memory://first"),
+            vane.File("memory://second"),
+        ),
+    )
+
+
 def test_distributed_partition_error_is_terminal_and_closes_iterator(monkeypatch):
     runner = _FakeRayRunner(
         [

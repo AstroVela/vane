@@ -2584,6 +2584,21 @@ def test_udf_runtime_output_buffer_accepts_zero_byte_null_tables():
     assert [value for output in outputs for value in output.column("payload").to_pylist()] == [None, None, None]
 
 
+def test_udf_runtime_output_buffer_flushes_before_an_output_schema_change():
+    from vane.execution._udf_runtime import RuntimeOutputBuffer
+
+    binary = pa.table({"payload": pa.array([b"first"], type=pa.binary())})
+    string = pa.table({"payload": pa.array(["second"], type=pa.string())})
+    buffer = RuntimeOutputBuffer(target_rows=2)
+
+    outputs = list(buffer.append(binary))
+    outputs.extend(buffer.append(string))
+    outputs.extend(buffer.flush())
+
+    assert [output.schema for output in outputs] == [binary.schema, string.schema]
+    assert [output.column("payload").to_pylist() for output in outputs] == [[b"first"], ["second"]]
+
+
 def test_udf_runtime_iter_submit_stream_output_flushes_by_target_bytes():
     from vane.execution._udf_runtime import UDFExecutor
 
@@ -9108,6 +9123,64 @@ def test_subprocess_worker_ref_bundle_output_preserves_runtime_output_blocks(mon
     request_payload = vane_pickle.loads(messages[0][1])
     assert request_payload["request_id"] == 11
     assert request_payload["size_bytes"] >= sum(meta["ipc_size_bytes"] for meta in descriptor["metadata"])
+
+
+@pytest.mark.parametrize("call_mode", ["map", "map_batches_rows"])
+def test_subprocess_worker_row_preserving_modes_fuse_heterogeneous_output_pieces(monkeypatch, call_mode):
+    import vane.execution.udf_subprocess_worker as worker
+    from vane import pickle as vane_pickle
+
+    class FakeExecutor:
+        def __init__(self):
+            self._payload = {
+                "call_mode": call_mode,
+                "scalar_arg_count": 1,
+                "output_schema": [{"name": "value"}],
+            }
+
+        def submit(self, table):
+            assert table.to_pydict() == {"identifier": [0, None, 1]}
+
+        def drain_outputs(self):
+            return [
+                pa.table({"value": pa.array([b"first", None], type=pa.binary())}),
+                pa.table({"value": pa.array(["second"], type=pa.string())}),
+            ]
+
+    captured: list[pa.Table] = []
+
+    def make_descriptor(tables, *, grant_id=None):
+        captured.extend(tables)
+        return {
+            "block_refs": [],
+            "metadata": [],
+            "names": list(tables[0].schema.names),
+            "grant_id": grant_id,
+        }
+
+    grant_payload = vane_pickle.dumps({"request_id": 12, "grant_id": 102})
+    recv_payload = worker._HEADER.pack(worker._MSG_OUTPUT_GRANT_GRANTED, len(grant_payload)) + grant_payload
+    sock = _FakeControlSocket(recv_payload)
+    monkeypatch.setattr(worker, "_make_local_shm_ref_bundle_descriptor_for_tables", make_descriptor)
+
+    _data_shm, msg_type, _payload = worker._execute_submit(
+        FakeExecutor(),
+        pa.table(
+            {
+                "identifier": pa.array([0, None, 1], type=pa.int64()),
+                "keep": ["a", "b", "c"],
+            }
+        ),
+        data_shm=None,
+        produce_ref_bundle_output=True,
+        sock=sock,
+        submit_count=12,
+    )
+
+    assert msg_type == worker._MSG_REF_BUNDLE_RESULT
+    assert [table.num_rows for table in captured] == [2, 1]
+    assert [table.column("value").type for table in captured] == [pa.binary(), pa.string()]
+    assert [table.column("keep").to_pylist() for table in captured] == [["a", "b"], ["c"]]
 
 
 def test_subprocess_task_submit_flushes_compute_tail_before_drain(monkeypatch):

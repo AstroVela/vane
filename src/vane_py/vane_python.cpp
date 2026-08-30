@@ -9,6 +9,7 @@
 
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/parser/parser.hpp"
 
 #include "vane_python/python_objects.hpp"
@@ -204,6 +205,10 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Create a type object by parsing the 'type_str' string", py::arg("type_str"), py::kw_only(),
 	    py::arg("connection") = py::none());
+	m.def(
+	    "_parse_serialized_logical_type",
+	    [](const string &type_str) { return make_shared_ptr<DuckDBPyType>(DBConfig::ParseLogicalType(type_str)); },
+	    "Parse an internal canonical serialized logical type", py::arg("type_str"));
 	m.def(
 	    "array_type",
 	    [](const shared_ptr<DuckDBPyType> &type, idx_t size, shared_ptr<DuckDBPyConnection> conn = nullptr) {

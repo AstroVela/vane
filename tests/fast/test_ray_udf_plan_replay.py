@@ -118,7 +118,10 @@ def test_attached_scalar_alias_survives_logical_plan_pickle_to_fresh_connection(
     ("corruption", "error"),
     [
         ("payload_version", "unsupported payload_version 999"),
-        ("logical_return_type", "payload missing method_return_type or output_schema"),
+        (
+            "logical_return_type",
+            "serialized return type 'INTEGER' does not match payload return type 'VARCHAR'",
+        ),
         ("return_type", "serialized return type 'VARCHAR' does not match payload return type 'INTEGER'"),
     ],
 )

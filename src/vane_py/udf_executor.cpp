@@ -336,6 +336,18 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 			}
 		}
 	}
+	auto cast_to_expected = [&](DataChunk &source) {
+		DataChunk cast_chunk;
+		cast_chunk.Initialize(context, expected_types, source.size());
+		cast_chunk.SetCardinality(source.size());
+		for (idx_t i = 0; i < source.ColumnCount(); i++) {
+			VectorOperations::Cast(context, source.data[i], cast_chunk.data[i], source.size());
+			cast_chunk.data[i].Verify(source.size());
+		}
+		auto output = make_uniq<DataChunk>();
+		output->Move(cast_chunk);
+		return output;
+	};
 
 	vector<column_t> column_ids;
 	column_ids.reserve(return_types.size());
@@ -356,6 +368,9 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 
 	if (first_chunk.size() == 0) {
 		// Empty table
+		if (needs_cast) {
+			return cast_to_expected(first_chunk);
+		}
 		auto output = make_uniq<DataChunk>();
 		output->Initialize(context, return_types, 0);
 		output->SetCardinality(0);
@@ -373,16 +388,7 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 		// buffers (zero-copy). ArrowAuxiliaryData on vector buffers keeps the
 		// Arrow memory alive after scan state is destroyed.
 		if (needs_cast) {
-			DataChunk cast_chunk;
-			cast_chunk.Initialize(context, expected_types, first_chunk.size());
-			cast_chunk.SetCardinality(first_chunk.size());
-			for (idx_t i = 0; i < first_chunk.ColumnCount(); i++) {
-				VectorOperations::Cast(context, first_chunk.data[i], cast_chunk.data[i], first_chunk.size());
-				cast_chunk.data[i].Verify(first_chunk.size());
-			}
-			auto output = make_uniq<DataChunk>();
-			output->Move(cast_chunk);
-			return output;
+			return cast_to_expected(first_chunk);
 		}
 		auto output = make_uniq<DataChunk>();
 		output->Move(first_chunk);
@@ -412,16 +418,7 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 	}
 
 	if (needs_cast) {
-		DataChunk cast_chunk;
-		cast_chunk.Initialize(context, expected_types, result.size());
-		cast_chunk.SetCardinality(result.size());
-		for (idx_t i = 0; i < result.ColumnCount(); i++) {
-			VectorOperations::Cast(context, result.data[i], cast_chunk.data[i], result.size());
-			cast_chunk.data[i].Verify(result.size());
-		}
-		auto output = make_uniq<DataChunk>();
-		output->Move(cast_chunk);
-		return output;
+		return cast_to_expected(result);
 	}
 
 	auto output = make_uniq<DataChunk>();
@@ -668,16 +665,24 @@ public:
 		}
 
 		PythonGILWrapper gil;
-		py::list refs;
-		py::list slices;
-		py::list metadata;
 		py::list names;
 		if (!chunk.wrap_columns_as_struct) {
 			for (auto &name : chunk.names) {
 				names.append(py::str(name));
 			}
 		}
-		for (auto &block : chunk.blocks) {
+
+		py::object helper;
+		try {
+			helper = py::module_::import("vane.execution.ref_bundle").attr("materialize_ref_bundle");
+		} catch (const py::error_already_set &ex) {
+			throw InvalidInputException("external block materialization failed: %s", ex.what());
+		}
+
+		auto materialize_block = [&](const ExternalBlockDescriptor &block) {
+			py::list refs;
+			py::list slices;
+			py::list metadata;
 			refs.append(BorrowPythonObjectHolder(block.object_ref));
 			if (block.has_slice) {
 				slices.append(py::make_tuple(block.slice.start_offset, block.slice.end_offset));
@@ -704,26 +709,46 @@ public:
 				meta[py::str("column_ids")] = std::move(column_ids);
 			}
 			metadata.append(std::move(meta));
-		}
+			try {
+				return helper(std::move(refs), std::move(slices), std::move(metadata), names);
+			} catch (const py::error_already_set &ex) {
+				throw InvalidInputException("external block materialization failed: %s", ex.what());
+			}
+		};
 
-		py::object table;
-		try {
-			auto helper = py::module_::import("vane.execution.ref_bundle").attr("materialize_ref_bundle");
-			table = helper(std::move(refs), std::move(slices), std::move(metadata), std::move(names));
-		} catch (const py::error_already_set &ex) {
-			throw InvalidInputException("external block materialization failed: %s", ex.what());
-		}
-
+		vector<LogicalType> materialized_types;
 		if (chunk.wrap_columns_as_struct) {
 			if (chunk.logical_types.size() != 1 || chunk.logical_types[0].id() != LogicalTypeId::STRUCT) {
 				throw InvalidInputException("lazy block STRUCT wrapping requires exactly one STRUCT logical type");
 			}
-			auto raw = ConvertArrowTableToDataChunk(table, context, StructChildTypes(chunk.logical_types[0]));
+			materialized_types = StructChildTypes(chunk.logical_types[0]);
+		} else {
+			materialized_types = chunk.logical_types;
+		}
+
+		unique_ptr<DataChunk> materialized;
+		for (auto &block : chunk.blocks) {
+			auto table = materialize_block(block);
+			auto block_chunk = ConvertArrowTableToDataChunk(table, context, materialized_types);
+			if (!materialized) {
+				materialized = std::move(block_chunk);
+				continue;
+			}
+			materialized->Flatten();
+			block_chunk->Flatten();
+			materialized->Append(*block_chunk, true);
+		}
+		if (!materialized || materialized->size() != chunk.cardinality) {
+			throw InvalidInputException("external block materialization expected %d rows but produced %d",
+			                            chunk.cardinality, materialized ? materialized->size() : 0);
+		}
+
+		if (chunk.wrap_columns_as_struct) {
 			py::gil_scoped_release release;
 			ScopedClientContextLock ctx_g;
-			return WrapDataChunkColumnsAsStruct(context, std::move(raw), chunk.logical_types[0]);
+			return WrapDataChunkColumnsAsStruct(context, std::move(materialized), chunk.logical_types[0]);
 		}
-		return ConvertArrowTableToDataChunk(table, context, chunk.logical_types);
+		return materialized;
 	}
 };
 
@@ -957,6 +982,10 @@ static bool HasStructField(const Value &payload, const string &name) {
 static vector<LogicalType> ParseStringListTypesField(const Value &payload, const string &name);
 
 static vector<LogicalType> ParseExpectedOutputTypes(const Value &payload) {
+	auto output_contract_types = ParseStringListTypesField(payload, "output_contract_types");
+	if (!output_contract_types.empty()) {
+		return output_contract_types;
+	}
 	auto return_type = GetStructStringField(payload, "method_return_type");
 	if (return_type.first && !return_type.second.empty()) {
 		vector<LogicalType> output_types;

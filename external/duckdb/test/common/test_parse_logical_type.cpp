@@ -15,6 +15,9 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 	SECTION("simple types") {
 		REQUIRE(DBConfig::ParseLogicalType("integer") == LogicalType::INTEGER);
 		REQUIRE(DBConfig::ParseLogicalType("any") == LogicalType::ANY);
+		auto sqlnull = LogicalType(LogicalType::SQLNULL);
+		REQUIRE(DBConfig::ParseLogicalType(sqlnull.ToString()) == sqlnull);
+		REQUIRE(DBConfig::ParseLogicalType(LogicalType::JSON().ToString()) == LogicalType::JSON());
 	}
 
 	SECTION("nested types") {
@@ -102,5 +105,55 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 		union_members.emplace_back(make_pair("value with space", struct_type));
 		auto union_type = LogicalType::UNION(std::move(union_members));
 		REQUIRE(DBConfig::ParseLogicalType(union_type.ToString()) == union_type);
+	}
+
+	SECTION("enum values round trip") {
+		auto enum_type = DBConfig::ParseLogicalType("ENUM('open', 'comma,value', 'quote''value', '')");
+		REQUIRE(enum_type.id() == LogicalTypeId::ENUM);
+		REQUIRE(EnumType::GetSize(enum_type) == 4);
+		REQUIRE(EnumType::GetString(enum_type, 0).GetString() == "open");
+		REQUIRE(EnumType::GetString(enum_type, 1).GetString() == "comma,value");
+		REQUIRE(EnumType::GetString(enum_type, 2).GetString() == "quote'value");
+		REQUIRE(EnumType::GetString(enum_type, 3).GetString().empty());
+		REQUIRE(DBConfig::ParseLogicalType(enum_type.ToString()) == enum_type);
+
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("status", enum_type));
+		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
+		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
+	}
+
+	SECTION("decimal values round trip") {
+		auto decimal_type = LogicalType::DECIMAL(10, 2);
+		REQUIRE(DBConfig::ParseLogicalType(decimal_type.ToString()) == decimal_type);
+		REQUIRE(DBConfig::ParseLogicalType("DECIMAL(38, 38)") == LogicalType::DECIMAL(38, 38));
+
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("document", FileLogicalType::Create()));
+		struct_children.emplace_back(make_pair("amount", decimal_type));
+		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
+		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
+
+		REQUIRE_THROWS_AS(DBConfig::ParseLogicalType("DECIMAL(0,0)"), InternalException);
+		REQUIRE_THROWS_AS(DBConfig::ParseLogicalType("DECIMAL(39,0)"), InternalException);
+		REQUIRE_THROWS_AS(DBConfig::ParseLogicalType("DECIMAL(4,5)"), InternalException);
+		REQUIRE_THROWS_AS(DBConfig::ParseLogicalType("DECIMAL(4)"), InternalException);
+	}
+
+	SECTION("tensor enum values with delimiters round trip") {
+		auto enum_type = DBConfig::ParseLogicalType("ENUM(')', '(', ']', '[', 'comma,value')");
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("document", FileLogicalType::Create()));
+		struct_children.emplace_back(make_pair("status", enum_type));
+		auto tensor_type = TensorType::Create(LogicalType::STRUCT(std::move(struct_children)), {2});
+
+		REQUIRE(DBConfig::ParseLogicalType(tensor_type.ToString()) == tensor_type);
+	}
+
+	SECTION("SQLNULL nested type round trip") {
+		child_list_t<LogicalType> struct_children;
+		struct_children.emplace_back(make_pair("missing", LogicalType::SQLNULL));
+		auto struct_type = LogicalType::STRUCT(std::move(struct_children));
+		REQUIRE(DBConfig::ParseLogicalType(struct_type.ToString()) == struct_type);
 	}
 }
