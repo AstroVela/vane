@@ -186,6 +186,96 @@ FROM (
 ----
 true	true	true
 
+# Named STRUCT casts retain DuckDB's case-insensitive name mapping around an
+# exact FILE leaf. Field order and unrelated source/target fields remain
+# governed by the ordinary STRUCT caster.
+query TTI
+SELECT typeof(value.document), value.document.url, value.n
+FROM (
+	SELECT CAST(
+		{'document': image_file('reordered.png'), 'n': 7}
+		AS STRUCT(n BIGINT, document IMAGEFILE)
+	) AS value
+)
+----
+IMAGEFILE	reordered.png	7
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.added IS NULL
+FROM (
+	SELECT CAST(
+		{'Document': image_file('case.png'), 'drop_me': 42}
+		AS STRUCT(document IMAGEFILE, added INTEGER)
+	) AS value
+)
+----
+IMAGEFILE	case.png	true
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.n
+FROM (
+	SELECT CAST(
+		ROW(image_file('positional.png'), 9)
+		AS STRUCT(document IMAGEFILE, n BIGINT)
+	) AS value
+)
+----
+IMAGEFILE	positional.png	9
+
+statement ok
+CREATE TYPE image_envelope AS STRUCT(document IMAGEFILE, count BIGINT)
+
+query TTI
+SELECT typeof(value.document), value.document.url, value.count
+FROM (
+	SELECT {'document': image_file('envelope.png'), 'count': 3}::image_envelope AS value
+)
+----
+IMAGEFILE	envelope.png	3
+
+# Adding, dropping, or renaming the FILE-bearing field itself remains
+# forbidden, even when another STRUCT member matches.
+statement error
+SELECT {'document': image_file('x'), 'n': 1}::STRUCT(n BIGINT)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'n': 1}::STRUCT(n BIGINT, document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'old_document': image_file('x'), 'n': 1}::STRUCT(document IMAGEFILE, n BIGINT)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {'document': audio_file('x')}::STRUCT(document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# UNION casts use the same case-insensitive member mapping as DuckDB's native
+# UNION binder and may add only unrelated target members.
+query TT
+WITH source(value) AS (
+	SELECT union_value(Document := image_file('union.png'))::UNION(Document IMAGEFILE, old BIGINT)
+), converted(value) AS (
+	SELECT value::UNION(extra VARCHAR, document IMAGEFILE, old BIGINT)
+	FROM source
+)
+SELECT union_tag(value), value.document.url
+FROM converted
+----
+document	union.png
+
+statement error
+SELECT (
+	union_value(n := 1)::UNION(n BIGINT, other VARCHAR)
+)::UNION(n BIGINT, other VARCHAR, document IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
 # Untyped NULL leaves do not bypass FILE validation and remain valid inputs for
 # empty or NULL-only container literals.
 query II

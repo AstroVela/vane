@@ -3,7 +3,9 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"
 
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/type_map.hpp"
 #include "duckdb/function/cast_rules.hpp"
@@ -52,6 +54,92 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 	return DBConfig::GetConfig(db).GetCollationBinding();
 }
 
+using file_child_compatibility_t = bool (*)(const LogicalType &, const LogicalType &);
+
+static bool StructFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                         file_child_compatibility_t child_compatible) {
+	if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo()) {
+		return false;
+	}
+	auto &source_children = StructType::GetChildTypes(source);
+	auto &target_children = StructType::GetChildTypes(target);
+	auto is_unnamed = source_children.empty() || target_children.empty() || StructType::IsUnnamed(source) ||
+	                  StructType::IsUnnamed(target);
+	if (is_unnamed) {
+		if (source_children.size() != target_children.size()) {
+			return false;
+		}
+		for (idx_t index = 0; index < target_children.size(); index++) {
+			if (!child_compatible(source_children[index].second, target_children[index].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	InsertionOrderPreservingMap<idx_t> target_children_map;
+	for (idx_t index = 0; index < target_children.size(); index++) {
+		target_children_map[target_children[index].first] = index;
+	}
+
+	bool has_any_match = false;
+	for (auto &source_child : source_children) {
+		auto target_child = target_children_map.find(source_child.first);
+		if (target_child == target_children_map.end()) {
+			if (TypeVisitor::Contains(source_child.second, FileLogicalType::IsFile)) {
+				return false;
+			}
+			continue;
+		}
+		has_any_match = true;
+		if (!child_compatible(source_child.second, target_children[target_child->second].second)) {
+			return false;
+		}
+		target_children_map.erase(target_child);
+	}
+
+	for (auto &target_child : target_children_map) {
+		if (TypeVisitor::Contains(target_children[target_child.second].second, FileLogicalType::IsFile)) {
+			return false;
+		}
+	}
+	return has_any_match;
+}
+
+static bool UnionFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                        file_child_compatibility_t child_compatible) {
+	if (source.id() != LogicalTypeId::UNION || !source.AuxInfo()) {
+		return false;
+	}
+	vector<bool> matched_targets(UnionType::GetMemberCount(target), false);
+	for (idx_t source_index = 0; source_index < UnionType::GetMemberCount(source); source_index++) {
+		auto &source_name = UnionType::GetMemberName(source, source_index);
+		bool found = false;
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			if (!StringUtil::CIEquals(source_name, UnionType::GetMemberName(target, target_index))) {
+				continue;
+			}
+			if (!child_compatible(UnionType::GetMemberType(source, source_index),
+			                      UnionType::GetMemberType(target, target_index))) {
+				return false;
+			}
+			matched_targets[target_index] = true;
+			found = true;
+			break;
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	for (idx_t target_index = 0; target_index < matched_targets.size(); target_index++) {
+		if (!matched_targets[target_index] &&
+		    TypeVisitor::Contains(UnionType::GetMemberType(target, target_index), FileLogicalType::IsFile)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool FileAliasRestorationCompatible(const LogicalType &source, const LogicalType &target) {
 	if (FileLogicalType::IsFile(target)) {
 		auto physical_file_type = target.DeepCopy();
@@ -65,34 +153,10 @@ static bool FileAliasRestorationCompatible(const LogicalType &source, const Logi
 	}
 
 	switch (target.id()) {
-	case LogicalTypeId::STRUCT: {
-		if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() ||
-		    StructType::GetChildCount(source) != StructType::GetChildCount(target)) {
-			return false;
-		}
-		for (idx_t index = 0; index < StructType::GetChildCount(target); index++) {
-			if (StructType::GetChildName(source, index) != StructType::GetChildName(target, index) ||
-			    !FileAliasRestorationCompatible(StructType::GetChildType(source, index),
-			                                    StructType::GetChildType(target, index))) {
-				return false;
-			}
-		}
-		return true;
-	}
-	case LogicalTypeId::UNION: {
-		if (source.id() != LogicalTypeId::UNION || !source.AuxInfo() ||
-		    UnionType::GetMemberCount(source) != UnionType::GetMemberCount(target)) {
-			return false;
-		}
-		for (idx_t index = 0; index < UnionType::GetMemberCount(target); index++) {
-			if (UnionType::GetMemberName(source, index) != UnionType::GetMemberName(target, index) ||
-			    !FileAliasRestorationCompatible(UnionType::GetMemberType(source, index),
-			                                    UnionType::GetMemberType(target, index))) {
-				return false;
-			}
-		}
-		return true;
-	}
+	case LogicalTypeId::STRUCT:
+		return StructFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
+	case LogicalTypeId::UNION:
+		return UnionFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
 	case LogicalTypeId::LIST:
 		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
 			return FileAliasRestorationCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
@@ -134,40 +198,15 @@ static bool FileLeavesPreservedCompatible(const LogicalType &source, const Logic
 	if (FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) {
 		return FileLogicalType::IsFile(source) && FileLogicalType::IsFile(target) && source == target;
 	}
-	if (!target_contains_file || source.HasAlias() != target.HasAlias() ||
-	    (source.HasAlias() && source.GetAlias() != target.GetAlias())) {
+	if (!target_contains_file) {
 		return false;
 	}
 
 	switch (target.id()) {
-	case LogicalTypeId::STRUCT: {
-		if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() ||
-		    StructType::GetChildCount(source) != StructType::GetChildCount(target)) {
-			return false;
-		}
-		for (idx_t index = 0; index < StructType::GetChildCount(target); index++) {
-			if (StructType::GetChildName(source, index) != StructType::GetChildName(target, index) ||
-			    !FileLeavesPreservedCompatible(StructType::GetChildType(source, index),
-			                                   StructType::GetChildType(target, index))) {
-				return false;
-			}
-		}
-		return true;
-	}
-	case LogicalTypeId::UNION: {
-		if (source.id() != LogicalTypeId::UNION || !source.AuxInfo() ||
-		    UnionType::GetMemberCount(source) != UnionType::GetMemberCount(target)) {
-			return false;
-		}
-		for (idx_t index = 0; index < UnionType::GetMemberCount(target); index++) {
-			if (UnionType::GetMemberName(source, index) != UnionType::GetMemberName(target, index) ||
-			    !FileLeavesPreservedCompatible(UnionType::GetMemberType(source, index),
-			                                   UnionType::GetMemberType(target, index))) {
-				return false;
-			}
-		}
-		return true;
-	}
+	case LogicalTypeId::STRUCT:
+		return StructFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
+	case LogicalTypeId::UNION:
+		return UnionFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
 	case LogicalTypeId::LIST:
 		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
 		       FileLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
