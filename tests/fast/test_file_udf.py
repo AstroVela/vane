@@ -792,11 +792,8 @@ def test_file_fixed_sequence_normalization_accepts_variable_list_storage(declare
             files,
         )
 
-    normalized = normalize_file_arrow_array(
-        source,
-        vane.type(declared_type),
-        boundary="variable-list-to-fixed-file-output",
-    )
+    dtype = vane.tensor_type(vane.file_type(), (2,)) if declared_type.startswith("TENSOR") else vane.type(declared_type)
+    normalized = normalize_file_arrow_array(source, dtype, boundary="variable-list-to-fixed-file-output")
 
     storage = normalized.storage if isinstance(normalized, pa.ExtensionArray) else normalized
     assert pa.types.is_fixed_size_list(storage.type)
@@ -874,7 +871,7 @@ def test_file_list_normalization_accepts_fixed_size_list_storage():
 def test_file_arrow_output_normalization_preserves_field_properties():
     import pyarrow as pa
 
-    from vane.execution.udf_file_contract import FileUDFContract
+    from vane.execution.udf_file_contract import FileUDFContract, _map_array_from_offsets
 
     source_file_fields = [
         pa.field("url", pa.large_string(), nullable=False, metadata={b"file-url": b"preserved"}),
@@ -904,7 +901,16 @@ def test_file_arrow_output_normalization_preserves_field_properties():
         pa.field("lookup_value", source_file_type, metadata={b"map-value": b"preserved"}),
         keys_sorted=True,
     )
-    lookup = pa.array([[("document", _file_record())]], type=lookup_type)
+    # pa.array() discards MAP child metadata before normalization can see it.
+    lookup = _map_array_from_offsets(
+        [0, 1],
+        pa.array(["document"]),
+        files,
+        mask=pa.array([False]),
+        map_type=lookup_type,
+    )
+    assert lookup.type.key_field.metadata == {b"map-key": b"preserved"}
+    assert lookup.type.item_field.metadata == {b"map-value": b"preserved"}
     payload_fields = [
         pa.field("document", source_file_type, nullable=False, metadata={b"document": b"preserved"}),
         pa.field("documents", documents.type, nullable=False, metadata={b"documents": b"preserved"}),
@@ -969,6 +975,75 @@ def test_file_arrow_output_normalization_preserves_field_properties():
             assert normalized_file_field.metadata == source_field.metadata
             expected_type = pa.string() if source_field.name in ("url", "content_type", "checksum") else pa.int64()
             assert normalized_file_field.type == expected_type
+
+
+def test_file_map_builder_canonicalizes_an_all_valid_key_bitmap_without_aborting():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import _map_array_from_offsets
+
+    keys = pa.ListArray.from_arrays(
+        pa.array([0, 1], type=pa.int32()),
+        pa.array([_file_record()], type=_file_arrow_type()),
+        mask=pa.array([False]),
+    )
+    assert keys.null_count == 0
+    assert keys.buffers()[0] is not None
+
+    result = _map_array_from_offsets(
+        [0, 1],
+        keys,
+        pa.array(["document"]),
+        mask=pa.array([False]),
+    )
+
+    assert result.to_pylist() == [[([_file_record()], "document")]]
+    assert result.keys.buffers()[0] is None
+
+    with pytest.raises(ValueError, match="contain NULL"):
+        _map_array_from_offsets(
+            [0, 1],
+            pa.array([None], type=pa.string()),
+            pa.array(["document"]),
+            mask=pa.array([False]),
+        )
+
+
+def test_file_map_normalization_drops_hidden_null_parent_entries_without_key_bitmap():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import _map_array_from_offsets, normalize_file_arrow_array
+
+    source_file_type = pa.struct(
+        [
+            pa.field("url", pa.large_string()),
+            pa.field("content_type", pa.large_string()),
+            pa.field("position", pa.int64()),
+            pa.field("size", pa.int64()),
+            pa.field("checksum", pa.large_string()),
+        ]
+    )
+    source = _map_array_from_offsets(
+        [0, 1, 2],
+        pa.array(["hidden", "visible"]),
+        pa.array(
+            [
+                _file_record(position=1, size=None),
+                _file_record(url="memory://visible"),
+            ],
+            type=source_file_type,
+        ),
+        mask=pa.array([True, False]),
+    )
+
+    normalized = normalize_file_arrow_array(
+        source,
+        vane.map_type(vane.sqltypes.VARCHAR, vane.file_type()),
+        boundary="null-parent-file-map-output",
+    )
+
+    assert normalized.to_pylist() == [None, [("visible", _file_record(url="memory://visible"))]]
+    assert normalized.keys.buffers()[0] is None
 
 
 def test_file_tensor_normalization_uses_canonical_extension_storage():
@@ -2725,7 +2800,7 @@ def test_scalar_file_udf_materializes_bit_sibling_as_text():
 def test_file_contract_marks_sliced_nested_bit_inputs():
     import pyarrow as pa
 
-    from vane.execution.udf_file_contract import FileUDFContract
+    from vane.execution.udf_file_contract import FileUDFContract, _map_array_from_offsets
 
     bit_storage = pa.array([b"\x01\xab"] * 4, type=pa.binary())
     flags = pa.ListArray.from_arrays(
@@ -2745,10 +2820,16 @@ def test_file_contract_marks_sliced_nested_bit_inputs():
         pa.field("lookup_value", pa.binary(), metadata={b"map-value": b"preserved"}),
         keys_sorted=True,
     )
-    lookup = pa.array(
-        [[("first", b"\x01\xab")], [("second", b"\x01\xab")]],
-        type=lookup_type,
+    # pa.array() discards MAP child metadata before BIT annotation can see it.
+    lookup = _map_array_from_offsets(
+        [0, 1, 2],
+        pa.array(["first", "second"]),
+        bit_storage.slice(0, 2),
+        mask=pa.array([False, False]),
+        map_type=lookup_type,
     )
+    assert lookup.type.key_field.metadata == {b"map-key": b"preserved"}
+    assert lookup.type.item_field.metadata == {b"map-value": b"preserved"}
     payload_fields = [
         pa.field("document", _file_arrow_type()),
         pa.field("flags", flags.type, nullable=False, metadata={b"flags": b"preserved"}),

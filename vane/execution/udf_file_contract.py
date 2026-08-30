@@ -25,7 +25,7 @@ import pyarrow.compute as pc  # type: ignore[import-not-found, import-untyped, u
 from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
-_TENSOR_TYPE_PATTERN = re.compile(r"^TENSOR\((.*),\s*\[([0-9,\s]+)\]\)$", flags=re.IGNORECASE)
+_TENSOR_TYPE_PATTERN = re.compile(r"\bTENSOR\s*\(", flags=re.IGNORECASE)
 _ARROW_LIST_OFFSET_MAX = (1 << 31) - 1
 _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
     "bignum",
@@ -166,15 +166,12 @@ def _parse_declared_type(type_name: Any, *, field: str) -> Any | None:
     try:
         return vane.type(type_name)
     except Exception as exc:
-        tensor_match = _TENSOR_TYPE_PATTERN.fullmatch(type_name.strip())
-        if tensor_match is None:
+        if _TENSOR_TYPE_PATTERN.search(type_name) is None:
             raise _invalid_input(f"UDF payload field {field!r} contains an invalid SQL type") from exc
-        child = _parse_declared_type(tensor_match.group(1).strip(), field=field)
-        if child is None:
-            raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR dtype") from exc
         try:
-            shape = tuple(int(dimension.strip()) for dimension in tensor_match.group(2).split(","))
-            return vane.tensor_type(child, shape)
+            from vane import _native
+
+            return _native._parse_serialized_logical_type(type_name)
         except Exception as tensor_error:
             raise _invalid_input(f"UDF payload field {field!r} contains an invalid TENSOR type") from tensor_error
 
@@ -348,15 +345,23 @@ def _list_array_from_offsets(
     if value_field is not None:
         normalized_field = value_field.with_type(values.type)
         target_type = pa.large_list(normalized_field) if use_large else pa.list_(normalized_field)
-    return constructor(pa.array(offsets, type=offset_type), values, type=target_type, mask=mask)
+    return constructor(
+        pa.array(offsets, type=offset_type),
+        values,
+        type=target_type,
+        mask=_optional_null_mask(mask),
+    )
+
+
+def _optional_null_mask(mask: Any) -> Any | None:
+    return mask if mask.true_count else None
 
 
 def _null_bitmap_from_mask(mask: Any) -> tuple[Any | None, int]:
-    nulls = [bool(value) for value in mask.to_pylist()]
-    null_count = sum(nulls)
+    null_count = int(mask.true_count)
     if not null_count:
         return None, 0
-    validity = pa.array([not is_null for is_null in nulls], type=pa.bool_())
+    validity = pc.invert(mask)
     return validity.buffers()[1], null_count
 
 
@@ -391,6 +396,16 @@ def _map_array_from_offsets(
 ) -> Any:
     # PyArrow 14 has neither type nor mask arguments on MapArray.from_arrays.
     # The buffer constructor preserves both the parent validity and child fields.
+    if keys.null_count != 0:
+        raise ValueError("Arrow MAP keys must not contain NULL values")
+    if keys.buffers()[0] is not None:
+        # Arrow permits an all-valid bitmap when null_count is zero, but
+        # PyArrow 25's MAP constructor rejects it through a fatal C++ check.
+        # Concatenating one array preserves its type and child fields while
+        # materializing canonical all-valid storage without that bitmap.
+        keys = pa.concat_arrays([keys])
+        if keys.buffers()[0] is not None:
+            raise ValueError("Arrow MAP keys must not advertise NULL values")
     target_type = pa.map_(keys.type, items.type) if map_type is None else map_type
     entries = pa.StructArray.from_arrays(
         [keys, items],
@@ -423,7 +438,7 @@ def _canonical_file_struct_storage(source: pa.StructArray, expected: pa.StructTy
         fields.append(source_field.with_type(child.type))
     if not changed:
         return source
-    return pa.StructArray.from_arrays(arrays, fields=fields, mask=source.is_null())
+    return pa.StructArray.from_arrays(arrays, fields=fields, mask=_optional_null_mask(source.is_null()))
 
 
 def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
@@ -495,7 +510,11 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
             field = fields[field_index]
             fields[field_index] = field.with_type(annotated.type)
             changed = True
-        return pa.StructArray.from_arrays(arrays, fields=fields, mask=array.is_null()) if changed else array
+        return (
+            pa.StructArray.from_arrays(arrays, fields=fields, mask=_optional_null_mask(array.is_null()))
+            if changed
+            else array
+        )
 
     if type_id == "list":
         if pa.types.is_list(array.type):
@@ -516,7 +535,12 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
             normalized_type = (
                 pa.large_list(normalized_field) if pa.types.is_large_list(array.type) else pa.list_(normalized_field)
             )
-            return constructor(normalized_offsets, annotated, type=normalized_type, mask=array.is_null())
+            return constructor(
+                normalized_offsets,
+                annotated,
+                type=normalized_type,
+                mask=_optional_null_mask(array.is_null()),
+            )
         is_list_view = getattr(pa.types, "is_list_view", None)
         if callable(is_list_view) and is_list_view(array.type):
             values = _annotate_duckdb_bit_input(array.values, _sequence_child(dtype), boundary=boundary)
@@ -527,7 +551,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
                 array.sizes,
                 values,
                 type=pa.list_view(array.type.value_field.with_type(values.type)),
-                mask=array.is_null(),
+                mask=_optional_null_mask(array.is_null()),
             )
         is_large_list_view = getattr(pa.types, "is_large_list_view", None)
         if callable(is_large_list_view) and is_large_list_view(array.type):
@@ -539,7 +563,7 @@ def _annotate_duckdb_bit_input(array: Any, dtype: Any, *, boundary: str) -> Any:
                 array.sizes,
                 values,
                 type=pa.large_list_view(array.type.value_field.with_type(values.type)),
-                mask=array.is_null(),
+                mask=_optional_null_mask(array.is_null()),
             )
         return array
 
@@ -1302,7 +1326,7 @@ def _canonical_values_to_arrow_array(
             names.append(name)
             child_values = [None if value is None else value.get(name) for value in values]
             arrays.append(_canonical_values_to_arrow_array(child_values, child, boundary=boundary))
-        return pa.StructArray.from_arrays(arrays, names=names, mask=null_mask)
+        return pa.StructArray.from_arrays(arrays, names=names, mask=_optional_null_mask(null_mask))
 
     if type_id == "list":
         offsets = [0]
@@ -1607,7 +1631,11 @@ def _normalize_file_arrow_array(
             )
             arrays.append(child_array)
             fields.append(source_field.with_name(name).with_type(child_array.type))
-        return pa.StructArray.from_arrays(arrays, fields=fields, mask=source.is_null())
+        return pa.StructArray.from_arrays(
+            arrays,
+            fields=fields,
+            mask=_optional_null_mask(source.is_null()),
+        )
 
     if type_id == "list":
         source = _mask_inactive(array, active)
@@ -1682,17 +1710,37 @@ def _normalize_file_arrow_array(
         if not pa.types.is_map(source.type):
             return source
 
-        start, _, offsets = _child_window(source)
+        _, _, offsets = _child_window(source)
         children = _type_children(dtype)
-        selected_indices: list[int] = []
-        normalized_offsets = [0]
-        for index, is_active in enumerate(active):
-            if is_active:
-                selected_indices.extend(range(offsets[index] - start, offsets[index + 1] - start))
-            normalized_offsets.append(len(selected_indices))
-        selection = pa.array(selected_indices, type=pa.int64())
-        keys = source.keys.slice(start, offsets[-1] - start).take(selection)
-        items = source.items.slice(start, offsets[-1] - start).take(selection)
+        if all(active):
+            start = offsets[0]
+            length = offsets[-1] - start
+            normalized_offsets = [offset - start for offset in offsets]
+            keys = source.keys.slice(start, length)
+            items = source.items.slice(start, length)
+        else:
+            normalized_offsets = [0]
+            key_segments = []
+            item_segments = []
+            for index, is_active in enumerate(active):
+                row_start = offsets[index]
+                row_length = offsets[index + 1] - row_start
+                if is_active:
+                    if row_length:
+                        key_segments.append(source.keys.slice(row_start, row_length))
+                        item_segments.append(source.items.slice(row_start, row_length))
+                    normalized_offsets.append(normalized_offsets[-1] + row_length)
+                else:
+                    normalized_offsets.append(normalized_offsets[-1])
+            if not key_segments:
+                keys = source.keys.slice(offsets[0], 0)
+                items = source.items.slice(offsets[0], 0)
+            elif len(key_segments) == 1:
+                keys = key_segments[0]
+                items = item_segments[0]
+            else:
+                keys = pa.concat_arrays(key_segments)
+                items = pa.concat_arrays(item_segments)
         keys = _normalize_file_arrow_array(
             keys,
             children["key"],
