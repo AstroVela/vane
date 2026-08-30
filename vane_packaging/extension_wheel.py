@@ -42,7 +42,7 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
-from vane_packaging.archive_safety import validate_zip_member_count
+from vane_packaging.archive_safety import ArchiveSnapshot, open_zip_snapshot, snapshot_archive
 from vane_packaging.manylinux_policy import ManylinuxPolicy, manylinux_policy
 
 if TYPE_CHECKING:
@@ -650,10 +650,19 @@ def _validate_dependency_trust_identities(
 
 
 def _read_dependency_wheel(path: Path) -> _DependencyWheel:
+    with snapshot_archive(
+        path,
+        max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
+        description="dependency extension wheel",
+        size_limit_description="the project's 100 MiB publication limit",
+    ) as snapshot:
+        return _read_dependency_wheel_snapshot(snapshot)
+
+
+def _read_dependency_wheel_snapshot(snapshot: ArchiveSnapshot) -> _DependencyWheel:
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionError
 
-    _validate_extension_wheel_size(path)
-    _validate_extension_wheel_member_count(path, description="dependency extension wheel")
+    path = snapshot.source_path
     try:
         filename_name, filename_version, build_tag, filename_tags = parse_wheel_filename(path.name)
     except InvalidWheelFilename as exception:
@@ -670,7 +679,11 @@ def _read_dependency_wheel(path: Path) -> _DependencyWheel:
     platform_tag = _validate_platform_tag(filename_tag.platform)
 
     try:
-        with zipfile.ZipFile(path) as wheel:
+        with open_zip_snapshot(
+            snapshot,
+            max_members=_MAX_EXTENSION_WHEEL_MEMBERS,
+            description="dependency extension wheel",
+        ) as wheel:
             _validate_extension_wheel_archive_size(wheel, description="dependency extension wheel")
             names = wheel.namelist()
             _validate_wheel_path_component_lengths(
@@ -3239,14 +3252,6 @@ def _normalize_extension_wheel_permissions(path: Path) -> None:
 def _validate_extension_wheel_size(path: Path, *, description: str = "extension wheel") -> None:
     if path.stat().st_size > _MAX_EXTENSION_WHEEL_BYTES:
         raise ValueError(f"{description} exceeds the project's 100 MiB publication limit")
-
-
-def _validate_extension_wheel_member_count(path: Path, *, description: str = "extension wheel") -> None:
-    validate_zip_member_count(
-        path,
-        max_members=_MAX_EXTENSION_WHEEL_MEMBERS,
-        description=description,
-    )
 
 
 def _validate_extension_wheel_archive_size(
