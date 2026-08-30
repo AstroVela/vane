@@ -100,6 +100,21 @@ def _contains_bit(dtype: Any | None) -> bool:
     return False
 
 
+def _contains_native_struct(dtype: Any | None) -> bool:
+    if dtype is None or _is_file_type(dtype):
+        return False
+    type_id = _type_id(dtype)
+    if type_id == "struct":
+        return True
+    if type_id in ("list", "array", "tensor"):
+        return _contains_native_struct(_sequence_child(dtype))
+    if type_id == "map":
+        return any(_contains_native_struct(child) for _, child in dtype.children)
+    # Native UNION values remain opaque until their selected tag can be
+    # represented explicitly at the Python boundary.
+    return False
+
+
 def _requires_native_output_encoding(dtype: Any | None) -> bool:
     """Return whether native output needs recursive Arrow-safe encoding."""
     if dtype is None:
@@ -801,6 +816,119 @@ def _materialize_native_value(value: Any, dtype: Any, *, boundary: str, path: st
     return value
 
 
+def _native_struct_child_values(
+    value: Any,
+    dtype: Any,
+    *,
+    boundary: str,
+    path: str,
+    require_struct: bool,
+) -> list[tuple[str, Any, Any]] | None:
+    struct_children = list(dtype.children)
+    if isinstance(value, Mapping):
+        actual_keys: dict[str, Any] = {}
+        for key in value:
+            if not isinstance(key, str):
+                raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
+            folded_key = key.casefold()
+            if folded_key in actual_keys:
+                raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {key!r}")
+            actual_keys[folded_key] = key
+        declared_keys = {name.casefold() for name, _ in struct_children}
+        if len(declared_keys) != len(struct_children) or set(actual_keys) != declared_keys:
+            raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
+        child_values = [value[actual_keys[name.casefold()]] for name, _ in struct_children]
+    elif isinstance(value, tuple):
+        if len(value) != len(struct_children):
+            raise _invalid_input(
+                f"{boundary} STRUCT value at {path} must contain exactly {len(struct_children)} positional fields"
+            )
+        child_values = list(value)
+    elif require_struct:
+        raise _invalid_input(f"{boundary} value at {path} must be a mapping or positional tuple")
+    else:
+        return None
+    return [
+        (name, child, child_value) for (name, child), child_value in zip(struct_children, child_values, strict=True)
+    ]
+
+
+def _validate_native_nested_struct_field_sets(
+    value: Any,
+    dtype: Any,
+    *,
+    boundary: str,
+    path: str,
+) -> None:
+    """Validate native STRUCT shapes while leaving cross-type casts untouched."""
+    if value is None or not _contains_native_struct(dtype):
+        return
+
+    type_id = _type_id(dtype)
+    if type_id == "struct":
+        child_values = _native_struct_child_values(
+            value,
+            dtype,
+            boundary=boundary,
+            path=path,
+            require_struct=False,
+        )
+        if child_values is None:
+            return
+        for name, child, child_value in child_values:
+            _validate_native_nested_struct_field_sets(
+                child_value,
+                child,
+                boundary=boundary,
+                path=f"{path}.{name}",
+            )
+        return
+    if type_id in ("list", "array", "tensor"):
+        if not isinstance(value, (list, tuple)):
+            return
+        child = _sequence_child(dtype)
+        for index, item in enumerate(value):
+            _validate_native_nested_struct_field_sets(
+                item,
+                child,
+                boundary=boundary,
+                path=f"{path}[{index}]",
+            )
+        return
+    if type_id == "map":
+        children = _type_children(dtype)
+        if (
+            isinstance(value, Mapping)
+            and set(value) == {"key", "value"}
+            and isinstance(value["key"], (list, tuple))
+            and isinstance(value["value"], (list, tuple))
+            and not _native_map_key_is_hashable(children["key"])
+        ):
+            entries: Any = zip(value["key"], value["value"])
+        elif isinstance(value, Mapping):
+            entries = value.items()
+        elif isinstance(value, (list, tuple)):
+            entries = value
+        else:
+            return
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, Sequence) or isinstance(entry, (str, bytes, bytearray)) or len(entry) != 2:
+                continue
+            key, item = entry
+            _validate_native_nested_struct_field_sets(
+                key,
+                children["key"],
+                boundary=boundary,
+                path=f"{path}[{index}].key",
+            )
+            _validate_native_nested_struct_field_sets(
+                item,
+                children["value"],
+                boundary=boundary,
+                path=f"{path}[{index}].value",
+            )
+
+
 def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: str) -> Any:
     if value is None:
         return None
@@ -825,30 +953,16 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             for index, item in enumerate(value)
         ]
     if type_id == "struct":
-        struct_children = list(dtype.children)
-        if isinstance(value, Mapping):
-            actual_keys: dict[str, Any] = {}
-            for key in value:
-                if not isinstance(key, str):
-                    raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
-                folded_key = key.casefold()
-                if folded_key in actual_keys:
-                    raise _invalid_input(f"{boundary} STRUCT at {path} has ambiguous field names matching {key!r}")
-                actual_keys[folded_key] = key
-            declared_keys = {name.casefold() for name, _ in struct_children}
-            if set(actual_keys) != declared_keys:
-                raise _invalid_input(f"{boundary} STRUCT value at {path} must contain exactly the declared fields")
-            child_values = [value[actual_keys[name.casefold()]] for name, _ in struct_children]
-        elif isinstance(value, tuple):
-            if len(value) != len(struct_children):
-                raise _invalid_input(
-                    f"{boundary} STRUCT value at {path} must contain exactly {len(struct_children)} positional fields"
-                )
-            child_values = list(value)
-        else:
-            raise _invalid_input(f"{boundary} value at {path} must be a mapping or positional tuple")
+        child_values = _native_struct_child_values(
+            value,
+            dtype,
+            boundary=boundary,
+            path=path,
+            require_struct=True,
+        )
+        assert child_values is not None
         result = {}
-        for (name, child), child_value in zip(struct_children, child_values, strict=True):
+        for name, child, child_value in child_values:
             result[name] = (
                 _canonicalize_native_output(child_value, child, boundary=boundary, path=f"{path}.{name}")
                 if _requires_native_output_encoding(child)
@@ -913,37 +1027,39 @@ def _canonical_values_to_arrow_array(
     if _is_file_type(dtype):
         return pa.array(values, type=_expected_arrow_type(dtype, boundary=boundary))
     type_id = _type_id(dtype)
-    if type_id in ("hugeint", "uhugeint"):
+    if type_id in ("bignum", "hugeint", "uhugeint"):
         encoded: list[str | None] = []
+        has_encoded = False
+        has_passthrough = False
         for value in values:
             if value is None:
                 encoded.append(None)
                 continue
             if isinstance(value, str):
                 encoded.append(value)
+                has_encoded = True
                 continue
-            integer = operator.index(value)
+            try:
+                integer = operator.index(value)
+            except TypeError:
+                encoded.append(None)
+                has_passthrough = True
+                continue
             if type_id == "hugeint":
                 in_range = -(1 << 127) <= integer < 1 << 127
-            else:
+            elif type_id == "uhugeint":
                 in_range = 0 <= integer < 1 << 128
+            else:
+                in_range = True
             if not in_range:
                 raise ValueError(f"{type_id.upper()} output is outside its 128-bit range")
             encoded.append(str(integer))
+            has_encoded = True
+        if has_passthrough:
+            if has_encoded:
+                raise TypeError(f"{type_id.upper()} output mixes encoded and native numeric storage")
+            return pa.array(values)
         return pa.array(encoded, type=pa.string())
-    if type_id == "bignum":
-        bignum_encoded: list[str | None] = []
-        for value in values:
-            if value is None:
-                bignum_encoded.append(None)
-                continue
-            try:
-                bignum_encoded.append(str(operator.index(value)))
-            except TypeError:
-                if not isinstance(value, str):
-                    raise
-                bignum_encoded.append(value)
-        return pa.array(bignum_encoded, type=pa.string())
     if type_id == "uuid":
         return pa.array(
             [
@@ -1036,10 +1152,11 @@ def _canonical_values_to_arrow_array(
 
 
 def _native_outputs_to_arrow_array(values: Sequence[Any], dtype: Any, *, boundary: str) -> pa.Array:
-    canonical = [
-        _canonicalize_native_output(value, dtype, boundary=boundary, path=f"row {row_index}")
-        for row_index, value in enumerate(values)
-    ]
+    canonical = []
+    for row_index, value in enumerate(values):
+        path = f"row {row_index}"
+        _validate_native_nested_struct_field_sets(value, dtype, boundary=boundary, path=path)
+        canonical.append(_canonicalize_native_output(value, dtype, boundary=boundary, path=path))
     try:
         return _canonical_values_to_arrow_array(canonical, dtype, boundary=boundary)
     except Exception:

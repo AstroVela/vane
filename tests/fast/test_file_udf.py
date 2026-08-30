@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -469,6 +470,55 @@ def test_file_native_struct_outputs_require_exact_fields(payload):
         contract.scalar_outputs_to_array([payload])
 
 
+@pytest.mark.parametrize(
+    ("return_type", "nested_value"),
+    [
+        ("STRUCT(document FILE, meta STRUCT(id INTEGER, label VARCHAR))", {"id": 1}),
+        ("STRUCT(document FILE, meta STRUCT(id INTEGER))", {"id": 1, "extra": "discarded"}),
+        ("STRUCT(document FILE, meta STRUCT(id INTEGER)[])", [{"id": 1, "extra": "discarded"}]),
+        (
+            "STRUCT(document FILE, meta MAP(VARCHAR, STRUCT(id INTEGER)))",
+            {"entry": {"id": 1, "extra": "discarded"}},
+        ),
+    ],
+    ids=["missing", "extra", "list", "map"],
+)
+def test_file_native_nested_non_file_struct_outputs_require_exact_fields(return_type, nested_value):
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "strict-nested-native-struct",
+            "method_return_type": return_type,
+        }
+    )
+
+    with pytest.raises(vane.InvalidInputException, match="exactly the declared fields"):
+        contract.scalar_outputs_to_array(
+            [
+                {
+                    "document": vane.File("memory://nested-struct"),
+                    "meta": nested_value,
+                }
+            ]
+        )
+
+
+def test_file_native_non_file_struct_sibling_preserves_string_cast_input():
+    output_type = vane.type("STRUCT(document FILE, meta STRUCT(id INTEGER))")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://string-to-struct"),
+            "meta": "{'id': 42}",
+        }
+
+    result = vane.connect().sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+
+    assert result.project("payload.meta.id").fetchone() == (42,)
+
+
 @pytest.mark.parametrize("malformed", ["missing", "extra"])
 def test_file_arrow_struct_outputs_require_exact_fields(malformed):
     import pyarrow as pa
@@ -739,6 +789,88 @@ def test_scalar_file_udf_accepts_textual_128_bit_integer_sibling(integer_type):
     result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
 
     assert result.project("payload.wide::VARCHAR").fetchone() == ("42",)
+
+
+@pytest.mark.parametrize("integer_type", ["HUGEINT", "UHUGEINT", "BIGNUM"])
+def test_native_file_udfs_preserve_numeric_casts_for_wide_integer_siblings(integer_type):
+    output_type = vane.type(f"STRUCT(document FILE, wide {integer_type})")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://numeric-wide-scalar"),
+            "wide": 1.0,
+        }
+
+    connection = vane.connect()
+    scalar_result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert scalar_result.project("payload.wide::VARCHAR").fetchone() == ("1",)
+
+    def build_row(_row):
+        return {
+            "payload": {
+                "document": vane.File("memory://numeric-wide-flat-map"),
+                "wide": 2.0,
+            }
+        }
+
+    flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.project("payload.wide::VARCHAR").fetchone() == ("2",)
+
+
+def test_native_file_udf_splits_mixed_wide_integer_storage():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "mixed-wide-storage",
+            "method_return_type": "STRUCT(document FILE, wide HUGEINT)",
+        }
+    )
+    outputs = [
+        {"document": vane.File("memory://wide-integer"), "wide": 2**100},
+        {"document": vane.File("memory://wide-double"), "wide": 1.0},
+    ]
+
+    arrays = contract.scalar_outputs_to_arrays(outputs)
+
+    assert [array.type.field("wide").type for array in arrays] == [pa.string(), pa.float64()]
+
+
+def test_file_udfs_roundtrip_parameterized_decimal_sibling_contract():
+    output_type = vane.type("STRUCT(document FILE, amount DECIMAL(10,2))")
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://decimal-scalar"),
+            "amount": Decimal("12.34"),
+        }
+
+    connection = vane.connect()
+    scalar_result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert scalar_result.project("payload.amount::VARCHAR").fetchone() == ("12.34",)
+
+    def build_row(_row):
+        return {
+            "payload": {
+                "document": vane.File("memory://decimal-flat-map"),
+                "amount": Decimal("56.78"),
+            }
+        }
+
+    flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.project("payload.amount::VARCHAR").fetchone() == ("56.78",)
 
 
 def test_file_udfs_preserve_arbitrary_precision_bignum_siblings():

@@ -541,6 +541,26 @@ static string ParseSerializedStringLiteral(const string &input, const string &fu
 	return result;
 }
 
+static uint8_t ParseSerializedDecimalParameter(const string &input, const string &full_type) {
+	string parameter = input;
+	StringUtil::Trim(parameter);
+	if (parameter.empty()) {
+		throw InternalException("Ill formatted decimal type: '%s'", full_type);
+	}
+
+	idx_t result = 0;
+	for (auto ch : parameter) {
+		if (!StringUtil::CharacterIsDigit(ch)) {
+			throw InternalException("Ill formatted decimal type: '%s'", full_type);
+		}
+		result = result * 10 + static_cast<idx_t>(ch - '0');
+		if (result > DecimalType::MaxWidth()) {
+			throw InternalException("Invalid decimal width or scale: '%s'", full_type);
+		}
+	}
+	return NumericCast<uint8_t>(result);
+}
+
 LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (StringUtil::CIEquals(type, "\"NULL\"") || StringUtil::CIEquals(type, "NULL")) {
 		return LogicalType::SQLNULL;
@@ -577,6 +597,19 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	}
 	if (upper_type == FileLogicalType::TYPE_NAME) {
 		return FileLogicalType::Create();
+	}
+	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
+		auto decimal_args_str = type.substr(8, type.size() - 9);
+		auto decimal_args = SplitSerializedTypeArguments(decimal_args_str, type);
+		if (decimal_args.size() != 2) {
+			throw InternalException("Ill formatted decimal type: '%s'", type);
+		}
+		auto width = ParseSerializedDecimalParameter(decimal_args[0], type);
+		auto scale = ParseSerializedDecimalParameter(decimal_args[1], type);
+		if (width == 0 || scale > width) {
+			throw InternalException("Invalid decimal width or scale: '%s'", type);
+		}
+		return LogicalType::DECIMAL(width, scale);
 	}
 	if (StringUtil::StartsWith(upper_type, "ENUM(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto enum_values_str = type.substr(5, type.size() - 6);
