@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 import vane
-from vane.extensions import DynamicExtensionResolver, LocalExtensionProvider
+from vane.extensions import LocalExtensionProvider
 
 
 def _configured_signed_provider():
@@ -148,7 +148,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
     from vane.runners.ray.runner import RayRunner
     from vane.runners.ray.worker import RayWorkerActor
 
-    provider, artifact = _configured_signed_provider()
+    _, artifact = _configured_signed_provider()
     connection = vane.connect(
         config={
             "allow_unsigned_extensions": "true",
@@ -156,11 +156,7 @@ def test_real_ray_prepares_and_reuses_explicit_signed_extension_without_driver_p
             "autoload_known_extensions": "true",
         }
     )
-    resolver = DynamicExtensionResolver(
-        trusted_identities={provider.trust_identity},
-        providers=(provider,),
-    )
-    resolver.load(connection, artifact.descriptor)
+    vane.load_installed_extension(artifact.descriptor.name, connection=connection)
     extension_security_settings = """
         SELECT
             CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),

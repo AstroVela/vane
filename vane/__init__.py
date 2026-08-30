@@ -241,6 +241,7 @@ from vane.extensions import (
     LocalExtensionProvider,
     ResolvedDynamicExtension,
     create_dynamic_extension_descriptor,
+    load_installed_extension,
 )
 from vane.value.constant import (
     BinaryValue,
@@ -541,6 +542,7 @@ __all__: list[str] = [
     "list_filesystems",
     "list_type",
     "load_extension",
+    "load_installed_extension",
     "map_type",
     "order",
     "open_file",

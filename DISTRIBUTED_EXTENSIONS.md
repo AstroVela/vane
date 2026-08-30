@@ -119,6 +119,13 @@ records it only after `DynamicExtensionResolver.load()` verifies the local
 artifact and DuckDB accepts the cached bytes. A non-static extension loaded by
 another route makes snapshot capture fail closed.
 
+Applications can call `vane.load_installed_extension(name, connection=...)` to
+discover exactly one installed root provider by canonical name and resolve only
+the dependency identities declared by that provider. This convenience API uses
+the same resolver and snapshot path; it does not scan extension directories,
+contact a repository, download a wheel, select a compatible version, or fall
+back to another artifact.
+
 Optional platform wheels are the offline deployment transport for these local
 providers. Each wheel contains exactly one self-contained artifact, its
 canonical descriptor, required license files, and one provider entry point,
