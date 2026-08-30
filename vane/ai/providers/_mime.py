@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from vane.ai._media import PromptMedia
+
 _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
 _GIF_SIGNATURES: Final = (b"GIF87a", b"GIF89a")
 _MAX_FTYP_BOX_SIZE: Final = 64 * 1024
@@ -154,13 +156,22 @@ class ImageMimePolicy:
     provider_name: str
     supported_mime_types: frozenset[str]
 
-    def require_supported(self, data: bytes) -> str:
-        """Return the detected MIME type or reject the input locally."""
-        mime_type = detect_image_mime_type(data)
-        if mime_type is None:
-            raise ValueError("Prompt image BLOB has an unrecognized image format")
+    def require_supported(self, value: bytes | PromptMedia) -> str:
+        """Return a declared/detected MIME type or reject the input locally."""
+        mime_type: str | None
+        if isinstance(value, PromptMedia):
+            mime_type = value.content_type
+        else:
+            mime_type = detect_image_mime_type(value)
+            if mime_type is None:
+                raise ValueError("Prompt image BLOB has an unrecognized image format")
         if mime_type not in self.supported_mime_types:
             supported = ", ".join(sorted(self.supported_mime_types))
+            if isinstance(value, PromptMedia):
+                raise ValueError(
+                    f"Prompt FILE MIME type {mime_type!r} is not supported by "
+                    f"{self.provider_name}; supported MIME types: {supported}"
+                )
             raise ValueError(
                 f"Prompt image BLOB format {mime_type!r} is not supported by "
                 f"{self.provider_name}; supported MIME types: {supported}"

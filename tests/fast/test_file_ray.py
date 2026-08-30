@@ -1,9 +1,61 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+from dataclasses import dataclass
+from typing import Any
+
 import pytest
 
 import vane
+from vane.ai._media import PromptMedia
+from vane.ai.protocols import PrompterDescriptor
+from vane.ai.provider import Provider
+from vane.ai.typing import UDFOptions
+
+
+class _RayFilePrompter:
+    async def prompt(self, messages: tuple[Any, ...]) -> str:
+        rendered = [
+            f"{message.content_type}={bytes(message).hex()}" if isinstance(message, PromptMedia) else str(message)
+            for message in messages
+        ]
+        return f"{os.getpid()}:" + ":".join(rendered)
+
+
+@dataclass
+class _RayFilePrompterDescriptor(PrompterDescriptor):
+    def get_provider(self) -> str:
+        return "ray-file-test"
+
+    def get_model(self) -> str:
+        return "ray-file-test"
+
+    def get_options(self) -> dict[str, object]:
+        return {}
+
+    def get_udf_options(self) -> UDFOptions:
+        return UDFOptions(num_gpus=0, batch_size=1, max_retries=0)
+
+    def instantiate(self) -> _RayFilePrompter:
+        return _RayFilePrompter()
+
+
+class _RayFileProvider(Provider):
+    @property
+    def name(self) -> str:
+        return "ray-file-test"
+
+    def get_prompter(
+        self,
+        model: str | None = None,
+        system_message: str | None = None,
+        return_format: dict[str, Any] | None = None,
+        return_raw_response: bool = False,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> _RayFilePrompterDescriptor:
+        return _RayFilePrompterDescriptor()
 
 
 @pytest.mark.usefixtures("ray_local")
@@ -124,3 +176,37 @@ def test_default_ray_executes_scalar_and_batch_file_udfs(monkeypatch):
     assert sorted(scalar_rows) == expected
     assert sorted(batch_rows) == expected
     assert sorted(nested_rows) == [(index, [vane.File(f"memory://ray-udf/{index}"), None]) for index in range(4)]
+
+
+@pytest.mark.usefixtures("ray_local")
+def test_default_ray_ai_prompt_reads_file_view_on_worker(monkeypatch, tmp_path):
+    path = tmp_path / "ray-ai-media.bin"
+    path.write_bytes(b"prefix-media-suffix")
+    path_sql = str(path).replace("'", "''")
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(f"""
+            SELECT
+                'describe'::VARCHAR AS prompt,
+                file('{path_sql}', 'audio/wav', 7, 5, NULL) AS media
+        """)
+        response = (
+            vane.ai.prompt(
+                source,
+                [vane.col("prompt"), vane.col("media")],
+                provider=_RayFileProvider(),
+            )
+            .project("response")
+            .fetchone()[0]
+        )
+    finally:
+        connection.close()
+
+    worker_pid, rendered = response.split(":", 1)
+    assert int(worker_pid) != os.getpid()
+    assert rendered == "describe:audio/wav=6d65646961"

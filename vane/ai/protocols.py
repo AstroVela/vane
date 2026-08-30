@@ -66,6 +66,10 @@ class PrompterDescriptor(Descriptor["Prompter"]):
         """Whether this descriptor's statically selected model accepts images."""
         return True
 
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        """Return a closed Prompt MIME allowlist, or ``None`` when support is provider/model-dynamic."""
+        return None
+
 
 class NativePrompterPlan(ABC):
     """Serializable prompt metadata consumed directly by a native planner.

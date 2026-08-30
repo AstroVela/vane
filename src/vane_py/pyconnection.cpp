@@ -3148,6 +3148,11 @@ void InstantiateNewInstance(DuckDB &db) {
 	vllm_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, vllm_info);
 
+	auto ai_prompt_pack_set = AISQLFunction::GetPromptPackFunctions();
+	CreateScalarFunctionInfo ai_prompt_pack_info(std::move(ai_prompt_pack_set));
+	ai_prompt_pack_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, ai_prompt_pack_info);
+
 	auto ai_prompt_implementation_set = AISQLFunction::GetPromptImplementationFunctions();
 	CreateScalarFunctionInfo ai_prompt_implementation_info(std::move(ai_prompt_implementation_set));
 	ai_prompt_implementation_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
