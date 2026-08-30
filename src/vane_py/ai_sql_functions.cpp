@@ -875,7 +875,12 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 			auto file_type = FileLogicalType::Create();
 			auto target_type =
 			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
-			arguments[1] = BoundCastExpression::AddCastToType(context, std::move(arguments[1]), target_type);
+			auto value = arguments[1]->return_type == PromptEmptyFilesSentinelType()
+			                 ? Value::LIST(file_type, vector<Value>())
+			                 : Value(target_type);
+			auto replacement = make_uniq<BoundConstantExpression>(std::move(value));
+			replacement->SetQueryLocation(arguments[1]->GetQueryLocation());
+			arguments[1] = std::move(replacement);
 		}
 		vector<unique_ptr<Expression>> messages;
 		messages.reserve(2);

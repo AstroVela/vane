@@ -1,5 +1,6 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
 
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"
 
 #include "duckdb/common/pair.hpp"
@@ -18,6 +19,7 @@ BindCastInput::BindCastInput(CastFunctionSet &function_set, optional_ptr<BindCas
 BoundCastInfo BindCastInput::GetCastFunction(const LogicalType &source, const LogicalType &target) {
 	GetCastFunctionInput input(context);
 	input.query_location = query_location;
+	input.file_cast_mode = file_cast_mode;
 	return function_set.GetCastFunction(source, target, input);
 }
 
@@ -54,12 +56,39 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	if (source == target) {
 		return DefaultCasts::NopCast;
 	}
+	// FILE aliases are semantic types, not presentation aliases. Letting the
+	// ordinary STRUCT cast path handle them would silently retag values and
+	// bypass their constructors and field validation.
+	auto internal_file_cast_allowed = [&]() {
+		switch (get_input.file_cast_mode) {
+		case FileCastMode::INTERNAL_FORMATTING:
+			return FileLogicalType::IsFile(source) && target == LogicalType::VARCHAR;
+		case FileCastMode::INTERNAL_ALIAS_RESTORATION: {
+			if (!FileLogicalType::IsFile(target) || FileLogicalType::IsFile(source)) {
+				return false;
+			}
+			auto physical_file_type = target.DeepCopy();
+			physical_file_type.SetAlias(string());
+			return source == physical_file_type;
+		}
+		case FileCastMode::STRICT:
+		default:
+			return false;
+		}
+	}();
+	if ((FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) && source.id() != LogicalTypeId::SQLNULL &&
+	    target.id() != LogicalTypeId::SQLNULL && !internal_file_cast_allowed) {
+		throw BinderException(get_input.query_location,
+		                      "Cannot cast from %s to %s: FILE-family casts require an exact logical type match",
+		                      source.ToString(), target.ToString());
+	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards
 	for (idx_t i = bind_functions.size(); i > 0; i--) {
 		auto &bind_function = bind_functions[i - 1];
 		BindCastInput input(*this, bind_function.info.get(), get_input.context);
 		input.query_location = get_input.query_location;
+		input.file_cast_mode = get_input.file_cast_mode;
 		auto result = bind_function.function(input, source, target);
 		if (result.function) {
 			// found a cast function! return it

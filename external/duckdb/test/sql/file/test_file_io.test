@@ -198,13 +198,7 @@ SELECT file_enrich(file('x', NULL, NULL, NULL, NULL), ['etag'])
 <REGEX>:.*field 'etag' is not supported.*
 
 statement error
-SELECT file_path(struct_pack(
-	url := NULL::VARCHAR,
-	content_type := NULL::VARCHAR,
-	"position" := NULL::BIGINT,
-	size := NULL::BIGINT,
-	checksum := NULL::VARCHAR
-)::FILE)
+SELECT file_path(file(NULL::VARCHAR, NULL, NULL, NULL, NULL))
 ----
 <REGEX>:.*url cannot be NULL.*
 
@@ -214,35 +208,17 @@ SELECT file('before' || chr(0) || 'after', NULL, NULL, NULL, NULL)
 <REGEX>:.*url cannot contain NUL bytes.*
 
 statement error
-SELECT file_exists(struct_pack(
-	url := 'test/sql/table_function/files/one.txt',
-	content_type := NULL::VARCHAR,
-	"position" := 0::BIGINT,
-	size := NULL::BIGINT,
-	checksum := NULL::VARCHAR
-)::FILE)
+SELECT file_exists(file('test/sql/table_function/files/one.txt', NULL, 0, NULL, NULL))
 ----
 <REGEX>:.*position and size must either both be NULL or both be non-NULL.*
 
 statement error
-SELECT file_stat(struct_pack(
-	url := 'test/sql/table_function/files/one.txt',
-	content_type := NULL::VARCHAR,
-	"position" := NULL::BIGINT,
-	size := NULL::BIGINT,
-	checksum := 'invalid'::VARCHAR
-)::FILE)
+SELECT file_stat(file('test/sql/table_function/files/one.txt', NULL, NULL, NULL, 'invalid'))
 ----
 <REGEX>:.*checksum must have the form <algorithm>:<digest>.*
 
 statement error
-SELECT file_content_id(struct_pack(
-	url := 'x',
-	content_type := NULL::VARCHAR,
-	"position" := NULL::BIGINT,
-	size := NULL::BIGINT,
-	checksum := ('sha256:a' || chr(0) || 'b')::VARCHAR
-)::FILE)
+SELECT file_content_id(file('x', NULL, NULL, NULL, 'sha256:a' || chr(0) || 'b'))
 ----
 <REGEX>:.*checksum must have the form <algorithm>:<digest>.*
 

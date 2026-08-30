@@ -20,8 +20,10 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/arrow_aux_data.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/udf_executor.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/scalar/udf_functions.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/config.hpp"
@@ -291,6 +293,22 @@ static void AreExtensionsRegistered(const LogicalType &arrow_type, const Logical
 	}
 }
 
+static void CastValidatedUDFOutput(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+	if (!TypeVisitor::Contains(result.GetType(), FileLogicalType::IsFile)) {
+		VectorOperations::Cast(context, source, result, count);
+		return;
+	}
+
+	// FileUDFContract validates every FILE value and media specialization before exporting the result to Arrow.
+	// Arrow intentionally carries the canonical physical STRUCT, so this boundary is the one trusted place where
+	// that STRUCT may recover the already-declared FILE-family alias. CastFunctionSet still requires an exact
+	// canonical physical shape and rejects FILE-to-FILE retagging.
+	auto &cast_functions = CastFunctionSet::Get(context);
+	GetCastFunctionInput input(context);
+	input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;
+	VectorOperations::TryCast(cast_functions, input, source, result, count, nullptr);
+}
+
 static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &table, ClientContext &context,
                                                           const vector<LogicalType> &expected_types) {
 	g_udf_direct_arrow_table_conversion_count.fetch_add(1, std::memory_order_relaxed);
@@ -341,7 +359,7 @@ static unique_ptr<DataChunk> ConvertArrowTableToDataChunk(const py::object &tabl
 		cast_chunk.Initialize(context, expected_types, source.size());
 		cast_chunk.SetCardinality(source.size());
 		for (idx_t i = 0; i < source.ColumnCount(); i++) {
-			VectorOperations::Cast(context, source.data[i], cast_chunk.data[i], source.size());
+			CastValidatedUDFOutput(context, source.data[i], cast_chunk.data[i], source.size());
 			cast_chunk.data[i].Verify(source.size());
 		}
 		auto output = make_uniq<DataChunk>();
@@ -643,7 +661,7 @@ static unique_ptr<DataChunk> WrapDataChunkColumnsAsStruct(ClientContext &context
 		if (raw->data[i].GetType() == declared_type) {
 			struct_entries[i]->Reference(raw->data[i]);
 		} else {
-			VectorOperations::Cast(context, raw->data[i], *struct_entries[i], row_count);
+			CastValidatedUDFOutput(context, raw->data[i], *struct_entries[i], row_count);
 		}
 	}
 	output->SetCardinality(row_count);

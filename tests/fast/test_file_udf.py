@@ -219,7 +219,7 @@ def test_scalar_file_udf_rejects_structural_output_fallbacks(fallback):
 
 
 @pytest.mark.parametrize("logical_type", ["FILE", "IMAGEFILE"])
-def test_file_udf_rejects_invalid_input_before_user_code(tmp_path, logical_type):
+def test_file_udf_does_not_run_after_invalid_file_construction(tmp_path, logical_type):
     marker = tmp_path / "called"
 
     @vane.func(return_dtype="INTEGER")
@@ -228,23 +228,18 @@ def test_file_udf_rejects_invalid_input_before_user_code(tmp_path, logical_type)
         return 1
 
     connection = vane.connect()
-    table_name = f"invalid_{logical_type.lower()}_udf_input"
-    connection.execute(f"CREATE TABLE {table_name}(value {logical_type})")
-    connection.execute(
-        f"""
-        INSERT INTO {table_name}
-        SELECT struct_pack(
-            url := NULL::VARCHAR,
-            content_type := NULL::VARCHAR,
-            "position" := NULL::BIGINT,
-            size := NULL::BIGINT,
-            checksum := NULL::VARCHAR
-        )
-        """
-    )
+    file_expression = "file(url, NULL, NULL, NULL, NULL)"
+    if logical_type == "IMAGEFILE":
+        file_expression = f"image_file({file_expression})"
 
-    with pytest.raises(Exception, match=r"invalid FILE value"):
-        connection.table(table_name).select(observe(vane.col("value"))).fetchall()
+    with pytest.raises(Exception, match=r"url cannot be NULL"):
+        connection.sql(f"""
+            SELECT {file_expression} AS value
+            FROM (
+                SELECT CASE WHEN i = 0 THEN NULL::VARCHAR ELSE 'memory://valid' END AS url
+                FROM range(1) AS source(i)
+            )
+        """).select(observe(vane.col("value"))).fetchall()
     assert not marker.exists()
 
 
@@ -318,7 +313,7 @@ def test_batch_file_udf_normalizes_each_worker_batch_before_concat():
     assert result.fetchall() == [(vane.File(f"memory://{identifier}"),) for identifier in range(4)]
 
 
-def test_batch_file_udf_rejects_invalid_input_before_user_code(tmp_path):
+def test_batch_file_udf_does_not_run_after_invalid_file_construction(tmp_path):
     marker = tmp_path / "called"
 
     @vane.func.batch(return_dtype="INTEGER")
@@ -329,27 +324,19 @@ def test_batch_file_udf_rejects_invalid_input_before_user_code(tmp_path):
         return pa.array([1] * len(values), type=pa.int32())
 
     connection = vane.connect()
-    connection.execute("CREATE TABLE invalid_batch_file_udf_input(value FILE)")
-    connection.execute(
-        """
-        INSERT INTO invalid_batch_file_udf_input
-        SELECT struct_pack(
-            url := NULL::VARCHAR,
-            content_type := NULL::VARCHAR,
-            "position" := NULL::BIGINT,
-            size := NULL::BIGINT,
-            checksum := NULL::VARCHAR
-        )
-        """
-    )
-
-    with pytest.raises(Exception, match=r"invalid FILE value"):
-        connection.table("invalid_batch_file_udf_input").select(observe(vane.col("value"))).fetchall()
+    with pytest.raises(Exception, match=r"url cannot be NULL"):
+        connection.sql("""
+            SELECT file(url, NULL, NULL, NULL, NULL) AS value
+            FROM (
+                SELECT CASE WHEN i = 0 THEN NULL::VARCHAR ELSE 'memory://valid' END AS url
+                FROM range(1) AS source(i)
+            )
+        """).select(observe(vane.col("value"))).fetchall()
     assert not marker.exists()
 
 
 @pytest.mark.parametrize("mode", ["map_batches", "flat_map"])
-def test_relation_table_file_udf_rejects_invalid_input_before_user_code(tmp_path, mode):
+def test_relation_table_file_udf_does_not_run_after_invalid_file_construction(tmp_path, mode):
     marker = tmp_path / "called"
 
     def observe_batch(table):
@@ -363,20 +350,13 @@ def test_relation_table_file_udf_rejects_invalid_input_before_user_code(tmp_path
         return {"result": 1}
 
     connection = vane.connect()
-    connection.execute("CREATE TABLE invalid_relation_file_udf_input(value FILE)")
-    connection.execute(
-        """
-        INSERT INTO invalid_relation_file_udf_input
-        SELECT struct_pack(
-            url := NULL::VARCHAR,
-            content_type := NULL::VARCHAR,
-            "position" := NULL::BIGINT,
-            size := NULL::BIGINT,
-            checksum := NULL::VARCHAR
+    source = connection.sql("""
+        SELECT file(url, NULL, NULL, NULL, NULL) AS value
+        FROM (
+            SELECT CASE WHEN i = 0 THEN NULL::VARCHAR ELSE 'memory://valid' END AS url
+            FROM range(1) AS source(i)
         )
-        """
-    )
-    source = connection.table("invalid_relation_file_udf_input")
+    """)
     if mode == "map_batches":
         result = source.map_batches(
             observe_batch,
@@ -390,7 +370,7 @@ def test_relation_table_file_udf_rejects_invalid_input_before_user_code(tmp_path
             execution_backend="subprocess_task",
         )
 
-    with pytest.raises(Exception, match=r"invalid FILE value"):
+    with pytest.raises(Exception, match=r"url cannot be NULL"):
         result.fetchall()
     assert not marker.exists()
 

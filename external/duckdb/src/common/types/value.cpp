@@ -16,6 +16,7 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/bit.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -1640,6 +1641,12 @@ hash_t Value::Hash() const {
 string Value::ToString() const {
 	if (IsNull()) {
 		return "NULL";
+	}
+	if (TypeVisitor::Contains(type_, FileLogicalType::IsFile)) {
+		CastFunctionSet cast_functions;
+		GetCastFunctionInput input;
+		input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
+		return StringValue::Get(CastAs(cast_functions, input, LogicalType::VARCHAR));
 	}
 	return StringValue::Get(DefaultCastAs(LogicalType::VARCHAR));
 }

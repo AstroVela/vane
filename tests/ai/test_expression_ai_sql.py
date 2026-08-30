@@ -1102,28 +1102,19 @@ def test_ai_prompt_sql_rejects_plain_struct_file_fallback():
         """).fetchall()
 
 
-def test_ai_prompt_sql_validates_malformed_file_before_opening():
+def test_ai_prompt_sql_rejects_invalid_file_construction_before_opening():
     connection = vane.connect()
-    connection.execute("CREATE TABLE malformed_ai_file(value FILE)")
-    connection.execute("""
-        INSERT INTO malformed_ai_file
-        SELECT struct_pack(
-            url := NULL::VARCHAR,
-            content_type := 'image/png',
-            "position" := NULL::BIGINT,
-            size := NULL::BIGINT,
-            checksum := NULL::VARCHAR
-        )
-    """)
-
-    with pytest.raises(Exception, match=r"ai_prompt\(\) url cannot be NULL"):
+    with pytest.raises(Exception, match=r"file\(\) url cannot be NULL"):
         connection.sql("""
             SELECT ai_prompt(
                 'describe',
-                value,
+                file(url, 'image/png', NULL, NULL, NULL),
                 provider := 'mock_ai_sql'
             )
-            FROM malformed_ai_file
+            FROM (
+                SELECT CASE WHEN i = 0 THEN NULL::VARCHAR ELSE 'memory://valid' END AS url
+                FROM range(1) AS source(i)
+            )
         """).fetchall()
 
 

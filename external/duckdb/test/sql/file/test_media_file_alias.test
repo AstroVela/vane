@@ -90,6 +90,87 @@ SELECT image_file('x') = audio_file('x')
 ----
 <REGEX>:.*Cannot compare values of type IMAGEFILE and type AUDIOFILE.*
 
+# FILE-family aliases are exact logical boundaries. DuckDB's ordinary STRUCT
+# casts must not retag a generic FILE, another specialization, or an unaliased
+# canonical STRUCT. Common-type and nested cast paths obey the same rule.
+statement error
+SELECT CAST(image_file('x') AS AUDIOFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(file('x', NULL, NULL, NULL, NULL) AS IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(image_file('x') AS STRUCT(
+	url VARCHAR,
+	content_type VARCHAR,
+	"position" BIGINT,
+	size BIGINT,
+	checksum VARCHAR
+))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CAST(image_file('x') AS VARCHAR)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT {
+	'url': 'x',
+	'content_type': NULL::VARCHAR,
+	'position': NULL::BIGINT,
+	'size': NULL::BIGINT,
+	'checksum': NULL::VARCHAR
+}::IMAGEFILE
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT CASE WHEN TRUE THEN image_file('x') ELSE audio_file('x') END
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT image_file('x') UNION ALL SELECT audio_file('x')
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT [image_file('x')]::AUDIOFILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT TRY_CAST(video_file('x') AS IMAGEFILE)
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Exact casts and NULL common types remain valid.
+query TTTT
+SELECT
+	typeof(CAST(image_file('x') AS IMAGEFILE)),
+	typeof(NULL::IMAGEFILE),
+	typeof(CASE WHEN TRUE THEN image_file('x') ELSE NULL END),
+	typeof(CASE WHEN TRUE THEN NULL ELSE audio_file('x') END)
+----
+IMAGEFILE	IMAGEFILE	IMAGEFILE	AUDIOFILE
+
+query T
+SELECT typeof(value)
+FROM (
+	SELECT video_file('x') AS value
+	UNION ALL
+	SELECT NULL
+)
+LIMIT 1
+----
+VIDEOFILE
+
 # Generic FILE-family functions accept all specializations. Value-returning
 # enrichment preserves its input alias, while identity functions compare
 # family members explicitly.
@@ -121,14 +202,32 @@ INSERT INTO media_files VALUES (
 	video_file('stored.mp4')
 )
 
+statement error
+INSERT INTO media_files(image) SELECT audio_file('wrong.mp3')
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement ok
+PREPARE insert_image AS INSERT INTO media_files(image) VALUES ($1)
+
+statement error
+EXECUTE insert_image(audio_file('wrong.mp3'))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement ok
+EXECUTE insert_image(image_file('prepared.png'))
+
 query TTTTTT
 SELECT
 	typeof(image), image.url,
 	typeof(audio), audio.url,
 	typeof(video), video.url
 FROM media_files
+ORDER BY image.url DESC
 ----
 IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4
+IMAGEFILE	prepared.png	AUDIOFILE	NULL	VIDEOFILE	NULL
 
 restart
 
@@ -138,5 +237,7 @@ SELECT
 	typeof(audio), audio.url,
 	typeof(video), video.url
 FROM media_files
+ORDER BY image.url DESC
 ----
 IMAGEFILE	stored.png	AUDIOFILE	stored.mp3	VIDEOFILE	stored.mp4
+IMAGEFILE	prepared.png	AUDIOFILE	NULL	VIDEOFILE	NULL

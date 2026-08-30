@@ -1499,16 +1499,18 @@ def test_plain_struct_does_not_select_file_union_member():
         vane.ConstantExpression(vane.Value(value, dtype))
 
 
-def test_invalid_stored_file_is_rejected_during_materialization(duckdb_cursor):
+def test_plain_struct_cannot_be_inserted_as_file(duckdb_cursor):
     duckdb_cursor.execute("CREATE TABLE invalid_file(value FILE)")
-    duckdb_cursor.execute(
-        """
-        INSERT INTO invalid_file
-        SELECT ROW(NULL::VARCHAR, NULL::VARCHAR, NULL::BIGINT, NULL::BIGINT, NULL::VARCHAR)
-        """
-    )
-    with pytest.raises(vane.InvalidInputException, match="url cannot be NULL"):
-        duckdb_cursor.sql("SELECT value FROM invalid_file").fetchone()
+    with pytest.raises(
+        vane.BinderException,
+        match="FILE-family casts require an exact logical type match",
+    ):
+        duckdb_cursor.execute(
+            """
+            INSERT INTO invalid_file
+            SELECT ROW(NULL::VARCHAR, NULL::VARCHAR, NULL::BIGINT, NULL::BIGINT, NULL::VARCHAR)
+            """
+        )
 
 
 def test_file_expression_api_is_pure_and_defers_validation(duckdb_cursor):
