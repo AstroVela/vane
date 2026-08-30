@@ -285,6 +285,54 @@ def _is_arrow_list_storage(dtype: pa.DataType) -> bool:
     )
 
 
+def _is_arrow_list_like_storage(dtype: pa.DataType) -> bool:
+    return _is_arrow_list_storage(dtype) or pa.types.is_fixed_size_list(dtype)
+
+
+def _list_storage_parts(array: Any) -> tuple[list[int | None], Any, bool] | None:
+    """Return logical row lengths and active children for Arrow list-like storage."""
+    if _is_arrow_list_storage(array.type):
+        lengths = [None if length is None else int(length) for length in pc.list_value_length(array).to_pylist()]
+        return lengths, pc.list_flatten(array), _is_arrow_large_list_storage(array.type)
+    if not pa.types.is_fixed_size_list(array.type):
+        return None
+
+    list_size = array.type.list_size
+    lengths = [list_size if is_valid else None for is_valid in array.is_valid().to_pylist()]
+    values = array.values.slice(array.offset * list_size, len(array) * list_size)
+    if all(length is not None for length in lengths):
+        return lengths, values, False
+    selected = [
+        row_index * list_size + child_index
+        for row_index, length in enumerate(lengths)
+        if length is not None
+        for child_index in range(list_size)
+    ]
+    return lengths, values.take(pa.array(selected, type=pa.int64())), False
+
+
+def _fixed_sequence_child_source(array: Any, dtype: Any, *, boundary: str) -> Any | None:
+    parts = _list_storage_parts(array)
+    if parts is None:
+        return None
+    lengths, flattened, _ = parts
+    expected_size = _fixed_sequence_size(dtype)
+    if any(length is not None and length != expected_size for length in lengths):
+        raise _invalid_input(f"{boundary} {_type_id(dtype).upper()} value must have fixed size {expected_size}")
+    if all(length is not None for length in lengths):
+        return flattened
+
+    flattened_index = 0
+    child_indices: list[int | None] = []
+    for length in lengths:
+        if length is None:
+            child_indices.extend([None] * expected_size)
+            continue
+        child_indices.extend(range(flattened_index, flattened_index + expected_size))
+        flattened_index += length
+    return flattened.take(pa.array(child_indices, type=pa.int64()))
+
+
 def _list_array_from_offsets(
     offsets: Sequence[int],
     values: Any,
@@ -477,7 +525,7 @@ def _validate_nested_struct_field_sets(
 
     if type_id in ("list", "array", "tensor"):
         actual_storage = actual.storage_type if _is_arrow_extension_type(actual) else actual
-        if not (_is_arrow_list_storage(actual_storage) or pa.types.is_fixed_size_list(actual_storage)):
+        if not _is_arrow_list_like_storage(actual_storage):
             return
         _validate_nested_struct_field_sets(
             actual_storage.value_type,
@@ -543,8 +591,8 @@ def _validate_arrow_storage_type(
 
     type_id = _type_id(dtype)
     if type_id == "list":
-        if not _is_arrow_list_storage(actual):
-            raise _invalid_input(f"{boundary} value at {path} must use an Arrow list type")
+        if not _is_arrow_list_like_storage(actual):
+            raise _invalid_input(f"{boundary} value at {path} must use an Arrow list-like type")
         _validate_arrow_storage_type(
             actual.value_type,
             _sequence_child(dtype),
@@ -564,11 +612,10 @@ def _validate_arrow_storage_type(
             ):
                 raise _invalid_input(f"{boundary} value at {path} must use its declared Arrow tensor metadata")
             actual_storage = actual.storage_type
-        if not pa.types.is_fixed_size_list(actual_storage):
-            raise _invalid_input(f"{boundary} value at {path} must use an Arrow fixed-size list type")
-        expected_size = _fixed_sequence_size(dtype)
-        if actual_storage.list_size != expected_size:
-            raise _invalid_input(f"{boundary} value at {path} must have fixed size {expected_size}")
+        if not _is_arrow_list_like_storage(actual_storage):
+            raise _invalid_input(f"{boundary} value at {path} must use an Arrow list-like type")
+        if pa.types.is_fixed_size_list(actual_storage) and actual_storage.list_size != _fixed_sequence_size(dtype):
+            raise _invalid_input(f"{boundary} value at {path} must have fixed size {_fixed_sequence_size(dtype)}")
         _validate_arrow_storage_type(
             actual_storage.value_type,
             _sequence_child(dtype),
@@ -739,23 +786,30 @@ def _validate_file_arrow_values(
         return
     if type_id == "list":
         source = _mask_inactive(array, active)
+        parts = _list_storage_parts(source)
+        if parts is None:
+            return
+        _, child_source, _ = parts
         _validate_file_arrow_values(
-            pc.list_flatten(source),
+            child_source,
             _sequence_child(dtype),
             boundary=boundary,
             path=f"{path}[]",
         )
         return
     if type_id in ("array", "tensor"):
-        storage = array.storage if type_id == "tensor" and isinstance(array, pa.ExtensionArray) else array
+        source = _mask_inactive(array, active)
+        storage = source.storage if type_id == "tensor" and isinstance(source, pa.ExtensionArray) else source
         array_size = _fixed_sequence_size(dtype)
-        child_active = [is_active for is_active in active for _ in range(array_size)]
+        child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
+        if child_source is None:
+            return
         _validate_file_arrow_values(
-            storage.values.slice(storage.offset * array_size, len(storage) * array_size),
+            child_source,
             _sequence_child(dtype),
             boundary=boundary,
             path=f"{path}[]",
-            parent_active=child_active,
+            parent_active=[is_active for is_active in active for _ in range(array_size)],
         )
         return
     if type_id == "map":
@@ -1348,15 +1402,16 @@ def _normalize_file_arrow_array(
 
     if type_id == "list":
         source = _mask_inactive(array, active)
-        if not _is_arrow_list_storage(source.type):
+        parts = _list_storage_parts(source)
+        if parts is None:
             return source
 
-        lengths = [0 if length is None else int(length) for length in pc.list_value_length(source).to_pylist()]
+        lengths, child_source, force_large = parts
         offsets = [0]
         for length in lengths:
-            offsets.append(offsets[-1] + length)
+            offsets.append(offsets[-1] + (0 if length is None else length))
         child_array = _normalize_file_arrow_array(
-            pc.list_flatten(source),
+            child_source,
             _sequence_child(dtype),
             boundary=boundary,
             normalize_value_dependent=normalize_value_dependent,
@@ -1365,7 +1420,7 @@ def _normalize_file_arrow_array(
             offsets,
             child_array,
             mask=source.is_null(),
-            force_large=_is_arrow_large_list_storage(source.type),
+            force_large=force_large,
         )
 
     if type_id in ("array", "tensor"):
@@ -1381,27 +1436,8 @@ def _normalize_file_arrow_array(
                 return source
             storage = source.storage
         array_size = _fixed_sequence_size(dtype)
-        child_source: Any
-        if _is_arrow_list_storage(storage.type):
-            lengths = pc.list_value_length(storage).to_pylist()
-            if any(length is not None and int(length) != array_size for length in lengths):
-                raise _invalid_input(f"{boundary} ARRAY value must have fixed size {array_size}")
-
-            flattened = pc.list_flatten(storage)
-            flattened_index = 0
-            child_indices: list[int | None] = []
-            for length in lengths:
-                if length is None:
-                    child_indices.extend([None] * array_size)
-                    continue
-                child_indices.extend(range(flattened_index, flattened_index + array_size))
-                flattened_index += int(length)
-            child_source = flattened.take(pa.array(child_indices, type=pa.int64()))
-        elif pa.types.is_fixed_size_list(storage.type):
-            if storage.type.list_size != array_size:
-                raise _invalid_input(f"{boundary} ARRAY value must have fixed size {array_size}")
-            child_source = storage.values.slice(storage.offset * array_size, len(storage) * array_size)
-        else:
+        child_source = _fixed_sequence_child_source(storage, dtype, boundary=boundary)
+        if child_source is None:
             return source
 
         child_array = _normalize_file_arrow_array(

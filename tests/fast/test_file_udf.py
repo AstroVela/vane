@@ -674,6 +674,114 @@ def test_file_arrow_list_normalization_preserves_large_offsets(storage_kind):
     assert normalized.to_pylist() == [[_file_record()]]
 
 
+@pytest.mark.parametrize("declared_type", ["FILE[2]", "TENSOR(FILE, [2])"], ids=["array", "tensor"])
+@pytest.mark.parametrize("storage_kind", ["list", "large_list", "list_view", "large_list_view"])
+def test_file_fixed_sequence_normalization_accepts_variable_list_storage(declared_type, storage_kind):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import normalize_file_arrow_array
+
+    records = [
+        _file_record(url="memory://first"),
+        _file_record(url="memory://second"),
+    ]
+    files = pa.array([_file_record(url="memory://ignored"), *records], type=_file_arrow_type())
+    if storage_kind == "list":
+        source = pa.ListArray.from_arrays(pa.array([0, 1, 3], type=pa.int32()), files).slice(1, 1)
+    elif storage_kind == "large_list":
+        source = pa.LargeListArray.from_arrays(pa.array([0, 1, 3], type=pa.int64()), files).slice(1, 1)
+    else:
+        class_name = "LargeListViewArray" if storage_kind == "large_list_view" else "ListViewArray"
+        view_array = getattr(pa, class_name, None)
+        predicate = getattr(pa.types, f"is_{storage_kind}", None)
+        if view_array is None or not callable(predicate):
+            pytest.skip(f"PyArrow does not expose {class_name}")
+        offset_type = pa.int64() if storage_kind == "large_list_view" else pa.int32()
+        source = view_array.from_arrays(
+            pa.array([1], type=offset_type),
+            pa.array([2], type=offset_type),
+            files,
+        )
+
+    normalized = normalize_file_arrow_array(
+        source,
+        vane.type(declared_type),
+        boundary="variable-list-to-fixed-file-output",
+    )
+
+    storage = normalized.storage if isinstance(normalized, pa.ExtensionArray) else normalized
+    assert pa.types.is_fixed_size_list(storage.type)
+    assert storage.type.list_size == 2
+    assert normalized.to_pylist() == [records]
+
+
+def test_file_array_normalization_validates_variable_list_lengths_and_values():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import normalize_file_arrow_array
+
+    wrong_length = pa.array([[_file_record()]], type=pa.list_(_file_arrow_type()))
+    with pytest.raises(vane.InvalidInputException, match="must have fixed size 2"):
+        normalize_file_arrow_array(
+            wrong_length,
+            vane.type("FILE[2]"),
+            boundary="wrong-length-file-array-output",
+        )
+
+    invalid_file = pa.array(
+        [[_file_record(), _file_record(position=1, size=None)]],
+        type=pa.list_(_file_arrow_type()),
+    )
+    with pytest.raises(vane.InvalidInputException, match="position and size"):
+        normalize_file_arrow_array(
+            invalid_file,
+            vane.type("FILE[2]"),
+            boundary="invalid-file-array-output",
+        )
+
+    hidden_invalid_file = pa.ListArray.from_arrays(
+        pa.array([0, 2], type=pa.int32()),
+        pa.array(
+            [_file_record(), _file_record(position=1, size=None)],
+            type=_file_arrow_type(),
+        ),
+        mask=pa.array([True], type=pa.bool_()),
+    )
+    normalized_null = normalize_file_arrow_array(
+        hidden_invalid_file,
+        vane.type("FILE[2]"),
+        boundary="null-file-array-output",
+    )
+    assert normalized_null.to_pylist() == [None]
+
+
+def test_file_list_normalization_accepts_fixed_size_list_storage():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import normalize_file_arrow_array
+
+    records = [
+        _file_record(url="memory://first"),
+        _file_record(url="memory://second"),
+    ]
+    source = pa.FixedSizeListArray.from_arrays(
+        pa.array(
+            [_file_record(url="memory://ignored-1"), _file_record(url="memory://ignored-2"), *records],
+            type=_file_arrow_type(),
+        ),
+        2,
+    ).slice(1, 1)
+
+    normalized = normalize_file_arrow_array(
+        source,
+        vane.list_type(vane.file_type()),
+        boundary="fixed-to-variable-file-list-output",
+    )
+
+    assert pa.types.is_list(normalized.type)
+    assert normalized.to_pylist() == [records]
+
+
 def test_file_arrow_non_file_map_sibling_preserves_string_cast_input():
     import pyarrow as pa
 
