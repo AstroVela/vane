@@ -1271,6 +1271,68 @@ def _native_outputs_to_arrow_arrays(values: Sequence[Any], dtype: Any, *, bounda
     return [group[0] if len(group) == 1 else pa.concat_arrays(group) for group in groups]
 
 
+def _collect_large_list_paths(
+    actual: pa.DataType,
+    dtype: Any,
+    *,
+    logical_path: tuple[int, ...],
+    result: set[tuple[int, ...]],
+) -> None:
+    """Collect declared LIST nodes normalized with 64-bit Arrow offsets."""
+    if _is_file_type(dtype):
+        return
+
+    type_id = _type_id(dtype)
+    if type_id == "list":
+        if not _is_arrow_list_like_storage(actual):
+            return
+        if _is_arrow_large_list_storage(actual):
+            result.add(logical_path)
+        _collect_large_list_paths(
+            actual.value_type,
+            _sequence_child(dtype),
+            logical_path=(*logical_path, 0),
+            result=result,
+        )
+        return
+    if type_id in ("array", "tensor"):
+        actual_storage = actual.storage_type if type_id == "tensor" and _is_arrow_extension_type(actual) else actual
+        if not _is_arrow_list_like_storage(actual_storage):
+            return
+        _collect_large_list_paths(
+            actual_storage.value_type,
+            _sequence_child(dtype),
+            logical_path=(*logical_path, 0),
+            result=result,
+        )
+        return
+    if type_id == "struct" and pa.types.is_struct(actual):
+        for child_index, (_, child) in enumerate(dtype.children):
+            if child_index >= actual.num_fields:
+                return
+            _collect_large_list_paths(
+                actual.field(child_index).type,
+                child,
+                logical_path=(*logical_path, child_index),
+                result=result,
+            )
+        return
+    if type_id == "map" and pa.types.is_map(actual):
+        children = _type_children(dtype)
+        _collect_large_list_paths(
+            actual.key_type,
+            children["key"],
+            logical_path=(*logical_path, 0),
+            result=result,
+        )
+        _collect_large_list_paths(
+            actual.item_type,
+            children["value"],
+            logical_path=(*logical_path, 1),
+            result=result,
+        )
+
+
 def _normalize_file_arrow_array(
     array: Any,
     dtype: Any,
@@ -1278,6 +1340,8 @@ def _normalize_file_arrow_array(
     boundary: str,
     parent_active: Sequence[bool] | None = None,
     normalize_value_dependent: bool = True,
+    force_large_list_paths: frozenset[tuple[int, ...]] = frozenset(),
+    logical_path: tuple[int, ...] = (),
 ) -> Any:
     """Canonicalize a FILE-bearing Arrow value to its declared stable storage."""
     if isinstance(array, pa.ChunkedArray):
@@ -1288,22 +1352,38 @@ def _normalize_file_arrow_array(
                 boundary=boundary,
                 parent_active=parent_active,
                 normalize_value_dependent=normalize_value_dependent,
+                force_large_list_paths=force_large_list_paths,
+                logical_path=logical_path,
             )
             return pa.chunked_array([], type=normalized_empty.type)
-        chunks = []
-        offset = 0
-        for chunk in array.chunks:
-            chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
-            chunks.append(
-                _normalize_file_arrow_array(
-                    chunk,
-                    dtype,
-                    boundary=boundary,
-                    parent_active=chunk_active,
-                    normalize_value_dependent=normalize_value_dependent,
+
+        def normalize_chunks(
+            *,
+            value_dependent: bool,
+            large_list_paths: frozenset[tuple[int, ...]],
+        ) -> list[Any]:
+            result = []
+            offset = 0
+            for chunk in array.chunks:
+                chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
+                result.append(
+                    _normalize_file_arrow_array(
+                        chunk,
+                        dtype,
+                        boundary=boundary,
+                        parent_active=chunk_active,
+                        normalize_value_dependent=value_dependent,
+                        force_large_list_paths=large_list_paths,
+                        logical_path=logical_path,
+                    )
                 )
-            )
-            offset += len(chunk)
+                offset += len(chunk)
+            return result
+
+        chunks = normalize_chunks(
+            value_dependent=normalize_value_dependent,
+            large_list_paths=force_large_list_paths,
+        )
         normalized_type = chunks[0].type
         if all(chunk.type.equals(normalized_type) for chunk in chunks[1:]):
             return pa.chunked_array(chunks, type=normalized_type)
@@ -1311,24 +1391,42 @@ def _normalize_file_arrow_array(
         # Some safe casts, notably temporal downcasts, depend on the values.
         # Retry every original chunk without those casts so the whole logical
         # column keeps one schema without concatenating or materializing it.
-        stable_chunks = []
-        offset = 0
-        for chunk in array.chunks:
-            chunk_active = None if parent_active is None else parent_active[offset : offset + len(chunk)]
-            stable_chunks.append(
-                _normalize_file_arrow_array(
-                    chunk,
-                    dtype,
-                    boundary=boundary,
-                    parent_active=chunk_active,
-                    normalize_value_dependent=False,
-                )
-            )
-            offset += len(chunk)
+        stable_chunks = normalize_chunks(value_dependent=False, large_list_paths=force_large_list_paths)
         stable_type = stable_chunks[0].type
-        if any(not chunk.type.equals(stable_type) for chunk in stable_chunks[1:]):
-            raise RuntimeError("FILE normalization could not stabilize a chunked Arrow column")
-        return pa.chunked_array(stable_chunks, type=stable_type)
+        if all(chunk.type.equals(stable_type) for chunk in stable_chunks[1:]):
+            return pa.chunked_array(stable_chunks, type=stable_type)
+
+        # A ListView chunk can logically flatten beyond INT32_MAX even when
+        # another chunk in the same column remains small. Promote each LIST
+        # path used by any normalized chunk, then rebuild every chunk with one
+        # stable offset width at that path.
+        promoted_paths = set(force_large_list_paths)
+        for chunk in stable_chunks:
+            _collect_large_list_paths(
+                chunk.type,
+                dtype,
+                logical_path=logical_path,
+                result=promoted_paths,
+            )
+        if promoted_paths != set(force_large_list_paths):
+            frozen_promoted_paths = frozenset(promoted_paths)
+            promoted_chunks = normalize_chunks(
+                value_dependent=normalize_value_dependent,
+                large_list_paths=frozen_promoted_paths,
+            )
+            promoted_type = promoted_chunks[0].type
+            if all(chunk.type.equals(promoted_type) for chunk in promoted_chunks[1:]):
+                return pa.chunked_array(promoted_chunks, type=promoted_type)
+            if normalize_value_dependent:
+                promoted_chunks = normalize_chunks(
+                    value_dependent=False,
+                    large_list_paths=frozen_promoted_paths,
+                )
+                promoted_type = promoted_chunks[0].type
+                if all(chunk.type.equals(promoted_type) for chunk in promoted_chunks[1:]):
+                    return pa.chunked_array(promoted_chunks, type=promoted_type)
+
+        raise RuntimeError("FILE normalization could not stabilize a chunked Arrow column")
     active = _active_values(array, parent_active)
     type_id = _type_id(dtype)
     if type_id == "bit":
@@ -1386,7 +1484,7 @@ def _normalize_file_arrow_array(
 
         arrays = []
         fields = []
-        for name, child in dtype.children:
+        for child_index, (name, child) in enumerate(dtype.children):
             field_index = _struct_field_index(source.type, name, boundary=boundary, path="column")
             child_array = source.field(field_index)
             child_array = _normalize_file_arrow_array(
@@ -1395,6 +1493,8 @@ def _normalize_file_arrow_array(
                 boundary=boundary,
                 parent_active=active,
                 normalize_value_dependent=normalize_value_dependent,
+                force_large_list_paths=force_large_list_paths,
+                logical_path=(*logical_path, child_index),
             )
             arrays.append(child_array)
             fields.append(pa.field(name, child_array.type))
@@ -1415,12 +1515,14 @@ def _normalize_file_arrow_array(
             _sequence_child(dtype),
             boundary=boundary,
             normalize_value_dependent=normalize_value_dependent,
+            force_large_list_paths=force_large_list_paths,
+            logical_path=(*logical_path, 0),
         )
         return _list_array_from_offsets(
             offsets,
             child_array,
             mask=source.is_null(),
-            force_large=force_large,
+            force_large=force_large or logical_path in force_large_list_paths,
         )
 
     if type_id in ("array", "tensor"):
@@ -1446,6 +1548,8 @@ def _normalize_file_arrow_array(
             boundary=boundary,
             parent_active=[is_active for is_active in active for _ in range(array_size)],
             normalize_value_dependent=normalize_value_dependent,
+            force_large_list_paths=force_large_list_paths,
+            logical_path=(*logical_path, 0),
         )
         normalized_storage = pa.FixedSizeListArray.from_arrays(child_array, array_size, mask=source.is_null())
         if type_id == "array":
@@ -1474,12 +1578,16 @@ def _normalize_file_arrow_array(
             children["key"],
             boundary=boundary,
             normalize_value_dependent=normalize_value_dependent,
+            force_large_list_paths=force_large_list_paths,
+            logical_path=(*logical_path, 0),
         )
         items = _normalize_file_arrow_array(
             items,
             children["value"],
             boundary=boundary,
             normalize_value_dependent=normalize_value_dependent,
+            force_large_list_paths=force_large_list_paths,
+            logical_path=(*logical_path, 1),
         )
         return pa.MapArray.from_arrays(
             pa.array(normalized_offsets, type=pa.int32()),

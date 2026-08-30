@@ -674,6 +674,95 @@ def test_file_arrow_list_normalization_preserves_large_offsets(storage_kind):
     assert normalized.to_pylist() == [[_file_record()]]
 
 
+@pytest.mark.parametrize("storage_kind", ["list", "list_view"])
+def test_chunked_file_list_normalization_promotes_every_chunk(monkeypatch, storage_kind):
+    import pyarrow as pa
+
+    import vane.execution.udf_file_contract as file_contract
+
+    monkeypatch.setattr(file_contract, "_ARROW_LIST_OFFSET_MAX", 1)
+
+    def make_chunk(records):
+        files = pa.array(records, type=_file_arrow_type())
+        if storage_kind == "list":
+            return pa.ListArray.from_arrays(pa.array([0, len(records)], type=pa.int32()), files)
+        list_view_array = getattr(pa, "ListViewArray", None)
+        is_list_view = getattr(pa.types, "is_list_view", None)
+        if list_view_array is None or not callable(is_list_view):
+            pytest.skip("PyArrow does not expose ListViewArray")
+        return list_view_array.from_arrays(
+            pa.array([0], type=pa.int32()),
+            pa.array([len(records)], type=pa.int32()),
+            files,
+        )
+
+    source = pa.chunked_array(
+        [
+            make_chunk([_file_record(url="memory://small")]),
+            make_chunk(
+                [
+                    _file_record(url="memory://large-1"),
+                    _file_record(url="memory://large-2"),
+                ]
+            ),
+        ]
+    )
+
+    normalized = file_contract.normalize_file_arrow_array(
+        source,
+        vane.list_type(vane.file_type()),
+        boundary="chunked-large-file-list-output",
+    )
+
+    assert pa.types.is_large_list(normalized.type)
+    assert all(pa.types.is_large_list(chunk.type) for chunk in normalized.chunks)
+    assert normalized.to_pylist() == source.to_pylist()
+
+
+def test_chunked_file_list_normalization_promotes_only_required_nested_paths(monkeypatch):
+    import pyarrow as pa
+
+    import vane.execution.udf_file_contract as file_contract
+
+    monkeypatch.setattr(file_contract, "_ARROW_LIST_OFFSET_MAX", 1)
+    list_type = pa.list_(_file_arrow_type())
+
+    def make_chunk(long_records):
+        return pa.StructArray.from_arrays(
+            [
+                pa.array([[_file_record(url="memory://short")]], type=list_type),
+                pa.array([long_records], type=list_type),
+                pa.array([0], type=pa.timestamp("ms")),
+            ],
+            names=["short", "long", "created_at"],
+        )
+
+    source = pa.chunked_array(
+        [
+            make_chunk([_file_record(url="memory://long-small")]),
+            make_chunk(
+                [
+                    _file_record(url="memory://long-large-1"),
+                    _file_record(url="memory://long-large-2"),
+                ]
+            ),
+        ]
+    )
+
+    normalized = file_contract.normalize_file_arrow_array(
+        source,
+        vane.type("STRUCT(short FILE[], long FILE[], created_at TIMESTAMP)"),
+        boundary="chunked-nested-large-file-list-output",
+    )
+
+    assert pa.types.is_list(normalized.type.field("short").type)
+    assert pa.types.is_large_list(normalized.type.field("long").type)
+    assert normalized.type.field("created_at").type == pa.timestamp("us")
+    assert all(pa.types.is_list(chunk.type.field("short").type) for chunk in normalized.chunks)
+    assert all(pa.types.is_large_list(chunk.type.field("long").type) for chunk in normalized.chunks)
+    assert normalized.to_pylist() == source.to_pylist()
+
+
 @pytest.mark.parametrize("declared_type", ["FILE[2]", "TENSOR(FILE, [2])"], ids=["array", "tensor"])
 @pytest.mark.parametrize("storage_kind", ["list", "large_list", "list_view", "large_list_view"])
 def test_file_fixed_sequence_normalization_accepts_variable_list_storage(declared_type, storage_kind):
