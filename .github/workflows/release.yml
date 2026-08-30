@@ -4,10 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Build only, or publish an existing draft release
+        description: Build only, publish a main-branch dev candidate, or publish an existing draft release
         type: choice
         options:
           - build-only
+          - testpypi-dev
           - release
         default: build-only
         required: true
@@ -150,6 +151,10 @@ jobs:
           )"
           if test "$OPERATION" = "release"; then
             test "$GITHUB_REF_NAME" = "v$version"
+          elif test "$OPERATION" = "testpypi-dev"; then
+            python scripts/validate_testpypi_candidate.py \
+              --version "$version" \
+              --github-ref "$GITHUB_REF"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           python scripts/check_release_artifacts.py --expected-version "$version" "$path"
@@ -358,7 +363,7 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    if: inputs.operation == 'release'
+    if: inputs.operation == 'release' || inputs.operation == 'testpypi-dev'
     needs: assemble
     runs-on: ubuntu-24.04
     environment:
@@ -382,10 +387,11 @@ jobs:
 
   verify-testpypi:
     name: Verify the TestPyPI candidate
-    if: inputs.operation == 'release'
+    if: inputs.operation == 'release' || inputs.operation == 'testpypi-dev'
     needs:
       - assemble
       - publish-testpypi
+      - source-package
     runs-on: ubuntu-24.04
     steps:
       - name: Set up Python
@@ -401,10 +407,11 @@ jobs:
 
       - name: Download and install the indexed candidate
         env:
+          EXPECTED_VERSION: ${{ needs['source-package'].outputs.version }}
           INDEX_URL: https://test.pypi.org/simple/
         run: |
           python -m pip install --upgrade pip
-          version="${GITHUB_REF_NAME#v}"
+          version="$EXPECTED_VERSION"
           indexed_wheel=""
           for attempt in 1 2 3 4 5; do
             candidate_dir="$RUNNER_TEMP/testpypi-candidate-$attempt"

@@ -59,8 +59,10 @@ Repository administrators must:
    scanning.
 4. Configure the `RELEASE_ARTIFACT_CONTENT_RULES` repository secret used by
    trusted artifact validation.
-5. Create protected `testpypi` and `pypi` GitHub environments. Both accept only
-   `v*` tags, require maintainer approval, and disallow administrator bypass.
+5. Create protected `testpypi` and `pypi` GitHub environments. The `testpypi`
+   environment accepts only the protected `main` branch and `v*` tags; the
+   `pypi` environment accepts only `v*` tags. Both require maintainer approval
+   and disallow administrator bypass.
 6. Register `.github/workflows/release.yml` as a trusted publisher for the
    `vane-ai` project on TestPyPI and PyPI, using the matching `testpypi` and
    `pypi` environment names. Publishing intentionally has no API-token fallback.
@@ -70,6 +72,28 @@ Repository administrators must:
 
 Review these settings before every release rather than assuming the one-time
 configuration has remained unchanged.
+
+## Publish a TestPyPI development candidate
+
+Use a development candidate to qualify exact cross-package dependencies before
+the next Vane release exists. Dispatch the release workflow from the protected
+`main` branch without creating a tag:
+
+```bash
+gh workflow run release.yml \
+  --repo AstroVela/vane \
+  --ref main \
+  -f operation=testpypi-dev
+```
+
+The workflow accepts only the canonical PEP 440 development version derived
+from that exact `main` commit and rejects a version already present on
+TestPyPI. It builds, validates, attests, and signs the same complete
+distribution set as a release, then publishes and clean-installs it through
+the protected `testpypi` environment. It does not publish to PyPI, create a
+tag, or create or modify a GitHub Release. A development candidate is
+immutable and is never promoted; if it is unsuitable, merge a fix and publish
+the new commit's development version.
 
 ## Prepare the release pull request
 
