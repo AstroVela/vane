@@ -118,6 +118,11 @@ class MockPrompterDescriptor(PrompterDescriptor):
     def supports_image_inputs(self) -> bool:
         return self.model_name != "text-only"
 
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        if self.model_name in {"image-only", "round-trip-file"}:
+            return frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
+        return None
+
     def instantiate(self) -> MockPrompter:
         return MockPrompter(
             self.model_name,
@@ -644,11 +649,10 @@ def test_ai_prompt_sql_file_media_survives_provider_retry(tmp_path):
 
 def test_ai_prompt_sql_unsupported_file_mime_obeys_on_error(tmp_path):
     path = tmp_path / "audio.bin"
-    path.write_bytes(b"audio")
     path_sql = str(path).replace("'", "''")
     connection = vane.connect()
 
-    with pytest.raises(Exception, match="Prompt execution"):
+    with pytest.raises(Exception, match="Prompt FILE MIME type.*not supported"):
         connection.sql(f"""
             SELECT ai_prompt(
                 'describe',
@@ -904,7 +908,7 @@ def test_ai_prompt_pack_enforces_vector_limit_across_file_columns_and_rows(tmp_p
         FROM (
             SELECT
                 row_id,
-                __vane_ai_prompt_pack(TRUE, FALSE, {packed_arguments}) AS packed
+                __vane_ai_prompt_pack(TRUE, ['image/png'], FALSE, {packed_arguments}) AS packed
             FROM (VALUES
                 (0, {oversized_row}),
                 (1, {valid_row})
@@ -919,6 +923,46 @@ def test_ai_prompt_pack_enforces_vector_limit_across_file_columns_and_rows(tmp_p
         (0, "vector_too_large", None),
         (1, None, 19 * 1024 * 1024),
     ]
+
+
+def test_ai_prompt_pack_rejects_unsupported_mime_before_vector_budget(tmp_path):
+    path = tmp_path / "mime-budget.bin"
+    with path.open("wb") as file:
+        file.truncate(19 * 1024 * 1024)
+    path_sql = str(path).replace("'", "''")
+
+    rows = (
+        vane.connect()
+        .sql(f"""
+        SELECT
+            row_id,
+            packed.message_0.error,
+            octet_length(packed.message_0.data)
+        FROM (
+            SELECT
+                row_id,
+                __vane_ai_prompt_pack(
+                    TRUE,
+                    ['image/png'],
+                    FALSE,
+                    file('{path_sql}', content_type, NULL, NULL, NULL)
+                ) AS packed
+            FROM (VALUES
+                (0, 'audio/wav'),
+                (1, 'audio/wav'),
+                (2, 'audio/wav'),
+                (3, 'audio/wav'),
+                (4, 'audio/wav'),
+                (5, 'audio/wav'),
+                (6, 'image/png')
+            ) AS source(row_id, content_type)
+        )
+        ORDER BY row_id
+    """)
+        .fetchall()
+    )
+
+    assert rows == [(row_id, "unsupported_mime", None) for row_id in range(6)] + [(6, None, 19 * 1024 * 1024)]
 
 
 def test_ai_prompt_sql_file_capability_error_obeys_on_error_before_io():
@@ -1470,6 +1514,15 @@ def test_ai_sql_helper_builds_prompt_specs_without_execution():
 
     file_spec = build_ai_prompt_sql_spec("mock_ai_sql", input_kind="file")
     assert file_spec["input_names"] == ["__vane_prompt_messages"]
+    assert file_spec["supported_media_mime_types"] == []
+
+    image_only_spec = build_ai_prompt_sql_spec("mock_ai_sql", model="image-only", input_kind="file")
+    assert image_only_spec["supported_media_mime_types"] == [
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    ]
 
 
 def test_ai_sql_helper_builds_closed_native_vllm_spec():

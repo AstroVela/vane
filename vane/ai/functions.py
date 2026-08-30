@@ -46,7 +46,7 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
-from vane.ai._media import PromptMedia
+from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -1219,6 +1219,12 @@ class _PromptBatch:
                 raise ValueError("Prompt FILE MIME type is missing and content detection was inconclusive")
             if error == "invalid_mime":
                 raise ValueError("FILE content_type must be a valid MIME type")
+            if error == "unsupported_mime":
+                provider, model = _descriptor_identity(self._descriptor)
+                content_type = value["content_type"]
+                raise ValueError(
+                    f"Prompt FILE MIME type {content_type!r} is not supported by provider {provider!r} model {model!r}"
+                )
             if error == "empty":
                 raise ValueError("Prompt FILE content cannot be zero length")
             if error == "too_large":
@@ -1863,13 +1869,28 @@ def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "fil
 _PROMPT_PACKED_INPUT_COLUMN = "__vane_prompt_messages"
 
 
+def _supported_prompt_media_mime_types(descriptor: Any) -> tuple[str, ...]:
+    """Return the normalized, deterministic native FILE media allowlist."""
+    values = descriptor.supported_media_mime_types()
+    if values is None:
+        return ()
+    if not values:
+        raise ValueError("supported_media_mime_types() must return None or a non-empty MIME allowlist")
+    return tuple(sorted({normalize_media_content_type(value) for value in values}))
+
+
 def _packed_prompt_messages(
-    messages: list[Expression], *, supports_media_inputs: bool, single_message: bool
+    messages: list[Expression],
+    *,
+    supports_media_inputs: bool,
+    supported_media_mime_types: tuple[str, ...],
+    single_message: bool,
 ) -> Expression:
     """Pack every message so all FILE inputs share one native byte budget."""
     return vane.FunctionExpression(
         "__vane_ai_prompt_pack",
         vane.ConstantExpression(supports_media_inputs),
+        vane.ConstantExpression(list(supported_media_mime_types)).cast("VARCHAR[]"),
         vane.ConstantExpression(single_message),
         *messages,
     )
@@ -1989,6 +2010,7 @@ def _prompt_relation(
             _PROMPT_PACKED_INPUT_COLUMN: _packed_prompt_messages(
                 message_expressions,
                 supports_media_inputs=supports_media_inputs,
+                supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
                 single_message=single_message,
             )
         }
@@ -2085,6 +2107,7 @@ def _prompt_expression(
     packed_messages = _packed_prompt_messages(
         message_expressions,
         supports_media_inputs=supports_media_inputs,
+        supported_media_mime_types=_supported_prompt_media_mime_types(descriptor),
         single_message=single_message,
     )
     wrapper = _PromptBatch(

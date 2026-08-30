@@ -124,6 +124,11 @@ class MockPrompterDescriptor(PrompterDescriptor):
     def supports_image_inputs(self) -> bool:
         return self.model_name != "text-only"
 
+    def supported_media_mime_types(self) -> frozenset[str] | None:
+        if self.model_name == "image-only":
+            return frozenset({"image/png"})
+        return None
+
     def instantiate(self) -> MockPrompter:
         return MockPrompter(self.return_format)
 
@@ -1556,9 +1561,9 @@ def test_ai_prompt_expression_sniffs_missing_file_mime_type(tmp_path):
     path_sql = str(path).replace("'", "''")
     relation = vane.connect().sql(f"SELECT file('{path_sql}', NULL, NULL, NULL, NULL) AS media")
 
-    response = relation.select(vane.ai.prompt(vane.col("media"), provider=MockProvider()).alias("response")).fetchone()[
-        0
-    ]
+    response = relation.select(
+        vane.ai.prompt(vane.col("media"), provider=MockProvider(), model="image-only").alias("response")
+    ).fetchone()[0]
 
     assert response == f"topic:image/png={payload.hex()}"
 
@@ -1606,6 +1611,29 @@ def test_ai_prompt_file_capability_failure_obeys_on_error_before_io():
     )
     with pytest.raises(Exception, match="does not support Prompt media inputs"):
         raised.project("response").fetchall()
+
+
+def test_ai_prompt_expression_rejects_unsupported_file_mime_before_io():
+    relation = vane.connect().sql("""
+        SELECT file('/definitely/missing/file-ai-prompt-audio.bin', 'audio/wav', NULL, NULL, NULL) AS media
+    """)
+
+    ignored = vane.ai.prompt(
+        vane.col("media"),
+        provider=MockProvider(),
+        model="image-only",
+        on_error="ignore",
+    )
+    assert relation.select(ignored).fetchall() == [(None,)]
+
+    raised = vane.ai.prompt(
+        vane.col("media"),
+        provider=MockProvider(),
+        model="image-only",
+        on_error="raise",
+    )
+    with pytest.raises(Exception, match="Prompt FILE MIME type.*not supported"):
+        relation.select(raised).fetchall()
 
 
 def test_prompt_file_read_errors_do_not_expose_locator_values(tmp_path):

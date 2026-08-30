@@ -19,6 +19,7 @@ from vane.ai.functions import (
     _PROMPT_PACKED_INPUT_COLUMN,
     _PromptBatch,
     _resolve_ai_batch_size,
+    _supported_prompt_media_mime_types,
     _ValidateStructuredOutputBatch,
 )
 from vane.ai.protocols import NativePrompterPlan
@@ -232,6 +233,7 @@ def build_ai_prompt_sql_spec(
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
         "supports_media_inputs": supports_media_inputs,
+        "supported_media_mime_types": list(_supported_prompt_media_mime_types(descriptor)),
         "return_type": (
             structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
         ),

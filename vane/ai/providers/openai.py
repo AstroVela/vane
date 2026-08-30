@@ -791,6 +791,9 @@ class OpenAIPrompterDescriptor(PrompterDescriptor):
             and self.model_name.strip().casefold() in _OPENAI_TEXT_ONLY_PROMPT_MODELS
         )
 
+    def supported_media_mime_types(self) -> frozenset[str]:
+        return _IMAGE_MIME_POLICY.supported_mime_types
+
     def get_udf_options(self) -> UDFOptions:
         return UDFOptions(num_gpus=0)
 
