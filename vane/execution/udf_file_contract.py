@@ -26,6 +26,7 @@ from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
 _FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 _TENSOR_TYPE_PATTERN = re.compile(r"^TENSOR\((.*),\s*\[([0-9,\s]+)\]\)$", flags=re.IGNORECASE)
+_ARROW_LIST_OFFSET_MAX = (1 << 31) - 1
 _NATIVE_OUTPUT_ENCODED_TYPE_IDS = {
     "bignum",
     "hugeint",
@@ -270,15 +271,31 @@ def _is_arrow_binary_storage(dtype: pa.DataType) -> bool:
     )
 
 
+def _is_arrow_large_list_storage(dtype: pa.DataType) -> bool:
+    is_large_list_view = getattr(pa.types, "is_large_list_view", None)
+    return pa.types.is_large_list(dtype) or (callable(is_large_list_view) and is_large_list_view(dtype))
+
+
 def _is_arrow_list_storage(dtype: pa.DataType) -> bool:
     is_list_view = getattr(pa.types, "is_list_view", None)
-    is_large_list_view = getattr(pa.types, "is_large_list_view", None)
     return (
         pa.types.is_list(dtype)
-        or pa.types.is_large_list(dtype)
         or (callable(is_list_view) and is_list_view(dtype))
-        or (callable(is_large_list_view) and is_large_list_view(dtype))
+        or _is_arrow_large_list_storage(dtype)
     )
+
+
+def _list_array_from_offsets(
+    offsets: Sequence[int],
+    values: Any,
+    *,
+    mask: Any,
+    force_large: bool = False,
+) -> Any:
+    use_large = force_large or offsets[-1] > _ARROW_LIST_OFFSET_MAX
+    offset_type = pa.int64() if use_large else pa.int32()
+    constructor = pa.LargeListArray.from_arrays if use_large else pa.ListArray.from_arrays
+    return constructor(pa.array(offsets, type=offset_type), values, mask=mask)
 
 
 def _is_arrow_extension_type(dtype: pa.DataType) -> bool:
@@ -942,6 +959,8 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
     type_id = _type_id(dtype)
     if type_id in ("list", "array", "tensor"):
         if not isinstance(value, (list, tuple)):
+            if not _contains_file(dtype):
+                return value
             raise _invalid_input(f"{boundary} value at {path} must be a sequence")
         if type_id in ("array", "tensor"):
             expected_size = _fixed_sequence_size(dtype)
@@ -958,9 +977,10 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
             dtype,
             boundary=boundary,
             path=path,
-            require_struct=True,
+            require_struct=_contains_file(dtype),
         )
-        assert child_values is not None
+        if child_values is None:
+            return value
         result = {}
         for name, child, child_value in child_values:
             result[name] = (
@@ -989,6 +1009,8 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
         elif isinstance(value, (list, tuple)):
             entries = value
         else:
+            if not _contains_file(dtype):
+                return value
             raise _invalid_input(f"{boundary} MAP value at {path} must be a mapping or sequence of pairs")
         canonical_pairs: list[tuple[Any, Any]] = []
         for index, entry in enumerate(entries):
@@ -1015,6 +1037,14 @@ def _canonicalize_native_output(value: Any, dtype: Any, *, boundary: str, path: 
     if type_id == "union":
         raise _invalid_input(f"{boundary} does not yet support UNION values containing FILE")
     return value
+
+
+def _native_value_uses_declared_container(value: Any, type_id: str) -> bool:
+    if type_id == "struct":
+        return isinstance(value, Mapping)
+    if type_id in ("list", "array", "tensor", "map"):
+        return isinstance(value, (list, tuple))
+    return False
 
 
 def _canonical_values_to_arrow_array(
@@ -1093,7 +1123,15 @@ def _canonical_values_to_arrow_array(
                 raise inference_error
             return pa.array(values, type=expected_type)
 
-    type_id = _type_id(dtype)
+    if type_id in ("struct", "list", "array", "tensor", "map"):
+        container_matches = [
+            _native_value_uses_declared_container(value, type_id) for value in values if value is not None
+        ]
+        if container_matches and not all(container_matches):
+            if any(container_matches):
+                raise TypeError(f"{type_id.upper()} output mixes declared-container and cross-type storage")
+            return pa.array(values)
+
     null_mask = pa.array([value is None for value in values], type=pa.bool_())
     if type_id == "struct":
         arrays = []
@@ -1113,7 +1151,7 @@ def _canonical_values_to_arrow_array(
             offsets.append(len(flattened))
         child = _sequence_child(dtype)
         child_array = _canonical_values_to_arrow_array(flattened, child, boundary=boundary)
-        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=null_mask)
+        return _list_array_from_offsets(offsets, child_array, mask=null_mask)
 
     if type_id in ("array", "tensor"):
         child = _sequence_child(dtype)
@@ -1323,7 +1361,12 @@ def _normalize_file_arrow_array(
             boundary=boundary,
             normalize_value_dependent=normalize_value_dependent,
         )
-        return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), child_array, mask=source.is_null())
+        return _list_array_from_offsets(
+            offsets,
+            child_array,
+            mask=source.is_null(),
+            force_large=_is_arrow_large_list_storage(source.type),
+        )
 
     if type_id in ("array", "tensor"):
         source = _mask_inactive(array, active)

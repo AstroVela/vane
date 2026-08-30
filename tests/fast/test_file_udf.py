@@ -644,6 +644,36 @@ def test_file_arrow_non_file_array_sibling_rejects_uneven_list_rows():
         contract.normalize_output_table(pa.table({"payload": value}))
 
 
+@pytest.mark.parametrize("storage_kind", ["large_list", "large_list_view"])
+def test_file_arrow_list_normalization_preserves_large_offsets(storage_kind):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import normalize_file_arrow_array
+
+    files = pa.array([_file_record()], type=_file_arrow_type())
+    if storage_kind == "large_list":
+        source = pa.LargeListArray.from_arrays(pa.array([0, 1], type=pa.int64()), files)
+    else:
+        large_list_view_array = getattr(pa, "LargeListViewArray", None)
+        is_large_list_view = getattr(pa.types, "is_large_list_view", None)
+        if large_list_view_array is None or not callable(is_large_list_view):
+            pytest.skip("PyArrow does not expose LargeListViewArray")
+        source = large_list_view_array.from_arrays(
+            pa.array([0], type=pa.int64()),
+            pa.array([1], type=pa.int64()),
+            files,
+        )
+
+    normalized = normalize_file_arrow_array(
+        source,
+        vane.list_type(vane.file_type()),
+        boundary="large-list-output",
+    )
+
+    assert pa.types.is_large_list(normalized.type)
+    assert normalized.to_pylist() == [[_file_record()]]
+
+
 def test_file_arrow_non_file_map_sibling_preserves_string_cast_input():
     import pyarrow as pa
 
@@ -934,6 +964,98 @@ def test_native_file_udfs_encode_special_leaves_inside_non_file_composites():
         str(wide),
         "43",
     )
+
+
+@pytest.mark.parametrize(
+    ("nested_type", "nested_value"),
+    [
+        ("STRUCT(wide BIGNUM)", "{'wide': 42}"),
+        ("BIGNUM[]", "[42]"),
+        ("BIGNUM[1]", "[42]"),
+        ("MAP(VARCHAR, BIGNUM)", "{key=42}"),
+        ("TENSOR(BIGNUM, [1])", "[42]"),
+    ],
+    ids=["struct", "list", "array", "map", "tensor"],
+)
+def test_native_file_special_composite_siblings_preserve_cross_type_storage(nested_type, nested_value):
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "special-composite-cross-type",
+            "method_return_type": f"STRUCT(document FILE, meta {nested_type})",
+        }
+    )
+
+    result = contract.scalar_outputs_to_array(
+        [
+            {
+                "document": vane.File("memory://special-composite-cross-type"),
+                "meta": nested_value,
+            }
+        ]
+    )
+
+    assert result.type.field("meta").type == pa.string()
+    assert result.to_pylist()[0]["meta"] == nested_value
+
+
+def test_native_file_special_struct_sibling_cross_type_casts_and_splits():
+    import pyarrow as pa
+
+    from vane.execution.udf_file_contract import FileUDFContract
+
+    output_type = vane.type("STRUCT(document FILE, meta STRUCT(wide BIGNUM))")
+    contract = FileUDFContract.from_payload(
+        {
+            "udf_name": "special-struct-cross-type",
+            "method_return_type": str(output_type),
+        }
+    )
+    pieces = contract.scalar_outputs_to_arrays(
+        [
+            {
+                "document": vane.File("memory://special-struct-declared"),
+                "meta": {"wide": 10**100},
+            },
+            {
+                "document": vane.File("memory://special-struct-cross-type"),
+                "meta": "{'wide': 42}",
+            },
+        ]
+    )
+    assert [piece.type.field("meta").type for piece in pieces] == [
+        pa.struct([pa.field("wide", pa.string())]),
+        pa.string(),
+    ]
+
+    @vane.func(return_dtype=output_type)
+    def build_document(_value):
+        return {
+            "document": vane.File("memory://special-struct-scalar"),
+            "meta": "{'wide': 42}",
+        }
+
+    connection = vane.connect()
+    scalar_result = connection.sql("SELECT 1 AS value").select(build_document(vane.col("value")).alias("payload"))
+    assert scalar_result.project("payload.meta.wide::VARCHAR").fetchone() == ("42",)
+
+    def build_row(_row):
+        return {
+            "payload": {
+                "document": vane.File("memory://special-struct-flat-map"),
+                "meta": "{'wide': 43}",
+            }
+        }
+
+    flat_map_result = connection.sql("SELECT 1 AS value").flat_map(
+        build_row,
+        schema={"payload": output_type},
+        execution_backend="subprocess_task",
+    )
+    assert flat_map_result.project("payload.meta.wide::VARCHAR").fetchone() == ("43",)
 
 
 def test_native_file_udfs_split_mixed_sibling_storage_for_duckdb_casts():
