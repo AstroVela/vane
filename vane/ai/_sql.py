@@ -10,13 +10,13 @@ from typing import Any
 
 from vane.ai._redaction import is_sensitive_option_key
 from vane.ai.functions import (
+    _PROMPT_PACKED_INPUT_COLUMN,
     _actor_number_or_one,
     _adapt_batch_wrapper_for_backend,
     _EmbedTextBatch,
     _gpus_or_zero,
     _prepare_embed_call,
     _prepare_prompt_call,
-    _PROMPT_PACKED_INPUT_COLUMN,
     _PromptBatch,
     _resolve_ai_batch_size,
     _supported_prompt_media_mime_types,
