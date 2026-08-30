@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import numpy as np
 
+from vane.ai._media import PromptMedia
 from vane.ai._redaction import unwrap_sensitive_options, wrap_sensitive_options
 from vane.ai._schema import (
     _is_known_openai_prompt_model,
@@ -867,7 +868,7 @@ class OpenAIPrompter:
         """Convert one validated Vane text/image part to the OpenAI shape."""
         if isinstance(msg, str):
             return self._process_str(msg)
-        if isinstance(msg, bytes):
+        if isinstance(msg, (bytes, PromptMedia)):
             return self._process_bytes(msg)
         raise TypeError(f"Unsupported Prompt content type: {type(msg).__name__}")
 
@@ -876,11 +877,11 @@ class OpenAIPrompter:
             return {"type": "text", "text": msg}
         return {"type": "input_text", "text": msg}
 
-    def _process_bytes(self, msg: bytes) -> dict[str, Any]:
+    def _process_bytes(self, msg: bytes | PromptMedia) -> dict[str, Any]:
         import base64
 
         mime_type = _IMAGE_MIME_POLICY.require_supported(msg)
-        b64 = base64.b64encode(msg).decode("utf-8")
+        b64 = base64.b64encode(bytes(msg)).decode("utf-8")
         data_url = f"data:{mime_type};base64,{b64}"
         return self._build_image_part(data_url)
 

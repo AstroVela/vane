@@ -6,6 +6,7 @@
 #include "vane_python/python_conversion.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -29,9 +30,30 @@ namespace duckdb {
 namespace {
 
 enum class AISQLKind : uint8_t { PROMPT, EMBED };
+enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
+
+static bool IsPromptFileList(const LogicalType &type) {
+	return type.id() == LogicalTypeId::LIST && FileLogicalType::IsFile(ListType::GetChildType(type));
+}
+
+static const char *PromptInputKindName(PromptInputKind kind) {
+	switch (kind) {
+	case PromptInputKind::TEXT:
+		return "text";
+	case PromptInputKind::BLOB:
+		return "blob";
+	case PromptInputKind::BLOB_LIST:
+		return "blob_list";
+	case PromptInputKind::FILE:
+		return "file";
+	case PromptInputKind::FILE_LIST:
+		return "file_list";
+	}
+	throw InternalException("unknown ai_prompt input kind");
+}
 
 struct NativeVLLMSpec {
 	string model;
@@ -152,11 +174,12 @@ static py::object ConstantArgumentToPython(ClientContext &context, vector<unique
 }
 
 static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<unique_ptr<Expression>> &arguments,
-                               idx_t options_index, bool image_input) {
+                               idx_t options_index, PromptInputKind prompt_input_kind) {
 	auto sql_module = py::module_::import("vane.ai._sql");
 	auto py_options = OptionsToPython(context, arguments, options_index, true);
 	if (kind == AISQLKind::PROMPT) {
-		auto constant_offset = image_input ? idx_t(2) : idx_t(1);
+		auto has_media_input = prompt_input_kind != PromptInputKind::TEXT;
+		auto constant_offset = has_media_input ? idx_t(2) : idx_t(1);
 		auto return_format = ConstantArgumentToPython(context, arguments, constant_offset, "return_format");
 		auto system_message = ConstantArgumentToPython(context, arguments, constant_offset + 1, "system_message");
 		auto provider = ConstantArgumentToPython(context, arguments, constant_offset + 2, "provider");
@@ -165,7 +188,8 @@ static py::dict BuildAISQLSpec(AISQLKind kind, ClientContext &context, vector<un
 		    ConstantArgumentToPython(context, arguments, constant_offset + 4, "return_raw_response");
 		auto on_error = ConstantArgumentToPython(context, arguments, constant_offset + 5, "on_error");
 		return py::cast<py::dict>(sql_module.attr("build_ai_prompt_sql_spec")(
-		    provider, model, system_message, on_error, py_options, image_input, return_format, return_raw_response));
+		    provider, model, system_message, on_error, py_options, PromptInputKindName(prompt_input_kind),
+		    return_format, return_raw_response));
 	}
 	auto provider = ConstantArgumentToPython(context, arguments, 1, "provider");
 	auto model = ConstantArgumentToPython(context, arguments, 2, "model");
@@ -290,16 +314,29 @@ static unique_ptr<Expression> LowerNativeVLLMPrompt(FunctionBindExpressionInput 
 static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction &bound_function,
                                           vector<unique_ptr<Expression>> &arguments, AISQLKind kind) {
 	auto options_index = OptionsArgumentIndex(kind, arguments.size());
-	auto image_input = kind == AISQLKind::PROMPT && arguments.size() == 9;
-	auto runtime_argument_count = image_input ? idx_t(2) : idx_t(1);
+	auto has_media_input = kind == AISQLKind::PROMPT && arguments.size() == 9;
+	auto runtime_argument_count = has_media_input ? idx_t(2) : idx_t(1);
+	auto prompt_input_kind = PromptInputKind::TEXT;
 	auto input_type_id = arguments[0]->return_type.id();
 	if (input_type_id != LogicalTypeId::VARCHAR && input_type_id != LogicalTypeId::SQLNULL) {
 		throw BinderException("ai SQL input argument must be VARCHAR");
 	}
-	if (image_input && arguments[1]->return_type != LogicalType::BLOB &&
-	    arguments[1]->return_type != LogicalType::LIST(LogicalType::BLOB) &&
-	    arguments[1]->return_type.id() != LogicalTypeId::SQLNULL) {
-		throw BinderException("ai_prompt image argument must be BLOB or BLOB[]");
+	if (has_media_input) {
+		auto media_type = arguments[1]->return_type;
+		if (media_type.id() == LogicalTypeId::SQLNULL && bound_function.arguments.size() > 1) {
+			media_type = bound_function.arguments[1];
+		}
+		if (media_type == LogicalType::BLOB) {
+			prompt_input_kind = PromptInputKind::BLOB;
+		} else if (media_type == LogicalType::LIST(LogicalType::BLOB)) {
+			prompt_input_kind = PromptInputKind::BLOB_LIST;
+		} else if (FileLogicalType::IsFile(media_type)) {
+			prompt_input_kind = PromptInputKind::FILE;
+		} else if (IsPromptFileList(media_type)) {
+			prompt_input_kind = PromptInputKind::FILE_LIST;
+		} else {
+			throw BinderException("ai_prompt media argument must be BLOB, BLOB[], FILE, or FILE[]");
+		}
 	}
 	Value payload;
 	Value native_validation_payload;
@@ -307,7 +344,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	unique_ptr<NativeVLLMSpec> native_vllm;
 	{
 		PythonGILWrapper acquire;
-		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, image_input);
+		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, prompt_input_kind);
 		auto return_type_obj = DictGetOrNone(spec, "return_type");
 		if (!py::isinstance<py::str>(return_type_obj)) {
 			throw BinderException("ai SQL helper returned invalid return_type");
@@ -356,7 +393,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 	} else {
 		// Prompt call-level constants are consumed by the binder. Only the
-		// prompt and optional image expression become row inputs.
+		// prompt and optional media expression become row inputs.
 		for (idx_t index = arguments.size(); index-- > runtime_argument_count;) {
 			Function::EraseArgument(bound_function, arguments, index);
 		}
@@ -450,8 +487,9 @@ static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &in
 		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
 	}
 	if (input_type != LogicalType::VARCHAR && input_type != LogicalType::BLOB &&
-	    input_type != LogicalType::LIST(LogicalType::BLOB)) {
-		throw BinderException("Prompt messages must have type VARCHAR, BLOB, or BLOB[]");
+	    input_type != LogicalType::LIST(LogicalType::BLOB) && !FileLogicalType::IsFile(input_type) &&
+	    !IsPromptFileList(input_type)) {
+		throw BinderException("Prompt messages must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]");
 	}
 	return std::move(message);
 }
@@ -460,6 +498,12 @@ static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput
 	if (input.children.size() != 2) {
 		throw BinderException("ai_prompt text validation expected two runtime arguments");
 	}
+	ThrowIfNotConstant(*input.children[1], "media_policy");
+	auto policy = EvaluateConstant(input.context, *input.children[1]);
+	if (policy.IsNull() || policy.type().id() != LogicalTypeId::BOOLEAN) {
+		throw BinderException("ai_prompt media policy must be a constant BOOLEAN");
+	}
+	auto text_only = BooleanValue::Get(policy);
 	auto &message = input.children[0];
 	auto input_type_id = message->return_type.id();
 	if (input_type_id == LogicalTypeId::UNKNOWN) {
@@ -468,8 +512,12 @@ static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput
 	if (input_type_id == LogicalTypeId::SQLNULL) {
 		return make_uniq<BoundConstantExpression>(Value(LogicalType::VARCHAR));
 	}
-	if (input_type_id != LogicalTypeId::VARCHAR) {
-		throw BinderException("Provider 'vllm' Prompt messages must have type VARCHAR");
+	if (input_type_id != LogicalTypeId::VARCHAR &&
+	    (text_only || (!FileLogicalType::IsFile(message->return_type) && !IsPromptFileList(message->return_type)))) {
+		if (text_only) {
+			throw BinderException("Native Prompt messages must have type VARCHAR");
+		}
+		throw BinderException("Prompt messages for this provider must have type VARCHAR, FILE, or FILE[]");
 	}
 	return std::move(message);
 }
@@ -506,16 +554,23 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::JSON(),
 	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                    LogicalType::VARCHAR, LogicalType::ANY});
+	auto file_type = FileLogicalType::Create();
+	add_implementation({LogicalType::VARCHAR, file_type, LogicalType::JSON(), LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                    LogicalType::ANY});
+	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(file_type), LogicalType::JSON(), LogicalType::VARCHAR,
+	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+	                    LogicalType::ANY});
 	return set;
 }
 
 unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
-	auto make_function = [&](const LogicalType *image_type, const char *image_parameter) {
+	auto make_function = [&](const LogicalType *media_type, const char *media_parameter) {
 		auto macro_arguments =
-		    image_type
+		    media_type
 		        ? StringUtil::Format("prompt, %s, return_format, system_message, provider, model, return_raw_response, "
 		                             "on_error, options",
-		                             image_parameter)
+		                             media_parameter)
 		        : "prompt, return_format, system_message, provider, model, return_raw_response, on_error, options";
 		auto expressions =
 		    Parser::ParseExpressionList(StringUtil::Format("%s(%s)", HIDDEN_PROMPT_FUNCTION, macro_arguments));
@@ -538,8 +593,8 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 		};
 
 		add_parameter("prompt", LogicalType::VARCHAR, nullptr);
-		if (image_type) {
-			add_parameter(image_parameter, *image_type, nullptr);
+		if (media_type) {
+			add_parameter(media_parameter, *media_type, nullptr);
 		}
 		// JSON registers a zero-cost implicit cast from BLOB, which makes a
 		// positional image ambiguous with the text overload's return_format.
@@ -565,6 +620,10 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	info->macros.push_back(make_function(&blob_type, "image"));
 	auto blob_list_type = LogicalType::LIST(LogicalType::BLOB);
 	info->macros.push_back(make_function(&blob_list_type, "images"));
+	auto file_type = FileLogicalType::Create();
+	info->macros.push_back(make_function(&file_type, "file"));
+	auto file_list_type = LogicalType::LIST(file_type);
+	info->macros.push_back(make_function(&file_list_type, "files"));
 	return info;
 }
 

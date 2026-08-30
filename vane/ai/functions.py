@@ -46,6 +46,7 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
+from vane.ai._media import PromptMedia, normalize_media_content_type
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -1088,7 +1089,7 @@ class _EmbedTextBatch:
 
 
 class _PromptBatch:
-    """Actor-local row-preserving wrapper for ordered text/image Prompt parts."""
+    """Actor-local row-preserving wrapper for ordered text/media Prompt parts."""
 
     def __init__(
         self,
@@ -1114,6 +1115,8 @@ class _PromptBatch:
         self._return_raw_response = return_raw_response
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
+        supports_media = getattr(descriptor, "supports_image_inputs", None)
+        self._supports_media_inputs = True if not callable(supports_media) else bool(supports_media())
         self._prompter: Prompter | None = None  # lazy: instantiate on first __call__
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._prompter_loop_bound = False  # set once the prompter is known loop-bound
@@ -1186,32 +1189,91 @@ class _PromptBatch:
         state["_prompter_loop_bound"] = False  # recomputed on next _ensure_prompter()
         return state
 
+    def _require_media_support(self) -> None:
+        if self._supports_media_inputs:
+            return
+        provider, model = _descriptor_identity(self._descriptor)
+        raise ValueError(f"Provider {provider!r} model {model!r} does not support Prompt media inputs")
+
     @staticmethod
-    def _append_message_value(parts: list[Any], value: Any) -> None:
+    def _materialize_file(value: Any) -> vane.File:
+        if isinstance(value, vane.File):
+            return value
+        # AI prompting is a batch UDF: after the shared FILE contract validates
+        # the Arrow input, a FILE leaf reaches this wrapper as its canonical
+        # five-field STRUCT mapping rather than as the scalar-UDF value object.
+        if not isinstance(value, Mapping):
+            raise TypeError("Prompt FILE input must use the canonical five-field value")
+        expected_fields = {"url", "content_type", "position", "size", "checksum"}
+        if set(value) != expected_fields:
+            raise TypeError("Prompt FILE input must contain exactly the canonical five fields")
+        return vane.File(
+            value["url"],
+            value["content_type"],
+            value["position"],
+            value["size"],
+            value["checksum"],
+        )
+
+    def _read_file_media(self, value: Any) -> PromptMedia:
+        self._require_media_support()
+        file = self._materialize_file(value)
+        content_type = normalize_media_content_type(file.content_type) if file.content_type is not None else None
+        data: bytes | None = None
+        read_error: Exception | None = None
+        try:
+            with file.open() as reader:
+                if content_type is None:
+                    detected_content_type = reader.guess_mime_type()
+                    if detected_content_type is not None:
+                        content_type = normalize_media_content_type(detected_content_type)
+                if content_type is not None:
+                    data = reader.read()
+        except Exception as exc:
+            read_error = exc
+        if read_error is not None:
+            provider, model = _descriptor_identity(self._descriptor)
+            raise _safe_provider_execution_error(provider, model, "Prompt FILE read", read_error) from None
+        if content_type is None:
+            raise ValueError("Prompt FILE MIME type is missing and content detection was inconclusive")
+        if data is None:
+            raise RuntimeError("Prompt FILE reader produced no content result")
+        return PromptMedia(data, content_type)
+
+    def _append_message_value(self, parts: list[Any], value: Any) -> None:
         if value is None:
             return
         if isinstance(value, str):
             parts.append(value)
             return
         if isinstance(value, (bytes, bytearray, memoryview)):
+            self._require_media_support()
             image = bytes(value)
             if not image:
                 raise ValueError("Prompt image BLOB cannot be zero length")
             parts.append(image)
             return
+        if isinstance(value, (vane.File, Mapping)):
+            parts.append(self._read_file_media(value))
+            return
         if isinstance(value, (list, tuple)):
             for item in value:
                 if item is None:
                     continue
-                if not isinstance(item, (bytes, bytearray, memoryview)):
-                    raise TypeError("Prompt BLOB[] content must contain only BLOB or NULL values")
-                image = bytes(item)
-                if not image:
-                    raise ValueError("Prompt image BLOB cannot be zero length")
-                parts.append(image)
+                if isinstance(item, (bytes, bytearray, memoryview)):
+                    self._require_media_support()
+                    image = bytes(item)
+                    if not image:
+                        raise ValueError("Prompt image BLOB cannot be zero length")
+                    parts.append(image)
+                elif isinstance(item, (vane.File, Mapping)):
+                    parts.append(self._read_file_media(item))
+                else:
+                    raise TypeError("Prompt media lists must contain only BLOB, FILE, or NULL values")
             return
         raise TypeError(
-            f"Prompt messages expressions must produce VARCHAR, BLOB, or BLOB[] values; got {type(value).__name__}"
+            "Prompt messages expressions must produce VARCHAR, BLOB, BLOB[], FILE, or FILE[] values; "
+            f"got {type(value).__name__}"
         )
 
     def _build_row_messages(self, columns: list[list[Any]], index: int) -> tuple[Any, ...] | None:
@@ -1243,9 +1305,10 @@ class _PromptBatch:
         for index in range(row_count):
             try:
                 messages = self._build_row_messages(columns, index)
-            except Exception:
+            except Exception as exc:
                 if self._on_error == "raise":
                     raise
+                _log_substituted_failure(exc, on_error=self._on_error)
                 continue
             if messages is not None:
                 row_messages[index] = messages
@@ -1774,17 +1837,23 @@ def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool]:
 
 def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[str]:
     types = [str(value).upper() for value in rel.select(*messages).types]
-    allowed = {"VARCHAR", "BLOB", "BLOB[]"}
+    allowed = {"VARCHAR", "BLOB", "BLOB[]", "FILE", "FILE[]"}
     for index, value in enumerate(types):
         if value not in allowed:
-            raise TypeError(f"Prompt messages[{index}] must have type VARCHAR, BLOB, or BLOB[]; got {value}")
+            raise TypeError(
+                f"Prompt messages[{index}] must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]; got {value}"
+            )
     return types
 
 
-def _validated_prompt_message(message: Any, *, text_only: bool = False) -> Expression:
+def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "file", "text"] = "all") -> Expression:
     """Add a bind-only Prompt type guard that is removed during planning."""
-    if text_only:
+    if media_policy == "text":
+        # The hidden BOOLEAN overload uses TRUE for strict text-only native plans.
         return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(True))
+    if media_policy == "file":
+        # FALSE permits text plus FILE while continuing to reject eager BLOB input.
+        return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(False))
     return vane.FunctionExpression("__vane_ai_prompt", message)
 
 
@@ -1860,7 +1929,7 @@ def _prompt_relation(
 
     if isinstance(descriptor, NativeInferencePlan):
         if any(value != "VARCHAR" for value in message_types):
-            raise ValueError(f"Provider {descriptor.get_provider()!r} does not support Prompt image inputs")
+            raise ValueError(f"Provider {descriptor.get_provider()!r} does not support Prompt media inputs")
         expression = _build_native_vllm_expression(message_expressions, descriptor)
         if structured_output is not None:
             input_column = "__vane_vllm_response"
@@ -1887,7 +1956,7 @@ def _prompt_relation(
         return rel.select(star, expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if not descriptor.supports_image_inputs() and any(value != "VARCHAR" for value in message_types):
+    if not descriptor.supports_image_inputs() and any(value in {"BLOB", "BLOB[]"} for value in message_types):
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
@@ -1946,7 +2015,9 @@ def _prompt_expression(
     )
 
     if isinstance(descriptor, NativeInferencePlan):
-        validated_messages = [_validated_prompt_message(message, text_only=True) for message in message_expressions]
+        validated_messages = [
+            _validated_prompt_message(message, media_policy="text") for message in message_expressions
+        ]
         expression = _build_native_vllm_expression(validated_messages, descriptor)
         if structured_output is None:
             return expression
@@ -1973,9 +2044,9 @@ def _prompt_expression(
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
+    media_policy: Literal["all", "file", "text"] = "all" if descriptor.supports_image_inputs() else "file"
     validated_messages = [
-        _validated_prompt_message(message, text_only=not descriptor.supports_image_inputs())
-        for message in message_expressions
+        _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
     ]
     wrapper = _PromptBatch(
         descriptor,
@@ -2092,7 +2163,7 @@ def prompt(
     output_column: str = _PROMPT_OUTPUT_COLUMN_DEFAULT,
     **options: Unpack[PromptOptions],
 ) -> Expression | Relation:
-    """Prompt over ordered VARCHAR, BLOB, or BLOB[] Expressions.
+    """Prompt over ordered VARCHAR, BLOB, BLOB[], FILE, or FILE[] Expressions.
 
     ``return_format`` accepts a Pydantic model class or the portable JSON
     Schema subset and exposes a native STRUCT. ``return_raw_response=True``

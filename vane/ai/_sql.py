@@ -48,6 +48,8 @@ _FLOAT_OPTION_NAMES = {
     "top_p",
 }
 
+_PROMPT_INPUT_KINDS = frozenset({"text", "blob", "blob_list", "file", "file_list"})
+
 
 def _reject_inline_credentials(value: Any, path: str = "options") -> None:
     """Reject sensitive-keyed options at any nesting depth (defense layer 1).
@@ -122,11 +124,16 @@ def build_ai_prompt_sql_spec(
     system_message: str | None = None,
     on_error: str = "raise",
     options: dict[str, Any] | None = None,
-    image_input: bool = False,
+    input_kind: str = "text",
     return_format: str | dict[str, Any] | None = None,
     return_raw_response: bool = False,
 ) -> dict[str, Any]:
     """Build the row-preserving SQL prompt UDF specification."""
+    if not isinstance(input_kind, str) or input_kind not in _PROMPT_INPUT_KINDS:
+        allowed = ", ".join(sorted(_PROMPT_INPUT_KINDS))
+        raise ValueError(f"AI_PROMPT input_kind must be one of: {allowed}")
+    media_input = input_kind != "text"
+    blob_input = input_kind in {"blob", "blob_list"}
     opts = _normalize_sql_options(options)
     if isinstance(return_format, str):
         try:
@@ -151,8 +158,8 @@ def build_ai_prompt_sql_spec(
     from vane.ai.providers.vllm import _build_native_vllm_options_argument
 
     if isinstance(descriptor, NativeInferencePlan):
-        if image_input:
-            raise ValueError("native inference ai_prompt does not support image inputs")
+        if media_input:
+            raise ValueError("native inference ai_prompt does not support media inputs")
 
         native_options = descriptor.build_physical_vllm_options()
         options_argument = _build_native_vllm_options_argument(native_options, engine=descriptor.get_engine())
@@ -194,13 +201,13 @@ def build_ai_prompt_sql_spec(
         return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if image_input and not descriptor.supports_image_inputs():
+    if blob_input and not descriptor.supports_image_inputs():
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
         )
 
-    input_names = ["message_0", "message_1"] if image_input else ["message_0"]
+    input_names = ["message_0", "message_1"] if media_input else ["message_0"]
     wrapper = _PromptBatch(
         descriptor,
         input_names,
