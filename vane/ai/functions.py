@@ -46,7 +46,7 @@ import vane
 from vane._expression_udf import _build_actor_map_batches_expression, _build_map_batches_expression
 from vane._expressions import as_expression, is_expression
 from vane._typing import Expression, Relation
-from vane.ai._media import PromptMedia, normalize_media_content_type
+from vane.ai._media import PromptMedia
 from vane.ai._schema import (
     OutputValidationError,
     RawResponseSerializationError,
@@ -1102,6 +1102,7 @@ class _PromptBatch:
         return_raw_response: bool = False,
         max_retries: int = 3,
         on_error: _OnError = "raise",
+        supports_media_inputs: bool | None = None,
     ) -> None:
         if not message_columns:
             raise ValueError("Prompt message_columns cannot be empty")
@@ -1115,8 +1116,10 @@ class _PromptBatch:
         self._return_raw_response = return_raw_response
         self._max_retries = max_retries
         self._on_error: _OnError = on_error
-        supports_media = getattr(descriptor, "supports_image_inputs", None)
-        self._supports_media_inputs = True if not callable(supports_media) else bool(supports_media())
+        if supports_media_inputs is None:
+            supports_media = getattr(descriptor, "supports_image_inputs", None)
+            supports_media_inputs = True if not callable(supports_media) else bool(supports_media())
+        self._supports_media_inputs = supports_media_inputs
         self._prompter: Prompter | None = None  # lazy: instantiate on first __call__
         self._run_async: Callable[[Awaitable[Any]], Any] | None = None  # executor-bound capability
         self._prompter_loop_bound = False  # set once the prompter is known loop-bound
@@ -1195,49 +1198,35 @@ class _PromptBatch:
         provider, model = _descriptor_identity(self._descriptor)
         raise ValueError(f"Provider {provider!r} model {model!r} does not support Prompt media inputs")
 
-    @staticmethod
-    def _materialize_file(value: Any) -> vane.File:
-        if isinstance(value, vane.File):
-            return value
-        # AI prompting is a batch UDF: after the shared FILE contract validates
-        # the Arrow input, a FILE leaf reaches this wrapper as its canonical
-        # five-field STRUCT mapping rather than as the scalar-UDF value object.
-        if not isinstance(value, Mapping):
-            raise TypeError("Prompt FILE input must use the canonical five-field value")
-        expected_fields = {"url", "content_type", "position", "size", "checksum"}
-        if set(value) != expected_fields:
-            raise TypeError("Prompt FILE input must contain exactly the canonical five fields")
-        return vane.File(
-            value["url"],
-            value["content_type"],
-            value["position"],
-            value["size"],
-            value["checksum"],
-        )
+    def _materialized_prompt_media(self, value: Any) -> PromptMedia:
+        """Decode the locator-free value produced by the native FILE boundary."""
+        if not isinstance(value, Mapping) or set(value) != {"content_type", "data", "error"}:
+            raise TypeError("Prompt FILE input did not cross the native media boundary")
+        error = value["error"]
+        if error is not None:
+            if error == "unsupported":
+                self._require_media_support()
+                raise RuntimeError("Prompt FILE capability validation produced an invalid result")
+            if error == "read":
+                provider, model = _descriptor_identity(self._descriptor)
+                safe_error = OSError("FILE access failed")
+                raise _safe_provider_execution_error(provider, model, "Prompt FILE read", safe_error) from None
+            if error == "mime":
+                raise ValueError("Prompt FILE MIME type is missing and content detection was inconclusive")
+            if error == "invalid_mime":
+                raise ValueError("FILE content_type must be a valid MIME type")
+            if error == "empty":
+                raise ValueError("Prompt FILE content cannot be zero length")
+            if error == "too_large":
+                raise ValueError("Prompt FILE content exceeds the 20 MiB materialization limit")
+            if error == "vector_too_large":
+                raise ValueError("Prompt FILE inputs exceed the 128 MiB materialization-vector limit")
+            raise RuntimeError("Prompt FILE materialization produced an unknown error")
 
-    def _read_file_media(self, value: Any) -> PromptMedia:
-        self._require_media_support()
-        file = self._materialize_file(value)
-        content_type = normalize_media_content_type(file.content_type) if file.content_type is not None else None
-        data: bytes | None = None
-        read_error: Exception | None = None
-        try:
-            with file.open() as reader:
-                if content_type is None:
-                    detected_content_type = reader.guess_mime_type()
-                    if detected_content_type is not None:
-                        content_type = normalize_media_content_type(detected_content_type)
-                if content_type is not None:
-                    data = reader.read()
-        except Exception as exc:
-            read_error = exc
-        if read_error is not None:
-            provider, model = _descriptor_identity(self._descriptor)
-            raise _safe_provider_execution_error(provider, model, "Prompt FILE read", read_error) from None
-        if content_type is None:
-            raise ValueError("Prompt FILE MIME type is missing and content detection was inconclusive")
-        if data is None:
-            raise RuntimeError("Prompt FILE reader produced no content result")
+        data = value["data"]
+        content_type = value["content_type"]
+        if not isinstance(data, bytes):
+            raise TypeError("Prompt FILE materialization did not produce bytes")
         return PromptMedia(data, content_type)
 
     def _append_message_value(self, parts: list[Any], value: Any) -> None:
@@ -1253,8 +1242,8 @@ class _PromptBatch:
                 raise ValueError("Prompt image BLOB cannot be zero length")
             parts.append(image)
             return
-        if isinstance(value, (vane.File, Mapping)):
-            parts.append(self._read_file_media(value))
+        if isinstance(value, Mapping):
+            parts.append(self._materialized_prompt_media(value))
             return
         if isinstance(value, (list, tuple)):
             for item in value:
@@ -1266,8 +1255,8 @@ class _PromptBatch:
                     if not image:
                         raise ValueError("Prompt image BLOB cannot be zero length")
                     parts.append(image)
-                elif isinstance(item, (vane.File, Mapping)):
-                    parts.append(self._read_file_media(item))
+                elif isinstance(item, Mapping):
+                    parts.append(self._materialized_prompt_media(item))
                 else:
                     raise TypeError("Prompt media lists must contain only BLOB, FILE, or NULL values")
             return
@@ -1847,7 +1836,7 @@ def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[st
 
 
 def _validated_prompt_message(message: Any, *, media_policy: Literal["all", "file", "text"] = "all") -> Expression:
-    """Add a bind-only Prompt type guard that is removed during planning."""
+    """Add a bind-only Prompt guard; FILE inputs lower to native materialization."""
     if media_policy == "text":
         # The hidden BOOLEAN overload uses TRUE for strict text-only native plans.
         return vane.FunctionExpression("__vane_ai_prompt", message, vane.ConstantExpression(True))
@@ -1956,13 +1945,18 @@ def _prompt_relation(
         return rel.select(star, expression)
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if not descriptor.supports_image_inputs() and any(value in {"BLOB", "BLOB[]"} for value in message_types):
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    if not supports_media_inputs and any(value in {"BLOB", "BLOB[]"} for value in message_types):
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
         )
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
+    media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
+    validated_messages = [
+        _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
+    ]
     wrapper = _PromptBatch(
         descriptor,
         input_names,
@@ -1973,10 +1967,11 @@ def _prompt_relation(
         return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
+        supports_media_inputs=supports_media_inputs,
     )
     expression = _build_ai_batch_expression(
         wrapper,
-        inputs=dict(zip(input_names, message_expressions, strict=True)),
+        inputs=dict(zip(input_names, validated_messages, strict=True)),
         output_column=output_column,
         output_type="VARCHAR",
         udf_opts=udf_options,
@@ -2044,7 +2039,8 @@ def _prompt_expression(
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
-    media_policy: Literal["all", "file", "text"] = "all" if descriptor.supports_image_inputs() else "file"
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    media_policy: Literal["all", "file", "text"] = "all" if supports_media_inputs else "file"
     validated_messages = [
         _validated_prompt_message(message, media_policy=media_policy) for message in message_expressions
     ]
@@ -2058,6 +2054,7 @@ def _prompt_expression(
         return_raw_response=return_raw_response,
         max_retries=udf_options.max_retries,
         on_error=udf_options.on_error,
+        supports_media_inputs=supports_media_inputs,
     )
     expression = _build_ai_batch_expression(
         wrapper,

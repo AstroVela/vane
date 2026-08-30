@@ -447,6 +447,36 @@ def test_ai_prompt_sql_exact_file_overload_reads_strict_view(tmp_path):
     assert rows == [("topic:describe:image/png=7061796c6f6164",)]
 
 
+def test_ai_prompt_sql_file_composes_with_structured_output(tmp_path):
+    schema = json.dumps(
+        {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "score": {"type": "integer"},
+            },
+            "required": ["answer", "score"],
+            "additionalProperties": False,
+        }
+    )
+    path = tmp_path / "structured.bin"
+    path.write_bytes(b"media")
+    path_sql = str(path).replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            return_format := json '{schema}',
+            provider := 'mock_ai_sql',
+            model := 'structured'
+        ) AS response
+    """)
+
+    answer = "structured:describe:image/png=6d65646961"
+    assert str(relation.types[0]) == "STRUCT(answer VARCHAR, score BIGINT)"
+    assert relation.fetchone() == ({"answer": answer, "score": len(answer)},)
+
+
 def test_ai_prompt_sql_exact_file_list_overload_preserves_order_and_ignores_nulls(tmp_path):
     first = tmp_path / "first.bin"
     second = tmp_path / "second.bin"
@@ -493,6 +523,101 @@ def test_ai_prompt_sql_file_without_content_type_uses_bounded_detection(tmp_path
     )
 
     assert row == (f"topic:describe:image/png={payload.hex()}",)
+
+
+@pytest.mark.parametrize("entry_point", ["sql", "relation"])
+def test_ai_prompt_file_uses_the_query_connection_secret(entry_point):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    payload = b"prefix-media-suffix"
+    expected_authorization = "Bearer query-token"
+
+    class ObjectHandler(BaseHTTPRequestHandler):
+        def _send_object(self, include_body):
+            if self.path.split("?", 1)[0] != "/object.bin":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if self.headers.get("Authorization") != expected_authorization:
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            body = payload
+            status = 200
+            content_range = None
+            range_header = self.headers.get("Range")
+            if range_header is not None:
+                start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+                start = int(start_text)
+                end = len(payload) - 1 if not end_text else min(int(end_text), len(payload) - 1)
+                body = payload[start : end + 1]
+                status = 206
+                content_range = f"bytes {start}-{end}/{len(payload)}"
+
+            self.send_response(status)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(body)))
+            if content_range is not None:
+                self.send_header("Content-Range", content_range)
+            self.end_headers()
+            if include_body:
+                self.wfile.write(body)
+
+        def do_HEAD(self):
+            self._send_object(False)
+
+        def do_GET(self):
+            self._send_object(True)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ObjectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/object.bin"
+    scope = f"http://127.0.0.1:{server.server_port}/"
+
+    connection = None
+    try:
+        connection = vane.connect()
+        connection.execute("LOAD httpfs")
+        connection.execute(f"CREATE SECRET prompt_http (TYPE HTTP, BEARER_TOKEN 'query-token', SCOPE '{scope}')")
+        if entry_point == "sql":
+            rows = connection.sql(f"""
+                SELECT ai_prompt(
+                    'describe',
+                    file('{url}', 'audio/wav', 7, 5, NULL),
+                    provider := 'mock_ai_sql'
+                )
+            """).fetchall()
+        else:
+            source = connection.sql(f"""
+                SELECT
+                    'describe'::VARCHAR AS prompt,
+                    file('{url}', 'audio/wav', 7, 5, NULL) AS media
+            """)
+            rows = (
+                vane.ai.prompt(
+                    source,
+                    [vane.col("prompt"), vane.col("media")],
+                    provider=MockProvider(),
+                )
+                .project("response")
+                .fetchall()
+            )
+    finally:
+        if connection is not None:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert rows == [("topic:describe:audio/wav=6d65646961",)]
 
 
 def test_ai_prompt_sql_file_media_survives_provider_retry(tmp_path):
@@ -657,6 +782,31 @@ def test_ai_prompt_sql_file_read_errors_obey_on_error(tmp_path):
     """).fetchall() == [(None,)]
 
 
+def test_ai_prompt_sql_inconclusive_file_mime_obeys_on_error(tmp_path):
+    path = tmp_path / "unknown.bin"
+    path.write_bytes(b"not-a-recognized-media-format")
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="content detection was inconclusive"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', NULL, NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', NULL, NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
 def test_ai_prompt_sql_zero_length_file_obeys_on_error(tmp_path):
     path = tmp_path / "empty.bin"
     path.write_bytes(b"")
@@ -676,6 +826,32 @@ def test_ai_prompt_sql_zero_length_file_obeys_on_error(tmp_path):
         SELECT ai_prompt(
             'describe',
             file('{path_sql}', 'image/png', NULL, NULL, NULL),
+            provider := 'mock_ai_sql',
+            on_error := 'ignore'
+        )
+    """).fetchall() == [(None,)]
+
+
+def test_ai_prompt_sql_rejects_file_larger_than_the_materialization_limit(tmp_path):
+    path = tmp_path / "oversized.bin"
+    with path.open("wb") as file:
+        file.truncate(20 * 1024 * 1024 + 1)
+    path_sql = str(path).replace("'", "''")
+    connection = vane.connect()
+
+    with pytest.raises(Exception, match="20 MiB materialization limit"):
+        connection.sql(f"""
+            SELECT ai_prompt(
+                'describe',
+                file('{path_sql}', 'video/mp4', NULL, NULL, NULL),
+                provider := 'mock_ai_sql'
+            )
+        """).fetchall()
+
+    assert connection.sql(f"""
+        SELECT ai_prompt(
+            'describe',
+            file('{path_sql}', 'video/mp4', NULL, NULL, NULL),
             provider := 'mock_ai_sql',
             on_error := 'ignore'
         )
@@ -747,7 +923,7 @@ def test_ai_prompt_sql_validates_malformed_file_before_opening():
         )
     """)
 
-    with pytest.raises(Exception, match="invalid FILE value"):
+    with pytest.raises(Exception, match=r"ai_prompt\(\) url cannot be NULL"):
         connection.sql("""
             SELECT ai_prompt(
                 'describe',
@@ -842,7 +1018,7 @@ def test_ai_prompt_sql_expression_udf_survives_plan_round_trip():
     assert 0 < len(serialized) < 1_000_000
 
 
-def test_ai_prompt_sql_file_contract_survives_plan_round_trip(tmp_path):
+def test_ai_prompt_sql_file_materialization_boundary_survives_plan_round_trip(tmp_path):
     path = tmp_path / "round-trip.bin"
     path.write_bytes(b"prefix-media-suffix")
     path_sql = str(path).replace("'", "''")
@@ -863,8 +1039,9 @@ def test_ai_prompt_sql_file_contract_survives_plan_round_trip(tmp_path):
 
     assert table.column(0).to_pylist() == ["round-trip-file:describe:image/png=6d65646961"]
     assert node["payload"]["input_names"] == ["message_0", "message_1"]
-    assert node["payload"]["input_types"] == ["VARCHAR", "FILE"]
-    assert node["payload"]["input_contract_types"] == [None, "FILE"]
+    assert node["payload"]["input_types"][0] == "VARCHAR"
+    assert node["payload"]["input_types"][1] == 'STRUCT(content_type VARCHAR, "data" BLOB, "error" VARCHAR)'
+    assert node["payload"]["input_contract_types"] == [None, None]
     assert b"prefix-media-suffix" not in serialized
     assert 0 < len(serialized) < 1_000_000
 

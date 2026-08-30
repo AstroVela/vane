@@ -201,7 +201,8 @@ def build_ai_prompt_sql_spec(
         return spec
     if isinstance(descriptor, NativePrompterPlan):
         raise ValueError(f"Unsupported native prompt plan {type(descriptor).__name__}")
-    if blob_input and not descriptor.supports_image_inputs():
+    supports_media_inputs = bool(descriptor.supports_image_inputs())
+    if blob_input and not supports_media_inputs:
         raise ValueError(
             f"Provider {descriptor.get_provider()!r} model {descriptor.get_model()!r} "
             "does not support Prompt image inputs"
@@ -218,6 +219,7 @@ def build_ai_prompt_sql_spec(
         return_raw_response=return_raw_response,
         max_retries=udf_opts.max_retries,
         on_error=udf_opts.on_error,
+        supports_media_inputs=supports_media_inputs,
     )
     actor_callable = _adapt_batch_wrapper_for_backend(wrapper, "subprocess_actor", force_actor=True)
     return {
@@ -225,6 +227,7 @@ def build_ai_prompt_sql_spec(
         "name": "ai_prompt",
         "provider": descriptor.get_provider(),
         "model": descriptor.get_model(),
+        "supports_media_inputs": supports_media_inputs,
         "return_type": (
             structured_output.duckdb_type if structured_output is not None and not return_raw_response else "VARCHAR"
         ),

@@ -47,3 +47,5 @@ add_library(
   vllm_executor.cpp)
 
 target_link_libraries(python_src PRIVATE vane_python_dependencies)
+target_include_directories(
+  python_src PRIVATE "${DUCKDB_SOURCE_PATH}/extension/file/include")

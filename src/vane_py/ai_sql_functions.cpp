@@ -3,8 +3,12 @@
 
 #include "vane_python/ai_sql_functions.hpp"
 
+#include "file_resolver.hpp"
+#include "file_value.hpp"
 #include "vane_python/python_conversion.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -34,6 +38,209 @@ enum class PromptInputKind : uint8_t { TEXT, BLOB, BLOB_LIST, FILE, FILE_LIST };
 
 static constexpr const char *HIDDEN_EMBED_FUNCTION = "__vane_ai_embed";
 static constexpr const char *HIDDEN_PROMPT_FUNCTION = "__vane_ai_prompt";
+static constexpr const char *HIDDEN_PROMPT_MEDIA_FUNCTION = "__vane_ai_prompt_media";
+
+// Prompt providers receive media inline. Keep both an individual FILE and the
+// materialized input vector bounded before allocating its bytes. The vector
+// limit matches the default UDF transport target; the per-FILE limit matches
+// the largest common inline request limit among the initial providers.
+static constexpr uint64_t MAX_PROMPT_FILE_BYTES = 20ULL * 1024ULL * 1024ULL;
+static constexpr uint64_t MAX_PROMPT_MEDIA_VECTOR_BYTES = 128ULL * 1024ULL * 1024ULL;
+
+static constexpr const char *PROMPT_MEDIA_ERROR_UNSUPPORTED = "unsupported";
+static constexpr const char *PROMPT_MEDIA_ERROR_READ = "read";
+static constexpr const char *PROMPT_MEDIA_ERROR_MIME = "mime";
+static constexpr const char *PROMPT_MEDIA_ERROR_INVALID_MIME = "invalid_mime";
+static constexpr const char *PROMPT_MEDIA_ERROR_EMPTY = "empty";
+static constexpr const char *PROMPT_MEDIA_ERROR_TOO_LARGE = "too_large";
+static constexpr const char *PROMPT_MEDIA_ERROR_VECTOR_TOO_LARGE = "vector_too_large";
+
+static LogicalType PromptMediaLogicalType() {
+	child_list_t<LogicalType> fields;
+	fields.emplace_back("content_type", LogicalType::VARCHAR);
+	fields.emplace_back("data", LogicalType::BLOB);
+	fields.emplace_back("error", LogicalType::VARCHAR);
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+static bool IsPromptMimeTokenCharacter(char value) {
+	return (value >= '0' && value <= '9') || (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+	       value == '!' || value == '#' || value == '$' || value == '%' || value == '&' || value == '\'' ||
+	       value == '*' || value == '+' || value == '-' || value == '.' || value == '^' || value == '_' ||
+	       value == '`' || value == '|' || value == '~';
+}
+
+static bool NormalizePromptContentType(const string &value, string &result) {
+	auto separator = value.find(';');
+	result = value.substr(0, separator);
+	StringUtil::Trim(result);
+	result = StringUtil::Lower(result);
+	auto slash = result.find('/');
+	if (slash == string::npos || slash == 0 || slash + 1 == result.size() ||
+	    result.find('/', slash + 1) != string::npos) {
+		return false;
+	}
+	auto media_type = result.substr(0, slash);
+	auto media_subtype = result.substr(slash + 1);
+	if (media_type == "*" || media_subtype == "*") {
+		return false;
+	}
+	for (auto character : result) {
+		if (character != '/' && !IsPromptMimeTokenCharacter(character)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool MustPropagatePromptFileError(const ErrorData &error) {
+	switch (error.Type()) {
+	case ExceptionType::INTERRUPT:
+	case ExceptionType::OUT_OF_MEMORY:
+	case ExceptionType::FATAL:
+	case ExceptionType::INTERNAL:
+	case ExceptionType::NULL_POINTER:
+		return true;
+	default:
+		return false;
+	}
+}
+
+struct PreparedPromptMedia {
+	bool is_null = false;
+	bool has_content_type = false;
+	string content_type;
+	string error;
+	uint64_t size = 0;
+	unique_ptr<ResolvedFile> resolved;
+
+	Value Materialize() {
+		auto media_type = PromptMediaLogicalType();
+		if (is_null) {
+			return Value(media_type);
+		}
+
+		Value data(LogicalType::BLOB);
+		if (error.empty()) {
+			try {
+				string bytes(NumericCast<idx_t>(size), '\0');
+				resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), size);
+				data = Value::BLOB_RAW(bytes);
+			} catch (const std::exception &exception) {
+				ErrorData error_data(exception);
+				if (MustPropagatePromptFileError(error_data)) {
+					throw;
+				}
+				// FILE validation already ran before opening. Everything left at
+				// this boundary is an execution-time resolver/read failure, which
+				// must reach the Python row policy without exposing its details.
+				error = PROMPT_MEDIA_ERROR_READ;
+			}
+		}
+		resolved.reset();
+
+		vector<Value> fields;
+		fields.reserve(3);
+		fields.push_back(has_content_type ? Value(content_type) : Value(LogicalType::VARCHAR));
+		fields.push_back(std::move(data));
+		fields.push_back(error.empty() ? Value(LogicalType::VARCHAR) : Value(error));
+		return Value::STRUCT(media_type, std::move(fields));
+	}
+};
+
+static void PreparePromptMedia(ClientContext &context, const Value &value, bool media_supported, uint64_t &vector_bytes,
+                               PreparedPromptMedia &result) {
+	if (value.IsNull()) {
+		result.is_null = true;
+		return;
+	}
+
+	// Validate the canonical FILE contract even when the selected provider
+	// cannot consume media. This is pure and intentionally precedes all I/O.
+	auto file = FileReference::FromValue(value, "ai_prompt");
+	if (!media_supported) {
+		result.error = PROMPT_MEDIA_ERROR_UNSUPPORTED;
+		return;
+	}
+	if (file.has_content_type) {
+		result.has_content_type = NormalizePromptContentType(file.content_type, result.content_type);
+		if (!result.has_content_type) {
+			result.error = PROMPT_MEDIA_ERROR_INVALID_MIME;
+			return;
+		}
+	}
+
+	try {
+		result.resolved = ResolvedFile::Open(context, file);
+		result.size = result.resolved->LogicalSize();
+		if (result.size == 0) {
+			result.error = PROMPT_MEDIA_ERROR_EMPTY;
+			result.resolved.reset();
+			return;
+		}
+		if (result.size > MAX_PROMPT_FILE_BYTES) {
+			result.error = PROMPT_MEDIA_ERROR_TOO_LARGE;
+			result.resolved.reset();
+			return;
+		}
+		if (!file.has_content_type) {
+			result.has_content_type = result.resolved->GuessMimeType(result.content_type);
+			if (!result.has_content_type) {
+				result.error = PROMPT_MEDIA_ERROR_MIME;
+				result.resolved.reset();
+				return;
+			}
+		}
+		if (result.size > MAX_PROMPT_MEDIA_VECTOR_BYTES - vector_bytes) {
+			result.error = PROMPT_MEDIA_ERROR_VECTOR_TOO_LARGE;
+			result.resolved.reset();
+			return;
+		}
+		vector_bytes += result.size;
+	} catch (const std::exception &exception) {
+		ErrorData error(exception);
+		if (MustPropagatePromptFileError(error)) {
+			throw;
+		}
+		result.error = PROMPT_MEDIA_ERROR_READ;
+		result.resolved.reset();
+	}
+}
+
+template <bool IS_LIST>
+static void PromptMediaFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto media_type = PromptMediaLogicalType();
+	auto return_type = IS_LIST ? LogicalType::LIST(media_type) : media_type;
+	uint64_t vector_bytes = 0;
+	for (idx_t row_index = 0; row_index < args.size(); row_index++) {
+		auto value = args.data[0].GetValue(row_index);
+		if (value.IsNull()) {
+			result.SetValue(row_index, Value(return_type));
+			continue;
+		}
+		auto media_supported_value = args.data[1].GetValue(row_index);
+		if (media_supported_value.IsNull()) {
+			throw InvalidInputException("ai_prompt media policy cannot be NULL");
+		}
+		auto media_supported = BooleanValue::Get(media_supported_value);
+		if (IS_LIST) {
+			auto &children = ListValue::GetChildren(value);
+			vector<Value> values;
+			values.reserve(children.size());
+			for (auto &child : children) {
+				PreparedPromptMedia item;
+				PreparePromptMedia(state.GetContext(), child, media_supported, vector_bytes, item);
+				values.push_back(item.Materialize());
+			}
+			result.SetValue(row_index, Value::LIST(media_type, std::move(values)));
+		} else {
+			PreparedPromptMedia item;
+			PreparePromptMedia(state.GetContext(), value, media_supported, vector_bytes, item);
+			result.SetValue(row_index, item.Materialize());
+		}
+	}
+}
 
 static bool IsPromptFileList(const LogicalType &type) {
 	return type.id() == LogicalTypeId::LIST && FileLogicalType::IsFile(ListType::GetChildType(type));
@@ -261,6 +468,15 @@ static unique_ptr<Expression> BindScalarFunction(ClientContext &context, const s
 	return result;
 }
 
+static unique_ptr<Expression> BindPromptMedia(ClientContext &context, unique_ptr<Expression> file,
+                                              bool media_supported) {
+	vector<unique_ptr<Expression>> children;
+	children.reserve(2);
+	children.push_back(std::move(file));
+	children.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(media_supported)));
+	return BindScalarFunction(context, HIDDEN_PROMPT_MEDIA_FUNCTION, std::move(children));
+}
+
 static unique_ptr<Expression> CastPromptOutput(ClientContext &context, unique_ptr<Expression> result,
                                                const LogicalType &target_type) {
 	if (result->return_type == target_type) {
@@ -342,6 +558,7 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	Value native_validation_payload;
 	LogicalType public_return_type;
 	unique_ptr<NativeVLLMSpec> native_vllm;
+	bool supports_prompt_media = true;
 	{
 		PythonGILWrapper acquire;
 		auto spec = BuildAISQLSpec(kind, context, arguments, options_index, prompt_input_kind);
@@ -365,10 +582,27 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 				    BuildAISQLPayload(context, py::reinterpret_borrow<py::dict>(validation_spec));
 			}
 		} else if (execution_kind == "expression_udf") {
+			if (prompt_input_kind == PromptInputKind::FILE || prompt_input_kind == PromptInputKind::FILE_LIST) {
+				auto supports_media_obj = DictGetOrNone(spec, "supports_media_inputs");
+				if (!py::isinstance<py::bool_>(supports_media_obj)) {
+					throw BinderException("ai SQL helper returned invalid supports_media_inputs");
+				}
+				supports_prompt_media = py::cast<bool>(supports_media_obj);
+			}
 			payload = BuildAISQLPayload(context, spec);
 		} else {
 			throw BinderException("ai SQL helper returned unknown execution_kind '%s'", execution_kind);
 		}
+	}
+	if (prompt_input_kind == PromptInputKind::FILE || prompt_input_kind == PromptInputKind::FILE_LIST) {
+		if (arguments[1]->return_type.id() == LogicalTypeId::SQLNULL) {
+			auto file_type = FileLogicalType::Create();
+			auto target_type =
+			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
+			arguments[1] = BoundCastExpression::AddCastToType(context, std::move(arguments[1]), target_type);
+		}
+		arguments[1] = BindPromptMedia(context, std::move(arguments[1]), supports_prompt_media);
+		bound_function.arguments[1] = arguments[1]->return_type;
 	}
 
 	if (native_vllm) {
@@ -491,6 +725,9 @@ static unique_ptr<Expression> LowerAIPromptInput(FunctionBindExpressionInput &in
 	    !IsPromptFileList(input_type)) {
 		throw BinderException("Prompt messages must have type VARCHAR, BLOB, BLOB[], FILE, or FILE[]");
 	}
+	if (FileLogicalType::IsFile(input_type) || IsPromptFileList(input_type)) {
+		return BindPromptMedia(input.context, std::move(message), true);
+	}
 	return std::move(message);
 }
 
@@ -519,10 +756,30 @@ static unique_ptr<Expression> LowerAIPromptTextInput(FunctionBindExpressionInput
 		}
 		throw BinderException("Prompt messages for this provider must have type VARCHAR, FILE, or FILE[]");
 	}
+	if (FileLogicalType::IsFile(message->return_type) || IsPromptFileList(message->return_type)) {
+		return BindPromptMedia(input.context, std::move(message), false);
+	}
 	return std::move(message);
 }
 
 } // namespace
+
+ScalarFunctionSet AISQLFunction::GetPromptMediaFunctions() {
+	ScalarFunctionSet set(HIDDEN_PROMPT_MEDIA_FUNCTION);
+	auto file_type = FileLogicalType::Create();
+	auto media_type = PromptMediaLogicalType();
+	auto add_function = [&](LogicalType input_type, LogicalType return_type, scalar_function_t function) {
+		auto materialize =
+		    ScalarFunction({std::move(input_type), LogicalType::BOOLEAN}, std::move(return_type), std::move(function));
+		materialize.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		materialize.SetStability(FunctionStability::VOLATILE);
+		materialize.SetFallible();
+		set.AddFunction(std::move(materialize));
+	};
+	add_function(file_type, media_type, PromptMediaFunction<false>);
+	add_function(LogicalType::LIST(file_type), LogicalType::LIST(media_type), PromptMediaFunction<true>);
+	return set;
+}
 
 ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 	ScalarFunctionSet set(HIDDEN_PROMPT_FUNCTION);

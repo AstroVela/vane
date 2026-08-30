@@ -1587,14 +1587,15 @@ def test_ai_prompt_file_capability_failure_obeys_on_error_before_io():
 
 
 def test_prompt_file_read_errors_do_not_expose_locator_values(tmp_path):
-    from vane.ai.functions import _PromptBatch
-
     secret = "SIGNED_QUERY_SECRET_SENTINEL"
-    value = vane.File(str(tmp_path / f"missing.bin?token={secret}"), "image/png")
-    wrapper = _PromptBatch(MockPrompterDescriptor(), ["message_0"], "response", max_retries=0)
+    path_sql = str(tmp_path / f"missing.bin?token={secret}").replace("'", "''")
+    relation = vane.connect().sql(f"""
+        SELECT file('{path_sql}', 'image/png', NULL, NULL, NULL) AS media
+    """)
+    prompted = vane.ai.prompt(relation, vane.col("media"), provider=MockProvider())
 
-    with pytest.raises(RuntimeError, match="Prompt FILE read") as exc_info:
-        wrapper._read_file_media(value)
+    with pytest.raises(Exception, match="Prompt FILE read") as exc_info:
+        prompted.project("response").fetchall()
 
     assert secret not in str(exc_info.value)
     assert secret not in repr(exc_info.value)

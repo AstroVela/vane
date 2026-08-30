@@ -158,6 +158,7 @@ class ImageMimePolicy:
 
     def require_supported(self, value: bytes | PromptMedia) -> str:
         """Return a declared/detected MIME type or reject the input locally."""
+        mime_type: str | None
         if isinstance(value, PromptMedia):
             mime_type = value.content_type
         else:
