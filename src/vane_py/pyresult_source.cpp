@@ -224,6 +224,10 @@ static bool DistributedResultTypeMatches(const LogicalType &actual, const Logica
 	if (FileLogicalType::IsFile(expected)) {
 		return IsFileStorageType(actual);
 	}
+	if (TensorType::IsTensor(expected)) {
+		return TensorType::IsTensor(actual) && TensorType::GetShape(actual) == TensorType::GetShape(expected) &&
+		       DistributedResultTypeMatches(TensorType::GetChildType(actual), TensorType::GetChildType(expected));
+	}
 	if (actual.HasAlias() || expected.HasAlias() || actual.id() != expected.id()) {
 		return false;
 	}
