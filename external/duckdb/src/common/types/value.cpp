@@ -16,7 +16,6 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/bit.hpp"
-#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -1642,13 +1641,7 @@ string Value::ToString() const {
 	if (IsNull()) {
 		return "NULL";
 	}
-	if (TypeVisitor::Contains(type_, FileLogicalType::IsFile)) {
-		CastFunctionSet cast_functions;
-		GetCastFunctionInput input;
-		input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
-		return StringValue::Get(CastAs(cast_functions, input, LogicalType::VARCHAR));
-	}
-	return StringValue::Get(DefaultCastAs(LogicalType::VARCHAR));
+	return StringValue::Get(DefaultCastAsForFormatting(LogicalType::VARCHAR));
 }
 
 string Value::ToSQLString() const {
@@ -2075,6 +2068,13 @@ Value Value::CastAs(ClientContext &context, const LogicalType &target_type, bool
 Value Value::DefaultCastAs(const LogicalType &target_type, bool strict) const {
 	CastFunctionSet set;
 	GetCastFunctionInput get_input;
+	return CastAs(set, get_input, target_type, strict);
+}
+
+Value Value::DefaultCastAsForFormatting(const LogicalType &target_type, bool strict) const {
+	CastFunctionSet set;
+	GetCastFunctionInput get_input;
+	get_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
 	return CastAs(set, get_input, target_type, strict);
 }
 

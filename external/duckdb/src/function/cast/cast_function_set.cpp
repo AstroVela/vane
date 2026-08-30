@@ -4,6 +4,7 @@
 #include "duckdb/main/settings.hpp"
 
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/type_map.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/planner/collation_binding.hpp"
@@ -51,6 +52,138 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 	return DBConfig::GetConfig(db).GetCollationBinding();
 }
 
+static bool FileAliasRestorationCompatible(const LogicalType &source, const LogicalType &target) {
+	if (FileLogicalType::IsFile(target)) {
+		auto physical_file_type = target.DeepCopy();
+		physical_file_type.SetAlias(string());
+		return source == physical_file_type;
+	}
+	if (!TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
+		// Non-FILE siblings retain the ordinary DuckDB cast rules. This is
+		// required for validated UDF outputs such as STRUCT(FILE, UUID).
+		return true;
+	}
+
+	switch (target.id()) {
+	case LogicalTypeId::STRUCT: {
+		if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() ||
+		    StructType::GetChildCount(source) != StructType::GetChildCount(target)) {
+			return false;
+		}
+		for (idx_t index = 0; index < StructType::GetChildCount(target); index++) {
+			if (StructType::GetChildName(source, index) != StructType::GetChildName(target, index) ||
+			    !FileAliasRestorationCompatible(StructType::GetChildType(source, index),
+			                                    StructType::GetChildType(target, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION: {
+		if (source.id() != LogicalTypeId::UNION || !source.AuxInfo() ||
+		    UnionType::GetMemberCount(source) != UnionType::GetMemberCount(target)) {
+			return false;
+		}
+		for (idx_t index = 0; index < UnionType::GetMemberCount(target); index++) {
+			if (UnionType::GetMemberName(source, index) != UnionType::GetMemberName(target, index) ||
+			    !FileAliasRestorationCompatible(UnionType::GetMemberType(source, index),
+			                                    UnionType::GetMemberType(target, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::LIST:
+		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+		}
+		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ListType::GetChildType(target));
+		}
+		return false;
+	case LogicalTypeId::ARRAY:
+		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+		}
+		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ListType::GetChildType(source), ArrayType::GetChildType(target));
+		}
+		return false;
+	case LogicalTypeId::MAP:
+		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
+		       FileAliasRestorationCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       FileAliasRestorationCompatible(MapType::ValueType(source), MapType::ValueType(target));
+	default:
+		return false;
+	}
+}
+
+static bool FileLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
+	if (source.id() == LogicalTypeId::SQLNULL) {
+		// Untyped NULL leaves carry no value that could bypass FILE
+		// validation. This also permits empty and NULL-only literals such as
+		// []::FILE[] and [NULL]::FILE[].
+		return true;
+	}
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	if (!source_contains_file && !target_contains_file) {
+		// Non-FILE siblings retain the ordinary DuckDB cast rules.
+		return true;
+	}
+	if (FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) {
+		return FileLogicalType::IsFile(source) && FileLogicalType::IsFile(target) && source == target;
+	}
+	if (!target_contains_file || source.HasAlias() != target.HasAlias() ||
+	    (source.HasAlias() && source.GetAlias() != target.GetAlias())) {
+		return false;
+	}
+
+	switch (target.id()) {
+	case LogicalTypeId::STRUCT: {
+		if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo() ||
+		    StructType::GetChildCount(source) != StructType::GetChildCount(target)) {
+			return false;
+		}
+		for (idx_t index = 0; index < StructType::GetChildCount(target); index++) {
+			if (StructType::GetChildName(source, index) != StructType::GetChildName(target, index) ||
+			    !FileLeavesPreservedCompatible(StructType::GetChildType(source, index),
+			                                   StructType::GetChildType(target, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::UNION: {
+		if (source.id() != LogicalTypeId::UNION || !source.AuxInfo() ||
+		    UnionType::GetMemberCount(source) != UnionType::GetMemberCount(target)) {
+			return false;
+		}
+		for (idx_t index = 0; index < UnionType::GetMemberCount(target); index++) {
+			if (UnionType::GetMemberName(source, index) != UnionType::GetMemberName(target, index) ||
+			    !FileLeavesPreservedCompatible(UnionType::GetMemberType(source, index),
+			                                   UnionType::GetMemberType(target, index))) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalTypeId::LIST:
+		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
+		       FileLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+	case LogicalTypeId::ARRAY:
+		return source.id() == LogicalTypeId::ARRAY && source.AuxInfo() &&
+		       ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
+		       FileLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+	case LogicalTypeId::MAP:
+		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
+		       FileLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       FileLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
+	default:
+		return false;
+	}
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
@@ -59,24 +192,21 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	// FILE aliases are semantic types, not presentation aliases. Letting the
 	// ordinary STRUCT cast path handle them would silently retag values and
 	// bypass their constructors and field validation.
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
 	auto internal_file_cast_allowed = [&]() {
 		switch (get_input.file_cast_mode) {
 		case FileCastMode::INTERNAL_FORMATTING:
-			return FileLogicalType::IsFile(source) && target == LogicalType::VARCHAR;
-		case FileCastMode::INTERNAL_ALIAS_RESTORATION: {
-			if (!FileLogicalType::IsFile(target) || FileLogicalType::IsFile(source)) {
-				return false;
-			}
-			auto physical_file_type = target.DeepCopy();
-			physical_file_type.SetAlias(string());
-			return source == physical_file_type;
-		}
+			return source_contains_file && target == LogicalType::VARCHAR;
+		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
+			return target_contains_file && !source_contains_file && FileAliasRestorationCompatible(source, target);
 		case FileCastMode::STRICT:
+			return target_contains_file && FileLeavesPreservedCompatible(source, target);
 		default:
 			return false;
 		}
 	}();
-	if ((FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) && source.id() != LogicalTypeId::SQLNULL &&
+	if ((source_contains_file || target_contains_file) && source.id() != LogicalTypeId::SQLNULL &&
 	    target.id() != LogicalTypeId::SQLNULL && !internal_file_cast_allowed) {
 		throw BinderException(get_input.query_location,
 		                      "Cannot cast from %s to %s: FILE-family casts require an exact logical type match",

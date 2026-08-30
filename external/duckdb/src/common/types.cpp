@@ -1776,6 +1776,83 @@ FileMediaType FileLogicalType::GetMediaType(const LogicalType &type) {
 	return media_type;
 }
 
+void FileLogicalType::ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+                                     int64_t size, const string *checksum, const string &function_name) {
+	if (!url) {
+		throw InvalidInputException("%s() url cannot be NULL", function_name);
+	}
+	if (url->find('\0') != string::npos) {
+		throw InvalidInputException("%s() url cannot contain NUL bytes", function_name);
+	}
+	if (has_position != has_size) {
+		throw InvalidInputException("%s() position and size must either both be NULL or both be non-NULL",
+		                            function_name);
+	}
+	if (has_position && (position < 0 || size < 0)) {
+		throw InvalidInputException("%s() position and size must be non-negative", function_name);
+	}
+	if (has_position && position > NumericLimits<int64_t>::Maximum() - size) {
+		throw InvalidInputException("%s() byte range exceeds BIGINT", function_name);
+	}
+	if (checksum) {
+		auto separator = checksum->find(':');
+		if (checksum->find('\0') != string::npos || separator == string::npos || separator == 0 ||
+		    separator + 1 == checksum->size() || checksum->find(':', separator + 1) != string::npos) {
+			throw InvalidInputException("%s() checksum must have the form <algorithm>:<digest>", function_name);
+		}
+	}
+}
+
+void FileLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsFile)) {
+		return;
+	}
+	if (IsFile(value.type())) {
+		auto &children = StructValue::GetChildren(value);
+		if (children.size() != FIELD_COUNT) {
+			throw InvalidInputException("%s() received a malformed FILE value", function_name);
+		}
+		string url;
+		const string *url_ptr = nullptr;
+		if (!children[URL].IsNull()) {
+			url = children[URL].GetValue<string>();
+			url_ptr = &url;
+		}
+		auto has_position = !children[POSITION].IsNull();
+		auto has_size = !children[SIZE].IsNull();
+		auto position = has_position ? children[POSITION].GetValue<int64_t>() : 0;
+		auto size = has_size ? children[SIZE].GetValue<int64_t>() : 0;
+		string checksum;
+		const string *checksum_ptr = nullptr;
+		if (!children[CHECKSUM].IsNull()) {
+			checksum = children[CHECKSUM].GetValue<string>();
+			checksum_ptr = &checksum;
+		}
+		ValidateFields(url_ptr, has_position, position, has_size, size, checksum_ptr, function_name);
+		return;
+	}
+
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	default:
+		throw InternalException("FILE value is nested in unsupported physical type %s", value.type());
+	}
+}
+
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
 	auto info = make_shared_ptr<AggregateStateTypeInfo>(std::move(state_type));
 	return LogicalType(LogicalTypeId::AGGREGATE_STATE, std::move(info));

@@ -15,7 +15,6 @@
 #include "duckdb/execution/operator/csv_scanner/csv_multi_file_info.hpp"
 #include "duckdb/execution/operator/csv_scanner/sniffer/csv_sniffer.hpp"
 #include "duckdb/function/copy_function.hpp"
-#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/scalar/string_functions.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/parser/expression/bound_expression.hpp"
@@ -161,12 +160,8 @@ static vector<unique_ptr<Expression>> CreateCastExpressions(WriteCSVData &bind_d
 			// CSV serialization is an internal formatting boundary. Bind this cast explicitly so FILE-family values,
 			// including nested ones, remain unavailable to ordinary SQL VARCHAR casts.
 			auto column = make_uniq<BoundReferenceExpression>(name, type, i);
-			auto &cast_functions = CastFunctionSet::Get(context);
-			GetCastFunctionInput cast_input(context);
-			cast_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
-			auto cast_function = cast_functions.GetCastFunction(type, LogicalType::VARCHAR, cast_input);
 			auto cast =
-			    make_uniq<BoundCastExpression>(std::move(column), LogicalType::VARCHAR, std::move(cast_function));
+			    BoundCastExpression::AddCastToTypeForFormatting(context, std::move(column), LogicalType::VARCHAR);
 			unbound_expressions.push_back(make_uniq<BoundExpression>(std::move(cast)));
 		} else if (has_dateformat && type.id() == LogicalTypeId::DATE) {
 			// strftime(<name>, 'format')

@@ -146,6 +146,59 @@ SELECT [image_file('x')]::AUDIOFILE[]
 <REGEX>:.*FILE-family casts require an exact logical type match.*
 
 statement error
+SELECT [image_file('x')]::IMAGEFILE[1]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT array_value(image_file('x'))::IMAGEFILE[2]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Transparent container casts may still convert non-FILE siblings when every
+# FILE leaf remains at the same path with the exact same specialization.
+query III
+SELECT typeof(value.document) = 'IMAGEFILE', value.document.url = 'x', value.missing IS NULL
+FROM (
+	SELECT CAST(
+		{'document': image_file('x'), 'missing': NULL}
+		AS STRUCT(document IMAGEFILE, missing INTEGER)
+	) AS value
+)
+----
+true	true	true
+
+# Untyped NULL leaves do not bypass FILE validation and remain valid inputs for
+# empty or NULL-only container literals.
+query II
+SELECT length([]::FILE[]), ([NULL]::IMAGEFILE[])[1] IS NULL
+----
+0	true
+
+statement error
+SELECT [NULL::VARCHAR]::FILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+# Opaque VARIANT conversion must not bypass a nested FILE leaf in either
+# direction.
+statement error
+SELECT [image_file('x')]::VARIANT
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
+SELECT ([{
+	'url': 'x',
+	'content_type': NULL::VARCHAR,
+	'position': NULL::BIGINT,
+	'size': NULL::BIGINT,
+	'checksum': NULL::VARCHAR
+}]::VARIANT)::IMAGEFILE[]
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
+
+statement error
 SELECT TRY_CAST(video_file('x') AS IMAGEFILE)
 ----
 <REGEX>:.*FILE-family casts require an exact logical type match.*
@@ -189,6 +242,87 @@ SELECT
 FROM read_csv('__TEST_DIR__/media_files.csv', header = TRUE, all_varchar = TRUE)
 ----
 true	true	true
+
+# PIVOT's engine-generated VARCHAR conversions retain internal formatting
+# capability through parsed and bound plan serialization. Explicit SQL casts
+# remain strict above.
+statement ok
+PRAGMA verify_serializer
+
+query III
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(image_file('one.png'), 1),
+		(image_file('two.png'), 2),
+		(NULL::IMAGEFILE, 3)
+	) AS source(file_value, amount)
+)
+ON file_value IN (
+	CASE WHEN TRUE THEN image_file('one.png') END,
+	CASE WHEN TRUE THEN image_file('two.png') END,
+	NULL::IMAGEFILE
+)
+USING sum(amount)
+----
+1	2	3
+
+statement ok
+SET pivot_filter_threshold = 1
+
+query II
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(audio_file('one.mp3'), 1),
+		(audio_file('two.mp3'), 2)
+	) AS source(file_value, amount)
+)
+ON file_value
+USING sum(amount)
+----
+1	2
+
+# A PIVOT IN subquery reaches the internal CREATE ENUM binder rather than the
+# automatic-discovery transform above.
+query II
+PIVOT (
+	SELECT *
+	FROM (VALUES
+		(video_file('one.mp4'), 1),
+		(video_file('two.mp4'), 2)
+	) AS source(file_value, amount)
+)
+ON file_value IN (
+	SELECT video_file('one.mp4')
+	UNION ALL
+	SELECT video_file('two.mp4')
+)
+USING sum(amount)
+----
+1	2
+
+statement ok
+RESET pivot_filter_threshold
+
+# SUMMARIZE's min/max presentation is another engine-owned formatting
+# boundary; it must not make explicit SQL casts legal.
+statement ok
+SUMMARIZE SELECT image_file('summary.png') AS file_value
+
+statement ok
+PRAGMA disable_verify_serializer
+
+# Partition directory naming and RETURN_STATS both format FILE partition keys
+# internally.
+statement ok
+COPY (
+	SELECT image_file('partition.png') AS partition_file, 42 AS value
+) TO '__TEST_DIR__/media_partitioned' (
+	FORMAT CSV,
+	PARTITION_BY (partition_file),
+	RETURN_STATS
+)
 
 # Generic FILE-family functions accept all specializations. Value-returning
 # enrichment preserves its input alias, while identity functions compare

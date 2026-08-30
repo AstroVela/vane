@@ -539,6 +539,9 @@ struct FileLogicalType {
 	DUCKDB_API static LogicalType Create(FileMediaType media_type = FileMediaType::UNKNOWN);
 	DUCKDB_API static bool IsFile(const LogicalType &type);
 	DUCKDB_API static FileMediaType GetMediaType(const LogicalType &type);
+	DUCKDB_API static void ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+	                                     int64_t size, const string *checksum, const string &function_name);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
 	DUCKDB_API static bool TryParseTypeName(const string &type_name, FileMediaType &media_type);
 	DUCKDB_API static const char *GetTypeName(FileMediaType media_type);
 	DUCKDB_API static const char *GetConstructorName(FileMediaType media_type);

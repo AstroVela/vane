@@ -103,29 +103,7 @@ FileReference FileReference::FromValue(const Value &value, const string &functio
 
 void FileReference::ValidateFields(const string *url, bool has_position, int64_t position, bool has_size, int64_t size,
                                    const string *checksum, const string &function_name) {
-	if (!url) {
-		throw InvalidInputException("%s() url cannot be NULL", function_name);
-	}
-	if (url->find('\0') != string::npos) {
-		throw InvalidInputException("%s() url cannot contain NUL bytes", function_name);
-	}
-	if (has_position != has_size) {
-		throw InvalidInputException("%s() position and size must either both be NULL or both be non-NULL",
-		                            function_name);
-	}
-	if (has_position && (position < 0 || size < 0)) {
-		throw InvalidInputException("%s() position and size must be non-negative", function_name);
-	}
-	if (has_position && position > NumericLimits<int64_t>::Maximum() - size) {
-		throw InvalidInputException("%s() byte range exceeds BIGINT", function_name);
-	}
-	if (checksum) {
-		auto separator = checksum->find(':');
-		if (checksum->find('\0') != string::npos || separator == string::npos || separator == 0 ||
-		    separator + 1 == checksum->size() || checksum->find(':', separator + 1) != string::npos) {
-			throw InvalidInputException("%s() checksum must have the form <algorithm>:<digest>", function_name);
-		}
-	}
+	FileLogicalType::ValidateFields(url, has_position, position, has_size, size, checksum, function_name);
 }
 
 void FileReference::Validate(const string &function_name) const {
