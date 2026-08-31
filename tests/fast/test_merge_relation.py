@@ -111,6 +111,48 @@ def test_merge_relation_supports_expression_condition_and_custom_aliases(monkeyp
         connection.close()
 
 
+def test_merge_relation_separates_line_comment_clauses(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = _merge_connection()
+    try:
+        connection.table("merge_source").merge_into(
+            "merge_target",
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET value = source.value -- update existing rows",
+                "WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
+            ],
+        )
+        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+            (1, "new"),
+            (2, "inserted"),
+            (3, "keep"),
+        ]
+    finally:
+        connection.close()
+
+
+def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = _merge_connection()
+    try:
+        connection.table("merge_source").merge_into(
+            "merge_target",
+            "target.id = source.id",
+            [
+                "WHEN\tMATCHED THEN UPDATE SET value = source.value",
+                "WHEN\nNOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
+            ],
+        )
+        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+            (1, "new"),
+            (2, "inserted"),
+            (3, "keep"),
+        ]
+    finally:
+        connection.close()
+
+
 def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()
@@ -223,6 +265,7 @@ def test_merge_relation_rejects_local_fte_runner(monkeypatch):
         ("target.id = source.id", [], {}, "at least one MERGE WHEN clause"),
         ("target.id = source.id", "WHEN MATCHED THEN DELETE", {}, "sequence of SQL strings"),
         ("target.id = source.id", ["UPDATE SET value = source.value"], {}, "must start with WHEN"),
+        ("target.id = source.id", ["WHENEVER MATCHED THEN DELETE"], {}, "must start with WHEN"),
         ("target.id = source.id", _WHEN_CLAUSES, {"source_alias": "target"}, "must be different"),
     ],
 )

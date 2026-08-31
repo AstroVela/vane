@@ -525,7 +525,7 @@ class DuckDBPyRelation:
         self,
         target_table: str,
         condition: Expression | str | typing.Sequence[str],
-        when_clauses: typing.Sequence[str],
+        when_clauses: lst[str] | tuple[str, ...],
         *,
         target_alias: str = "target",
         source_alias: str = "source",
