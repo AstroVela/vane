@@ -572,7 +572,7 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 			       source == ArrayType::ConvertToList(target);
 		case FileCastMode::EXPLICIT_IMAGE_LAYOUT:
 			return target_contains_governed && GovernedLeavesPreservedCompatible<true>(source, target);
-		case FileCastMode::STRICT:
+		case FileCastMode::STRICT_CAST:
 			return target_contains_governed && GovernedLeavesPreservedCompatible(source, target);
 		default:
 			return false;

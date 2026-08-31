@@ -17,7 +17,7 @@ static BoundCastInfo BindCastFunction(ClientContext &context, const LogicalType 
 	GetCastFunctionInput input(context);
 	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING
 	                       : explicit_image_layout  ? FileCastMode::EXPLICIT_IMAGE_LAYOUT
-	                                                : FileCastMode::STRICT;
+	                                                : FileCastMode::STRICT_CAST;
 	return cast_functions.GetCastFunction(source, target, input);
 }
 

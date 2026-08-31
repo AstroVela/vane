@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
