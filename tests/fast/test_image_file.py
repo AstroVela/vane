@@ -159,6 +159,33 @@ def test_image_file_metadata_limits_are_enforced(duckdb_cursor, tmp_path):
         duckdb_cursor.execute("SELECT image_file_metadata($1, 1024, 11)", [value]).fetchone()
 
 
+def test_image_file_per_call_pixel_limit_overrides_and_restores_pillow_global_limit(
+    duckdb_cursor,
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "image.png"
+    path.write_bytes(_encoded_image("PNG", size=(4, 3)))
+    value = vane.ImageFile(str(path), "image/png")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+
+    assert value.metadata(max_pixels=12, connection=duckdb_cursor).width == 4
+    assert Image.MAX_IMAGE_PIXELS == 1
+    assert duckdb_cursor.execute("SELECT image_file_metadata($1, 1024, 12)", [value]).fetchone()[0]["height"] == 3
+    assert Image.MAX_IMAGE_PIXELS == 1
+    # TIFF checks the global limit again while allocating its decode tile, so
+    # this also verifies that the per-call limit covers the complete load.
+    decode_path = tmp_path / "image.tiff"
+    decode_path.write_bytes(_encoded_image("TIFF", size=(4, 3)))
+    decoded = vane.ImageFile(str(decode_path), "image/tiff").decode(
+        max_pixels=12,
+        connection=duckdb_cursor,
+    )
+    assert decoded.size == (4, 3)
+    decoded.close()
+    assert Image.MAX_IMAGE_PIXELS == 1
+
+
 def test_image_file_decode_limits_are_enforced(duckdb_cursor, tmp_path):
     path = tmp_path / "image.png"
     payload = _encoded_image("PNG", size=(4, 3))
@@ -169,8 +196,14 @@ def test_image_file_decode_limits_are_enforced(duckdb_cursor, tmp_path):
         value.decode(max_input_bytes=len(payload) - 1, connection=duckdb_cursor)
     with pytest.raises(vane.ImageFileLimitError, match="max_pixels=11"):
         value.decode(max_pixels=11, connection=duckdb_cursor)
-    with pytest.raises(vane.ImageFileLimitError, match="max_decoded_bytes=35"):
-        value.decode(max_decoded_bytes=35, connection=duckdb_cursor)
+    for mode in (None, "LA", "YCbCr"):
+        with pytest.raises(
+            vane.ImageFileLimitError,
+            match="requires up to 96 bytes, exceeding max_decoded_bytes=95",
+        ):
+            value.decode(mode, max_decoded_bytes=95, connection=duckdb_cursor)
+        decoded = value.decode(mode, max_decoded_bytes=96, connection=duckdb_cursor)
+        decoded.close()
 
 
 @pytest.mark.parametrize(

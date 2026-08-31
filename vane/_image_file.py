@@ -5,9 +5,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import io
+import threading
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +38,7 @@ _MIME_ALIASES = {
     "image/x-icon": "image/vnd.microsoft.icon",
 }
 _GENERIC_MIME_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", "image/*"})
+_PILLOW_LIMIT_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,12 @@ class _ImageReaderProxy:
     def read(self, size: int = -1, /) -> bytes:
         try:
             return self._reader.read(size)
+        except Exception as error:
+            raise _ImageReaderError(error) from error
+
+    def readline(self, size: int = -1, /) -> bytes:
+        try:
+            return self._reader.readline(size)
         except Exception as error:
             raise _ImageReaderError(error) from error
 
@@ -121,6 +131,30 @@ def _load_pillow() -> tuple[Any, type[Exception]]:
             "ImageFile metadata and decoding require the 'pillow' package. Please `pip install 'vane-ai[image]'`."
         ) from error
     return image_module, unidentified_error
+
+
+@contextlib.contextmanager
+def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -> Iterator[Any]:
+    # Pillow consults a process-global limit while opening and, for some
+    # formats, again while loading pixels. Serialize the complete operation,
+    # loosen the global cap only as far as this call requires, and restore it
+    # afterwards. Vane's per-call validation remains the authoritative limit.
+    with _PILLOW_LIMIT_LOCK:
+        previous_limit = image_module.MAX_IMAGE_PIXELS
+        pillow_limit = previous_limit
+        # Pillow raises only above twice MAX_IMAGE_PIXELS; the warning between
+        # the two thresholds is redundant with Vane's exact validation below.
+        minimum_pillow_limit = (max_pixels + 1) // 2
+        if previous_limit is not None and previous_limit < minimum_pillow_limit:
+            pillow_limit = minimum_pillow_limit
+        image_module.MAX_IMAGE_PIXELS = pillow_limit
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", image_module.DecompressionBombWarning)
+                with image_module.open(stream) as image:
+                    yield image
+        finally:
+            image_module.MAX_IMAGE_PIXELS = previous_limit
 
 
 def _positive_limit(value: object, *, name: str, maximum: int | None = None) -> int:
@@ -207,15 +241,13 @@ def _probe_image_metadata(
     image_module, unidentified_error = _load_pillow()
     stream = _MetadataBuffer(data, truncated=truncated)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", image_module.DecompressionBombWarning)
-            with image_module.open(stream) as image:
-                metadata = _metadata_from_image(
-                    image,
-                    image_module,
-                    max_pixels=max_pixels,
-                    content_type=content_type,
-                )
+        with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
+            metadata = _metadata_from_image(
+                image,
+                image_module,
+                max_pixels=max_pixels,
+                content_type=content_type,
+            )
     except ImageFileError:
         raise
     except image_module.DecompressionBombError as error:
@@ -252,18 +284,14 @@ def _image_file_metadata_value(
 
 
 def _decoded_bytes(image: Any, output_mode: str) -> int:
-    if output_mode == "1":
+    if output_mode in {"1", "L", "P"}:
         bytes_per_pixel = 1
-    elif output_mode in {"L", "P"}:
-        bytes_per_pixel = 1
-    elif output_mode in {"LA"} or output_mode.startswith("I;16"):
+    elif output_mode.startswith("I;16"):
         bytes_per_pixel = 2
-    elif output_mode in {"RGB", "YCbCr"}:
-        bytes_per_pixel = 3
-    elif output_mode in {"RGBA", "CMYK", "I", "F"}:
+    elif output_mode in {"LA", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"}:
         bytes_per_pixel = 4
     else:
-        bytes_per_pixel = max(1, len(image.getbands()))
+        bytes_per_pixel = max(4, len(image.getbands()))
     return int(image.width) * int(image.height) * bytes_per_pixel
 
 
@@ -302,32 +330,37 @@ def _decode_image_file(
                 raise ImageFileLimitError(
                     f"encoded image contains {input_size} bytes, exceeding max_input_bytes={normalized_max_input}"
                 )
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", image_module.DecompressionBombWarning)
-                with image_module.open(_ImageReaderProxy(reader)) as source:
-                    metadata = _metadata_from_image(
-                        source,
-                        image_module,
-                        max_pixels=normalized_max_pixels,
-                        content_type=value.content_type,
+            with _open_image_with_limit(
+                image_module,
+                _ImageReaderProxy(reader),
+                max_pixels=normalized_max_pixels,
+            ) as source:
+                metadata = _metadata_from_image(
+                    source,
+                    image_module,
+                    max_pixels=normalized_max_pixels,
+                    content_type=value.content_type,
+                )
+                output_mode = normalized_mode or metadata.mode
+                source_bytes = _decoded_bytes(source, metadata.mode)
+                output_bytes = _decoded_bytes(source, output_mode)
+                decoded_working_bytes = source_bytes + output_bytes
+                if decoded_working_bytes > normalized_max_decoded:
+                    raise ImageFileLimitError(
+                        f"image decode requires up to {decoded_working_bytes} bytes, "
+                        f"exceeding max_decoded_bytes={normalized_max_decoded}"
                     )
-                    output_mode = normalized_mode or metadata.mode
-                    decoded_bytes = _decoded_bytes(source, output_mode)
-                    if decoded_bytes > normalized_max_decoded:
-                        raise ImageFileLimitError(
-                            f"decoded image requires {decoded_bytes} bytes, "
-                            f"exceeding max_decoded_bytes={normalized_max_decoded}"
-                        )
 
-                    if normalized_mode is not None and normalized_mode != source.mode:
-                        converted = source.convert(normalized_mode)
-                        try:
-                            converted.load()
-                            return converted.copy()
-                        finally:
-                            converted.close()
-                    source.load()
-                    return source.copy()
+                if normalized_mode is not None and normalized_mode != source.mode:
+                    converted = source.convert(normalized_mode)
+                    try:
+                        converted.load()
+                    except BaseException:
+                        converted.close()
+                        raise
+                    return converted
+                source.load()
+                return source.copy()
     except _ImageReaderError as error:
         raise error.cause.with_traceback(error.cause.__traceback__)
     except ImageFileError:
