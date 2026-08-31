@@ -41,9 +41,6 @@ def _default_triplet() -> str:
     raise RuntimeError(f"no default vcpkg triplet for {sys.platform} on {machine}")
 
 
-DEFAULT_SHARE_DIR = REPOSITORY_ROOT / "vcpkg_installed" / _default_triplet() / "share"
-
-
 def _baseline() -> str:
     manifest = json.loads((REPOSITORY_ROOT / "vcpkg.json").read_text(encoding="utf-8"))
     return str(manifest["builtin-baseline"])
@@ -86,12 +83,16 @@ def render_bundle(share_dir: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--share-dir", type=Path, default=DEFAULT_SHARE_DIR)
+    parser.add_argument("--share-dir", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true", help="fail instead of rewriting an out-of-date bundle")
     args = parser.parse_args()
 
-    expected = render_bundle(args.share_dir)
+    share_dir = args.share_dir
+    if share_dir is None:
+        share_dir = REPOSITORY_ROOT / "vcpkg_installed" / _default_triplet() / "share"
+
+    expected = render_bundle(share_dir)
     if args.check:
         actual = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
         if actual != expected:
