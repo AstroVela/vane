@@ -49,6 +49,26 @@ SELECT
 ----
 IMAGEFILE	image.png	AUDIOFILE	audio.mp3	VIDEOFILE	video.mp4
 
+# Unresolved constructor parameters retain the unambiguous URL interpretation.
+statement ok
+PREPARE prepared_media_files AS SELECT
+	typeof(image_file($1)), image_file($1).url,
+	typeof(audio_file($2)), audio_file($2).url,
+	typeof(video_file($3)), video_file($3).url
+
+query TTTTTT
+EXECUTE prepared_media_files('prepared.png', 'prepared.mp3', 'prepared.mp4')
+----
+IMAGEFILE	prepared.png	AUDIOFILE	prepared.mp3	VIDEOFILE	prepared.mp4
+
+statement ok
+PREPARE prepared_verified_image AS SELECT typeof(image_file($1, $2)), image_file($1, $2).url
+
+query TT
+EXECUTE prepared_verified_image('prepared-verified.png', FALSE)
+----
+IMAGEFILE	prepared-verified.png
+
 # JSON is a semantic VARCHAR alias, not a file locator alias.
 statement error
 SELECT image_file(json '"image.png"')
@@ -268,6 +288,42 @@ SELECT union_tag(value), value.document.url
 FROM converted
 ----
 document	union.png
+
+# A scalar value can use DuckDB's native promotion into an exact FILE-family
+# UNION member without retagging the value.
+query TTTT
+SELECT
+	union_tag(generic_value), generic_value.document.url,
+	union_tag(image_value), image_value.image.url
+FROM (
+	SELECT
+		CAST(file('generic.txt', NULL, NULL, NULL, NULL) AS UNION(document FILE, n BIGINT)) AS generic_value,
+		CAST(image_file('image.png') AS UNION(image IMAGEFILE, n BIGINT)) AS image_value
+)
+----
+document	generic.txt	image	image.png
+
+statement ok
+SET old_implicit_casting = true
+
+query TT
+SELECT union_tag(generic_value), generic_value.document.url
+FROM (
+	SELECT CAST(
+		file('legacy-casting.txt', NULL, NULL, NULL, NULL)
+		AS UNION(document FILE, text VARCHAR)
+	) AS generic_value
+)
+----
+document	legacy-casting.txt
+
+statement ok
+SET old_implicit_casting = false
+
+statement error
+SELECT CAST(image_file('x') AS UNION(document FILE, n BIGINT))
+----
+<REGEX>:.*FILE-family casts require an exact logical type match.*
 
 statement error
 SELECT (

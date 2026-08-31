@@ -114,9 +114,12 @@ static void VerifyMediaFile(ClientContext &context, FileReference &file, const s
 template <FileMediaType MEDIA_TYPE>
 static unique_ptr<FunctionData> BindMediaFileConstructor(ClientContext &, ScalarFunction &bound_function,
                                                          vector<unique_ptr<Expression>> &arguments) {
-	auto &input_type = arguments[0]->return_type;
+	auto input_type = arguments[0]->return_type;
 	if (input_type.id() == LogicalTypeId::UNKNOWN) {
-		throw ParameterNotResolvedException();
+		// The URL form is the only interpretation available for an unresolved
+		// parameter. Preserve exact FILE-family types when the input type is
+		// already known, but retain normal VARCHAR inference for PREPARE.
+		input_type = LogicalType::VARCHAR;
 	}
 	auto valid_input = (input_type.id() == LogicalTypeId::VARCHAR && !input_type.IsJSONType()) ||
 	                   input_type.id() == LogicalTypeId::STRING_LITERAL || input_type.id() == LogicalTypeId::SQLNULL;

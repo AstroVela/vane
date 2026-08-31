@@ -195,6 +195,18 @@ static bool FileLeavesPreservedCompatible(const LogicalType &source, const Logic
 		// Non-FILE siblings retain the ordinary DuckDB cast rules.
 		return true;
 	}
+	if (source_contains_file && target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION &&
+	    target.AuxInfo()) {
+		// DuckDB promotes a non-UNION value to the best matching UNION member.
+		// Permit that native path only when at least one member preserves every
+		// FILE leaf; the selected member is checked again by its child cast.
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			if (FileLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
+				return true;
+			}
+		}
+		return false;
+	}
 	if (FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) {
 		return FileLogicalType::IsFile(source) && FileLogicalType::IsFile(target) && source == target;
 	}
@@ -376,7 +388,10 @@ int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, c
 	}
 	// if not, fallback to the default implicit cast rules
 	auto score = CastRules::ImplicitCast(source, target);
-	if (score < 0 && source.id() != LogicalTypeId::BLOB && target.id() == LogicalTypeId::VARCHAR) {
+	// FILE-to-VARCHAR remains an internal formatting operation even when the
+	// legacy compatibility setting enables ordinary implicit string casts.
+	if (score < 0 && source.id() != LogicalTypeId::BLOB && target.id() == LogicalTypeId::VARCHAR &&
+	    !TypeVisitor::Contains(source, FileLogicalType::IsFile)) {
 		bool old_implicit_casting = false;
 		if (context) {
 			old_implicit_casting = Settings::Get<OldImplicitCastingSetting>(*context);
