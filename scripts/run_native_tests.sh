@@ -97,7 +97,7 @@ if [[ "$windows_host" == true ]]; then
   # library for CMake's generic FindZLIB module. A prefix alone cannot provide
   # that mapping, so use the pinned toolchain in classic (already installed)
   # mode without triggering a second manifest install.
-  vcpkg_root="${VCPKG_ROOT:-$project_root/.cache/vcpkg}"
+  vcpkg_root="${VCPKG_ROOT:-${RUNNER_TEMP:-$project_root/.cache}/vcpkg}"
   vcpkg_toolchain="$vcpkg_root/scripts/buildsystems/vcpkg.cmake"
   if [[ ! -f "$vcpkg_toolchain" ]]; then
     echo "Pinned vcpkg toolchain not found at $vcpkg_toolchain" >&2
