@@ -61,30 +61,40 @@ if(EXISTS "${_VANE_VCPKG_INSTALLED_DIR}")
   if(DEFINED VCPKG_TARGET_TRIPLET)
     list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
          "${_VANE_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  elseif(DEFINED ENV{VCPKG_TARGET_TRIPLET} AND NOT "$ENV{VCPKG_TARGET_TRIPLET}"
+                                               STREQUAL "")
+    list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+         "${_VANE_VCPKG_INSTALLED_DIR}/$ENV{VCPKG_TARGET_TRIPLET}")
   endif()
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-linux-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/x64-linux")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-linux-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/arm64-linux")
     endif()
   elseif(APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-osx-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/arm64-osx")
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-osx-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/x64-osx")
     endif()
   elseif(WIN32)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/arm64-windows-static-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/arm64-windows")
     else()
       list(APPEND _VANE_VCPKG_PREFIX_CANDIDATES
+           "${_VANE_VCPKG_INSTALLED_DIR}/x64-windows-static-release"
            "${_VANE_VCPKG_INSTALLED_DIR}/x64-windows")
     endif()
   endif()

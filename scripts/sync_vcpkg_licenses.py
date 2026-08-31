@@ -8,11 +8,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
+import sys
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SHARE_DIR = REPOSITORY_ROOT / "vcpkg_installed" / "x64-linux" / "share"
 DEFAULT_OUTPUT = REPOSITORY_ROOT / "LICENSES" / "vcpkg-binary-dependencies.txt"
+
+
+def _default_triplet() -> str:
+    configured = os.environ.get("VCPKG_TARGET_TRIPLET")
+    if configured:
+        return configured
+
+    machine = platform.machine().lower()
+    if sys.platform.startswith("linux"):
+        if machine in {"x86_64", "amd64"}:
+            return "x64-linux-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-linux-release"
+    elif sys.platform == "darwin":
+        if machine in {"x86_64", "amd64"}:
+            return "x64-osx-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-osx-release"
+    elif sys.platform == "win32":
+        if machine in {"x86_64", "amd64"}:
+            return "x64-windows-static-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-windows-static-release"
+    raise RuntimeError(f"no default vcpkg triplet for {sys.platform} on {machine}")
+
+
+DEFAULT_SHARE_DIR = REPOSITORY_ROOT / "vcpkg_installed" / _default_triplet() / "share"
 
 
 def _baseline() -> str:

@@ -6,7 +6,13 @@ set -euo pipefail
 
 project_root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 project_root="$(cd "$project_root" && pwd)"
-triplet="${VCPKG_TARGET_TRIPLET:-x64-linux}"
+source "$project_root/scripts/vcpkg_triplet.sh"
+default_triplet=""
+if [[ -z "${VCPKG_TARGET_TRIPLET:-}" || -z "${VCPKG_HOST_TRIPLET:-}" ]]; then
+  default_triplet="$(vane_default_vcpkg_triplet)"
+fi
+triplet="${VCPKG_TARGET_TRIPLET:-$default_triplet}"
+host_triplet="${VCPKG_HOST_TRIPLET:-$default_triplet}"
 vcpkg_root="${VCPKG_ROOT:-${RUNNER_TEMP:-$project_root/.cache}/vcpkg}"
 install_root="${VCPKG_INSTALLED_DIR:-$project_root/vcpkg_installed}"
 
@@ -62,7 +68,10 @@ mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE" "$install_root"
 "$vcpkg_root/vcpkg" install \
   --x-manifest-root="$project_root" \
   --x-install-root="$install_root" \
-  --triplet="$triplet"
+  --triplet="$triplet" \
+  --host-triplet="$host_triplet" \
+  --clean-buildtrees-after-build \
+  --clean-packages-after-build
 
 "$python_cmd" "$project_root/scripts/sync_vcpkg_licenses.py" \
   --share-dir "$install_root/$triplet/share" \

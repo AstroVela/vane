@@ -46,7 +46,11 @@ cmake_args=(
   -DDUCKDB_DISTRIBUTED_EXCHANGE_USE_INSTALLED_LIBS=OFF
 )
 
-triplet="${VCPKG_TARGET_TRIPLET:-x64-linux}"
+source "$project_root/scripts/vcpkg_triplet.sh"
+triplet="${VCPKG_TARGET_TRIPLET:-}"
+if [[ -z "$triplet" ]]; then
+  triplet="$(vane_default_vcpkg_triplet)"
+fi
 install_root="${VCPKG_INSTALLED_DIR:-$project_root/vcpkg_installed}"
 if [[ "$install_root" != /* ]]; then
   install_root="$project_root/$install_root"
