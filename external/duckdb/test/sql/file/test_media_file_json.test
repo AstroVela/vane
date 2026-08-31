@@ -9,6 +9,12 @@ require json
 statement ok
 PRAGMA enable_verification
 
+# JSON is a semantic VARCHAR alias, not a file locator alias.
+statement error
+SELECT image_file(json '"image.png"')
+----
+<REGEX>:.*image_file.*requires VARCHAR, FILE, or IMAGEFILE.*JSON.*
+
 # JSON creation consumes FILE's canonical STRUCT representation without
 # stripping its semantic alias through an ordinary SQL cast.
 query TTTTT
