@@ -387,7 +387,10 @@ The launcher uses Ninja's single Release configuration by default. Windows CI
 follows DuckDB's native MSVC path with
 `VANE_NATIVE_CMAKE_GENERATOR="Visual Studio 17 2022"` and
 `VANE_NATIVE_CMAKE_GENERATOR_PLATFORM=x64`; the launcher restricts the
-multi-config build to Release and runs the corresponding test executable.
+multi-config build to Release and runs the corresponding test executable. It
+uses the pinned vcpkg toolchain in classic mode so Windows package wrappers
+resolve release-only static library names without installing dependencies a
+second time.
 
 Statically linked DuckDB extensions participate in Ray execution through the
 explicit scan callback and write provider contracts described in

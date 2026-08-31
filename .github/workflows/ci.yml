@@ -398,7 +398,8 @@ jobs:
           python-version: "3.12"
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: vcpkg_cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
@@ -417,6 +418,15 @@ jobs:
       - name: Build and run DuckDB unit tests
         shell: bash
         run: scripts/run_native_tests.sh
+
+      # Completed ports are content-addressed and safe to reuse even when a
+      # later configure or test step fails during initial Windows bring-up.
+      - name: Save vcpkg binary cache
+        if: ${{ always() && steps.vcpkg_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
 
   fast-tests:
     name: Fast tests (${{ matrix.label }})

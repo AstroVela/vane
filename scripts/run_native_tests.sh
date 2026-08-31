@@ -42,6 +42,12 @@ fi
 generator="${VANE_NATIVE_CMAKE_GENERATOR:-Ninja}"
 generator_platform="${VANE_NATIVE_CMAKE_GENERATOR_PLATFORM:-}"
 kernel_name="$(uname -s)"
+windows_host=false
+case "$kernel_name" in
+  MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT*)
+    windows_host=true
+    ;;
+esac
 multi_config=false
 case "$generator" in
   *"Multi-Config"* | Xcode | Visual\ Studio*)
@@ -86,6 +92,25 @@ if [[ ! -f "$arrow_config" ]]; then
   exit 1
 fi
 cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
+if [[ "$windows_host" == true ]]; then
+  # vcpkg's Windows package wrappers map names such as the static zlib `zs`
+  # library for CMake's generic FindZLIB module. A prefix alone cannot provide
+  # that mapping, so use the pinned toolchain in classic (already installed)
+  # mode without triggering a second manifest install.
+  vcpkg_root="${VCPKG_ROOT:-$project_root/.cache/vcpkg}"
+  vcpkg_toolchain="$vcpkg_root/scripts/buildsystems/vcpkg.cmake"
+  if [[ ! -f "$vcpkg_toolchain" ]]; then
+    echo "Pinned vcpkg toolchain not found at $vcpkg_toolchain" >&2
+    echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the repository root first." >&2
+    exit 1
+  fi
+  cmake_args+=(
+    "-DCMAKE_TOOLCHAIN_FILE=$vcpkg_toolchain"
+    "-DVCPKG_INSTALLED_DIR=$install_root"
+    "-DVCPKG_TARGET_TRIPLET=$triplet"
+    "-DVCPKG_MANIFEST_MODE=OFF"
+  )
+fi
 
 duckdb_upstream_version="$(<"$project_root/DUCKDB_UPSTREAM_VERSION")"
 duckdb_fork_version="$(
@@ -142,11 +167,9 @@ test_binary="$build_dir/test/unittest"
 if [[ "$multi_config" == true ]]; then
   test_binary="$build_dir/test/Release/unittest"
 fi
-case "$kernel_name" in
-  MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT*)
-    test_binary="${test_binary}.exe"
-    ;;
-esac
+if [[ "$windows_host" == true ]]; then
+  test_binary="${test_binary}.exe"
+fi
 if [[ ! -x "$test_binary" ]]; then
   echo "Native test binary was not generated at $test_binary" >&2
   exit 1
