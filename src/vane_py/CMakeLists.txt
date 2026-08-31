@@ -27,6 +27,7 @@ add_library(
   dynamic_extension.cpp
   vane_python.cpp
   importer.cpp
+  merge_relation.cpp
   ai_sql_functions.cpp
   image_file_functions.cpp
   path_like.cpp

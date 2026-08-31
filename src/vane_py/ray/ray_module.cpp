@@ -12,6 +12,7 @@
 #include "datasource_function.hpp"
 
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_objects.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
