@@ -69,6 +69,69 @@ EXECUTE prepared_verified_image('prepared-verified.png', FALSE)
 ----
 IMAGEFILE	prepared-verified.png
 
+# Typed macro overloads infer the generic FILE family member only when an
+# argument is unresolved or entirely untyped. Known media values remain exact.
+statement ok
+CREATE MACRO infer_file_family
+	(value FILE) AS 'FILE',
+	(value IMAGEFILE) AS 'IMAGEFILE',
+	(value AUDIOFILE) AS 'AUDIOFILE',
+	(value VIDEOFILE) AS 'VIDEOFILE'
+
+statement ok
+CREATE MACRO infer_file_list_family
+	(value FILE[]) AS 'FILE[]',
+	(value IMAGEFILE[]) AS 'IMAGEFILE[]',
+	(value AUDIOFILE[]) AS 'AUDIOFILE[]',
+	(value VIDEOFILE[]) AS 'VIDEOFILE[]'
+
+query TTTT
+SELECT
+	infer_file_family(value := NULL),
+	infer_file_family(image_file('image.png')),
+	infer_file_list_family(value := []),
+	infer_file_list_family([audio_file('audio.mp3')])
+----
+FILE	IMAGEFILE	FILE[]	AUDIOFILE[]
+
+statement ok
+PREPARE prepared_file_macro AS SELECT infer_file_family(value := $1)
+
+statement ok
+PREPARE prepared_file_list_macro AS SELECT infer_file_list_family(value := $1)
+
+query T
+EXECUTE prepared_file_macro(file('prepared.txt', NULL, NULL, NULL, NULL))
+----
+FILE
+
+query T
+EXECUTE prepared_file_macro(image_file('prepared.png'))
+----
+IMAGEFILE
+
+query T
+EXECUTE prepared_file_list_macro([file('prepared.txt', NULL, NULL, NULL, NULL)])
+----
+FILE[]
+
+query T
+EXECUTE prepared_file_list_macro([video_file('prepared.mp4')])
+----
+VIDEOFILE[]
+
+# The generic preference must not resolve a second, independent FILE overload
+# dimension according to named-argument order.
+statement ok
+CREATE MACRO preserve_independent_file_ambiguity
+	(left_value FILE, right_value IMAGEFILE) AS 'generic-left',
+	(left_value IMAGEFILE, right_value FILE) AS 'generic-right'
+
+statement error
+SELECT preserve_independent_file_ambiguity(left_value := NULL, right_value := NULL)
+----
+<REGEX>:.*multiple overloads.*
+
 # JSON is a semantic VARCHAR alias, not a file locator alias.
 statement error
 SELECT image_file(json '"image.png"')
@@ -302,6 +365,36 @@ FROM (
 )
 ----
 document	generic.txt	image	image.png
+
+# Non-FILE scalars retain DuckDB's native promotion into an unrelated UNION
+# member even when another member is FILE-specialized.
+query TITT
+SELECT
+	union_tag(integer_value), integer_value.n,
+	union_tag(text_value), text_value.text
+FROM (
+	SELECT
+		CAST(1 AS UNION(n INTEGER, image IMAGEFILE)) AS integer_value,
+		CAST('text' AS UNION(image IMAGEFILE, text VARCHAR)) AS text_value
+)
+----
+n	1	text	text
+
+statement ok
+CREATE TEMP TABLE promoted_file_union(value UNION(n INTEGER, image IMAGEFILE))
+
+statement ok
+INSERT INTO promoted_file_union VALUES (2)
+
+statement ok
+INSERT INTO promoted_file_union VALUES (image_file('inserted.png'))
+
+query TT rowsort
+SELECT union_tag(value), COALESCE(value.n::VARCHAR, value.image.url)
+FROM promoted_file_union
+----
+image	inserted.png
+n	2
 
 statement ok
 SET old_implicit_casting = true

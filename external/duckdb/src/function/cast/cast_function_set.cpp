@@ -195,8 +195,7 @@ static bool FileLeavesPreservedCompatible(const LogicalType &source, const Logic
 		// Non-FILE siblings retain the ordinary DuckDB cast rules.
 		return true;
 	}
-	if (source_contains_file && target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION &&
-	    target.AuxInfo()) {
+	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION && target.AuxInfo()) {
 		// DuckDB promotes a non-UNION value to the best matching UNION member.
 		// Permit that native path only when at least one member preserves every
 		// FILE leaf; the selected member is checked again by its child cast.
@@ -233,6 +232,26 @@ static bool FileLeavesPreservedCompatible(const LogicalType &source, const Logic
 	default:
 		return false;
 	}
+}
+
+static bool FileImplicitCastCompatible(const LogicalType &source, const LogicalType &target) {
+	if (source.id() == LogicalTypeId::UNKNOWN || source.id() == LogicalTypeId::SQLNULL ||
+	    target.id() == LogicalTypeId::ANY || target.id() == LogicalTypeId::TEMPLATE ||
+	    target.id() == LogicalTypeId::UNKNOWN) {
+		return true;
+	}
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	if (!source_contains_file && !target_contains_file) {
+		return true;
+	}
+	if (!target.IsComplete()) {
+		// Generic function signatures use incomplete composite types such as
+		// UNION without child metadata. Their bind callbacks replace the
+		// placeholder with the concrete input type before any cast is created.
+		return true;
+	}
+	return FileLeavesPreservedCompatible(source, target);
 }
 
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
@@ -379,6 +398,24 @@ private:
 
 int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, const LogicalType &source,
                                           const LogicalType &target) {
+	if (!FileImplicitCastCompatible(source, target)) {
+		return -1;
+	}
+	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION &&
+	    source.id() != LogicalTypeId::UNKNOWN && source.id() != LogicalTypeId::SQLNULL &&
+	    TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
+		// CastRules cannot account for FILE aliases while recursively scoring
+		// UNION members. Score each member through this guarded function so
+		// invalid FILE retagging is excluded before DuckDB selects a candidate.
+		int64_t best_cost = -1;
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			auto member_cost = ImplicitCastCost(context, source, UnionType::GetMemberType(target, target_index));
+			if (member_cost >= 0 && (best_cost < 0 || member_cost < best_cost)) {
+				best_cost = member_cost;
+			}
+		}
+		return best_cost;
+	}
 	// check if a cast has been registered
 	if (map_info) {
 		auto entry = map_info->GetEntry(source, target);
@@ -388,10 +425,7 @@ int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, c
 	}
 	// if not, fallback to the default implicit cast rules
 	auto score = CastRules::ImplicitCast(source, target);
-	// FILE-to-VARCHAR remains an internal formatting operation even when the
-	// legacy compatibility setting enables ordinary implicit string casts.
-	if (score < 0 && source.id() != LogicalTypeId::BLOB && target.id() == LogicalTypeId::VARCHAR &&
-	    !TypeVisitor::Contains(source, FileLogicalType::IsFile)) {
+	if (score < 0 && source.id() != LogicalTypeId::BLOB && target.id() == LogicalTypeId::VARCHAR) {
 		bool old_implicit_casting = false;
 		if (context) {
 			old_implicit_casting = Settings::Get<OldImplicitCastingSetting>(*context);

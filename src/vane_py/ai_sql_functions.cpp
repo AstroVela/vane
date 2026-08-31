@@ -237,49 +237,6 @@ static void PreparePromptMedia(ClientContext &context, const Value &value, bool 
 
 static bool IsPromptFileList(const LogicalType &type);
 
-static LogicalType PromptNullFileSentinelType() {
-	LogicalType result(LogicalTypeId::TIMESTAMP);
-	result.SetAlias("__VANE_AI_PROMPT_NULL_FILE");
-	return result;
-}
-
-static LogicalType PromptNullFilesSentinelType() {
-	LogicalType result(LogicalTypeId::TIMESTAMP_MS);
-	result.SetAlias("__VANE_AI_PROMPT_NULL_FILES");
-	return result;
-}
-
-static LogicalType PromptEmptyFilesSentinelType() {
-	LogicalType child(LogicalTypeId::TIMESTAMP_NS);
-	child.SetAlias("__VANE_AI_PROMPT_EMPTY_FILE_ELEMENT");
-	return LogicalType::LIST(child);
-}
-
-static bool IsPromptNullFileSentinel(const LogicalType &type) {
-	return type == PromptNullFileSentinelType();
-}
-
-static bool IsPromptNullFilesSentinel(const LogicalType &type) {
-	return type == PromptNullFilesSentinelType() || type == PromptEmptyFilesSentinelType();
-}
-
-static void ValidatePromptFileSentinel(ClientContext &context, Expression &expression) {
-	if (expression.HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-	if (!expression.IsFoldable()) {
-		throw BinderException("ai_prompt FILE fallback only accepts a foldable NULL or empty list");
-	}
-	auto value = ExpressionExecutor::EvaluateScalar(context, expression);
-	if (expression.return_type == PromptEmptyFilesSentinelType()) {
-		if (value.IsNull() || !ListValue::GetChildren(value).empty()) {
-			throw BinderException("ai_prompt FILE-list fallback only accepts an empty list");
-		}
-	} else if (!value.IsNull()) {
-		throw BinderException("ai_prompt FILE fallback only accepts NULL");
-	}
-}
-
 struct MaterializedPromptFileInput {
 	Value value;
 	bool has_error;
@@ -835,12 +792,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 			prompt_input_kind = PromptInputKind::FILE;
 		} else if (IsPromptFileList(media_type)) {
 			prompt_input_kind = PromptInputKind::FILE_LIST;
-		} else if (IsPromptNullFileSentinel(media_type)) {
-			ValidatePromptFileSentinel(context, *arguments[1]);
-			prompt_input_kind = PromptInputKind::FILE;
-		} else if (IsPromptNullFilesSentinel(media_type)) {
-			ValidatePromptFileSentinel(context, *arguments[1]);
-			prompt_input_kind = PromptInputKind::FILE_LIST;
 		} else {
 			throw BinderException("ai_prompt media argument must be BLOB, BLOB[], FILE, or FILE[]");
 		}
@@ -889,18 +840,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 	}
 	if (prompt_input_kind == PromptInputKind::FILE || prompt_input_kind == PromptInputKind::FILE_LIST) {
-		if (IsPromptNullFileSentinel(arguments[1]->return_type) ||
-		    IsPromptNullFilesSentinel(arguments[1]->return_type)) {
-			auto file_type = FileLogicalType::Create();
-			auto target_type =
-			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
-			auto value = arguments[1]->return_type == PromptEmptyFilesSentinelType()
-			                 ? Value::LIST(file_type, vector<Value>())
-			                 : Value(target_type);
-			auto replacement = make_uniq<BoundConstantExpression>(std::move(value));
-			replacement->SetQueryLocation(arguments[1]->GetQueryLocation());
-			arguments[1] = std::move(replacement);
-		}
 		vector<unique_ptr<Expression>> messages;
 		messages.reserve(2);
 		messages.push_back(std::move(arguments[0]));
@@ -1118,15 +1057,6 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 		                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 		                    LogicalType::VARCHAR, LogicalType::ANY});
 	}
-	add_implementation({LogicalType::VARCHAR, PromptNullFileSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                    LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, PromptNullFilesSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                    LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, PromptEmptyFilesSentinelType(), LogicalType::JSON(), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                    LogicalType::ANY});
 	return set;
 }
 
@@ -1192,15 +1122,6 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 		auto file_list_type = LogicalType::LIST(file_type);
 		info->macros.push_back(make_function(&file_list_type, "files"));
 	}
-	// The four FILE-family aliases have equal cast cost from untyped NULLs. These
-	// internal aliases select the named fallbacks without admitting non-FILE
-	// values or tying the pre-existing positional BLOB/BLOB[] overloads.
-	auto null_file_type = PromptNullFileSentinelType();
-	info->macros.push_back(make_function(&null_file_type, "file"));
-	auto null_files_type = PromptNullFilesSentinelType();
-	info->macros.push_back(make_function(&null_files_type, "files"));
-	auto null_list_type = PromptEmptyFilesSentinelType();
-	info->macros.push_back(make_function(&null_list_type, "files"));
 	return info;
 }
 
