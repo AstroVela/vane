@@ -691,7 +691,7 @@ TEST_CASE("PhysicalPlanTranslator: simple projection", "[distributed]") {
 	auto &projection2 = plan_ptr->Make<PhysicalProjection>(types, std::move(select_list2), estimated_cardinality);
 	plan_ptr->SetRoot(projection2);
 	auto result = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 }
 
 TEST_CASE("PhysicalPlanTranslator: filter + projection", "[distributed]") {
@@ -736,7 +736,7 @@ TEST_CASE("PhysicalPlanTranslator: filter + projection", "[distributed]") {
 	auto &projection3 = plan_ptr2->Make<PhysicalProjection>(types, std::move(select_list2), estimated_cardinality);
 	plan_ptr2->SetRoot(projection3);
 	auto result2 = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr2);
-	REQUIRE(result2.ok);
+	REQUIRE(result2.is_ok());
 }
 
 TEST_CASE("PhysicalPlanTranslator: null plan returns error", "[distributed]") {
@@ -926,7 +926,7 @@ TEST_CASE("PhysicalFilter: empty select list handled as true", "[distributed]") 
 	plan_ptr->SetRoot(projection2);
 
 	auto result = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 }
 
 TEST_CASE("PhysicalPlanTranslator: grouped hash aggregate -> AggregateNode", "[distributed]") {
@@ -963,7 +963,7 @@ TEST_CASE("PhysicalPlanTranslator: grouped hash aggregate -> AggregateNode", "[d
 	plan_ptr->SetRoot(agg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto dist = res.value();
 	auto inner = dist->inner();
@@ -1211,7 +1211,7 @@ TEST_CASE("PhysicalPlanTranslator: perfect hash aggregate -> PerfectHashAggregat
 	plan_ptr->SetRoot(agg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto dist = res.value();
 	auto inner = dist->inner();
@@ -1245,7 +1245,7 @@ TEST_CASE("PhysicalPlanTranslator: partitioned aggregate -> PartitionedAggregate
 	plan_ptr->SetRoot(agg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto dist = res.value();
 	auto inner = dist->inner();
@@ -1261,7 +1261,7 @@ TEST_CASE("PhysicalPlanTranslator: dummy scan -> ScanSourceNode", "[distributed]
 	plan_ptr->SetRoot(scan);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::ScanSourceNode>(inner) != nullptr);
@@ -1276,7 +1276,7 @@ TEST_CASE("PhysicalPlanTranslator: empty result -> EmptyResultSourceNode", "[dis
 	plan_ptr->SetRoot(empty_result);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto empty_source = std::dynamic_pointer_cast<duckdb::distributed::EmptyResultSourceNode>(res.value()->inner());
 	REQUIRE(empty_source != nullptr);
@@ -1513,7 +1513,7 @@ TEST_CASE("PhysicalPlanTranslator: column data scan -> ScanSourceNode", "[distri
 	plan_ptr->SetRoot(scan);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::ScanSourceNode>(inner) != nullptr);
@@ -1530,7 +1530,7 @@ TEST_CASE("PhysicalPlanTranslator: column data scan schema preserves all columns
 	plan_ptr->SetRoot(scan);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	REQUIRE(SchemaColumnCount(res.value()->config().schema()) == 2);
 }
@@ -1547,7 +1547,7 @@ TEST_CASE("PhysicalPlanTranslator: cte scan -> ScanSourceNode", "[distributed]")
 	plan_ptr->SetRoot(scan);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::ScanSourceNode>(inner) != nullptr);
@@ -1579,7 +1579,7 @@ TEST_CASE("PhysicalPlanTranslator: parquet scan splits row groups", "[distribute
 	cfg.config = std::make_shared<DuckDBExecutionConfig>(DuckDBExecutionConfig::from_env());
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(cfg, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	REQUIRE(res.value()->num_partitions() > 1);
 	auto scan_source = std::dynamic_pointer_cast<ScanSourceNode>(res.value()->inner());
@@ -1718,7 +1718,7 @@ TEST_CASE("PhysicalPlanTranslator: expression scan -> ExpressionScanNode", "[dis
 	plan_ptr->SetRoot(expr_scan);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::ExpressionScanNode>(inner) != nullptr);
@@ -1750,7 +1750,7 @@ TEST_CASE("PhysicalPlanTranslator: ungrouped aggregate -> AggregateNode", "[dist
 	plan_ptr->SetRoot(uagg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto dist = res.value();
 	auto inner = dist->inner();
@@ -1803,7 +1803,7 @@ TEST_CASE("PhysicalPlanTranslator: grouped hash aggregate produces Aggregate nod
 	plan_ptr->SetRoot(agg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	auto node = res.value();
 	REQUIRE(node != nullptr);
 	REQUIRE(node->name() == "Aggregate");
@@ -1829,7 +1829,7 @@ TEST_CASE("PhysicalPlanTranslator: ungrouped aggregate produces Aggregate node",
 	plan_ptr->SetRoot(uagg);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	auto node = res.value();
 	REQUIRE(node != nullptr);
 	REQUIRE(node->name() == "Aggregate");
@@ -1844,7 +1844,7 @@ TEST_CASE("PhysicalPlanTranslator: limit -> LimitNode", "[distributed]") {
 	plan.plan->SetRoot(limit);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan.plan);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::LimitNode>(inner) != nullptr);
@@ -1860,7 +1860,7 @@ TEST_CASE("PhysicalPlanTranslator: streaming limit -> StreamingLimitNode", "[dis
 	plan.plan->SetRoot(limit);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan.plan);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::StreamingLimitNode>(inner) != nullptr);
@@ -1875,7 +1875,7 @@ TEST_CASE("PhysicalPlanTranslator: limit percent -> LimitPercentNode", "[distrib
 	plan.plan->SetRoot(limit);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan.plan);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::LimitPercentNode>(inner) != nullptr);
@@ -1917,7 +1917,7 @@ TEST_CASE("PhysicalPlanTranslator: order by -> OrderByNode", "[distributed]") {
 	plan.plan->SetRoot(order_by);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan.plan);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::OrderByNode>(inner) != nullptr);
@@ -1933,7 +1933,7 @@ TEST_CASE("PhysicalPlanTranslator: top n -> TopNNode", "[distributed]") {
 	plan.plan->SetRoot(topn);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan.plan);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	auto inner = res.value()->inner();
 	REQUIRE(std::dynamic_pointer_cast<duckdb::distributed::TopNNode>(inner) != nullptr);
@@ -2183,7 +2183,7 @@ TEST_CASE("PhysicalPlanTranslator: left delim join -> placeholder node", "[distr
 	REQUIRE(delim_join.GetChildren().size() == 3);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	REQUIRE(res.value()->name() == "LEFT_DELIM_JOIN");
 }
@@ -2211,7 +2211,7 @@ TEST_CASE("PhysicalPlanTranslator: inout function -> TableInOutNode", "[distribu
 	plan_ptr->SetRoot(inout);
 
 	auto res = duckdb::distributed::physical_plan_to_pipeline_node(duckdb::distributed::PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 	REQUIRE(res.value()->name() == "TableInOut");
 }
