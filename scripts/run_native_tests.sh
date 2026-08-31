@@ -25,17 +25,34 @@ if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+python_cmd="${VANE_NATIVE_PYTHON:-}"
+if [[ -z "$python_cmd" ]]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      python_cmd="$(command -v "$candidate")"
+      break
+    fi
+  done
+fi
+if [[ -z "$python_cmd" ]]; then
+  echo "Python is required to configure native tests." >&2
+  exit 1
+fi
+
 generator="${VANE_NATIVE_CMAKE_GENERATOR:-Ninja}"
+generator_platform="${VANE_NATIVE_CMAKE_GENERATOR_PLATFORM:-}"
+multi_config=false
 case "$generator" in
-  *"Multi-Config"* | "Green Hills MULTI" | Xcode | Visual\ Studio*)
-    echo "Multi-config CMake generators are not supported by this script (Release single-config expected): $generator" >&2
-    echo "Set VANE_NATIVE_CMAKE_GENERATOR to a single-config generator such as 'Ninja'." >&2
+  *"Multi-Config"* | Xcode | Visual\ Studio*)
+    multi_config=true
+    ;;
+  "Green Hills MULTI")
+    echo "Unsupported CMake generator: $generator" >&2
     exit 2
     ;;
 esac
 
 cmake_args=(
-  -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_CXX_STANDARD=20
   -DCMAKE_CXX_STANDARD_REQUIRED=ON
   -DCMAKE_CXX_EXTENSIONS=OFF
@@ -45,6 +62,11 @@ cmake_args=(
   -DBUILD_DISTRIBUTED_EXCHANGE=ON
   -DDUCKDB_DISTRIBUTED_EXCHANGE_USE_INSTALLED_LIBS=OFF
 )
+if [[ "$multi_config" == true ]]; then
+  cmake_args+=("-DCMAKE_CONFIGURATION_TYPES=Release")
+else
+  cmake_args+=("-DCMAKE_BUILD_TYPE=Release")
+fi
 
 source "$project_root/scripts/vcpkg_triplet.sh"
 triplet="${VCPKG_TARGET_TRIPLET:-}"
@@ -66,10 +88,10 @@ cmake_args+=("-DCMAKE_PREFIX_PATH=$vcpkg_prefix")
 
 duckdb_upstream_version="$(<"$project_root/DUCKDB_UPSTREAM_VERSION")"
 duckdb_fork_version="$(
-  python3 "$project_root/scripts/resolve_duckdb_fork_version.py" --print-version
+  "$python_cmd" "$project_root/scripts/resolve_duckdb_fork_version.py" --print-version
 )"
 duckdb_source_id="$(
-  python3 "$project_root/scripts/sync_duckdb_source_id.py" --print
+  "$python_cmd" "$project_root/scripts/sync_duckdb_source_id.py" --print
 )"
 cmake_args+=(
   "-DOVERRIDE_GIT_DESCRIBE=${duckdb_upstream_version}-0-g${duckdb_source_id:0:10}"
@@ -82,19 +104,37 @@ if [[ "$build_dir" != /* ]]; then
   build_dir="$project_root/$build_dir"
 fi
 
+generator_args=(-G "$generator")
+if [[ -n "$generator_platform" ]]; then
+  generator_args+=(-A "$generator_platform")
+fi
 cmake --fresh \
   -S "$project_root/external/duckdb" \
   -B "$build_dir" \
-  -G "$generator" \
+  "${generator_args[@]}" \
   "${cmake_args[@]}"
-cmake --build "$build_dir" \
-  --target \
-  unittest \
-  loadable_extension_demo_loadable_extension \
-  loadable_extension_optimizer_demo_loadable_extension \
+
+build_args=(
+  --target
+  unittest
+  loadable_extension_demo_loadable_extension
+  loadable_extension_optimizer_demo_loadable_extension
   --parallel "$build_jobs"
+)
+if [[ "$multi_config" == true ]]; then
+  build_args=(--config Release "${build_args[@]}")
+fi
+cmake --build "$build_dir" "${build_args[@]}"
 
 test_binary="$build_dir/test/unittest"
+if [[ "$multi_config" == true ]]; then
+  test_binary="$build_dir/test/Release/unittest"
+fi
+case "$(uname -s)" in
+  MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT*)
+    test_binary="${test_binary}.exe"
+    ;;
+esac
 if [[ ! -x "$test_binary" ]]; then
   echo "Native test binary was not generated at $test_binary" >&2
   exit 1

@@ -79,6 +79,39 @@ int ParseFlightIpLiteral(int family, const std::string &host, void *address) {
 #endif
 }
 
+bool IsNumericIpv4Like(const std::string &host) {
+	return std::all_of(host.begin(), host.end(),
+	                   [](char character) { return (character >= '0' && character <= '9') || character == '.'; });
+}
+
+bool IsCanonicalIpv4Literal(const std::string &host) {
+	idx_t component_count = 0;
+	idx_t component_start = 0;
+	for (idx_t position = 0; position <= host.size(); position++) {
+		if (position < host.size() && host[position] != '.') {
+			continue;
+		}
+
+		const auto component_length = position - component_start;
+		if (component_length == 0 || component_length > 3 || (component_length > 1 && host[component_start] == '0')) {
+			return false;
+		}
+		idx_t component_value = 0;
+		for (idx_t component_position = component_start; component_position < position; component_position++) {
+			const auto character = host[component_position];
+			if (character < '0' || character > '9') {
+				return false;
+			}
+			component_value = component_value * 10 + NumericCast<idx_t>(character - '0');
+		}
+		if (component_value > 255 || ++component_count > 4) {
+			return false;
+		}
+		component_start = position + 1;
+	}
+	return component_count == 4;
+}
+
 DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 	StringUtil::Trim(host);
 	if (host.empty()) {
@@ -102,6 +135,14 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 	const auto is_zero = [](unsigned char byte) {
 		return byte == 0;
 	};
+	const bool is_numeric_ipv4_like = IsNumericIpv4Like(host);
+	// inet_pton accepts leading-zero IPv4 components on some platforms. Apply
+	// the project's canonical dotted-decimal policy before the system parser so
+	// validation is identical on Linux, macOS, and Windows.
+	if (is_numeric_ipv4_like && !IsCanonicalIpv4Literal(host)) {
+		return DuckDBResult<ParsedFlightHost>::err(
+		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
+	}
 	if (ParseFlightIpLiteral(AF_INET, host, address.data()) == 1) {
 		const bool is_unspecified = std::all_of(address.begin(), address.begin() + 4, is_zero);
 		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified});
@@ -113,9 +154,6 @@ DuckDBResult<ParsedFlightHost> ParseFlightHost(std::string host) {
 		                                        std::all_of(address.begin() + 12, address.end(), is_zero);
 		return DuckDBResult<ParsedFlightHost>::ok({std::move(host), is_unspecified || is_ipv4_mapped_unspecified});
 	}
-	const bool is_numeric_ipv4_like = std::all_of(host.begin(), host.end(), [](char character) {
-		return (character >= '0' && character <= '9') || character == '.';
-	});
 	if (is_numeric_ipv4_like) {
 		return DuckDBResult<ParsedFlightHost>::err(
 		    DuckDBError::value_error("Flight host is not a canonical IPv4 literal: " + host));
