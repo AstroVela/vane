@@ -263,7 +263,7 @@ static DistributedWriteOperatorExtension DistributedTestWriteOperator() {
 	DistributedWriteOperatorExtension result;
 	result.name = DISTRIBUTED_TEST_WRITE_NAME;
 	result.protocol_version = DISTRIBUTED_TEST_WRITE_PROTOCOL;
-	result.mode = DistributedWriteMode::CALLBACK;
+	result.mode = DistributedWriteMode::CALLBACK_SINK;
 	result.fragment_codec = {DISTRIBUTED_TEST_WRITE_CODEC, DISTRIBUTED_TEST_WRITE_CODEC_VERSION};
 	result.callbacks = DistributedTestWriteCallbacks();
 	return result;

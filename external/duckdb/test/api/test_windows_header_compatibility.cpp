@@ -2,8 +2,26 @@
 #include <windows.h>
 #endif
 #include "catch.hpp"
+
+// Keep the Windows macro regression active on non-Windows CI as well. These
+// object-style macros are expanded even when they appear after a scoped enum's
+// qualifier.
+#ifndef _WIN32
+#define CALLBACK
+#define OPTIONAL
+#define REQUIRED
+#define STRICT 1
+#endif
+
 #include "test_helpers.hpp"
 #include "duckdb.hpp"
+
+#ifndef _WIN32
+#undef CALLBACK
+#undef OPTIONAL
+#undef REQUIRED
+#undef STRICT
+#endif
 
 using namespace duckdb;
 using namespace std;

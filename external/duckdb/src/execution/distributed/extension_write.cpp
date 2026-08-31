@@ -250,7 +250,7 @@ void DistributedExtensionWriteInfo::Validate() const {
 			                            WriteName(*this));
 		}
 		break;
-	case DistributedWriteMode::CALLBACK:
+	case DistributedWriteMode::CALLBACK_SINK:
 		break;
 	default:
 		throw InvalidInputException("distributed extension write '%s' has an unknown mode", WriteName(*this));
@@ -309,7 +309,7 @@ void DistributedWriteOperatorExtension::Validate(const string &capability_identi
 			                            capability_identity);
 		}
 		return;
-	case DistributedWriteMode::CALLBACK:
+	case DistributedWriteMode::CALLBACK_SINK:
 		callbacks.Validate(capability_identity);
 		return;
 	default:
@@ -445,7 +445,7 @@ vector<DistributedWriteTaskResult> ParseDistributedWriteTaskResults(const Distri
 	if (query_id.empty()) {
 		throw InvalidInputException("distributed extension write requires a non-empty query identity");
 	}
-	if (info.mode != DistributedWriteMode::CALLBACK) {
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK) {
 		throw InvalidInputException("distributed extension write '%s' is not a callback write", WriteName(info));
 	}
 	vector<DistributedWriteTaskResult> results;

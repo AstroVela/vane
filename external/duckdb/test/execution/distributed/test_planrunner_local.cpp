@@ -601,7 +601,7 @@ void RegisterPlanRunnerTestExtension(DatabaseInstance &db) {
 	DistributedWriteOperatorExtension callback_write_operator;
 	callback_write_operator.name = "callback_write";
 	callback_write_operator.protocol_version = 1;
-	callback_write_operator.mode = DistributedWriteMode::CALLBACK;
+	callback_write_operator.mode = DistributedWriteMode::CALLBACK_SINK;
 	callback_write_operator.fragment_codec = {"planrunner-test.fragment", 1};
 	callback_write_operator.callbacks.initialize_global = PlanRunnerTestWriteInitializeGlobal;
 	callback_write_operator.callbacks.initialize_local = PlanRunnerTestWriteInitializeLocal;

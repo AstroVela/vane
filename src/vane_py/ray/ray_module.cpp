@@ -200,7 +200,7 @@ static void RegisterCoordinatorOnlyExtensionWriteForTest(ClientContext &context)
 	DistributedWriteOperatorExtension write_operator;
 	write_operator.name = "coordinator_only_write";
 	write_operator.protocol_version = 1;
-	write_operator.mode = DistributedWriteMode::CALLBACK;
+	write_operator.mode = DistributedWriteMode::CALLBACK_SINK;
 	write_operator.fragment_codec = {"vane_test.coordinator_only_write", 1};
 	write_operator.callbacks.initialize_global = CoordinatorOnlyWriteInitializeGlobalForTest;
 	write_operator.callbacks.initialize_local = CoordinatorOnlyWriteInitializeLocalForTest;
@@ -319,8 +319,8 @@ static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, cons
 	throw std::runtime_error("connection setting query returned no rows: " + name);
 }
 
-template <typename CALLBACK>
-static auto WithCopyRecoveryContext(py::object conn_obj, CALLBACK callback) {
+template <typename CALLABLE>
+static auto WithCopyRecoveryContext(py::object conn_obj, CALLABLE callback) {
 	auto run_callback = [&](duckdb::ClientContext &context) {
 		using Result = decltype(callback(context));
 		std::optional<Result> result;

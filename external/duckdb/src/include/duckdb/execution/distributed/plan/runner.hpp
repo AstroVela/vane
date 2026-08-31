@@ -744,7 +744,7 @@ public:
 				    StringUtil::Format("distributed file-artifact write %s did not translate to exactly one COPY sink",
 				                       extension_write_info->Name())));
 			}
-			if (extension_write_info->mode == DistributedWriteMode::CALLBACK &&
+			if (extension_write_info->mode == DistributedWriteMode::CALLBACK_SINK &&
 			    (callback_sink_count != 1 || copy_sink_count != 0 || data_sink_count != 0)) {
 				return DuckDBResult<PlanResult>::err(DuckDBError::invalid_state_error(
 				    StringUtil::Format("distributed callback write %s did not translate to exactly one callback sink",
