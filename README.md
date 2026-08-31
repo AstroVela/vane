@@ -259,28 +259,28 @@ local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckD
 
 ### Distributed MERGE INTO
 
-Use the explicit statement-write API when a catalog extension provides distributed `MERGE INTO` execution:
+Merge a source relation into a catalog table with the same terminal-relation path used by insert, update, and delete:
 
 ```python
 import vane
 
 vane.configure(runner="ray")
 connection = vane.connect()
-outcome = vane.execute_distributed_write(
-    """
-    MERGE INTO catalog.schema.target AS target
-    USING staged_changes AS source
-    ON target.id = source.id
-    WHEN MATCHED THEN UPDATE SET value = source.value
-    WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)
-    """,
-    connection=connection,
+source = connection.table("staged_changes")
+source.merge_into(
+    "catalog.schema.target",
+    "target.id = source.id",
+    [
+        "WHEN MATCHED THEN UPDATE SET value = source.value",
+        "WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
+    ],
 )
 ```
 
-The API accepts exactly one parameter-free `MERGE INTO` statement, requires DuckDB auto-commit mode and the Ray
-runner, and returns the normal distributed write result. Parsing, planning, worker, coordinator, and commit failures
-are returned directly and never fall back to local execution. Existing `execute()` and `sql()` behavior is unchanged.
+The condition accepts a SQL string, an `Expression`, or a sequence of column names for `USING (...)`. Ordered SQL
+`WHEN` clauses preserve the complete DuckDB `MERGE INTO` action grammar. With the Ray runner, the merge is submitted
+as a distributed write, requires DuckDB auto-commit mode, and never falls back to local execution. Set
+`VANE_RUNNER=local-fast` to execute the same relation with native DuckDB.
 
 ### More Resources
 

@@ -181,23 +181,6 @@ class RayRunner(Runner):
         # Send PyLogicalPlan to Driver — Driver will create physical plan
         return client.run_copy_plan(logical_plan)
 
-    def run_statement_write(
-        self,
-        connection: vane.DuckDBPyConnection,
-        statement: str | vane.Statement,
-    ) -> dict[str, Any]:
-        """Execute one distributed statement write."""
-        PyLogicalPlan = require_ray_cxx_attr(
-            "PyLogicalPlan",
-            hint="Ensure the C++ ray extension is built and importable in worker processes.",
-        )
-
-        query_id = str(uuid.uuid4())
-        logical_plan = PyLogicalPlan.from_duckdb_write_statement(connection, statement, query_id)
-        session_id = str(logical_plan.session_id())
-        client = self._client_for_session(session_id)
-        return client.run_copy_plan(logical_plan)
-
     def run_datasink(self, relation: vane.DuckDBPyRelation) -> dict[str, Any]:
         """Execute one distributed Python DataSink query."""
 

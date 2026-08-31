@@ -239,7 +239,6 @@ from vane.datasink import (
 )
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
-from vane.distributed_write import execute_distributed_write
 from vane.extensions import (
     DynamicExtensionDependency,
     DynamicExtensionDescriptor,
@@ -511,7 +510,6 @@ __all__: list[str] = [
     "enable_profiling",
     "enum_type",
     "execute",
-    "execute_distributed_write",
     "executemany",
     "extract_statements",
     "fetch_arrow_table",

@@ -41,11 +41,6 @@ class Runner:
         ...
 
     @abstractmethod
-    def run_statement_write(self, connection: Any, statement: Any) -> dict[str, Any]:
-        """Execute a statement write through the selected backend."""
-        ...
-
-    @abstractmethod
     def run_datasink(self, relation: Any) -> dict[str, Any]:
         """Execute a Python DataSink terminal through the selected backend."""
         ...

@@ -776,9 +776,6 @@ class LocalRunner(Runner):
                 details = "; ".join(f"{type(error).__name__}: {error}" for error in cleanup_errors)
                 raise RuntimeError(f"failed to shut down local write resources: {details}") from cleanup_errors[0]
 
-    def run_statement_write(self, connection: Any, statement: Any) -> dict[str, Any]:
-        raise NotImplementedError("distributed statement writes require the Ray runner")
-
     def run_datasink(self, relation: Any) -> dict[str, Any]:
         """Execute one DataSink attempt with the local FTE backend."""
 

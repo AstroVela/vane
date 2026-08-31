@@ -12,8 +12,8 @@
 #include "datasource_function.hpp"
 
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
-#include "vane_python/pystatement.hpp"
 #include "vane_python/python_objects.hpp"
 #include "vane_python/arrow/arrow_array_stream.hpp"
 #include "vane_python/arrow/arrow_export_utils.hpp"
@@ -1172,19 +1172,6 @@ void register_ray_bindings(py::module_ &mod) {
 		                try {
 			                return LogicalPlanFromDuckDBRelation(std::move(relation_obj), std::move(query_id_obj),
 			                                                     DuckDBRelationPlanKind::WRITE);
-		                } catch (const py::type_error &) {
-			                throw;
-		                } catch (const py::error_already_set &) {
-			                throw;
-		                } catch (const std::exception &ex) {
-			                throw py::value_error(ex.what());
-		                }
-	                })
-	    .def_static("from_duckdb_write_statement",
-	                [](py::object connection_obj, py::object statement_obj, py::object query_id_obj) {
-		                try {
-			                return LogicalPlanFromDuckDBWriteStatement(
-			                    std::move(connection_obj), std::move(statement_obj), std::move(query_id_obj));
 		                } catch (const py::type_error &) {
 			                throw;
 		                } catch (const py::error_already_set &) {
