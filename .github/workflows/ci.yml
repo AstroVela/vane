@@ -149,7 +149,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-release-${{ hashFiles('vcpkg.json') }}
 
       - name: Install pinned native dependencies
         run: bash scripts/bootstrap_vcpkg.sh
@@ -321,6 +321,50 @@ jobs:
             dist/*.whl
             dist/extension-wheels/*.whl
           if-no-files-found: error
+
+  native-macos:
+    name: Native build and tests (macOS arm64)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VANE_NATIVE_BUILD_JOBS: "2"
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_MAX_CONCURRENCY: "2"
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: brew install ccache ninja
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-arm64-osx-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install pinned Release native dependencies
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Verify the Release-only dependency prefix
+        run: |
+          test "$(uname -m)" = arm64
+          test -f vcpkg_installed/arm64-osx-release/share/arrow/ArrowConfig.cmake
+          test ! -e vcpkg_installed/arm64-osx-release/debug
+
+      - name: Build and run DuckDB unit tests
+        run: scripts/run_native_tests.sh
 
   fast-tests:
     name: Fast tests (${{ matrix.label }})
@@ -726,6 +770,7 @@ jobs:
       - changes
       - source-package
       - native-fast-tests
+      - native-macos
       - fast-tests
       - milvus-tests
       - qdrant-tests
@@ -742,6 +787,7 @@ jobs:
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
           NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
+          NATIVE_MACOS_RESULT: ${{ needs.native-macos.result }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change classification did not succeed: $CHANGES_RESULT" >&2
@@ -763,11 +809,12 @@ jobs:
 
           if [[ "$SOURCE_PACKAGE_RESULT" != "$expected_result" ||
                 "$NATIVE_TESTS_RESULT" != "$expected_result" ||
+                "$NATIVE_MACOS_RESULT" != "$expected_result" ||
                 "$FAST_TESTS_RESULT" != "$expected_result" ||
                 "$MILVUS_TESTS_RESULT" != "$expected_result" ||
                 "$QDRANT_TESTS_RESULT" != "$expected_result" ||
                 "$AI_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, native-macos=$NATIVE_MACOS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 

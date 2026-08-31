@@ -215,6 +215,7 @@ include = [
     "/vcpkg.json",
     "/scripts/bootstrap_manylinux_bison.sh",
     "/scripts/bootstrap_vcpkg.sh",
+    "/scripts/vcpkg_triplet.sh",
     "cmake/**",
     "/scripts/check_release_artifacts.py",
     "/scripts/build_extension_wheel.py",

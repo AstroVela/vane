@@ -4,7 +4,8 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 ## Prerequisites
 
-- Linux x86-64 for the currently tested path
+- Linux x86-64 for the complete build and test path
+- macOS arm64 for the native build and distributed-test path used by CI
 - Python 3.10 through 3.14; Python 3.12 is recommended and is the primary development version
 - Git with `git subtree` support
 - A C++20 compiler, CMake 3.29+, Ninja, and ccache
@@ -21,8 +22,14 @@ bash scripts/bootstrap_vcpkg.sh
 
 The helper checks out the exact baseline from `vcpkg.json`, installs into
 `vcpkg_installed`, and verifies the committed native-dependency license bundle.
-When intentionally changing native dependencies, regenerate the bundle with
-`python scripts/sync_vcpkg_licenses.py` and review its diff.
+It selects the host platform's release-only target and host triplets by default,
+including `x64-linux-release` on Linux x86-64 and `arm64-osx-release` on Apple
+Silicon. Set `VCPKG_TARGET_TRIPLET=x64-linux` when both release and debug target
+dependency builds are needed; `VCPKG_HOST_TRIPLET` independently overrides the
+host tools triplet. When intentionally changing native dependencies, regenerate
+the bundle with `python scripts/sync_vcpkg_licenses.py` and review its diff.
+Successful port builds are cached before their temporary build and package
+trees are removed, keeping bootstrap within hosted-runner disk limits.
 
 ## Incremental package build
 

@@ -523,7 +523,8 @@ clangd:
 		short_source_id="$$(printf '%.10s' "$$duckdb_source_id")" && \
 		vcpkg_install_root="$${VCPKG_INSTALLED_DIR:-$(VANE_PROJECT_ROOT)/vcpkg_installed}" && \
 		case "$$vcpkg_install_root" in /*) ;; *) vcpkg_install_root="$(VANE_PROJECT_ROOT)/$$vcpkg_install_root";; esac && \
-		vcpkg_prefix="$$vcpkg_install_root/$${VCPKG_TARGET_TRIPLET:-x64-linux}" && \
+		vcpkg_triplet="$${VCPKG_TARGET_TRIPLET:-$$("$(VANE_PROJECT_ROOT)/scripts/vcpkg_triplet.sh")}" && \
+		vcpkg_prefix="$$vcpkg_install_root/$$vcpkg_triplet" && \
 		test -f "$$vcpkg_prefix/share/arrow/ArrowConfig.cmake" || { \
 			echo "Pinned Arrow package not found at $$vcpkg_prefix/share/arrow/ArrowConfig.cmake" >&2; \
 			echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the Vane repository root first." >&2; \
