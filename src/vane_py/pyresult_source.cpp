@@ -200,8 +200,8 @@ static bool ResultPythonRuntimeUsable() {
 	return distributed::python::ray::SafePyObjectCanDecRef();
 }
 
-//! Arrow transports FILE using its canonical STRUCT storage. Restore that one
-//! Vane-owned alias only when the relation metadata declares FILE.
+//! Arrow transports the FILE family using canonical STRUCT storage. Restore a
+//! Vane-owned FILE alias only when relation metadata declares its exact type.
 static bool IsFileStorageType(const LogicalType &type) {
 	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
 	    StructType::GetChildCount(type) != FileLogicalType::FIELD_COUNT) {

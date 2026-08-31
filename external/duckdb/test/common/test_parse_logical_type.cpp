@@ -140,6 +140,17 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 		REQUIRE_THROWS_AS(DBConfig::ParseLogicalType("DECIMAL(4)"), InternalException);
 	}
 
+	SECTION("media FILE aliases round trip") {
+		for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+			auto file_type = FileLogicalType::Create(media_type);
+			REQUIRE(FileLogicalType::IsFile(file_type));
+			REQUIRE(FileLogicalType::GetMediaType(file_type) == media_type);
+			REQUIRE(DBConfig::ParseLogicalType(file_type.ToString()) == file_type);
+			REQUIRE(DBConfig::ParseLogicalType(LogicalType::LIST(file_type).ToString()) ==
+			        LogicalType::LIST(file_type));
+		}
+	}
+
 	SECTION("tensor enum values with delimiters round trip") {
 		auto enum_type = DBConfig::ParseLogicalType("ENUM(')', '(', ']', '[', 'comma,value')");
 		child_list_t<LogicalType> struct_children;

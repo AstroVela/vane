@@ -16,6 +16,7 @@ namespace duckdb {
 
 //! A validated, extension-owned view of the five fields in a FILE value.
 struct FileReference {
+	FileMediaType media_type = FileMediaType::UNKNOWN;
 	string url;
 	string content_type;
 	int64_t position = 0;
@@ -26,7 +27,8 @@ struct FileReference {
 	bool has_checksum = false;
 
 	static FileReference FromFields(const Value &url, const Value &content_type, const Value &position,
-	                                const Value &size, const Value &checksum, const string &function_name);
+	                                const Value &size, const Value &checksum, const string &function_name,
+	                                FileMediaType media_type = FileMediaType::UNKNOWN);
 	static FileReference FromValue(const Value &value, const string &function_name);
 	static void ValidateFields(const string *url, bool has_position, int64_t position, bool has_size, int64_t size,
 	                           const string *checksum, const string &function_name);

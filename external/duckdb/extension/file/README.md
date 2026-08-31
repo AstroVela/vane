@@ -6,6 +6,22 @@ the URL at execution time through the current `ClientContext` file opener, so
 connector selection, Secret scope matching, retries, and credential refresh
 remain connector-owned.
 
+## Media specialization contract
+
+`IMAGEFILE`, `AUDIOFILE`, and `VIDEOFILE` are schema-level specializations of
+the same five-field FILE storage. They add no fields, credentials, or decoded
+content. `image_file`, `audio_file`, and `video_file` accept a URL, a generic
+FILE, or an already matching specialization. Their default path is pure and
+performs no I/O. Passing `TRUE` as the second argument performs bounded
+magic-byte inspection through the existing resolver and rejects content that
+does not match the declared media family.
+
+Generic metadata, reader, identity, UDF, and AI consumers accept the complete
+FILE family. FILE-valued functions such as `file_enrich` preserve the input
+specialization. Direct equality and inequality require the exact same alias;
+the explicit location and content identity functions can compare different
+family members. Media decoding is intentionally outside this extension layer.
+
 ## Metadata contract
 
 `file_stat(file)` returns this connector-neutral struct:

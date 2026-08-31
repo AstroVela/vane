@@ -80,6 +80,19 @@ if TYPE_CHECKING:
 else:
     BaseModel = Any
 
+_PROMPT_FILE_TYPES = frozenset(
+    {
+        "FILE",
+        "FILE[]",
+        "IMAGEFILE",
+        "IMAGEFILE[]",
+        "AUDIOFILE",
+        "AUDIOFILE[]",
+        "VIDEOFILE",
+        "VIDEOFILE[]",
+    }
+)
+
 
 def _resolve_provider(provider: str | Provider) -> Provider:
     """Resolve a provider argument to a Provider instance."""
@@ -1856,7 +1869,7 @@ def _normalize_prompt_messages(messages: Any) -> tuple[list[Expression], bool]:
 
 def _prompt_relation_types(rel: Relation, messages: list[Expression]) -> list[str]:
     types = [str(value).upper() for value in rel.select(*messages).types]
-    allowed = {"VARCHAR", "BLOB", "BLOB[]", "FILE", "FILE[]"}
+    allowed = {"VARCHAR", "BLOB", "BLOB[]"} | _PROMPT_FILE_TYPES
     for index, value in enumerate(types):
         if value not in allowed:
             raise TypeError(
@@ -2013,7 +2026,7 @@ def _prompt_relation(
         )
 
     input_names = [f"message_{index}" for index in range(len(message_expressions))]
-    has_file_inputs = any(value in {"FILE", "FILE[]"} for value in message_types)
+    has_file_inputs = any(value in _PROMPT_FILE_TYPES for value in message_types)
     packed_input_column = _PROMPT_PACKED_INPUT_COLUMN if has_file_inputs else None
     if has_file_inputs:
         udf_inputs = {

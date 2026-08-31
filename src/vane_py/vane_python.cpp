@@ -241,8 +241,18 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    "Create a fixed-shape tensor type object from 'type' and 'shape'", py::arg("type").none(false),
 	    py::arg("shape").none(false), py::kw_only(), py::arg("connection") = py::none());
 	m.def(
-	    "file_type", []() { return make_shared_ptr<DuckDBPyType>(FileLogicalType::Create()); },
-	    "Create the canonical FILE logical type");
+	    "file_type",
+	    [](const py::object &media_type) {
+		    auto native_media_type = FileMediaType::UNKNOWN;
+		    if (!media_type.is_none()) {
+			    if (!py::isinstance<PythonFileMediaType>(media_type)) {
+				    throw py::type_error("media_type must be vane.MediaType");
+			    }
+			    native_media_type = py::cast<PythonFileMediaType>(media_type).Type();
+		    }
+		    return make_shared_ptr<DuckDBPyType>(FileLogicalType::Create(native_media_type));
+	    },
+	    "Create a logical type in the FILE family", py::arg("media_type") = py::none());
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {

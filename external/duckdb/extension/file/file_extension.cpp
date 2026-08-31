@@ -13,7 +13,9 @@
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	loader.RegisterType(FileLogicalType::TYPE_NAME, FileLogicalType::Create());
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
+	}
 
 	for (auto &function : FileFunctions::GetFunctions()) {
 		loader.RegisterFunction(std::move(function));
@@ -25,9 +27,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(std::move(function));
 	}
 
-	auto file_key_extract = GetKeyExtractFunction();
-	file_key_extract.arguments[0] = FileLogicalType::Create();
-	loader.RegisterFunction(std::move(file_key_extract));
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_key_extract = GetKeyExtractFunction();
+		file_key_extract.arguments[0] = FileLogicalType::Create(media_type);
+		loader.RegisterFunction(std::move(file_key_extract));
+	}
 }
 
 void FileExtension::Load(ExtensionLoader &loader) {

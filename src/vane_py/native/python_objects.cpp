@@ -485,7 +485,7 @@ py::object PythonObject::FromValue(const Value &val, const LogicalType &type,
 		return py::none();
 	}
 	if (FileLogicalType::IsFile(type)) {
-		return py::cast(PythonFile::FromValue(val));
+		return PythonFile::FromValue(val);
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:

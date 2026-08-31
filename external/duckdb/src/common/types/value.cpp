@@ -1641,12 +1641,29 @@ string Value::ToString() const {
 	if (IsNull()) {
 		return "NULL";
 	}
-	return StringValue::Get(DefaultCastAs(LogicalType::VARCHAR));
+	return StringValue::Get(DefaultCastAsForFormatting(LogicalType::VARCHAR));
 }
 
 string Value::ToSQLString() const {
 	if (IsNull()) {
 		return ToString();
+	}
+	if (FileLogicalType::IsFile(type_)) {
+		auto &children = StructValue::GetChildren(*this);
+		string file_expression = "file(";
+		for (idx_t index = 0; index < children.size(); index++) {
+			if (index > 0) {
+				file_expression += ", ";
+			}
+			file_expression += children[index].ToSQLString();
+		}
+		file_expression += ")";
+
+		auto media_type = FileLogicalType::GetMediaType(type_);
+		if (media_type == FileMediaType::UNKNOWN) {
+			return file_expression;
+		}
+		return string(FileLogicalType::GetConstructorName(media_type)) + "(" + file_expression + ")";
 	}
 	switch (type_.id()) {
 	case LogicalTypeId::UUID:
@@ -2068,6 +2085,13 @@ Value Value::CastAs(ClientContext &context, const LogicalType &target_type, bool
 Value Value::DefaultCastAs(const LogicalType &target_type, bool strict) const {
 	CastFunctionSet set;
 	GetCastFunctionInput get_input;
+	return CastAs(set, get_input, target_type, strict);
+}
+
+Value Value::DefaultCastAsForFormatting(const LogicalType &target_type, bool strict) const {
+	CastFunctionSet set;
+	GetCastFunctionInput get_input;
+	get_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
 	return CastAs(set, get_input, target_type, strict);
 }
 

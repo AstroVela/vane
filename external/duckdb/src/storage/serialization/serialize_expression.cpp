@@ -123,13 +123,16 @@ void BoundCastExpression::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<unique_ptr<Expression>>(200, "child", child);
 	serializer.WriteProperty<LogicalType>(201, "return_type", return_type);
 	serializer.WritePropertyWithDefault<bool>(202, "try_cast", try_cast);
+	serializer.WritePropertyWithDefault<bool>(203, "file_internal_formatting", file_internal_formatting);
 }
 
 unique_ptr<Expression> BoundCastExpression::Deserialize(Deserializer &deserializer) {
 	auto child = deserializer.ReadPropertyWithDefault<unique_ptr<Expression>>(200, "child");
 	auto return_type = deserializer.ReadProperty<LogicalType>(201, "return_type");
-	auto result = duckdb::unique_ptr<BoundCastExpression>(new BoundCastExpression(deserializer.Get<ClientContext &>(), std::move(child), std::move(return_type)));
-	deserializer.ReadPropertyWithDefault<bool>(202, "try_cast", result->try_cast);
+	auto try_cast = deserializer.ReadPropertyWithDefault<bool>(202, "try_cast");
+	auto file_internal_formatting = deserializer.ReadPropertyWithDefault<bool>(203, "file_internal_formatting");
+	auto result = duckdb::unique_ptr<BoundCastExpression>(new BoundCastExpression(deserializer.Get<ClientContext &>(), std::move(child), std::move(return_type), file_internal_formatting));
+	result->try_cast = try_cast;
 	return std::move(result);
 }
 

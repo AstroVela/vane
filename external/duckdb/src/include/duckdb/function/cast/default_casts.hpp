@@ -19,6 +19,16 @@ namespace duckdb {
 class CastFunctionSet;
 struct FunctionLocalState;
 
+enum class FileCastMode : uint8_t {
+	STRICT,
+	//! Value rendering needs FILE values to use the ordinary nested-to-VARCHAR implementation without exposing that
+	//! cast to SQL.
+	INTERNAL_FORMATTING,
+	//! Validated Python UDF output arrives from Arrow as the canonical unaliased STRUCT and must recover its declared
+	//! FILE-family alias.
+	INTERNAL_ALIAS_RESTORATION,
+};
+
 //! Extra data that can be attached to a bind function of a cast, and is available during binding
 struct BindCastInfo {
 	DUCKDB_API virtual ~BindCastInfo();
@@ -127,6 +137,7 @@ struct BindCastInput {
 	optional_ptr<BindCastInfo> info;
 	optional_ptr<ClientContext> context;
 	optional_idx query_location;
+	FileCastMode file_cast_mode = FileCastMode::STRICT;
 
 public:
 	DUCKDB_API BoundCastInfo GetCastFunction(const LogicalType &source, const LogicalType &target);

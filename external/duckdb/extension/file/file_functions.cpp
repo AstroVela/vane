@@ -9,10 +9,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "file_functions.hpp"
+#include "file_resolver.hpp"
 #include "file_value.hpp"
 
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/planner/expression.hpp"
 
 namespace duckdb {
 
@@ -74,6 +79,91 @@ static void FileConstructorFunction(DataChunk &args, ExpressionState &, Vector &
 	result.Verify(args.size());
 }
 
+static bool MimeTypeMatches(FileMediaType media_type, const string &mime_type) {
+	switch (media_type) {
+	case FileMediaType::IMAGE:
+		return StringUtil::CIStartsWith(mime_type, "image/");
+	case FileMediaType::AUDIO:
+		return StringUtil::CIStartsWith(mime_type, "audio/");
+	case FileMediaType::VIDEO:
+		return StringUtil::CIStartsWith(mime_type, "video/");
+	case FileMediaType::UNKNOWN:
+	default:
+		throw InternalException("Cannot verify an unknown FILE media type");
+	}
+}
+
+static void VerifyMediaFile(ClientContext &context, FileReference &file, const string &function_name) {
+	if (file.has_content_type && !MimeTypeMatches(file.media_type, file.content_type)) {
+		throw InvalidInputException("%s() expected %s content but content_type is '%s'", function_name,
+		                            FileLogicalType::GetTypeName(file.media_type), file.content_type);
+	}
+
+	string detected_type;
+	auto resolved = ResolvedFile::Open(context, file);
+	if (!resolved->GuessMimeType(detected_type) || !MimeTypeMatches(file.media_type, detected_type)) {
+		throw InvalidInputException("%s() could not verify %s content at '%s'", function_name,
+		                            FileLogicalType::GetTypeName(file.media_type), file.url);
+	}
+	if (!file.has_content_type) {
+		file.has_content_type = true;
+		file.content_type = std::move(detected_type);
+	}
+}
+
+template <FileMediaType MEDIA_TYPE>
+static unique_ptr<FunctionData> BindMediaFileConstructor(ClientContext &, ScalarFunction &bound_function,
+                                                         vector<unique_ptr<Expression>> &arguments) {
+	auto input_type = arguments[0]->return_type;
+	if (input_type.id() == LogicalTypeId::UNKNOWN) {
+		// The URL form is the only interpretation available for an unresolved
+		// parameter. Preserve exact FILE-family types when the input type is
+		// already known, but retain normal VARCHAR inference for PREPARE.
+		input_type = LogicalType::VARCHAR;
+	}
+	auto valid_input = (input_type.id() == LogicalTypeId::VARCHAR && !input_type.IsJSONType()) ||
+	                   input_type.id() == LogicalTypeId::STRING_LITERAL || input_type.id() == LogicalTypeId::SQLNULL;
+	if (FileLogicalType::IsFile(input_type)) {
+		auto input_media_type = FileLogicalType::GetMediaType(input_type);
+		valid_input = input_media_type == FileMediaType::UNKNOWN || input_media_type == MEDIA_TYPE;
+	}
+	if (!valid_input) {
+		throw BinderException("%s() requires VARCHAR, FILE, or %s, not %s",
+		                      FileLogicalType::GetConstructorName(MEDIA_TYPE), FileLogicalType::GetTypeName(MEDIA_TYPE),
+		                      input_type.ToString());
+	}
+	bound_function.arguments[0] = input_type.id() == LogicalTypeId::STRING_LITERAL ? LogicalType::VARCHAR : input_type;
+	return nullptr;
+}
+
+template <FileMediaType MEDIA_TYPE>
+static void MediaFileConstructorFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto function_name = FileLogicalType::GetConstructorName(MEDIA_TYPE);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto input = args.data[0].GetValue(row);
+		auto verify = args.ColumnCount() == 2 ? args.data[1].GetValue(row) : Value::BOOLEAN(false);
+		if (input.IsNull() || verify.IsNull()) {
+			result.SetValue(row, Value(result.GetType()));
+			continue;
+		}
+
+		FileReference file;
+		if (input.type().id() == LogicalTypeId::VARCHAR) {
+			file.url = input.GetValue<string>();
+			file.media_type = MEDIA_TYPE;
+			file.Validate(function_name);
+		} else {
+			file = FileReference::FromValue(input, function_name);
+			file.media_type = MEDIA_TYPE;
+		}
+		if (verify.GetValue<bool>()) {
+			VerifyMediaFile(state.GetContext(), file, function_name);
+		}
+		result.SetValue(row, file.ToValue());
+	}
+}
+
 template <bool NEGATE>
 static void FileComparisonFunction(DataChunk &args, ExpressionState &, Vector &result) {
 	D_ASSERT(args.ColumnCount() == 2);
@@ -126,9 +216,26 @@ static ScalarFunction GetFileConstructor() {
 	return function;
 }
 
+template <FileMediaType MEDIA_TYPE>
+static ScalarFunction GetMediaFileConstructor(bool with_verify) {
+	vector<LogicalType> arguments {LogicalType::ANY};
+	if (with_verify) {
+		arguments.push_back(LogicalType::BOOLEAN);
+	}
+	ScalarFunction function(FileLogicalType::GetConstructorName(MEDIA_TYPE), std::move(arguments),
+	                        FileLogicalType::Create(MEDIA_TYPE), MediaFileConstructorFunction<MEDIA_TYPE>,
+	                        BindMediaFileConstructor<MEDIA_TYPE>);
+	function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	function.SetFallible();
+	if (with_verify) {
+		function.SetStability(FunctionStability::VOLATILE);
+	}
+	return function;
+}
+
 template <bool NEGATE>
-static ScalarFunction GetFileComparison() {
-	auto file_type = FileLogicalType::Create();
+static ScalarFunction GetFileComparison(FileMediaType media_type) {
+	auto file_type = FileLogicalType::Create(media_type);
 	auto name = NEGATE ? FileLogicalType::NOT_EQUAL_FUNCTION_NAME : FileLogicalType::EQUAL_FUNCTION_NAME;
 	return ScalarFunction(name, {file_type, file_type}, LogicalType::BOOLEAN, FileComparisonFunction<NEGATE>);
 }
@@ -138,8 +245,16 @@ static ScalarFunction GetFileComparison() {
 vector<ScalarFunction> FileFunctions::GetFunctions() {
 	vector<ScalarFunction> result;
 	result.push_back(GetFileConstructor());
-	result.push_back(GetFileComparison<false>());
-	result.push_back(GetFileComparison<true>());
+	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(false));
+	result.push_back(GetMediaFileConstructor<FileMediaType::IMAGE>(true));
+	result.push_back(GetMediaFileConstructor<FileMediaType::AUDIO>(false));
+	result.push_back(GetMediaFileConstructor<FileMediaType::AUDIO>(true));
+	result.push_back(GetMediaFileConstructor<FileMediaType::VIDEO>(false));
+	result.push_back(GetMediaFileConstructor<FileMediaType::VIDEO>(true));
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		result.push_back(GetFileComparison<false>(media_type));
+		result.push_back(GetFileComparison<true>(media_type));
+	}
 	return result;
 }
 

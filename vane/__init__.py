@@ -28,6 +28,7 @@ from vane._expression_udf import attach_function, cls, detach_function, func
 from vane._expressions import col, lit, sql_expr
 from vane._file import (
     VaneFileReader,
+    audio_file,
     file,
     file_content_id,
     file_enrich,
@@ -41,10 +42,12 @@ from vane._file import (
     file_stat,
     from_files,
     guess_mime_type,
+    image_file,
     list_files,
     open_file,
     to_file,
     try_to_file,
+    video_file,
 )
 
 if _typing.TYPE_CHECKING:
@@ -56,6 +59,7 @@ if _typing.TYPE_CHECKING:
 else:
     _Runner = _typing.Any
 from vane._native import (
+    AudioFile,
     BinderException,
     CaseExpression,
     CatalogException,
@@ -80,6 +84,7 @@ from vane._native import (
     File,
     FunctionExpression,
     HTTPException,
+    ImageFile,
     IntegrityError,
     InternalError,
     InternalException,
@@ -88,6 +93,7 @@ from vane._native import (
     InvalidTypeException,
     IOException,
     LambdaExpression,
+    MediaType,
     NotImplementedException,
     NotSupportedError,
     OperationalError,
@@ -107,6 +113,7 @@ from vane._native import (
     SyntaxException,
     TransactionException,
     TypeMismatchException,
+    VideoFile,
     Warning,
     __formatted_python_version__,
     __git_revision__,
@@ -348,6 +355,7 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "AudioFile",
     "BINARY",
     "BinaryValue",
     "BinderException",
@@ -398,6 +406,7 @@ __all__: list[str] = [
     "HTTPException",
     "HugeIntegerValue",
     "IOException",
+    "ImageFile",
     "IntegerValue",
     "IntegrityError",
     "InternalError",
@@ -412,6 +421,7 @@ __all__: list[str] = [
     "LocalExtensionArtifact",
     "LocalExtensionProvider",
     "MapValue",
+    "MediaType",
     "MilvusSink",
     "QdrantSink",
     "NUMBER",
@@ -457,6 +467,7 @@ __all__: list[str] = [
     "UnsignedLongValue",
     "UnsignedShortValue",
     "Value",
+    "VideoFile",
     "VaneFileReader",
     "Warning",
     "WriteContext",
@@ -476,6 +487,7 @@ __all__: list[str] = [
     "alias",
     "apilevel",
     "append",
+    "audio_file",
     "array_type",
     "arrow",
     "begin",
@@ -535,6 +547,7 @@ __all__: list[str] = [
     "get_runner",
     "get_table_names",
     "guess_mime_type",
+    "image_file",
     "install_extension",
     "interrupt",
     "limit",
@@ -583,6 +596,7 @@ __all__: list[str] = [
     "torch",
     "type",
     "try_to_file",
+    "video_file",
     "union_type",
     "unregister",
     "unregister_filesystem",

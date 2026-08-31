@@ -479,15 +479,16 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 	}
 
 	if (object_type == PythonObjectType::File) {
+		auto value = py::cast<PythonFile>(ele).ToValue();
 		for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
 			auto &member_type = UnionType::GetMemberType(target_type, index);
-			if (!FileLogicalType::IsFile(member_type)) {
+			if (member_type != value.type()) {
 				continue;
 			}
-			auto value = py::cast<PythonFile>(ele).ToValue();
 			return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(index), std::move(value));
 		}
-		throw InvalidInputException("vane.File value has no FILE member in target type %s", target_type);
+		throw InvalidInputException("vane.File value of type %s has no exact member in target type %s", value.type(),
+		                            target_type);
 	}
 
 	auto composite = object_type == PythonObjectType::List || object_type == PythonObjectType::Tuple ||
@@ -662,6 +663,9 @@ struct PythonValueConversion {
 		}
 		if (is_array) {
 			result = Value::ARRAY(element_type, std::move(values));
+			if (TensorType::IsTensor(target_type)) {
+				result.Reinterpret(target_type);
+			}
 		} else {
 			result = Value::LIST(element_type, std::move(values));
 		}
@@ -692,10 +696,11 @@ struct PythonValueConversion {
 		}
 		case PythonObjectType::File: {
 			auto converted = py::cast<PythonFile>(ele).ToValue();
-			if (target_type.id() == LogicalTypeId::UNKNOWN || FileLogicalType::IsFile(target_type)) {
+			if (target_type.id() == LogicalTypeId::UNKNOWN || target_type == converted.type()) {
 				return converted;
 			}
-			throw InvalidInputException("vane.File values can only be converted to FILE, not %s", target_type);
+			throw InvalidInputException("vane.File value of type %s cannot be converted to %s", converted.type(),
+			                            target_type);
 		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
@@ -723,7 +728,7 @@ struct PythonValueConversion {
 				return converted;
 			}
 			if (FileLogicalType::IsFile(target_type) || FileLogicalType::IsFile(converted.type())) {
-				throw InvalidInputException("vane.File values can only be converted to FILE");
+				throw InvalidInputException("FILE-family values require an exact matching logical type");
 			}
 			return CastToTarget(std::move(converted), target_type);
 		}

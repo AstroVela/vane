@@ -106,9 +106,14 @@
         "id": 202,
         "name": "try_cast",
         "type": "bool"
+      },
+      {
+        "id": 203,
+        "name": "file_internal_formatting",
+        "type": "bool"
       }
     ],
-    "constructor": ["$ClientContext", "child", "return_type"]
+    "constructor": ["$ClientContext", "child", "return_type", "file_internal_formatting"]
   },
   {
     "class": "BoundColumnRefExpression",

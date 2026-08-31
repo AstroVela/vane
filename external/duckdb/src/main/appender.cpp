@@ -7,6 +7,7 @@
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
 #include "duckdb/common/operator/string_cast.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
@@ -309,6 +310,12 @@ void BaseAppender::Append(Value value) { // NOLINT: template stuff
 	AppendValue(value);
 }
 
+static void ValidateAppenderFileValue(const Value &value) {
+	if (TypeVisitor::Contains(value.type(), FileLogicalType::IsFile)) {
+		FileLogicalType::ValidateValue(value, "Appender");
+	}
+}
+
 void duckdb::BaseAppender::Append(DataChunk &target, const Value &value, idx_t col, idx_t row) {
 	if (col >= target.ColumnCount()) {
 		throw InvalidInputException("Too many appends for chunk!");
@@ -317,12 +324,14 @@ void duckdb::BaseAppender::Append(DataChunk &target, const Value &value, idx_t c
 		throw InvalidInputException("Too many rows for chunk!");
 	}
 
+	ValidateAppenderFileValue(value);
 	if (value.type() == target.GetTypes()[col]) {
 		target.SetValue(col, row, value);
 	} else {
 		Value new_value;
 		string error_msg;
 		if (value.DefaultTryCastAs(target.GetTypes()[col], new_value, &error_msg)) {
+			ValidateAppenderFileValue(new_value);
 			target.SetValue(col, row, new_value);
 		} else {
 			throw InvalidInputException("type mismatch in Append, expected %s, got %s for column %d",
@@ -341,8 +350,20 @@ void BaseAppender::Append(std::nullptr_t value) {
 }
 
 void BaseAppender::AppendValue(const Value &value) {
+	ValidateAppenderFileValue(value);
 	chunk.SetValue(column, chunk.size(), value);
 	column++;
+}
+
+static void ValidateAppenderFileChunk(const DataChunk &chunk, const vector<LogicalType> &types) {
+	for (idx_t column = 0; column < types.size(); column++) {
+		if (!TypeVisitor::Contains(types[column], FileLogicalType::IsFile)) {
+			continue;
+		}
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			FileLogicalType::ValidateValue(chunk.GetValue(column, row), "Appender");
+		}
+	}
 }
 
 void BaseAppender::AppendDataChunk(DataChunk &chunk_p) {
@@ -351,6 +372,7 @@ void BaseAppender::AppendDataChunk(DataChunk &chunk_p) {
 
 	// Early-out, if types match.
 	if (chunk_types == appender_types) {
+		ValidateAppenderFileChunk(chunk_p, appender_types);
 		collection->Append(chunk_p);
 		if (ShouldFlush()) {
 			Flush();
@@ -384,6 +406,7 @@ void BaseAppender::AppendDataChunk(DataChunk &chunk_p) {
 		}
 	}
 
+	ValidateAppenderFileChunk(cast_chunk, appender_types);
 	collection->Append(cast_chunk);
 	if (ShouldFlush()) {
 		Flush();

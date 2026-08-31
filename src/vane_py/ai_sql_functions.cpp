@@ -784,9 +784,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 	}
 	if (has_media_input) {
 		auto media_type = arguments[1]->return_type;
-		if (media_type.id() == LogicalTypeId::SQLNULL && bound_function.arguments.size() > 1) {
-			media_type = bound_function.arguments[1];
-		}
 		if (media_type == LogicalType::BLOB) {
 			prompt_input_kind = PromptInputKind::BLOB;
 		} else if (media_type == LogicalType::LIST(LogicalType::BLOB)) {
@@ -843,12 +840,6 @@ static unique_ptr<FunctionData> AISQLBind(ClientContext &context, ScalarFunction
 		}
 	}
 	if (prompt_input_kind == PromptInputKind::FILE || prompt_input_kind == PromptInputKind::FILE_LIST) {
-		if (arguments[1]->return_type.id() == LogicalTypeId::SQLNULL) {
-			auto file_type = FileLogicalType::Create();
-			auto target_type =
-			    prompt_input_kind == PromptInputKind::FILE_LIST ? LogicalType::LIST(file_type) : file_type;
-			arguments[1] = BoundCastExpression::AddCastToType(context, std::move(arguments[1]), target_type);
-		}
 		vector<unique_ptr<Expression>> messages;
 		messages.reserve(2);
 		messages.push_back(std::move(arguments[0]));
@@ -1057,13 +1048,15 @@ ScalarFunctionSet AISQLFunction::GetPromptImplementationFunctions() {
 	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(LogicalType::BLOB), LogicalType::JSON(),
 	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                    LogicalType::VARCHAR, LogicalType::ANY});
-	auto file_type = FileLogicalType::Create();
-	add_implementation({LogicalType::VARCHAR, file_type, LogicalType::JSON(), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                    LogicalType::ANY});
-	add_implementation({LogicalType::VARCHAR, LogicalType::LIST(file_type), LogicalType::JSON(), LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
-	                    LogicalType::ANY});
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_type = FileLogicalType::Create(media_type);
+		add_implementation({LogicalType::VARCHAR, file_type, LogicalType::JSON(), LogicalType::VARCHAR,
+		                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::VARCHAR,
+		                    LogicalType::ANY});
+		add_implementation({LogicalType::VARCHAR, LogicalType::LIST(file_type), LogicalType::JSON(),
+		                    LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
+		                    LogicalType::VARCHAR, LogicalType::ANY});
+	}
 	return set;
 }
 
@@ -1123,10 +1116,12 @@ unique_ptr<CreateMacroInfo> AISQLFunction::GetPromptMacro() {
 	info->macros.push_back(make_function(&blob_type, "image"));
 	auto blob_list_type = LogicalType::LIST(LogicalType::BLOB);
 	info->macros.push_back(make_function(&blob_list_type, "images"));
-	auto file_type = FileLogicalType::Create();
-	info->macros.push_back(make_function(&file_type, "file"));
-	auto file_list_type = LogicalType::LIST(file_type);
-	info->macros.push_back(make_function(&file_list_type, "files"));
+	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
+		auto file_type = FileLogicalType::Create(media_type);
+		info->macros.push_back(make_function(&file_type, "file"));
+		auto file_list_type = LogicalType::LIST(file_type);
+		info->macros.push_back(make_function(&file_list_type, "files"));
+	}
 	return info;
 }
 

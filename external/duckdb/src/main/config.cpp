@@ -595,8 +595,9 @@ LogicalType DBConfig::ParseLogicalType(const string &type) {
 	if (upper_type == LogicalType::JSON_TYPE_NAME) {
 		return LogicalType::JSON();
 	}
-	if (upper_type == FileLogicalType::TYPE_NAME) {
-		return FileLogicalType::Create();
+	FileMediaType file_media_type;
+	if (FileLogicalType::TryParseTypeName(upper_type, file_media_type)) {
+		return FileLogicalType::Create(file_media_type);
 	}
 	if (StringUtil::StartsWith(upper_type, "DECIMAL(") && StringUtil::EndsWith(upper_type, ")")) {
 		auto decimal_args_str = type.substr(8, type.size() - 9);

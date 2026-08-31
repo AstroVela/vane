@@ -6,6 +6,32 @@
 using namespace duckdb;
 using namespace std;
 
+TEST_CASE("Appender validates FILE leaves before transparent sibling casts", "[api][file]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("LOAD file"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE file_values(value STRUCT(document IMAGEFILE, missing INTEGER))"));
+
+	auto file_type = FileLogicalType::Create(FileMediaType::IMAGE);
+	duckdb::vector<Value> file_fields;
+	file_fields.emplace_back(LogicalType::VARCHAR);
+	file_fields.emplace_back(LogicalType::VARCHAR);
+	file_fields.emplace_back(LogicalType::BIGINT);
+	file_fields.emplace_back(LogicalType::BIGINT);
+	file_fields.emplace_back(LogicalType::VARCHAR);
+	auto malformed_file = Value::STRUCT(file_type, std::move(file_fields));
+
+	auto source_type = LogicalType::STRUCT({{"document", file_type}, {"missing", LogicalType::SQLNULL}});
+	duckdb::vector<Value> source_fields;
+	source_fields.push_back(std::move(malformed_file));
+	source_fields.emplace_back();
+	auto source_value = Value::STRUCT(source_type, std::move(source_fields));
+
+	Appender appender(con, "file_values");
+	appender.BeginRow();
+	REQUIRE_THROWS_WITH(appender.Append(std::move(source_value)), Catch::Matchers::Contains("url cannot be NULL"));
+}
+
 template <class SRC>
 void TestAppendingSingleDecimalValue(SRC value, Value expected_result, uint8_t width, uint8_t scale) {
 	auto db = make_uniq<DuckDB>(nullptr);

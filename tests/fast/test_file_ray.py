@@ -179,6 +179,62 @@ def test_default_ray_executes_scalar_and_batch_file_udfs(monkeypatch):
 
 
 @pytest.mark.usefixtures("ray_local")
+def test_default_ray_preserves_media_file_types_across_udf_and_result_boundaries(monkeypatch):
+    import pyarrow as pa
+
+    monkeypatch.setenv("VANE_RUNNER", "ray")
+    vane.teardown_runner()
+    vane.set_runner_ray(noop_if_initialized=True)
+
+    @vane.func(return_dtype=vane.file_type(vane.MediaType.image()))
+    def image_identity(value):
+        assert type(value) is vane.ImageFile
+        return value
+
+    @vane.func.batch(return_dtype=vane.file_type(vane.MediaType.audio()), batch_size=2)
+    def audio_identity(values):
+        assert isinstance(values, (pa.Array, pa.ChunkedArray))
+        return values
+
+    @vane.func(return_dtype=vane.list_type(vane.file_type(vane.MediaType.video())))
+    def video_identity(values):
+        assert type(values[0]) is vane.VideoFile
+        assert values[1] is None
+        return values
+
+    connection = vane.connect()
+    try:
+        source = connection.sql(
+            """
+            SELECT
+                i,
+                image_file('memory://image/' || i::VARCHAR) AS image,
+                audio_file('memory://audio/' || i::VARCHAR) AS audio,
+                [video_file('memory://video/' || i::VARCHAR), NULL::VIDEOFILE] AS videos
+            FROM range(3) AS t(i)
+            """
+        )
+        image_result = source.select(vane.col("i"), image_identity(vane.col("image")).alias("image"))
+        audio_result = source.select(vane.col("i"), audio_identity(vane.col("audio")).alias("audio"))
+        video_result = source.select(vane.col("i"), video_identity(vane.col("videos")).alias("videos"))
+        image_types = [str(dtype) for dtype in image_result.types]
+        audio_types = [str(dtype) for dtype in audio_result.types]
+        video_types = [str(dtype) for dtype in video_result.types]
+        image_rows = image_result.fetchall()
+        audio_rows = audio_result.fetchall()
+        video_rows = video_result.fetchall()
+    finally:
+        connection.close()
+
+    assert image_types == ["BIGINT", "IMAGEFILE"]
+    assert audio_types == ["BIGINT", "AUDIOFILE"]
+    assert video_types == ["BIGINT", "VIDEOFILE[]"]
+    assert sorted(image_rows) == [(index, vane.ImageFile(f"memory://image/{index}")) for index in range(3)]
+    assert sorted(audio_rows) == [(index, vane.AudioFile(f"memory://audio/{index}")) for index in range(3)]
+    assert sorted(video_rows) == [(index, [vane.VideoFile(f"memory://video/{index}"), None]) for index in range(3)]
+
+
+@pytest.mark.usefixtures("ray_local")
 def test_default_ray_ai_prompt_reads_file_view_on_worker(monkeypatch, tmp_path):
     path = tmp_path / "ray-ai-media.bin"
     path.write_bytes(b"prefix-media-suffix")
@@ -193,8 +249,9 @@ def test_default_ray_ai_prompt_reads_file_view_on_worker(monkeypatch, tmp_path):
         source = connection.sql(f"""
             SELECT
                 'describe'::VARCHAR AS prompt,
-                file('{path_sql}', 'audio/wav', 7, 5, NULL) AS media
+                audio_file(file('{path_sql}', 'audio/wav', 7, 5, NULL)) AS media
         """)
+        assert str(source.types[1]) == "AUDIOFILE"
         response = (
             vane.ai.prompt(
                 source,

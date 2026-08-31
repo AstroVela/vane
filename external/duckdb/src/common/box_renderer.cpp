@@ -4,6 +4,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/original/std/sstream.hpp"
 #include "utf8proc_wrapper.hpp"
 
@@ -643,6 +644,13 @@ void RenderDataCollection::InitializeChunk(DataChunk &chunk) {
 	chunk.Initialize(context, render_values->Types());
 }
 
+static void CastRenderVector(ClientContext &context, Vector &source, Vector &target, idx_t count) {
+	auto &cast_functions = CastFunctionSet::Get(context);
+	GetCastFunctionInput cast_input(context);
+	cast_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
+	VectorOperations::TryCast(cast_functions, cast_input, source, target, count, nullptr);
+}
+
 void BoxRendererImplementation::FetchTopCollection(RenderDataCollection &top_collection,
                                                    const ColumnDataCollection &result, idx_t chunk_idx, idx_t row_idx,
                                                    idx_t top_rows, idx_t bottom_rows) {
@@ -673,7 +681,7 @@ void BoxRendererImplementation::FetchTopCollection(RenderDataCollection &top_col
 			auto &source_vector = fetch_result.data[c];
 			auto &target_vector = top_collection.Values(insert_result, c);
 			auto &render_lengths = top_collection.RenderLengths(insert_result, c);
-			VectorOperations::Cast(context, source_vector, target_vector, insert_count);
+			CastRenderVector(context, source_vector, target_vector, insert_count);
 			ConvertRenderVector(target_vector, render_lengths, insert_count, source_vector.GetType(),
 			                    null_render_length);
 		}
@@ -791,7 +799,7 @@ void BoxRendererImplementation::FetchBottomCollection(RenderDataCollection &bott
 			auto &source_vector = chunk.data[c];
 			auto &target_vector = bottom_collection.Values(insert_result, c);
 			auto &render_lengths = bottom_collection.RenderLengths(insert_result, c);
-			VectorOperations::Cast(context, source_vector, target_vector, insert_count);
+			CastRenderVector(context, source_vector, target_vector, insert_count);
 			ConvertRenderVector(target_vector, render_lengths, insert_count, source_vector.GetType(),
 			                    null_render_length);
 		}

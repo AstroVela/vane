@@ -1683,7 +1683,60 @@ LogicalType LogicalType::STRUCT(child_list_t<LogicalType> children) {
 	return LogicalType(LogicalTypeId::STRUCT, std::move(info));
 }
 
-LogicalType FileLogicalType::Create() {
+const FileMediaType FileLogicalType::MEDIA_TYPES[] = {FileMediaType::UNKNOWN, FileMediaType::IMAGE,
+                                                      FileMediaType::AUDIO, FileMediaType::VIDEO};
+
+const char *FileLogicalType::GetTypeName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return TYPE_NAME;
+	case FileMediaType::IMAGE:
+		return IMAGE_TYPE_NAME;
+	case FileMediaType::AUDIO:
+		return AUDIO_TYPE_NAME;
+	case FileMediaType::VIDEO:
+		return VIDEO_TYPE_NAME;
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+const char *FileLogicalType::GetConstructorName(FileMediaType media_type) {
+	switch (media_type) {
+	case FileMediaType::UNKNOWN:
+		return "file";
+	case FileMediaType::IMAGE:
+		return "image_file";
+	case FileMediaType::AUDIO:
+		return "audio_file";
+	case FileMediaType::VIDEO:
+		return "video_file";
+	default:
+		throw InternalException("Unknown FILE media type");
+	}
+}
+
+bool FileLogicalType::TryParseTypeName(const string &type_name, FileMediaType &media_type) {
+	if (StringUtil::CIEquals(type_name, TYPE_NAME)) {
+		media_type = FileMediaType::UNKNOWN;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, IMAGE_TYPE_NAME)) {
+		media_type = FileMediaType::IMAGE;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, AUDIO_TYPE_NAME)) {
+		media_type = FileMediaType::AUDIO;
+		return true;
+	}
+	if (StringUtil::CIEquals(type_name, VIDEO_TYPE_NAME)) {
+		media_type = FileMediaType::VIDEO;
+		return true;
+	}
+	return false;
+}
+
+LogicalType FileLogicalType::Create(FileMediaType media_type) {
 	child_list_t<LogicalType> children;
 	children.reserve(FIELD_COUNT);
 	children.emplace_back("url", LogicalType::VARCHAR);
@@ -1693,14 +1746,15 @@ LogicalType FileLogicalType::Create() {
 	children.emplace_back("checksum", LogicalType::VARCHAR);
 
 	auto result = LogicalType::STRUCT(std::move(children));
-	result.SetAlias(TYPE_NAME);
+	result.SetAlias(GetTypeName(media_type));
 	return result;
 }
 
 bool FileLogicalType::IsFile(const LogicalType &type) {
+	FileMediaType media_type;
 	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
 	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
-	    type.GetAlias() != TYPE_NAME) {
+	    !TryParseTypeName(type.GetAlias(), media_type) || type.GetAlias() != GetTypeName(media_type)) {
 		return false;
 	}
 	auto &children = StructType::GetChildTypes(type);
@@ -1712,6 +1766,91 @@ bool FileLogicalType::IsFile(const LogicalType &type) {
 	       children[POSITION].first == "position" && children[POSITION].second == LogicalType::BIGINT &&
 	       children[SIZE].first == "size" && children[SIZE].second == LogicalType::BIGINT &&
 	       children[CHECKSUM].first == "checksum" && children[CHECKSUM].second == LogicalType::VARCHAR;
+}
+
+FileMediaType FileLogicalType::GetMediaType(const LogicalType &type) {
+	FileMediaType media_type;
+	if (!IsFile(type) || !TryParseTypeName(type.GetAlias(), media_type)) {
+		throw InternalException("Expected a canonical FILE-family logical type, got %s", type.ToString());
+	}
+	return media_type;
+}
+
+void FileLogicalType::ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+                                     int64_t size, const string *checksum, const string &function_name) {
+	if (!url) {
+		throw InvalidInputException("%s() url cannot be NULL", function_name);
+	}
+	if (url->find('\0') != string::npos) {
+		throw InvalidInputException("%s() url cannot contain NUL bytes", function_name);
+	}
+	if (has_position != has_size) {
+		throw InvalidInputException("%s() position and size must either both be NULL or both be non-NULL",
+		                            function_name);
+	}
+	if (has_position && (position < 0 || size < 0)) {
+		throw InvalidInputException("%s() position and size must be non-negative", function_name);
+	}
+	if (has_position && position > NumericLimits<int64_t>::Maximum() - size) {
+		throw InvalidInputException("%s() byte range exceeds BIGINT", function_name);
+	}
+	if (checksum) {
+		auto separator = checksum->find(':');
+		if (checksum->find('\0') != string::npos || separator == string::npos || separator == 0 ||
+		    separator + 1 == checksum->size() || checksum->find(':', separator + 1) != string::npos) {
+			throw InvalidInputException("%s() checksum must have the form <algorithm>:<digest>", function_name);
+		}
+	}
+}
+
+void FileLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsFile)) {
+		return;
+	}
+	if (IsFile(value.type())) {
+		auto &children = StructValue::GetChildren(value);
+		if (children.size() != FIELD_COUNT) {
+			throw InvalidInputException("%s() received a malformed FILE value", function_name);
+		}
+		string url;
+		const string *url_ptr = nullptr;
+		if (!children[URL].IsNull()) {
+			url = children[URL].GetValue<string>();
+			url_ptr = &url;
+		}
+		auto has_position = !children[POSITION].IsNull();
+		auto has_size = !children[SIZE].IsNull();
+		auto position = has_position ? children[POSITION].GetValue<int64_t>() : 0;
+		auto size = has_size ? children[SIZE].GetValue<int64_t>() : 0;
+		string checksum;
+		const string *checksum_ptr = nullptr;
+		if (!children[CHECKSUM].IsNull()) {
+			checksum = children[CHECKSUM].GetValue<string>();
+			checksum_ptr = &checksum;
+		}
+		ValidateFields(url_ptr, has_position, position, has_size, size, checksum_ptr, function_name);
+		return;
+	}
+
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	default:
+		throw InternalException("FILE value is nested in unsupported physical type %s", value.type());
+	}
 }
 
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT

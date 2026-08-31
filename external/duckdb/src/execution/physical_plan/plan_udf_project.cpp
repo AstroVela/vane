@@ -261,7 +261,7 @@ static bool UDFTypeContainsFile(const LogicalType &type) {
 
 static LogicalType UDFInputContractType(const LogicalType &type) {
 	if (FileLogicalType::IsFile(type)) {
-		return FileLogicalType::Create();
+		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}
 	if (type.id() == LogicalTypeId::BIT) {
 		return LogicalType::BIT;

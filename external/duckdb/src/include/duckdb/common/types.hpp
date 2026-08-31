@@ -514,11 +514,18 @@ struct StructType {
 	DUCKDB_API static bool IsUnnamed(const LogicalType &type);
 };
 
+enum class FileMediaType : uint8_t { UNKNOWN = 0, IMAGE = 1, AUDIO = 2, VIDEO = 3 };
+
 struct FileLogicalType {
-	//! FILE is intentionally a named STRUCT representation. Generic nested operations retain STRUCT semantics.
+	//! The FILE family intentionally uses named STRUCT representations. Generic nested operations retain STRUCT
+	//! semantics while explicit FILE boundaries preserve the alias.
 	static constexpr const char *TYPE_NAME = "FILE";
+	static constexpr const char *IMAGE_TYPE_NAME = "IMAGEFILE";
+	static constexpr const char *AUDIO_TYPE_NAME = "AUDIOFILE";
+	static constexpr const char *VIDEO_TYPE_NAME = "VIDEOFILE";
 	static constexpr const char *EQUAL_FUNCTION_NAME = "__vane_file_equal";
 	static constexpr const char *NOT_EQUAL_FUNCTION_NAME = "__vane_file_not_equal";
+	DUCKDB_API static const FileMediaType MEDIA_TYPES[4];
 
 	enum FieldIndex : idx_t {
 		URL = 0,
@@ -529,8 +536,15 @@ struct FileLogicalType {
 		FIELD_COUNT = 5,
 	};
 
-	DUCKDB_API static LogicalType Create();
+	DUCKDB_API static LogicalType Create(FileMediaType media_type = FileMediaType::UNKNOWN);
 	DUCKDB_API static bool IsFile(const LogicalType &type);
+	DUCKDB_API static FileMediaType GetMediaType(const LogicalType &type);
+	DUCKDB_API static void ValidateFields(const string *url, bool has_position, int64_t position, bool has_size,
+	                                     int64_t size, const string *checksum, const string &function_name);
+	DUCKDB_API static void ValidateValue(const Value &value, const string &function_name);
+	DUCKDB_API static bool TryParseTypeName(const string &type_name, FileMediaType &media_type);
+	DUCKDB_API static const char *GetTypeName(FileMediaType media_type);
+	DUCKDB_API static const char *GetConstructorName(FileMediaType media_type);
 };
 
 struct MapType {

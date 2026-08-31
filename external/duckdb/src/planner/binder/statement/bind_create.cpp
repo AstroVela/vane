@@ -563,7 +563,10 @@ BoundStatement Binder::Bind(CreateStatement &stmt) {
 				// push a projection casting to varchar
 				vector<unique_ptr<Expression>> select_list;
 				auto ref = make_uniq<BoundColumnRefExpression>(sql_types[0], query->GetColumnBindings()[0]);
-				auto cast_expr = BoundCastExpression::AddCastToType(context, std::move(ref), LogicalType::VARCHAR);
+				auto cast_expr =
+				    create_type_info.query_internal_file_formatting
+				        ? BoundCastExpression::AddCastToTypeForFormatting(context, std::move(ref), LogicalType::VARCHAR)
+				        : BoundCastExpression::AddCastToType(context, std::move(ref), LogicalType::VARCHAR);
 				select_list.push_back(std::move(cast_expr));
 				auto proj = make_uniq<LogicalProjection>(GenerateTableIndex(), std::move(select_list));
 				proj->AddChild(std::move(query));

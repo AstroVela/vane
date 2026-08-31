@@ -10,27 +10,31 @@
 
 namespace duckdb {
 
-static BoundCastInfo BindCastFunction(ClientContext &context, const LogicalType &source, const LogicalType &target) {
+static BoundCastInfo BindCastFunction(ClientContext &context, const LogicalType &source, const LogicalType &target,
+                                      bool file_internal_formatting) {
 	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
 	GetCastFunctionInput input(context);
+	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING : FileCastMode::STRICT;
 	return cast_functions.GetCastFunction(source, target, input);
 }
 
 BoundCastExpression::BoundCastExpression(unique_ptr<Expression> child_p, LogicalType target_type_p,
-                                         BoundCastInfo bound_cast_p, bool try_cast_p)
+                                         BoundCastInfo bound_cast_p, bool try_cast_p, bool file_internal_formatting_p)
     : Expression(ExpressionType::OPERATOR_CAST, ExpressionClass::BOUND_CAST, std::move(target_type_p)),
-      child(std::move(child_p)), try_cast(try_cast_p), bound_cast(std::move(bound_cast_p)) {
+      child(std::move(child_p)), try_cast(try_cast_p), file_internal_formatting(file_internal_formatting_p),
+      bound_cast(std::move(bound_cast_p)) {
 }
 
 BoundCastExpression::BoundCastExpression(ClientContext &context, unique_ptr<Expression> child_p,
-                                         LogicalType target_type_p)
+                                         LogicalType target_type_p, bool file_internal_formatting_p)
     : Expression(ExpressionType::OPERATOR_CAST, ExpressionClass::BOUND_CAST, std::move(target_type_p)),
-      child(std::move(child_p)), try_cast(false),
-      bound_cast(BindCastFunction(context, child->return_type, return_type)) {
+      child(std::move(child_p)), try_cast(false), file_internal_formatting(file_internal_formatting_p),
+      bound_cast(BindCastFunction(context, child->return_type, return_type, file_internal_formatting)) {
 }
 
 static unique_ptr<Expression> AddCastExpressionInternal(unique_ptr<Expression> expr, const LogicalType &target_type,
-                                                        BoundCastInfo bound_cast, bool try_cast) {
+                                                        BoundCastInfo bound_cast, bool try_cast,
+                                                        bool file_internal_formatting) {
 	if (ExpressionBinder::GetExpressionReturnType(*expr) == target_type) {
 		return expr;
 	}
@@ -42,7 +46,8 @@ static unique_ptr<Expression> AddCastExpressionInternal(unique_ptr<Expression> e
 			return expr;
 		}
 	}
-	auto result = make_uniq<BoundCastExpression>(std::move(expr), target_type, std::move(bound_cast), try_cast);
+	auto result = make_uniq<BoundCastExpression>(std::move(expr), target_type, std::move(bound_cast), try_cast,
+	                                             file_internal_formatting);
 	result->SetQueryLocation(result->child->GetQueryLocation());
 	return std::move(result);
 }
@@ -90,7 +95,8 @@ static unique_ptr<Expression> AddCastToTypeInternal(unique_ptr<Expression> expr,
 	}
 
 	auto cast_function = cast_functions.GetCastFunction(expr->return_type, target_type, get_input);
-	return AddCastExpressionInternal(std::move(expr), target_type, std::move(cast_function), try_cast);
+	return AddCastExpressionInternal(std::move(expr), target_type, std::move(cast_function), try_cast,
+	                                 get_input.file_cast_mode == FileCastMode::INTERNAL_FORMATTING);
 }
 
 unique_ptr<Expression> BoundCastExpression::AddDefaultCastToType(unique_ptr<Expression> expr,
@@ -106,6 +112,16 @@ unique_ptr<Expression> BoundCastExpression::AddCastToType(ClientContext &context
 	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
 	GetCastFunctionInput get_input(context);
 	get_input.query_location = expr->GetQueryLocation();
+	return AddCastToTypeInternal(std::move(expr), target_type, cast_functions, get_input, try_cast);
+}
+
+unique_ptr<Expression> BoundCastExpression::AddCastToTypeForFormatting(ClientContext &context,
+                                                                       unique_ptr<Expression> expr,
+                                                                       const LogicalType &target_type, bool try_cast) {
+	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
+	GetCastFunctionInput get_input(context);
+	get_input.query_location = expr->GetQueryLocation();
+	get_input.file_cast_mode = FileCastMode::INTERNAL_FORMATTING;
 	return AddCastToTypeInternal(std::move(expr), target_type, cast_functions, get_input, try_cast);
 }
 
@@ -217,11 +233,15 @@ bool BoundCastExpression::Equals(const BaseExpression &other_p) const {
 	if (try_cast != other.try_cast) {
 		return false;
 	}
+	if (file_internal_formatting != other.file_internal_formatting) {
+		return false;
+	}
 	return true;
 }
 
 unique_ptr<Expression> BoundCastExpression::Copy() const {
-	auto copy = make_uniq<BoundCastExpression>(child->Copy(), return_type, bound_cast.Copy(), try_cast);
+	auto copy = make_uniq<BoundCastExpression>(child->Copy(), return_type, bound_cast.Copy(), try_cast,
+	                                           file_internal_formatting);
 	copy->CopyProperties(*this);
 	return std::move(copy);
 }

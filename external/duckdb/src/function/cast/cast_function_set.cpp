@@ -1,8 +1,12 @@
 #include "duckdb/function/cast/cast_function_set.hpp"
 
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/main/settings.hpp"
 
+#include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/common/pair.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/types/type_map.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/planner/collation_binding.hpp"
@@ -18,6 +22,7 @@ BindCastInput::BindCastInput(CastFunctionSet &function_set, optional_ptr<BindCas
 BoundCastInfo BindCastInput::GetCastFunction(const LogicalType &source, const LogicalType &target) {
 	GetCastFunctionInput input(context);
 	input.query_location = query_location;
+	input.file_cast_mode = file_cast_mode;
 	return function_set.GetCastFunction(source, target, input);
 }
 
@@ -49,10 +54,233 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 	return DBConfig::GetConfig(db).GetCollationBinding();
 }
 
+using file_child_compatibility_t = bool (*)(const LogicalType &, const LogicalType &);
+
+static bool StructFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                         file_child_compatibility_t child_compatible) {
+	if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo()) {
+		return false;
+	}
+	auto &source_children = StructType::GetChildTypes(source);
+	auto &target_children = StructType::GetChildTypes(target);
+	auto is_unnamed = source_children.empty() || target_children.empty() || StructType::IsUnnamed(source) ||
+	                  StructType::IsUnnamed(target);
+	if (is_unnamed) {
+		if (source_children.size() != target_children.size()) {
+			return false;
+		}
+		for (idx_t index = 0; index < target_children.size(); index++) {
+			if (!child_compatible(source_children[index].second, target_children[index].second)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	InsertionOrderPreservingMap<idx_t> target_children_map;
+	for (idx_t index = 0; index < target_children.size(); index++) {
+		target_children_map[target_children[index].first] = index;
+	}
+
+	bool has_any_match = false;
+	for (auto &source_child : source_children) {
+		auto target_child = target_children_map.find(source_child.first);
+		if (target_child == target_children_map.end()) {
+			if (TypeVisitor::Contains(source_child.second, FileLogicalType::IsFile)) {
+				return false;
+			}
+			continue;
+		}
+		has_any_match = true;
+		if (!child_compatible(source_child.second, target_children[target_child->second].second)) {
+			return false;
+		}
+		target_children_map.erase(target_child);
+	}
+
+	for (auto &target_child : target_children_map) {
+		if (TypeVisitor::Contains(target_children[target_child.second].second, FileLogicalType::IsFile)) {
+			return false;
+		}
+	}
+	return has_any_match;
+}
+
+static bool UnionFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                        file_child_compatibility_t child_compatible) {
+	if (source.id() != LogicalTypeId::UNION || !source.AuxInfo()) {
+		return false;
+	}
+	vector<bool> matched_targets(UnionType::GetMemberCount(target), false);
+	for (idx_t source_index = 0; source_index < UnionType::GetMemberCount(source); source_index++) {
+		auto &source_name = UnionType::GetMemberName(source, source_index);
+		bool found = false;
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			if (!StringUtil::CIEquals(source_name, UnionType::GetMemberName(target, target_index))) {
+				continue;
+			}
+			if (!child_compatible(UnionType::GetMemberType(source, source_index),
+			                      UnionType::GetMemberType(target, target_index))) {
+				return false;
+			}
+			matched_targets[target_index] = true;
+			found = true;
+			break;
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	for (idx_t target_index = 0; target_index < matched_targets.size(); target_index++) {
+		if (!matched_targets[target_index] &&
+		    TypeVisitor::Contains(UnionType::GetMemberType(target, target_index), FileLogicalType::IsFile)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool FileAliasRestorationCompatible(const LogicalType &source, const LogicalType &target) {
+	if (FileLogicalType::IsFile(target)) {
+		auto physical_file_type = target.DeepCopy();
+		physical_file_type.SetAlias(string());
+		return source == physical_file_type;
+	}
+	if (!TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
+		// Non-FILE siblings retain the ordinary DuckDB cast rules. This is
+		// required for validated UDF outputs such as STRUCT(FILE, UUID).
+		return true;
+	}
+
+	switch (target.id()) {
+	case LogicalTypeId::STRUCT:
+		return StructFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
+	case LogicalTypeId::UNION:
+		return UnionFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
+	case LogicalTypeId::LIST:
+		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+		}
+		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ListType::GetChildType(target));
+		}
+		return false;
+	case LogicalTypeId::ARRAY:
+		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+		}
+		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
+			return FileAliasRestorationCompatible(ListType::GetChildType(source), ArrayType::GetChildType(target));
+		}
+		return false;
+	case LogicalTypeId::MAP:
+		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
+		       FileAliasRestorationCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       FileAliasRestorationCompatible(MapType::ValueType(source), MapType::ValueType(target));
+	default:
+		return false;
+	}
+}
+
+static bool FileLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
+	if (source.id() == LogicalTypeId::SQLNULL) {
+		// Untyped NULL leaves carry no value that could bypass FILE
+		// validation. This also permits empty and NULL-only literals such as
+		// []::FILE[] and [NULL]::FILE[].
+		return true;
+	}
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	if (!source_contains_file && !target_contains_file) {
+		// Non-FILE siblings retain the ordinary DuckDB cast rules.
+		return true;
+	}
+	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION && target.AuxInfo()) {
+		// DuckDB promotes a non-UNION value to the best matching UNION member.
+		// Permit that native path only when at least one member preserves every
+		// FILE leaf; the selected member is checked again by its child cast.
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			if (FileLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) {
+		return FileLogicalType::IsFile(source) && FileLogicalType::IsFile(target) && source == target;
+	}
+	if (!target_contains_file) {
+		return false;
+	}
+
+	switch (target.id()) {
+	case LogicalTypeId::STRUCT:
+		return StructFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
+	case LogicalTypeId::UNION:
+		return UnionFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
+	case LogicalTypeId::LIST:
+		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
+		       FileLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+	case LogicalTypeId::ARRAY:
+		return source.id() == LogicalTypeId::ARRAY && source.AuxInfo() &&
+		       ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
+		       FileLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+	case LogicalTypeId::MAP:
+		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
+		       FileLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       FileLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
+	default:
+		return false;
+	}
+}
+
+static bool FileImplicitCastCompatible(const LogicalType &source, const LogicalType &target) {
+	if (source.id() == LogicalTypeId::UNKNOWN || source.id() == LogicalTypeId::SQLNULL ||
+	    target.id() == LogicalTypeId::ANY || target.id() == LogicalTypeId::TEMPLATE ||
+	    target.id() == LogicalTypeId::UNKNOWN) {
+		return true;
+	}
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	if (!source_contains_file && !target_contains_file) {
+		return true;
+	}
+	if (!target.IsComplete()) {
+		// Generic function signatures use incomplete composite types such as
+		// UNION without child metadata. Their bind callbacks replace the
+		// placeholder with the concrete input type before any cast is created.
+		return true;
+	}
+	return FileLeavesPreservedCompatible(source, target);
+}
+
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
                                                GetCastFunctionInput &get_input) {
 	if (source == target) {
 		return DefaultCasts::NopCast;
+	}
+	// FILE aliases are semantic types, not presentation aliases. Letting the
+	// ordinary STRUCT cast path handle them would silently retag values and
+	// bypass their constructors and field validation.
+	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
+	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
+	auto internal_file_cast_allowed = [&]() {
+		switch (get_input.file_cast_mode) {
+		case FileCastMode::INTERNAL_FORMATTING:
+			return source_contains_file && target == LogicalType::VARCHAR;
+		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
+			return target_contains_file && !source_contains_file && FileAliasRestorationCompatible(source, target);
+		case FileCastMode::STRICT:
+			return target_contains_file && FileLeavesPreservedCompatible(source, target);
+		default:
+			return false;
+		}
+	}();
+	if ((source_contains_file || target_contains_file) && source.id() != LogicalTypeId::SQLNULL &&
+	    target.id() != LogicalTypeId::SQLNULL && !internal_file_cast_allowed) {
+		throw BinderException(get_input.query_location,
+		                      "Cannot cast from %s to %s: FILE-family casts require an exact logical type match",
+		                      source.ToString(), target.ToString());
 	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards
@@ -60,6 +288,7 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 		auto &bind_function = bind_functions[i - 1];
 		BindCastInput input(*this, bind_function.info.get(), get_input.context);
 		input.query_location = get_input.query_location;
+		input.file_cast_mode = get_input.file_cast_mode;
 		auto result = bind_function.function(input, source, target);
 		if (result.function) {
 			// found a cast function! return it
@@ -169,6 +398,24 @@ private:
 
 int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, const LogicalType &source,
                                           const LogicalType &target) {
+	if (!FileImplicitCastCompatible(source, target)) {
+		return -1;
+	}
+	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION &&
+	    source.id() != LogicalTypeId::UNKNOWN && source.id() != LogicalTypeId::SQLNULL &&
+	    TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
+		// CastRules cannot account for FILE aliases while recursively scoring
+		// UNION members. Score each member through this guarded function so
+		// invalid FILE retagging is excluded before DuckDB selects a candidate.
+		int64_t best_cost = -1;
+		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
+			auto member_cost = ImplicitCastCost(context, source, UnionType::GetMemberType(target, target_index));
+			if (member_cost >= 0 && (best_cost < 0 || member_cost < best_cost)) {
+				best_cost = member_cost;
+			}
+		}
+		return best_cost;
+	}
 	// check if a cast has been registered
 	if (map_info) {
 		auto entry = map_info->GetEntry(source, target);
