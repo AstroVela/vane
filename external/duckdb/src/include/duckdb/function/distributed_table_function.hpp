@@ -33,7 +33,7 @@ static constexpr const char *DISTRIBUTED_SINGLETON_SOURCE_SPLIT_CODEC = "vane.si
 //! Whether a distributed table-function contract requires a FunctionData
 //! object. Some table-in/out functions carry their complete portable state in
 //! scalar parameters and legitimately bind to nullptr.
-enum class TableFunctionDistributedBindDataMode : uint8_t { REQUIRED = 0, OPTIONAL = 1 };
+enum class TableFunctionDistributedBindDataMode : uint8_t { BIND_DATA_REQUIRED = 0, BIND_DATA_OPTIONAL = 1 };
 
 //! Stable catalog identity for one table-function overload. This uses the
 //! declared argument and varargs types rather than bind-time concrete types.
@@ -119,7 +119,7 @@ typedef void (*table_function_apply_distributed_scan_splits_t)(optional_ptr<Func
 struct TableFunctionDistributedScanCallbacks {
 	idx_t protocol_version = 0;
 	DistributedPayloadCodec split_codec;
-	TableFunctionDistributedBindDataMode bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
+	TableFunctionDistributedBindDataMode bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED;
 	table_function_plan_distributed_scan_splits_t plan_splits = nullptr;
 	table_function_create_distributed_worker_bind_t create_worker_bind = nullptr;
 	table_function_apply_distributed_scan_splits_t apply_splits = nullptr;
@@ -139,6 +139,6 @@ private:
 //! partitionable. The scalar parameters remain part of PhysicalTableScan serde;
 //! the singleton split controls exactly-once scheduler assignment.
 DUCKDB_API TableFunctionDistributedScanCallbacks MakeDistributedSingletonSourceCallbacks(
-    TableFunctionDistributedBindDataMode bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED);
+    TableFunctionDistributedBindDataMode bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED);
 
 } // namespace duckdb

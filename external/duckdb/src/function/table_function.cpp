@@ -181,8 +181,8 @@ void TableFunctionDistributedScanCallbacks::ValidateDefinition(const string &fun
 		    "Distributed scan protocol version for table function '%s' must be greater than zero", function_name);
 	}
 	switch (bind_data_mode) {
-	case TableFunctionDistributedBindDataMode::REQUIRED:
-	case TableFunctionDistributedBindDataMode::OPTIONAL:
+	case TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED:
+	case TableFunctionDistributedBindDataMode::BIND_DATA_OPTIONAL:
 		break;
 	default:
 		throw InvalidInputException("Distributed scan callbacks for table function '%s' have an invalid bind-data mode",
