@@ -524,7 +524,7 @@ class DuckDBPyRelation:
     def merge_into(
         self,
         target_table: str,
-        condition: _ExpressionLike | typing.Sequence[str],
+        condition: Expression | str | typing.Sequence[str],
         when_clauses: typing.Sequence[str],
         *,
         target_alias: str = "target",

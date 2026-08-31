@@ -353,7 +353,7 @@ def test_merge_relation_logical_plan_round_trip_does_not_execute_locally(tmp_pat
         verification_connection.close()
 
 
-def test_merge_relation_rejects_native_provider_before_backend_mutation(tmp_path, monkeypatch):
+def test_merge_relation_rejects_ordinary_duckdb_target_before_backend_mutation(tmp_path, monkeypatch):
     from vane.runners.fte.backends.native import NativeFteWorkerManagerBackend
 
     monkeypatch.setenv("VANE_RUNNER", "ray")

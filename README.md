@@ -279,8 +279,9 @@ source.merge_into(
 
 The condition accepts a SQL string, an `Expression`, or a sequence of column names for `USING (...)`. Ordered SQL
 `WHEN` clauses preserve the complete DuckDB `MERGE INTO` action grammar. With the Ray runner, the merge is submitted
-as a distributed write, requires DuckDB auto-commit mode, and never falls back to local execution. Set
-`VANE_RUNNER=local-fast` to execute the same relation with native DuckDB.
+as a distributed write and the target catalog must plan it as a registered distributed extension write. An ordinary
+DuckDB table is rejected instead of executing locally. Ray merges require DuckDB auto-commit mode and never fall back
+to local execution. Set `VANE_RUNNER=local-fast` to execute the same relation with native DuckDB.
 
 ### More Resources
 
