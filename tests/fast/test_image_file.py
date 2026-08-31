@@ -3,6 +3,7 @@
 
 import importlib
 import io
+import threading
 
 import pytest
 from PIL import Image
@@ -74,6 +75,42 @@ def test_image_file_metadata_facades(duckdb_cursor, tmp_path):
     expected = {"width": 3, "height": 2, "format": "PNG", "mode": "RGB"}
     assert function_result == expected
     assert method_result == expected
+
+
+def test_image_file_accepts_raw_jpeg2000_mime(duckdb_cursor, tmp_path):
+    buffer = io.BytesIO()
+    image = Image.new("L", (3, 2), 100)
+    try:
+        image.save(buffer, format="JPEG2000", no_jp2=True)
+    except OSError as error:
+        pytest.skip(f"Pillow build does not support JPEG 2000: {error}")
+    finally:
+        image.close()
+    payload = buffer.getvalue()
+    assert payload.startswith(b"\xff\x4f\xff\x51")
+    path = tmp_path / "image.j2c"
+    path.write_bytes(payload)
+    value = vane.ImageFile(str(path), "image/j2c")
+
+    assert value.metadata(connection=duckdb_cursor).format == "JPEG2000"
+    assert duckdb_cursor.execute("SELECT image_file_metadata($1)", [value]).fetchone()[0]["mode"] == "L"
+    decoded = value.decode(connection=duckdb_cursor)
+    assert decoded.size == (3, 2)
+    decoded.close()
+    with pytest.raises(vane.ImageFileFormatError, match="detected MIME type"):
+        vane.ImageFile(str(path), "image/jp2").metadata(connection=duckdb_cursor)
+
+
+def test_image_file_accepts_precise_and_family_portable_anymap_mimes(duckdb_cursor, tmp_path):
+    path = tmp_path / "image.pgm"
+    path.write_bytes(b"P5\n2 1\n255\n\x00\xff")
+
+    precise = vane.ImageFile(str(path), "image/x-portable-graymap")
+    family = vane.ImageFile(str(path), "image/x-portable-anymap")
+    assert precise.metadata(connection=duckdb_cursor).mode == "L"
+    assert duckdb_cursor.execute("SELECT image_file_metadata($1)", [family]).fetchone()[0]["format"] == "PPM"
+    with pytest.raises(vane.ImageFileFormatError, match="detected MIME type"):
+        vane.ImageFile(str(path), "image/x-portable-pixmap").metadata(connection=duckdb_cursor)
 
 
 def test_image_file_preserves_high_bit_depth_mode(duckdb_cursor, tmp_path):
@@ -159,7 +196,7 @@ def test_image_file_metadata_limits_are_enforced(duckdb_cursor, tmp_path):
         duckdb_cursor.execute("SELECT image_file_metadata($1, 1024, 11)", [value]).fetchone()
 
 
-def test_image_file_per_call_pixel_limit_overrides_and_restores_pillow_global_limit(
+def test_image_file_per_call_pixel_limit_does_not_change_pillow_global_limit(
     duckdb_cursor,
     tmp_path,
     monkeypatch,
@@ -173,8 +210,8 @@ def test_image_file_per_call_pixel_limit_overrides_and_restores_pillow_global_li
     assert Image.MAX_IMAGE_PIXELS == 1
     assert duckdb_cursor.execute("SELECT image_file_metadata($1, 1024, 12)", [value]).fetchone()[0]["height"] == 3
     assert Image.MAX_IMAGE_PIXELS == 1
-    # TIFF checks the global limit again while allocating its decode tile, so
-    # this also verifies that the per-call limit covers the complete load.
+    # TIFF repeats Pillow's bomb check while allocating its decode tile, so
+    # this also verifies that the per-call context covers the complete load.
     decode_path = tmp_path / "image.tiff"
     decode_path.write_bytes(_encoded_image("TIFF", size=(4, 3)))
     decoded = vane.ImageFile(str(decode_path), "image/tiff").decode(
@@ -184,6 +221,48 @@ def test_image_file_per_call_pixel_limit_overrides_and_restores_pillow_global_li
     assert decoded.size == (4, 3)
     decoded.close()
     assert Image.MAX_IMAGE_PIXELS == 1
+
+
+def test_image_file_pixel_limit_is_isolated_from_unrelated_pillow_threads(monkeypatch):
+    payload = _encoded_image("PNG", size=(4, 3))
+    entered = threading.Event()
+    release = threading.Event()
+    worker_sizes: list[tuple[int, int]] = []
+    worker_errors: list[BaseException] = []
+    original_check = Image._decompression_bomb_check
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+
+    class BlockingBytesIO(io.BytesIO):
+        def read(self, size=-1, /):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release the ImageFile reader")
+            return super().read(size)
+
+    def open_with_vane_limit():
+        try:
+            with _image_file._open_image_with_limit(Image, BlockingBytesIO(payload), max_pixels=12) as image:
+                image.load()
+                worker_sizes.append(image.size)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    worker = threading.Thread(target=open_with_vane_limit)
+    worker.start()
+    try:
+        assert entered.wait(timeout=5)
+        with pytest.raises(Image.DecompressionBombError):
+            with Image.open(io.BytesIO(payload)) as unrelated:
+                unrelated.load()
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert worker_sizes == [(4, 3)]
+    assert Image.MAX_IMAGE_PIXELS == 1
+    assert Image._decompression_bomb_check is original_check
 
 
 def test_image_file_decode_limits_are_enforced(duckdb_cursor, tmp_path):

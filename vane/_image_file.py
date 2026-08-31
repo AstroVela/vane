@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import functools
 import importlib
 import io
 import threading
-import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,13 +33,17 @@ _MAX_UBIGINT = (1 << 64) - 1
 
 _EXPLICIT_IMAGE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "CMYK", "YCbCr", "I", "F"})
 _MIME_ALIASES = {
+    "image/j2k": "image/j2c",
+    "image/jpc": "image/j2c",
     "image/jpg": "image/jpeg",
     "image/pjpeg": "image/jpeg",
+    "image/x-portable-greymap": "image/x-portable-graymap",
     "image/x-png": "image/png",
     "image/x-icon": "image/vnd.microsoft.icon",
 }
 _GENERIC_MIME_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", "image/*"})
-_PILLOW_LIMIT_LOCK = threading.RLock()
+_PILLOW_PIXEL_LIMIT = contextvars.ContextVar[int | None]("vane_image_file_max_pixels", default=None)
+_PILLOW_HOOK_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +66,17 @@ class ImageFileFormatError(ImageFileError):
 
 class ImageFileLimitError(ImageFileError):
     """An ImageFile operation exceeded an explicit resource limit."""
+
+
+@dataclass(slots=True)
+class _PillowLimitHook:
+    image_module: Any
+    original: Callable[[tuple[int, int]], None]
+    wrapper: Callable[[tuple[int, int]], None]
+    users: int = 0
+
+
+_PILLOW_HOOK: _PillowLimitHook | None = None
 
 
 class _ImageReaderError(Exception):
@@ -133,28 +149,62 @@ def _load_pillow() -> tuple[Any, type[Exception]]:
     return image_module, unidentified_error
 
 
+def _pillow_limit_wrapper(
+    original: Callable[[tuple[int, int]], None],
+) -> Callable[[tuple[int, int]], None]:
+    @functools.wraps(original)
+    def check(size: tuple[int, int]) -> None:
+        max_pixels = _PILLOW_PIXEL_LIMIT.get()
+        if max_pixels is None:
+            original(size)
+            return
+        pixels = max(1, int(size[0])) * max(1, int(size[1]))
+        if pixels > max_pixels:
+            raise ImageFileLimitError(f"image contains {pixels} pixels, exceeding max_pixels={max_pixels}")
+
+    return check
+
+
+@contextlib.contextmanager
+def _pillow_pixel_limit(image_module: Any, max_pixels: int) -> Iterator[None]:
+    """Scope Pillow's process-global check through a context-local limit."""
+    global _PILLOW_HOOK
+
+    token = _PILLOW_PIXEL_LIMIT.set(max_pixels)
+    try:
+        with _PILLOW_HOOK_LOCK:
+            hook = _PILLOW_HOOK
+            if hook is None:
+                original = image_module._decompression_bomb_check
+                wrapper = _pillow_limit_wrapper(original)
+                hook = _PillowLimitHook(image_module, original, wrapper)
+                image_module._decompression_bomb_check = wrapper
+                _PILLOW_HOOK = hook
+            elif hook.image_module is not image_module or image_module._decompression_bomb_check is not hook.wrapper:
+                raise RuntimeError("Pillow decompression check changed during an ImageFile operation")
+            hook.users += 1
+        try:
+            yield
+        finally:
+            with _PILLOW_HOOK_LOCK:
+                hook.users -= 1
+                if hook.users == 0:
+                    if hook.image_module._decompression_bomb_check is hook.wrapper:
+                        hook.image_module._decompression_bomb_check = hook.original
+                    if _PILLOW_HOOK is hook:
+                        _PILLOW_HOOK = None
+    finally:
+        _PILLOW_PIXEL_LIMIT.reset(token)
+
+
 @contextlib.contextmanager
 def _open_image_with_limit(image_module: Any, stream: Any, *, max_pixels: int) -> Iterator[Any]:
-    # Pillow consults a process-global limit while opening and, for some
-    # formats, again while loading pixels. Serialize the complete operation,
-    # loosen the global cap only as far as this call requires, and restore it
-    # afterwards. Vane's per-call validation remains the authoritative limit.
-    with _PILLOW_LIMIT_LOCK:
-        previous_limit = image_module.MAX_IMAGE_PIXELS
-        pillow_limit = previous_limit
-        # Pillow raises only above twice MAX_IMAGE_PIXELS; the warning between
-        # the two thresholds is redundant with Vane's exact validation below.
-        minimum_pillow_limit = (max_pixels + 1) // 2
-        if previous_limit is not None and previous_limit < minimum_pillow_limit:
-            pillow_limit = minimum_pillow_limit
-        image_module.MAX_IMAGE_PIXELS = pillow_limit
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", image_module.DecompressionBombWarning)
-                with image_module.open(stream) as image:
-                    yield image
-        finally:
-            image_module.MAX_IMAGE_PIXELS = previous_limit
+    # Pillow has no per-open pixel limit and some plugins repeat its private
+    # check while loading. The scoped hook delegates unchanged outside this
+    # context, so unrelated threads retain their own global Pillow policy.
+    with _pillow_pixel_limit(image_module, max_pixels):
+        with image_module.open(stream) as image:
+            yield image
 
 
 def _positive_limit(value: object, *, name: str, maximum: int | None = None) -> int:
@@ -178,7 +228,11 @@ def _canonical_mime_type(value: str) -> str:
     return _MIME_ALIASES.get(normalized, normalized)
 
 
-def _validate_content_type(content_type: str | None, detected_mime_type: str | None) -> None:
+def _validate_content_type(
+    content_type: str | None,
+    detected_mime_type: str | None,
+    compatible_mime_types: frozenset[str],
+) -> None:
     if content_type is None:
         return
     declared = _canonical_mime_type(content_type)
@@ -189,10 +243,30 @@ def _validate_content_type(content_type: str | None, detected_mime_type: str | N
     if detected_mime_type is None:
         return
     detected = _canonical_mime_type(detected_mime_type)
-    if declared != detected:
+    if declared != detected and declared not in compatible_mime_types:
         raise ImageFileFormatError(
             f"IMAGEFILE content_type {content_type!r} contradicts detected MIME type {detected_mime_type!r}"
         )
+
+
+def _detected_image_mime_types(image: Any) -> tuple[str | None, frozenset[str]]:
+    detected_mime_type = image.get_format_mimetype()
+    compatible_mime_types: set[str] = set()
+
+    if image.format == "JPEG2000" and getattr(image, "codec", None) == "j2k":
+        # Pillow uses its JPEG2000-wide image/jp2 registry entry for raw J2K
+        # codestreams, whose registered media type is image/j2c.
+        detected_mime_type = "image/j2c"
+    elif image.format == "PPM":
+        # Pillow reports the precise PBM/PGM/PPM subtype when available. The
+        # portable-anymap type remains a compatible family-level declaration.
+        compatible_mime_types.add("image/x-portable-anymap")
+        if image.mode == "F":
+            compatible_mime_types.add("image/x-portable-floatmap")
+
+    if detected_mime_type is not None:
+        compatible_mime_types.add(_canonical_mime_type(detected_mime_type))
+    return detected_mime_type, frozenset(compatible_mime_types)
 
 
 def _validate_dimensions(width: int, height: int, max_pixels: int) -> None:
@@ -205,7 +279,6 @@ def _validate_dimensions(width: int, height: int, max_pixels: int) -> None:
 
 def _metadata_from_image(
     image: Any,
-    image_module: Any,
     *,
     max_pixels: int,
     content_type: str | None,
@@ -221,8 +294,8 @@ def _metadata_from_image(
     mode = image.mode
     if not isinstance(mode, str) or not mode:
         raise ImageFileFormatError("image decoder did not report a pixel mode")
-    detected_mime_type = image_module.MIME.get(image_format.upper())
-    _validate_content_type(content_type, detected_mime_type)
+    detected_mime_type, compatible_mime_types = _detected_image_mime_types(image)
+    _validate_content_type(content_type, detected_mime_type, compatible_mime_types)
     return ImageMetadata(width=width, height=height, format=image_format.upper(), mode=mode)
 
 
@@ -244,7 +317,6 @@ def _probe_image_metadata(
         with _open_image_with_limit(image_module, stream, max_pixels=max_pixels) as image:
             metadata = _metadata_from_image(
                 image,
-                image_module,
                 max_pixels=max_pixels,
                 content_type=content_type,
             )
@@ -337,7 +409,6 @@ def _decode_image_file(
             ) as source:
                 metadata = _metadata_from_image(
                     source,
-                    image_module,
                     max_pixels=normalized_max_pixels,
                     content_type=value.content_type,
                 )
