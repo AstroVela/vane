@@ -307,9 +307,7 @@ protected:
 	static bool ChildCanBindAsInput(Relation &child, Binder &binder) {
 		return child.CanBindAsInputInternal(binder);
 	}
-	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
-		return child.TryGetSerializableQueryNode(binder);
-	}
+	static unique_ptr<QueryNode> TryGetSerializableChildQueryNode(Relation &child, Binder &binder);
 
 private:
 	friend class Binder;

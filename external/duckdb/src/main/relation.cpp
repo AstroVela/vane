@@ -293,6 +293,10 @@ unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
 	return RestoreDuplicateColumnAliases(GetQueryNode(), GetAlias(), Columns());
 }
 
+unique_ptr<QueryNode> Relation::TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
+	return child.TryGetSerializableQueryNode(binder);
+}
+
 unique_ptr<QueryNode> Relation::RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
                                                               const vector<ColumnDefinition> &columns) {
 	case_insensitive_set_t output_names;

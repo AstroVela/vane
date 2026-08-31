@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -33,7 +34,6 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-#include <unistd.h>
 
 namespace duckdb {
 namespace distributed {
@@ -716,7 +716,7 @@ ShuffleCache::ShuffleCache(ShuffleCacheConfig config, std::shared_ptr<ShuffleSto
 	// batch file overwrites from concurrent sink tasks.
 	auto counter = g_shuffle_cache_counter.fetch_add(1);
 	std::ostringstream ss;
-	ss << getpid() << "_" << counter;
+	ss << ResolveVaneProcessId() << "_" << counter;
 	instance_id_ = ss.str();
 	for (auto &entry : next_file_ids_) {
 		entry.store(0);
