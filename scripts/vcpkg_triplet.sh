@@ -22,7 +22,7 @@ vane_default_vcpkg_triplet() {
     MINGW*_NT*:x86_64 | MSYS*_NT*:x86_64 | CYGWIN*_NT*:x86_64)
       printf '%s\n' x64-windows-static-release
       ;;
-    MINGW*_NT*:arm64 | MSYS*_NT*:arm64 | CYGWIN*_NT*:arm64)
+    MINGW*_NT*:arm64 | MINGW*_NT*:aarch64 | MSYS*_NT*:arm64 | MSYS*_NT*:aarch64 | CYGWIN*_NT*:arm64 | CYGWIN*_NT*:aarch64)
       printf '%s\n' arm64-windows-static-release
       ;;
     *)
