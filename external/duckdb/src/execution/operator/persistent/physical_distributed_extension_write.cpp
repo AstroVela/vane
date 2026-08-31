@@ -88,7 +88,7 @@ PhysicalDistributedExtensionWrite::PhysicalDistributedExtensionWrite(PhysicalPla
                        estimated_cardinality),
       info(std::move(info_p)) {
 	info.Validate();
-	if (info.mode != DistributedWriteMode::CALLBACK) {
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK) {
 		throw InternalException("PhysicalDistributedExtensionWrite requires callback mode");
 	}
 }
@@ -97,7 +97,7 @@ unique_ptr<GlobalSinkState> PhysicalDistributedExtensionWrite::GetGlobalSinkStat
 	task_context.Validate();
 	auto write_operator = DistributedExtensionManager::Get(context).GetWriteOperator(info.capability);
 	write_operator->Validate(info.capability.CanonicalIdentity());
-	if (write_operator->mode != DistributedWriteMode::CALLBACK ||
+	if (write_operator->mode != DistributedWriteMode::CALLBACK_SINK ||
 	    write_operator->fragment_codec != info.fragment_codec) {
 		throw InvalidInputException("distributed extension write '%s' worker contract does not match the plan",
 		                            info.Name());

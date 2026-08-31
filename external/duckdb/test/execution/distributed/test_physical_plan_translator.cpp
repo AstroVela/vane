@@ -103,7 +103,7 @@ public:
 	    : PhysicalOperator(physical_plan, operator_type, std::move(types), 0) {
 		plan.extension_name = "test_extension";
 		plan.operator_name = std::move(extension_write_name_p);
-		if (mode == DistributedWriteMode::CALLBACK) {
+		if (mode == DistributedWriteMode::CALLBACK_SINK) {
 			plan.worker_bind_data = "worker-bind";
 		}
 	}
@@ -265,10 +265,11 @@ TEST_CASE("PhysicalPlanTranslator: extension write unwraps its COPY child", "[di
 TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker sink", "[distributed][extension-write]") {
 	DuckDB db(nullptr);
 	Connection connection(db);
-	RegisterTestExtensionWrite(*db.instance, "test_callback_extension_write", DistributedWriteMode::CALLBACK);
+	RegisterTestExtensionWrite(*db.instance, "test_callback_extension_write", DistributedWriteMode::CALLBACK_SINK);
 	auto unary = MakeUnaryScanPlan();
-	auto &extension = unary.plan->Make<TestExtensionWriteOperator>(
-	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK);
+	auto &extension = unary.plan->Make<TestExtensionWriteOperator>(vector<LogicalType> {LogicalType::BIGINT},
+	                                                               "test_callback_extension_write",
+	                                                               DistributedWriteMode::CALLBACK_SINK);
 	auto &extension_write = extension.Cast<TestExtensionWriteOperator>();
 	extension.children.push_back(*unary.scan);
 	unary.plan->SetRoot(extension);
@@ -285,7 +286,7 @@ TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker si
 	REQUIRE(StringUtil::Contains(unrelated_result.error().what(), "requires an extension write root"));
 	auto wrong_type = MakeUnaryScanPlan();
 	auto &wrong_type_extension = wrong_type.plan->Make<TestExtensionWriteOperator>(
-	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK,
+	    vector<LogicalType> {LogicalType::BIGINT}, "test_callback_extension_write", DistributedWriteMode::CALLBACK_SINK,
 	    PhysicalOperatorType::PROJECTION);
 	wrong_type_extension.children.push_back(*wrong_type.scan);
 	wrong_type.plan->SetRoot(wrong_type_extension);
@@ -303,7 +304,7 @@ TEST_CASE("PhysicalPlanTranslator: callback extension write installs a worker si
 	REQUIRE(translated.is_ok());
 	auto write_sink = std::dynamic_pointer_cast<ExtensionWriteSinkNode>(translated.value()->inner());
 	REQUIRE(write_sink != nullptr);
-	REQUIRE(write_sink->write_info().mode == DistributedWriteMode::CALLBACK);
+	REQUIRE(write_sink->write_info().mode == DistributedWriteMode::CALLBACK_SINK);
 	REQUIRE(write_sink->write_info().Name() == "test_callback_extension_write");
 	REQUIRE(write_sink->write_info().fragment_codec.name == "test-extension.opaque-write");
 

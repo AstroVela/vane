@@ -17,10 +17,10 @@ class ExtensionLoader;
 class Serializer;
 
 //! Selects the worker-side implementation used by an extension write.
-//! FILE_ARTIFACT consumes DuckDB WRITTEN_FILE_STATISTICS. CALLBACK replaces
+//! FILE_ARTIFACT consumes DuckDB WRITTEN_FILE_STATISTICS. CALLBACK_SINK replaces
 //! the coordinator-only extension root with the registered streaming callback
 //! sink on every worker.
-enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK = 1 };
+enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK_SINK = 1 };
 
 //! An immutable object created by a worker write. The extension owns the
 //! artifact codec and payload. URI is optional for non-file artifacts. Worker
