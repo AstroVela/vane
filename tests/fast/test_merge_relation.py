@@ -153,6 +153,27 @@ def test_merge_relation_accepts_sql_whitespace_after_when(monkeypatch):
         connection.close()
 
 
+def test_merge_relation_accepts_sql_comments_after_when(monkeypatch):
+    monkeypatch.setenv("VANE_RUNNER", "local-fast")
+    connection = _merge_connection()
+    try:
+        connection.table("merge_source").merge_into(
+            "merge_target",
+            "target.id = source.id",
+            [
+                "WHEN/* update existing rows */MATCHED THEN UPDATE SET value = source.value",
+                "WHEN-- insert missing rows\nNOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
+            ],
+        )
+        assert connection.execute("SELECT * FROM merge_target ORDER BY id").fetchall() == [
+            (1, "new"),
+            (2, "inserted"),
+            (3, "keep"),
+        ]
+    finally:
+        connection.close()
+
+
 def test_merge_relation_dispatches_as_write_without_local_execution(monkeypatch):
     monkeypatch.setenv("VANE_RUNNER", "ray")
     ray_cxx = _require_ray_cxx()

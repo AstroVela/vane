@@ -2309,8 +2309,9 @@ static vector<string> MergeWhenClauses(const py::object &when_clauses) {
 		}
 		auto clause = clause_obj.cast<string>();
 		StringUtil::Trim(clause);
-		if (!StringUtil::CIStartsWith(clause, "WHEN") || clause.size() == 4 ||
-		    !StringUtil::CharacterIsSpace(clause[4])) {
+		auto tokens = Parser::Tokenize(clause);
+		if (tokens.empty() || tokens[0].start != 0 || tokens[0].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
+		    !StringUtil::CIStartsWith(clause, "WHEN")) {
 			throw InvalidInputException("Every MERGE action must start with WHEN");
 		}
 		result.push_back(std::move(clause));
