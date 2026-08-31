@@ -470,6 +470,8 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def("file_exists", [](const DuckDBPyExpression &self) { return self.FileFunction("file_exists"); });
 	expression.def("file_stat", [](const DuckDBPyExpression &self) { return self.FileFunction("file_stat"); });
 	expression.def("file_mime_type", &DuckDBPyExpression::FileMimeType, py::arg("detect") = "metadata");
+	expression.def("image_file_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("image_file_metadata"); });
 }
 
 } // namespace duckdb

@@ -28,6 +28,7 @@ add_library(
   vane_python.cpp
   importer.cpp
   ai_sql_functions.cpp
+  image_file_functions.cpp
   path_like.cpp
   pyconnection.cpp
   datasource_function.cpp

@@ -12,11 +12,18 @@
 #include "vane_python/python_objects.hpp"
 
 #include <mutex>
+#include <type_traits>
 #include <utility>
 
 namespace duckdb {
 
 namespace {
+
+static constexpr uint64_t DEFAULT_IMAGE_METADATA_BYTES = 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_PIXELS = 100000000;
+static constexpr uint64_t DEFAULT_IMAGE_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_INPUT_BYTES = 256 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_IMAGE_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 
 static string PythonTypeName(const py::handle &value) {
 	return py::str(py::type::of(value)).cast<string>();
@@ -120,6 +127,37 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 	file.def(
 	    py::pickle([](const FILE_TYPE &value) { return value.State(); },
 	               [class_name](const py::tuple &state) { return FileFromPickleState<FILE_TYPE>(state, class_name); }));
+	if constexpr (std::is_same_v<FILE_TYPE, PythonImageFile>) {
+		file.def(
+		    "metadata",
+		    [](const FILE_TYPE &value, const py::object &max_bytes, const py::object &max_pixels,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._image_file")
+			        .attr("_image_file_metadata_value")(
+			            py::cast(value, py::return_value_policy::copy), py::arg("max_bytes") = max_bytes,
+			            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+		    },
+		    "Inspect bounded encoded image headers without decoding pixels", py::kw_only(),
+		    py::arg("max_bytes") = DEFAULT_IMAGE_METADATA_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+		    py::arg("connection") = py::none());
+		file.def(
+		    "decode",
+		    [](const FILE_TYPE &value, const py::object &mode, const py::object &buffer_size,
+		       const py::object &max_input_bytes, const py::object &max_pixels, const py::object &max_decoded_bytes,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._image_file")
+			        .attr("_decode_image_file")(py::cast(value, py::return_value_policy::copy), mode, buffer_size,
+			                                    py::arg("max_input_bytes") = max_input_bytes,
+			                                    py::arg("max_pixels") = max_pixels,
+			                                    py::arg("max_decoded_bytes") = max_decoded_bytes,
+			                                    py::arg("connection") = std::move(connection));
+		    },
+		    "Decode frame zero into a fully loaded, detached Pillow image", py::arg("mode") = py::none(),
+		    py::arg("buffer_size") = DEFAULT_IMAGE_BUFFER_SIZE, py::kw_only(),
+		    py::arg("max_input_bytes") = DEFAULT_IMAGE_MAX_INPUT_BYTES,
+		    py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+		    py::arg("max_decoded_bytes") = DEFAULT_IMAGE_MAX_DECODED_BYTES, py::arg("connection") = py::none());
+	}
 }
 
 static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
