@@ -97,7 +97,7 @@ jobs:
         run: bash scripts/bootstrap_vcpkg.sh
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.language == 'c-cpp' && 'manual' || 'none' }}
