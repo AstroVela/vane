@@ -41,6 +41,7 @@ fi
 
 generator="${VANE_NATIVE_CMAKE_GENERATOR:-Ninja}"
 generator_platform="${VANE_NATIVE_CMAKE_GENERATOR_PLATFORM:-}"
+kernel_name="$(uname -s)"
 multi_config=false
 case "$generator" in
   *"Multi-Config"* | Xcode | Visual\ Studio*)
@@ -114,11 +115,22 @@ cmake --fresh \
   "${generator_args[@]}" \
   "${cmake_args[@]}"
 
-build_args=(
-  --target
+build_targets=(
   unittest
   loadable_extension_demo_loadable_extension
-  loadable_extension_optimizer_demo_loadable_extension
+)
+case "$kernel_name" in
+  MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT* | SunOS)
+    # DuckDB does not define the optimizer demo extension target on Windows or
+    # Sun; keep the launcher aligned with test/extension/CMakeLists.txt.
+    ;;
+  *)
+    build_targets+=(loadable_extension_optimizer_demo_loadable_extension)
+    ;;
+esac
+build_args=(
+  --target
+  "${build_targets[@]}"
   --parallel "$build_jobs"
 )
 if [[ "$multi_config" == true ]]; then
@@ -130,7 +142,7 @@ test_binary="$build_dir/test/unittest"
 if [[ "$multi_config" == true ]]; then
   test_binary="$build_dir/test/Release/unittest"
 fi
-case "$(uname -s)" in
+case "$kernel_name" in
   MINGW*_NT* | MSYS*_NT* | CYGWIN*_NT*)
     test_binary="${test_binary}.exe"
     ;;
