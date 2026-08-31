@@ -126,6 +126,27 @@ struct PyLogicalPlan {
 	PyPhysicalPlanWrapper to_physical_plan(py::object conn_obj, py::object effective_session_config) const;
 };
 
+static string SerializeLogicalPlan(ClientContext &client_context, unique_ptr<LogicalOperator> logical_plan) {
+	// The unoptimized bound plan is optimized by the Driver after deserialization.
+	duckdb::MemoryStream stream(duckdb::Allocator::Get(client_context));
+	duckdb::SerializationOptions options;
+	options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
+	options.serialize_default_values = true;
+	duckdb::BinarySerializer serializer(stream, options);
+	serializer.GetSerializationData().Set<duckdb::ClientContext &>(client_context);
+	serializer.Begin();
+	logical_plan->Serialize(serializer);
+	serializer.End();
+
+	auto data_ptr = stream.GetData();
+	auto data_size = stream.GetPosition();
+	if (data_size == 0) {
+		throw duckdb::InternalException("Logical plan serialization returned empty payload");
+	}
+	auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
+	return EncodeLogicalPlanEnvelope(logical_payload);
+}
+
 static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::Relation> &rel) {
 	if (!rel) {
 		throw duckdb::InternalException("Relation is null");
@@ -137,31 +158,17 @@ static string SerializeLogicalPlanFromRelation(const duckdb::shared_ptr<duckdb::
 		auto relation_stmt = make_uniq<duckdb::RelationStatement>(rel, *statement_binder);
 		duckdb::Planner planner(*client_context);
 		planner.CreatePlan(std::move(relation_stmt));
-		auto logical_plan = std::move(planner.plan);
+		serialized_plan = SerializeLogicalPlan(*client_context, std::move(planner.plan));
+	});
+	return serialized_plan;
+}
 
-		// NOTE: We intentionally do NOT run the Optimizer here.
-		// The unoptimized (bound) logical plan is serialized and sent to the Driver,
-		// where the Optimizer runs. This avoids needing serialization support for
-		// custom LogicalOperator types created by optimizer passes
-		// (e.g., LogicalUDFProject, LogicalLocalExchange).
-
-		duckdb::MemoryStream stream(duckdb::Allocator::Get(*client_context));
-		duckdb::SerializationOptions options;
-		options.serialization_compatibility = duckdb::SerializationCompatibility::Latest();
-		options.serialize_default_values = true;
-		duckdb::BinarySerializer serializer(stream, options);
-		serializer.GetSerializationData().Set<duckdb::ClientContext &>(*client_context);
-		serializer.Begin();
-		logical_plan->Serialize(serializer);
-		serializer.End();
-
-		auto data_ptr = stream.GetData();
-		auto data_size = stream.GetPosition();
-		if (data_size == 0) {
-			throw duckdb::InternalException("Logical plan serialization returned empty payload");
-		}
-		auto logical_payload = string(reinterpret_cast<const char *>(data_ptr), data_size);
-		serialized_plan = EncodeLogicalPlanEnvelope(logical_payload);
+static string SerializeLogicalPlanFromStatement(ClientContext &client_context, unique_ptr<SQLStatement> statement) {
+	string serialized_plan;
+	client_context.RunFunctionInTransaction([&]() {
+		duckdb::Planner planner(client_context);
+		planner.CreatePlan(std::move(statement));
+		serialized_plan = SerializeLogicalPlan(client_context, std::move(planner.plan));
 	});
 	return serialized_plan;
 }
@@ -1371,6 +1378,51 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 		}
 		plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper, connection_owner);
 	}
+	return plan;
+}
+
+static unique_ptr<SQLStatement> ExtractDistributedWriteStatement(DuckDBPyConnection &conn_wrapper,
+                                                                 const py::object &statement_obj) {
+	unique_ptr<SQLStatement> statement;
+	if (py::isinstance<py::str>(statement_obj)) {
+		auto statements = conn_wrapper.con.GetConnection().ExtractStatements(statement_obj.cast<string>());
+		if (statements.size() != 1) {
+			throw InvalidInputException("Distributed statement writes require exactly one statement");
+		}
+		statement = std::move(statements[0]);
+	} else if (py::isinstance<DuckDBPyStatement>(statement_obj)) {
+		statement = statement_obj.cast<DuckDBPyStatement &>().GetStatement();
+	} else {
+		throw py::type_error("Expected SQL text or a Vane Statement object");
+	}
+	if (statement->type != StatementType::MERGE_INTO_STATEMENT) {
+		throw InvalidInputException("Distributed statement writes currently accept only MERGE INTO");
+	}
+	if (!statement->named_param_map.empty()) {
+		throw InvalidInputException("Distributed MERGE INTO does not accept prepared parameters");
+	}
+	return statement;
+}
+
+static PyLogicalPlan LogicalPlanFromDuckDBWriteStatement(py::object connection_obj, py::object statement_obj,
+                                                         py::object query_id_obj) {
+	auto &conn_wrapper = ExtractPyConnectionWrapper(connection_obj);
+	auto &client_context = *conn_wrapper.con.GetConnection().context;
+	if (!client_context.transaction.IsAutoCommit()) {
+		throw InvalidInputException("Distributed MERGE INTO requires DuckDB auto-commit mode and cannot participate in "
+		                            "an explicit transaction");
+	}
+	auto statement = ExtractDistributedWriteStatement(conn_wrapper, statement_obj);
+
+	PyLogicalPlan plan;
+	plan.query_id_ = query_id_obj.is_none() ? string() : py::cast<string>(query_id_obj);
+	plan.serialized_logical_plan_ = SerializeLogicalPlanFromStatement(client_context, std::move(statement));
+	plan.source_connection_ = connection_obj;
+	auto registrations = conn_wrapper.ExportDistributedPythonUDFRegistrations();
+	if (py::len(registrations) > 0) {
+		plan.udf_registrations_ = std::move(registrations);
+	}
+	plan.connection_snapshot_ = CaptureConnectionSnapshot(conn_wrapper, connection_obj);
 	return plan;
 }
 

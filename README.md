@@ -257,6 +257,31 @@ submitted as a distributed write and any planning or execution error is returned
 local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckDB backend. An unset or empty
 `VANE_RUNNER` selects Ray.
 
+### Distributed MERGE INTO
+
+Use the explicit statement-write API when a catalog extension provides distributed `MERGE INTO` execution:
+
+```python
+import vane
+
+vane.configure(runner="ray")
+connection = vane.connect()
+outcome = vane.execute_distributed_write(
+    """
+    MERGE INTO catalog.schema.target AS target
+    USING staged_changes AS source
+    ON target.id = source.id
+    WHEN MATCHED THEN UPDATE SET value = source.value
+    WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)
+    """,
+    connection=connection,
+)
+```
+
+The API accepts exactly one parameter-free `MERGE INTO` statement, requires DuckDB auto-commit mode and the Ray
+runner, and returns the normal distributed write result. Parsing, planning, worker, coordinator, and commit failures
+are returned directly and never fall back to local execution. Existing `execute()` and `sql()` behavior is unchanged.
+
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
