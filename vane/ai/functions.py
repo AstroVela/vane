@@ -717,6 +717,13 @@ def chunk_text(
     Returns:
         List of text chunks. Returns ``[text]`` if text fits in one chunk.
     """
+    if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0:
+        raise ValueError("max_chars must be a positive integer")
+    if isinstance(overlap_chars, bool) or not isinstance(overlap_chars, int) or overlap_chars < 0:
+        raise ValueError("overlap_chars must be an integer >= 0")
+    if overlap_chars >= max_chars:
+        raise ValueError("overlap_chars must be smaller than max_chars")
+
     if len(text) <= max_chars:
         return [text]
 
@@ -739,7 +746,10 @@ def _weighted_average_embeddings(
     """Compute length-weighted average of embeddings."""
     arr = np.array(embeddings, dtype=np.float64)
     w = np.array(weights, dtype=np.float64)
-    w /= w.sum()
+    total = float(w.sum())
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("weights must sum to a positive finite value")
+    w /= total
     averaged = (arr * w[:, np.newaxis]).sum(axis=0)
     norm = np.linalg.norm(averaged)
     if norm > 0:

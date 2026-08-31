@@ -541,7 +541,7 @@ class TestChunking:
         """Short text returns single chunk."""
         from vane.ai.functions import chunk_text
 
-        result = chunk_text("hello world", max_chars=100)
+        result = chunk_text("hello world", max_chars=100, overlap_chars=0)
         assert result == ["hello world"]
 
     def test_chunk_text_exact_boundary(self):
@@ -549,8 +549,22 @@ class TestChunking:
         from vane.ai.functions import chunk_text
 
         text = "a" * 100
-        result = chunk_text(text, max_chars=100)
+        result = chunk_text(text, max_chars=100, overlap_chars=0)
         assert result == [text]
+
+    @pytest.mark.parametrize("max_chars", [0, -1, True, 1.5])
+    def test_chunk_text_rejects_invalid_max_chars(self, max_chars):
+        from vane.ai.functions import chunk_text
+
+        with pytest.raises(ValueError, match="max_chars must be a positive integer"):
+            chunk_text("text", max_chars=max_chars, overlap_chars=0)
+
+    @pytest.mark.parametrize("overlap_chars", [-1, True, 1.5, 100])
+    def test_chunk_text_rejects_invalid_overlap_chars(self, overlap_chars):
+        from vane.ai.functions import chunk_text
+
+        with pytest.raises(ValueError, match="overlap_chars"):
+            chunk_text("text", max_chars=100, overlap_chars=overlap_chars)
 
     def test_chunk_text_splits(self):
         """Long text is split into overlapping chunks."""
@@ -602,6 +616,14 @@ class TestChunking:
         # e1 has 3x the weight
         result = _weighted_average_embeddings([e1, e2], [3.0, 1.0])
         assert result[0] > result[1]  # x component dominant
+
+    @pytest.mark.parametrize("weights", [[0.0, 0.0], [-2.0, 1.0], [np.nan, 1.0], [np.inf, 1.0]])
+    def test_weighted_average_rejects_invalid_weight_total(self, weights):
+        from vane.ai.functions import _weighted_average_embeddings
+
+        embeddings = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        with pytest.raises(ValueError, match="positive finite value"):
+            _weighted_average_embeddings(embeddings, weights)
 
     def test_embed_batch_with_chunking(self):
         """_EmbedTextBatch chunks long texts and averages embeddings."""
