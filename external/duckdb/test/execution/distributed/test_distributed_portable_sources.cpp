@@ -242,7 +242,7 @@ TEST_CASE("Distributed optional-bind singleton accepts static and FTE assignment
 		                                                  connection.context.get());
 		auto &scan = plan->Root().Cast<PhysicalTableScan>();
 		auto callbacks = scan.function.GetDistributedScanCallbacks();
-		callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::OPTIONAL;
+		callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_OPTIONAL;
 		scan.function.SetDistributedScanCallbacks(std::move(callbacks));
 		scan.bind_data.reset();
 		scan.extra_info.scan_node_id = optional_idx(scan_node_id);

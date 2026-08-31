@@ -398,7 +398,7 @@ TableFunction GetJSONTableInOutFunction(const LogicalType &input_type, const boo
 	function.serialize = JSONTableInOutSerialize;
 	function.deserialize = JSONTableInOutDeserialize;
 	function.SetDistributedScanCallbacks(
-	    MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode::OPTIONAL));
+	    MakeDistributedSingletonSourceCallbacks(TableFunctionDistributedBindDataMode::BIND_DATA_OPTIONAL));
 	function.projection_pushdown = true;
 	return function;
 }
