@@ -95,6 +95,12 @@ tag, or create or modify a GitHub Release. A development candidate is
 immutable and is never promoted; if it is unsuitable, merge a fix and publish
 the new commit's development version.
 
+Only these no-tag candidate wheels trust the dedicated AstroVela TestPyPI
+extension-signing key. Build-only and tagged release wheels explicitly leave
+that key disabled. Provider candidates signed by it are therefore qualification
+artifacts only: never promote them to PyPI, and never reuse the candidate key
+as the production extension-signing key.
+
 ## Prepare the release pull request
 
 1. Choose a final canonical PEP 440 version with an `X.Y.Z` release segment.

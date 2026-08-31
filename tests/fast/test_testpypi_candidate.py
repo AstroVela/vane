@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
 import urllib.error
+from pathlib import Path
 
 import pytest
 from packaging.version import Version
@@ -13,6 +17,9 @@ from scripts.validate_testpypi_candidate import (
     require_testpypi_version_absent,
     validate_development_version,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+TESTPYPI_EXTENSION_KEY_FINGERPRINT = "f02108bc37439677d8ade5c6e0efd90314d5ac7308b8d972d2271f41791b4941"
 
 
 @pytest.mark.parametrize("raw_version", ["0.2.0.dev601", "0.2.0rc2.dev3"])
@@ -63,3 +70,42 @@ def test_require_testpypi_version_absent_rejects_existing_or_indeterminate_versi
     expected = "already exists" if status == 200 else "query failed"
     with pytest.raises(CandidateValidationError, match=expected):
         require_testpypi_version_absent(Version("0.2.0.dev601"), open_url=open_url)
+
+
+def test_testpypi_extension_signing_key_is_candidate_only():
+    option_name = "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"
+    duckdb_cmake = (REPOSITORY_ROOT / "external/duckdb/CMakeLists.txt").read_text(encoding="utf-8")
+    extension_cmake = (REPOSITORY_ROOT / "external/duckdb/src/main/extension/CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+    extension_helper = (REPOSITORY_ROOT / "external/duckdb/src/main/extension/extension_helper.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    option = re.search(rf"option\({option_name}\s+\"[^\"]+\"\s+(\w+)\)", duckdb_cmake)
+    assert option is not None
+    assert option.group(1) == "FALSE"
+    assert extension_cmake.count(f"if({option_name})") == 1
+    assert extension_cmake.count(f"PRIVATE {option_name}") == 1
+
+    key_block = re.search(
+        rf"#ifdef {option_name}.*?R\"\(\n"
+        r"(-----BEGIN PUBLIC KEY-----\n.+?\n-----END PUBLIC KEY-----)\n"
+        r"\)\",\n#endif",
+        extension_helper,
+        flags=re.DOTALL,
+    )
+    assert key_block is not None
+    public_key_lines = key_block.group(1).splitlines()
+    public_key_der = base64.b64decode("".join(public_key_lines[1:-1]), validate=True)
+    assert hashlib.sha256(public_key_der).hexdigest() == TESTPYPI_EXTENSION_KEY_FINGERPRINT
+    assert TESTPYPI_EXTENSION_KEY_FINGERPRINT in key_block.group(0)
+
+    workflow_setting = (
+        'CIBW_CONFIG_SETTINGS: "cmake.define.'
+        f"{option_name}=${{{{ inputs.operation == 'testpypi-dev' && 'ON' || 'OFF' }}}}\""
+    )
+    workflows = sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yml"))
+    workflow_contents = [path.read_text(encoding="utf-8") for path in workflows]
+    assert sum(content.count(workflow_setting) for content in workflow_contents) == 1
+    assert sum(content.count(option_name) for content in workflow_contents) == 1

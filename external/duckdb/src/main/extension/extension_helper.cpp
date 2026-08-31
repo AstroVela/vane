@@ -418,6 +418,22 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 }
 
 static const char *const public_keys[] = {
+#ifdef VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY
+    // Candidate-only AstroVela TestPyPI key. Its DER-encoded SubjectPublicKeyInfo
+    // has SHA-256 f02108bc37439677d8ade5c6e0efd90314d5ac7308b8d972d2271f41791b4941.
+    // Production releases must use an independently managed signing key.
+    R"(
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7zuFv8bsD9U0YboZXyIx
+KNe99EktVJewYMTFSTMmLyRH3Ldn3yLTQCk1kciABjT8o556ZtviuGeo5pWXN/Gl
+a2BF0lftvrrU6mJTrY+Hwggk33JSXA46puTrCOlRuREDe2pcAIUela3ktpaqxfXQ
+l1yuIeoFO3tyGRMyvevEZ3Bx5MSdSr9ooLdvhKEm5uW/gb4yVx9QbZ4WVvHLn+Sq
+YyBVHLxB9c1k0MDRFfwpZOnq8r1VFD6ULkAQEgAM8NHZnZsHfmetoemuZmpLx/AB
+mh+FqYTeIb8dIGVBWyCkQa5/0fvhTVuZ+iImLqdbLbDDIYgwKmylrKDoY77n640C
+UQIDAQAB
+-----END PUBLIC KEY-----
+)",
+#endif
 #ifdef VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY
     // This public key matches test/mbedtls/private.pem and is intentionally
     // available only in builds that opt into Vane's integration-test fixture.
@@ -652,7 +668,8 @@ SLWQo0+/ciQ21Zwz5SwimX8ep1YpqYirO04gcyGZzAfGboXRvdUwA+1bZvuUXdKC
 EMS5gLv50CzQqJXK9mNzPuYXNUIc4Pw4ssVWe0OfN3Od90gl5uFUwk/G9lWSYnBN
 3wIDAQAB
 -----END PUBLIC KEY-----
-)", nullptr};
+)",
+    nullptr};
 
 static const char *const community_public_keys[] = {
     R"(
