@@ -257,32 +257,6 @@ submitted as a distributed write and any planning or execution error is returned
 local DuckDB. Set `VANE_RUNNER=local-fast` to explicitly select the native DuckDB backend. An unset or empty
 `VANE_RUNNER` selects Ray.
 
-### Distributed MERGE INTO
-
-Merge a source relation into a catalog table with the same terminal-relation path used by insert, update, and delete:
-
-```python
-import vane
-
-vane.configure(runner="ray")
-connection = vane.connect()
-source = connection.table("staged_changes")
-source.merge_into(
-    "catalog.schema.target",
-    "target.id = source.id",
-    [
-        "WHEN MATCHED THEN UPDATE SET value = source.value",
-        "WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
-    ],
-)
-```
-
-The condition accepts a SQL string, an `Expression`, or a sequence of column names for `USING (...)`. Ordered SQL
-`WHEN` clauses preserve the complete DuckDB `MERGE INTO` action grammar. With the Ray runner, the merge is submitted
-as a distributed write and the target catalog must plan it as a registered distributed extension write. An ordinary
-DuckDB table is rejected instead of executing locally. Ray merges require DuckDB auto-commit mode and never fall back
-to local execution. Set `VANE_RUNNER=local-fast` to execute the same relation with native DuckDB.
-
 ### More Resources
 
 - [Examples](https://vane.astrovela.ai/docs/data/examples)
