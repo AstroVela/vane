@@ -14,6 +14,7 @@
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/physical_plan.hpp"
@@ -34,6 +35,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/parser/query_node.hpp"
 
 #include <functional>
 
@@ -67,8 +69,8 @@ static unique_ptr<ColumnDataCollection> MakeIntegerCollection(const vector<Value
 
 class MarkSummaryTestExchangeSink final : public distributed::ExchangeSink {
 public:
-	DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> AddChunk(idx_t partition_id, DataChunk &chunk) override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
 	bool IsBlocked() const override {
@@ -78,12 +80,12 @@ public:
 	void WaitUnblocked() override {
 	}
 
-	DuckDBResult<void> Finish() override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> Finish() override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
-	DuckDBResult<void> Abort() override {
-		return DuckDBResult<void>::ok();
+	distributed::DuckDBResult<void> Abort() override {
+		return distributed::DuckDBResult<void>::ok();
 	}
 
 	size_t GetMemoryUsage() const override {

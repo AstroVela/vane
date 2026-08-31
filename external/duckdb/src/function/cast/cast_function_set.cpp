@@ -270,7 +270,7 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 			return source_contains_file && target == LogicalType::VARCHAR;
 		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
 			return target_contains_file && !source_contains_file && FileAliasRestorationCompatible(source, target);
-		case FileCastMode::STRICT:
+		case FileCastMode::STRICT_CAST:
 			return target_contains_file && FileLeavesPreservedCompatible(source, target);
 		default:
 			return false;

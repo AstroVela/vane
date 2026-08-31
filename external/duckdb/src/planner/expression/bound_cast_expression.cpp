@@ -14,7 +14,7 @@ static BoundCastInfo BindCastFunction(ClientContext &context, const LogicalType 
                                       bool file_internal_formatting) {
 	auto &cast_functions = DBConfig::GetConfig(context).GetCastFunctions();
 	GetCastFunctionInput input(context);
-	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING : FileCastMode::STRICT;
+	input.file_cast_mode = file_internal_formatting ? FileCastMode::INTERNAL_FORMATTING : FileCastMode::STRICT_CAST;
 	return cast_functions.GetCastFunction(source, target, input);
 }
 
