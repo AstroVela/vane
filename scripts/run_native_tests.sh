@@ -104,8 +104,11 @@ if [[ "$windows_host" == true ]]; then
     echo "Run 'bash scripts/bootstrap_vcpkg.sh' from the repository root first." >&2
     exit 1
   fi
+  # Match DuckDB's native Windows CI: unity builds can leak windows.h names
+  # such as `byte` between concatenated test translation units.
   cmake_args+=(
     "-DCMAKE_TOOLCHAIN_FILE=$vcpkg_toolchain"
+    "-DDISABLE_UNITY=1"
     "-DVCPKG_INSTALLED_DIR=$install_root"
     "-DVCPKG_TARGET_TRIPLET=$triplet"
     "-DVCPKG_MANIFEST_MODE=OFF"

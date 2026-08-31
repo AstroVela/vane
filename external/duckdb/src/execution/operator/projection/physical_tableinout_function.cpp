@@ -186,12 +186,12 @@ OperatorResultType PhysicalTableInOutFunction::ExecuteBatch(ExecutionContext &co
 
 ExecutionBatchRequirement PhysicalTableInOutFunction::GetExecutionBatchRequirement(PipelineOperatorRole role) const {
 	if (role != PipelineOperatorRole::INTERMEDIATE || !projected_input.empty() || this->ordinality_idx.IsValid()) {
-		return ExecutionBatchRequirement::OPTIONAL;
+		return ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 	if (function.in_out_function_batch || function.in_out_function_final_batch) {
-		return ExecutionBatchRequirement::REQUIRED;
+		return ExecutionBatchRequirement::BATCH_REQUIRED;
 	}
-	return ExecutionBatchRequirement::OPTIONAL;
+	return ExecutionBatchRequirement::BATCH_OPTIONAL;
 }
 
 InsertionOrderPreservingMap<string> PhysicalTableInOutFunction::ParamsToString() const {

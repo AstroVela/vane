@@ -365,7 +365,7 @@ TEST_CASE("PhysicalPlanTranslator: preserves source_node_id on column data scan"
 	plan_ptr->SetRoot(scan_op);
 
 	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 
 	auto inner = res.value()->inner();
@@ -390,7 +390,7 @@ TEST_CASE("PhysicalPlanTranslator: assigns fresh id when source_node_id is not s
 	plan_ptr->SetRoot(scan);
 
 	auto res = physical_plan_to_pipeline_node(PlanConfig {}, plan_ptr);
-	REQUIRE(res.ok);
+	REQUIRE(res.is_ok());
 	REQUIRE(res.value() != nullptr);
 
 	auto inner = res.value()->inner();
@@ -417,7 +417,7 @@ TEST_CASE("PhysicalPlanTranslator: translates cross product with two inputs", "[
 	plan->SetRoot(cross);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto cross_node = std::dynamic_pointer_cast<CrossProductNode>(result.value()->inner());
 	REQUIRE(cross_node != nullptr);
@@ -440,7 +440,7 @@ TEST_CASE("PhysicalPlanTranslator: translates positional join through ordered ga
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto positional_node = std::dynamic_pointer_cast<PositionalJoinNode>(result.value()->inner());
 	REQUIRE(positional_node != nullptr);
@@ -479,7 +479,7 @@ TEST_CASE("PhysicalPlanTranslator: translates ASOF joins to a gathered native wo
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto join_node = std::dynamic_pointer_cast<AsOfJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);
@@ -542,7 +542,7 @@ TEST_CASE("PhysicalPlanTranslator: normalizes range joins to a gathered nested-l
 		}
 
 		auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-		REQUIRE(result.ok);
+		REQUIRE(result.is_ok());
 		REQUIRE(result.value() != nullptr);
 		auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 		REQUIRE(join_node != nullptr);
@@ -576,7 +576,7 @@ TEST_CASE("PhysicalPlanTranslator: preserves range join projection maps", "[dist
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);
 	REQUIRE(join_node->left_projection_map_ == vector<idx_t> {0, 1});
@@ -626,7 +626,7 @@ TEST_CASE("PhysicalPlanTranslator: translates blockwise nested-loop joins", "[di
 	plan->SetRoot(join);
 
 	auto result = physical_plan_to_pipeline_node(PlanConfig {}, plan);
-	REQUIRE(result.ok);
+	REQUIRE(result.is_ok());
 	REQUIRE(result.value() != nullptr);
 	auto join_node = std::dynamic_pointer_cast<NestedLoopJoinNode>(result.value()->inner());
 	REQUIRE(join_node != nullptr);

@@ -52,7 +52,7 @@ enum class OperatorCachingMode : uint8_t { NONE, PARTITIONED, ORDERED, UNORDERED
 enum class PipelineOperatorRole : uint8_t { SOURCE, INTERMEDIATE, SINK };
 
 //! Whether a role needs ExecutionBatch callbacks to preserve its execution semantics.
-enum class ExecutionBatchRequirement : uint8_t { OPTIONAL, REQUIRED };
+enum class ExecutionBatchRequirement : uint8_t { BATCH_OPTIONAL, BATCH_REQUIRED };
 
 //! PhysicalOperator is the base class of the physical operators present in the execution plan.
 class PhysicalOperator {
@@ -158,9 +158,10 @@ public:
 	}
 
 	//! Whether this operator needs ExecutionBatch callbacks for the role it has in a pipeline.
-	//! OPTIONAL operators remain compatible with ExecutionBatch pipelines through the default materializing wrappers.
+	//! Batch-optional operators remain compatible with ExecutionBatch pipelines through the default materializing
+	//! wrappers.
 	virtual ExecutionBatchRequirement GetExecutionBatchRequirement(PipelineOperatorRole) const {
-		return ExecutionBatchRequirement::OPTIONAL;
+		return ExecutionBatchRequirement::BATCH_OPTIONAL;
 	}
 
 public:
