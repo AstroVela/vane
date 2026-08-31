@@ -415,18 +415,19 @@ jobs:
           test -f vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake
           test ! -e vcpkg_installed/x64-windows-static-release/debug
 
-      - name: Build and run DuckDB unit tests
-        shell: bash
-        run: scripts/run_native_tests.sh
-
-      # Completed ports are content-addressed and safe to reuse even when a
-      # later configure or test step fails during initial Windows bring-up.
+      # Publish the stable immutable key only after the complete bootstrap and
+      # prefix checks pass. A later configure/test failure must not discard the
+      # successful cold build, while a partial bootstrap must not poison the key.
       - name: Save vcpkg binary cache
-        if: ${{ always() && steps.vcpkg_cache.outputs.cache-hit != 'true' }}
+        if: ${{ steps.vcpkg_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
           key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Build and run DuckDB unit tests
+        shell: bash
+        run: scripts/run_native_tests.sh
 
   fast-tests:
     name: Fast tests (${{ matrix.label }})
