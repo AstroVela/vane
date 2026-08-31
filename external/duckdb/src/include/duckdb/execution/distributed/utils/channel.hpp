@@ -321,7 +321,10 @@ public:
 				return false;
 			}
 			queue_.push(std::move(value));
-			ready_callback = std::move(ready_callback_);
+			// A moved-from std::function is valid but not required to be empty.
+			// Swap with an empty callback so the registered callback is reliably
+			// one-shot across standard library implementations.
+			ready_callback.swap(ready_callback_);
 		}
 		not_empty_.notify_one();
 		if (ready_callback) {
@@ -379,7 +382,7 @@ public:
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			closed_ = true;
-			ready_callback = std::move(ready_callback_);
+			ready_callback.swap(ready_callback_);
 		}
 		not_empty_.notify_all();
 		not_full_.notify_all();
@@ -398,7 +401,7 @@ public:
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
 				queue_.swap(*abandoned);
-				ready_callback = std::move(ready_callback_);
+				ready_callback.swap(ready_callback_);
 			}
 		} catch (...) {
 			// Receiver cleanup runs from noexcept move/destruction paths. If allocating
@@ -408,7 +411,7 @@ public:
 			try {
 				std::lock_guard<std::mutex> lock(mutex_);
 				closed_ = true;
-				ready_callback = std::move(ready_callback_);
+				ready_callback.swap(ready_callback_);
 			} catch (...) {
 				// No safe cleanup remains if locking the state also fails.
 			}
