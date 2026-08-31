@@ -4,6 +4,7 @@
 #include "duckdb/execution/operator/persistent/physical_distributed_extension_write.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
 

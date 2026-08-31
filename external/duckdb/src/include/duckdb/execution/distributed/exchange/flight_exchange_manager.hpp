@@ -16,6 +16,7 @@
 #include "duckdb/execution/distributed/exchange/flight_server.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/types.hpp"
 
@@ -28,12 +29,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-#if defined(_WIN32)
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 
 namespace duckdb {
 
@@ -101,14 +96,6 @@ inline std::string FlightExchangeJoinPath(const std::string &base, const std::st
 		return base + child;
 	}
 	return base + "/" + child;
-}
-
-inline unsigned long long ResolveVaneProcessId() {
-#if defined(_WIN32)
-	return static_cast<unsigned long long>(_getpid());
-#else
-	return static_cast<unsigned long long>(getpid());
-#endif
 }
 
 inline void SetFlightExchangeEnvString(const char *name, const std::string &value) {

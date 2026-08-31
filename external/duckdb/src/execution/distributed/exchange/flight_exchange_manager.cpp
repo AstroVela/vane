@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "duckdb/common/windows_undefs.hpp"
 #else
 #include <arpa/inet.h>
 #endif
