@@ -326,6 +326,7 @@ jobs:
     name: Native build and tests (macOS arm64)
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
+    # GitHub Actions maps macos-15 to Apple Silicon; macos-15-intel is x86-64.
     runs-on: macos-15
     timeout-minutes: 180
     env:
