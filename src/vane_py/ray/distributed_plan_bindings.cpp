@@ -548,7 +548,11 @@ struct PyPhysicalPlanWrapper {
 		struct UDFIdentityRollback {
 			const vector<UDFFunctionData *> &bind_data;
 			vector<Value> &payloads;
-			bool active = true;
+			bool active;
+
+			UDFIdentityRollback(const vector<UDFFunctionData *> &bind_data_p, vector<Value> &payloads_p)
+			    : bind_data(bind_data_p), payloads(payloads_p), active(true) {
+			}
 
 			~UDFIdentityRollback() {
 				if (!active) {
@@ -562,7 +566,7 @@ struct PyPhysicalPlanWrapper {
 			void Commit() {
 				active = false;
 			}
-		} identity_rollback {physical_udfs, unidentified_payloads};
+		} identity_rollback(physical_udfs, unidentified_payloads);
 
 		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get());
 		vector<duckdb::distributed::DistributedPipelineNodeRef> pipeline_nodes;
