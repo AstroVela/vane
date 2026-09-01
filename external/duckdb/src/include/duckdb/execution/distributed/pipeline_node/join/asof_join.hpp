@@ -19,6 +19,8 @@ class TaskIDCounter;
 
 //! Executes an ASOF join after co-locating both complete inputs on one worker.
 class AsOfJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<AsOfJoinNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	AsOfJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<JoinCondition> conditions,
 	             JoinType join_type, duckdb::vector<LogicalType> output_types,

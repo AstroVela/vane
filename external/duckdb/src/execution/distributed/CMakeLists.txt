@@ -70,11 +70,14 @@ set(DISTRIBUTED_SOURCES_PIPELINE_NODE
     pipeline_node/scan_source.cpp
     pipeline_node/sample.cpp
     pipeline_node/pivot.cpp
-    pipeline_node/unnest.cpp
+    # Use unique basenames for distributed sources. MSVC static archives use
+    # object-file basenames for member names, and DuckDB already has sort.cpp,
+    # unnest.cpp, and execution/operator/exchange/repartition.cpp.
+    pipeline_node/unnest_node.cpp
     pipeline_node/union.cpp
-    pipeline_node/shuffles/repartition.cpp
+    pipeline_node/shuffles/repartition_node.cpp
     pipeline_node/sink.cpp
-    pipeline_node/sort.cpp
+    pipeline_node/sort_node.cpp
     pipeline_node/window.cpp
     pipeline_node/pipeline_node.cpp
     pipeline_node/pipeline_node_task_builder.cpp

@@ -17,6 +17,8 @@ namespace distributed {
 class TaskIDCounter;
 
 class PositionalJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<PositionalJoinNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	PositionalJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<LogicalType> output_types,
 	                   idx_t estimated_cardinality, std::shared_ptr<DistributedPipelineNode> left,

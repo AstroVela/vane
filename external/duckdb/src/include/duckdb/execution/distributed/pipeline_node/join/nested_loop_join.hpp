@@ -20,6 +20,8 @@ class TaskIDCounter;
 //! Executes comparison and arbitrary-expression joins with a correctness-first
 //! nested-loop strategy after their inputs have been co-located.
 class NestedLoopJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<NestedLoopJoinNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	NestedLoopJoinNode(NodeID node_id, const PlanConfig &plan_config, PhysicalOperatorType source_type,
 	                   duckdb::vector<JoinCondition> conditions, unique_ptr<Expression> predicate, JoinType join_type,
