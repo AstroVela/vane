@@ -25,6 +25,14 @@ public:
 		return false;
 	}
 
+	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		backing_fs.CreateDirectory(directory, opener);
+	}
+
+	void CreateDirectoriesRecursive(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		backing_fs.CreateDirectoriesRecursive(directory, opener);
+	}
+
 	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
 	               FileOpener * = nullptr) override {
 		return ListObjectKeys(directory, directory, callback);
@@ -499,7 +507,7 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto root_run_dir = BuildCopyDirectWriteRunDirectory(root, "run-root", root);
 	REQUIRE(root_run_dir == root + "_vane_direct_write_run-root");
 	REQUIRE(BuildCopyDirectWriteTaskDirectory(root, "run-root", "w_0", root) == root_run_dir + root + "w_0");
-	auto root_direct_target = BuildCopyDirectTargetFilePath(root, "run-root", "w_0", "part.parquet");
+	auto root_direct_target = BuildCopyDirectTargetFilePath(root, "run-root", "w_0", "part.parquet", root);
 	REQUIRE(root_direct_target == root + "run-root_w_0_part.parquet");
 	REQUIRE(DistributedCopyPathIsInDirectory(root_direct_target, root, root));
 	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, root, "run-root", root_direct_target));
@@ -513,6 +521,11 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto authority_paths =
 	    BuildDistributedCopyFinalizeCommitPaths(fs, authority_root_res.value(), "run-authority-root");
 	REQUIRE(authority_paths.commit_dir == "s3://bucket/.duckdb_commit/run-authority-root");
+	WindowsPathFileSystem windows_fs;
+	auto windows_authority_paths =
+	    BuildDistributedCopyFinalizeCommitPaths(windows_fs, authority_root_res.value(), "run-authority-root");
+	REQUIRE(windows_authority_paths.commit_dir == authority_paths.commit_dir);
+	REQUIRE(windows_authority_paths.manifest_path == "s3://bucket/.duckdb_commit/run-authority-root/manifest.txt");
 	REQUIRE(BuildCopyDirectWriteRunDirectory(authority_root_res.value(), "run-authority-root") ==
 	        "s3://bucket/_vane_direct_write_run-authority-root");
 	auto authority_direct_target =
@@ -532,7 +545,9 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(DistributedCopyDirectWriteFinalPathBelongsToRun(fs, empty_authority_root_res.value(), "run-file-root",
 	                                                        file_root_direct_target));
 
-	WindowsPathFileSystem windows_fs;
+	auto repeated_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\\)");
+	REQUIRE(repeated_root_res.is_ok());
+	REQUIRE(repeated_root_res.value() == R"(\)");
 	auto unc_root_res = CanonicalDistributedCopyBasePath(windows_fs, R"(\\server\share)");
 	REQUIRE(unc_root_res.is_ok());
 	REQUIRE(unc_root_res.value() == R"(\\server\share\)");
@@ -550,6 +565,7 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	        R"(C:\_vane_direct_write_run-drive-root)");
 	REQUIRE_FALSE(DistributedCopyPathIsInDirectory(R"(C:)", drive_root_res.value(), R"(\)"));
 	REQUIRE(DistributedCopyPathIsInDirectory(R"(C:\run-drive-root_w_0_part.parquet)", drive_root_res.value(), R"(\)"));
+	REQUIRE(DistributedCopyPathIsInDirectory(R"(C:/run-drive-root_w_0_part.parquet)", drive_root_res.value(), R"(\)"));
 	auto forward_slash_drive_root_res = CanonicalDistributedCopyBasePath(windows_fs, "C:////");
 	REQUIRE(forward_slash_drive_root_res.is_ok());
 	REQUIRE(forward_slash_drive_root_res.value() == R"(C:\)");
@@ -855,10 +871,12 @@ TEST_CASE("Distributed COPY reports an unknown outcome when committed marker rea
 TEST_CASE("Distributed COPY resolves relative and qualified list paths",
           "[distributed][copy][lifecycle][object-storage][path]") {
 	LocalFileSystem fs;
+	WindowsPathFileSystem windows_fs;
 	const string directory = "memory://bucket/out.duckdb_commit";
 	const string qualified_path = directory + "/run/lifecycle.txt";
 
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "run/lifecycle.txt") == qualified_path);
+	REQUIRE(ResolveDistributedCopyListedPath(windows_fs, directory, "run/lifecycle.txt") == qualified_path);
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, qualified_path) == qualified_path);
 	REQUIRE(ResolveDistributedCopyListedPath(fs, directory, "/bucket/out.duckdb_commit/run/lifecycle.txt") ==
 	        qualified_path);

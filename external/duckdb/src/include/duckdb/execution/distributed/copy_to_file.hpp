@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include "duckdb/common/enums/copy_overwrite_mode.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/filename_pattern.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -104,6 +105,27 @@ struct DistributedCopyResult {
 };
 
 // ── Shared path utilities (used by scheduler + worker) ──────────────────────
+
+inline bool DistributedCopyPathHasProtocol(FileSystem &fs, const std::string &path) {
+	auto protocol = path.find("://");
+	if (protocol == std::string::npos) {
+		return false;
+	}
+	// A Windows drive path such as C://output is not a URI.
+	return !(protocol == 1 && fs.PathSeparator(path) == "\\" && fs.IsPathAbsolute(path));
+}
+
+inline std::string DistributedCopyPathSeparator(FileSystem &fs, const std::string &path) {
+	return DistributedCopyPathHasProtocol(fs, path) ? std::string("/") : fs.PathSeparator(path);
+}
+
+inline std::string JoinDistributedCopyPath(FileSystem &fs, const std::string &base, const std::string &child) {
+	if (base.empty()) {
+		return child;
+	}
+	auto separator = DistributedCopyPathSeparator(fs, base);
+	return StringUtil::EndsWith(base, separator) ? base + child : base + separator + child;
+}
 
 inline bool IsDistributedCopyOutputPlaceholder(const std::string &path) {
 	return StringUtil::StartsWith(path, DISTRIBUTED_COPY_OUTPUT_PLACEHOLDER_PREFIX);

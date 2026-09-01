@@ -241,7 +241,7 @@ public:
 	DuckDBResult<void> WriteTextFileAtomically(const std::string &path, const std::string &contents) const override {
 		auto tmp_path = path + ".tmp";
 		{
-			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc);
+			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
 			if (!output) {
 				return DuckDBResult<void>::err(DuckDBError::io_error("failed to open shuffle text file: " + tmp_path));
 			}
@@ -877,6 +877,9 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 	idx_t line_no = 0;
 	while (std::getline(input, line)) {
 		line_no++;
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
 		if (line.empty()) {
 			continue;
 		}
