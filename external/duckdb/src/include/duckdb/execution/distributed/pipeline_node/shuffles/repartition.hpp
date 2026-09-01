@@ -13,7 +13,7 @@
 namespace duckdb {
 namespace distributed {
 class PlanExecutionContext;
-class PlanConfig;
+struct PlanConfig;
 class TaskIDCounter;
 class ExchangeManager;
 } // namespace distributed

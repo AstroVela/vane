@@ -13,7 +13,7 @@
 namespace duckdb {
 
 class ClientContext;
-class DuckDBPyConnection;
+struct DuckDBPyConnection;
 class PythonFile;
 class ResolvedFile;
 

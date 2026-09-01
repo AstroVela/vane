@@ -36,7 +36,7 @@ namespace duckdb {
 struct BoundStatement;
 
 class Binder;
-class DuckDBPyRelation;
+struct DuckDBPyRelation;
 class Expression;
 class LogicalOperator;
 struct PythonReplacementScan;
@@ -312,7 +312,7 @@ protected:
 private:
 	friend class Binder;
 	friend class ClientContext;
-	friend class DuckDBPyRelation;
+	friend struct DuckDBPyRelation;
 	friend class RelationStatement;
 	friend struct PythonReplacementScan;
 

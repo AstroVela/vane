@@ -30,7 +30,6 @@
 namespace duckdb {
 
 class Expression;
-class LogicalType;
 
 namespace distributed {
 
