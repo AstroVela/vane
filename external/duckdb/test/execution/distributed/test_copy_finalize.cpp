@@ -316,7 +316,7 @@ private:
 	string missing_marker_path;
 };
 
-class WindowsPathFileSystem : public LocalFileSystem {
+class WindowsPathSemanticsFileSystem : public LocalFileSystem {
 public:
 	string PathSeparator(const string &) override {
 		return "\\";
@@ -521,7 +521,7 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	auto authority_paths =
 	    BuildDistributedCopyFinalizeCommitPaths(fs, authority_root_res.value(), "run-authority-root");
 	REQUIRE(authority_paths.commit_dir == "s3://bucket/.duckdb_commit/run-authority-root");
-	WindowsPathFileSystem windows_fs;
+	WindowsPathSemanticsFileSystem windows_fs;
 	auto windows_authority_paths =
 	    BuildDistributedCopyFinalizeCommitPaths(windows_fs, authority_root_res.value(), "run-authority-root");
 	REQUIRE(windows_authority_paths.commit_dir == authority_paths.commit_dir);
@@ -871,7 +871,7 @@ TEST_CASE("Distributed COPY reports an unknown outcome when committed marker rea
 TEST_CASE("Distributed COPY resolves relative and qualified list paths",
           "[distributed][copy][lifecycle][object-storage][path]") {
 	LocalFileSystem fs;
-	WindowsPathFileSystem windows_fs;
+	WindowsPathSemanticsFileSystem windows_fs;
 	const string directory = "memory://bucket/out.duckdb_commit";
 	const string qualified_path = directory + "/run/lifecycle.txt";
 
