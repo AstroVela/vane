@@ -191,7 +191,7 @@ py::bytes PythonFileReaderHandle::Read(int64_t size) {
 					    result.resize(NumericCast<idx_t>(requested_size));
 					    context_scope.CheckInterrupted();
 					    auto read_size =
-					        ReadLocked(reinterpret_cast<data_ptr_t>(result.data()), NumericCast<idx_t>(requested_size));
+					        ReadLocked(reinterpret_cast<data_ptr_t>(&result[0]), NumericCast<idx_t>(requested_size));
 					    if (read_size != requested_size) {
 						    throw InternalException(
 						        "FILE reader produced fewer bytes than its bounded logical request");
