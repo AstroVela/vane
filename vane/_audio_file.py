@@ -571,7 +571,7 @@ def _decode_audio_file(
     soundfile = _load_soundfile()
     numpy = importlib.import_module("numpy")
 
-    class _AudioDecoder(soundfile.SoundFile):
+    class _AudioDecoder(soundfile.SoundFile):  # type: ignore[name-defined]
         def seekable(self) -> bool:
             # libsndfile reports SF_COUNT_MAX when a container omits its
             # total frame count. The encoded stream can still seek while
