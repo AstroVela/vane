@@ -797,7 +797,8 @@ public:
 					}
 					return DuckDBResult<void>::ok();
 				}
-				auto staging_root = fs.JoinPath(copy_sink_node->staging_root_base(), copy_sink_node->staging_run_id());
+				auto staging_root =
+				    JoinDistributedCopyPath(fs, copy_sink_node->staging_root_base(), copy_sink_node->staging_run_id());
 				RemoveDistributedCopyDirectoryTree(fs, staging_root);
 				RemoveDistributedCopyDirectoryIfEmpty(fs, copy_sink_node->staging_root_base());
 				return DuckDBResult<void>::ok();

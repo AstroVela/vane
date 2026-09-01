@@ -8,6 +8,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/distributed/exchange/flight_ticket.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
 #include "duckdb/execution/distributed/exchange/shuffle_cache_registry.hpp"
@@ -283,8 +284,9 @@ void RequireTwoColumnRows(const MaterializedRows &rows, const vector<int32_t> &i
 
 class MockObjectShuffleStorage final : public ShuffleStorage {
 public:
-	explicit MockObjectShuffleStorage(std::string root, idx_t remove_failures = 0)
-	    : root_(std::move(root)), fs_(FileSystem::CreateLocal()), remove_failures_remaining_(remove_failures) {
+	explicit MockObjectShuffleStorage(std::string root, idx_t remove_failures = 0, bool write_crlf = false)
+	    : root_(std::move(root)), fs_(FileSystem::CreateLocal()), remove_failures_remaining_(remove_failures),
+	      write_crlf_(write_crlf) {
 	}
 
 	bool SupportsObjectPaths() const override {
@@ -323,11 +325,11 @@ public:
 		}
 		auto tmp_path = mapped + ".tmp";
 		{
-			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc);
+			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
 			if (!output) {
 				return DuckDBResult<void>::err(DuckDBError::io_error("mock object storage open failed: " + tmp_path));
 			}
-			output << contents;
+			output << (write_crlf_ ? StringUtil::Replace(contents, "\n", "\r\n") : contents);
 		}
 		try {
 			fs_->TryRemoveFile(mapped);
@@ -451,6 +453,7 @@ private:
 	std::string root_;
 	unique_ptr<FileSystem> fs_;
 	mutable idx_t remove_failures_remaining_ = 0;
+	bool write_crlf_ = false;
 };
 
 } // namespace
@@ -1455,13 +1458,14 @@ TEST_CASE("Exchange: ShuffleCache validates buffer byte settings", "[distributed
 	}
 }
 
-TEST_CASE("Exchange: ShuffleCache committed manifest replay via object storage backend", "[distributed][exchange]") {
+TEST_CASE("Exchange: ShuffleCache committed CRLF manifest replay via object storage backend",
+          "[distributed][exchange]") {
 	DuckDB db(nullptr);
 	Connection conn(db);
 	auto &context = *conn.context;
 
 	auto root = TestCreatePath("exchange_object_storage");
-	auto storage = std::make_shared<MockObjectShuffleStorage>(root);
+	auto storage = std::make_shared<MockObjectShuffleStorage>(root, 0, true);
 
 	ShuffleCacheConfig config;
 	config.exchange_id = "object_exchange";
