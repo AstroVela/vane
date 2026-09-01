@@ -494,6 +494,10 @@ def test_image_extra_installs_pillow():
     assert _requirements_for_extra("image") == {"pillow"}
 
 
+def test_audio_extra_installs_soundfile():
+    assert _requirements_for_extra("audio") == {"soundfile"}
+
+
 def test_video_extra_installs_video_dependencies():
     selected = _requirements_for_extra("video")
     assert {"pillow", "psutil"} <= selected
@@ -501,11 +505,11 @@ def test_video_extra_installs_video_dependencies():
     assert ("decord" in selected) is supports_decord
 
 
-def test_base_distribution_keeps_video_dependencies_optional():
+def test_base_distribution_keeps_media_dependencies_optional():
     base_requirements = set()
     for raw_requirement in requires("vane-ai") or []:
         requirement = Requirement(raw_requirement)
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"pillow", "psutil", "decord"}.isdisjoint(base_requirements)
+    assert {"pillow", "psutil", "decord", "soundfile"}.isdisjoint(base_requirements)
