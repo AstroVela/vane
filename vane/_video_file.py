@@ -260,7 +260,7 @@ class _NestedIOBlocker:
         # Do not echo a nested URL because manifests can contain signed query
         # parameters or embedded credentials.
         del url, flags, options
-        self.error = VideoFileFormatError("video metadata requires an external resource")
+        self.error = VideoFileFormatError("video metadata does not permit nested external resources")
         raise self.error
 
     def raise_if_error(self) -> None:

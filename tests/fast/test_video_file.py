@@ -515,8 +515,17 @@ def test_video_container_cleanup_does_not_replace_primary_error(monkeypatch):
 
 def test_video_nested_io_is_rejected():
     blocker = _video_file._NestedIOBlocker()
+    nested_url = "https://example.test/segment.ts?token=secret"
 
-    with pytest.raises(vane.VideoFileFormatError, match="external resource"):
-        blocker("file:///tmp/segment.ts", 0, {})
-    with pytest.raises(vane.VideoFileFormatError, match="external resource"):
+    with pytest.raises(
+        vane.VideoFileFormatError,
+        match="does not permit nested external resources",
+    ) as captured:
+        blocker(nested_url, 0, {})
+    assert nested_url not in str(captured.value)
+
+    with pytest.raises(
+        vane.VideoFileFormatError,
+        match="does not permit nested external resources",
+    ):
         blocker.raise_if_error()
