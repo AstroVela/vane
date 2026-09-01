@@ -600,65 +600,76 @@ def _decode_audio_file(
                     decoded_frame_limit = normalized_max_decoded // frame_bytes
                     frame_limit = min(normalized_max_frames, decoded_frame_limit)
                     if frame_limit == 0:
-                        raise AudioFileLimitError(
-                            f"one decoded audio frame requires {frame_bytes} bytes, "
-                            f"exceeding max_decoded_bytes={normalized_max_decoded}"
-                        )
+                        # A stream with an unknown total can still be empty. A
+                        # one-frame probe distinguishes EOF from a non-empty
+                        # result that cannot fit the requested output budget.
+                        probe = bytearray(frame_bytes)
+                        probe_frames = audio.buffer_read_into(probe, dtype="float64")
+                        proxy.raise_if_error()
+                        del probe
+                        if probe_frames < 0 or probe_frames > 1:
+                            raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                        if probe_frames:
+                            raise AudioFileLimitError(
+                                f"one decoded audio frame requires {frame_bytes} bytes, "
+                                f"exceeding max_decoded_bytes={normalized_max_decoded}"
+                            )
+                        samples = numpy.empty((0, metadata.channels), dtype=numpy.float64)
+                    else:
+                        # Unknown-length streams cannot accumulate both a decoded
+                        # output and a same-sized scratch buffer without violating
+                        # max_decoded_bytes. Spool bounded chunks, release the
+                        # scratch allocation, then materialize the exact ndarray
+                        # directly from the temporary file.
+                        with tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_audio_") as decoded_file:
+                            decoded_frames = 0
+                            while decoded_frames < frame_limit:
+                                requested_frames = min(64 * 1024, frame_limit - decoded_frames)
+                                chunk = bytearray(requested_frames * frame_bytes)
+                                chunk_frames = audio.buffer_read_into(chunk, dtype="float64")
+                                proxy.raise_if_error()
+                                if chunk_frames < 0 or chunk_frames > requested_frames:
+                                    raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                                chunk_bytes = chunk_frames * frame_bytes
+                                chunk_view = memoryview(chunk)[:chunk_bytes]
+                                while chunk_view:
+                                    written = decoded_file.write(chunk_view)
+                                    if written is None or written <= 0:
+                                        raise OSError("temporary audio spool made no write progress")
+                                    chunk_view = chunk_view[written:]
+                                decoded_frames += chunk_frames
+                                reached_end = chunk_frames < requested_frames
+                                del chunk_view
+                                del chunk
+                                if reached_end:
+                                    break
 
-                    # Unknown-length streams cannot accumulate both a decoded
-                    # output and a same-sized scratch buffer without violating
-                    # max_decoded_bytes. Spool bounded chunks, release the
-                    # scratch allocation, then materialize the exact ndarray
-                    # directly from the temporary file.
-                    with tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_audio_") as decoded_file:
-                        decoded_frames = 0
-                        while decoded_frames < frame_limit:
-                            requested_frames = min(64 * 1024, frame_limit - decoded_frames)
-                            chunk = bytearray(requested_frames * frame_bytes)
-                            chunk_frames = audio.buffer_read_into(chunk, dtype="float64")
-                            proxy.raise_if_error()
-                            if chunk_frames < 0 or chunk_frames > requested_frames:
-                                raise AudioFileFormatError("audio decoder returned an invalid frame count")
-                            chunk_bytes = chunk_frames * frame_bytes
-                            chunk_view = memoryview(chunk)[:chunk_bytes]
-                            while chunk_view:
-                                written = decoded_file.write(chunk_view)
-                                if written is None or written <= 0:
-                                    raise OSError("temporary audio spool made no write progress")
-                                chunk_view = chunk_view[written:]
-                            decoded_frames += chunk_frames
-                            reached_end = chunk_frames < requested_frames
-                            del chunk_view
-                            del chunk
-                            if reached_end:
-                                break
-
-                        if decoded_frames == frame_limit:
-                            extra = bytearray(frame_bytes)
-                            extra_frames = audio.buffer_read_into(extra, dtype="float64")
-                            proxy.raise_if_error()
-                            del extra
-                            if extra_frames < 0 or extra_frames > 1:
-                                raise AudioFileFormatError("audio decoder returned an invalid frame count")
-                            if extra_frames:
-                                if normalized_max_frames <= decoded_frame_limit:
+                            if decoded_frames == frame_limit:
+                                extra = bytearray(frame_bytes)
+                                extra_frames = audio.buffer_read_into(extra, dtype="float64")
+                                proxy.raise_if_error()
+                                del extra
+                                if extra_frames < 0 or extra_frames > 1:
+                                    raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                                if extra_frames:
+                                    if normalized_max_frames <= decoded_frame_limit:
+                                        raise AudioFileLimitError(
+                                            f"audio contains more than max_frames={normalized_max_frames} frames"
+                                        )
                                     raise AudioFileLimitError(
-                                        f"audio contains more than max_frames={normalized_max_frames} frames"
+                                        f"audio decode requires more than max_decoded_bytes={normalized_max_decoded}"
                                     )
-                                raise AudioFileLimitError(
-                                    f"audio decode requires more than max_decoded_bytes={normalized_max_decoded}"
-                                )
 
-                        samples = numpy.empty((decoded_frames, metadata.channels), dtype=numpy.float64)
-                        output_view = memoryview(samples).cast("B")
-                        decoded_file.seek(0)
-                        output_offset = 0
-                        while output_offset < len(output_view):
-                            read_count = decoded_file.readinto(output_view[output_offset:])
-                            if read_count is None or read_count <= 0:
-                                raise OSError("temporary audio spool ended before the decoded output")
-                            output_offset += read_count
-                        del output_view
+                            samples = numpy.empty((decoded_frames, metadata.channels), dtype=numpy.float64)
+                            output_view = memoryview(samples).cast("B")
+                            decoded_file.seek(0)
+                            output_offset = 0
+                            while output_offset < len(output_view):
+                                read_count = decoded_file.readinto(output_view[output_offset:])
+                                if read_count is None or read_count <= 0:
+                                    raise OSError("temporary audio spool ended before the decoded output")
+                                output_offset += read_count
+                            del output_view
                 else:
                     decoded_bytes = metadata.frames * metadata.channels * 8
                     if decoded_bytes > normalized_max_decoded:

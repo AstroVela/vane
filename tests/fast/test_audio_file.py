@@ -207,6 +207,63 @@ def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path,
     assert decoded.nbytes == 0
 
 
+@pytest.mark.parametrize(
+    ("channels", "decoded_frames"),
+    [(1, 0), (2, 0), (1, 1)],
+    ids=["empty-mono", "empty-stereo", "nonempty"],
+)
+def test_unknown_length_audio_probes_eof_under_sub_frame_byte_limit(
+    duckdb_cursor,
+    tmp_path,
+    monkeypatch,
+    channels,
+    decoded_frames,
+):
+    probes = []
+
+    class FakeSoundFileError(Exception):
+        pass
+
+    class UnknownLengthSoundFile:
+        samplerate = 8000
+        frames = _audio_file._MAX_BIGINT
+        format = "FLAC"
+        subtype = "PCM_16"
+
+        def __init__(self, stream, *, mode, closefd):
+            assert mode == "r"
+            assert closefd is False
+            self.channels = channels
+
+        def buffer_read_into(self, buffer, *, dtype):
+            assert dtype == "float64"
+            probes.append(len(buffer))
+            return decoded_frames
+
+        def close(self):
+            pass
+
+    class FakeSoundFileModule:
+        SoundFile = UnknownLengthSoundFile
+        SoundFileError = FakeSoundFileError
+
+    path = tmp_path / "unknown-total.flac"
+    path.write_bytes(b"encoded-audio")
+    value = vane.AudioFile(str(path), "audio/flac")
+    monkeypatch.setattr(_audio_file, "_load_soundfile", lambda: FakeSoundFileModule)
+
+    if decoded_frames:
+        with pytest.raises(vane.AudioFileLimitError, match="one decoded audio frame requires"):
+            value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
+    else:
+        decoded = value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
+        assert decoded.dtype == np.float64
+        assert decoded.shape == (0, channels)
+        assert decoded.nbytes == 0
+
+    assert probes == [channels * 8]
+
+
 def test_audio_metadata_can_use_header_without_reading_complete_waveform(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "PCM_16", frames=100_000, channels=2)
     path = tmp_path / "large.wav"
