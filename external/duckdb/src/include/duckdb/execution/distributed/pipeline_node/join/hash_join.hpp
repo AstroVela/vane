@@ -25,6 +25,8 @@ namespace distributed {
 class TaskIDCounter;
 
 class HashJoinNode : public PipelineNodeImpl, public std::enable_shared_from_this<HashJoinNode> {
+	friend class JoinTaskBuilderTestAccess;
+
 public:
 	HashJoinNode(NodeID node_id, const PlanConfig &plan_config, duckdb::vector<JoinCondition> conditions,
 	             JoinType join_type, duckdb::vector<LogicalType> output_types, duckdb::vector<LogicalType> delim_types,
