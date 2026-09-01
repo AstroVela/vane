@@ -29,6 +29,7 @@ add_library(
   importer.cpp
   merge_relation.cpp
   ai_sql_functions.cpp
+  audio_file_functions.cpp
   image_file_functions.cpp
   path_like.cpp
   pyconnection.cpp

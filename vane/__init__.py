@@ -15,6 +15,13 @@ the two distributions do not share Python modules or extension names.
 import importlib as _importlib
 import typing as _typing
 
+from vane._audio_file import (
+    AudioFileError,
+    AudioFileFormatError,
+    AudioFileLimitError,
+    AudioMetadata,
+    audio_metadata,
+)
 from vane._dbapi_type_object import (
     BINARY,
     DATETIME,
@@ -363,6 +370,10 @@ def __dir__() -> list[str]:
 
 __all__: list[str] = [
     "AudioFile",
+    "AudioFileError",
+    "AudioFileFormatError",
+    "AudioFileLimitError",
+    "AudioMetadata",
     "BINARY",
     "BinaryValue",
     "BinderException",
@@ -499,6 +510,7 @@ __all__: list[str] = [
     "apilevel",
     "append",
     "audio_file",
+    "audio_metadata",
     "array_type",
     "arrow",
     "begin",

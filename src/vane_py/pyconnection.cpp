@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/audio_file_functions.hpp"
 #include "vane_python/image_file_functions.hpp"
 #include "datasource_function.hpp"
 #include "vane_python/ai_sql_functions.hpp"
@@ -3148,6 +3149,11 @@ void InstantiateNewInstance(DuckDB &db) {
 	CreateScalarFunctionInfo image_file_info(std::move(image_file_set));
 	image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
 	system_catalog.CreateFunction(transaction, image_file_info);
+
+	auto audio_file_set = AudioFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo audio_file_info(std::move(audio_file_set));
+	audio_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, audio_file_info);
 
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));

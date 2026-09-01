@@ -27,6 +27,7 @@ if typing.TYPE_CHECKING:
 
     import vane.sqltypes as sqltypes
     import vane.udf as func
+    from vane._audio_file import AudioMetadata
     from vane._file import VaneFileReader
     from vane._image_file import ImageMetadata
     from vane.ai.options import EmbedOptions, PromptOptions
@@ -933,6 +934,7 @@ class Expression:
     def file_path(self) -> Expression: ...
     def file_size(self) -> Expression: ...
     def file_stat(self) -> Expression: ...
+    def audio_metadata(self) -> Expression: ...
     def image_file_metadata(self) -> Expression: ...
     def get_name(self) -> str: ...
     def isin(self, *args: _ExpressionLike) -> Expression: ...
@@ -1024,7 +1026,22 @@ class ImageFile(File):
     ) -> ImageMetadata: ...
 
 @typing.final
-class AudioFile(File): ...
+class AudioFile(File):
+    def metadata(
+        self,
+        *,
+        max_bytes: int = 8388608,
+        connection: DuckDBPyConnection | None = None,
+    ) -> AudioMetadata: ...
+    def to_numpy(
+        self,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 536870912,
+        max_frames: int = 100000000,
+        max_decoded_bytes: int = 536870912,
+        connection: DuckDBPyConnection | None = None,
+    ) -> np.ndarray[typing.Any, np.dtype[np.float64]]: ...
 
 @typing.final
 class VideoFile(File): ...

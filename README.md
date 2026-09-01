@@ -96,6 +96,7 @@ pip install 'vane-ai[openai]'   # OpenAI provider (anthropic / google / transfor
 pip install 'vane-ai[vllm]'     # Native vLLM inference on Linux x86-64
 pip install 'vane-ai[sglang]'   # Native SGLang 0.5.17 inference on Linux x86-64
 pip install 'vane-ai[image]'    # ndarray image inputs for AI providers (Pillow)
+pip install 'vane-ai[audio]'    # AudioFile metadata and waveform decoding (SoundFile)
 pip install 'vane-ai[video]'    # video data source (Pillow, psutil, decord)
 pip install 'vane-ai[milvus]'   # distributed full-row Milvus upserts
 pip install 'vane-ai[qdrant]'   # distributed full-point Qdrant upserts
