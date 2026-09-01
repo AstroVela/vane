@@ -41,6 +41,7 @@ _PYAV_UNSAFE_STREAM_OPTIONS_ERROR = (
 )
 
 _MIME_ALIASES = {
+    "application/ogg": "video/ogg",
     "video/avi": "video/x-msvideo",
     "video/mkv": "video/x-matroska",
     "video/mp2t": "video/mp2t",

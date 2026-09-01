@@ -30,7 +30,8 @@ def _encoded_video(
 ) -> bytes:
     buffer = io.BytesIO()
     with av.open(buffer, mode="w", format=container_format) as container:
-        stream = container.add_stream("mpeg4", rate=frame_rate)
+        codec = "libvpx" if container_format == "ogg" else "mpeg4"
+        stream = container.add_stream(codec, rate=frame_rate)
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv420p"
@@ -418,6 +419,8 @@ def test_video_metadata_rejects_contradictory_mime(duckdb_cursor, tmp_path, cont
         ("mp4", "application/octet-stream"),
         ("mp4", "video/*"),
         ("matroska", "video/mkv"),
+        ("ogg", "application/ogg"),
+        ("ogg", "video/ogg"),
     ],
 )
 def test_video_metadata_accepts_compatible_and_generic_mimes(
