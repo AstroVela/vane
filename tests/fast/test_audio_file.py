@@ -587,13 +587,27 @@ def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally
         value.to_numpy(max_decoded_bytes=63 * 2 * 8, connection=duckdb_cursor)
 
 
-def test_audio_file_rejects_finite_underreported_flac_frame_count(duckdb_cursor, tmp_path):
+def test_audio_file_rejects_decoder_output_beyond_finite_frame_count(duckdb_cursor, tmp_path, monkeypatch):
     payload, _ = _encoded_audio("FLAC", "PCM_16", frames=64, channels=2)
     path = tmp_path / "underreported-total.flac"
     path.write_bytes(_flac_with_total_samples(payload, 63))
     value = vane.AudioFile(str(path), "audio/flac")
 
     assert value.metadata(connection=duckdb_cursor).frames == 63
+
+    original_buffer_read_into = soundfile.SoundFile.buffer_read_into
+    read_count = 0
+
+    def expose_extra_frame(self, buffer, dtype):
+        nonlocal read_count
+        read_count += 1
+        decoded_frames = original_buffer_read_into(self, buffer, dtype=dtype)
+        if read_count == 2:
+            assert decoded_frames == 0
+            return 1
+        return decoded_frames
+
+    monkeypatch.setattr(soundfile.SoundFile, "buffer_read_into", expose_extra_frame)
     with pytest.raises(vane.AudioFileFormatError, match="more frames after reporting 63"):
         value.to_numpy(connection=duckdb_cursor)
 

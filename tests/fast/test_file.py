@@ -16,11 +16,18 @@ import vane
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 FILE_METHODS = ("exists", "mime_type", "open", "stat", "to_tempfile")
 IMAGE_FILE_METHODS = FILE_METHODS + ("decode", "metadata")
+AUDIO_FILE_METHODS = FILE_METHODS + ("metadata", "to_numpy")
 MEDIA_FILE_CASES = (
     ("image", "IMAGEFILE", vane.ImageFile, vane.image_file),
     ("audio", "AUDIOFILE", vane.AudioFile, vane.audio_file),
     ("video", "VIDEOFILE", vane.VideoFile, vane.video_file),
 )
+FILE_METHODS_BY_CLASS = {
+    vane.File: FILE_METHODS,
+    vane.ImageFile: IMAGE_FILE_METHODS,
+    vane.AudioFile: AUDIO_FILE_METHODS,
+    vane.VideoFile: FILE_METHODS,
+}
 
 
 def test_file_value_contract():
@@ -207,7 +214,7 @@ def test_media_file_python_value_contract(media, type_name, value_class, _constr
     generic = vane.File(value.url, value.content_type, value.position, value.size, value.checksum)
     assert value != generic
     assert len({value, generic}) == 2
-    expected_methods = IMAGE_FILE_METHODS if value_class is vane.ImageFile else FILE_METHODS
+    expected_methods = FILE_METHODS_BY_CLASS[value_class]
     assert {name for name in dir(value) if not name.startswith("_")} == set(FILE_FIELDS + expected_methods)
 
 
