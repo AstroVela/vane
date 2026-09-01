@@ -843,7 +843,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 	std::vector<std::shared_ptr<RayWorkerRuntime>> new_workers;
 	std::vector<std::shared_ptr<std::atomic<bool>>> new_worker_retirement_states;
 	bool worker_creation_succeeded = false;
-	std::weak_ptr<RayWorkerManager> weak_manager = shared_from_this();
+	std::weak_ptr<const RayWorkerManager> weak_manager = shared_from_this();
 	{
 		duckdb::PythonGILWrapper gil;
 		try {
