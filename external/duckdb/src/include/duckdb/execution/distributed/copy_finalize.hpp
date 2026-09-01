@@ -46,7 +46,8 @@ inline bool DistributedCopyExceptionIsNotFound(const std::exception &ex) {
 		return true;
 	}
 	auto error_number = extra_info.find("errno");
-	if (error_number != extra_info.end() && error_number->second == std::to_string(ENOENT)) {
+	if (error_number != extra_info.end() &&
+	    (error_number->second == std::to_string(ENOENT) || error_number->second == "404")) {
 		return true;
 	}
 
