@@ -63,6 +63,13 @@ from vane._image_file import (
     ImageMetadata,
     image_file_metadata,
 )
+from vane._video_file import (
+    VideoFileError,
+    VideoFileFormatError,
+    VideoFileLimitError,
+    VideoMetadata,
+    video_metadata,
+)
 
 if _typing.TYPE_CHECKING:
     from vane import ai as ai
@@ -490,6 +497,10 @@ __all__: list[str] = [
     "UnsignedShortValue",
     "Value",
     "VideoFile",
+    "VideoFileError",
+    "VideoFileFormatError",
+    "VideoFileLimitError",
+    "VideoMetadata",
     "VaneFileReader",
     "Warning",
     "WriteContext",
@@ -621,6 +632,7 @@ __all__: list[str] = [
     "type",
     "try_to_file",
     "video_file",
+    "video_metadata",
     "union_type",
     "unregister",
     "unregister_filesystem",

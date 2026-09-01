@@ -87,7 +87,8 @@ image = [ # ImageFile metadata/decoding and ndarray image inputs for AI provider
 audio = [ # AudioFile metadata and float64 waveform decoding
     "soundfile>=0.14",
 ]
-video = [ # video data source; decord is gated to Vane's supported native platform (it lacks modern macOS/ARM wheels)
+video = [ # VideoFile metadata plus the existing video data source
+    "av>=15,<18",
     "pillow>=10",
     "psutil>=5.9",
     "decord>=0.6; platform_system == 'Linux' and platform_machine == 'x86_64'",
@@ -101,6 +102,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "tiktoken",
     "pandas",  # used for pandas dataframes
     "adbc-driver-manager", # for the adbc driver
+    "av>=15,<18", # VideoFile metadata through PyAV/FFmpeg
     "pillow>=10", # used for image inputs and video frames
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
@@ -456,6 +458,7 @@ test = [ # dependencies used for running the complete test suite
     "pytz",
     "requests",
     "soundfile>=0.14",
+    "av>=15,<18",
     "urllib3",
     "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "torch>=2.2.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_version > '3.11'",

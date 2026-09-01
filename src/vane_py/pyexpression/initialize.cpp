@@ -474,6 +474,8 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	               [](const DuckDBPyExpression &self) { return self.FileFunction("image_file_metadata"); });
 	expression.def("audio_metadata",
 	               [](const DuckDBPyExpression &self) { return self.FileFunction("audio_metadata"); });
+	expression.def("video_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("video_metadata"); });
 }
 
 } // namespace duckdb
