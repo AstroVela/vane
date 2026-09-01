@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
   echo "Usage: scripts/run_native_tests.sh [unittest arguments...]"
   echo
-  echo "Build and run Vane's complete DuckDB unit test suite with pinned Arrow/Flight dependencies and C++20."
+  echo "Build and run Vane's DuckDB C++11 core and C++20 Arrow/Flight exchange tests."
 }
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,7 +60,7 @@ case "$generator" in
 esac
 
 cmake_args=(
-  -DCMAKE_CXX_STANDARD=20
+  -DCMAKE_CXX_STANDARD=11
   -DCMAKE_CXX_STANDARD_REQUIRED=ON
   -DCMAKE_CXX_EXTENSIONS=OFF
   -DBUILD_UNITTESTS=ON

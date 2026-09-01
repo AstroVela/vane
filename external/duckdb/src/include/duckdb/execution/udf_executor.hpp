@@ -45,15 +45,19 @@ public:
 	UDFOutputLease(const UDFOutputLease &) = delete;
 	UDFOutputLease &operator=(const UDFOutputLease &) = delete;
 	UDFOutputLease(UDFOutputLease &&other) noexcept
-	    : handoff_(std::exchange(other.handoff_, {})), release_(std::exchange(other.release_, {})) {
+	    : handoff_(std::move(other.handoff_)), release_(std::move(other.release_)) {
+		other.handoff_ = nullptr;
+		other.release_ = nullptr;
 	}
 	UDFOutputLease &operator=(UDFOutputLease &&other) noexcept {
 		if (this == &other) {
 			return *this;
 		}
 		ReleaseNoThrow();
-		handoff_ = std::exchange(other.handoff_, {});
-		release_ = std::exchange(other.release_, {});
+		handoff_ = std::move(other.handoff_);
+		release_ = std::move(other.release_);
+		other.handoff_ = nullptr;
+		other.release_ = nullptr;
 		return *this;
 	}
 	~UDFOutputLease() {
@@ -68,16 +72,18 @@ public:
 		if (!handoff_) {
 			return;
 		}
-		auto handoff = std::exchange(handoff_, {});
+		auto handoff = std::move(handoff_);
+		handoff_ = nullptr;
 		handoff();
 	}
 
 	void Release() {
-		handoff_ = {};
+		handoff_ = nullptr;
 		if (!release_) {
 			return;
 		}
-		auto release = std::exchange(release_, {});
+		auto release = std::move(release_);
+		release_ = nullptr;
 		release();
 	}
 

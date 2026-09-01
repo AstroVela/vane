@@ -49,8 +49,8 @@
 #include <duckdb/optimizer/remove_unused_columns.hpp>
 
 #include <exception>
-#include <optional>
 #include <tuple>
+#include <utility>
 
 static inline int DuckdbGetEnvIntMs(const char *name) {
 	const char *val = std::getenv(name);
@@ -324,10 +324,11 @@ static string QueryConnectionSettingForTest(DuckDBPyConnection &connection, cons
 }
 
 template <typename CALLABLE>
-static auto WithCopyRecoveryContext(py::object conn_obj, CALLABLE callback) {
-	auto run_callback = [&](duckdb::ClientContext &context) {
-		using Result = decltype(callback(context));
-		std::optional<Result> result;
+static auto WithCopyRecoveryContext(py::object conn_obj, CALLABLE callback)
+    -> decltype(callback(std::declval<duckdb::ClientContext &>())) {
+	using Result = decltype(callback(std::declval<duckdb::ClientContext &>()));
+	auto run_callback = [&](duckdb::ClientContext &context) -> Result {
+		distributed::Optional<Result> result;
 		std::exception_ptr callback_error;
 		{
 			py::gil_scoped_release release;

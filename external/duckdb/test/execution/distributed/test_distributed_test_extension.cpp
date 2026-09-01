@@ -47,6 +47,11 @@ static atomic<idx_t> distributed_test_create_worker_bind_calls {0};
 static atomic<idx_t> distributed_test_last_target_split_count {0};
 
 struct DistributedTestSourceUnit {
+	DistributedTestSourceUnit() = default;
+	DistributedTestSourceUnit(idx_t unit_id_p, string resource_p, string artifact_p)
+	    : unit_id(unit_id_p), resource(std::move(resource_p)), artifact(std::move(artifact_p)) {
+	}
+
 	idx_t unit_id = 0;
 	string resource;
 	string artifact;

@@ -62,13 +62,6 @@ set(CMAKE_CXX_STANDARD "11" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# MSVC otherwise reports the legacy 199711L value through __cplusplus even
-# when CMake selects C++20. DuckDB uses that macro for standard-library feature
-# selection, so make it reflect the actual language mode.
-if(MSVC)
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
-endif()
-
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_MACOSX_RPATH 1)
@@ -179,16 +172,6 @@ endif()
 option(BUILD_DISTRIBUTED_PIPELINE_NODE "Build the distributed pipeline_node module" ON)
 # Option to enable Arrow Flight-based exchange support for distributed execution.
 option(BUILD_DISTRIBUTED_EXCHANGE "Build Arrow Flight exchange support for distributed execution" ON)
-
-# The pinned Arrow/Flight packages require C++20. Raise the complete engine
-# build to the dependency requirement when exchange is enabled so standalone
-# builds and consumers do not depend on accidental target propagation.
-if(BUILD_DISTRIBUTED_EXCHANGE AND CMAKE_CXX_STANDARD LESS 20)
-  message(STATUS "Distributed Arrow Flight exchange requires C++20; upgrading CMAKE_CXX_STANDARD")
-  set(CMAKE_CXX_STANDARD
-      20
-      CACHE STRING "C++ standard to enforce" FORCE)
-endif()
 
 if (MUSL_ENABLED)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__MUSL_ENABLED__")

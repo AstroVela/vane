@@ -741,6 +741,11 @@ function(duckdb_add_library target_name)
   _duckdb_resolve_fork_version()
   _duckdb_print_summary()
 
+  # Keep the embedded engine pinned to its native language mode even if a
+  # downstream embedding project selects a newer default. The Arrow Flight
+  # exchange target declares its own C++20 requirement.
+  set(CMAKE_CXX_STANDARD 11)
+
   # Add DuckDB subdirectory - it will use our variables
   add_subdirectory("${DUCKDB_SOURCE_PATH}" duckdb EXCLUDE_FROM_ALL)
   if(TARGET clangd_cache)

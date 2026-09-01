@@ -38,6 +38,7 @@
 #include "duckdb/parser/query_node.hpp"
 
 #include <functional>
+#include <thread>
 
 using namespace duckdb;
 

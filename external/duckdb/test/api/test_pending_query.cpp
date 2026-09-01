@@ -106,10 +106,12 @@ TEST_CASE("ClientContext drains executor tasks during exception unwinding", "[ap
 
 		auto &executor = connection.context->GetExecutor();
 		duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
-		executor_task = std::thread([task = std::move(task)]() mutable {
-			task->Execute(TaskExecutionMode::PROCESS_ALL);
-			task.reset();
-		});
+		executor_task = std::thread(
+		    [](duckdb::shared_ptr<Task> task) {
+			    task->Execute(TaskExecutionMode::PROCESS_ALL);
+			    task.reset();
+		    },
+		    std::move(task));
 
 		{
 			std::unique_lock<std::mutex> lock(state->lock);
@@ -151,10 +153,12 @@ TEST_CASE("Successful query cleanup clears executor cancellation interrupt", "[a
 	auto state = make_shared_ptr<BlockingExecutorTaskState>();
 	auto &executor = connection.context->GetExecutor();
 	duckdb::shared_ptr<Task> task = make_shared_ptr<BlockingExecutorTask>(executor, state);
-	std::thread executor_task([task = std::move(task)]() mutable {
-		task->Execute(TaskExecutionMode::PROCESS_ALL);
-		task.reset();
-	});
+	std::thread executor_task(
+	    [](duckdb::shared_ptr<Task> task) {
+		    task->Execute(TaskExecutionMode::PROCESS_ALL);
+		    task.reset();
+	    },
+	    std::move(task));
 
 	{
 		std::unique_lock<std::mutex> lock(state->lock);
