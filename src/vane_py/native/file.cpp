@@ -12,7 +12,6 @@
 #include "vane_python/python_objects.hpp"
 
 #include <mutex>
-#include <type_traits>
 #include <utility>
 
 namespace duckdb {
@@ -117,8 +116,7 @@ static FILE_TYPE FileFromPickleState(const py::tuple &state, const char *class_n
 }
 
 template <class FILE_TYPE>
-static void BindMediaFileClass(py::handle &m, const char *class_name) {
-	auto file = py::class_<FILE_TYPE, PythonFile>(m, class_name, py::module_local(), py::is_final());
+static void BindMediaFileClass(py::class_<FILE_TYPE, PythonFile> &file, const char *class_name) {
 	file.def(py::init([](const py::object &url, const py::object &content_type, const py::object &position,
 	                     const py::object &size, const py::object &checksum) {
 		         return FileFromPython<FILE_TYPE>(url, content_type, position, size, checksum);
@@ -128,37 +126,36 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 	file.def(
 	    py::pickle([](const FILE_TYPE &value) { return value.State(); },
 	               [class_name](const py::tuple &state) { return FileFromPickleState<FILE_TYPE>(state, class_name); }));
-	if constexpr (std::is_same_v<FILE_TYPE, PythonImageFile>) {
-		file.def(
-		    "metadata",
-		    [](const FILE_TYPE &value, const py::object &max_bytes, const py::object &max_pixels,
-		       shared_ptr<DuckDBPyConnection> connection) {
-			    return py::module_::import("vane._image_file")
-			        .attr("_image_file_metadata_value")(
-			            py::cast(value, py::return_value_policy::copy), py::arg("max_bytes") = max_bytes,
-			            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
-		    },
-		    "Inspect bounded encoded image headers without decoding pixels", py::kw_only(),
-		    py::arg("max_bytes") = DEFAULT_IMAGE_METADATA_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
-		    py::arg("connection") = py::none());
-		file.def(
-		    "decode",
-		    [](const FILE_TYPE &value, const py::object &mode, const py::object &buffer_size,
-		       const py::object &max_input_bytes, const py::object &max_pixels, const py::object &max_decoded_bytes,
-		       shared_ptr<DuckDBPyConnection> connection) {
-			    return py::module_::import("vane._image_file")
-			        .attr("_decode_image_file")(py::cast(value, py::return_value_policy::copy), mode, buffer_size,
-			                                    py::arg("max_input_bytes") = max_input_bytes,
-			                                    py::arg("max_pixels") = max_pixels,
-			                                    py::arg("max_decoded_bytes") = max_decoded_bytes,
-			                                    py::arg("connection") = std::move(connection));
-		    },
-		    "Decode frame zero into a fully loaded, detached Pillow image", py::arg("mode") = py::none(),
-		    py::arg("buffer_size") = DEFAULT_IMAGE_BUFFER_SIZE, py::kw_only(),
-		    py::arg("max_input_bytes") = DEFAULT_IMAGE_MAX_INPUT_BYTES,
-		    py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
-		    py::arg("max_decoded_bytes") = DEFAULT_IMAGE_MAX_DECODED_BYTES, py::arg("connection") = py::none());
-	}
+}
+
+static void BindImageFileMethods(py::class_<PythonImageFile, PythonFile> &file) {
+	file.def(
+	    "metadata",
+	    [](const PythonImageFile &value, const py::object &max_bytes, const py::object &max_pixels,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._image_file")
+		        .attr("_image_file_metadata_value")(
+		            py::cast(value, py::return_value_policy::copy), py::arg("max_bytes") = max_bytes,
+		            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+	    },
+	    "Inspect bounded encoded image headers without decoding pixels", py::kw_only(),
+	    py::arg("max_bytes") = DEFAULT_IMAGE_METADATA_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+	    py::arg("connection") = py::none());
+	file.def(
+	    "decode",
+	    [](const PythonImageFile &value, const py::object &mode, const py::object &buffer_size,
+	       const py::object &max_input_bytes, const py::object &max_pixels, const py::object &max_decoded_bytes,
+	       shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._image_file")
+		        .attr("_decode_image_file")(
+		            py::cast(value, py::return_value_policy::copy), mode, buffer_size,
+		            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_pixels") = max_pixels,
+		            py::arg("max_decoded_bytes") = max_decoded_bytes, py::arg("connection") = std::move(connection));
+	    },
+	    "Decode frame zero into a fully loaded, detached Pillow image", py::arg("mode") = py::none(),
+	    py::arg("buffer_size") = DEFAULT_IMAGE_BUFFER_SIZE, py::kw_only(),
+	    py::arg("max_input_bytes") = DEFAULT_IMAGE_MAX_INPUT_BYTES, py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
+	    py::arg("max_decoded_bytes") = DEFAULT_IMAGE_MAX_DECODED_BYTES, py::arg("connection") = py::none());
 }
 
 static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
@@ -304,9 +301,13 @@ void PythonFile::Initialize(py::handle &m) {
 	file.def("__hash__", &PythonFile::Hash);
 	file.def(py::pickle([](const PythonFile &value) { return value.State(); },
 	                    [](const py::tuple &state) { return FileFromPickleState<PythonFile>(state, "File"); }));
-	BindMediaFileClass<PythonImageFile>(m, "ImageFile");
-	BindMediaFileClass<PythonAudioFile>(m, "AudioFile");
-	BindMediaFileClass<PythonVideoFile>(m, "VideoFile");
+	auto image_file = py::class_<PythonImageFile, PythonFile>(m, "ImageFile", py::module_local(), py::is_final());
+	BindMediaFileClass(image_file, "ImageFile");
+	BindImageFileMethods(image_file);
+	auto audio_file = py::class_<PythonAudioFile, PythonFile>(m, "AudioFile", py::module_local(), py::is_final());
+	BindMediaFileClass(audio_file, "AudioFile");
+	auto video_file = py::class_<PythonVideoFile, PythonFile>(m, "VideoFile", py::module_local(), py::is_final());
+	BindMediaFileClass(video_file, "VideoFile");
 
 	// Native media subclasses are registered above; keep the public hierarchy
 	// closed so user-defined subclasses cannot add state to governed values.
