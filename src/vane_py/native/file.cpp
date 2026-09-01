@@ -24,6 +24,11 @@ static constexpr uint64_t DEFAULT_IMAGE_MAX_PIXELS = 100000000;
 static constexpr uint64_t DEFAULT_IMAGE_BUFFER_SIZE = 1024 * 1024;
 static constexpr uint64_t DEFAULT_IMAGE_MAX_INPUT_BYTES = 256 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_IMAGE_MAX_DECODED_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_METADATA_BYTES = 8 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 
 static string PythonTypeName(const py::handle &value) {
 	return py::str(py::type::of(value)).cast<string>();
@@ -157,6 +162,34 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 		    py::arg("max_input_bytes") = DEFAULT_IMAGE_MAX_INPUT_BYTES,
 		    py::arg("max_pixels") = DEFAULT_IMAGE_MAX_PIXELS,
 		    py::arg("max_decoded_bytes") = DEFAULT_IMAGE_MAX_DECODED_BYTES, py::arg("connection") = py::none());
+	} else if constexpr (std::is_same_v<FILE_TYPE, PythonAudioFile>) {
+		file.def(
+		    "metadata",
+		    [](const FILE_TYPE &value, const py::object &max_bytes, shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._audio_file")
+			        .attr("_audio_file_metadata_value")(py::cast(value, py::return_value_policy::copy),
+			                                            py::arg("max_bytes") = max_bytes,
+			                                            py::arg("connection") = std::move(connection));
+		    },
+		    "Inspect bounded encoded audio metadata without decoding samples", py::kw_only(),
+		    py::arg("max_bytes") = DEFAULT_AUDIO_METADATA_BYTES, py::arg("connection") = py::none());
+		file.def(
+		    "to_numpy",
+		    [](const FILE_TYPE &value, const py::object &buffer_size, const py::object &max_input_bytes,
+		       const py::object &max_frames, const py::object &max_decoded_bytes,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._audio_file")
+			        .attr("_decode_audio_file")(py::cast(value, py::return_value_policy::copy), buffer_size,
+			                                    py::arg("max_input_bytes") = max_input_bytes,
+			                                    py::arg("max_frames") = max_frames,
+			                                    py::arg("max_decoded_bytes") = max_decoded_bytes,
+			                                    py::arg("connection") = std::move(connection));
+		    },
+		    "Decode audio samples into a detached float64 (frames, channels) NumPy array",
+		    py::arg("buffer_size") = DEFAULT_AUDIO_BUFFER_SIZE, py::kw_only(),
+		    py::arg("max_input_bytes") = DEFAULT_AUDIO_MAX_INPUT_BYTES,
+		    py::arg("max_frames") = DEFAULT_AUDIO_MAX_FRAMES,
+		    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES, py::arg("connection") = py::none());
 	}
 }
 

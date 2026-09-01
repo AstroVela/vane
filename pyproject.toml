@@ -84,6 +84,9 @@ sglang = [
 image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
 ]
+audio = [ # AudioFile metadata and float64 waveform decoding
+    "soundfile>=0.14",
+]
 video = [ # video data source; decord is gated to Vane's supported native platform (it lacks modern macOS/ARM wheels)
     "pillow>=10",
     "psutil>=5.9",
@@ -101,6 +104,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "pillow>=10", # used for image inputs and video frames
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
+    "soundfile>=0.14", # AudioFile metadata and waveform decoding
 ]
 
 ######################################################################################################
@@ -451,6 +455,7 @@ test = [ # dependencies used for running the complete test suite
     "pyspark",
     "pytz",
     "requests",
+    "soundfile>=0.14",
     "urllib3",
     "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",
     "torch>=2.2.2; sys_platform != 'win32' or platform_machine != 'ARM64' or python_version > '3.11'",

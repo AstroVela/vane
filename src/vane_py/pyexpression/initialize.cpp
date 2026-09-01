@@ -472,6 +472,8 @@ void DuckDBPyExpression::Initialize(py::module_ &m) {
 	expression.def("file_mime_type", &DuckDBPyExpression::FileMimeType, py::arg("detect") = "metadata");
 	expression.def("image_file_metadata",
 	               [](const DuckDBPyExpression &self) { return self.FileFunction("image_file_metadata"); });
+	expression.def("audio_metadata",
+	               [](const DuckDBPyExpression &self) { return self.FileFunction("audio_metadata"); });
 }
 
 } // namespace duckdb
