@@ -1331,7 +1331,7 @@ static PyLogicalPlan LogicalPlanFromDuckDBRelation(py::object relation_obj, py::
 	const bool is_write_relation =
 	    rel->type == RelationType::CREATE_TABLE_RELATION || rel->type == RelationType::INSERT_RELATION ||
 	    rel->type == RelationType::DELETE_RELATION || rel->type == RelationType::UPDATE_RELATION ||
-	    rel->type == RelationType::WRITE_FILE_RELATION;
+	    rel->type == RelationType::WRITE_FILE_RELATION || dynamic_cast<MergeRelation *>(rel.get()) != nullptr;
 	const bool is_datasink_relation = dynamic_cast<DataSinkRelation *>(rel.get()) != nullptr;
 	if (plan_kind == DuckDBRelationPlanKind::WRITE || plan_kind == DuckDBRelationPlanKind::DATA_SINK) {
 		if (!rel->context) {

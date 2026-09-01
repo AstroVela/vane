@@ -81,7 +81,7 @@ vllm = [
 sglang = [
     "sglang==0.5.17; platform_system == 'Linux' and platform_machine == 'x86_64'", # validated public async Engine API and lifecycle target
 ]
-image = [ # ndarray image inputs for AI providers
+image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
 ]
 video = [ # video data source; decord is gated to Vane's supported native platform (it lacks modern macOS/ARM wheels)

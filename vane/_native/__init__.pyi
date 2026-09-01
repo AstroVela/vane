@@ -20,6 +20,7 @@ if typing.TYPE_CHECKING:
     import fsspec  # type: ignore[import-not-found, import-untyped, unused-ignore]
     import numpy as np
     import pandas  # type: ignore[import-not-found, import-untyped, unused-ignore]
+    import PIL.Image  # type: ignore[import-not-found, unused-ignore]
     import polars  # type: ignore[import-not-found, import-untyped, unused-ignore]
     import pyarrow.lib  # type: ignore[import-untyped, unused-ignore]
     from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
@@ -27,6 +28,7 @@ if typing.TYPE_CHECKING:
     import vane.sqltypes as sqltypes
     import vane.udf as func
     from vane._file import VaneFileReader
+    from vane._image_file import ImageMetadata
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
@@ -521,6 +523,15 @@ class DuckDBPyRelation:
     ) -> DuckDBPyRelation: ...
     def insert(self, values: lst[object]) -> None: ...
     def insert_into(self, table_name: str) -> None: ...
+    def merge_into(
+        self,
+        target_table: str,
+        condition: Expression | str | typing.Sequence[str],
+        when_clauses: lst[str] | tuple[str, ...],
+        *,
+        target_alias: str = "target",
+        source_alias: str = "source",
+    ) -> None: ...
     def intersect(self, other_rel: DuckDBPyRelation) -> DuckDBPyRelation: ...
     def join(
         self,
@@ -922,6 +933,7 @@ class Expression:
     def file_path(self) -> Expression: ...
     def file_size(self) -> Expression: ...
     def file_stat(self) -> Expression: ...
+    def image_file_metadata(self) -> Expression: ...
     def get_name(self) -> str: ...
     def isin(self, *args: _ExpressionLike) -> Expression: ...
     def isnotin(self, *args: _ExpressionLike) -> Expression: ...
@@ -992,7 +1004,24 @@ class File:
     def url(self) -> str: ...
 
 @typing.final
-class ImageFile(File): ...
+class ImageFile(File):
+    def decode(
+        self,
+        mode: str | None = None,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 268435456,
+        max_pixels: int = 100000000,
+        max_decoded_bytes: int = 536870912,
+        connection: DuckDBPyConnection | None = None,
+    ) -> PIL.Image.Image: ...
+    def metadata(
+        self,
+        *,
+        max_bytes: int = 1048576,
+        max_pixels: int = 100000000,
+        connection: DuckDBPyConnection | None = None,
+    ) -> ImageMetadata: ...
 
 @typing.final
 class AudioFile(File): ...

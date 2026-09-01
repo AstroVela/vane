@@ -6,6 +6,7 @@
 
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 #include "vane_python/pyrelation.hpp"
+#include "vane_python/merge_relation.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pytype.hpp"
 #include "vane_python/pyresult.hpp"
@@ -48,6 +49,7 @@
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -2251,6 +2253,107 @@ void DuckDBPyRelation::Delete(const py::object &where) {
 	PyExecuteRelation(delete_relation);
 }
 
+static string MergeConditionToSQL(const py::object &condition) {
+	if (py::isinstance<py::str>(condition)) {
+		auto condition_sql = condition.cast<string>();
+		StringUtil::Trim(condition_sql);
+		if (condition_sql.empty()) {
+			throw InvalidInputException("Please provide a non-empty MERGE condition");
+		}
+		return " ON " + condition_sql;
+	}
+
+	if (py::isinstance<py::sequence>(condition)) {
+		auto using_columns = py::list(condition);
+		if (using_columns.size() == 0) {
+			throw InvalidInputException("Please provide at least one MERGE USING column");
+		}
+		string result = " USING (";
+		for (idx_t column_idx = 0; column_idx < using_columns.size(); column_idx++) {
+			auto column = using_columns[column_idx];
+			if (!py::isinstance<py::str>(column)) {
+				throw InvalidInputException("Please provide MERGE USING columns as strings");
+			}
+			auto column_name = column.cast<string>();
+			if (column_name.empty()) {
+				throw InvalidInputException("MERGE USING column names must not be empty");
+			}
+			if (column_idx > 0) {
+				result += ", ";
+			}
+			result += KeywordHelper::WriteOptionallyQuoted(column_name);
+		}
+		return result + ")";
+	}
+
+	shared_ptr<DuckDBPyExpression> expression;
+	if (py::try_cast<shared_ptr<DuckDBPyExpression>>(condition, expression)) {
+		return " ON " + expression->GetExpression().ToString();
+	}
+	throw InvalidInputException("Please provide a MERGE condition as an Expression, SQL string, or column sequence");
+}
+
+static vector<string> MergeWhenClauses(const py::object &when_clauses) {
+	if (py::isinstance<py::str>(when_clauses) || !py::isinstance<py::sequence>(when_clauses)) {
+		throw InvalidInputException("Please provide 'when_clauses' as a sequence of SQL strings");
+	}
+	auto clauses = py::list(when_clauses);
+	if (clauses.size() == 0) {
+		throw InvalidInputException("Please provide at least one MERGE WHEN clause");
+	}
+	vector<string> result;
+	result.reserve(clauses.size());
+	for (auto clause_obj : clauses) {
+		if (!py::isinstance<py::str>(clause_obj)) {
+			throw InvalidInputException("Please provide every MERGE WHEN clause as a SQL string");
+		}
+		auto clause = clause_obj.cast<string>();
+		StringUtil::Trim(clause);
+		auto tokens = Parser::Tokenize(clause);
+		if (tokens.empty() || tokens[0].start != 0 || tokens[0].type != SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD ||
+		    !StringUtil::CIStartsWith(clause, "WHEN")) {
+			throw InvalidInputException("Every MERGE action must start with WHEN");
+		}
+		result.push_back(std::move(clause));
+	}
+	return result;
+}
+
+void DuckDBPyRelation::MergeInto(const string &target_table, const py::object &condition,
+                                 const py::object &when_clauses, const string &target_alias,
+                                 const string &source_alias) {
+	AssertRelation();
+	if (target_alias.empty() || source_alias.empty()) {
+		throw InvalidInputException("MERGE target and source aliases must not be empty");
+	}
+	if (StringUtil::CIEquals(target_alias, source_alias)) {
+		throw InvalidInputException("MERGE target and source aliases must be different");
+	}
+
+	auto target = QualifiedName::Parse(target_table);
+	auto merge_sql = "MERGE INTO " + target.ToString() + " AS " + KeywordHelper::WriteOptionallyQuoted(target_alias) +
+	                 " USING (SELECT NULL) AS " + KeywordHelper::WriteOptionallyQuoted(source_alias) +
+	                 MergeConditionToSQL(condition);
+	for (const auto &clause : MergeWhenClauses(when_clauses)) {
+		merge_sql += "\n" + clause;
+	}
+
+	auto statements = rel->context->GetContext()->ParseStatements(merge_sql);
+	if (statements.size() != 1 || statements[0]->type != StatementType::MERGE_INTO_STATEMENT) {
+		throw InvalidInputException("MERGE relation requires exactly one MERGE INTO statement");
+	}
+	if (!statements[0]->named_param_map.empty()) {
+		throw InvalidInputException("MERGE relation does not accept prepared parameters");
+	}
+	auto statement = unique_ptr_cast<SQLStatement, MergeIntoStatement>(std::move(statements[0]));
+	auto source = rel->Alias(source_alias);
+	auto merge = make_shared_ptr<MergeRelation>(std::move(source), std::move(statement));
+	if (TryDispatchToRunner(merge, connection_owner, "MERGE INTO")) {
+		return;
+	}
+	PyExecuteRelation(merge);
+}
+
 void DuckDBPyRelation::Insert(const py::object &params) const {
 	AssertRelation();
 	if (this->rel->type != RelationType::TABLE_RELATION) {
@@ -2894,6 +2997,9 @@ resizeTFTree();
 py::str DuckDBPyRelation::Type() {
 	if (!rel) {
 		return py::str("QUERY_RESULT");
+	}
+	if (dynamic_cast<MergeRelation *>(rel.get())) {
+		return py::str("MERGE_RELATION");
 	}
 	return py::str(RelationTypeToString(rel->type));
 }

@@ -281,6 +281,8 @@ public:
 	void Insert(const py::object &params = py::list()) const;
 	void Update(const py::object &set, const py::object &where = py::none());
 	void Delete(const py::object &where = py::none());
+	void MergeInto(const string &target_table, const py::object &condition, const py::object &when_clauses,
+	               const string &target_alias, const string &source_alias);
 
 	void Create(const string &table, const py::object &properties, const py::object &partition_by);
 

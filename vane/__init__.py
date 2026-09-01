@@ -49,6 +49,13 @@ from vane._file import (
     try_to_file,
     video_file,
 )
+from vane._image_file import (
+    ImageFileError,
+    ImageFileFormatError,
+    ImageFileLimitError,
+    ImageMetadata,
+    image_file_metadata,
+)
 
 if _typing.TYPE_CHECKING:
     from vane import ai as ai
@@ -407,6 +414,10 @@ __all__: list[str] = [
     "HugeIntegerValue",
     "IOException",
     "ImageFile",
+    "ImageFileError",
+    "ImageFileFormatError",
+    "ImageFileLimitError",
+    "ImageMetadata",
     "IntegerValue",
     "IntegrityError",
     "InternalError",
@@ -548,6 +559,7 @@ __all__: list[str] = [
     "get_table_names",
     "guess_mime_type",
     "image_file",
+    "image_file_metadata",
     "install_extension",
     "interrupt",
     "limit",

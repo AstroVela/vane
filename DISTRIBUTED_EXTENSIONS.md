@@ -400,13 +400,15 @@ contract before translation, task selection, preparation, or artifact creation.
 There is no mode inference: the physical shape must exactly match the declared
 mode.
 
-Python relation INSERT, UPDATE, DELETE, and CTAS mutations follow the selected
+Python relation INSERT, UPDATE, DELETE, MERGE, and CTAS mutations follow the selected
 backend strictly. This includes `insert_into`, row-value `insert`, `update`,
-`delete`, and `create`/`to_table`. An unset, empty, or explicit
+`delete`, `merge_into`, and `create`/`to_table`. An unset, empty, or explicit
 `VANE_RUNNER=ray` dispatches the mutation to Ray and requires the target to
 translate to a registered distributed extension write; an ordinary DuckDB
 table target therefore reports an unsupported distributed operator instead of
-executing locally. `VANE_RUNNER=local-fast` selects native DuckDB execution as
+executing locally. For MERGE, the target catalog's `PlanMergeInto` implementation
+must likewise return an extension physical root with an
+`ExtensionWriteTaskProvider`. `VANE_RUNNER=local-fast` selects native DuckDB execution as
 a separate backend. Other runner values are not mutation backends, and neither
 backend falls back to the other.
 

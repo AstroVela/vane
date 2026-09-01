@@ -5,6 +5,7 @@
 // Modified by Vane contributors.
 
 #include "vane_python/pyconnection/pyconnection.hpp"
+#include "vane_python/image_file_functions.hpp"
 #include "datasource_function.hpp"
 #include "vane_python/ai_sql_functions.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
@@ -3142,6 +3143,11 @@ void InstantiateNewInstance(DuckDB &db) {
 	auto transaction = CatalogTransaction::GetSystemTransaction(db_instance);
 
 	system_catalog.CreateFunction(transaction, scan_info);
+
+	auto image_file_set = ImageFileFunctions::GetFunctions();
+	CreateScalarFunctionInfo image_file_info(std::move(image_file_set));
+	image_file_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	system_catalog.CreateFunction(transaction, image_file_info);
 
 	auto vllm_set = VLLMFunction::GetFunctions();
 	CreateScalarFunctionInfo vllm_info(std::move(vllm_set));
