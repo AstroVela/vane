@@ -198,7 +198,7 @@ void QueryLifecycleCoordinator::RegisterImmediate(const std::string &query_id, c
 	CompleteRegistration(registration, true);
 }
 
-std::optional<QueryLifecycleCoordinator::Operation>
+Optional<QueryLifecycleCoordinator::Operation>
 QueryLifecycleCoordinator::BeginOperation(const std::string &query_id, const std::string &requested_owner_query_id,
                                           bool create_if_missing) {
 	if (query_id.empty()) {
@@ -206,16 +206,16 @@ QueryLifecycleCoordinator::BeginOperation(const std::string &query_id, const std
 	}
 	std::lock_guard<std::mutex> guard(mutex_);
 	if (shutdown_started_) {
-		return std::nullopt;
+		return nullopt;
 	}
 
 	auto lifecycle = ResolveLocked(query_id);
 	if (!lifecycle && requested_owner_query_id.empty()) {
-		return std::nullopt;
+		return nullopt;
 	}
 	if (!lifecycle) {
 		if (!create_if_missing) {
-			return std::nullopt;
+			return nullopt;
 		}
 		auto owner_binding = ResolveLocked(requested_owner_query_id);
 		if (owner_binding && owner_binding->ref.owner_query_id != requested_owner_query_id) {
@@ -228,7 +228,7 @@ QueryLifecycleCoordinator::BeginOperation(const std::string &query_id, const std
 		}
 		lifecycle = owner_lifecycle ? owner_lifecycle : CreateLifecycleLocked(requested_owner_query_id);
 		if (lifecycle->phase != Phase::OPEN) {
-			return std::nullopt;
+			return nullopt;
 		}
 		BindQueryLocked(lifecycle, query_id);
 		lifecycle->registered_query_ids.insert(query_id);
@@ -244,7 +244,7 @@ QueryLifecycleCoordinator::BeginOperation(const std::string &query_id, const std
 		                         " existing=" + lifecycle->ref.owner_query_id + " requested=" + owner_query_id);
 	}
 	if (lifecycle->phase != Phase::OPEN) {
-		return std::nullopt;
+		return nullopt;
 	}
 	lifecycle->active_operations++;
 	return Operation {lifecycle->ref};
@@ -285,7 +285,7 @@ void QueryLifecycleCoordinator::WaitForAllOperations() {
 	std::unique_lock<std::mutex> guard(mutex_);
 	condition_.wait(guard, [&]() {
 		return std::all_of(lifecycles_by_owner_.begin(), lifecycles_by_owner_.end(),
-		                   [](const auto &entry) { return entry.second->active_operations == 0; });
+		                   [](const LifecycleMap::value_type &entry) { return entry.second->active_operations == 0; });
 	});
 }
 
@@ -364,11 +364,11 @@ void QueryLifecycleCoordinator::WaitForAttemptLocked(std::unique_lock<std::mutex
 	attempt->waiters--;
 }
 
-std::optional<QueryLifecycleCoordinator::Abort>
+Optional<QueryLifecycleCoordinator::Abort>
 QueryLifecycleCoordinator::BeginAbortLocked(std::unique_lock<std::mutex> &guard,
                                             const std::shared_ptr<LifecycleState> &lifecycle) {
 	if (lifecycle->phase == Phase::QUIESCED || lifecycle->phase == Phase::DROPPING) {
-		return std::nullopt;
+		return nullopt;
 	}
 	if (lifecycle->abort_attempt) {
 		auto attempt = lifecycle->abort_attempt;
@@ -376,7 +376,7 @@ QueryLifecycleCoordinator::BeginAbortLocked(std::unique_lock<std::mutex> &guard,
 		if (attempt->error) {
 			throw std::runtime_error(*attempt->error);
 		}
-		return std::nullopt;
+		return nullopt;
 	}
 
 	if (lifecycle->phase == Phase::OPEN) {
@@ -391,11 +391,11 @@ QueryLifecycleCoordinator::BeginAbortLocked(std::unique_lock<std::mutex> &guard,
 	return Abort {lifecycle->ref, OrderedQueryIds(*lifecycle), attempt->token, lifecycle->active_operations != 0};
 }
 
-std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::BeginAbort(const std::string &query_id) {
+Optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::BeginAbort(const std::string &query_id) {
 	std::unique_lock<std::mutex> guard(mutex_);
 	auto lifecycle = ResolveLocked(query_id);
 	if (!lifecycle) {
-		return std::nullopt;
+		return nullopt;
 	}
 	if (lifecycle->abort_attempt) {
 		return BeginAbortLocked(guard, lifecycle);
@@ -404,7 +404,7 @@ std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::Begin
 	return BeginAbortLocked(guard, lifecycle);
 }
 
-std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::BeginAbort(const Teardown &teardown) {
+Optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::BeginAbort(const Teardown &teardown) {
 	std::unique_lock<std::mutex> guard(mutex_);
 	auto lifecycle = FindLifecycleLocked(teardown.lifecycle);
 	if (!lifecycle || !lifecycle->teardown_attempt || lifecycle->teardown_attempt->token != teardown.token) {
@@ -414,7 +414,7 @@ std::optional<QueryLifecycleCoordinator::Abort> QueryLifecycleCoordinator::Begin
 	return BeginAbortLocked(guard, lifecycle);
 }
 
-void QueryLifecycleCoordinator::CompleteAbort(const Abort &abort, const std::optional<std::string> &error) {
+void QueryLifecycleCoordinator::CompleteAbort(const Abort &abort, const Optional<std::string> &error) {
 	std::shared_ptr<Attempt> attempt;
 	{
 		std::lock_guard<std::mutex> guard(mutex_);
@@ -432,12 +432,11 @@ void QueryLifecycleCoordinator::CompleteAbort(const Abort &abort, const std::opt
 	condition_.notify_all();
 }
 
-std::optional<QueryLifecycleCoordinator::Teardown>
-QueryLifecycleCoordinator::BeginTeardown(const std::string &query_id) {
+Optional<QueryLifecycleCoordinator::Teardown> QueryLifecycleCoordinator::BeginTeardown(const std::string &query_id) {
 	std::unique_lock<std::mutex> guard(mutex_);
 	auto lifecycle = ResolveLocked(query_id);
 	if (!lifecycle) {
-		return std::nullopt;
+		return nullopt;
 	}
 	if (lifecycle->teardown_attempt) {
 		auto attempt = lifecycle->teardown_attempt;
@@ -445,7 +444,7 @@ QueryLifecycleCoordinator::BeginTeardown(const std::string &query_id) {
 		if (attempt->error) {
 			throw std::runtime_error(*attempt->error);
 		}
-		return std::nullopt;
+		return nullopt;
 	}
 	EnsureTransitionAllowedLocked(query_id, "tear down");
 	if (lifecycle->phase == Phase::OPEN) {
@@ -477,7 +476,7 @@ void QueryLifecycleCoordinator::MarkDropping(const Teardown &teardown) {
 	lifecycle->phase = Phase::DROPPING;
 }
 
-void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown, const std::optional<std::string> &error) {
+void QueryLifecycleCoordinator::CompleteTeardown(const Teardown &teardown, const Optional<std::string> &error) {
 	std::shared_ptr<Attempt> attempt;
 	{
 		std::lock_guard<std::mutex> guard(mutex_);
@@ -538,10 +537,12 @@ bool QueryLifecycleCoordinator::BeginShutdown() {
 		}
 	}
 	condition_.wait(guard, [&]() {
-		return std::all_of(lifecycles_by_owner_.begin(), lifecycles_by_owner_.end(), [](const auto &entry) {
-			const auto &lifecycle = *entry.second;
-			return lifecycle.pending_registrations.empty() && !lifecycle.abort_attempt && !lifecycle.teardown_attempt;
-		});
+		return std::all_of(lifecycles_by_owner_.begin(), lifecycles_by_owner_.end(),
+		                   [](const LifecycleMap::value_type &entry) {
+			                   const auto &lifecycle = *entry.second;
+			                   return lifecycle.pending_registrations.empty() && !lifecycle.abort_attempt &&
+			                          !lifecycle.teardown_attempt;
+		                   });
 	});
 	return true;
 }

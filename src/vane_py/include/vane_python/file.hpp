@@ -7,8 +7,6 @@
 
 #include "duckdb/common/types/value.hpp"
 
-#include <optional>
-
 namespace duckdb {
 
 class DuckDBPyConnection;
@@ -35,8 +33,8 @@ private:
 //! The immutable Python representation of an engine FILE value.
 class PythonFile {
 public:
-	PythonFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-	           std::optional<int64_t> size, std::optional<string> checksum,
+	PythonFile(string url, distributed::Optional<string> content_type, distributed::Optional<int64_t> position,
+	           distributed::Optional<int64_t> size, distributed::Optional<string> checksum,
 	           FileMediaType media_type = FileMediaType::UNKNOWN);
 	virtual ~PythonFile() = default;
 
@@ -57,37 +55,37 @@ public:
 	py::object MimeType(const string &detect, shared_ptr<DuckDBPyConnection> connection) const;
 
 	const string &Url() const;
-	const std::optional<string> &ContentType() const;
-	const std::optional<int64_t> &Position() const;
-	const std::optional<int64_t> &Size() const;
-	const std::optional<string> &Checksum() const;
+	const distributed::Optional<string> &ContentType() const;
+	const distributed::Optional<int64_t> &Position() const;
+	const distributed::Optional<int64_t> &Size() const;
+	const distributed::Optional<string> &Checksum() const;
 	FileMediaType MediaType() const;
 
 private:
 	FileMediaType media_type;
 	string url;
-	std::optional<string> content_type;
-	std::optional<int64_t> position;
-	std::optional<int64_t> size;
-	std::optional<string> checksum;
+	distributed::Optional<string> content_type;
+	distributed::Optional<int64_t> position;
+	distributed::Optional<int64_t> size;
+	distributed::Optional<string> checksum;
 };
 
 class PythonImageFile final : public PythonFile {
 public:
-	PythonImageFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-	                std::optional<int64_t> size, std::optional<string> checksum);
+	PythonImageFile(string url, distributed::Optional<string> content_type, distributed::Optional<int64_t> position,
+	                distributed::Optional<int64_t> size, distributed::Optional<string> checksum);
 };
 
 class PythonAudioFile final : public PythonFile {
 public:
-	PythonAudioFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-	                std::optional<int64_t> size, std::optional<string> checksum);
+	PythonAudioFile(string url, distributed::Optional<string> content_type, distributed::Optional<int64_t> position,
+	                distributed::Optional<int64_t> size, distributed::Optional<string> checksum);
 };
 
 class PythonVideoFile final : public PythonFile {
 public:
-	PythonVideoFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-	                std::optional<int64_t> size, std::optional<string> checksum);
+	PythonVideoFile(string url, distributed::Optional<string> content_type, distributed::Optional<int64_t> position,
+	                distributed::Optional<int64_t> size, distributed::Optional<string> checksum);
 };
 
 } // namespace duckdb

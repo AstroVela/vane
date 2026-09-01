@@ -363,10 +363,12 @@ release environments contain only the public key.
 
 ## Native C++ tests
 
-The complete native gate builds DuckDB, distributed exchange, and the test
-runner with the same pinned Arrow and C++20 configuration used by CI. The
-script starts from a fresh CMake configuration (`cmake --fresh`) to avoid
-configuration drift, which triggers a clean rebuild in its build directory:
+Vane, DuckDB, and the non-Arrow distributed engine build as C++11, while the
+Arrow Flight exchange and its direct tests use C++20. This matches DuckDB's
+native language mode without leaking Arrow's requirement into the engine or
+its consumers. The script starts from a fresh CMake configuration (`cmake
+--fresh`) to avoid configuration drift, which triggers a clean rebuild in its
+build directory:
 
 ```bash
 scripts/run_native_tests.sh "[distributed]"

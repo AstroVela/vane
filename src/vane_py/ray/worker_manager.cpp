@@ -72,7 +72,7 @@ void RayWorkerManager::EndOperation() const {
 	shutdown_cv_.notify_all();
 }
 
-std::optional<QueryLifecycleCoordinator::Operation>
+duckdb::distributed::Optional<QueryLifecycleCoordinator::Operation>
 RayWorkerManager::BeginQueryOperation(const string &query_id, const string &requested_owner_query_id) {
 	return query_lifecycles_.BeginOperation(query_id, requested_owner_query_id, !requested_owner_query_id.empty());
 }
@@ -109,7 +109,8 @@ void RayWorkerManager::RecordQueryWorkers(const string &owner_query_id,
 		owned_workers.push_back(worker);
 	}
 }
-std::optional<QueryLifecycleCoordinator::Abort> RayWorkerManager::BeginQueryAbort(const string &query_id) {
+duckdb::distributed::Optional<QueryLifecycleCoordinator::Abort>
+RayWorkerManager::BeginQueryAbort(const string &query_id) {
 	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 		py::gil_scoped_release release;
 		return query_lifecycles_.BeginAbort(query_id);
@@ -117,7 +118,7 @@ std::optional<QueryLifecycleCoordinator::Abort> RayWorkerManager::BeginQueryAbor
 	return query_lifecycles_.BeginAbort(query_id);
 }
 
-std::optional<QueryLifecycleCoordinator::Abort>
+duckdb::distributed::Optional<QueryLifecycleCoordinator::Abort>
 RayWorkerManager::BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown) {
 	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 		py::gil_scoped_release release;
@@ -126,7 +127,8 @@ RayWorkerManager::BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &tea
 	return query_lifecycles_.BeginAbort(teardown);
 }
 
-std::optional<QueryLifecycleCoordinator::Teardown> RayWorkerManager::BeginQueryTeardown(const string &query_id) {
+duckdb::distributed::Optional<QueryLifecycleCoordinator::Teardown>
+RayWorkerManager::BeginQueryTeardown(const string &query_id) {
 	if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 		py::gil_scoped_release release;
 		return query_lifecycles_.BeginTeardown(query_id);
@@ -279,7 +281,8 @@ void RayWorkerManager::ClearFteResultHandles(const string &query_id) {
 	}
 	vane::BoundedErrorDetails errors;
 	std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> retry_handles;
-	auto release_all = [&](auto &owned_handles, const char *kind) {
+	auto release_all = [&](std::vector<std::unique_ptr<RayWorkerRuntime::TaskResultHandleType>> &owned_handles,
+	                       const char *kind) {
 		for (size_t index = 0; index < owned_handles.size(); index++) {
 			try {
 				owned_handles[index]->ReleasePollResult();
@@ -473,20 +476,22 @@ DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>> RayWorkerMana
 	const bool discard_unselected_outputs =
 	    !selected_only && finished_status && finished_status->selected_attempt_task_ids.empty();
 	if (on_output) {
-		std::stable_sort(handles.begin(), handles.end(), [](const auto &lhs, const auto &rhs) {
-			const auto lhs_context = lhs->GetTaskContext();
-			const auto rhs_context = rhs->GetTaskContext();
-			if (lhs_context.query_idx() != rhs_context.query_idx()) {
-				return lhs_context.query_idx() < rhs_context.query_idx();
-			}
-			if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
-				return lhs_context.last_node_id() < rhs_context.last_node_id();
-			}
-			if (lhs_context.task_id() != rhs_context.task_id()) {
-				return lhs_context.task_id() < rhs_context.task_id();
-			}
-			return lhs->GetFteTaskId() < rhs->GetFteTaskId();
-		});
+		std::stable_sort(handles.begin(), handles.end(),
+		                 [](const std::unique_ptr<RayWorkerRuntime::TaskResultHandleType> &lhs,
+		                    const std::unique_ptr<RayWorkerRuntime::TaskResultHandleType> &rhs) {
+			                 const auto lhs_context = lhs->GetTaskContext();
+			                 const auto rhs_context = rhs->GetTaskContext();
+			                 if (lhs_context.query_idx() != rhs_context.query_idx()) {
+				                 return lhs_context.query_idx() < rhs_context.query_idx();
+			                 }
+			                 if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
+				                 return lhs_context.last_node_id() < rhs_context.last_node_id();
+			                 }
+			                 if (lhs_context.task_id() != rhs_context.task_id()) {
+				                 return lhs_context.task_id() < rhs_context.task_id();
+			                 }
+			                 return lhs->GetFteTaskId() < rhs->GetFteTaskId();
+		                 });
 	}
 
 	std::vector<bool> retain_payload_until_query_cleanup(handles.size(), false);
@@ -838,7 +843,7 @@ RayWorkerManager::WorkerSnapshotResult RayWorkerManager::WorkerSnapshotsWithoutG
 	std::vector<std::shared_ptr<RayWorkerRuntime>> new_workers;
 	std::vector<std::shared_ptr<std::atomic<bool>>> new_worker_retirement_states;
 	bool worker_creation_succeeded = false;
-	auto weak_manager = weak_from_this();
+	std::weak_ptr<RayWorkerManager> weak_manager = shared_from_this();
 	{
 		duckdb::PythonGILWrapper gil;
 		try {
@@ -1195,12 +1200,13 @@ DuckDBResult<void> RayWorkerManager::close_session(const string &session_id) {
 	return DuckDBResult<void>::ok();
 }
 
-DuckDBResult<void> RayWorkerManager::ExecuteQueryAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort) {
+DuckDBResult<void>
+RayWorkerManager::ExecuteQueryAbort(duckdb::distributed::Optional<QueryLifecycleCoordinator::Abort> active_abort) {
 	if (!active_abort) {
 		return DuckDBResult<void>::ok();
 	}
 
-	std::optional<string> failure;
+	duckdb::distributed::Optional<string> failure;
 	try {
 		std::vector<string> errors;
 		auto prepare_workers = [&]() {
@@ -1346,7 +1352,7 @@ void RayWorkerManager::drop_query_fragments(const string &query_id) {
 			lock_guard<mutex> guard(mutex_);
 			state_.workers_by_query_owner.erase(teardown->lifecycle.owner_query_id);
 		}
-		query_lifecycles_.CompleteTeardown(*teardown, std::nullopt);
+		query_lifecycles_.CompleteTeardown(*teardown, duckdb::distributed::nullopt);
 	} catch (...) {
 		auto failure = ExceptionMessage(std::current_exception());
 		try {

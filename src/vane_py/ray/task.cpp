@@ -46,7 +46,7 @@ class ScopedGILReleaseIfHeld {
 public:
 	ScopedGILReleaseIfHeld() {
 		if (RayTaskPythonRuntimeUsable() && PyGILState_Check()) {
-			release_ = std::make_unique<py::gil_scoped_release>();
+			release_.reset(new py::gil_scoped_release());
 		}
 	}
 
@@ -1161,7 +1161,7 @@ std::pair<bool, PythonTaskResultHandle::PollResult> PythonTaskResultHandle::poll
 			return std::make_pair(true, poll_result_cache_->result.value());
 		}
 	}
-	std::optional<ResultType> terminal_result;
+	duckdb::distributed::Optional<ResultType> terminal_result;
 	try {
 		PythonGILWrapper gil;
 		if (!handle_.has_value()) {
@@ -1340,7 +1340,8 @@ py::object RayWorkerTask::Plan() const {
 	// Keep ownership locally until the capsule is fully constructed. Capsule
 	// construction can allocate and raise before its destructor callback owns
 	// the pointer.
-	auto plan_copy = std::make_unique<std::shared_ptr<duckdb::PhysicalPlan>>(plan_ref);
+	std::unique_ptr<std::shared_ptr<duckdb::PhysicalPlan>> plan_copy(
+	    new std::shared_ptr<duckdb::PhysicalPlan>(plan_ref));
 	py::capsule plan_capsule(plan_copy.get(),
 	                         [](void *ptr) { delete static_cast<std::shared_ptr<duckdb::PhysicalPlan> *>(ptr); });
 	plan_copy.release();

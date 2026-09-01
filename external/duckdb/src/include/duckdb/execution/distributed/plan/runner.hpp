@@ -929,8 +929,10 @@ public:
 			}
 			auto task_executor = std::make_shared<PlanTaskExecutor>(client_context_, execute_status);
 
-			auto self = this->weak_from_this().lock();
-			if (!self) {
+			std::shared_ptr<PlanRunner> self;
+			try {
+				self = this->shared_from_this();
+			} catch (const std::bad_weak_ptr &) {
 				throw InternalException("PlanRunner requires shared_ptr ownership; create via std::make_shared");
 			}
 			auto sender_ptr = std::make_shared<UnboundedSender<MaterializedOutput>>(std::move(sender));
@@ -963,40 +965,39 @@ public:
 				}
 			}
 			execution_may_have_started = true;
-			task_executor->ScheduleTask(
-			    [self, pipeline_node, sender_ptr, output_state, execute_status, task_executor, initial_inputs_ptr,
-			     bound_execution_errors,
-			     validate_incremental_output = std::move(validate_incremental_output)]() mutable {
-				    std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
-				    auto publish_error = [&](const DuckDBError &error) {
-					    execute_status->RecordError(error);
-					    if (output_state) {
-						    output_state->close();
-					    }
-				    };
-				    try {
-					    output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
-					    auto result =
-					        self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
-					                           std::move(*initial_inputs_ptr), std::move(validate_incremental_output));
-					    if (result.is_err()) {
-						    publish_error(result.error());
-					    }
-					    output_lifetime_guard.reset();
-				    } catch (const std::exception &ex) {
-					    DuckDBError error =
-					        bound_execution_errors
-					            ? DuckDBError::external_error(BoundDataSinkOutcomeError(
-					                  "execute_plan task threw: " + BoundDataSinkOutcomeError(ex.what())))
-					            : DuckDBError::external_error(string("execute_plan task threw: ") + ex.what());
-					    publish_error(error);
-					    output_lifetime_guard.reset();
-				    } catch (...) {
-					    DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
-					    publish_error(error);
-					    output_lifetime_guard.reset();
-				    }
-			    });
+			task_executor->ScheduleTask([self, pipeline_node, sender_ptr, output_state, execute_status, task_executor,
+			                             initial_inputs_ptr, bound_execution_errors,
+			                             validate_incremental_output]() mutable {
+				std::unique_ptr<UnboundedSender<MaterializedOutput>> output_lifetime_guard;
+				auto publish_error = [&](const DuckDBError &error) {
+					execute_status->RecordError(error);
+					if (output_state) {
+						output_state->close();
+					}
+				};
+				try {
+					output_lifetime_guard = make_uniq<UnboundedSender<MaterializedOutput>>(sender_ptr->clone());
+					auto result =
+					    self->execute_plan(pipeline_node, task_executor, std::move(*sender_ptr),
+					                       std::move(*initial_inputs_ptr), std::move(validate_incremental_output));
+					if (result.is_err()) {
+						publish_error(result.error());
+					}
+					output_lifetime_guard.reset();
+				} catch (const std::exception &ex) {
+					DuckDBError error =
+					    bound_execution_errors
+					        ? DuckDBError::external_error(BoundDataSinkOutcomeError(
+					              "execute_plan task threw: " + BoundDataSinkOutcomeError(ex.what())))
+					        : DuckDBError::external_error(string("execute_plan task threw: ") + ex.what());
+					publish_error(error);
+					output_lifetime_guard.reset();
+				} catch (...) {
+					DuckDBError error = DuckDBError::external_error("execute_plan task threw unknown exception");
+					publish_error(error);
+					output_lifetime_guard.reset();
+				}
+			});
 			if (on_execution_started) {
 				on_execution_started();
 			}

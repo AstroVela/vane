@@ -79,7 +79,7 @@ struct ResultPartitionStream : public std::enable_shared_from_this<ResultPartiti
 			NotifyReady();
 			return;
 		}
-		auto weak_self = weak_from_this();
+		std::weak_ptr<ResultPartitionStream> weak_self = shared_from_this();
 		stream_->NotifyWhenReady([weak_self]() {
 			if (auto self = weak_self.lock()) {
 				self->NotifyReady();

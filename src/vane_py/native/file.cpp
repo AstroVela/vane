@@ -29,16 +29,16 @@ static string RequireString(const py::handle &value, const char *field) {
 	return py::cast<string>(value);
 }
 
-static std::optional<string> OptionalString(const py::handle &value, const char *field) {
+static distributed::Optional<string> OptionalString(const py::handle &value, const char *field) {
 	if (value.is_none()) {
-		return std::nullopt;
+		return distributed::nullopt;
 	}
 	return RequireString(value, field);
 }
 
-static std::optional<int64_t> OptionalInteger(const py::handle &value, const char *field) {
+static distributed::Optional<int64_t> OptionalInteger(const py::handle &value, const char *field) {
 	if (value.is_none()) {
-		return std::nullopt;
+		return distributed::nullopt;
 	}
 	if (py::isinstance<py::bool_>(value) || !py::isinstance<py::int_>(value)) {
 		throw py::type_error(StringUtil::Format("File.%s must be int or None, not '%s'", field, PythonTypeName(value)));
@@ -58,25 +58,26 @@ static std::optional<int64_t> OptionalInteger(const py::handle &value, const cha
 	return result;
 }
 
-static Value OptionalStringValue(const std::optional<string> &value) {
+static Value OptionalStringValue(const distributed::Optional<string> &value) {
 	return value ? Value(*value) : Value(LogicalType::VARCHAR);
 }
 
-static Value OptionalIntegerValue(const std::optional<int64_t> &value) {
+static Value OptionalIntegerValue(const distributed::Optional<int64_t> &value) {
 	return value ? Value::BIGINT(*value) : Value(LogicalType::BIGINT);
 }
 
-static std::optional<string> OptionalStringFromReference(bool has_value, const string &value) {
-	return has_value ? std::optional<string>(value) : std::nullopt;
+static distributed::Optional<string> OptionalStringFromReference(bool has_value, const string &value) {
+	return has_value ? distributed::Optional<string>(value) : distributed::Optional<string>();
 }
 
-static std::optional<int64_t> OptionalIntegerFromReference(bool has_value, int64_t value) {
-	return has_value ? std::optional<int64_t>(value) : std::nullopt;
+static distributed::Optional<int64_t> OptionalIntegerFromReference(bool has_value, int64_t value) {
+	return has_value ? distributed::Optional<int64_t>(value) : distributed::Optional<int64_t>();
 }
 
-static FileReference MakeReference(const string &url, const std::optional<string> &content_type,
-                                   const std::optional<int64_t> &position, const std::optional<int64_t> &size,
-                                   const std::optional<string> &checksum, FileMediaType media_type) {
+static FileReference MakeReference(const string &url, const distributed::Optional<string> &content_type,
+                                   const distributed::Optional<int64_t> &position,
+                                   const distributed::Optional<int64_t> &size,
+                                   const distributed::Optional<string> &checksum, FileMediaType media_type) {
 	return FileReference::FromFields(Value(url), OptionalStringValue(content_type), OptionalIntegerValue(position),
 	                                 OptionalIntegerValue(size), OptionalStringValue(checksum), "File", media_type);
 }
@@ -204,8 +205,9 @@ Py_hash_t PythonFileMediaType::Hash() const {
 	return py::hash(py::int_(static_cast<int>(media_type)));
 }
 
-PythonFile::PythonFile(string url_p, std::optional<string> content_type_p, std::optional<int64_t> position_p,
-                       std::optional<int64_t> size_p, std::optional<string> checksum_p, FileMediaType media_type_p)
+PythonFile::PythonFile(string url_p, distributed::Optional<string> content_type_p,
+                       distributed::Optional<int64_t> position_p, distributed::Optional<int64_t> size_p,
+                       distributed::Optional<string> checksum_p, FileMediaType media_type_p)
     : media_type(media_type_p), url(std::move(url_p)), content_type(std::move(content_type_p)), position(position_p),
       size(size_p), checksum(std::move(checksum_p)) {
 	MakeReference(url, content_type, position, size, checksum, media_type);
@@ -372,19 +374,19 @@ const string &PythonFile::Url() const {
 	return url;
 }
 
-const std::optional<string> &PythonFile::ContentType() const {
+const distributed::Optional<string> &PythonFile::ContentType() const {
 	return content_type;
 }
 
-const std::optional<int64_t> &PythonFile::Position() const {
+const distributed::Optional<int64_t> &PythonFile::Position() const {
 	return position;
 }
 
-const std::optional<int64_t> &PythonFile::Size() const {
+const distributed::Optional<int64_t> &PythonFile::Size() const {
 	return size;
 }
 
-const std::optional<string> &PythonFile::Checksum() const {
+const distributed::Optional<string> &PythonFile::Checksum() const {
 	return checksum;
 }
 
@@ -392,18 +394,21 @@ FileMediaType PythonFile::MediaType() const {
 	return media_type;
 }
 
-PythonImageFile::PythonImageFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-                                 std::optional<int64_t> size, std::optional<string> checksum)
+PythonImageFile::PythonImageFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
     : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::IMAGE) {
 }
 
-PythonAudioFile::PythonAudioFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-                                 std::optional<int64_t> size, std::optional<string> checksum)
+PythonAudioFile::PythonAudioFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
     : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::AUDIO) {
 }
 
-PythonVideoFile::PythonVideoFile(string url, std::optional<string> content_type, std::optional<int64_t> position,
-                                 std::optional<int64_t> size, std::optional<string> checksum)
+PythonVideoFile::PythonVideoFile(string url, distributed::Optional<string> content_type,
+                                 distributed::Optional<int64_t> position, distributed::Optional<int64_t> size,
+                                 distributed::Optional<string> checksum)
     : PythonFile(std::move(url), std::move(content_type), position, size, std::move(checksum), FileMediaType::VIDEO) {
 }
 

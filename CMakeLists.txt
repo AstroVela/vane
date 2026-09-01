@@ -10,10 +10,9 @@ cmake_minimum_required(VERSION 3.29)
 
 project(vane_python LANGUAGES CXX)
 
-# Arrow 24 requires C++20. Use the same standard for the complete Vane native
-# build so Python bindings, distributed exchange, and their consumers cannot
-# silently diverge based on transitive CMake requirements.
-set(CMAKE_CXX_STANDARD 20)
+# Match DuckDB's native C++11 mode throughout Vane. The Arrow Flight exchange
+# target opts into C++20 explicitly without changing DuckDB or its consumers.
+set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 # Vane does not use C++ modules. CMake's automatic C++20 module scan emits GCC

@@ -1605,11 +1605,11 @@ static bool RegisterQueryPythonReplayState(const string &query_id, const py::obj
 	auto entry = g_query_python_replay_states.find(query_id);
 	if (entry == g_query_python_replay_states.end()) {
 		g_query_python_replay_states.emplace(
-		    query_id, std::make_unique<QueryPythonReplayState>(std::move(session_id), std::move(session_config),
-		                                                       py::reinterpret_borrow<py::object>(udf_registrations),
-		                                                       py::reinterpret_borrow<py::object>(udf_actor_handles),
-		                                                       py::reinterpret_borrow<py::object>(connection_snapshot),
-		                                                       std::move(retained_coordinator_connection)));
+		    query_id,
+		    std::unique_ptr<QueryPythonReplayState>(new QueryPythonReplayState(
+		        std::move(session_id), std::move(session_config), py::reinterpret_borrow<py::object>(udf_registrations),
+		        py::reinterpret_borrow<py::object>(udf_actor_handles),
+		        py::reinterpret_borrow<py::object>(connection_snapshot), std::move(retained_coordinator_connection))));
 		return true;
 	}
 	auto &state = *entry->second;

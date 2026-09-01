@@ -152,6 +152,15 @@ using distributed_write_finalize_t = vector<DistributedWriteFragment> (*)(Client
 //! Complete worker-side streaming write implementation registered by a static
 //! extension. Every callback is mandatory; missing callbacks are hard errors.
 struct DistributedExtensionWriteCallbacks {
+	DistributedExtensionWriteCallbacks() = default;
+	DistributedExtensionWriteCallbacks(distributed_write_initialize_global_t initialize_global_p,
+	                                   distributed_write_initialize_local_t initialize_local_p,
+	                                   distributed_write_sink_t sink_p, distributed_write_combine_t combine_p,
+	                                   distributed_write_finalize_t finalize_p)
+	    : initialize_global(initialize_global_p), initialize_local(initialize_local_p), sink(sink_p),
+	      combine(combine_p), finalize(finalize_p) {
+	}
+
 	distributed_write_initialize_global_t initialize_global = nullptr;
 	distributed_write_initialize_local_t initialize_local = nullptr;
 	distributed_write_sink_t sink = nullptr;

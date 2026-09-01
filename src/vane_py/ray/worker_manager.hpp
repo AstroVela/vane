@@ -12,7 +12,6 @@
 #include <functional>
 #include <future>
 #include <memory>
-#include <optional>
 
 #include <vector>
 #include <string>
@@ -139,7 +138,7 @@ private:
 
 	private:
 		RayWorkerManager &manager_;
-		std::optional<QueryLifecycleCoordinator::Operation> operation_;
+		Optional<QueryLifecycleCoordinator::Operation> operation_;
 	};
 
 	const string manager_instance_id_;
@@ -152,18 +151,17 @@ private:
 
 	bool BeginOperation() const;
 	void EndOperation() const;
-	std::optional<QueryLifecycleCoordinator::Operation> BeginQueryOperation(const string &query_id,
-	                                                                        const string &requested_owner_query_id);
+	Optional<QueryLifecycleCoordinator::Operation> BeginQueryOperation(const string &query_id,
+	                                                                   const string &requested_owner_query_id);
 	void EndQueryOperation(const QueryLifecycleCoordinator::Operation &operation);
 	void WaitForQueryOperations(const QueryLifecycleCoordinator::LifecycleRef &lifecycle);
 	void RecordQueryWorkers(const string &owner_query_id,
 	                        const std::vector<std::shared_ptr<RayWorkerRuntime>> &workers);
-	std::optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const string &query_id);
-	std::optional<QueryLifecycleCoordinator::Abort>
-	BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown);
-	std::optional<QueryLifecycleCoordinator::Teardown> BeginQueryTeardown(const string &query_id);
+	Optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const string &query_id);
+	Optional<QueryLifecycleCoordinator::Abort> BeginQueryAbort(const QueryLifecycleCoordinator::Teardown &teardown);
+	Optional<QueryLifecycleCoordinator::Teardown> BeginQueryTeardown(const string &query_id);
 	std::vector<std::shared_ptr<RayWorkerRuntime>> QueryWorkers(const string &owner_query_id) const;
-	DuckDBResult<void> ExecuteQueryAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort);
+	DuckDBResult<void> ExecuteQueryAbort(Optional<QueryLifecycleCoordinator::Abort> active_abort);
 	bool ShutdownStarted() const;
 	bool RetireWorkerForFailure(const string &worker_id, const std::shared_ptr<RayWorkerRuntime> &worker,
 	                            const std::shared_ptr<std::atomic<bool>> &retired) const;
