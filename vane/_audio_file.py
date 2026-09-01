@@ -660,12 +660,6 @@ def _decode_audio_file(
                             output_offset += read_count
                         del output_view
                 else:
-                    frame_bytes = metadata.channels * 8
-                    if frame_bytes > normalized_max_decoded:
-                        raise AudioFileLimitError(
-                            f"one decoded audio frame requires {frame_bytes} bytes, "
-                            f"exceeding max_decoded_bytes={normalized_max_decoded}"
-                        )
                     decoded_bytes = metadata.frames * metadata.channels * 8
                     if decoded_bytes > normalized_max_decoded:
                         raise AudioFileLimitError(

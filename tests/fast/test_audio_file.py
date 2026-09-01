@@ -190,6 +190,23 @@ def test_audio_to_numpy_returns_detached_frame_major_float64(duckdb_cursor, tmp_
     np.testing.assert_allclose(decoded, expected, rtol=0, atol=1e-7)
 
 
+@pytest.mark.parametrize("channels", [1, 2])
+def test_empty_audio_decodes_under_sub_frame_byte_limit(duckdb_cursor, tmp_path, channels):
+    payload, _ = _encoded_audio("WAV", "PCM_16", frames=0, channels=channels)
+    path = tmp_path / f"empty-{channels}.wav"
+    path.write_bytes(payload)
+    value = vane.AudioFile(str(path), "audio/wav")
+
+    metadata = value.metadata(connection=duckdb_cursor)
+    decoded = value.to_numpy(max_decoded_bytes=1, connection=duckdb_cursor)
+
+    assert metadata.frames == 0
+    assert metadata.duration == 0
+    assert decoded.dtype == np.float64
+    assert decoded.shape == (0, channels)
+    assert decoded.nbytes == 0
+
+
 def test_audio_metadata_can_use_header_without_reading_complete_waveform(duckdb_cursor, tmp_path):
     payload, _ = _encoded_audio("WAV", "PCM_16", frames=100_000, channels=2)
     path = tmp_path / "large.wav"
