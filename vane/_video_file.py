@@ -23,8 +23,22 @@ MAX_VIDEO_METADATA_BYTES = 64 * 1024 * 1024
 _MAX_VIDEO_METADATA_FETCH_BYTES = 64 * 1024
 _VIDEO_METADATA_FETCHES_PER_BUDGET = 8
 _MAX_VIDEO_METADATA_FETCHES = 1024
+_VIDEO_METADATA_TIMEOUT_SECONDS = 5.0
+# Permit 8K UHD metadata while bounding decoder allocation before dimensions
+# become available to Vane's post-probe validation.
+_MAX_VIDEO_FRAME_PIXELS = 32 * 1024 * 1024
+_MAX_VIDEO_AUDIO_SAMPLES = 1024 * 1024
+_MAX_VIDEO_STREAMS = 64
+_MAX_VIDEO_PROBE_PACKETS = 256
+_MAX_VIDEO_INDEX_BYTES = 256 * 1024
+_MAX_VIDEO_ANALYZE_DURATION_US = 5 * 1_000_000
+_MAX_VIDEO_FPS_PROBE_FRAMES = 32
 _MAX_BIGINT = (1 << 63) - 1
 _MAX_UINTEGER = (1 << 32) - 1
+
+_PYAV_UNSAFE_STREAM_OPTIONS_ERROR = (
+    "stream_options were provided, but this format does not expose its streams before avformat_find_stream_info"
+)
 
 _MIME_ALIASES = {
     "video/avi": "video/x-msvideo",
@@ -272,6 +286,7 @@ def _load_av() -> Any:
     try:
         av_module = importlib.import_module("av")
         av_module.open
+        av_module.error.ExitError
         av_module.error.FFmpegError
         av_module.stream.Disposition.attached_pic
         av_module.time_base
@@ -316,6 +331,12 @@ def _container_format_names(container: Any) -> frozenset[str]:
 
 
 def _validate_content_type(content_type: str | None, format_names: frozenset[str]) -> None:
+    compatible: set[str] = set()
+    for format_name in format_names:
+        compatible.update(_FORMAT_MIME_TYPES.get(format_name, ()))
+    if not compatible:
+        raise VideoFileFormatError(f"unsupported video container format {','.join(sorted(format_names))!r}")
+
     if content_type is None:
         return
     declared = _canonical_mime_type(content_type)
@@ -323,11 +344,7 @@ def _validate_content_type(content_type: str | None, format_names: frozenset[str
         return
     if not declared.startswith("video/"):
         raise VideoFileFormatError(f"VIDEOFILE content_type {content_type!r} contradicts the video content")
-
-    compatible: set[str] = set()
-    for format_name in format_names:
-        compatible.update(_FORMAT_MIME_TYPES.get(format_name, ()))
-    if compatible and declared not in compatible:
+    if declared not in compatible:
         raise VideoFileFormatError(
             f"VIDEOFILE content_type {content_type!r} contradicts detected container format "
             f"{','.join(sorted(format_names))!r}"
@@ -415,12 +432,20 @@ def _metadata_from_container(container: Any, content_type: str | None, av_module
     if video is None:
         raise VideoFileFormatError("logical FILE view does not contain a video stream")
 
+    format_names = _container_format_names(container)
+    _validate_content_type(content_type, format_names)
+    if getattr(video, "codec_context", None) is None:
+        raise VideoFileFormatError("video stream does not have an available decoder")
+
     width = int(video.width)
     height = int(video.height)
     if width <= 0 or width > _MAX_UINTEGER or height <= 0 or height > _MAX_UINTEGER:
         raise VideoFileFormatError(f"video dimensions must fit positive UINTEGER values, found {width}x{height}")
+    if width * height > _MAX_VIDEO_FRAME_PIXELS:
+        raise VideoFileLimitError(
+            f"video dimensions {width}x{height} exceed the metadata pixel limit of {_MAX_VIDEO_FRAME_PIXELS}"
+        )
     time_base = _positive_fraction(video.time_base, name="time base")
-    _validate_content_type(content_type, _container_format_names(container))
     return VideoMetadata(
         width=width,
         height=height,
@@ -441,13 +466,36 @@ def _probe_video_metadata(
     av_module = _load_av()
     stream = _VideoMetadataView(read_at, logical_size=logical_size, max_bytes=max_bytes)
     nested_io = _NestedIOBlocker()
+    decoder_options = {
+        "max_pixels": str(_MAX_VIDEO_FRAME_PIXELS),
+        "max_samples": str(_MAX_VIDEO_AUDIO_SAMPLES),
+        "skip_frame": "all",
+        "threads": "1",
+    }
+    probe_options = {
+        "analyzeduration": str(_MAX_VIDEO_ANALYZE_DURATION_US),
+        "formatprobesize": str(max(2048, max_bytes)),
+        "fpsprobesize": str(_MAX_VIDEO_FPS_PROBE_FRAMES),
+        "indexmem": str(_MAX_VIDEO_INDEX_BYTES),
+        "max_probe_packets": str(_MAX_VIDEO_PROBE_PACKETS),
+        "max_streams": str(_MAX_VIDEO_STREAMS),
+        "probesize": str(max(32, max_bytes)),
+        "skip_estimate_duration_from_pts": "1",
+    }
     try:
         container = av_module.open(
             stream,
             mode="r",
+            options=decoder_options,
+            container_options=probe_options,
+            # PyAV 17.1 fails closed when streams are not available before
+            # avformat_find_stream_info(), because per-stream decoder limits
+            # cannot otherwise be applied safely.
+            stream_options=[decoder_options.copy()],
             metadata_encoding="utf-8",
             metadata_errors="replace",
             buffer_size=min(_MAX_VIDEO_METADATA_FETCH_BYTES, max_bytes),
+            timeout=(_VIDEO_METADATA_TIMEOUT_SECONDS, _VIDEO_METADATA_TIMEOUT_SECONDS),
             io_open=nested_io,
         )
         with _close_container(container):
@@ -463,6 +511,14 @@ def _probe_video_metadata(
         nested_io.raise_if_error()
         if isinstance(error, VideoFileError):
             raise
+        if isinstance(error, av_module.error.ExitError):
+            raise VideoFileLimitError(
+                f"a video metadata probe phase exceeded its {_VIDEO_METADATA_TIMEOUT_SECONDS:g}-second timeout"
+            ) from error
+        if isinstance(error, ValueError) and str(error).startswith(_PYAV_UNSAFE_STREAM_OPTIONS_ERROR):
+            raise VideoFileFormatError(
+                "video container cannot be inspected safely within metadata resource limits"
+            ) from error
         if not isinstance(error, av_module.error.FFmpegError):
             raise
         if stream.budget_exhausted:
@@ -518,7 +574,7 @@ def video_metadata(
     *,
     max_bytes: int | vane.Expression = DEFAULT_VIDEO_METADATA_BYTES,
 ) -> vane.Expression:
-    """Inspect the first video stream with bounded reads and no frame decoding."""
+    """Inspect the first non-attached video stream with bounded stream-info probing."""
     return vane.FunctionExpression(
         "video_metadata",
         as_expression(value),

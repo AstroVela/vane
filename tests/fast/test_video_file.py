@@ -3,12 +3,18 @@
 
 import importlib
 import io
+import struct
+import subprocess
+import sys
+import textwrap
+import zlib
 from fractions import Fraction
 from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
+from PIL import Image
 
 import vane
 from vane import _video_file
@@ -36,6 +42,29 @@ def _encoded_video(
         for packet in stream.encode():
             container.mux(packet)
     return buffer.getvalue()
+
+
+def _encoded_image(image_format: str) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), color=(10, 20, 30)).save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
+def _video_with_unknown_codec() -> bytes:
+    payload = _encoded_video("matroska")
+    known_codec = b"V_MPEG4/ISO/ASP"
+    unknown_codec = b"V_FAKE/NO/CODEC"
+    assert len(known_codec) == len(unknown_codec)
+    assert known_codec in payload
+    return payload.replace(known_codec, unknown_codec, 1)
+
+
+def _oversized_png() -> bytes:
+    payload = bytearray(_encoded_image("PNG"))
+    assert payload[12:16] == b"IHDR"
+    struct.pack_into(">II", payload, 16, 65_535, 32_768)
+    struct.pack_into(">I", payload, 29, zlib.crc32(payload[12:29]) & 0xFFFFFFFF)
+    return bytes(payload)
 
 
 def test_video_metadata_sql_and_python_value(duckdb_cursor, tmp_path):
@@ -126,6 +155,7 @@ def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
     video = SimpleNamespace(
         type="video",
         disposition=av.stream.Disposition(0),
+        codec_context=object(),
         width=16,
         height=12,
         time_base=Fraction(1, 1000),
@@ -158,6 +188,7 @@ def test_video_metadata_rejects_missing_container_format():
     video = SimpleNamespace(
         type="video",
         disposition=av.stream.Disposition(0),
+        codec_context=object(),
         width=16,
         height=12,
         time_base=Fraction(1, 1000),
@@ -184,6 +215,7 @@ def test_video_metadata_skips_attached_picture_streams():
     video = SimpleNamespace(
         type="video",
         disposition=av.stream.Disposition(0),
+        codec_context=object(),
         width=16,
         height=12,
         time_base=Fraction(1, 1000),
@@ -206,8 +238,11 @@ def test_video_metadata_skips_attached_picture_streams():
         _video_file._metadata_from_container(container, None, av)
 
 
-def test_video_metadata_replaces_undecodable_tags(monkeypatch):
+def test_video_metadata_configures_bounded_probe(monkeypatch):
     class FakeFFmpegError(Exception):
+        pass
+
+    class FakeExitError(FakeFFmpegError):
         pass
 
     class ProbeStopped(RuntimeError):
@@ -222,7 +257,7 @@ def test_video_metadata_replaces_undecodable_tags(monkeypatch):
 
     fake_av = SimpleNamespace(
         open=inspect_open_options,
-        error=SimpleNamespace(FFmpegError=FakeFFmpegError),
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
         time_base=1_000_000,
     )
     monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
@@ -230,13 +265,86 @@ def test_video_metadata_replaces_undecodable_tags(monkeypatch):
     with pytest.raises(ProbeStopped):
         _video_file._probe_video_metadata(
             lambda offset, size: b"x" * size,
+            logical_size=4096,
+            content_type=None,
+            max_bytes=4096,
+        )
+
+    assert open_options["metadata_encoding"] == "utf-8"
+    assert open_options["metadata_errors"] == "replace"
+    assert open_options["timeout"] == (5.0, 5.0)
+    assert open_options["options"] == {
+        "max_pixels": str(32 * 1024 * 1024),
+        "max_samples": str(1024 * 1024),
+        "skip_frame": "all",
+        "threads": "1",
+    }
+    assert open_options["stream_options"] == [open_options["options"]]
+    assert open_options["stream_options"][0] is not open_options["options"]
+    assert open_options["container_options"] == {
+        "analyzeduration": "5000000",
+        "formatprobesize": "4096",
+        "fpsprobesize": "32",
+        "indexmem": str(256 * 1024),
+        "max_probe_packets": "256",
+        "max_streams": "64",
+        "probesize": "4096",
+        "skip_estimate_duration_from_pts": "1",
+    }
+
+
+def test_video_metadata_classifies_probe_timeout(monkeypatch):
+    class FakeFFmpegError(Exception):
+        pass
+
+    class FakeExitError(FakeFFmpegError):
+        pass
+
+    def time_out(stream, **kwargs):
+        del stream, kwargs
+        raise FakeExitError("Immediate exit requested")
+
+    fake_av = SimpleNamespace(
+        open=time_out,
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
+        time_base=1_000_000,
+    )
+    monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
+
+    with pytest.raises(vane.VideoFileLimitError, match="exceeded its 5-second timeout"):
+        _video_file._probe_video_metadata(
+            lambda offset, size: b"x" * size,
             logical_size=2,
             content_type=None,
             max_bytes=2,
         )
 
-    assert open_options["metadata_encoding"] == "utf-8"
-    assert open_options["metadata_errors"] == "replace"
+
+def test_video_metadata_rejects_container_without_safe_stream_options(monkeypatch):
+    class FakeFFmpegError(Exception):
+        pass
+
+    class FakeExitError(FakeFFmpegError):
+        pass
+
+    def reject_stream_options(stream, **kwargs):
+        del stream, kwargs
+        raise ValueError(_video_file._PYAV_UNSAFE_STREAM_OPTIONS_ERROR + " (e.g. MPEG)")
+
+    fake_av = SimpleNamespace(
+        open=reject_stream_options,
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
+        time_base=1_000_000,
+    )
+    monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
+
+    with pytest.raises(vane.VideoFileFormatError, match="cannot be inspected safely"):
+        _video_file._probe_video_metadata(
+            lambda offset, size: b"x" * size,
+            logical_size=2,
+            content_type=None,
+            max_bytes=2,
+        )
 
 
 def test_video_metadata_budget_is_enforced(duckdb_cursor, tmp_path):
@@ -263,6 +371,9 @@ def test_video_metadata_probe_preserves_non_parser_errors_after_budget_exhaustio
     class FakeFFmpegError(Exception):
         pass
 
+    class FakeExitError(FakeFFmpegError):
+        pass
+
     def failing_open(stream, **kwargs):
         del kwargs
         assert stream.read(1) == b"x"
@@ -271,7 +382,7 @@ def test_video_metadata_probe_preserves_non_parser_errors_after_budget_exhaustio
 
     fake_av = SimpleNamespace(
         open=failing_open,
-        error=SimpleNamespace(FFmpegError=FakeFFmpegError),
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
         time_base=1_000_000,
     )
     monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
@@ -321,6 +432,91 @@ def test_video_metadata_accepts_compatible_and_generic_mimes(
 
     assert value.metadata(connection=duckdb_cursor).width == 16
     assert duckdb_cursor.execute("SELECT (video_metadata($1)).width", [value]).fetchone()[0] == 16
+
+
+@pytest.mark.parametrize("image_format", ["PNG", "JPEG", "GIF"])
+@pytest.mark.parametrize("content_type", [None, "video/*", "video/mp4"])
+def test_video_metadata_rejects_standalone_images(
+    duckdb_cursor,
+    tmp_path,
+    image_format,
+    content_type,
+):
+    path = tmp_path / f"image.{image_format.lower()}"
+    path.write_bytes(_encoded_image(image_format))
+    value = vane.VideoFile(str(path), content_type)
+
+    with pytest.raises(vane.VideoFileFormatError, match="unsupported video container format"):
+        value.metadata(connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match="unsupported video container format"):
+        duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
+
+
+def test_video_metadata_rejects_stream_without_decoder(duckdb_cursor, tmp_path):
+    path = tmp_path / "unsupported-codec.mkv"
+    path.write_bytes(_video_with_unknown_codec())
+    value = vane.VideoFile(str(path), "video/x-matroska")
+
+    with pytest.raises(vane.VideoFileFormatError, match="does not have an available decoder"):
+        value.metadata(connection=duckdb_cursor)
+    with pytest.raises(vane.InvalidInputException, match="does not have an available decoder"):
+        duckdb_cursor.execute("SELECT video_metadata($1)", [value]).fetchone()
+
+
+def test_video_metadata_rejects_oversized_dimensions_before_extraction():
+    video = SimpleNamespace(
+        type="video",
+        disposition=av.stream.Disposition(0),
+        codec_context=object(),
+        width=65_535,
+        height=32_768,
+    )
+    container = SimpleNamespace(
+        streams=[video],
+        format=SimpleNamespace(name="matroska"),
+        duration=None,
+    )
+
+    with pytest.raises(vane.VideoFileLimitError, match="metadata pixel limit"):
+        _video_file._metadata_from_container(container, "video/x-matroska", av)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS regression is Linux-specific")
+def test_video_metadata_bounds_untrusted_probe_memory_and_time(tmp_path):
+    pytest.importorskip("resource")
+    path = tmp_path / "oversized.png"
+    path.write_bytes(_oversized_png())
+    script = textwrap.dedent(
+        """
+        import resource
+        import sys
+
+        import av
+        import vane
+
+        del av
+        current_pages = int(open("/proc/self/statm").read().split()[0])
+        address_space_limit = current_pages * resource.getpagesize() + 1024 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (address_space_limit, address_space_limit))
+
+        try:
+            vane.VideoFile(sys.argv[1], "video/*").metadata()
+        except vane.VideoFileError:
+            pass
+        else:
+            raise AssertionError("oversized standalone image was accepted as VIDEOFILE")
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_video_metadata_requires_a_video_stream(duckdb_cursor, tmp_path):
@@ -547,6 +743,9 @@ def test_video_metadata_probe_preserves_control_flow_over_stored_reader_error(mo
     class FakeFFmpegError(Exception):
         pass
 
+    class FakeExitError(FakeFFmpegError):
+        pass
+
     def interrupting_open(stream, **kwargs):
         del kwargs
         assert stream.read(1) == b""
@@ -554,7 +753,7 @@ def test_video_metadata_probe_preserves_control_flow_over_stored_reader_error(mo
 
     fake_av = SimpleNamespace(
         open=interrupting_open,
-        error=SimpleNamespace(FFmpegError=FakeFFmpegError),
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
         time_base=1_000_000,
     )
     monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)

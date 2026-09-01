@@ -117,7 +117,7 @@ static void RequireVideoDependency() {
 	}
 }
 
-static VideoMetadataResult ProbeVideoMetadata(ResolvedFile &resolved, const FileReference &file,
+static VideoMetadataResult ProbeVideoMetadata(ClientContext &context, ResolvedFile &resolved, const FileReference &file,
                                               uint64_t max_metadata_bytes) {
 	PythonGILWrapper gil;
 	py::object video_file_error_type;
@@ -126,13 +126,19 @@ static VideoMetadataResult ProbeVideoMetadata(ResolvedFile &resolved, const File
 		auto module = py::module_::import("vane._video_file");
 		video_file_error_type = module.attr("VideoFileError");
 		auto helper = module.attr("_probe_video_metadata");
-		auto read_at = py::cpp_function([&resolved, &read_error](uint64_t offset, uint64_t size) {
+		auto read_at = py::cpp_function([&context, &resolved, &read_error](uint64_t offset, uint64_t size) {
 			string bytes;
 			try {
+				if (context.IsInterrupted()) {
+					throw InterruptException();
+				}
 				bytes.resize(NumericCast<idx_t>(size));
 				if (size > 0) {
 					py::gil_scoped_release release;
 					resolved.ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), size, offset);
+				}
+				if (context.IsInterrupted()) {
+					throw InterruptException();
 				}
 			} catch (...) {
 				read_error = std::current_exception();
@@ -234,7 +240,7 @@ static void VideoMetadataFunction(DataChunk &args, ExpressionState &state, Vecto
 			}
 			auto file = FileReference::FromValue(file_value, "video_metadata");
 			auto resolved = ResolvedFile::Open(context, file);
-			auto metadata = ProbeVideoMetadata(*resolved, file, max_metadata_bytes);
+			auto metadata = ProbeVideoMetadata(context, *resolved, file, max_metadata_bytes);
 			if (context.IsInterrupted()) {
 				throw InterruptException();
 			}
