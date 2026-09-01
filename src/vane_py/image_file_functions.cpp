@@ -137,7 +137,7 @@ static void ImageFileMetadataFunction(DataChunk &args, ExpressionState &state, V
 		auto read_size = MinValue<uint64_t>(logical_size, max_metadata_bytes);
 		string bytes(NumericCast<idx_t>(read_size), '\0');
 		if (read_size > 0) {
-			resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), read_size);
+			resolved->ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), read_size);
 		}
 		auto metadata = ProbeImageMetadata(bytes, max_pixels, logical_size > read_size, file, max_metadata_bytes);
 		if (state.GetContext().IsInterrupted()) {
