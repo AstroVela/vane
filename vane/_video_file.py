@@ -53,7 +53,7 @@ _FORMAT_MIME_TYPES: dict[str, frozenset[str]] = {
 
 @dataclass(frozen=True, slots=True)
 class VideoMetadata:
-    """Container metadata for the first video stream of a :class:`vane.VideoFile`."""
+    """Container metadata for the first non-attached video stream of a VideoFile."""
 
     width: int
     height: int
@@ -273,6 +273,7 @@ def _load_av() -> Any:
         av_module = importlib.import_module("av")
         av_module.open
         av_module.error.FFmpegError
+        av_module.stream.Disposition.attached_pic
         av_module.time_base
     except (AttributeError, ImportError, OSError) as error:
         raise ImportError(
@@ -406,7 +407,11 @@ def _optional_frame_count(video: Any) -> int | None:
 
 
 def _metadata_from_container(container: Any, content_type: str | None, av_module: Any) -> VideoMetadata:
-    video = next((stream for stream in container.streams if stream.type == "video"), None)
+    attached_pic = av_module.stream.Disposition.attached_pic
+    video = next(
+        (stream for stream in container.streams if stream.type == "video" and not (stream.disposition & attached_pic)),
+        None,
+    )
     if video is None:
         raise VideoFileFormatError("logical FILE view does not contain a video stream")
 
@@ -441,6 +446,7 @@ def _probe_video_metadata(
             stream,
             mode="r",
             metadata_encoding="utf-8",
+            metadata_errors="replace",
             buffer_size=min(_MAX_VIDEO_METADATA_FETCH_BYTES, max_bytes),
             io_open=nested_io,
         )

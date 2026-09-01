@@ -125,6 +125,7 @@ def test_video_metadata_preserves_unknown_frame_count(duckdb_cursor, tmp_path):
 def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
     video = SimpleNamespace(
         type="video",
+        disposition=av.stream.Disposition(0),
         width=16,
         height=12,
         time_base=Fraction(1, 1000),
@@ -138,7 +139,7 @@ def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
         format=SimpleNamespace(name="matroska,webm"),
         duration=2_000_000,
     )
-    av_module = SimpleNamespace(time_base=1_000_000)
+    av_module = SimpleNamespace(time_base=1_000_000, stream=av.stream)
 
     metadata = _video_file._metadata_from_container(container, "video/webm", av_module)
 
@@ -156,6 +157,7 @@ def test_video_metadata_treats_zero_parser_sentinels_as_unknown():
 def test_video_metadata_rejects_missing_container_format():
     video = SimpleNamespace(
         type="video",
+        disposition=av.stream.Disposition(0),
         width=16,
         height=12,
         time_base=Fraction(1, 1000),
@@ -167,7 +169,74 @@ def test_video_metadata_rejects_missing_container_format():
     container = SimpleNamespace(streams=[video], format=None, duration=None)
 
     with pytest.raises(vane.VideoFileFormatError, match="did not report a container format"):
-        _video_file._metadata_from_container(container, None, SimpleNamespace(time_base=1_000_000))
+        _video_file._metadata_from_container(
+            container,
+            None,
+            SimpleNamespace(time_base=1_000_000, stream=av.stream),
+        )
+
+
+def test_video_metadata_skips_attached_picture_streams():
+    cover = SimpleNamespace(
+        type="video",
+        disposition=av.stream.Disposition.attached_pic,
+    )
+    video = SimpleNamespace(
+        type="video",
+        disposition=av.stream.Disposition(0),
+        width=16,
+        height=12,
+        time_base=Fraction(1, 1000),
+        average_rate=Fraction(24, 1),
+        guessed_rate=None,
+        duration=1000,
+        frames=24,
+    )
+    container = SimpleNamespace(
+        streams=[cover, video],
+        format=SimpleNamespace(name="matroska"),
+        duration=1_000_000,
+    )
+
+    metadata = _video_file._metadata_from_container(container, "video/x-matroska", av)
+
+    assert (metadata.width, metadata.height) == (16, 12)
+    container.streams = [cover]
+    with pytest.raises(vane.VideoFileFormatError, match="does not contain a video stream"):
+        _video_file._metadata_from_container(container, None, av)
+
+
+def test_video_metadata_replaces_undecodable_tags(monkeypatch):
+    class FakeFFmpegError(Exception):
+        pass
+
+    class ProbeStopped(RuntimeError):
+        pass
+
+    open_options = {}
+
+    def inspect_open_options(stream, **kwargs):
+        del stream
+        open_options.update(kwargs)
+        raise ProbeStopped
+
+    fake_av = SimpleNamespace(
+        open=inspect_open_options,
+        error=SimpleNamespace(FFmpegError=FakeFFmpegError),
+        time_base=1_000_000,
+    )
+    monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
+
+    with pytest.raises(ProbeStopped):
+        _video_file._probe_video_metadata(
+            lambda offset, size: b"x" * size,
+            logical_size=2,
+            content_type=None,
+            max_bytes=2,
+        )
+
+    assert open_options["metadata_encoding"] == "utf-8"
+    assert open_options["metadata_errors"] == "replace"
 
 
 def test_video_metadata_budget_is_enforced(duckdb_cursor, tmp_path):
