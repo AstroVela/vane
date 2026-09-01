@@ -9,7 +9,7 @@
 
 namespace duckdb {
 
-class DuckDBPyConnection;
+struct DuckDBPyConnection;
 
 //! Python-facing schema specialization selector for the FILE logical family.
 class PythonFileMediaType final {
