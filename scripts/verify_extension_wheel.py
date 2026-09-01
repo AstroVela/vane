@@ -33,6 +33,7 @@ try:
     sys.path.insert(0, str(REPOSITORY_ROOT))
     from scripts.check_release_artifacts import check_artifact as _check_release_artifact
     from vane_packaging.archive_safety import ArchiveSnapshot, open_zip_snapshot, snapshot_archive
+    from vane_packaging.artifact_limits import PUBLICATION_FILE_LIMIT_DESCRIPTION
     from vane_packaging.extension_wheel import (
         _ELF_MAGIC,
         _MAX_EXTENSION_DESCRIPTOR_DEPENDENCIES,
@@ -106,7 +107,7 @@ def _wheel_snapshot(
         wheel,
         max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
         description=description,
-        size_limit_description="the project's 100 MiB publication limit",
+        size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
         yield snapshot
 
@@ -875,7 +876,7 @@ def _enter_verification_snapshot(
 ) -> tuple[ArchiveSnapshot, int]:
     max_bytes = min(_MAX_EXTENSION_WHEEL_BYTES, remaining_bytes)
     size_limit_description = (
-        "the project's 100 MiB publication limit"
+        PUBLICATION_FILE_LIMIT_DESCRIPTION
         if max_bytes == _MAX_EXTENSION_WHEEL_BYTES
         else _CLEAN_VERIFICATION_SNAPSHOT_LIMIT_DESCRIPTION
     )
