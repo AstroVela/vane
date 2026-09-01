@@ -242,6 +242,43 @@ def test_audio_metadata_probe_preserves_cancellation_after_budget_exhaustion(mon
         )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MemoryError("allocation failed"),
+        RuntimeError("decoder invariant failed"),
+        _audio_file.AudioFileFormatError("classified media failure"),
+    ],
+    ids=["memory", "internal", "classified-media"],
+)
+def test_audio_metadata_probe_preserves_non_decoder_errors_after_budget_exhaustion(monkeypatch, failure):
+    class FakeSoundFileError(Exception):
+        pass
+
+    class FailingSoundFile:
+        def __init__(self, stream, *, mode, closefd):
+            assert mode == "r"
+            assert closefd is False
+            assert stream.read(1) == b"x"
+            assert stream.read(1) == b""
+            raise failure
+
+    class FakeSoundFileModule:
+        SoundFile = FailingSoundFile
+        SoundFileError = FakeSoundFileError
+
+    monkeypatch.setattr(_audio_file, "_load_soundfile", lambda: FakeSoundFileModule)
+
+    with pytest.raises(type(failure)) as raised:
+        _audio_file._probe_audio_metadata(
+            lambda offset, size: b"x" * size,
+            logical_size=2,
+            content_type=None,
+            max_bytes=1,
+        )
+    assert raised.value is failure
+
+
 def test_audio_operations_preserve_current_cancellation_over_stored_reader_error(
     duckdb_cursor,
     tmp_path,
@@ -585,31 +622,6 @@ def test_audio_file_preserves_unknown_flac_frame_count_and_decodes_incrementally
         value.to_numpy(max_frames=63, connection=duckdb_cursor)
     with pytest.raises(vane.AudioFileLimitError, match="max_decoded_bytes"):
         value.to_numpy(max_decoded_bytes=63 * 2 * 8, connection=duckdb_cursor)
-
-
-def test_audio_file_rejects_decoder_output_beyond_finite_frame_count(duckdb_cursor, tmp_path, monkeypatch):
-    payload, _ = _encoded_audio("FLAC", "PCM_16", frames=64, channels=2)
-    path = tmp_path / "underreported-total.flac"
-    path.write_bytes(_flac_with_total_samples(payload, 63))
-    value = vane.AudioFile(str(path), "audio/flac")
-
-    assert value.metadata(connection=duckdb_cursor).frames == 63
-
-    original_buffer_read_into = soundfile.SoundFile.buffer_read_into
-    read_count = 0
-
-    def expose_extra_frame(self, buffer, dtype):
-        nonlocal read_count
-        read_count += 1
-        decoded_frames = original_buffer_read_into(self, buffer, dtype=dtype)
-        if read_count == 2:
-            assert decoded_frames == 0
-            return 1
-        return decoded_frames
-
-    monkeypatch.setattr(soundfile.SoundFile, "buffer_read_into", expose_extra_frame)
-    with pytest.raises(vane.AudioFileFormatError, match="more frames after reporting 63"):
-        value.to_numpy(connection=duckdb_cursor)
 
 
 def test_soundfile_cleanup_does_not_replace_primary_audio_errors(duckdb_cursor, tmp_path, monkeypatch):

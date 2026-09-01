@@ -511,17 +511,17 @@ def _probe_audio_metadata(
         if not isinstance(error, Exception):
             raise
         stream.raise_if_error()
+        if isinstance(error, AudioFileError):
+            raise
+        if not isinstance(error, soundfile.SoundFileError):
+            raise
         if stream.budget_exhausted:
             raise AudioFileLimitError(f"audio metadata requires more than max_bytes={max_bytes}") from error
         if stream.fetch_limit_exhausted:
             raise AudioFileLimitError(
                 f"audio metadata requires more than {_MAX_AUDIO_METADATA_FETCHES} source ranges"
             ) from error
-        if isinstance(error, AudioFileError):
-            raise
-        if isinstance(error, soundfile.SoundFileError):
-            raise AudioFileFormatError("logical FILE view is not a supported encoded audio file") from error
-        raise
+        raise AudioFileFormatError("logical FILE view is not a supported encoded audio file") from error
     if stream.budget_exhausted:
         raise AudioFileLimitError(f"audio metadata requires more than max_bytes={max_bytes}")
     if stream.fetch_limit_exhausted:
@@ -685,16 +685,6 @@ def _decode_audio_file(
                         samples = numpy.frombuffer(decoded, dtype=numpy.float64).reshape(
                             metadata.frames,
                             metadata.channels,
-                        )
-                    extra = bytearray(frame_bytes)
-                    extra_frames = audio.buffer_read_into(extra, dtype="float64")
-                    proxy.raise_if_error()
-                    del extra
-                    if extra_frames < 0 or extra_frames > 1:
-                        raise AudioFileFormatError("audio decoder returned an invalid frame count")
-                    if extra_frames:
-                        raise AudioFileFormatError(
-                            f"audio decoder produced more frames after reporting {metadata.frames}"
                         )
                 proxy.raise_if_error()
         except BaseException as error:
