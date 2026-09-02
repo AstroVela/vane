@@ -432,11 +432,11 @@ def _fetch_extension_catalog_contents(request: Request, validated_url: str) -> b
         _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
     try:
         worker.start()
-    except RuntimeError as exception:
+    except RuntimeError as start_exception:
         _EXTENSION_CATALOG_FETCH_SLOTS.release()
         raise DynamicExtensionError(
             "CATALOG_UNAVAILABLE", "could not start the extension catalog request"
-        ) from exception
+        ) from start_exception
     except BaseException:
         _EXTENSION_CATALOG_FETCH_SLOTS.release()
         raise
@@ -446,13 +446,13 @@ def _fetch_extension_catalog_contents(request: Request, validated_url: str) -> b
         cancelled.set()
         _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
     try:
-        contents, exception = results.get_nowait()
+        contents, fetch_exception = results.get_nowait()
     except queue.Empty as queue_exception:
         raise DynamicExtensionError(
             "CATALOG_UNAVAILABLE", "extension catalog request did not return a result"
         ) from queue_exception
-    if exception is not None:
-        raise exception
+    if fetch_exception is not None:
+        raise fetch_exception
     if contents is None:
         _fail("CATALOG_UNAVAILABLE", "extension catalog request did not return a response body")
     return contents
