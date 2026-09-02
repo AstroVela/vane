@@ -226,8 +226,9 @@ inline std::string BuildCopyDirectTargetFilePath(const std::string &base_path, c
 inline std::string BuildCopyDirectTargetFilePath(FileSystem &fs, const std::string &base_path,
                                                  const std::string &run_id, const std::string &worker_dir_name,
                                                  const std::string &file_name) {
-	return BuildCopyDirectTargetFilePath(base_path, run_id, worker_dir_name, file_name,
-	                                     DistributedCopyPathSeparator(fs, base_path));
+	auto normalized_base_path = NormalizeDistributedCopyPathForComparison(fs, base_path);
+	return BuildCopyDirectTargetFilePath(normalized_base_path, run_id, worker_dir_name, file_name,
+	                                     DistributedCopyPathSeparator(fs, normalized_base_path));
 }
 
 inline std::string BuildCopyDirectTargetFilenamePattern(const std::string &run_id, const std::string &worker_dir_name) {
