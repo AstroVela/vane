@@ -29,6 +29,7 @@ from packaging.version import Version
 import scripts.verify_extension_wheel as verify_extension_wheel_module
 import vane
 import vane_packaging.archive_safety as archive_safety_module
+import vane_packaging.artifact_limits as artifact_limits_module
 import vane_packaging.extension_wheel as extension_wheel_module
 import vane_packaging.manylinux_policy as manylinux_policy_module
 from scripts import check_release_artifacts
@@ -38,6 +39,16 @@ from vane_packaging.extension_wheel import ENTRY_POINT_GROUP, build_extension_wh
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TEST_TRUST_IDENTITY = "vane-tests"
+
+
+def test_extension_wheel_uses_the_shared_layered_size_budgets() -> None:
+    assert extension_wheel_module._MAX_EXTENSION_WHEEL_BYTES == artifact_limits_module.MAX_PUBLICATION_FILE_BYTES
+    assert extension_wheel_module._MAX_EXTENSION_WHEEL_MEMBER_BYTES == artifact_limits_module.MAX_ARCHIVE_MEMBER_BYTES
+    assert (
+        extension_wheel_module._MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES
+        == artifact_limits_module.MAX_ARCHIVE_UNCOMPRESSED_BYTES
+    )
+    assert extension_wheel_module._MAX_EXTENSION_ARTIFACT_BYTES == artifact_limits_module.MAX_EXTENSION_ARTIFACT_BYTES
 
 
 def _runtime_platform() -> str:
@@ -3071,7 +3082,7 @@ def test_platform_wheel_rejects_oversized_dependency_wheels(
     )
     monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_BYTES", 0)
 
-    with pytest.raises(ValueError, match="100 MiB publication limit"):
+    with pytest.raises(ValueError, match="128 MiB publication limit"):
         _build_sample_wheel(tmp_path, output_name="root-dist", dependencies=(dependency.path,))
 
 
@@ -4646,7 +4657,7 @@ def test_platform_wheel_rejects_an_oversized_archive_before_publication(
 ):
     monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_BYTES", 0)
 
-    with pytest.raises(ValueError, match="100 MiB publication limit"):
+    with pytest.raises(ValueError, match="128 MiB publication limit"):
         _build_sample_wheel(tmp_path)
 
     assert not list((tmp_path / "dist").glob("*.whl"))
@@ -4657,14 +4668,14 @@ def test_platform_wheel_rejects_an_oversized_artifact_before_descriptor_inspecti
     monkeypatch,
 ):
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
-    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES", 0)
+    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_ARTIFACT_BYTES", 0)
 
     def reject_descriptor_inspection(*args, **kwargs):
         raise AssertionError("oversized artifact reached descriptor inspection")
 
     monkeypatch.setattr(extension_wheel_module, "_create_descriptor", reject_descriptor_inspection)
 
-    with pytest.raises(ValueError, match="extension artifact exceeds.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="extension artifact exceeds.*384 MiB extension-artifact limit"):
         _build_sample_wheel(tmp_path, artifact_path=artifact_path)
 
 
@@ -4680,7 +4691,7 @@ def test_platform_wheel_rechecks_the_artifact_bound_immediately_before_descripto
     def reject_descriptor_inspection(*args, **kwargs):
         raise AssertionError("expanded artifact reached descriptor inspection")
 
-    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES", len(b"initial"))
+    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_ARTIFACT_BYTES", len(b"initial"))
     monkeypatch.setattr(
         extension_wheel_module,
         "_validate_dependency_wheel_requirements",
@@ -4688,7 +4699,7 @@ def test_platform_wheel_rechecks_the_artifact_bound_immediately_before_descripto
     )
     monkeypatch.setattr(extension_wheel_module, "_create_descriptor", reject_descriptor_inspection)
 
-    with pytest.raises(ValueError, match="extension artifact exceeds.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="extension artifact exceeds.*384 MiB extension-artifact limit"):
         _build_sample_wheel(tmp_path, artifact_path=artifact_path)
 
 
@@ -4705,10 +4716,10 @@ def test_platform_wheel_rechecks_the_artifact_bound_after_descriptor_inspection(
         path.write_bytes(b"expanded")
         return descriptor
 
-    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES", len(b"initial"))
+    monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_ARTIFACT_BYTES", len(b"initial"))
     monkeypatch.setattr(extension_wheel_module, "_create_descriptor", create_then_expand)
 
-    with pytest.raises(ValueError, match="extension artifact exceeds.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="extension artifact exceeds.*384 MiB extension-artifact limit"):
         _build_sample_wheel(tmp_path, artifact_path=artifact_path)
 
 
@@ -4720,11 +4731,11 @@ def test_platform_wheel_rejects_an_oversized_license_before_reading_it(
     artifact_path = _write_artifact(tmp_path / "sample.duckdb_extension")
     monkeypatch.setattr(
         extension_wheel_module,
-        "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES",
-        artifact_path.stat().st_size,
+        "_MAX_EXTENSION_WHEEL_MEMBER_BYTES",
+        0,
     )
 
-    with pytest.raises(ValueError, match="license file exceeds.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="license file exceeds.*384 MiB per-member uncompressed limit"):
         _build_sample_wheel(tmp_path, artifact_path=artifact_path)
 
 
@@ -4735,7 +4746,7 @@ def test_platform_wheel_rejects_oversized_decompressed_contents_before_publicati
 ):
     monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES", 0)
 
-    with pytest.raises(ValueError, match="100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="512 MiB total uncompressed limit"):
         _build_sample_wheel(tmp_path)
 
     assert not list((tmp_path / "dist").glob("*.whl"))
@@ -4756,7 +4767,7 @@ def test_platform_wheel_rejects_oversized_aggregate_contents_before_creating_arc
 
     monkeypatch.setattr(extension_wheel_module.tempfile, "mkstemp", reject_archive_creation)
 
-    with pytest.raises(ValueError, match="decompressed contents exceed.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="decompressed contents exceed.*512 MiB total uncompressed limit"):
         build_extension_wheel(
             artifact=artifact_path,
             extension_name="sample",
@@ -4791,12 +4802,12 @@ def test_platform_wheel_rejects_oversized_decompressed_dependency_before_reading
 
     monkeypatch.setattr(
         extension_wheel_module,
-        "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES",
+        "_MAX_EXTENSION_WHEEL_MEMBER_BYTES",
         root_artifact.stat().st_size,
     )
     monkeypatch.setattr(extension_wheel_module.zipfile.ZipFile, "read", require_size_check_before_read)
 
-    with pytest.raises(ValueError, match="dependency extension wheel.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="dependency extension wheel.*384 MiB per-member uncompressed limit"):
         _build_sample_wheel(
             tmp_path,
             artifact_path=root_artifact,
@@ -5016,7 +5027,7 @@ def test_platform_wheel_rejects_oversized_total_decompressed_dependency_contents
         largest_member,
     )
 
-    with pytest.raises(ValueError, match="decompressed contents exceed.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="decompressed contents exceed.*512 MiB total uncompressed limit"):
         _build_sample_wheel(tmp_path, output_name="root-dist", dependencies=(dependency.path,))
 
 
@@ -5031,13 +5042,13 @@ def test_clean_verifier_rejects_an_oversized_extension_wheel(
     @contextmanager
     def reject_extension(path, **kwargs):
         if kwargs["description"] == "extension wheel":
-            raise ValueError("extension wheel exceeds the project's 100 MiB publication limit")
+            raise ValueError("extension wheel exceeds the project's 128 MiB publication limit")
         with snapshot_archive(path, **kwargs) as snapshot:
             yield snapshot
 
     monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_extension)
 
-    with pytest.raises(RuntimeError, match="100 MiB publication limit"):
+    with pytest.raises(RuntimeError, match="128 MiB publication limit"):
         verify_extension_wheel(
             base_wheel=_write_minimal_base_wheel(tmp_path),
             extension_wheel=built.path,
@@ -5121,7 +5132,7 @@ def test_clean_verifier_rejects_oversized_decompressed_extension_contents(
     built = _build_sample_wheel(tmp_path)
     monkeypatch.setattr(extension_wheel_module, "_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES", 0)
 
-    with pytest.raises(RuntimeError, match="100 MiB uncompressed limit"):
+    with pytest.raises(RuntimeError, match="512 MiB total uncompressed limit"):
         verify_extension_wheel(
             base_wheel=_write_minimal_base_wheel(tmp_path),
             extension_wheel=built.path,
@@ -5142,13 +5153,13 @@ def test_clean_verifier_rejects_an_oversized_base_wheel_before_opening_it(
     @contextmanager
     def reject_base(path, **kwargs):
         if kwargs["description"] == "base Vane wheel":
-            raise ValueError("base Vane wheel exceeds the project's 100 MiB publication limit")
+            raise ValueError("base Vane wheel exceeds the project's 128 MiB publication limit")
         with snapshot_archive(path, **kwargs) as snapshot:
             yield snapshot
 
     monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_base)
 
-    with pytest.raises(RuntimeError, match="base Vane wheel exceeds.*100 MiB publication limit"):
+    with pytest.raises(RuntimeError, match="base Vane wheel exceeds.*128 MiB publication limit"):
         verify_extension_wheel(
             base_wheel=base_wheel,
             extension_wheel=root.path,
@@ -5177,13 +5188,13 @@ def test_clean_verifier_rejects_an_oversized_dependency_before_opening_it(
     @contextmanager
     def reject_dependency(path, **kwargs):
         if kwargs["description"] == "dependency extension wheel":
-            raise ValueError("dependency extension wheel exceeds the project's 100 MiB publication limit")
+            raise ValueError("dependency extension wheel exceeds the project's 128 MiB publication limit")
         with snapshot_archive(path, **kwargs) as snapshot:
             yield snapshot
 
     monkeypatch.setattr(verify_extension_wheel_module, "snapshot_archive", reject_dependency)
 
-    with pytest.raises(RuntimeError, match="100 MiB publication limit"):
+    with pytest.raises(RuntimeError, match="128 MiB publication limit"):
         verify_extension_wheel(
             base_wheel=_write_minimal_base_wheel(tmp_path),
             extension_wheel=root.path,

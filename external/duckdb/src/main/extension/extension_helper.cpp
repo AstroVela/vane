@@ -420,17 +420,17 @@ void ExtensionHelper::AutoLoadExtension(DatabaseInstance &db, const string &exte
 static const char *const public_keys[] = {
 #ifdef VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY
     // Candidate-only AstroVela TestPyPI key. Its DER-encoded SubjectPublicKeyInfo
-    // has SHA-256 f02108bc37439677d8ade5c6e0efd90314d5ac7308b8d972d2271f41791b4941.
+    // has SHA-256 53779fb8f9c97e9dec9c66ff838839eb234d1a64d4b105671304820e627b5e32.
     // Production releases must use an independently managed signing key.
     R"(
 -----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7zuFv8bsD9U0YboZXyIx
-KNe99EktVJewYMTFSTMmLyRH3Ldn3yLTQCk1kciABjT8o556ZtviuGeo5pWXN/Gl
-a2BF0lftvrrU6mJTrY+Hwggk33JSXA46puTrCOlRuREDe2pcAIUela3ktpaqxfXQ
-l1yuIeoFO3tyGRMyvevEZ3Bx5MSdSr9ooLdvhKEm5uW/gb4yVx9QbZ4WVvHLn+Sq
-YyBVHLxB9c1k0MDRFfwpZOnq8r1VFD6ULkAQEgAM8NHZnZsHfmetoemuZmpLx/AB
-mh+FqYTeIb8dIGVBWyCkQa5/0fvhTVuZ+iImLqdbLbDDIYgwKmylrKDoY77n640C
-UQIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1NVtTvTBmZsTT34Hg066
+yJeo+rYT1VRROdr7WEY/kuT5CLdGnuEynG69w3HBFakhz5oTnd+bODCecgpQ83K5
+aYYF8KKlI3a62Tg3lOZvd7gVhwxE7np2z4aBZn5/BtvHAdyqMnCP2k9veZFan2GJ
+/xsCLeTvEJPBBy831gCrfwJriCKE7uE9Ck4/n1lztLbxIelz8e5MZ7KDuK76jNuI
+i/q3XQkDf5+5eIoKBsMVL+m3Au+McjhjvzoCZaghT8wsks5cLiQtrvTxeX8WkDrV
+luem0uNYeof25pwgGiUunWBXYhkUVysDqLmDjoBQLP+WoOsND/QeEepwpzu8+1/Y
+9wIDAQAB
 -----END PUBLIC KEY-----
 )",
 #endif

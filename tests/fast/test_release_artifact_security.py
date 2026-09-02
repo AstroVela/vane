@@ -22,7 +22,7 @@ import pytest
 from packaging.version import Version
 
 from scripts import check_release_artifacts, verify_duckdb_coexistence
-from vane_packaging import archive_safety
+from vane_packaging import archive_safety, artifact_limits
 
 TEST_VERSION = Version("0.2.0.dev14")
 TEST_LAYOUT = check_release_artifacts.distribution_layout(TEST_VERSION)
@@ -39,6 +39,21 @@ REQUIRED_WHEEL_PATHS = (
     f"{TEST_LAYOUT.dist_info_root}/WHEEL",
     f"{TEST_LAYOUT.dist_info_root}/RECORD",
 )
+
+
+def test_release_artifact_size_budgets_are_independent() -> None:
+    assert artifact_limits.MAX_PUBLICATION_FILE_BYTES == 128 * artifact_limits.MEBIBYTE
+    assert artifact_limits.MAX_ARCHIVE_MEMBER_BYTES == 384 * artifact_limits.MEBIBYTE
+    assert artifact_limits.MAX_ARCHIVE_UNCOMPRESSED_BYTES == 512 * artifact_limits.MEBIBYTE
+    assert artifact_limits.MAX_EXTENSION_ARTIFACT_BYTES == artifact_limits.MAX_ARCHIVE_MEMBER_BYTES
+    assert check_release_artifacts.MAX_ARTIFACT_BYTES == artifact_limits.MAX_PUBLICATION_FILE_BYTES
+    assert check_release_artifacts.MAX_ARTIFACT_MEMBER_BYTES == artifact_limits.MAX_ARCHIVE_MEMBER_BYTES
+    assert check_release_artifacts.MAX_ARTIFACT_UNCOMPRESSED_BYTES == artifact_limits.MAX_ARCHIVE_UNCOMPRESSED_BYTES
+    assert (
+        artifact_limits.MAX_PUBLICATION_FILE_BYTES
+        < artifact_limits.MAX_ARCHIVE_MEMBER_BYTES
+        < artifact_limits.MAX_ARCHIVE_UNCOMPRESSED_BYTES
+    )
 
 
 class _NamesOnlyArtifact:
@@ -110,9 +125,9 @@ def _write_archive_members(path: Path, members: dict[str, bytes]) -> None:
 def _validate_tar_member_count(path: Path, **kwargs) -> int:
     with archive_safety.snapshot_archive(
         path,
-        max_bytes=100 * 1024 * 1024,
+        max_bytes=artifact_limits.MAX_PUBLICATION_FILE_BYTES,
         description="sdist",
-        size_limit_description="the test archive limit",
+        size_limit_description=artifact_limits.PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
         return archive_safety.validate_tar_member_count(
             snapshot.file,
@@ -591,7 +606,7 @@ def test_content_scan_rejects_an_oversized_decompressed_member_before_reading_it
     contents = b"a" * 1024
     _write_archive(artifact, "project/oversized.bin", contents)
     assert artifact.stat().st_size < len(contents)
-    monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_UNCOMPRESSED_BYTES", 512)
+    monkeypatch.setattr(check_release_artifacts, "MAX_ARTIFACT_MEMBER_BYTES", 512)
     artifact_type = (
         check_release_artifacts.SdistArtifact if suffix == ".tar.gz" else check_release_artifacts.WheelArtifact
     )
@@ -601,7 +616,7 @@ def test_content_scan_rejects_an_oversized_decompressed_member_before_reading_it
 
     monkeypatch.setattr(artifact_type, "read", reject_member_read)
 
-    with pytest.raises(ValueError, match="archive member.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="archive member.*384 MiB per-member uncompressed limit"):
         check_release_artifacts.check_artifact_contents(artifact)
 
 
@@ -629,7 +644,7 @@ def test_content_scan_rejects_oversized_total_decompressed_contents_before_readi
 
     monkeypatch.setattr(artifact_type, "read", reject_member_read)
 
-    with pytest.raises(ValueError, match="decompressed contents exceed.*100 MiB uncompressed limit"):
+    with pytest.raises(ValueError, match="decompressed contents exceed.*512 MiB total uncompressed limit"):
         check_release_artifacts.check_artifact_contents(artifact)
 
 
@@ -886,7 +901,8 @@ def test_uncompressed_tar_preflight_and_parser_use_the_same_snapshot(tmp_path, m
             max_members=1,
             max_member_bytes=1024,
             max_total_bytes=1024,
-            uncompressed_limit_description="the test limit",
+            member_limit_description="the test member limit",
+            total_limit_description="the test total limit",
             description="test TAR",
         ) as archive:
             members = archive.getmembers()
@@ -941,7 +957,8 @@ def test_sdist_streaming_preflight_normalizes_corrupt_deflate_errors(tmp_path, m
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -975,7 +992,8 @@ def test_sdist_streaming_preflight_rejects_oversized_header_before_advancing(
             max_members=10,
             max_member_bytes=512,
             max_total_bytes=2048,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -1002,7 +1020,8 @@ def test_sdist_streaming_preflight_bounds_extension_header_payloads(tmp_path, mo
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -1026,7 +1045,8 @@ def test_sdist_streaming_preflight_rejects_gnu_sparse_before_special_parsing(tmp
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -1048,7 +1068,8 @@ def test_sdist_streaming_preflight_matches_tarfile_for_nonzero_directory_sizes(t
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
         == 2
@@ -1078,7 +1099,8 @@ def test_sdist_streaming_preflight_matches_tarfile_local_pax_size_precedence(tmp
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
         == 3
@@ -1101,7 +1123,8 @@ def test_sdist_streaming_preflight_rejects_ambiguous_global_pax_size(tmp_path):
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -1119,7 +1142,8 @@ def test_sdist_streaming_preflight_rejects_a_concatenated_gzip_payload_after_the
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
 
@@ -1141,7 +1165,8 @@ def test_sdist_streaming_preflight_accepts_bounded_zero_padding_after_the_termin
             max_members=10,
             max_member_bytes=2048,
             max_total_bytes=4096,
-            uncompressed_limit_description="the uncompressed test limit",
+            member_limit_description="the uncompressed test limit",
+            total_limit_description="the uncompressed test limit",
             description="sdist",
         )
         == 1

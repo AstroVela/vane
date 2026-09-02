@@ -500,7 +500,7 @@ def test_audio_extra_installs_soundfile():
 
 def test_video_extra_installs_video_dependencies():
     selected = _requirements_for_extra("video")
-    assert {"pillow", "psutil"} <= selected
+    assert {"av", "pillow", "psutil"} <= selected
     supports_decord = platform.system() == "Linux" and platform.machine() == "x86_64"
     assert ("decord" in selected) is supports_decord
 
@@ -512,4 +512,4 @@ def test_base_distribution_keeps_media_dependencies_optional():
         if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
             base_requirements.add(canonicalize_name(requirement.name))
 
-    assert {"pillow", "psutil", "decord", "soundfile"}.isdisjoint(base_requirements)
+    assert {"av", "pillow", "psutil", "decord", "soundfile"}.isdisjoint(base_requirements)

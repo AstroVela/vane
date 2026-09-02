@@ -54,14 +54,23 @@ try:
         open_zip_snapshot,
         snapshot_archive,
     )
+    from vane_packaging.artifact_limits import (
+        ARCHIVE_MEMBER_LIMIT_DESCRIPTION,
+        ARCHIVE_TOTAL_LIMIT_DESCRIPTION,
+        MAX_ARCHIVE_MEMBER_BYTES,
+        MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+        MAX_PUBLICATION_FILE_BYTES,
+        PUBLICATION_FILE_LIMIT_DESCRIPTION,
+    )
 finally:
     sys.path[:] = _ORIGINAL_SYS_PATH
     del _ORIGINAL_SYS_PATH
 
 PROJECT_METADATA = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 EXPECTED_NAME = str(PROJECT_METADATA["name"])
-MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
-MAX_ARTIFACT_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_ARTIFACT_BYTES = MAX_PUBLICATION_FILE_BYTES
+MAX_ARTIFACT_MEMBER_BYTES = MAX_ARCHIVE_MEMBER_BYTES
+MAX_ARTIFACT_UNCOMPRESSED_BYTES = MAX_ARCHIVE_UNCOMPRESSED_BYTES
 MAX_ARTIFACT_MEMBERS = 10_000
 MAX_CORE_METADATA_BYTES = 1024 * 1024
 MAX_CORE_METADATA_HEADERS = 1024
@@ -218,7 +227,7 @@ class WheelArtifact:
                         archive_input,
                         max_bytes=MAX_ARTIFACT_BYTES,
                         description="artifact",
-                        size_limit_description="the project's 100 MiB publication limit",
+                        size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
                     )
                 )
             self.raw_content_match = _detect_raw_archive_content(self.snapshot, content_rules)
@@ -267,7 +276,7 @@ class SdistArtifact:
                         archive_input,
                         max_bytes=MAX_ARTIFACT_BYTES,
                         description="artifact",
-                        size_limit_description="the project's 100 MiB publication limit",
+                        size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
                     )
                 )
             self.raw_content_match = _detect_raw_archive_content(self.snapshot, content_rules)
@@ -276,9 +285,10 @@ class SdistArtifact:
                 open_tar_snapshot(
                     self.snapshot,
                     max_members=MAX_ARTIFACT_MEMBERS,
-                    max_member_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
+                    max_member_bytes=MAX_ARTIFACT_MEMBER_BYTES,
                     max_total_bytes=MAX_ARTIFACT_UNCOMPRESSED_BYTES,
-                    uncompressed_limit_description="the project's 100 MiB uncompressed limit",
+                    member_limit_description=ARCHIVE_MEMBER_LIMIT_DESCRIPTION,
+                    total_limit_description=ARCHIVE_TOTAL_LIMIT_DESCRIPTION,
                     description="sdist",
                     metadata_chunk_callback=metadata_scanner if content_rules else None,
                     mode="r:gz",
@@ -444,7 +454,7 @@ def _detect_raw_archive_content(
         while chunk := snapshot.file.read(_RAW_ARCHIVE_SCAN_CHUNK_BYTES):
             total_size += len(chunk)
             if total_size > MAX_ARTIFACT_BYTES:
-                raise ValueError(f"{path}: artifact exceeds the project's 100 MiB publication limit")
+                raise ValueError(f"{path}: artifact exceeds {PUBLICATION_FILE_LIMIT_DESCRIPTION}")
             window = overlap + chunk
             for rule in content_rules:
                 if rule.matches(window):
@@ -757,6 +767,7 @@ def _check_sdist(artifact: SdistArtifact, layout: DistributionLayout) -> None:
         "build_backend.py",
         "vane_packaging/__init__.py",
         "vane_packaging/archive_safety.py",
+        "vane_packaging/artifact_limits.py",
         "vane_packaging/extension_wheel.py",
         "vane_packaging/manylinux_policy.py",
         "vane_packaging/setuptools_scm_version.py",
@@ -910,15 +921,13 @@ def _validate_artifact_contents_size(artifact: Artifact) -> None:
     for member_name, member_size in artifact.member_sizes():
         if member_size < 0:
             raise ValueError(f"{artifact.path}: archive member {member_name!r} has an invalid negative size")
-        if member_size > MAX_ARTIFACT_UNCOMPRESSED_BYTES:
+        if member_size > MAX_ARTIFACT_MEMBER_BYTES:
             raise ValueError(
-                f"{artifact.path}: archive member {member_name!r} exceeds the project's 100 MiB uncompressed limit"
+                f"{artifact.path}: archive member {member_name!r} exceeds {ARCHIVE_MEMBER_LIMIT_DESCRIPTION}"
             )
         total_size += member_size
         if total_size > MAX_ARTIFACT_UNCOMPRESSED_BYTES:
-            raise ValueError(
-                f"{artifact.path}: archive decompressed contents exceed the project's 100 MiB uncompressed limit"
-            )
+            raise ValueError(f"{artifact.path}: archive decompressed contents exceed {ARCHIVE_TOTAL_LIMIT_DESCRIPTION}")
 
 
 def _open_artifact(

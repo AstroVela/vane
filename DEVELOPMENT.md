@@ -215,11 +215,15 @@ policy, fixed UCRT API-set contracts, the exact CPython runtime DLL, and the VC
 runtime shipped with CPython are accepted; publisher-local, lookalike API-set,
 or path-qualified imports are rejected. Clean verification applies the same
 checks to every PE member of the base wheel. The builder and verifier reject
-extension wheels above the project's 100 MiB publication limit, any archive
-member above a 100 MiB uncompressed limit, or an archive whose total decompressed
-contents exceed that limit. The preflight runs before reading
-dependency, root, or base wheel members. Before constructing Python's ZIP
-reader, every supplied wheel also receives a streaming central-directory
+extension wheels above the project's 128 MiB publication limit, any archive
+member above a 384 MiB per-member uncompressed limit, or an archive whose total
+decompressed contents exceed 512 MiB. These independent budgets bound bytes in
+transport, one large native artifact, and aggregate decompression amplification
+without requiring them to share the same value. These are Vane's safety budgets;
+an external package index may impose a smaller project-specific upload limit.
+The preflight runs before reading dependency, root, or base wheel members.
+Before constructing Python's ZIP reader, every supplied wheel also receives a
+streaming central-directory
 preflight capped at 10,000 members. Archives with comments, spanning, ZIP64 end records, or
 internally inconsistent counts and bounds are rejected. Untrusted release and
 extension-wheel archive paths are opened once, confirmed to name regular
@@ -265,14 +269,15 @@ each decompressed TAR header and bounded PAX or GNU extension-header payload,
 including matches split across streaming chunks. They also scan the
 bounded raw artifact stream, including ZIP gaps and other bytes not exposed as
 archive members; text-only rules retain their archive-member binary filter.
-The staged `.duckdb_extension` must also be a regular file within the 100 MiB
-uncompressed limit. The builder checks it before descriptor inspection and
+The staged `.duckdb_extension` must also be a regular file within the 384 MiB
+extension-artifact limit. The builder checks it before descriptor inspection and
 performs a second file-descriptor check plus a bounded read before packaging.
-License inputs use the same bounded reader, and an existing output wheel is
-size-checked before it is compared with the generated wheel in bounded chunks.
-The complete generated member set is checked against the total uncompressed
-limit before a temporary wheel is created, including a second check after its
-RECORD is generated.
+License inputs use the 384 MiB per-member bounded reader, and an existing output
+wheel is size-checked before it is compared with the generated wheel in bounded
+chunks.
+The complete generated member set is checked against the 512 MiB total
+uncompressed limit before a temporary wheel is created, including a second check
+after its RECORD is generated.
 Load an installed provider and its exact dependency closure by canonical
 extension name:
 

@@ -19,7 +19,7 @@ from scripts.validate_testpypi_candidate import (
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-TESTPYPI_EXTENSION_KEY_FINGERPRINT = "f02108bc37439677d8ade5c6e0efd90314d5ac7308b8d972d2271f41791b4941"
+TESTPYPI_EXTENSION_KEY_FINGERPRINT = "53779fb8f9c97e9dec9c66ff838839eb234d1a64d4b105671304820e627b5e32"
 
 
 @pytest.mark.parametrize("raw_version", ["0.2.0.dev601", "0.2.0rc2.dev3"])

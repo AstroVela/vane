@@ -31,6 +31,7 @@ add_library(
   ai_sql_functions.cpp
   audio_file_functions.cpp
   image_file_functions.cpp
+  video_file_functions.cpp
   path_like.cpp
   pyconnection.cpp
   datasource_function.cpp

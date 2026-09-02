@@ -28,6 +28,7 @@ static constexpr uint64_t DEFAULT_AUDIO_BUFFER_SIZE = 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024;
 
 static string PythonTypeName(const py::handle &value) {
 	return py::str(py::type::of(value)).cast<string>();
@@ -191,6 +192,19 @@ static void BindAudioFileMethods(py::class_<PythonAudioFile, PythonFile> &file) 
 	    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES, py::arg("connection") = py::none());
 }
 
+static void BindVideoFileMethods(py::class_<PythonVideoFile, PythonFile> &file) {
+	file.def(
+	    "metadata",
+	    [](const PythonVideoFile &value, const py::object &max_bytes, shared_ptr<DuckDBPyConnection> connection) {
+		    return py::module_::import("vane._video_file")
+		        .attr("_video_file_metadata_value")(py::cast(value, py::return_value_policy::copy),
+		                                            py::arg("max_bytes") = max_bytes,
+		                                            py::arg("connection") = std::move(connection));
+	    },
+	    "Inspect the first video stream with bounded reads and no frame decoding", py::kw_only(),
+	    py::arg("max_bytes") = DEFAULT_VIDEO_METADATA_BYTES, py::arg("connection") = py::none());
+}
+
 static py::object ExecuteFileScalar(const PythonFile &file, shared_ptr<DuckDBPyConnection> connection,
                                     const string &query, vector<Value> parameters = {}) {
 	if (!connection) {
@@ -342,6 +356,7 @@ void PythonFile::Initialize(py::handle &m) {
 	BindAudioFileMethods(audio_file);
 	auto video_file = py::class_<PythonVideoFile, PythonFile>(m, "VideoFile", py::module_local(), py::is_final());
 	BindMediaFileClass(video_file, "VideoFile");
+	BindVideoFileMethods(video_file);
 
 	// Native media subclasses are registered above; keep the public hierarchy
 	// closed so user-defined subclasses cannot add state to governed values.

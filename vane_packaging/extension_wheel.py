@@ -43,6 +43,16 @@ from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel
 from packaging.version import InvalidVersion, Version
 
 from vane_packaging.archive_safety import ArchiveSnapshot, open_zip_snapshot, snapshot_archive
+from vane_packaging.artifact_limits import (
+    ARCHIVE_MEMBER_LIMIT_DESCRIPTION,
+    ARCHIVE_TOTAL_LIMIT_DESCRIPTION,
+    EXTENSION_ARTIFACT_LIMIT_DESCRIPTION,
+    MAX_ARCHIVE_MEMBER_BYTES,
+    MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+    MAX_EXTENSION_ARTIFACT_BYTES,
+    MAX_PUBLICATION_FILE_BYTES,
+    PUBLICATION_FILE_LIMIT_DESCRIPTION,
+)
 from vane_packaging.manylinux_policy import ManylinuxPolicy, manylinux_policy
 
 if TYPE_CHECKING:
@@ -54,8 +64,10 @@ _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _EXTENSION_INTERPRETER_TAG_RE = re.compile(r"^cp3(?:10|11|12|13|14)$")
 _WHEEL_PLATFORM_TAG_RE = re.compile(r"^[a-z0-9_]+$")
 _MAX_WHEEL_PATH_COMPONENT_BYTES = 255
-_MAX_EXTENSION_WHEEL_BYTES = 100 * 1024 * 1024
-_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+_MAX_EXTENSION_WHEEL_BYTES = MAX_PUBLICATION_FILE_BYTES
+_MAX_EXTENSION_WHEEL_MEMBER_BYTES = MAX_ARCHIVE_MEMBER_BYTES
+_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES = MAX_ARCHIVE_UNCOMPRESSED_BYTES
+_MAX_EXTENSION_ARTIFACT_BYTES = MAX_EXTENSION_ARTIFACT_BYTES
 _MAX_EXTENSION_WHEEL_MEMBERS = 10_000
 _MAX_CORE_METADATA_BYTES = 1024 * 1024
 _MAX_CORE_METADATA_HEADERS = 1024
@@ -654,7 +666,7 @@ def _read_dependency_wheel(path: Path) -> _DependencyWheel:
         path,
         max_bytes=_MAX_EXTENSION_WHEEL_BYTES,
         description="dependency extension wheel",
-        size_limit_description="the project's 100 MiB publication limit",
+        size_limit_description=PUBLICATION_FILE_LIMIT_DESCRIPTION,
     ) as snapshot:
         return _read_dependency_wheel_snapshot(snapshot)
 
@@ -3251,7 +3263,7 @@ def _normalize_extension_wheel_permissions(path: Path) -> None:
 
 def _validate_extension_wheel_size(path: Path, *, description: str = "extension wheel") -> None:
     if path.stat().st_size > _MAX_EXTENSION_WHEEL_BYTES:
-        raise ValueError(f"{description} exceeds the project's 100 MiB publication limit")
+        raise ValueError(f"{description} exceeds {PUBLICATION_FILE_LIMIT_DESCRIPTION}")
 
 
 def _validate_extension_wheel_archive_size(
@@ -3293,18 +3305,25 @@ def _validate_extension_wheel_member_sizes(
 ) -> None:
     total_size = 0
     for member_name, member_size in members:
-        if member_size > _MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES:
-            raise ValueError(f"{description} member {member_name!r} exceeds the project's 100 MiB uncompressed limit")
+        if member_size > _MAX_EXTENSION_WHEEL_MEMBER_BYTES:
+            raise ValueError(f"{description} member {member_name!r} exceeds {ARCHIVE_MEMBER_LIMIT_DESCRIPTION}")
         total_size += member_size
         if total_size > _MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES:
-            raise ValueError(f"{description} decompressed contents exceed the project's 100 MiB uncompressed limit")
+            raise ValueError(f"{description} decompressed contents exceed {ARCHIVE_TOTAL_LIMIT_DESCRIPTION}")
 
 
-def _validate_bounded_file_metadata(path: Path, metadata: os.stat_result, *, description: str) -> None:
+def _validate_bounded_file_metadata(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    description: str,
+    max_bytes: int,
+    limit_description: str,
+) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"{description} must be a regular file: {path}")
-    if metadata.st_size > _MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES:
-        raise ValueError(f"{description} exceeds the project's 100 MiB uncompressed limit: {path}")
+    if metadata.st_size > max_bytes:
+        raise ValueError(f"{description} exceeds {limit_description}: {path}")
 
 
 def _validate_extension_artifact_size(path: Path) -> None:
@@ -3312,27 +3331,46 @@ def _validate_extension_artifact_size(path: Path) -> None:
         metadata = path.stat()
     except OSError as exception:
         raise ValueError(f"could not inspect extension artifact: {path}") from exception
-    _validate_bounded_file_metadata(path, metadata, description="extension artifact")
+    _validate_bounded_file_metadata(
+        path,
+        metadata,
+        description="extension artifact",
+        max_bytes=_MAX_EXTENSION_ARTIFACT_BYTES,
+        limit_description=EXTENSION_ARTIFACT_LIMIT_DESCRIPTION,
+    )
 
 
-def _read_bounded_file(path: Path, *, description: str) -> bytes:
+def _read_bounded_file(
+    path: Path,
+    *,
+    description: str,
+    max_bytes: int,
+    limit_description: str,
+) -> bytes:
     try:
         with path.open("rb") as artifact_file:
             _validate_bounded_file_metadata(
                 path,
                 os.fstat(artifact_file.fileno()),
                 description=description,
+                max_bytes=max_bytes,
+                limit_description=limit_description,
             )
-            contents = artifact_file.read(_MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES + 1)
+            contents = artifact_file.read(max_bytes + 1)
     except OSError as exception:
         raise ValueError(f"could not read {description}: {path}") from exception
-    if len(contents) > _MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES:
-        raise ValueError(f"{description} exceeds the project's 100 MiB uncompressed limit: {path}")
+    if len(contents) > max_bytes:
+        raise ValueError(f"{description} exceeds {limit_description}: {path}")
     return contents
 
 
 def _read_extension_artifact(path: Path) -> bytes:
-    return _read_bounded_file(path, description="extension artifact")
+    return _read_bounded_file(
+        path,
+        description="extension artifact",
+        max_bytes=_MAX_EXTENSION_ARTIFACT_BYTES,
+        limit_description=EXTENSION_ARTIFACT_LIMIT_DESCRIPTION,
+    )
 
 
 def _bounded_files_equal(first: Path, second: Path) -> bool:
@@ -3342,7 +3380,7 @@ def _bounded_files_equal(first: Path, second: Path) -> bool:
         if not stat.S_ISREG(first_metadata.st_mode) or not stat.S_ISREG(second_metadata.st_mode):
             return False
         if first_metadata.st_size > _MAX_EXTENSION_WHEEL_BYTES:
-            raise ValueError("existing extension wheel exceeds the project's 100 MiB publication limit")
+            raise ValueError(f"existing extension wheel exceeds {PUBLICATION_FILE_LIMIT_DESCRIPTION}")
         if first_metadata.st_size != second_metadata.st_size:
             return False
         remaining = first_metadata.st_size
@@ -3379,9 +3417,14 @@ def _license_entries(
                 f"{colliding_path!r} and {relative_path!r}"
             )
         casefolded_paths[member_name.casefold()] = relative_path
-        entries[member_name] = _read_bounded_file(path, description="license file")
+        entries[member_name] = _read_bounded_file(
+            path,
+            description="license file",
+            max_bytes=_MAX_EXTENSION_WHEEL_MEMBER_BYTES,
+            limit_description=ARCHIVE_MEMBER_LIMIT_DESCRIPTION,
+        )
         if sum(map(len, entries.values())) > _MAX_EXTENSION_WHEEL_UNCOMPRESSED_BYTES:
-            raise ValueError("license files exceed the project's 100 MiB total uncompressed limit")
+            raise ValueError(f"license files exceed {ARCHIVE_TOTAL_LIMIT_DESCRIPTION}")
     if not entries:
         raise ValueError("license_files must contain every license required by the extension artifact")
     for member_name, relative_path in sorted(casefolded_paths.items()):

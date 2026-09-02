@@ -230,7 +230,8 @@ def validate_tar_member_count(
     max_members: int,
     max_member_bytes: int,
     max_total_bytes: int,
-    uncompressed_limit_description: str,
+    member_limit_description: str,
+    total_limit_description: str,
     description: str,
     metadata_chunk_callback: Callable[[bytes, bool], None] | None = None,
 ) -> int:
@@ -255,7 +256,8 @@ def validate_tar_member_count(
                     max_members=max_members,
                     max_member_bytes=max_member_bytes,
                     max_total_bytes=max_total_bytes,
-                    uncompressed_limit_description=uncompressed_limit_description,
+                    member_limit_description=member_limit_description,
+                    total_limit_description=total_limit_description,
                     description=description,
                     metadata_chunk_callback=metadata_chunk_callback,
                 )
@@ -265,7 +267,8 @@ def validate_tar_member_count(
             max_members=max_members,
             max_member_bytes=max_member_bytes,
             max_total_bytes=max_total_bytes,
-            uncompressed_limit_description=uncompressed_limit_description,
+            member_limit_description=member_limit_description,
+            total_limit_description=total_limit_description,
             description=description,
             metadata_chunk_callback=metadata_chunk_callback,
         )
@@ -300,7 +303,8 @@ def open_tar_snapshot(
     max_members: int,
     max_member_bytes: int,
     max_total_bytes: int,
-    uncompressed_limit_description: str,
+    member_limit_description: str,
+    total_limit_description: str,
     description: str,
     metadata_chunk_callback: Callable[[bytes, bool], None] | None = None,
     mode: str = "r:*",
@@ -312,7 +316,8 @@ def open_tar_snapshot(
         max_members=max_members,
         max_member_bytes=max_member_bytes,
         max_total_bytes=max_total_bytes,
-        uncompressed_limit_description=uncompressed_limit_description,
+        member_limit_description=member_limit_description,
+        total_limit_description=total_limit_description,
         description=description,
         metadata_chunk_callback=metadata_chunk_callback,
     )
@@ -328,7 +333,8 @@ def _validate_tar_stream(
     max_members: int,
     max_member_bytes: int,
     max_total_bytes: int,
-    uncompressed_limit_description: str,
+    member_limit_description: str,
+    total_limit_description: str,
     description: str,
     metadata_chunk_callback: Callable[[bytes, bool], None] | None,
 ) -> int:
@@ -368,7 +374,7 @@ def _validate_tar_stream(
             member_name=member.name,
             archive_path=archive_path,
             max_member_bytes=max_member_bytes,
-            uncompressed_limit_description=uncompressed_limit_description,
+            member_limit_description=member_limit_description,
         )
 
         if member.type in _PAX_HEADER_TYPES | _GNU_LONG_HEADER_TYPES:
@@ -382,7 +388,7 @@ def _validate_tar_stream(
                 member.size,
                 archive_path=archive_path,
                 max_total_bytes=max_total_bytes,
-                uncompressed_limit_description=uncompressed_limit_description,
+                total_limit_description=total_limit_description,
             )
             payload = _read_tar_payload(
                 tar_stream,
@@ -413,14 +419,14 @@ def _validate_tar_stream(
             member_name=member.name,
             archive_path=archive_path,
             max_member_bytes=max_member_bytes,
-            uncompressed_limit_description=uncompressed_limit_description,
+            member_limit_description=member_limit_description,
         )
         total_size = _add_tar_payload_size(
             total_size,
             effective_size,
             archive_path=archive_path,
             max_total_bytes=max_total_bytes,
-            uncompressed_limit_description=uncompressed_limit_description,
+            total_limit_description=total_limit_description,
         )
         physical_size = effective_size if member.type in _REGULAR_TAR_MEMBER_TYPES else 0
         _read_tar_payload(tar_stream, physical_size, collect=False)
@@ -432,12 +438,12 @@ def _validate_tar_payload_size(
     member_name: str,
     archive_path: Path,
     max_member_bytes: int,
-    uncompressed_limit_description: str,
+    member_limit_description: str,
 ) -> None:
     if size < 0:
         raise ValueError(f"{archive_path}: archive member {member_name!r} has an invalid negative size")
     if size > max_member_bytes:
-        raise ValueError(f"{archive_path}: archive member {member_name!r} exceeds {uncompressed_limit_description}")
+        raise ValueError(f"{archive_path}: archive member {member_name!r} exceeds {member_limit_description}")
 
 
 def _add_tar_payload_size(
@@ -446,11 +452,11 @@ def _add_tar_payload_size(
     *,
     archive_path: Path,
     max_total_bytes: int,
-    uncompressed_limit_description: str,
+    total_limit_description: str,
 ) -> int:
     updated_size = total_size + member_size
     if updated_size > max_total_bytes:
-        raise ValueError(f"{archive_path}: archive decompressed contents exceed {uncompressed_limit_description}")
+        raise ValueError(f"{archive_path}: archive decompressed contents exceed {total_limit_description}")
     return updated_size
 
 
