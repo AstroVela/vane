@@ -32,6 +32,7 @@ dependencies = [
     "numpy",
     "pyarrow>=14.0.0",
     "pyelftools>=0.33,<1",
+    "pyyaml>=6.0,<7",
     "ray>=2.53.0,<3",
     "typing-extensions",
 ]
@@ -63,6 +64,9 @@ Documentation = "https://github.com/AstroVela/vane#readme"
 Source = "https://github.com/AstroVela/vane"
 Issues = "https://github.com/AstroVela/vane/issues"
 Changelog = "https://github.com/AstroVela/vane/releases"
+
+[project.scripts]
+vane = "vane.cli:main"
 
 [project.optional-dependencies]
 milvus = ["pymilvus>=3.0.1,<4"]
