@@ -119,6 +119,13 @@ inline std::string DistributedCopyPathSeparator(FileSystem &fs, const std::strin
 	return DistributedCopyPathHasProtocol(fs, path) ? std::string("/") : fs.PathSeparator(path);
 }
 
+inline std::string NormalizeDistributedCopyPathForComparison(FileSystem &fs, const std::string &path) {
+	// Object-store keys use URI semantics even when the coordinator runs on
+	// Windows. Only normalize local paths, where Win32 accepts both separators
+	// but directory enumeration returns the native representation.
+	return DistributedCopyPathHasProtocol(fs, path) ? path : fs.ConvertSeparators(path);
+}
+
 inline std::string JoinDistributedCopyPath(FileSystem &fs, const std::string &base, const std::string &child) {
 	if (base.empty()) {
 		return child;
@@ -214,6 +221,13 @@ inline std::string BuildCopyDirectTargetFilePath(const std::string &base_path, c
                                                  const std::string &separator = "/") {
 	auto root = NormalizeCopyDirectWriteRoot(base_path, separator);
 	return BuildCopyPathUnderRoot(root, BuildCopyDirectTargetFileName(run_id, worker_dir_name, file_name), separator);
+}
+
+inline std::string BuildCopyDirectTargetFilePath(FileSystem &fs, const std::string &base_path,
+                                                 const std::string &run_id, const std::string &worker_dir_name,
+                                                 const std::string &file_name) {
+	return BuildCopyDirectTargetFilePath(base_path, run_id, worker_dir_name, file_name,
+	                                     DistributedCopyPathSeparator(fs, base_path));
 }
 
 inline std::string BuildCopyDirectTargetFilenamePattern(const std::string &run_id, const std::string &worker_dir_name) {
