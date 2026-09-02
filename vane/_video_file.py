@@ -1680,6 +1680,7 @@ def _iter_video_frames(
         decoded_batches: Generator[_DecodedPacketBatch, None, None] | None = None
         prepared_batch: _PreparedFrameBatch | None = None
         error_from_consumer = False
+        target_delivered = False
         try:
             _check_video_io(reader, nested_io)
             container = av_module.open(
@@ -1756,9 +1757,14 @@ def _iter_video_frames(
                                     # only later undelivered batch entries are closed.
                                     del result
                                 _check_video_io(reader, nested_io)
+                                if options.target_frame_index is not None:
+                                    target_delivered = True
+                                    break
                         finally:
                             prepared_batch.release()
                             prepared_batch = None
+                        if target_delivered:
+                            break
                 finally:
                     decoded_batches.close()
                 _check_video_io(reader, nested_io)
@@ -1873,14 +1879,30 @@ def _video_file_frame_by_idx_value(
         except BaseException:
             pass
         raise
+    assert image is not None
+    try:
+        unexpected_frame = next(frames)
+    except StopIteration:
+        # Advancing the dedicated single-frame generator to normal exhaustion
+        # runs container and reader teardown on their success paths. In
+        # particular, close-time connector failures and cancellation remain
+        # observable instead of being suppressed as effects of GeneratorExit.
+        return image
+    except BaseException:
+        _close_image(image)
+        try:
+            frames.close()
+        except BaseException:
+            pass
+        raise
+
+    _close_image(unexpected_frame.data)
+    _close_image(image)
     try:
         frames.close()
     except BaseException:
-        assert image is not None
-        _close_image(image)
-        raise
-    assert image is not None
-    return image
+        pass
+    raise RuntimeError("single-frame video selection yielded more than one frame")
 
 
 def _iter_keyframe_images(frames: Generator[VideoFrameData, None, None]) -> Generator[PILImage, None, None]:
