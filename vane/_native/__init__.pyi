@@ -30,7 +30,7 @@ if typing.TYPE_CHECKING:
     from vane._audio_file import AudioMetadata
     from vane._file import VaneFileReader
     from vane._image_file import ImageMetadata
-    from vane._video_file import VideoMetadata
+    from vane._video_file import VideoFrameData, VideoMetadata
     from vane.ai.options import EmbedOptions, PromptOptions
     from vane.ai.provider import Provider
     from vane.ai.typing import JSONSchema
@@ -1047,6 +1047,35 @@ class AudioFile(File):
 
 @typing.final
 class VideoFile(File):
+    def frames(
+        self,
+        start_time: int | float = 0,
+        end_time: int | float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        is_key_frame: bool | None = None,
+        sample_interval_seconds: int | float | None = None,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 8589934592,
+        max_frames: int = 1000000,
+        max_pixels: int = 33554432,
+        connection: DuckDBPyConnection | None = None,
+    ) -> typing.Generator[VideoFrameData, None, None]: ...
+    def keyframes(
+        self,
+        start_time: int | float = 0,
+        end_time: int | float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        sample_interval_seconds: int | float | None = None,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 8589934592,
+        max_frames: int = 1000000,
+        max_pixels: int = 33554432,
+        connection: DuckDBPyConnection | None = None,
+    ) -> typing.Generator[PIL.Image.Image, None, None]: ...
     def metadata(
         self,
         *,
@@ -1059,8 +1088,11 @@ class _VaneFileReaderHandle:
     def __repr__(self) -> str: ...
     def __str__(self) -> str: ...
     def _close(self) -> None: ...
+    def _close_and_check_interrupted(self) -> None: ...
+    def _check_interrupted(self) -> None: ...
     def _guess_mime_type(self) -> str | None: ...
     def _read(self, size: int = -1) -> bytes: ...
+    def _read_and_check_interrupted(self, size: int = -1) -> bytes: ...
     def _seek(self, offset: int, whence: int = 0) -> int: ...
     def _size(self) -> int: ...
     def _tell(self) -> int: ...

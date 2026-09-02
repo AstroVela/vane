@@ -30,6 +30,10 @@ static constexpr uint64_t DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_INPUT_BYTES = 8ULL * 1024 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_FRAMES = 1000000;
+static constexpr uint64_t DEFAULT_VIDEO_MAX_PIXELS = 32 * 1024 * 1024;
 
 static string PythonTypeName(const py::handle &value) {
 	return py::str(py::type::of(value)).cast<string>();
@@ -202,6 +206,49 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 		    },
 		    "Inspect the first video stream with bounded reads and no frame decoding", py::kw_only(),
 		    py::arg("max_bytes") = DEFAULT_VIDEO_METADATA_BYTES, py::arg("connection") = py::none());
+		file.def(
+		    "frames",
+		    [](const FILE_TYPE &value, const py::object &start_time, const py::object &end_time,
+		       const py::object &width, const py::object &height, const py::object &is_key_frame,
+		       const py::object &sample_interval_seconds, const py::object &buffer_size,
+		       const py::object &max_input_bytes, const py::object &max_frames, const py::object &max_pixels,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._video_file")
+			        .attr("_video_file_frames_value")(
+			            py::cast(value, py::return_value_policy::copy), start_time, end_time, width, height,
+			            is_key_frame, sample_interval_seconds, buffer_size,
+			            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+			            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+		    },
+		    "Stream decoded RGB frames with exact temporal provenance; native decode calls are atomic and limits are "
+		    "observed at packet/frame boundaries",
+		    py::arg("start_time") = 0, py::arg("end_time") = py::none(), py::arg("width") = py::none(),
+		    py::arg("height") = py::none(), py::arg("is_key_frame") = py::none(),
+		    py::arg("sample_interval_seconds") = py::none(), py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE,
+		    py::kw_only(), py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+		    py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES, py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS,
+		    py::arg("connection") = py::none());
+		file.def(
+		    "keyframes",
+		    [](const FILE_TYPE &value, const py::object &start_time, const py::object &end_time,
+		       const py::object &width, const py::object &height, const py::object &sample_interval_seconds,
+		       const py::object &buffer_size, const py::object &max_input_bytes, const py::object &max_frames,
+		       const py::object &max_pixels, shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._video_file")
+			        .attr("_video_file_keyframes_value")(
+			            py::cast(value, py::return_value_policy::copy), start_time, end_time, width, height,
+			            sample_interval_seconds, buffer_size, py::arg("max_input_bytes") = max_input_bytes,
+			            py::arg("max_frames") = max_frames, py::arg("max_pixels") = max_pixels,
+			            py::arg("connection") = std::move(connection));
+		    },
+		    "Stream decoded RGB keyframes as detached Pillow images; native decode calls are atomic and limits are "
+		    "observed at packet/frame boundaries",
+		    py::arg("start_time") = 0, py::arg("end_time") = py::none(), py::arg("width") = py::none(),
+		    py::arg("height") = py::none(), py::arg("sample_interval_seconds") = py::none(),
+		    py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE, py::kw_only(),
+		    py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+		    py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES, py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS,
+		    py::arg("connection") = py::none());
 	}
 }
 

@@ -33,6 +33,16 @@ class VaneFileReader(io.RawIOBase):
         return self._inner._read(size)
 
     def readinto(self, buffer: Any, /) -> int:
+        return self._readinto_from(buffer, self._inner._read)
+
+    def _read_and_check_interrupted(self, size: int = -1, /) -> bytes:
+        return self._inner._read_and_check_interrupted(size)
+
+    def _readinto_and_check_interrupted(self, buffer: Any, /) -> int:
+        return self._readinto_from(buffer, self._inner._read_and_check_interrupted)
+
+    @staticmethod
+    def _readinto_from(buffer: Any, read: Any) -> int:
         try:
             view = memoryview(buffer)
         except TypeError as error:
@@ -45,7 +55,7 @@ class VaneFileReader(io.RawIOBase):
                 byte_view = view.cast("B")
             except TypeError as error:
                 raise TypeError("readinto() argument must be a contiguous writable bytes-like object") from error
-            data = self._inner._read(byte_view.nbytes)
+            data = read(byte_view.nbytes)
             byte_view[: len(data)] = data
             return len(data)
         finally:
@@ -67,6 +77,9 @@ class VaneFileReader(io.RawIOBase):
         """Return the size of this FILE's logical byte view."""
         return self._inner._size()
 
+    def _check_interrupted(self) -> None:
+        self._inner._check_interrupted()
+
     def guess_mime_type(self) -> str | None:
         """Inspect bounded bytes without changing the current stream position."""
         return self._inner._guess_mime_type()
@@ -74,6 +87,12 @@ class VaneFileReader(io.RawIOBase):
     def close(self) -> None:
         try:
             self._inner._close()
+        finally:
+            super().close()
+
+    def _close_and_check_interrupted(self) -> None:
+        try:
+            self._inner._close_and_check_interrupted()
         finally:
             super().close()
 
@@ -105,8 +124,16 @@ class VaneFileReader(io.RawIOBase):
         self._require_open()
         return self
 
-    def __exit__(self, _exc_type: object, _exc_value: object, _traceback: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, _exc_value: object, _traceback: object) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except BaseException:
+            # Cleanup must not replace an exception already escaping the reader
+            # body, including control-flow exceptions injected into a generator.
+            pass
 
     def __str__(self) -> str:
         return str(self._inner)

@@ -67,6 +67,7 @@ from vane._video_file import (
     VideoFileError,
     VideoFileFormatError,
     VideoFileLimitError,
+    VideoFrameData,
     VideoMetadata,
     video_metadata,
 )
@@ -500,6 +501,7 @@ __all__: list[str] = [
     "VideoFileError",
     "VideoFileFormatError",
     "VideoFileLimitError",
+    "VideoFrameData",
     "VideoMetadata",
     "VaneFileReader",
     "Warning",

@@ -27,20 +27,26 @@ public:
 	                                               shared_ptr<DuckDBPyConnection> connection);
 
 	py::bytes Read(int64_t size);
+	py::bytes ReadAndCheckInterrupted(int64_t size);
 	int64_t Seek(int64_t offset, int whence);
 	int64_t Tell();
 	int64_t Size();
+	void CheckInterrupted();
 	py::object GuessMimeType();
 	void Close();
+	void CloseAndCheckInterrupted();
 	bool Closed() const;
 	string ToString() const;
 	string Repr() const;
 
 private:
 	PythonFileReaderHandle(string url, idx_t buffer_size, shared_ptr<DuckDBPyConnection> connection,
-	                       shared_ptr<ClientContext> context, unique_ptr<ResolvedFile> resolved);
+	                       shared_ptr<ClientContext> context, unique_ptr<ResolvedFile> resolved,
+	                       uint64_t interrupt_generation);
 
 	void RequireOpen() const;
+	void CloseInternal(bool check_interrupted);
+	py::bytes ReadInternal(int64_t size, bool check_retained_interrupt);
 	idx_t ReadLocked(data_ptr_t target, idx_t requested_size);
 	void FillBufferLocked();
 
@@ -49,10 +55,12 @@ private:
 	shared_ptr<DuckDBPyConnection> connection;
 	shared_ptr<ClientContext> context;
 	unique_ptr<ResolvedFile> resolved;
+	const uint64_t interrupt_generation;
 	vector<data_t> buffer;
 	uint64_t buffer_start = 0;
 	uint64_t position = 0;
 	std::atomic<bool> closed {false};
+	mutable std::mutex close_lock;
 	mutable std::mutex lock;
 };
 
