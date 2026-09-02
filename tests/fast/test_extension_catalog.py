@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import threading
+import time
 from http.client import HTTPException
 from itertools import repeat
 from urllib.error import URLError
@@ -45,7 +47,8 @@ class _CatalogResponse:
         self.contents = contents
         self.url = url
         self.status = status
-        self.read_limit = None
+        self.read_limits = []
+        self.read_offset = 0
 
     def __enter__(self):
         return self
@@ -56,9 +59,28 @@ class _CatalogResponse:
     def geturl(self):
         return self.url
 
-    def read(self, limit):
-        self.read_limit = limit
-        return self.contents
+    def read1(self, limit):
+        self.read_limits.append(limit)
+        chunk = self.contents[self.read_offset : self.read_offset + limit]
+        self.read_offset += len(chunk)
+        return chunk
+
+
+class _BlockingCatalogResponse(_CatalogResponse):
+    def __init__(self):
+        super().__init__(b"")
+        self.entered_read = threading.Event()
+        self.release_read = threading.Event()
+        self.finished = threading.Event()
+
+    def __exit__(self, exception_type, exception, traceback):
+        self.finished.set()
+        return False
+
+    def read1(self, limit):
+        self.entered_read.set()
+        self.release_read.wait(timeout=2)
+        return b""
 
 
 class _CatalogOpener:
@@ -134,8 +156,26 @@ def test_extension_catalog_fetches_one_bounded_remote_index(monkeypatch):
     assert [entry.extension_name for entry in entries] == ["iceberg", "lance", "paimon"]
     assert opener.request.full_url == _CATALOG_URL
     assert opener.request.get_header("Accept") == "application/json"
-    assert opener.timeout == extension_module._EXTENSION_CATALOG_TIMEOUT_SECONDS
-    assert response.read_limit == extension_module._EXTENSION_CATALOG_MAX_BYTES + 1
+    assert 0 < opener.timeout <= extension_module._EXTENSION_CATALOG_TIMEOUT_SECONDS
+    assert response.read_limits
+    assert max(response.read_limits) <= extension_module._EXTENSION_CATALOG_READ_CHUNK_BYTES
+
+
+def test_extension_catalog_enforces_a_total_wall_clock_deadline(monkeypatch):
+    response = _BlockingCatalogResponse()
+    monkeypatch.setattr(extension_module, "_EXTENSION_CATALOG_OPENER", _CatalogOpener(response))
+    monkeypatch.setattr(extension_module, "_EXTENSION_CATALOG_TIMEOUT_SECONDS", 0.5)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(extension_module.DynamicExtensionError, match="VANE_DYNAMIC_EXTENSION_CATALOG_UNAVAILABLE"):
+            vane.extension_catalog(catalog_url=_CATALOG_URL)
+    finally:
+        response.release_read.set()
+
+    assert time.monotonic() - started < 2
+    assert response.entered_read.is_set()
+    assert response.finished.wait(timeout=1)
 
 
 @pytest.mark.parametrize(
@@ -210,6 +250,25 @@ def test_extension_catalog_rejects_duplicate_json_keys(monkeypatch):
 
     with pytest.raises(extension_module.DynamicExtensionError, match="VANE_DYNAMIC_EXTENSION_CATALOG_INVALID"):
         vane.extension_catalog(catalog_url=_CATALOG_URL)
+
+
+def test_extension_catalog_rejects_a_lone_unicode_surrogate(monkeypatch):
+    document = _catalog_document()
+    document["extensions"][0]["description"] = "\ud800"
+    response = _CatalogResponse(json.dumps(document).encode())
+    monkeypatch.setattr(extension_module, "_EXTENSION_CATALOG_OPENER", _CatalogOpener(response))
+
+    with pytest.raises(extension_module.DynamicExtensionError, match="VANE_DYNAMIC_EXTENSION_CATALOG_INVALID"):
+        vane.extension_catalog(catalog_url=_CATALOG_URL)
+
+
+def test_extension_catalog_rejects_names_with_ambiguous_distribution_normalization():
+    document = _catalog_document()
+    document["extensions"][0]["extension_name"] = "ice__berg"
+    document["extensions"][0]["distribution_name"] = "vane-extension-ice-berg"
+
+    with pytest.raises(extension_module.DynamicExtensionError, match="VANE_DYNAMIC_EXTENSION_CATALOG_INVALID"):
+        extension_module._parse_extension_catalog(document)
 
 
 @pytest.mark.parametrize(

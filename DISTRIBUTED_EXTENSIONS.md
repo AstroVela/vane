@@ -172,9 +172,11 @@ vane.load_installed_extension("iceberg", connection=connection)
 ```
 
 `extension_catalog()` makes one bounded HTTPS request to the default versioned
-registry index. It rejects redirects and malformed metadata and has no cache or
-fallback. A caller may explicitly supply another HTTPS catalog URL, or pass a
-previously fetched tuple to `vane_extensions(catalog=...)`.
+registry index under a 10-second wall-clock deadline. It rejects redirects,
+malformed metadata, and extension names with ambiguous Python distribution
+normalization, and it has no cache or fallback. A caller may explicitly supply
+another HTTPS catalog URL, or pass a previously fetched tuple to
+`vane_extensions(catalog=...)`.
 
 `vane_extensions()` returns a DuckDB relation modeled after
 `duckdb_extensions()`. It combines the fetched catalog, installed

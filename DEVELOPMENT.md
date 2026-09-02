@@ -331,11 +331,13 @@ Known provider distributions are maintained independently in
 `AstroVela/vane-extensions`. Vane contains only the generic client for its
 versioned HTTPS index, so adding a provider does not require a Vane change or
 release. The runtime parser is strict and the fetch is bounded: redirects,
-duplicate names, aliases, unknown fields, non-HTTPS URLs, and unsupported
-catalog format versions are rejected. There is no cache or fallback. Catalog
-metadata is for discovery only; do not add artifact versions, digests, platform
-selection, or trust policy to it. Those values belong to each immutable dynamic
-descriptor and are checked only after explicit provider initialization.
+duplicate or ambiguously normalized names, aliases, invalid Unicode scalar
+values, unknown fields, non-HTTPS URLs, and unsupported catalog format versions
+are rejected. The complete request has a 10-second wall-clock deadline. There
+is no cache or fallback. Catalog metadata is for discovery only; do not add
+artifact versions, digests, platform selection, or trust policy to it. Those
+values belong to each immutable dynamic descriptor and are checked only after
+explicit provider initialization.
 
 Every Ray node must install the same platform extension wheels before queries
 start. Each wheel supplies one provider entry point under

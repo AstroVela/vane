@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import stat
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 _DESCRIPTOR_FORMAT_VERSION = 1
 _VALID_ABI_TYPES = frozenset({"CPP", "C_STRUCT", "C_STRUCT_UNSTABLE"})
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_CATALOG_EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _HEX_RE = re.compile(r"^[0-9a-f]{7,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9_]+$")
@@ -51,6 +53,8 @@ _EXTENSION_CATALOG_FORMAT_VERSION = 1
 _EXTENSION_CATALOG_MAX_BYTES = 64 * 1024
 _EXTENSION_CATALOG_MAX_ENTRIES = 1024
 _EXTENSION_CATALOG_TIMEOUT_SECONDS = 10.0
+_EXTENSION_CATALOG_READ_CHUNK_BYTES = 16 * 1024
+_EXTENSION_CATALOG_MAX_CONCURRENT_FETCHES = 4
 _DISTRIBUTION_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 DEFAULT_EXTENSION_CATALOG_URL = "https://astrovela.github.io/vane-extensions/v1/index.json"
 
@@ -69,6 +73,7 @@ class _RejectCatalogRedirects(HTTPRedirectHandler):
 
 
 _EXTENSION_CATALOG_OPENER = build_opener(_RejectCatalogRedirects())
+_EXTENSION_CATALOG_FETCH_SLOTS = threading.BoundedSemaphore(_EXTENSION_CATALOG_MAX_CONCURRENT_FETCHES)
 
 
 def _snapshot_mode_is_read_only(mode: int) -> bool:
@@ -114,8 +119,11 @@ def _make_snapshot_read_only(path: Path, *, description: str) -> None:
 def _require_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         _fail("DESCRIPTOR_INVALID", f"{field_name} must be a non-empty string")
-    if any(character.isspace() or ord(character) < 32 for character in value):
-        _fail("DESCRIPTOR_INVALID", f"{field_name} must not contain whitespace or control characters")
+    if any(character.isspace() or ord(character) < 32 or 0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail(
+            "DESCRIPTOR_INVALID",
+            f"{field_name} must not contain whitespace, control characters, or lone Unicode surrogates",
+        )
     return value
 
 
@@ -153,6 +161,8 @@ def _catalog_string(value: object, field_name: str, *, max_length: int) -> str:
         _fail("CATALOG_INVALID", f"{field_name} exceeds its {max_length}-character limit")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         _fail("CATALOG_INVALID", f"{field_name} must not contain control characters")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail("CATALOG_INVALID", f"{field_name} must not contain lone Unicode surrogates")
     return value
 
 
@@ -224,7 +234,7 @@ def _parse_extension_catalog(value: object) -> tuple[ExtensionCatalogEntry, ...]
             f"extensions[{index}].extension_name",
             max_length=128,
         )
-        if not _EXTENSION_NAME_RE.fullmatch(extension_name):
+        if not _CATALOG_EXTENSION_NAME_RE.fullmatch(extension_name):
             _fail(
                 "CATALOG_INVALID",
                 f"extensions[{index}].extension_name must use lowercase ASCII extension-name syntax",
@@ -347,6 +357,107 @@ def _reject_duplicate_catalog_keys(pairs: list[tuple[str, object]]) -> dict[str,
     return result
 
 
+def _extension_catalog_deadline_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    return remaining
+
+
+def _read_extension_catalog_response(
+    response: object,
+    *,
+    deadline: float,
+    cancelled: threading.Event,
+) -> bytes:
+    read_one = getattr(response, "read1", None)
+    if not callable(read_one):
+        _fail("CATALOG_UNAVAILABLE", "extension catalog response does not support bounded reads")
+
+    contents = bytearray()
+    maximum_read = _EXTENSION_CATALOG_MAX_BYTES + 1
+    while len(contents) < maximum_read:
+        if cancelled.is_set():
+            _fail("CATALOG_UNAVAILABLE", "extension catalog request was cancelled")
+        _extension_catalog_deadline_remaining(deadline)
+        read_size = min(_EXTENSION_CATALOG_READ_CHUNK_BYTES, maximum_read - len(contents))
+        chunk = read_one(read_size)
+        _extension_catalog_deadline_remaining(deadline)
+        if not isinstance(chunk, bytes) or len(chunk) > read_size:
+            _fail("CATALOG_UNAVAILABLE", "extension catalog endpoint returned an invalid response body")
+        if not chunk:
+            break
+        contents.extend(chunk)
+    return bytes(contents)
+
+
+def _extension_catalog_fetch_worker(
+    request: Request,
+    validated_url: str,
+    deadline: float,
+    cancelled: threading.Event,
+    results: queue.Queue[tuple[bytes | None, Exception | None]],
+) -> None:
+    try:
+        with _EXTENSION_CATALOG_OPENER.open(
+            request,
+            timeout=_extension_catalog_deadline_remaining(deadline),
+        ) as response:
+            get_url = getattr(response, "geturl", None)
+            if getattr(response, "status", None) != 200 or not callable(get_url) or get_url() != validated_url:
+                _fail("CATALOG_UNAVAILABLE", "extension catalog endpoint did not return the requested resource")
+            contents = _read_extension_catalog_response(
+                response,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        results.put((contents, None))
+    except Exception as exception:
+        results.put((None, exception))
+    finally:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+
+
+def _fetch_extension_catalog_contents(request: Request, validated_url: str) -> bytes:
+    deadline = time.monotonic() + _EXTENSION_CATALOG_TIMEOUT_SECONDS
+    cancelled = threading.Event()
+    results: queue.Queue[tuple[bytes | None, Exception | None]] = queue.Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_extension_catalog_fetch_worker,
+        args=(request, validated_url, deadline, cancelled, results),
+        name="vane-extension-catalog-fetch",
+        daemon=True,
+    )
+    if not _EXTENSION_CATALOG_FETCH_SLOTS.acquire(timeout=_extension_catalog_deadline_remaining(deadline)):
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    try:
+        worker.start()
+    except RuntimeError as exception:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+        raise DynamicExtensionError(
+            "CATALOG_UNAVAILABLE", "could not start the extension catalog request"
+        ) from exception
+    except BaseException:
+        _EXTENSION_CATALOG_FETCH_SLOTS.release()
+        raise
+
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive() or time.monotonic() >= deadline:
+        cancelled.set()
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request exceeded its wall-clock deadline")
+    try:
+        contents, exception = results.get_nowait()
+    except queue.Empty as queue_exception:
+        raise DynamicExtensionError(
+            "CATALOG_UNAVAILABLE", "extension catalog request did not return a result"
+        ) from queue_exception
+    if exception is not None:
+        raise exception
+    if contents is None:
+        _fail("CATALOG_UNAVAILABLE", "extension catalog request did not return a response body")
+    return contents
+
+
 def extension_catalog(
     *,
     catalog_url: str = DEFAULT_EXTENSION_CATALOG_URL,
@@ -365,10 +476,7 @@ def extension_catalog(
         },
     )
     try:
-        with _EXTENSION_CATALOG_OPENER.open(request, timeout=_EXTENSION_CATALOG_TIMEOUT_SECONDS) as response:
-            if response.status != 200 or response.geturl() != validated_url:
-                _fail("CATALOG_UNAVAILABLE", "extension catalog endpoint did not return the requested resource")
-            contents = response.read(_EXTENSION_CATALOG_MAX_BYTES + 1)
+        contents = _fetch_extension_catalog_contents(request, validated_url)
     except DynamicExtensionError:
         raise
     except (HTTPError, URLError, HTTPException, OSError, TimeoutError) as exception:
@@ -907,8 +1015,14 @@ class _InstalledExtensionProviderMetadata:
 def _provider_metadata_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         _fail("PROVIDER_INVALID", f"installed provider {field_name} must be a non-empty trimmed string")
-    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
-        _fail("PROVIDER_INVALID", f"installed provider {field_name} must not contain whitespace or control characters")
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        _fail(
+            "PROVIDER_INVALID",
+            f"installed provider {field_name} must not contain whitespace, control characters, or lone Unicode surrogates",
+        )
     return value
 
 
