@@ -7,6 +7,9 @@
 
 #include "duckdb/common/common.hpp"
 
+#include <atomic>
+#include <mutex>
+
 namespace duckdb {
 
 class ClientContext;
@@ -21,9 +24,12 @@ public:
 
 	static void Initialize(py::module_ &m);
 	void CheckInterrupted() const;
-	shared_ptr<ClientContext> GetContext() const;
+	void Invalidate();
+	std::unique_lock<std::mutex> LockContext(shared_ptr<ClientContext> &active_context) const;
 
 private:
+	std::atomic<bool> active {true};
+	mutable std::mutex context_lock;
 	shared_ptr<ClientContext> context;
 };
 

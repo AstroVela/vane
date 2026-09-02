@@ -175,6 +175,56 @@ class FailingSource(DataSource):
         yield FailingTask()
 
 
+_retained_execution_contexts: list[object] = []
+_retained_file_readers: list[object] = []
+
+
+class RetainingExecutionContextTask(DataSourceTask):
+    def __init__(self, outcome: str, path: str | None = None) -> None:
+        self.outcome = outcome
+        self.path = path
+
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("retaining task requires a DataSource execution context")
+        yield  # pragma: no cover
+
+    def _execute_with_context(self, execution_context: object) -> Iterator[pa.RecordBatch]:
+        _retained_execution_contexts.append(execution_context)
+        if self.outcome == "setup_error":
+            raise RuntimeError("planned DataSource setup failure")
+        if self.path is not None:
+            from vane._file import _file_open_in_datasource_context
+
+            reader = _file_open_in_datasource_context(
+                vane.File(self.path),
+                16,
+                execution_context=execution_context,
+            )
+            _retained_file_readers.append(reader)
+
+        def batches() -> Iterator[pa.RecordBatch]:
+            if self.outcome == "stream_error":
+                raise RuntimeError("planned DataSource stream failure")
+            yield pa.record_batch({"value": pa.array([47], type=pa.int64())})
+            if self.outcome == "early_close":
+                yield pa.record_batch({"value": pa.array([48], type=pa.int64())})
+
+        return batches()
+
+
+class RetainingExecutionContextSource(DataSource):
+    def __init__(self, outcome: str, path: str | None = None) -> None:
+        self.outcome = outcome
+        self.path = path
+
+    @property
+    def schema(self) -> dict[str, str]:
+        return {"value": "BIGINT"}
+
+    def get_tasks(self) -> Iterator[DataSourceTask]:
+        yield RetainingExecutionContextTask(self.outcome, self.path)
+
+
 class SourceKeepaliveProbe(DataSource):
     def __init__(self, path: str) -> None:
         self.path = path
@@ -385,6 +435,50 @@ def test_datasource_factory_owner_released_when_query_fails(duckdb_conn):
     assert finished["registry_size"] == baseline["registry_size"]
     assert finished["factory_count"] == baseline["factory_count"]
     assert finished["owner_count"] == baseline["owner_count"]
+
+
+@pytest.mark.parametrize("outcome", ["complete", "early_close", "setup_error", "stream_error"])
+def test_datasource_execution_context_expires_with_arrow_stream(duckdb_conn, outcome):
+    _retained_execution_contexts.clear()
+    relation = read_datasource(RetainingExecutionContextSource(outcome), con=duckdb_conn)
+
+    if outcome in {"complete", "early_close"}:
+        result = relation.limit(1).fetchall() if outcome == "early_close" else relation.fetchall()
+        assert result == [(47,)]
+    else:
+        with pytest.raises(Exception, match=f"planned DataSource {outcome.removesuffix('_error')} failure"):
+            relation.fetchall()
+
+    assert len(_retained_execution_contexts) == 1
+    with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+        _retained_execution_contexts[0]._check_interrupted()
+
+
+def test_datasource_reader_cannot_outlive_its_query_context(duckdb_conn, tmp_path):
+    path = tmp_path / "retained-reader.bin"
+    path.write_bytes(b"retained reader payload")
+    _retained_execution_contexts.clear()
+    _retained_file_readers.clear()
+
+    relation = read_datasource(RetainingExecutionContextSource("complete", str(path)), con=duckdb_conn)
+    assert relation.fetchall() == [(47,)]
+    assert len(_retained_execution_contexts) == 1
+    assert len(_retained_file_readers) == 1
+    execution_context = _retained_execution_contexts[0]
+    reader = _retained_file_readers[0]
+    try:
+        from vane._file import _file_open_in_datasource_context
+
+        with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+            _file_open_in_datasource_context(
+                vane.File(str(path)),
+                16,
+                execution_context=execution_context,
+            )
+        with pytest.raises(vane.InvalidInputException, match="execution context is no longer active"):
+            reader.read(1)
+    finally:
+        reader.close()
 
 
 def test_datasource_worker_plan_uses_resource_query_owner_when_execution_id_differs(duckdb_conn):

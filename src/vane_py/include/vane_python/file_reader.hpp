@@ -45,10 +45,12 @@ public:
 
 private:
 	PythonFileReaderHandle(string url, idx_t buffer_size, shared_ptr<DuckDBPyConnection> connection,
+	                       shared_ptr<PythonDataSourceExecutionContext> execution_context,
 	                       shared_ptr<ClientContext> context, unique_ptr<ResolvedFile> resolved,
 	                       uint64_t interrupt_generation);
 
 	void RequireOpen() const;
+	std::unique_lock<std::mutex> LockDataSourceContext() const;
 	void CloseInternal(bool check_interrupted);
 	py::bytes ReadInternal(int64_t size, bool check_retained_interrupt);
 	idx_t ReadLocked(data_ptr_t target, idx_t requested_size);
@@ -57,6 +59,7 @@ private:
 	const string url;
 	const idx_t buffer_size;
 	shared_ptr<DuckDBPyConnection> connection;
+	shared_ptr<PythonDataSourceExecutionContext> execution_context;
 	shared_ptr<ClientContext> context;
 	unique_ptr<ResolvedFile> resolved;
 	const uint64_t interrupt_generation;
