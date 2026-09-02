@@ -438,6 +438,10 @@ def test_file_reader_interrupt_cancels_only_the_active_operation():
         assert isinstance(errors[0], vane.InterruptException)
         assert reader.tell() == 0
         assert reader.read(4) == payload[1024 * 1024 : 1024 * 1024 + 4]
+        # A recovered generic reader must not report that historical interrupt
+        # again when its ordinary context-manager lifetime ends.
+        reader.__exit__(None, None, None)
+        assert reader.closed
     finally:
         handler.release_read.set()
         if read_thread is not None:
@@ -491,6 +495,80 @@ def test_concurrent_file_reader_close_waits_for_complete_cleanup():
         assert all(not thread.is_alive() for thread in close_threads)
         assert all(finished.is_set() for finished in close_finished)
         assert reader.closed
+    finally:
+        handler.release_read.set()
+        if read_thread is not None:
+            read_thread.join(timeout=5)
+        for thread in close_threads:
+            thread.join(timeout=5)
+        if reader is not None:
+            reader.close()
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+
+def test_file_reader_close_observes_interrupt_during_native_teardown():
+    payload = bytes(range(256)) * (2 * 1024 * 1024 // 256)
+    server, server_thread, handler = _start_object_server(payload)
+    connection = vane.connect()
+    reader = None
+    read_thread = None
+    close_threads = []
+    read_errors = []
+    close_errors = []
+    try:
+        connection.execute("SET http_proxy = ''")
+        url = f"http://127.0.0.1:{server.server_address[1]}/bucket/object.bin"
+        reader = vane.File(url).open(buffer_size=4096, connection=connection)
+        handler.block_reads = True
+
+        def read_file():
+            try:
+                reader.read()
+            except BaseException as error:
+                read_errors.append(error)
+
+        read_thread = threading.Thread(target=read_file)
+        read_thread.start()
+        assert handler.read_started.wait(timeout=5)
+
+        def close_reader():
+            try:
+                reader._close_and_check_interrupted()
+            except BaseException as error:
+                close_errors.append(error)
+
+        # Both checked closers must serialize behind one teardown owner. The
+        # non-owner may not clear the retained generation before it is checked.
+        close_threads.append(threading.Thread(target=close_reader))
+        close_threads[0].start()
+
+        # ``closed`` flips before native Close releases the GIL and waits for
+        # the in-flight read's mutex, so observing it proves native teardown
+        # started before this interrupt.
+        for _ in range(500):
+            if reader.closed:
+                break
+            threading.Event().wait(0.01)
+        assert reader.closed
+
+        close_threads.append(threading.Thread(target=close_reader))
+        close_threads[1].start()
+
+        connection.interrupt()
+        handler.release_read.set()
+        read_thread.join(timeout=5)
+        for thread in close_threads:
+            thread.join(timeout=5)
+
+        assert not read_thread.is_alive()
+        assert all(not thread.is_alive() for thread in close_threads)
+        assert len(read_errors) == 1
+        assert isinstance(read_errors[0], vane.InterruptException)
+        assert len(close_errors) == 1
+        assert isinstance(close_errors[0], vane.InterruptException)
     finally:
         handler.release_read.set()
         if read_thread is not None:

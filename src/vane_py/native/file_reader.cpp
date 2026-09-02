@@ -73,9 +73,10 @@ void RunReaderContextOperation(ClientContext &context, DuckDBPyConnection &conne
 
 PythonFileReaderHandle::PythonFileReaderHandle(string url_p, idx_t buffer_size_p,
                                                shared_ptr<DuckDBPyConnection> connection_p,
-                                               shared_ptr<ClientContext> context_p, unique_ptr<ResolvedFile> resolved_p)
+                                               shared_ptr<ClientContext> context_p, unique_ptr<ResolvedFile> resolved_p,
+                                               uint64_t interrupt_generation_p)
     : url(std::move(url_p)), buffer_size(buffer_size_p), connection(std::move(connection_p)),
-      context(std::move(context_p)), resolved(std::move(resolved_p)) {
+      context(std::move(context_p)), resolved(std::move(resolved_p)), interrupt_generation(interrupt_generation_p) {
 }
 
 PythonFileReaderHandle::~PythonFileReaderHandle() = default;
@@ -84,11 +85,14 @@ void PythonFileReaderHandle::Initialize(py::module_ &m) {
 	py::class_<PythonFileReaderHandle, shared_ptr<PythonFileReaderHandle>>(m, "_VaneFileReaderHandle",
 	                                                                       py::module_local(), py::is_final())
 	    .def("_read", &PythonFileReaderHandle::Read, py::arg("size") = -1)
+	    .def("_read_and_check_interrupted", &PythonFileReaderHandle::ReadAndCheckInterrupted, py::arg("size") = -1)
 	    .def("_seek", &PythonFileReaderHandle::Seek, py::arg("offset"), py::arg("whence") = 0)
 	    .def("_tell", &PythonFileReaderHandle::Tell)
 	    .def("_size", &PythonFileReaderHandle::Size)
+	    .def("_check_interrupted", &PythonFileReaderHandle::CheckInterrupted)
 	    .def("_guess_mime_type", &PythonFileReaderHandle::GuessMimeType)
 	    .def("_close", &PythonFileReaderHandle::Close)
+	    .def("_close_and_check_interrupted", &PythonFileReaderHandle::CloseAndCheckInterrupted)
 	    .def_property_readonly("_closed", &PythonFileReaderHandle::Closed)
 	    .def("__str__", &PythonFileReaderHandle::ToString)
 	    .def("__repr__", &PythonFileReaderHandle::Repr);
@@ -116,8 +120,9 @@ shared_ptr<PythonFileReaderHandle> PythonFileReaderHandle::Open(const PythonFile
 		RunReaderContextOperation(*context, *connection, interrupt_generation,
 		                          [&](ReaderContextScope &) { resolved = ResolvedFile::Open(*context, reference); });
 	}
-	return shared_ptr<PythonFileReaderHandle>(new PythonFileReaderHandle(
-	    std::move(reference.url), buffer_size, std::move(connection), std::move(context), std::move(resolved)));
+	return shared_ptr<PythonFileReaderHandle>(new PythonFileReaderHandle(std::move(reference.url), buffer_size,
+	                                                                     std::move(connection), std::move(context),
+	                                                                     std::move(resolved), interrupt_generation));
 }
 
 void PythonFileReaderHandle::RequireOpen() const {
@@ -169,12 +174,23 @@ idx_t PythonFileReaderHandle::ReadLocked(data_ptr_t target, idx_t requested_size
 }
 
 py::bytes PythonFileReaderHandle::Read(int64_t size) {
+	return ReadInternal(size, false);
+}
+
+py::bytes PythonFileReaderHandle::ReadAndCheckInterrupted(int64_t size) {
+	return ReadInternal(size, true);
+}
+
+py::bytes PythonFileReaderHandle::ReadInternal(int64_t size, bool check_retained_interrupt) {
 	string result;
 	D_ASSERT(py::gil_check());
-	// Python connection.interrupt() also requires the GIL, and Close only resets
-	// the retained connection after reacquiring it. Snapshot before releasing the
-	// GIL so this call is cancellable while waiting on either mutex.
-	auto interrupt_generation = connection ? connection->InterruptGeneration() : 0;
+	// Generic reads establish an independent operation generation so a reader can
+	// be reused after an interrupted read. Video decoding instead retains the
+	// generation captured when the reader opened: checking it inside this native
+	// operation closes the gap between a Python callback's pre-read check and the
+	// connector read itself.
+	auto operation_generation =
+	    check_retained_interrupt ? interrupt_generation : (connection ? connection->InterruptGeneration() : 0);
 	{
 		py::gil_scoped_release release;
 		unique_lock<mutex> reader_guard(lock);
@@ -187,7 +203,7 @@ py::bytes PythonFileReaderHandle::Read(int64_t size) {
 			try {
 				unique_lock<mutex> connection_guard(connection->py_connection_lock);
 				RunReaderContextOperation(
-				    *context, *connection, interrupt_generation, [&](ReaderContextScope &context_scope) {
+				    *context, *connection, operation_generation, [&](ReaderContextScope &context_scope) {
 					    result.resize(NumericCast<idx_t>(requested_size));
 					    context_scope.CheckInterrupted();
 					    auto read_size =
@@ -273,6 +289,15 @@ int64_t PythonFileReaderHandle::Size() {
 	return NumericCast<int64_t>(result);
 }
 
+void PythonFileReaderHandle::CheckInterrupted() {
+	D_ASSERT(py::gil_check());
+	py::gil_scoped_release release;
+	unique_lock<mutex> reader_guard(lock);
+	RequireOpen();
+	unique_lock<mutex> connection_guard(connection->py_connection_lock);
+	ReaderContextScope(*context, *connection, interrupt_generation).CheckInterrupted();
+}
+
 py::object PythonFileReaderHandle::GuessMimeType() {
 	string result;
 	bool found;
@@ -292,7 +317,27 @@ py::object PythonFileReaderHandle::GuessMimeType() {
 }
 
 void PythonFileReaderHandle::Close() {
-	closed.store(true);
+	CloseInternal(false);
+}
+
+void PythonFileReaderHandle::CloseAndCheckInterrupted() {
+	CloseInternal(true);
+}
+
+void PythonFileReaderHandle::CloseInternal(bool check_interrupted) {
+	// Only one caller owns teardown. Other close calls wait without the GIL for
+	// that owner to finish, then observe the completed close. In particular, a
+	// later closer must not clear the context needed by a checked close.
+	unique_lock<mutex> close_guard(close_lock, std::defer_lock);
+	{
+		D_ASSERT(py::gil_check());
+		py::gil_scoped_release release;
+		close_guard.lock();
+	}
+	const auto first_close = !closed.exchange(true);
+	if (!first_close) {
+		return;
+	}
 	unique_lock<mutex> reader_guard(lock, std::defer_lock);
 	{
 		D_ASSERT(py::gil_check());
@@ -302,10 +347,24 @@ void PythonFileReaderHandle::Close() {
 		buffer.clear();
 	}
 	// Keep the reader lock across GIL reacquisition and release of the retained
-	// context/connection. Every concurrent close therefore returns only after the
-	// complete cleanup has finished.
+	// context/connection. On a checked close, compare against the reader's
+	// retained open generation after cleanup. This covers both the gap
+	// after the caller's final check and interrupts that race with native handle
+	// destruction. The GIL prevents another Python thread from advancing the
+	// generation between this check and releasing the retained connection.
+	std::exception_ptr close_error;
+	if (check_interrupted && context && connection) {
+		try {
+			ReaderContextScope(*context, *connection, interrupt_generation).CheckInterrupted();
+		} catch (...) {
+			close_error = std::current_exception();
+		}
+	}
 	context.reset();
 	connection.reset();
+	if (close_error) {
+		std::rethrow_exception(close_error);
+	}
 }
 
 bool PythonFileReaderHandle::Closed() const {
