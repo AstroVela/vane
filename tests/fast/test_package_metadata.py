@@ -3,7 +3,6 @@
 
 import importlib
 import os
-import platform
 import subprocess
 import sys
 import types
@@ -503,10 +502,7 @@ def test_audio_extra_installs_soundfile():
 
 
 def test_video_extra_installs_video_dependencies():
-    selected = _requirements_for_extra("video")
-    assert {"av", "pillow", "psutil"} <= selected
-    supports_decord = platform.system() == "Linux" and platform.machine() == "x86_64"
-    assert ("decord" in selected) is supports_decord
+    assert _requirements_for_extra("video") == {"av", "pillow", "psutil"}
 
 
 def test_base_distribution_keeps_media_dependencies_optional():
