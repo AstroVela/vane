@@ -571,6 +571,8 @@ TEST_CASE("Distributed COPY canonical base path handles temporary and trailing p
 	REQUIRE(forward_slash_drive_root_res.value() == R"(C:\)");
 	REQUIRE(NormalizeDistributedCopyPathForComparison(windows_fs, R"(C:/out/file.parquet)") ==
 	        R"(C:\out\file.parquet)");
+	REQUIRE(BuildCopyDirectTargetFilePath(windows_fs, R"(C:/out)", "run-mixed", "w_0", "part.parquet") ==
+	        R"(C:\out\run-mixed_w_0_part.parquet)");
 	REQUIRE(NormalizeDistributedCopyPathForComparison(windows_fs, "s3://bucket/out/file.parquet") ==
 	        "s3://bucket/out/file.parquet");
 
