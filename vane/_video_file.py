@@ -154,9 +154,8 @@ class VideoFrameData:
 
     ``frame_time`` is elapsed presentation time from the stream's declared
     timestamp origin. ``frame_time_base`` is the exact unit for the raw PTS,
-    DTS, and duration fields. The zero-based ``frame_index`` is present only
-    when decoding starts at the beginning; after keyframe seek it remains
-    ``None`` rather than being estimated from an average frame rate.
+    DTS, and duration fields. The zero-based ``frame_index`` records the frame's
+    position in the sequential decode stream when the decoder can establish it.
     """
 
     frame_index: int | None
@@ -1008,12 +1007,12 @@ def _frame_time_base(frame: Any, video: Any) -> Fraction | None:
         video = None
 
 
-def _stream_time_origin(video: Any, time_base: Fraction) -> tuple[int, Fraction]:
+def _stream_time_origin(video: Any, time_base: Fraction) -> Fraction:
     try:
         stream_start = _optional_frame_integer(getattr(video, "start_time", None), name="stream start time")
         if stream_start is None:
-            return 0, Fraction(0)
-        return stream_start, stream_start * time_base
+            return Fraction(0)
+        return stream_start * time_base
     finally:
         video = None
 
@@ -1030,13 +1029,6 @@ def _frame_time(
     if not math.isfinite(result):
         raise VideoFileFormatError("video decoder reported a non-finite frame time")
     return exact_time, result
-
-
-def _seek_timestamp(start_time: Fraction, time_base: Fraction, stream_start: int) -> int:
-    timestamp = stream_start + start_time // time_base
-    if timestamp < _MIN_BIGINT or timestamp > _MAX_BIGINT:
-        raise ValueError("start_time is outside the supported video timestamp range")
-    return int(timestamp)
 
 
 def _decoded_frame_dimensions(frame: Any, options: _VideoFrameOptions) -> tuple[int, int]:
@@ -1219,39 +1211,6 @@ def _configure_video_decoder(video: Any) -> None:
         video = None
 
 
-def _video_reorder_depth(video: Any) -> int:
-    codec_context: Any = None
-    try:
-        codec_context = getattr(video, "codec_context", None)
-        if codec_context is None:
-            raise VideoFileFormatError("video stream does not have an available decoder")
-        try:
-            reorder_depth = operator.index(codec_context.reorder_depth)
-        except (AttributeError, TypeError, ValueError, OverflowError) as error:
-            raise VideoFileFormatError("video decoder reported an invalid reorder depth") from error
-        if reorder_depth < 0 or reorder_depth > _MAX_PYAV_BUFFER_SIZE:
-            raise VideoFileFormatError("video decoder reported an out-of-range reorder depth")
-        return reorder_depth
-    finally:
-        codec_context = None
-        video = None
-
-
-def _restore_video_reorder_depth(video: Any, reorder_depth: int) -> None:
-    codec_context: Any = None
-    try:
-        codec_context = getattr(video, "codec_context", None)
-        if codec_context is None:
-            raise VideoFileFormatError("video stream does not have an available decoder")
-        try:
-            codec_context.reorder_depth = reorder_depth
-        except (AttributeError, TypeError, ValueError, OverflowError) as error:
-            raise VideoFileFormatError("video decoder reorder depth could not be restored after seek") from error
-    finally:
-        codec_context = None
-        video = None
-
-
 def _advance_sample_target(current: Fraction, interval: Fraction, frame_time: Fraction) -> Fraction:
     skipped_intervals = (frame_time - current) // interval
     return current + (skipped_intervals + 1) * interval
@@ -1307,93 +1266,6 @@ def _check_video_io(reader: _VideoReaderProxy, nested_io: _NestedIOBlocker) -> N
     reader.check_interrupted()
     reader.raise_if_error()
     nested_io.raise_if_error()
-
-
-def _seek_video_stream(
-    container: Any,
-    video: Any,
-    seek_timestamp: int,
-    reader: _VideoReaderProxy,
-    nested_io: _NestedIOBlocker,
-) -> None:
-    """Seek at a checked native boundary and restore PyAV's reorder state."""
-
-    try:
-        reorder_depth = _video_reorder_depth(video)
-        _check_video_io(reader, nested_io)
-        try:
-            container.seek(seek_timestamp, backward=True, any_frame=False, stream=video)
-        except BaseException as error:
-            if not isinstance(error, Exception):
-                raise
-            _check_video_io(reader, nested_io)
-            raise
-        _check_video_io(reader, nested_io)
-        try:
-            _restore_video_reorder_depth(video, reorder_depth)
-        except BaseException as error:
-            if not isinstance(error, Exception):
-                raise
-            _check_video_io(reader, nested_io)
-            raise
-        _check_video_io(reader, nested_io)
-    finally:
-        # A retained seek traceback must not own the PyAV container, stream,
-        # or native codec context after the outer operation has closed them.
-        container = None
-        video = None
-
-
-def _seek_video_stream_for_time_window(
-    container: Any,
-    video: Any,
-    requested_timestamp: int,
-    stream_start: int,
-    reader: _VideoReaderProxy,
-    nested_io: _NestedIOBlocker,
-) -> None:
-    """Seek only when the selected random-access point can cover the window.
-
-    FFmpeg's seek index can be ordered by decode timestamps. For streams with
-    reordered frames, seeking to a presentation timestamp may therefore land on
-    a keyframe whose PTS is *after* the requested boundary. Probe the first
-    selected packet without decoding it and keep the optimized seek only when
-    that keyframe is early enough. Otherwise restart at the stream origin, which
-    is the correctness fallback when the container cannot prove safe preroll.
-    """
-
-    packet_and_flush: tuple[Any, bool] | None = None
-    packet: Any = None
-    try:
-        if requested_timestamp <= stream_start:
-            _seek_video_stream(container, video, stream_start, reader, nested_io)
-            return
-
-        _seek_video_stream(container, video, requested_timestamp, reader, nested_io)
-        packet_and_flush = _next_demuxed_packet(container, video, reader, nested_io)
-        seek_is_safe = False
-        if packet_and_flush is not None:
-            packet, is_flush = packet_and_flush
-            packet_and_flush = None
-            if not is_flush:
-                packet_pts = _optional_frame_integer(packet.pts, name="seek packet PTS")
-                try:
-                    is_keyframe = packet.is_keyframe
-                except AttributeError as error:
-                    raise VideoFileFormatError("video demuxer did not report seek packet keyframe state") from error
-                if not isinstance(is_keyframe, bool):
-                    raise VideoFileFormatError("video demuxer reported invalid seek packet keyframe state")
-                seek_is_safe = is_keyframe and packet_pts is not None and packet_pts <= requested_timestamp
-            packet = None
-
-        safe_timestamp = requested_timestamp if seek_is_safe else stream_start
-        _seek_video_stream(container, video, safe_timestamp, reader, nested_io)
-    finally:
-        # Probe failures must not retain native packet/container/codec owners.
-        packet = None
-        packet_and_flush = None
-        container = None
-        video = None
 
 
 def _decode_packet_frames(
@@ -1621,7 +1493,6 @@ def _prepare_video_packet_batch(
     reader: _VideoReaderProxy,
     nested_io: _NestedIOBlocker,
     *,
-    did_seek: bool,
     next_sample_time: Fraction | None,
 ) -> _PreparedFrameBatch:
     """Detach every selected image before exposing any result from a packet."""
@@ -1669,7 +1540,7 @@ def _prepare_video_packet_batch(
                 try:
                     _check_video_io(reader, nested_io)
                     result = VideoFrameData(
-                        frame_index=None if did_seek else info.frame_index,
+                        frame_index=info.frame_index,
                         frame_time=info.frame_time,
                         frame_time_base=info.time_base,
                         frame_pts=info.frame_pts,
@@ -1809,20 +1680,9 @@ def _iter_video_frames(
                     max_pixels=options.max_pixels,
                 )
                 video = _select_video_stream(container, av_module)
-                stream_start, stream_time_origin = _stream_time_origin(video, metadata.time_base)
+                stream_time_origin = _stream_time_origin(video, metadata.time_base)
                 _configure_video_decoder(video)
                 reformatter = av_module.video.reformatter.VideoReformatter()
-                did_seek = options.start_time > 0
-                if did_seek:
-                    seek_timestamp = _seek_timestamp(options.start_time, metadata.time_base, stream_start)
-                    _seek_video_stream_for_time_window(
-                        container,
-                        video,
-                        int(seek_timestamp),
-                        stream_start,
-                        reader,
-                        nested_io,
-                    )
 
                 next_sample_time = options.start_time if options.sample_interval_seconds is not None else None
                 decoded_batches = _iter_decoded_packet_batches(
@@ -1848,7 +1708,6 @@ def _iter_video_frames(
                             reformatter,
                             reader,
                             nested_io,
-                            did_seek=did_seek,
                             next_sample_time=next_sample_time,
                         )
                         del batch

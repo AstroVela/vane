@@ -27,6 +27,7 @@ from vane import _video_file
 def _encoded_video(
     container_format: str = "mp4",
     *,
+    codec_name: str | None = None,
     width: int = 16,
     height: int = 12,
     frame_count: int = 4,
@@ -36,7 +37,7 @@ def _encoded_video(
 ) -> bytes:
     buffer = io.BytesIO()
     with av.open(buffer, mode="w", format=container_format) as container:
-        codec = "libvpx" if container_format == "ogg" else "mpeg4"
+        codec = codec_name or ("libvpx" if container_format == "ogg" else "mpeg4")
         stream = container.add_stream(codec, rate=frame_rate)
         stream.width = width
         stream.height = height
@@ -313,7 +314,12 @@ def test_video_frames_filter_time_keyframes_and_sample_exactly(duckdb_cursor, tm
         return result
 
     assert [frame.frame_pts for frame in selected] == expected_pts(start=Fraction(3, 4), end=Fraction(2))
-    assert all(frame.frame_index is None for frame in selected)
+    expected_indices = {
+        frame.frame_pts: frame.frame_index
+        for frame in all_frames
+        if frame.frame_pts in expected_pts(start=Fraction(3, 4), end=Fraction(2))
+    }
+    assert [frame.frame_index for frame in selected] == [expected_indices[frame.frame_pts] for frame in selected]
     assert [frame.frame_pts for frame in key_frames] == expected_pts(key_frame=True)
     assert [frame.frame_pts for frame in non_key_frames] == expected_pts(key_frame=False)
     assert [frame.frame_pts for frame in sampled] == expected_pts(interval=Fraction(1, 2))
@@ -353,6 +359,43 @@ def test_video_frames_time_window_with_b_frames_matches_full_decode(duckdb_curso
 
     assert [frame.frame_pts for frame in selected] == [frame.frame_pts for frame in expected]
     assert [frame.frame_time for frame in selected] == pytest.approx([0.25, 0.5])
+
+
+def test_video_frames_time_window_with_distinct_pts_dts_origins_matches_full_decode(duckdb_cursor, tmp_path):
+    payload = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        frame_count=12,
+        frame_rate=8,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    with av.open(io.BytesIO(payload), mode="r") as container:
+        video = container.streams.video[0]
+        first_packet = next(packet for packet in container.demux(video) if packet.size)
+        assert first_packet.pts is not None
+        assert first_packet.dts is not None
+        assert first_packet.pts != first_packet.dts
+
+    path = tmp_path / "distinct-pts-dts-origins.ts"
+    path.write_bytes(payload)
+    value = vane.VideoFile(str(path), "video/mp2t")
+
+    all_frames = list(value.frames(connection=duckdb_cursor))
+    selected = list(value.frames(start_time=0.125, end_time=0.375, connection=duckdb_cursor))
+    assert all_frames[0].frame_pts is not None
+    assert all_frames[0].frame_time_base is not None
+    stream_origin = all_frames[0].frame_pts * all_frames[0].frame_time_base
+    expected = [
+        frame
+        for frame in all_frames
+        if frame.frame_pts is not None
+        and frame.frame_time_base is not None
+        and Fraction(1, 8) <= frame.frame_pts * frame.frame_time_base - stream_origin <= Fraction(3, 8)
+    ]
+
+    assert [frame.frame_pts for frame in selected] == [frame.frame_pts for frame in expected]
+    assert [frame.frame_time for frame in selected] == pytest.approx([0.125, 0.25, 0.375])
 
 
 def test_video_visible_pixel_limit_is_independent_of_coded_alignment(duckdb_cursor, tmp_path):
@@ -815,7 +858,7 @@ def test_video_frame_conversion_traceback_releases_native_frames():
     assert output_ref() is None
 
 
-def test_video_frame_provenance_and_seek_rebase_nonzero_stream_origin():
+def test_video_frame_provenance_rebases_nonzero_stream_origin():
     options = _video_file._VideoFrameOptions(
         start_time=Fraction(0),
         end_time=None,
@@ -830,7 +873,7 @@ def test_video_frame_provenance_and_seek_rebase_nonzero_stream_origin():
     )
     frame = _FakeDecodedVideoFrame(pts=105)
     video = SimpleNamespace(start_time=100, time_base=Fraction(1, 10))
-    stream_start, stream_origin = _video_file._stream_time_origin(video, video.time_base)
+    stream_origin = _video_file._stream_time_origin(video, video.time_base)
     info = _video_file._decoded_frame_info(
         frame,
         video,
@@ -842,7 +885,6 @@ def test_video_frame_provenance_and_seek_rebase_nonzero_stream_origin():
     assert info.frame_pts == 105
     assert info.exact_time == Fraction(1, 2)
     assert info.frame_time == 0.5
-    assert _video_file._seek_timestamp(Fraction(1, 2), video.time_base, stream_start) == 105
 
 
 def test_video_frame_preserves_zero_duration_provenance():
@@ -1583,130 +1625,6 @@ def test_video_demux_does_not_mistake_side_data_only_packet_for_flush():
     assert container.packets == []
 
 
-def test_video_seek_checks_interrupt_after_dependency_failure():
-    seek_error = RuntimeError("seek failed")
-    interrupt_error = RuntimeError("query interrupted")
-    seek_failed = False
-
-    def fail_seek(timestamp, *, backward, any_frame, stream):
-        nonlocal seek_failed
-        del timestamp, backward, any_frame, stream
-        seek_failed = True
-        raise seek_error
-
-    def check_interrupted():
-        if seek_failed:
-            raise interrupt_error
-
-    video = SimpleNamespace(codec_context=SimpleNamespace(reorder_depth=2))
-    reader = SimpleNamespace(
-        check_interrupted=check_interrupted,
-        raise_if_error=lambda: None,
-    )
-    no_error = SimpleNamespace(raise_if_error=lambda: None)
-
-    with pytest.raises(RuntimeError, match="query interrupted") as raised:
-        _video_file._seek_video_stream(SimpleNamespace(seek=fail_seek), video, 42, reader, no_error)
-    assert raised.value is interrupt_error
-
-
-def test_video_seek_preserves_direct_control_flow_exception():
-    class SeekControlFlow(BaseException):
-        pass
-
-    control_flow = SeekControlFlow("stop seek")
-    later_interrupt = RuntimeError("later query interrupt")
-    seek_failed = False
-    checks = 0
-
-    def fail_seek(timestamp, *, backward, any_frame, stream):
-        nonlocal seek_failed
-        del timestamp, backward, any_frame, stream
-        seek_failed = True
-        raise control_flow
-
-    def check_interrupted():
-        nonlocal checks
-        checks += 1
-        if seek_failed:
-            raise later_interrupt
-
-    video = SimpleNamespace(codec_context=SimpleNamespace(reorder_depth=2))
-    reader = SimpleNamespace(check_interrupted=check_interrupted, raise_if_error=lambda: None)
-    no_error = SimpleNamespace(raise_if_error=lambda: None)
-
-    with pytest.raises(SeekControlFlow, match="stop seek") as raised:
-        _video_file._seek_video_stream(SimpleNamespace(seek=fail_seek), video, 42, reader, no_error)
-
-    assert raised.value is control_flow
-    assert checks == 1
-
-
-def test_video_seek_checks_interrupt_before_restoring_reorder_depth(monkeypatch):
-    events = []
-    video = SimpleNamespace(codec_context=SimpleNamespace(reorder_depth=2))
-
-    def seek(timestamp, *, backward, any_frame, stream):
-        assert (timestamp, backward, any_frame, stream) == (42, True, False, video)
-        events.append("seek")
-
-    def restore(selected_video, reorder_depth):
-        assert (selected_video, reorder_depth) == (video, 2)
-        events.append("restore")
-
-    reader = SimpleNamespace(
-        check_interrupted=lambda: events.append("check"),
-        raise_if_error=lambda: None,
-    )
-    no_error = SimpleNamespace(raise_if_error=lambda: None)
-    monkeypatch.setattr(_video_file, "_restore_video_reorder_depth", restore)
-
-    _video_file._seek_video_stream(SimpleNamespace(seek=seek), video, 42, reader, no_error)
-
-    assert events == ["check", "seek", "check", "restore", "check"]
-
-
-def test_video_seek_traceback_releases_container_and_codec_owners():
-    class CodecContext:
-        reorder_depth = 2
-
-    class Container:
-        def __init__(self, seek):
-            self.seek = seek
-
-    class Video:
-        def __init__(self, container, codec_context):
-            self.container = container
-            self.codec_context = codec_context
-
-    def fail_seek(timestamp, *, backward, any_frame, stream):
-        del timestamp, backward, any_frame, stream
-        raise RuntimeError("seek failed")
-
-    container = Container(fail_seek)
-    codec_context = CodecContext()
-    video = Video(container, codec_context)
-    container_ref = weakref.ref(container)
-    video_ref = weakref.ref(video)
-    codec_ref = weakref.ref(codec_context)
-    no_error = SimpleNamespace(
-        check_interrupted=lambda: None,
-        raise_if_error=lambda: None,
-    )
-
-    with pytest.raises(RuntimeError, match="seek failed") as raised:
-        _video_file._seek_video_stream(container, video, 42, no_error, no_error)
-    container = None
-    video = None
-    codec_context = None
-    gc.collect()
-
-    assert raised.value is not None
-    assert container_ref() is None
-    assert video_ref() is None
-    assert codec_ref() is None
-
-
 def test_video_packet_decode_bounds_complete_returned_batch():
     options = _video_file._VideoFrameOptions(
         start_time=Fraction(0),
@@ -1882,7 +1800,6 @@ def test_video_packet_conversion_is_atomic(monkeypatch):
             object(),
             no_error,
             no_error,
-            did_seek=False,
             next_sample_time=None,
         )
     gc.collect()
@@ -2248,7 +2165,7 @@ def test_video_frames_observe_interrupt_during_container_close(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(time_base=Fraction(1)),
     )
     monkeypatch.setattr(_video_file, "_select_video_stream", lambda *args: object())
-    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: (0, Fraction(0)))
+    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: Fraction(0))
     monkeypatch.setattr(_video_file, "_configure_video_decoder", lambda *args: None)
     monkeypatch.setattr(_video_file, "_iter_decoded_packet_batches", lambda *args, **kwargs: (x for x in ()))
     options = _video_file._VideoFrameOptions(
@@ -2333,7 +2250,7 @@ def test_video_reader_close_failure_traceback_releases_native_owners(monkeypatch
         lambda *args, **kwargs: SimpleNamespace(time_base=Fraction(1)),
     )
     monkeypatch.setattr(_video_file, "_select_video_stream", select_video)
-    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: (0, Fraction(0)))
+    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: Fraction(0))
     monkeypatch.setattr(_video_file, "_configure_video_decoder", lambda *args: None)
     monkeypatch.setattr(_video_file, "_iter_decoded_packet_batches", lambda *args, **kwargs: (x for x in ()))
     options = _video_file._VideoFrameOptions(
@@ -2412,7 +2329,7 @@ def test_video_reader_close_failure_does_not_replace_active_decode_error(monkeyp
         lambda *args, **kwargs: SimpleNamespace(time_base=Fraction(1)),
     )
     monkeypatch.setattr(_video_file, "_select_video_stream", lambda *args: object())
-    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: (0, Fraction(0)))
+    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: Fraction(0))
     monkeypatch.setattr(_video_file, "_configure_video_decoder", lambda *args: None)
     monkeypatch.setattr(_video_file, "_iter_decoded_packet_batches", fail_decode)
     options = _video_file._VideoFrameOptions(
