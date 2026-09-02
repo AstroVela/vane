@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "datasource_function.hpp"
+#include "vane_python/datasource_execution_context.hpp"
 #include "vane_python/pybind11/gil_wrapper.hpp"
 
 #include "duckdb/common/arrow/arrow.hpp"
@@ -17,6 +18,22 @@
 namespace py = pybind11;
 
 namespace duckdb {
+
+PythonDataSourceExecutionContext::PythonDataSourceExecutionContext(shared_ptr<ClientContext> context_p)
+    : context(std::move(context_p)) {
+	if (!context) {
+		throw InvalidInputException("DataSource execution context must not be NULL");
+	}
+}
+
+void PythonDataSourceExecutionContext::Initialize(py::module_ &m) {
+	py::class_<PythonDataSourceExecutionContext, shared_ptr<PythonDataSourceExecutionContext>>(
+	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final());
+}
+
+shared_ptr<ClientContext> PythonDataSourceExecutionContext::GetContext() const {
+	return context;
+}
 
 // Helper: extract raw bytes from py::bytes without UTF-8 decode
 static string PyBytesToString(const py::object &obj) {
@@ -148,7 +165,11 @@ static bool HasFactoryOwners(const DataSourceFactoryRegistryEntry &entry) {
 // C callback called by datasource_scan GetData/InitLocal from pipeline threads.
 // pickled_task blob layout: [magic/version][source UUID][pickled task bytes]
 
-void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream) {
+void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pickled_len, ArrowArrayStream *out_stream,
+                                            ClientContext *context) {
+	if (!context) {
+		throw InvalidInputException("datasource_scan requires the current query execution context");
+	}
 	auto task = ParseDataSourcePayload(pickled_task, pickled_len, "task");
 	PythonGILWrapper acquire;
 
@@ -168,8 +189,11 @@ void DataSourceStreamFactory::ProduceStream(const char *pickled_task, idx_t pick
 	auto cloudpickle = py::module::import("cloudpickle");
 	auto task_obj = cloudpickle.attr("loads")(py::bytes(task.payload, task.payload_len));
 
-	// 2. Call task.execute() to get a generator of RecordBatches
-	auto generator = task_obj.attr("execute")();
+	// 2. Execute through the internal context-aware hook. Ordinary DataSource
+	// tasks ignore this token, while governed readers use the exact worker
+	// query context for filesystem, Secret, and cancellation resolution.
+	auto execution_context = make_shared_ptr<PythonDataSourceExecutionContext>(context->shared_from_this());
+	auto generator = task_obj.attr("_execute_with_context")(std::move(execution_context));
 
 	// 3. Wrap in RecordBatchReader
 	auto pa = py::module::import("pyarrow");

@@ -15,6 +15,7 @@ namespace duckdb {
 class ClientContext;
 class DuckDBPyConnection;
 class PythonFile;
+class PythonDataSourceExecutionContext;
 class ResolvedFile;
 
 //! Native, range-aware cursor used by the public Python VaneFileReader.
@@ -25,6 +26,9 @@ public:
 	static void Initialize(py::module_ &m);
 	static shared_ptr<PythonFileReaderHandle> Open(const PythonFile &file, idx_t buffer_size,
 	                                               shared_ptr<DuckDBPyConnection> connection);
+	static shared_ptr<PythonFileReaderHandle>
+	OpenInDataSourceContext(const PythonFile &file, idx_t buffer_size,
+	                        const shared_ptr<PythonDataSourceExecutionContext> &execution_context);
 
 	py::bytes Read(int64_t size);
 	py::bytes ReadAndCheckInterrupted(int64_t size);

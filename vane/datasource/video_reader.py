@@ -6,7 +6,8 @@
 ``VideoFile.frames()`` owns encoded-video semantics: FILE resolution, strict
 logical ranges, PyAV decoding, selection, provenance, cancellation, and error
 classification. This module only turns that row-wise stream into bounded Arrow
-batches and schedules independent VIDEOFILE values across UDF workers.
+batches and schedules independent VIDEOFILE values through engine DataSource
+tasks bound to each Worker's query context.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -30,15 +31,14 @@ from vane.datasource import DataSource, DataSourceTask
 
 if TYPE_CHECKING:
     import vane
+    from vane._native import _DataSourceExecutionContext
 
 
 _DEFAULT_MAX_PARTITION_BYTES = int(os.environ.get("VANE_VIDEO_MAX_PARTITION_BYTES", str(10 * 1024 * 1024)))
-_DEFAULT_VIDEO_SOURCE_UDF_MEMORY_BYTES = 512 * 1024**2
 _DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024
 _DEFAULT_MAX_INPUT_BYTES = 8 * 1024**3
 _DEFAULT_MAX_DECODED_FRAMES = 1_000_000
 _DEFAULT_MAX_PIXELS = 32 * 1024**2
-_VIDEO_DECODER_MEMORY_HEADROOM_BYTES = 128 * 1024**2
 _ARROW_STRING_DATA_MAX_BYTES = int(np.iinfo(np.int32).max)
 _ARROW_STRING_OFFSET_BYTES = np.dtype(np.int32).itemsize
 _INT64_BYTES = np.dtype(np.int64).itemsize
@@ -63,26 +63,6 @@ def _import_video_dependency(module_name: str, package_name: str) -> ModuleType:
         ) from error
 
 
-def _read_optional_float_env(name: str) -> float | None:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return None
-    result = float(value)
-    if result <= 0.0 or not math.isfinite(result):
-        raise ValueError(f"{name} must be a finite positive number, got {value!r}")
-    return result
-
-
-def _read_optional_positive_int_env(name: str) -> int | None:
-    value = os.environ.get(name)
-    if value is None or value.strip() == "":
-        return None
-    result = int(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be positive, got {value!r}")
-    return result
-
-
 def _read_positive_int_env(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -96,9 +76,8 @@ def _read_positive_int_env(name: str, default: int) -> int:
     return result
 
 
-# Admission control is intentionally process-local. Ray accounts for the same
-# task working set through ``memory_bytes`` below, while this guard prevents a
-# local worker from starting another decoder under host-memory pressure.
+# Admission control is process-local to each engine Worker and prevents that
+# Worker from starting another decoder under host-memory pressure.
 _MAX_CONCURRENT_DECODES = _read_positive_int_env("VANE_MAX_CONCURRENT_DECODES", 1)
 _decode_semaphore = threading.Semaphore(_MAX_CONCURRENT_DECODES)
 _MEM_HIGH_WATERMARK = float(os.environ.get("VANE_DECODE_MEM_HIGH_PCT", "80"))
@@ -426,30 +405,7 @@ def _video_output_row_bytes(*, height: int, width: int, max_file_row_bytes: int)
     return frame_bytes + int(max_file_row_bytes) + provenance_bytes
 
 
-def _video_output_batch_bytes(
-    row_count: int,
-    *,
-    height: int,
-    width: int,
-    max_file_string_bytes: int,
-    max_file_row_bytes: int,
-) -> int:
-    row_count = int(row_count)
-    if row_count < 0:
-        raise ValueError("row_count must be non-negative")
-    max_rows = _video_max_output_rows(max_file_string_bytes)
-    if row_count > max_rows:
-        raise ValueError(
-            f"video output batch has {row_count} rows, exceeding Arrow's UTF-8 offset limit of {max_rows} rows"
-        )
-    return row_count * _video_output_row_bytes(
-        height=height,
-        width=width,
-        max_file_row_bytes=max_file_row_bytes,
-    )
-
-
-def _video_source_udf_output_batch_size(
+def _video_output_batch_size(
     height: int,
     width: int,
     max_partition_bytes: int,
@@ -464,41 +420,10 @@ def _video_source_udf_output_batch_size(
         width=width,
         max_file_row_bytes=max_file_row_bytes,
     )
-    # Ray's block target is soft: the row that first crosses it remains in the
-    # block. Keep the same boundary so this source composes with Ray Data.
+    # The partition target is soft: keep the row that first crosses it so one
+    # logical frame is never split across output batches.
     target_rows = max(1, int(max_partition_bytes) // row_bytes + 1)
     return min(target_rows, _video_max_output_rows(max_file_string_bytes))
-
-
-def _video_source_peak_memory_bytes(
-    *,
-    height: int,
-    width: int,
-    max_partition_bytes: int,
-    max_pixels: int = _DEFAULT_MAX_PIXELS,
-    buffer_size: int = _DEFAULT_VIDEO_BUFFER_SIZE,
-    max_file_string_bytes: int = 0,
-    max_file_row_bytes: int = 0,
-    output_batch_size: int | None = None,
-) -> int:
-    """Return the bounded source-task working set used for Ray admission."""
-    decode_batch_size = _video_source_udf_output_batch_size(
-        height,
-        width,
-        max_partition_bytes,
-        max_file_string_bytes=max_file_string_bytes,
-        max_file_row_bytes=max_file_row_bytes,
-    )
-    transport_batch_size = decode_batch_size if output_batch_size is None else max(1, int(output_batch_size))
-    output_bytes = _video_output_batch_bytes(
-        max(decode_batch_size, transport_batch_size),
-        height=height,
-        width=width,
-        max_file_string_bytes=max_file_string_bytes,
-        max_file_row_bytes=max_file_row_bytes,
-    )
-    current_rgb_frame_bytes = int(max_pixels) * 3
-    return _VIDEO_DECODER_MEMORY_HEADROOM_BYTES + int(buffer_size) + current_rgb_frame_bytes + 2 * output_bytes
 
 
 def _flush_frame_batch(
@@ -565,11 +490,15 @@ def _decode_video_batches(
     *,
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
+    connection: vane.DuckDBPyConnection | None = None,
+    execution_context: _DataSourceExecutionContext | None = None,
 ) -> Iterator[pa.RecordBatch]:
+    if (connection is None) == (execution_context is None):
+        raise ValueError("video decoding requires exactly one explicit connection or DataSource execution context")
     if max_output_frames is not None and max_output_frames <= 0:
         return
 
-    batch_size = _video_source_udf_output_batch_size(
+    batch_size = _video_output_batch_size(
         options.height,
         options.width,
         options.max_partition_bytes,
@@ -606,18 +535,37 @@ def _decode_video_batches(
             key_frame_flags=key_frame_flags,
         )
 
-    frames = value.frames(
-        start_time=options.start_time,
-        end_time=options.end_time,
-        width=options.width,
-        height=options.height,
-        is_key_frame=options.is_key_frame,
-        sample_interval_seconds=options.sample_interval_seconds,
-        buffer_size=options.buffer_size,
-        max_input_bytes=options.max_input_bytes,
-        max_frames=options.max_decoded_frames,
-        max_pixels=options.max_pixels,
-    )
+    if execution_context is None:
+        frames = value.frames(
+            start_time=options.start_time,
+            end_time=options.end_time,
+            width=options.width,
+            height=options.height,
+            is_key_frame=options.is_key_frame,
+            sample_interval_seconds=options.sample_interval_seconds,
+            buffer_size=options.buffer_size,
+            max_input_bytes=options.max_input_bytes,
+            max_frames=options.max_decoded_frames,
+            max_pixels=options.max_pixels,
+            connection=connection,
+        )
+    else:
+        from vane._video_file import _video_file_frames_value
+
+        frames = _video_file_frames_value(
+            value,
+            start_time=options.start_time,
+            end_time=options.end_time,
+            width=options.width,
+            height=options.height,
+            is_key_frame=options.is_key_frame,
+            sample_interval_seconds=options.sample_interval_seconds,
+            buffer_size=options.buffer_size,
+            max_input_bytes=options.max_input_bytes,
+            max_frames=options.max_decoded_frames,
+            max_pixels=options.max_pixels,
+            _execution_context=execution_context,
+        )
     try:
         for record in frames:
             try:
@@ -700,10 +648,18 @@ def _decode_video_with_policy(
     *,
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
+    connection: vane.DuckDBPyConnection | None = None,
+    execution_context: _DataSourceExecutionContext | None = None,
 ) -> Iterator[pa.RecordBatch]:
     import vane
 
-    batches = _decode_video_batches(value, options=options, max_output_frames=max_output_frames)
+    batches = _decode_video_batches(
+        value,
+        options=options,
+        max_output_frames=max_output_frames,
+        connection=connection,
+        execution_context=execution_context,
+    )
     while True:
         try:
             batch = next(batches)
@@ -731,6 +687,8 @@ def _decode_video_guarded(
     *,
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
+    connection: vane.DuckDBPyConnection | None = None,
+    execution_context: _DataSourceExecutionContext | None = None,
 ) -> Iterator[pa.RecordBatch]:
     _wait_for_memory()
     _decode_semaphore.acquire()
@@ -739,122 +697,11 @@ def _decode_video_guarded(
             value,
             options=options,
             max_output_frames=max_output_frames,
+            connection=connection,
+            execution_context=execution_context,
         )
     finally:
         _decode_semaphore.release()
-
-
-def _coalesce_video_frame_batches(
-    batches: Iterator[pa.RecordBatch],
-    *,
-    target_rows: int,
-) -> Iterator[pa.Table]:
-    """Coalesce short file tails without crossing one read-task row target."""
-    target_rows = max(1, int(target_rows))
-    pending: list[pa.Table] = []
-    pending_rows = 0
-    try:
-        for batch in batches:
-            table = pa.Table.from_batches([batch])
-            offset = 0
-            while offset < table.num_rows:
-                take_rows = min(target_rows - pending_rows, table.num_rows - offset)
-                pending.append(table.slice(offset, take_rows))
-                pending_rows += take_rows
-                offset += take_rows
-                if pending_rows == target_rows:
-                    yield pa.concat_tables(pending)
-                    pending = []
-                    pending_rows = 0
-
-        if pending_rows:
-            yield pa.concat_tables(pending)
-    except BaseException:
-        _close_iterator_preserving_active_error(batches)
-        raise
-
-
-def _video_source_udf_backend() -> str:
-    backend = os.environ.get("VANE_VIDEO_SOURCE_UDF_BACKEND", "").strip().lower()
-    if not backend:
-        runner = os.environ.get("VANE_RUNNER", "").strip().lower() or "ray"
-        backend = "ray_task" if runner == "ray" else "subprocess_task"
-    if backend not in {"ray_task", "subprocess_task"}:
-        raise ValueError(f"VANE_VIDEO_SOURCE_UDF_BACKEND must be one of: ray_task, subprocess_task; got {backend!r}")
-    return backend
-
-
-def _video_source_udf_files_per_task(frame_limit: int | None, file_count: int) -> int:
-    if frame_limit is not None:
-        return max(1, file_count)
-    return _read_positive_int_env("VANE_VIDEO_SOURCE_UDF_FILES_PER_TASK", 1)
-
-
-def _video_source_udf_cpus() -> float:
-    configured = _read_optional_float_env("VANE_VIDEO_SOURCE_UDF_CPUS")
-    return 1.0 if configured is None else configured
-
-
-def _video_source_udf_kwargs(
-    *,
-    height: int = 640,
-    width: int = 480,
-    max_partition_bytes: int = _DEFAULT_MAX_PARTITION_BYTES,
-    max_pixels: int = _DEFAULT_MAX_PIXELS,
-    buffer_size: int = _DEFAULT_VIDEO_BUFFER_SIZE,
-    max_file_string_bytes: int = 0,
-    max_file_row_bytes: int = 0,
-    frame_limit: int | None = None,
-    file_count: int = 1,
-    pre_grouped_files: bool = False,
-    schema: dict[str, object] | None = None,
-) -> dict[str, object]:
-    files_per_task = 1 if pre_grouped_files else _video_source_udf_files_per_task(frame_limit, file_count)
-    execution_backend = _video_source_udf_backend()
-    output_batch_size = _read_positive_int_env(
-        "VANE_VIDEO_SOURCE_UDF_OUTPUT_BATCH_SIZE",
-        _video_source_udf_output_batch_size(
-            height,
-            width,
-            max_partition_bytes,
-            max_file_string_bytes=max_file_string_bytes,
-            max_file_row_bytes=max_file_row_bytes,
-        ),
-    )
-    output_batch_bytes = _video_output_batch_bytes(
-        output_batch_size,
-        height=height,
-        width=width,
-        max_file_string_bytes=max_file_string_bytes,
-        max_file_row_bytes=max_file_row_bytes,
-    )
-    result: dict[str, object] = {
-        "execution_backend": execution_backend,
-        "batch_size": files_per_task,
-        "output_batch_size": output_batch_size,
-        "output_target_max_bytes": max(int(max_partition_bytes) * 2, output_batch_bytes, 1),
-        "preserve_compute_batch_boundaries": True,
-        "cpus": _video_source_udf_cpus(),
-    }
-    if execution_backend == "ray_task":
-        configured_memory_bytes = (
-            _read_optional_positive_int_env("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES")
-            or _DEFAULT_VIDEO_SOURCE_UDF_MEMORY_BYTES
-        )
-        peak_memory_bytes = _video_source_peak_memory_bytes(
-            height=height,
-            width=width,
-            max_partition_bytes=max_partition_bytes,
-            max_pixels=max_pixels,
-            buffer_size=buffer_size,
-            max_file_string_bytes=max_file_string_bytes,
-            max_file_row_bytes=max_file_row_bytes,
-            output_batch_size=output_batch_size,
-        )
-        result["memory_bytes"] = max(configured_memory_bytes, peak_memory_bytes)
-    if schema is not None:
-        result["schema"] = schema
-    return result
 
 
 def _split_video_file_groups(
@@ -886,251 +733,6 @@ def _video_source_file_groups(source: VideoFrameSource) -> list[tuple[vane.Video
     return _split_video_file_groups(source.files, source.read_task_count)
 
 
-def _sql_string_literal(value: str) -> str:
-    """Encode arbitrary Python Unicode without placing it in a SQL string token."""
-    return f"decode(from_hex('{value.encode('utf-8').hex()}'))"
-
-
-def _sql_optional_string(value: str | None) -> str:
-    return "NULL::VARCHAR" if value is None else _sql_string_literal(value)
-
-
-def _sql_optional_bigint(value: int | None) -> str:
-    return "NULL::BIGINT" if value is None else f"{int(value)}::BIGINT"
-
-
-def _sql_optional_time(value: int | float | None) -> str:
-    if value is None:
-        return "NULL::VARCHAR"
-    if isinstance(value, int):
-        token = f"i:{value}"
-    else:
-        token = f"f:{value.hex()}"
-    return _sql_string_literal(token)
-
-
-def _sql_optional_boolean(value: bool | None) -> str:
-    if value is None:
-        return "NULL::BOOLEAN"
-    return "TRUE::BOOLEAN" if value else "FALSE::BOOLEAN"
-
-
-def _video_file_sql(value: vane.VideoFile) -> str:
-    generic_file = (
-        "file("
-        f"{_sql_string_literal(value.url)}, "
-        f"{_sql_optional_string(value.content_type)}, "
-        f"{_sql_optional_bigint(value.position)}, "
-        f"{_sql_optional_bigint(value.size)}, "
-        f"{_sql_optional_string(value.checksum)}"
-        ")"
-    )
-    return f"video_file({generic_file})"
-
-
-def _video_frame_source_manifest_sql(source: VideoFrameSource) -> str:
-    if not source.files:
-        return (
-            "select []::VIDEOFILE[] as video_files, 0::BIGINT as height, 0::BIGINT as width, "
-            "0::BIGINT as max_partition_bytes, NULL::BIGINT as frame_limit, "
-            "'i:0'::VARCHAR as start_time, NULL::VARCHAR as end_time, NULL::BOOLEAN as is_key_frame, "
-            "NULL::VARCHAR as sample_interval_seconds, 0::BIGINT as buffer_size, "
-            "0::UBIGINT as max_input_bytes, 0::BIGINT as max_decoded_frames, "
-            "0::BIGINT as max_pixels, 0::BIGINT as max_file_string_bytes, "
-            "0::BIGINT as max_file_row_bytes, 'raise'::VARCHAR as on_error where false"
-        )
-
-    frame_limit_sql = "NULL::BIGINT" if source.frame_limit is None else f"{source.frame_limit}::BIGINT"
-    rows = ", ".join(
-        "("
-        f"list_value({', '.join(_video_file_sql(value) for value in group)}), "
-        f"{source.height}, {source.width}, {source.max_partition_bytes}, {frame_limit_sql}, "
-        f"{_sql_optional_time(source.start_time)}, {_sql_optional_time(source.end_time)}, "
-        f"{_sql_optional_boolean(source.is_key_frame)}, "
-        f"{_sql_optional_time(source.sample_interval_seconds)}, "
-        f"{source.buffer_size}, {source.max_input_bytes}, {source.max_decoded_frames}, "
-        f"{source.max_pixels}, {source.file_bounds.max_string_bytes}, "
-        f"{source.file_bounds.max_row_bytes}, {_sql_string_literal(source.on_error)}"
-        ")"
-        for group in _video_source_file_groups(source)
-    )
-    return (
-        "select video_files::VIDEOFILE[] as video_files, height::BIGINT as height, "
-        "width::BIGINT as width, max_partition_bytes::BIGINT as max_partition_bytes, "
-        "frame_limit::BIGINT as frame_limit, start_time::VARCHAR as start_time, "
-        "end_time::VARCHAR as end_time, is_key_frame::BOOLEAN as is_key_frame, "
-        "sample_interval_seconds::VARCHAR as sample_interval_seconds, buffer_size::BIGINT as buffer_size, "
-        "max_input_bytes::UBIGINT as max_input_bytes, max_decoded_frames::BIGINT as max_decoded_frames, "
-        "max_pixels::BIGINT as max_pixels, max_file_string_bytes::BIGINT as max_file_string_bytes, "
-        "max_file_row_bytes::BIGINT as max_file_row_bytes, on_error::VARCHAR as on_error "
-        f"from (values {rows}) as manifest("
-        "video_files, height, width, max_partition_bytes, frame_limit, start_time, end_time, "
-        "is_key_frame, sample_interval_seconds, buffer_size, max_input_bytes, max_decoded_frames, "
-        "max_pixels, max_file_string_bytes, max_file_row_bytes, on_error)"
-    )
-
-
-def _manifest_column(table: pa.Table, name: str) -> list[object]:
-    if name not in table.column_names:
-        raise ValueError(f"VideoFrameSource manifest is missing column {name!r}")
-    return table.column(name).to_pylist()
-
-
-def _manifest_int(values: Sequence[object], index: int, name: str) -> int:
-    value = values[index]
-    if value is None:
-        raise ValueError(f"VideoFrameSource manifest column {name!r} cannot be NULL")
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"VideoFrameSource manifest column {name!r} must be an integer")
-    return value
-
-
-def _manifest_frame_limit(values: Sequence[object]) -> int | None:
-    present = []
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError("VideoFrameSource manifest frame_limit must be an integer or NULL")
-        if value < 0:
-            raise ValueError("VideoFrameSource manifest frame_limit must be non-negative")
-        present.append(value)
-    if not present:
-        return None
-    if len(present) != len(values) or any(value != present[0] for value in present):
-        raise ValueError("VideoFrameSource manifest frame_limit must be constant")
-    return present[0]
-
-
-def _manifest_time(value: object, *, name: str, optional: bool = False) -> int | float | None:
-    if value is None:
-        if optional:
-            return None
-        raise ValueError(f"VideoFrameSource manifest column {name!r} cannot be NULL")
-    if not isinstance(value, str):
-        raise ValueError(f"VideoFrameSource manifest column {name!r} must be VARCHAR")
-    kind, separator, payload = value.partition(":")
-    if not separator or not payload:
-        raise ValueError(f"VideoFrameSource manifest column {name!r} has an invalid time token")
-    try:
-        if kind == "i":
-            return int(payload)
-        if kind == "f":
-            return float.fromhex(payload)
-    except ValueError:
-        pass
-    raise ValueError(f"VideoFrameSource manifest column {name!r} has an invalid time token")
-
-
-def _video_file_from_arrow(value: object) -> vane.VideoFile:
-    import vane
-
-    if not isinstance(value, dict) or tuple(value) != _FILE_FIELDS:
-        raise ValueError("VideoFrameSource manifest contains a malformed VIDEOFILE value")
-    url = value["url"]
-    if not isinstance(url, str):
-        raise ValueError("VideoFrameSource manifest VIDEOFILE url must be non-NULL VARCHAR")
-    return vane.VideoFile(
-        url,
-        cast("str | None", value["content_type"]),
-        cast("int | None", value["position"]),
-        cast("int | None", value["size"]),
-        cast("str | None", value["checksum"]),
-    )
-
-
-def _video_frame_source_map_batches(table: pa.Table) -> Iterator[pa.Table]:
-    file_groups_raw = _manifest_column(table, "video_files")
-    file_groups = [
-        [] if group is None else [_video_file_from_arrow(value) for value in cast("list[object]", group)]
-        for group in file_groups_raw
-    ]
-    heights = _manifest_column(table, "height")
-    widths = _manifest_column(table, "width")
-    partition_bytes = _manifest_column(table, "max_partition_bytes")
-    frame_limits = _manifest_column(table, "frame_limit")
-    start_times = _manifest_column(table, "start_time")
-    end_times = _manifest_column(table, "end_time")
-    key_frame_filters = _manifest_column(table, "is_key_frame")
-    sample_intervals = _manifest_column(table, "sample_interval_seconds")
-    buffer_sizes = _manifest_column(table, "buffer_size")
-    max_input_bytes_values = _manifest_column(table, "max_input_bytes")
-    max_decoded_frames_values = _manifest_column(table, "max_decoded_frames")
-    max_pixels_values = _manifest_column(table, "max_pixels")
-    max_file_string_bytes_values = _manifest_column(table, "max_file_string_bytes")
-    max_file_row_bytes_values = _manifest_column(table, "max_file_row_bytes")
-    error_modes = _manifest_column(table, "on_error")
-    remaining = _manifest_frame_limit(frame_limits)
-
-    for row_index, files in enumerate(file_groups):
-        bounds = _FileStorageBounds(
-            max_string_bytes=_manifest_int(
-                max_file_string_bytes_values,
-                row_index,
-                "max_file_string_bytes",
-            ),
-            max_row_bytes=_manifest_int(max_file_row_bytes_values, row_index, "max_file_row_bytes"),
-        )
-        actual_bounds = _file_storage_bounds(files)
-        if (
-            bounds.max_string_bytes < actual_bounds.max_string_bytes
-            or bounds.max_row_bytes < actual_bounds.max_row_bytes
-        ):
-            raise ValueError("VideoFrameSource manifest FILE storage bounds are smaller than its VIDEOFILE values")
-        options = _make_decode_options(
-            height=_manifest_int(heights, row_index, "height"),
-            width=_manifest_int(widths, row_index, "width"),
-            max_partition_bytes=_manifest_int(partition_bytes, row_index, "max_partition_bytes"),
-            start_time=_manifest_time(start_times[row_index], name="start_time"),
-            end_time=_manifest_time(end_times[row_index], name="end_time", optional=True),
-            is_key_frame=key_frame_filters[row_index],
-            sample_interval_seconds=_manifest_time(
-                sample_intervals[row_index],
-                name="sample_interval_seconds",
-                optional=True,
-            ),
-            buffer_size=_manifest_int(buffer_sizes, row_index, "buffer_size"),
-            max_input_bytes=_manifest_int(max_input_bytes_values, row_index, "max_input_bytes"),
-            max_decoded_frames=_manifest_int(
-                max_decoded_frames_values,
-                row_index,
-                "max_decoded_frames",
-            ),
-            max_pixels=_manifest_int(max_pixels_values, row_index, "max_pixels"),
-            on_error=error_modes[row_index],
-            file_bounds=bounds,
-        )
-        target_rows = _video_source_udf_output_batch_size(
-            options.height,
-            options.width,
-            options.max_partition_bytes,
-            max_file_string_bytes=bounds.max_string_bytes,
-            max_file_row_bytes=bounds.max_row_bytes,
-        )
-
-        def decode_group() -> Iterator[pa.RecordBatch]:
-            nonlocal remaining
-            for value in files:
-                if remaining is not None and remaining <= 0:
-                    return
-                for batch in _decode_video_guarded(
-                    value,
-                    options=options,
-                    max_output_frames=remaining,
-                ):
-                    if remaining is not None:
-                        if batch.num_rows > remaining:
-                            batch = batch.slice(0, remaining)
-                        remaining -= batch.num_rows
-                    yield batch
-                    if remaining is not None and remaining <= 0:
-                        return
-
-        yield from _coalesce_video_frame_batches(decode_group(), target_rows=target_rows)
-        if remaining is not None and remaining <= 0:
-            return
-
-
 class VideoFrameTask(DataSourceTask):
     """Decode one governed VIDEOFILE into bounded Arrow frame batches."""
 
@@ -1144,10 +746,14 @@ class VideoFrameTask(DataSourceTask):
         self.options = options
 
     def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("VideoFrameTask must be executed by datasource_scan with an explicit query context")
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
         yield from _decode_video_guarded(
             self.video_file,
             options=self.options,
             max_output_frames=None,
+            execution_context=execution_context,
         )
 
 
@@ -1168,6 +774,9 @@ class LimitedVideoFrameTask(DataSourceTask):
         self.max_frames = normalized_max_frames
 
     def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("LimitedVideoFrameTask must be executed by datasource_scan with an explicit query context")
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
         remaining = self.max_frames
         for value in self.files:
             if remaining <= 0:
@@ -1176,6 +785,7 @@ class LimitedVideoFrameTask(DataSourceTask):
                 value,
                 options=self.options,
                 max_output_frames=remaining,
+                execution_context=execution_context,
             ):
                 remaining -= batch.num_rows
                 yield batch
@@ -1189,12 +799,21 @@ class _VideoFrameGroupTask(DataSourceTask):
         self.options = options
 
     def execute(self) -> Iterator[pa.RecordBatch]:
+        raise RuntimeError("Video frame group tasks require an explicit datasource_scan query context")
+
+    def _execute_with_context(self, execution_context: _DataSourceExecutionContext) -> Iterator[pa.RecordBatch]:
         for value in self.files:
             yield from _decode_video_guarded(
                 value,
                 options=self.options,
                 max_output_frames=None,
+                execution_context=execution_context,
             )
+
+
+class _EmptyVideoFrameTask(DataSourceTask):
+    def execute(self) -> Iterator[pa.RecordBatch]:
+        return iter(())
 
 
 class VideoFrameSource(DataSource):
@@ -1318,6 +937,9 @@ class VideoFrameSource(DataSource):
         }
 
     def get_tasks(self) -> Iterator[DataSourceTask]:
+        if not self.files:
+            yield _EmptyVideoFrameTask()
+            return
         if self.frame_limit is not None:
             yield LimitedVideoFrameTask(
                 self.files,
@@ -1332,37 +954,12 @@ class VideoFrameSource(DataSource):
                 yield _VideoFrameGroupTask(group, self.options)
 
     def to_udf_relation(self, con: Any) -> Any:
-        import vane
-
-        manifest = con.sql(_video_frame_source_manifest_sql(self))
-        udf_kwargs = _video_source_udf_kwargs(
-            height=self.height,
-            width=self.width,
-            max_partition_bytes=self.max_partition_bytes,
-            max_pixels=self.max_pixels,
-            buffer_size=self.buffer_size,
-            max_file_string_bytes=self.file_bounds.max_string_bytes,
-            max_file_row_bytes=self.file_bounds.max_row_bytes,
-            frame_limit=self.frame_limit,
-            file_count=len(_video_source_file_groups(self)),
-            pre_grouped_files=True,
-            schema={
-                "file": vane.file_type(vane.MediaType.video()),
-                "frame_index": vane.sqltypes.BIGINT,
-                "frame_time": vane.sqltypes.DOUBLE,
-                "frame_time_base_numerator": vane.sqltypes.BIGINT,
-                "frame_time_base_denominator": vane.sqltypes.BIGINT,
-                "frame_pts": vane.sqltypes.BIGINT,
-                "frame_dts": vane.sqltypes.BIGINT,
-                "frame_duration": vane.sqltypes.BIGINT,
-                "is_key_frame": vane.sqltypes.BOOLEAN,
-                "frame": vane.tensor_type(
-                    vane.sqltypes.UTINYINT,
-                    (self.height, self.width, 3),
-                ),
-            },
+        relation = con.from_datasource(self)
+        return relation.project(
+            "video_file(file(file.url, file.content_type, file.position, file.size, file.checksum)) AS file, "
+            "frame_index, frame_time, frame_time_base_numerator, frame_time_base_denominator, "
+            "frame_pts, frame_dts, frame_duration, is_key_frame, frame"
         )
-        return manifest.map_batches(_video_frame_source_map_batches, **udf_kwargs)
 
 
 __all__ = [

@@ -21,17 +21,12 @@ from vane.datasource.video_reader import (
     VideoFrameSource,
     VideoFrameTask,
     VideoReadError,
-    _coalesce_video_frame_batches,
     _decode_video_batches,
     _decode_video_with_policy,
     _file_storage_bounds,
     _flush_frame_batch,
     _split_video_file_groups,
-    _video_frame_source_manifest_sql,
-    _video_frame_source_map_batches,
-    _video_source_peak_memory_bytes,
-    _video_source_udf_kwargs,
-    _video_source_udf_output_batch_size,
+    _video_output_batch_size,
 )
 
 
@@ -131,8 +126,12 @@ class _FakeVideoFile:
         self.error = error
         self.closed = False
         self.frames_kwargs = None
+        self.connection = None
 
     def frames(self, **kwargs):
+        self.connection = kwargs.pop("connection", None)
+        if self.connection is None:
+            raise AssertionError("test decode must provide an explicit connection")
         self.frames_kwargs = kwargs
 
         def generate():
@@ -253,7 +252,7 @@ def test_video_frame_source_schema_exposes_source_and_exact_frame_provenance():
     assert arrow_schema.field("frame").type == pa.fixed_shape_tensor(pa.uint8(), (4, 5, 3))
 
 
-def test_video_frame_source_manifest_preserves_video_logical_type_and_exact_range(duckdb_cursor, tmp_path):
+def test_video_frame_source_task_preserves_exact_file_and_options(tmp_path):
     value = _ranged_video(tmp_path)
     source = VideoFrameSource(
         [value],
@@ -269,104 +268,48 @@ def test_video_frame_source_manifest_preserves_video_logical_type_and_exact_rang
         max_pixels=1000,
         on_error="skip",
     )
+    task = next(source.get_tasks())
 
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source))
-    row = manifest.to_arrow_table().to_pylist()[0]
-
-    assert str(manifest.types[0]) == "VIDEOFILE[]"
-    assert row["video_files"] == [
-        {
-            "url": value.url,
-            "content_type": value.content_type,
-            "position": value.position,
-            "size": value.size,
-            "checksum": value.checksum,
-        }
-    ]
-    assert row | {"video_files": None, "max_file_string_bytes": None, "max_file_row_bytes": None} == {
-        "video_files": None,
-        "height": 7,
-        "width": 9,
-        "max_partition_bytes": 10 * 1024 * 1024,
-        "frame_limit": None,
-        "start_time": f"f:{float(0.25).hex()}",
-        "end_time": f"f:{float(1.5).hex()}",
-        "is_key_frame": False,
-        "sample_interval_seconds": f"f:{float(0.5).hex()}",
-        "buffer_size": 64,
-        "max_input_bytes": 10_000,
-        "max_decoded_frames": 50,
-        "max_pixels": 1000,
-        "max_file_string_bytes": None,
-        "max_file_row_bytes": None,
-        "on_error": "skip",
-    }
+    assert isinstance(task, VideoFrameTask)
+    assert task.video_file is value
+    assert task.options == source.options
 
 
-def test_video_frame_source_manifest_escapes_quotes(duckdb_cursor):
-    value = vane.VideoFile("memory://it's/a-video", "video/x-'quoted'\x00tail")
-    source = VideoFrameSource([value])
-
-    row = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table().to_pylist()[0]
-
-    assert row["video_files"][0]["url"] == value.url
-    assert row["video_files"][0]["content_type"] == value.content_type
-
-
-def test_video_frame_source_manifest_preserves_large_integer_times_exactly(duckdb_cursor):
-    start_time = 2**60 + 1
-    end_time = start_time + 2
-    source = VideoFrameSource(["memory://video"], start_time=start_time, end_time=end_time)
-
-    row = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table().to_pylist()[0]
-
-    assert row["start_time"] == f"i:{start_time}"
-    assert row["end_time"] == f"i:{end_time}"
-    assert video_reader._manifest_time(row["start_time"], name="start_time") == start_time
-    assert video_reader._manifest_time(row["end_time"], name="end_time") == end_time
-
-
-def test_video_frame_source_manifest_groups_files_like_read_tasks(duckdb_cursor):
+def test_video_frame_source_groups_files_into_read_tasks():
     source = VideoFrameSource([f"memory://{index}" for index in range(5)], read_task_count=2)
+    tasks = list(source.get_tasks())
 
-    table = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
-
-    assert [[value["url"] for value in group] for group in table.column("video_files").to_pylist()] == [
+    assert [[value.url for value in task.files] for task in tasks] == [
         ["memory://0", "memory://1", "memory://2"],
         ["memory://3", "memory://4"],
     ]
 
 
-def test_global_frame_limit_forces_one_ordered_task_and_manifest_row(duckdb_cursor):
+def test_global_frame_limit_forces_one_ordered_task():
     source = VideoFrameSource(["a.mp4", "b.mp4"], frame_limit=3, read_task_count=2)
 
     tasks = list(source.get_tasks())
-    table = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
 
     assert len(tasks) == 1
     assert isinstance(tasks[0], LimitedVideoFrameTask)
     assert [value.url for value in tasks[0].files] == ["a.mp4", "b.mp4"]
-    assert table.num_rows == 1
-    assert [value["url"] for value in table.column("video_files").to_pylist()[0]] == ["a.mp4", "b.mp4"]
-
-
-def test_empty_video_frame_source_has_typed_empty_manifest(duckdb_cursor):
-    source = VideoFrameSource([])
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source))
-
-    assert manifest.count("*").fetchone()[0] == 0
-    assert str(manifest.types[0]) == "VIDEOFILE[]"
-    assert list(source.get_tasks()) == []
 
 
 def test_video_frame_tasks_are_pickle_safe():
-    source = VideoFrameSource([vane.VideoFile("memory://video")], height=2, width=3, max_pixels=100)
+    value = vane.VideoFile(
+        "memory://it's/a-video",
+        "video/x-'quoted'\x00tail",
+        7,
+        13,
+        "sha256:" + "1" * 64,
+    )
+    source = VideoFrameSource([value], height=2, width=3, max_pixels=100)
     task = next(source.get_tasks())
 
     restored = pickle.loads(pickle.dumps(task))
 
     assert isinstance(restored, VideoFrameTask)
-    assert restored.video_file == vane.VideoFile("memory://video")
+    assert restored.video_file == value
     assert restored.options == source.options
 
 
@@ -382,7 +325,7 @@ def test_split_video_file_groups_is_balanced_and_ordered():
     ]
 
 
-def test_decode_video_batches_honors_range_selection_resize_and_provenance(tmp_path):
+def test_decode_video_batches_honors_range_selection_resize_and_provenance(tmp_path, duckdb_cursor):
     value = _ranged_video(tmp_path, frame_count=8)
     source = VideoFrameSource(
         [value],
@@ -396,7 +339,14 @@ def test_decode_video_batches_honors_range_selection_resize_and_provenance(tmp_p
         max_pixels=1000,
     )
 
-    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=None))
+    batches = list(
+        _decode_video_batches(
+            value,
+            options=source.options,
+            max_output_frames=None,
+            connection=duckdb_cursor,
+        )
+    )
     table = pa.Table.from_batches(batches)
 
     assert [batch.num_rows for batch in batches] == [2, 1]
@@ -425,17 +375,18 @@ def test_decode_video_batches_honors_range_selection_resize_and_provenance(tmp_p
     assert frames.shape == (3, 6, 8, 3)
 
 
-def test_decode_video_batches_closes_images_and_decoder_at_output_limit():
+def test_decode_video_batches_closes_images_and_decoder_at_output_limit(duckdb_cursor):
     records = [_fake_record(index) for index in range(5)]
     value = _FakeVideoFile(records)
     source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
 
-    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=2))
+    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=2, connection=duckdb_cursor))
 
     assert sum(batch.num_rows for batch in batches) == 2
     assert all(record.data.closed for record in records[:2])
     assert all(not record.data.closed for record in records[2:])
     assert value.closed
+    assert value.connection is duckdb_cursor
     assert value.frames_kwargs == {
         "start_time": 0,
         "end_time": None,
@@ -450,7 +401,7 @@ def test_decode_video_batches_closes_images_and_decoder_at_output_limit():
     }
 
 
-def test_decode_video_batches_closes_decoder_when_limit_ends_on_full_batch():
+def test_decode_video_batches_closes_decoder_when_limit_ends_on_full_batch(duckdb_cursor):
     records = [_fake_record(index) for index in range(2)]
     value = _FakeVideoFile(records)
     source = VideoFrameSource(
@@ -461,7 +412,7 @@ def test_decode_video_batches_closes_decoder_when_limit_ends_on_full_batch():
         max_pixels=100,
     )
 
-    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=1))
+    batches = list(_decode_video_batches(value, options=source.options, max_output_frames=1, connection=duckdb_cursor))
 
     assert [batch.num_rows for batch in batches] == [1]
     assert records[0].data.closed
@@ -469,7 +420,7 @@ def test_decode_video_batches_closes_decoder_when_limit_ends_on_full_batch():
     assert value.closed
 
 
-def test_decode_video_batches_does_not_mutate_emitted_arrow_buffers():
+def test_decode_video_batches_does_not_mutate_emitted_arrow_buffers(duckdb_cursor):
     records = [_fake_record(index) for index in range(4)]
     value = _FakeVideoFile(records)
     source = VideoFrameSource(
@@ -479,7 +430,12 @@ def test_decode_video_batches_does_not_mutate_emitted_arrow_buffers():
         max_partition_bytes=200,
         max_pixels=100,
     )
-    batches = _decode_video_batches(value, options=source.options, max_output_frames=None)
+    batches = _decode_video_batches(
+        value,
+        options=source.options,
+        max_output_frames=None,
+        connection=duckdb_cursor,
+    )
 
     first = next(batches)
     snapshot = first.column("frame").to_numpy_ndarray().copy()
@@ -487,6 +443,26 @@ def test_decode_video_batches_does_not_mutate_emitted_arrow_buffers():
 
     np.testing.assert_array_equal(first.column("frame").to_numpy_ndarray(), snapshot)
     assert sum(batch.num_rows for batch in remaining) + first.num_rows == 4
+
+
+def test_decode_video_batches_requires_exactly_one_explicit_io_context(duckdb_cursor):
+    value = _FakeVideoFile([_fake_record(0)])
+    source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
+
+    with pytest.raises(ValueError, match="exactly one explicit connection"):
+        list(_decode_video_batches(value, options=source.options, max_output_frames=None))
+    with pytest.raises(ValueError, match="exactly one explicit connection"):
+        list(
+            _decode_video_batches(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+                execution_context=object(),
+            )
+        )
+
+    assert value.frames_kwargs is None
 
 
 def test_flush_frame_batch_compacts_short_tail():
@@ -511,12 +487,19 @@ def test_flush_frame_batch_compacts_short_tail():
     assert tensor.storage.values.buffers()[1].size == 2 * 3 * 3
 
 
-def test_video_error_policy_wraps_or_skips_only_format_errors(caplog):
+def test_video_error_policy_wraps_or_skips_only_format_errors(caplog, duckdb_cursor):
     source_raise = VideoFrameSource(["memory://fake"], height=2, width=3, max_pixels=100)
     bad_raise = _FakeVideoFile(error=vane.VideoFileFormatError("bad codec"))
 
     with pytest.raises(VideoReadError, match="bad codec") as raised:
-        list(_decode_video_with_policy(bad_raise, options=source_raise.options, max_output_frames=None))
+        list(
+            _decode_video_with_policy(
+                bad_raise,
+                options=source_raise.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )
     assert isinstance(raised.value.__cause__, vane.VideoFileFormatError)
 
     source_skip = VideoFrameSource(
@@ -528,7 +511,17 @@ def test_video_error_policy_wraps_or_skips_only_format_errors(caplog):
     )
     bad_skip = _FakeVideoFile(error=vane.VideoFileFormatError("bad codec"))
     with caplog.at_level("WARNING"):
-        assert list(_decode_video_with_policy(bad_skip, options=source_skip.options, max_output_frames=None)) == []
+        assert (
+            list(
+                _decode_video_with_policy(
+                    bad_skip,
+                    options=source_skip.options,
+                    max_output_frames=None,
+                    connection=duckdb_cursor,
+                )
+            )
+            == []
+        )
     assert "Skipping unreadable VIDEOFILE" in caplog.text
 
 
@@ -541,7 +534,7 @@ def test_video_error_policy_wraps_or_skips_only_format_errors(caplog):
         RuntimeError("internal invariant"),
     ],
 )
-def test_video_skip_policy_propagates_system_resource_and_internal_errors(error):
+def test_video_skip_policy_propagates_system_resource_and_internal_errors(error, duckdb_cursor):
     source = VideoFrameSource(
         ["memory://fake"],
         height=2,
@@ -552,10 +545,17 @@ def test_video_skip_policy_propagates_system_resource_and_internal_errors(error)
     value = _FakeVideoFile(error=error)
 
     with pytest.raises(type(error), match=str(error)):
-        list(_decode_video_with_policy(value, options=source.options, max_output_frames=None))
+        list(
+            _decode_video_with_policy(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )
 
 
-def test_consumer_error_is_not_reclassified_as_bad_media():
+def test_consumer_error_is_not_reclassified_as_bad_media(duckdb_cursor):
     record = _fake_record(0)
     value = _FakeVideoFile([record])
     source = VideoFrameSource(
@@ -565,7 +565,12 @@ def test_consumer_error_is_not_reclassified_as_bad_media():
         max_pixels=100,
         on_error="skip",
     )
-    batches = _decode_video_with_policy(value, options=source.options, max_output_frames=None)
+    batches = _decode_video_with_policy(
+        value,
+        options=source.options,
+        max_output_frames=None,
+        connection=duckdb_cursor,
+    )
     next(batches)
     consumer_error = vane.VideoFileFormatError("downstream failure")
 
@@ -575,10 +580,7 @@ def test_consumer_error_is_not_reclassified_as_bad_media():
     assert value.closed
 
 
-def test_video_frame_source_map_batches_honors_global_limit_across_file_groups(
-    monkeypatch,
-    duckdb_cursor,
-):
+def test_limited_video_task_propagates_context_and_global_limit(monkeypatch):
     source = VideoFrameSource(
         ["memory://a", "memory://b"],
         height=2,
@@ -587,11 +589,13 @@ def test_video_frame_source_map_batches_honors_global_limit_across_file_groups(
         frame_limit=3,
         max_pixels=100,
     )
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
+    task = next(source.get_tasks())
+    execution_context = object()
     decoded = []
 
-    def fake_decode(value, *, options, max_output_frames):
-        decoded.append((value.url, max_output_frames))
+    def fake_decode(value, *, options, max_output_frames, connection=None, execution_context=None):
+        del options, connection
+        decoded.append((value.url, max_output_frames, execution_context))
         indices = [0, 1]
         if max_output_frames is not None:
             indices = indices[:max_output_frames]
@@ -599,14 +603,16 @@ def test_video_frame_source_map_batches_honors_global_limit_across_file_groups(
 
     monkeypatch.setattr(video_reader, "_decode_video_guarded", fake_decode)
 
-    tables = list(_video_frame_source_map_batches(manifest))
+    batches = list(task._execute_with_context(execution_context))
 
-    assert decoded == [("memory://a", 3), ("memory://b", 1)]
-    assert sum(table.num_rows for table in tables) == 3
-    assert pa.concat_tables(tables).column("file").to_pylist()[2]["url"] == "memory://b"
+    assert decoded == [
+        ("memory://a", 3, execution_context),
+        ("memory://b", 1, execution_context),
+    ]
+    assert sum(batch.num_rows for batch in batches) == 3
 
 
-def test_video_frame_source_map_batches_coalesces_file_tails(monkeypatch, duckdb_cursor):
+def test_grouped_video_task_propagates_one_context_to_every_file(monkeypatch):
     source = VideoFrameSource(
         ["memory://a", "memory://b"],
         height=2,
@@ -615,31 +621,21 @@ def test_video_frame_source_map_batches_coalesces_file_tails(monkeypatch, duckdb
         read_task_count=1,
         max_pixels=100,
     )
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
+    task = next(source.get_tasks())
+    execution_context = object()
+    decoded = []
 
-    def fake_decode(value, *, options, max_output_frames):
-        del options, max_output_frames
+    def fake_decode(value, *, options, max_output_frames, connection=None, execution_context=None):
+        del options, max_output_frames, connection
+        decoded.append((value.url, execution_context))
         yield _fake_batch(value, [0])
 
     monkeypatch.setattr(video_reader, "_decode_video_guarded", fake_decode)
 
-    tables = list(_video_frame_source_map_batches(manifest))
+    batches = list(task._execute_with_context(execution_context))
 
-    assert [table.num_rows for table in tables] == [2]
-    assert [value["url"] for value in tables[0].column("file").to_pylist()] == [
-        "memory://a",
-        "memory://b",
-    ]
-
-
-def test_coalesce_video_frame_batches_obeys_target_rows():
-    value = vane.VideoFile("memory://video")
-    batches = iter([_fake_batch(value, [0]), _fake_batch(value, [1, 2, 3])])
-
-    tables = list(_coalesce_video_frame_batches(batches, target_rows=3))
-
-    assert [table.num_rows for table in tables] == [3, 1]
-    assert pa.concat_tables(tables).column("frame_index").to_pylist() == [0, 1, 2, 3]
+    assert decoded == [("memory://a", execution_context), ("memory://b", execution_context)]
+    assert [batch.num_rows for batch in batches] == [1, 1]
 
 
 def test_output_batch_size_accounts_for_file_and_provenance_columns():
@@ -651,7 +647,7 @@ def test_output_batch_size_accounts_for_file_and_provenance_columns():
     bounds = _file_storage_bounds((value,))
     partition_bytes = 10_000
 
-    actual = _video_source_udf_output_batch_size(
+    actual = _video_output_batch_size(
         10,
         10,
         partition_bytes,
@@ -667,7 +663,7 @@ def test_output_batch_size_respects_arrow_string_offset_limit(monkeypatch):
     monkeypatch.setattr(video_reader, "_ARROW_STRING_DATA_MAX_BYTES", 100)
 
     assert (
-        _video_source_udf_output_batch_size(
+        _video_output_batch_size(
             1,
             1,
             10_000,
@@ -678,83 +674,18 @@ def test_output_batch_size_respects_arrow_string_offset_limit(monkeypatch):
     )
 
 
-def test_source_peak_memory_accounts_for_decoder_reader_current_frame_and_output_buffers():
-    peak = _video_source_peak_memory_bytes(
-        height=2,
-        width=3,
-        max_partition_bytes=1,
-        max_pixels=100,
-        buffer_size=64,
-        max_file_string_bytes=10,
-        max_file_row_bytes=50,
-        output_batch_size=2,
-    )
-    output_bytes = video_reader._video_output_batch_bytes(
-        2,
-        height=2,
-        width=3,
-        max_file_string_bytes=10,
-        max_file_row_bytes=50,
-    )
-
-    assert peak == 128 * 1024**2 + 64 + 100 * 3 + 2 * output_bytes
-
-
-def test_video_source_udf_resources_use_pyav_single_cpu_and_bounded_memory(monkeypatch):
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.delenv("VANE_VIDEO_SOURCE_UDF_CPUS", raising=False)
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", "1")
-
-    kwargs = _video_source_udf_kwargs(height=2, width=3, max_pixels=100)
-
-    assert kwargs["execution_backend"] == "ray_task"
-    assert kwargs["cpus"] == 1.0
-    assert kwargs["memory_bytes"] == _video_source_peak_memory_bytes(
-        height=2,
-        width=3,
-        max_partition_bytes=10 * 1024 * 1024,
-        max_pixels=100,
-        output_batch_size=kwargs["output_batch_size"],
-    )
-    assert kwargs["preserve_compute_batch_boundaries"] is True
-
-
-def test_video_source_udf_resource_overrides_are_validated(monkeypatch):
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "2.5")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_MEMORY_BYTES", str(700 * 1024**2))
-
-    kwargs = _video_source_udf_kwargs(height=2, width=3, max_pixels=100)
-
-    assert kwargs["cpus"] == 2.5
-    assert kwargs["memory_bytes"] == 700 * 1024**2
-
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_CPUS", "0")
-    with pytest.raises(ValueError, match="finite positive"):
-        _video_source_udf_kwargs()
-
-
-def test_video_frame_source_builds_hidden_typed_udf_plan(monkeypatch, duckdb_cursor):
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
+def test_video_frame_source_builds_typed_datasource_scan_plan(duckdb_cursor):
     source = VideoFrameSource([vane.VideoFile("memory://video")], height=8, width=9)
 
     relation = read_datasource(source, con=duckdb_cursor)
     plan = relation.explain()
-    compact_plan = "".join(character for character in plan if character.isalnum() or character == "_")
 
-    assert "STREAMING_UDF" in plan
-    assert "_video_frame_source_map_batches" in compact_plan
+    assert "DATASOURCE_SCAN" in plan
+    assert "STREAMING_UDF" not in plan
     assert str(relation.types[0]) == "VIDEOFILE"
-    assert "ray_task" in plan
 
 
-def test_video_frame_source_subprocess_execution_preserves_range_alias_and_provenance(
-    monkeypatch,
-    duckdb_cursor,
-    tmp_path,
-):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "subprocess_task")
+def test_video_frame_source_execution_preserves_range_alias_and_provenance(duckdb_cursor, tmp_path):
     value = _ranged_video(tmp_path, frame_count=8)
     source = VideoFrameSource(
         [value],
@@ -793,13 +724,41 @@ def test_video_frame_source_subprocess_execution_preserves_range_alias_and_prove
     assert all(isinstance(row[9], tuple) and len(row[9]) == 6 * 8 * 3 for row in rows)
 
 
-def test_video_frame_source_subprocess_global_frame_limit_is_ordered(
-    monkeypatch,
-    duckdb_cursor,
-    tmp_path,
-):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "subprocess_task")
+def test_video_frame_source_uses_query_connection_context_without_default_fallback(duckdb_cursor, tmp_path):
+    scoped_home = tmp_path / "query-home"
+    default_home = tmp_path / "default-home"
+    scoped_home.mkdir()
+    default_home.mkdir()
+    relative_name = "connection-scoped.mp4"
+    (scoped_home / relative_name).write_bytes(_encoded_video(frame_count=1))
+    duckdb_cursor.execute("SET home_directory = ?", [str(scoped_home)])
+
+    previous_default = vane.default_connection()
+    wrong_default = vane.connect()
+    wrong_default.execute("SET home_directory = ?", [str(default_home)])
+    vane.set_default_connection(wrong_default)
+    try:
+        rows = (
+            read_datasource(
+                VideoFrameSource(
+                    [vane.VideoFile(f"~/{relative_name}", "video/mp4")],
+                    height=6,
+                    width=8,
+                    max_pixels=1000,
+                ),
+                con=duckdb_cursor,
+            )
+            .select("frame_index")
+            .fetchall()
+        )
+    finally:
+        vane.set_default_connection(previous_default)
+        wrong_default.close()
+
+    assert rows == [(0,)]
+
+
+def test_video_frame_source_global_frame_limit_is_ordered(duckdb_cursor, tmp_path):
     first_path = tmp_path / "first.mp4"
     second_path = tmp_path / "second.mp4"
     first_path.write_bytes(_encoded_video(frame_count=2))
@@ -819,10 +778,7 @@ def test_video_frame_source_subprocess_global_frame_limit_is_ordered(
     assert rows == [(first, 0), (first, 1), (second, 0)]
 
 
-def test_empty_video_frame_source_preserves_output_schema(monkeypatch, duckdb_cursor):
-    monkeypatch.setenv("VANE_RUNNER", "local")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "subprocess_task")
-
+def test_empty_video_frame_source_preserves_output_schema(duckdb_cursor):
     relation = read_datasource(VideoFrameSource([]), con=duckdb_cursor)
 
     assert [str(dtype) for dtype in relation.types] == [
@@ -842,7 +798,6 @@ def test_empty_video_frame_source_preserves_output_schema(monkeypatch, duckdb_cu
 
 def test_video_frame_source_executes_ranged_videofile_on_real_ray(ray_local, monkeypatch, tmp_path):
     monkeypatch.setenv("VANE_RUNNER", "ray")
-    monkeypatch.setenv("VANE_VIDEO_SOURCE_UDF_BACKEND", "ray_task")
     vane.teardown_runner()
     vane.set_runner_ray(noop_if_initialized=True)
     value = _ranged_video(tmp_path, frame_count=4)
@@ -886,23 +841,9 @@ def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_f
         max_pixels=1000,
         on_error="skip",
     )
-    manifest = duckdb_cursor.sql(_video_frame_source_manifest_sql(source)).to_arrow_table()
+    rows = read_datasource(source, con=duckdb_cursor).select("file").fetchall()
 
-    tables = list(_video_frame_source_map_batches(manifest))
-
-    assert (
-        pa.concat_tables(tables).column("file").to_pylist()
-        == [
-            {
-                "url": valid.url,
-                "content_type": valid.content_type,
-                "position": None,
-                "size": None,
-                "checksum": None,
-            }
-        ]
-        * 2
-    )
+    assert rows == [(valid,), (valid,)]
 
     missing = vane.VideoFile(str(tmp_path / "missing.mp4"), "video/mp4")
     missing_source = VideoFrameSource(
@@ -913,10 +854,17 @@ def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_f
         on_error="skip",
     )
     with pytest.raises(vane.IOException):
-        list(_decode_video_with_policy(missing, options=missing_source.options, max_output_frames=None))
+        list(
+            _decode_video_with_policy(
+                missing,
+                options=missing_source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )
 
 
-def test_video_frame_source_max_input_limit_propagates_in_skip_mode(tmp_path):
+def test_video_frame_source_max_input_limit_propagates_in_skip_mode(tmp_path, duckdb_cursor):
     path = tmp_path / "video.mp4"
     path.write_bytes(_encoded_video())
     value = vane.VideoFile(str(path), "video/mp4")
@@ -930,4 +878,11 @@ def test_video_frame_source_max_input_limit_propagates_in_skip_mode(tmp_path):
     )
 
     with pytest.raises(vane.VideoFileLimitError, match="max_input_bytes=1"):
-        list(_decode_video_with_policy(value, options=source.options, max_output_frames=None))
+        list(
+            _decode_video_with_policy(
+                value,
+                options=source.options,
+                max_output_frames=None,
+                connection=duckdb_cursor,
+            )
+        )

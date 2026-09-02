@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any
 
 import vane
 from vane._expressions import as_expression
-from vane._file import _positive_buffer_size
+from vane._file import _file_open_in_datasource_context, _positive_buffer_size
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage  # type: ignore[import-not-found]
+
+    from vane._native import _DataSourceExecutionContext
 else:
     PILImage = Any
 
@@ -1647,8 +1649,18 @@ def _iter_video_frames(
     av_module: Any,
     image_module: Any,
     connection: vane.DuckDBPyConnection | None,
+    execution_context: _DataSourceExecutionContext | None = None,
 ) -> Generator[VideoFrameData, None, None]:
-    file_reader = value.open(buffer_size=options.buffer_size, connection=connection)
+    if execution_context is not None:
+        if connection is not None:
+            raise ValueError("video decoding accepts either connection or execution context, not both")
+        file_reader = _file_open_in_datasource_context(
+            value,
+            options.buffer_size,
+            execution_context=execution_context,
+        )
+    else:
+        file_reader = value.open(buffer_size=options.buffer_size, connection=connection)
     with _close_video_reader(file_reader):
         input_size = file_reader.size()
         file_reader._check_interrupted()
@@ -1810,6 +1822,7 @@ def _video_file_frames_value(
     max_frames: int = DEFAULT_VIDEO_MAX_FRAMES,
     max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     connection: vane.DuckDBPyConnection | None = None,
+    _execution_context: _DataSourceExecutionContext | None = None,
 ) -> Generator[VideoFrameData, None, None]:
     options = _normalize_frame_options(
         start_time=start_time,
@@ -1825,7 +1838,7 @@ def _video_file_frames_value(
     )
     av_module = _load_av()
     image_module = _load_pillow()
-    return _iter_video_frames(value, options, av_module, image_module, connection)
+    return _iter_video_frames(value, options, av_module, image_module, connection, _execution_context)
 
 
 def _video_file_frame_by_idx_value(
