@@ -256,6 +256,217 @@ def test_video_frame_data_is_frozen_and_slotted():
         image.close()
 
 
+def test_video_get_frame_by_idx_matches_sequential_b_frame_decode(duckdb_cursor, tmp_path):
+    path = tmp_path / "indexed-b-frames.mp4"
+    path.write_bytes(_encoded_video(frame_count=12, frame_rate=4, gop_size=6, max_b_frames=2))
+    value = vane.VideoFile(str(path), "video/mp4")
+    frames = list(value.frames(connection=duckdb_cursor))
+    selected_images = []
+    try:
+        for idx in (0, 5, 11):
+            image = value.get_frame_by_idx(idx, connection=duckdb_cursor)
+            selected_images.append(image)
+            assert image.mode == "RGB"
+            np.testing.assert_array_equal(np.asarray(image), np.asarray(frames[idx].data))
+    finally:
+        for image in selected_images:
+            image.close()
+        for frame in frames:
+            frame.data.close()
+
+
+def test_video_get_frame_by_idx_honors_logical_range_vfr_and_timestamp_discontinuity(duckdb_cursor, tmp_path):
+    first_segment = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        muxer_options={"mpegts_flags": "resend_headers+initial_discontinuity"},
+        frame_count=8,
+        frame_rate=8,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    second_segment = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        muxer_options={"mpegts_flags": "resend_headers+initial_discontinuity"},
+        frame_count=8,
+        frame_rate=4,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    payload = first_segment + second_segment
+    prefix = b"not-a-video-prefix"
+    suffix = b"not-a-video-suffix"
+    path = tmp_path / "ranged-timestamp-discontinuity.bin"
+    path.write_bytes(prefix + payload + suffix)
+    value = vane.VideoFile(str(path), "video/mp2t", len(prefix), len(payload))
+    frames = list(value.frames(connection=duckdb_cursor))
+    image = None
+    try:
+        image = value.get_frame_by_idx(9, buffer_size=64, connection=duckdb_cursor)
+        assert len(frames) == 16
+        assert all(frames[index].frame_time is not None for index in (1, 2, 7, 8, 9))
+        assert frames[2].frame_time - frames[1].frame_time == pytest.approx(0.125)
+        assert frames[9].frame_time - frames[8].frame_time == pytest.approx(0.25)
+        assert frames[8].frame_time < frames[7].frame_time
+        np.testing.assert_array_equal(np.asarray(image), np.asarray(frames[9].data))
+    finally:
+        if image is not None:
+            image.close()
+        for frame in frames:
+            frame.data.close()
+
+
+def test_video_get_frame_by_idx_converts_only_the_target_frame(duckdb_cursor, tmp_path, monkeypatch):
+    path = tmp_path / "single-conversion.mp4"
+    path.write_bytes(_encoded_video(frame_count=8, frame_rate=4, gop_size=3, max_b_frames=2))
+    converted_indices = []
+    convert_frame = _video_file._frame_to_image
+
+    def record_conversion(frame, info, *args, **kwargs):
+        converted_indices.append(info.frame_index)
+        return convert_frame(frame, info, *args, **kwargs)
+
+    monkeypatch.setattr(_video_file, "_frame_to_image", record_conversion)
+    image = vane.VideoFile(str(path), "video/mp4").get_frame_by_idx(5, connection=duckdb_cursor)
+    try:
+        assert converted_indices == [5]
+        assert image.mode == "RGB"
+        assert image.size == (16, 12)
+    finally:
+        image.close()
+
+
+def test_video_get_frame_by_idx_reports_out_of_range(duckdb_cursor, tmp_path):
+    path = tmp_path / "four-frames.mp4"
+    path.write_bytes(_encoded_video(frame_count=4))
+
+    with pytest.raises(IndexError, match="video frame index 4 is out of range"):
+        vane.VideoFile(str(path), "video/mp4").get_frame_by_idx(4, connection=duckdb_cursor)
+
+
+@pytest.mark.parametrize(
+    ("idx", "error_type", "message"),
+    [
+        (True, TypeError, "idx must be int"),
+        (1.0, TypeError, "idx must be int"),
+        (-1, ValueError, "idx must be non-negative"),
+        (1 << 63, ValueError, "idx must be at most"),
+    ],
+)
+def test_video_get_frame_by_idx_validates_index_without_opening_file(idx, error_type, message):
+    with pytest.raises(error_type, match=message):
+        vane.VideoFile("memory://not-opened").get_frame_by_idx(idx)
+
+
+def test_video_get_frame_by_idx_enforces_decode_budget_without_opening_file():
+    with pytest.raises(vane.VideoFileLimitError, match="exceeding max_frames=5"):
+        vane.VideoFile("memory://not-opened").get_frame_by_idx(5, max_frames=5)
+
+
+@pytest.mark.parametrize("teardown", ["success", "container_error", "interrupt"])
+def test_video_get_frame_by_idx_finishes_teardown_before_transferring_image(monkeypatch, teardown):
+    teardown_error = RuntimeError(f"{teardown} during video teardown")
+    image_close_calls = 0
+    container_close_calls = 0
+
+    class TrackingImage:
+        def close(self):
+            nonlocal image_close_calls
+            image_close_calls += 1
+
+    image = TrackingImage()
+
+    class Reader:
+        interrupted = False
+        close_calls = 0
+        checked_close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+        def _close_and_check_interrupted(self):
+            self.checked_close_calls += 1
+            self._check_interrupted()
+
+        def size(self):
+            return 1
+
+        def _check_interrupted(self):
+            if self.interrupted:
+                raise teardown_error
+
+    reader = Reader()
+
+    class Value:
+        content_type = None
+
+        def open(self, **kwargs):
+            del kwargs
+            return reader
+
+    class Container:
+        def close(self):
+            nonlocal container_close_calls
+            container_close_calls += 1
+            if teardown == "container_error":
+                raise teardown_error
+            if teardown == "interrupt":
+                reader.interrupted = True
+
+    class FakeFFmpegError(Exception):
+        pass
+
+    class FakeExitError(FakeFFmpegError):
+        pass
+
+    fake_av = SimpleNamespace(
+        open=lambda *args, **kwargs: Container(),
+        error=SimpleNamespace(ExitError=FakeExitError, FFmpegError=FakeFFmpegError),
+        video=SimpleNamespace(reformatter=SimpleNamespace(VideoReformatter=object)),
+    )
+    prepared_batch = _video_file._PreparedFrameBatch(
+        results=[vane.VideoFrameData(0, 0.0, Fraction(1), 0, 0, 1, True, image)],
+        next_sample_time=None,
+        last_frame_time=None,
+    )
+
+    monkeypatch.setattr(_video_file, "_load_av", lambda: fake_av)
+    monkeypatch.setattr(_video_file, "_load_pillow", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        _video_file,
+        "_metadata_from_container",
+        lambda *args, **kwargs: SimpleNamespace(time_base=Fraction(1)),
+    )
+    monkeypatch.setattr(_video_file, "_select_video_stream", lambda *args: object())
+    monkeypatch.setattr(_video_file, "_stream_time_origin", lambda *args: Fraction(0))
+    monkeypatch.setattr(_video_file, "_configure_video_decoder", lambda *args: None)
+    monkeypatch.setattr(
+        _video_file,
+        "_iter_decoded_packet_batches",
+        lambda *args, **kwargs: (batch for batch in (object(),)),
+    )
+    monkeypatch.setattr(_video_file, "_prepare_video_packet_batch", lambda *args, **kwargs: prepared_batch)
+
+    if teardown == "success":
+        selected = _video_file._video_file_frame_by_idx_value(Value(), 0)
+        assert selected is image
+        assert image_close_calls == 0
+        assert reader.checked_close_calls == 1
+        assert reader.close_calls == 0
+        selected.close()
+        assert image_close_calls == 1
+    else:
+        with pytest.raises(RuntimeError, match=f"{teardown} during video teardown") as raised:
+            _video_file._video_file_frame_by_idx_value(Value(), 0)
+        assert raised.value is teardown_error
+        assert image_close_calls == 1
+        assert reader.checked_close_calls == 0
+        assert reader.close_calls == 1
+
+    assert container_close_calls == 1
+
+
 def test_video_frames_honor_logical_range_and_resize(duckdb_cursor, tmp_path):
     payload = _encoded_video(width=18, height=10, frame_count=5, frame_rate=5)
     prefix = b"not-a-video-prefix"
@@ -1844,6 +2055,66 @@ def test_video_packet_conversion_is_atomic(monkeypatch):
     assert first_image_ref is not None
     assert first_image_ref() is None
     assert raised.value is not None
+
+
+def test_video_index_selection_keeps_preroll_frame_before_stream_origin(monkeypatch):
+    options = _video_file._VideoFrameOptions(
+        start_time=Fraction(0),
+        end_time=None,
+        width=None,
+        height=None,
+        is_key_frame=None,
+        sample_interval_seconds=None,
+        buffer_size=1024,
+        max_input_bytes=1024,
+        max_frames=1,
+        max_pixels=100,
+        target_frame_index=0,
+    )
+    frame = _FakeDecodedVideoFrame(pts=5)
+    video = _fake_decoder_video()
+    info = _video_file._decoded_frame_info(
+        frame,
+        video,
+        options,
+        frame_index=0,
+        stream_time_origin=Fraction(1),
+    )
+    batch = _video_file._DecodedPacketBatch(frames=[frame], infos=(info,))
+    converted_images = []
+
+    def convert_frame(*args, **kwargs):
+        del args, kwargs
+        image = Image.new("RGB", (10, 10))
+        converted_images.append(image)
+        return image
+
+    monkeypatch.setattr(_video_file, "_frame_to_image", convert_frame)
+    no_error = SimpleNamespace(
+        check_interrupted=lambda: None,
+        raise_if_error=lambda: None,
+    )
+    prepared = _video_file._prepare_video_packet_batch(
+        batch,
+        options,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        object(),
+        no_error,
+        no_error,
+        next_sample_time=None,
+        last_frame_time=None,
+    )
+
+    try:
+        result = prepared.take_result(0)
+        assert result.frame_index == 0
+        assert result.frame_time == pytest.approx(-0.5)
+        assert result.data is converted_images[0]
+    finally:
+        prepared.release()
+        for image in converted_images:
+            image.close()
 
 
 def test_video_packet_decode_traceback_releases_container_and_codec_owners():

@@ -192,6 +192,7 @@ class _VideoFrameOptions:
     max_input_bytes: int
     max_frames: int
     max_pixels: int
+    target_frame_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,6 +612,16 @@ def _positive_limit(value: object, *, name: str, maximum: int | None = None) -> 
     return value
 
 
+def _nonnegative_frame_index(value: object, *, name: str = "idx") -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be int, not {type(value).__name__!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    if value > _MAX_BIGINT:
+        raise ValueError(f"{name} must be at most {_MAX_BIGINT}")
+    return value
+
+
 def _nonnegative_time(value: object, *, name: str, optional: bool = False) -> Fraction | None:
     if value is None:
         if optional:
@@ -663,6 +674,7 @@ def _normalize_frame_options(
     max_input_bytes: object,
     max_frames: object,
     max_pixels: object,
+    target_frame_index: object | None = None,
 ) -> _VideoFrameOptions:
     normalized_start = _nonnegative_time(start_time, name="start_time")
     assert normalized_start is not None
@@ -702,6 +714,7 @@ def _normalize_frame_options(
         max_input_bytes=normalized_max_input,
         max_frames=normalized_max_frames,
         max_pixels=normalized_max_pixels,
+        target_frame_index=(None if target_frame_index is None else _nonnegative_frame_index(target_frame_index)),
     )
 
 
@@ -1507,34 +1520,40 @@ def _prepare_video_packet_batch(
             _check_video_io(reader, nested_io)
             frame = batch.take_frame(index)
             try:
-                if info.exact_time is not None:
-                    if last_frame_time is not None and info.exact_time < last_frame_time:
-                        # MPEG-TS and other streaming containers can reset their
-                        # presentation timeline at a discontinuity. Sampling
-                        # targets belong to each monotonic segment rather than a
-                        # previous segment's now-unreachable timestamp range.
-                        next_sample_time = options.start_time if options.sample_interval_seconds is not None else None
-                    last_frame_time = info.exact_time
-                    if info.exact_time < options.start_time:
+                if options.target_frame_index is not None:
+                    if info.frame_index != options.target_frame_index:
                         continue
-                    if options.end_time is not None and info.exact_time > options.end_time:
-                        # Do not stop globally: a later discontinuity can move
-                        # presentation timestamps back into the requested window.
+                else:
+                    if info.exact_time is not None:
+                        if last_frame_time is not None and info.exact_time < last_frame_time:
+                            # MPEG-TS and other streaming containers can reset their
+                            # presentation timeline at a discontinuity. Sampling
+                            # targets belong to each monotonic segment rather than a
+                            # previous segment's now-unreachable timestamp range.
+                            next_sample_time = (
+                                options.start_time if options.sample_interval_seconds is not None else None
+                            )
+                        last_frame_time = info.exact_time
+                        if info.exact_time < options.start_time:
+                            continue
+                        if options.end_time is not None and info.exact_time > options.end_time:
+                            # Do not stop globally: a later discontinuity can move
+                            # presentation timestamps back into the requested window.
+                            continue
+
+                    if options.is_key_frame is not None and info.is_key_frame is not options.is_key_frame:
                         continue
 
-                if options.is_key_frame is not None and info.is_key_frame is not options.is_key_frame:
-                    continue
-
-                if options.sample_interval_seconds is not None:
-                    assert info.exact_time is not None
-                    assert next_sample_time is not None
-                    if info.exact_time < next_sample_time:
-                        continue
-                    next_sample_time = _advance_sample_target(
-                        next_sample_time,
-                        options.sample_interval_seconds,
-                        info.exact_time,
-                    )
+                    if options.sample_interval_seconds is not None:
+                        assert info.exact_time is not None
+                        assert next_sample_time is not None
+                        if info.exact_time < next_sample_time:
+                            continue
+                        next_sample_time = _advance_sample_target(
+                            next_sample_time,
+                            options.sample_interval_seconds,
+                            info.exact_time,
+                        )
 
                 image = _frame_to_image(
                     frame,
@@ -1665,6 +1684,7 @@ def _iter_video_frames(
         decoded_batches: Generator[_DecodedPacketBatch, None, None] | None = None
         prepared_batch: _PreparedFrameBatch | None = None
         error_from_consumer = False
+        target_delivered = False
         try:
             _check_video_io(reader, nested_io)
             container = av_module.open(
@@ -1741,9 +1761,14 @@ def _iter_video_frames(
                                     # only later undelivered batch entries are closed.
                                     del result
                                 _check_video_io(reader, nested_io)
+                                if options.target_frame_index is not None:
+                                    target_delivered = True
+                                    break
                         finally:
                             prepared_batch.release()
                             prepared_batch = None
+                        if target_delivered:
+                            break
                 finally:
                     decoded_batches.close()
                 _check_video_io(reader, nested_io)
@@ -1801,6 +1826,87 @@ def _video_file_frames_value(
     av_module = _load_av()
     image_module = _load_pillow()
     return _iter_video_frames(value, options, av_module, image_module, connection)
+
+
+def _video_file_frame_by_idx_value(
+    value: vane.VideoFile,
+    idx: int,
+    buffer_size: int = DEFAULT_VIDEO_BUFFER_SIZE,
+    *,
+    max_input_bytes: int = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+    max_frames: int = DEFAULT_VIDEO_MAX_FRAMES,
+    max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
+    connection: vane.DuckDBPyConnection | None = None,
+) -> PILImage:
+    target_index = _nonnegative_frame_index(idx)
+    options = _normalize_frame_options(
+        start_time=0,
+        end_time=None,
+        width=None,
+        height=None,
+        is_key_frame=None,
+        sample_interval_seconds=None,
+        buffer_size=buffer_size,
+        max_input_bytes=max_input_bytes,
+        max_frames=max_frames,
+        max_pixels=max_pixels,
+        target_frame_index=target_index,
+    )
+    if target_index >= options.max_frames:
+        raise VideoFileLimitError(
+            f"video frame index {target_index} requires decoding at least {target_index + 1} frames, "
+            f"exceeding max_frames={options.max_frames}"
+        )
+
+    av_module = _load_av()
+    image_module = _load_pillow()
+    frames = _iter_video_frames(value, options, av_module, image_module, connection)
+    frame: VideoFrameData | None = None
+    image: PILImage | None = None
+    try:
+        try:
+            frame = next(frames)
+        except StopIteration:
+            raise IndexError(f"video frame index {target_index} is out of range") from None
+        if frame.frame_index != target_index:
+            raise RuntimeError(
+                f"video decoder returned frame index {frame.frame_index!r} while selecting {target_index}"
+            )
+        image = frame.data
+        frame = None
+    except BaseException:
+        if frame is not None:
+            _close_image(frame.data)
+            frame = None
+        try:
+            frames.close()
+        except BaseException:
+            pass
+        raise
+    assert image is not None
+    try:
+        unexpected_frame = next(frames)
+    except StopIteration:
+        # Advancing the dedicated single-frame generator to normal exhaustion
+        # runs container and reader teardown on their success paths. In
+        # particular, close-time connector failures and cancellation remain
+        # observable instead of being suppressed as effects of GeneratorExit.
+        return image
+    except BaseException:
+        _close_image(image)
+        try:
+            frames.close()
+        except BaseException:
+            pass
+        raise
+
+    _close_image(unexpected_frame.data)
+    _close_image(image)
+    try:
+        frames.close()
+    except BaseException:
+        pass
+    raise RuntimeError("single-frame video selection yielded more than one frame")
 
 
 def _iter_keyframe_images(frames: Generator[VideoFrameData, None, None]) -> Generator[PILImage, None, None]:

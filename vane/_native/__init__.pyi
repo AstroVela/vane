@@ -1076,6 +1076,16 @@ class VideoFile(File):
         max_pixels: int = 33554432,
         connection: DuckDBPyConnection | None = None,
     ) -> typing.Generator[PIL.Image.Image, None, None]: ...
+    def get_frame_by_idx(
+        self,
+        idx: int,
+        buffer_size: int = 1048576,
+        *,
+        max_input_bytes: int = 8589934592,
+        max_frames: int = 1000000,
+        max_pixels: int = 33554432,
+        connection: DuckDBPyConnection | None = None,
+    ) -> PIL.Image.Image: ...
     def metadata(
         self,
         *,

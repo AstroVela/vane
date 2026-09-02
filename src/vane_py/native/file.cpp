@@ -249,6 +249,22 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 		    py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES,
 		    py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES, py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS,
 		    py::arg("connection") = py::none());
+		file.def(
+		    "get_frame_by_idx",
+		    [](const FILE_TYPE &value, const py::object &idx, const py::object &buffer_size,
+		       const py::object &max_input_bytes, const py::object &max_frames, const py::object &max_pixels,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._video_file")
+			        .attr("_video_file_frame_by_idx_value")(
+			            py::cast(value, py::return_value_policy::copy), idx, buffer_size,
+			            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+			            py::arg("max_pixels") = max_pixels, py::arg("connection") = std::move(connection));
+		    },
+		    "Sequentially decode the exact zero-based presentation-order frame into a detached RGB Pillow image",
+		    py::arg("idx"), py::arg("buffer_size") = DEFAULT_VIDEO_BUFFER_SIZE, py::kw_only(),
+		    py::arg("max_input_bytes") = DEFAULT_VIDEO_MAX_INPUT_BYTES,
+		    py::arg("max_frames") = DEFAULT_VIDEO_MAX_FRAMES, py::arg("max_pixels") = DEFAULT_VIDEO_MAX_PIXELS,
+		    py::arg("connection") = py::none());
 	}
 }
 
