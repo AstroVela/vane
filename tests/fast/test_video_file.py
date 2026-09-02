@@ -256,6 +256,114 @@ def test_video_frame_data_is_frozen_and_slotted():
         image.close()
 
 
+def test_video_get_frame_by_idx_matches_sequential_b_frame_decode(duckdb_cursor, tmp_path):
+    path = tmp_path / "indexed-b-frames.mp4"
+    path.write_bytes(_encoded_video(frame_count=12, frame_rate=4, gop_size=6, max_b_frames=2))
+    value = vane.VideoFile(str(path), "video/mp4")
+    frames = list(value.frames(connection=duckdb_cursor))
+    selected_images = []
+    try:
+        for idx in (0, 5, 11):
+            image = value.get_frame_by_idx(idx, connection=duckdb_cursor)
+            selected_images.append(image)
+            assert image.mode == "RGB"
+            np.testing.assert_array_equal(np.asarray(image), np.asarray(frames[idx].data))
+    finally:
+        for image in selected_images:
+            image.close()
+        for frame in frames:
+            frame.data.close()
+
+
+def test_video_get_frame_by_idx_honors_logical_range_vfr_and_timestamp_discontinuity(duckdb_cursor, tmp_path):
+    first_segment = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        muxer_options={"mpegts_flags": "resend_headers+initial_discontinuity"},
+        frame_count=8,
+        frame_rate=8,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    second_segment = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        muxer_options={"mpegts_flags": "resend_headers+initial_discontinuity"},
+        frame_count=8,
+        frame_rate=4,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    payload = first_segment + second_segment
+    prefix = b"not-a-video-prefix"
+    suffix = b"not-a-video-suffix"
+    path = tmp_path / "ranged-timestamp-discontinuity.bin"
+    path.write_bytes(prefix + payload + suffix)
+    value = vane.VideoFile(str(path), "video/mp2t", len(prefix), len(payload))
+    frames = list(value.frames(connection=duckdb_cursor))
+    image = None
+    try:
+        image = value.get_frame_by_idx(9, buffer_size=64, connection=duckdb_cursor)
+        assert len(frames) == 16
+        assert all(frames[index].frame_time is not None for index in (1, 2, 7, 8, 9))
+        assert frames[2].frame_time - frames[1].frame_time == pytest.approx(0.125)
+        assert frames[9].frame_time - frames[8].frame_time == pytest.approx(0.25)
+        assert frames[8].frame_time < frames[7].frame_time
+        np.testing.assert_array_equal(np.asarray(image), np.asarray(frames[9].data))
+    finally:
+        if image is not None:
+            image.close()
+        for frame in frames:
+            frame.data.close()
+
+
+def test_video_get_frame_by_idx_converts_only_the_target_frame(duckdb_cursor, tmp_path, monkeypatch):
+    path = tmp_path / "single-conversion.mp4"
+    path.write_bytes(_encoded_video(frame_count=8, frame_rate=4, gop_size=3, max_b_frames=2))
+    converted_indices = []
+    convert_frame = _video_file._frame_to_image
+
+    def record_conversion(frame, info, *args, **kwargs):
+        converted_indices.append(info.frame_index)
+        return convert_frame(frame, info, *args, **kwargs)
+
+    monkeypatch.setattr(_video_file, "_frame_to_image", record_conversion)
+    image = vane.VideoFile(str(path), "video/mp4").get_frame_by_idx(5, connection=duckdb_cursor)
+    try:
+        assert converted_indices == [5]
+        assert image.mode == "RGB"
+        assert image.size == (16, 12)
+    finally:
+        image.close()
+
+
+def test_video_get_frame_by_idx_reports_out_of_range(duckdb_cursor, tmp_path):
+    path = tmp_path / "four-frames.mp4"
+    path.write_bytes(_encoded_video(frame_count=4))
+
+    with pytest.raises(IndexError, match="video frame index 4 is out of range"):
+        vane.VideoFile(str(path), "video/mp4").get_frame_by_idx(4, connection=duckdb_cursor)
+
+
+@pytest.mark.parametrize(
+    ("idx", "error_type", "message"),
+    [
+        (True, TypeError, "idx must be int"),
+        (1.0, TypeError, "idx must be int"),
+        (-1, ValueError, "idx must be non-negative"),
+        (1 << 63, ValueError, "idx must be at most"),
+    ],
+)
+def test_video_get_frame_by_idx_validates_index_without_opening_file(idx, error_type, message):
+    with pytest.raises(error_type, match=message):
+        vane.VideoFile("memory://not-opened").get_frame_by_idx(idx)
+
+
+def test_video_get_frame_by_idx_enforces_decode_budget_without_opening_file():
+    with pytest.raises(vane.VideoFileLimitError, match="exceeding max_frames=5"):
+        vane.VideoFile("memory://not-opened").get_frame_by_idx(5, max_frames=5)
+
+
 def test_video_frames_honor_logical_range_and_resize(duckdb_cursor, tmp_path):
     payload = _encoded_video(width=18, height=10, frame_count=5, frame_rate=5)
     prefix = b"not-a-video-prefix"
