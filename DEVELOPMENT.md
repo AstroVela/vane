@@ -327,6 +327,16 @@ the verified cache snapshot, Vane records the artifact's canonical
 that ordered descriptor manifest, including each SHA-256 digest and dependency
 identity, but never a local artifact path or binary payload.
 
+Known provider distributions are maintained independently in
+`AstroVela/vane-extensions`. Vane contains only the generic client for its
+versioned HTTPS index, so adding a provider does not require a Vane change or
+release. The runtime parser is strict and the fetch is bounded: redirects,
+duplicate names, aliases, unknown fields, non-HTTPS URLs, and unsupported
+catalog format versions are rejected. There is no cache or fallback. Catalog
+metadata is for discovery only; do not add artifact versions, digests, platform
+selection, or trust policy to it. Those values belong to each immutable dynamic
+descriptor and are checked only after explicit provider initialization.
+
 Every Ray node must install the same platform extension wheels before queries
 start. Each wheel supplies one provider entry point under
 `vane.dynamic_extension_providers`; its name is the canonical DuckDB extension

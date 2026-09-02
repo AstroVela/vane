@@ -26,6 +26,7 @@ def test_vane_public_exports_are_unique_and_resolvable():
 
     expected_vane_exports = {
         "Connection",
+        "DEFAULT_EXTENSION_CATALOG_URL",
         "EnvRegistry",
         "File",
         "Relation",
@@ -39,12 +40,15 @@ def test_vane_public_exports_are_unique_and_resolvable():
         "current_config",
         "detach_function",
         "env",
+        "extension_catalog",
+        "extension_statuses",
         "file",
         "file_type",
         "func",
         "lit",
         "load_installed_extension",
         "sql_expr",
+        "vane_extensions",
     }
     assert expected_vane_exports <= set(vane.__all__)
     assert all(hasattr(vane, name) for name in vane.__all__)
