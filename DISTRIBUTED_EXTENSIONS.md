@@ -140,6 +140,63 @@ other's installed files. Each extension wheel is tagged for the active
 supported CPython minor, matching the native base wheel selected for that
 runtime instead of claiming cross-interpreter availability. The base Vane wheel
 contains no optional extension artifact.
+
+### Provider catalog and package management
+
+The independent
+[`AstroVela/vane-extensions`](https://github.com/AstroVela/vane-extensions)
+repository publishes a strict, versioned catalog of known provider
+distributions. Adding a provider updates that registry without changing or
+releasing Vane. The catalog is discovery metadata, not another artifact
+transport or a trust allowlist. Standard Python package tooling installs and
+removes providers; Vane does not invoke pip, contact a provider repository, or
+choose another package when a provider is missing.
+
+```bash
+python -m pip install vane-extension-iceberg
+```
+
+The catalog and the current connection state are available through the Python
+API:
+
+```python
+import vane
+
+connection = vane.connect()
+
+for entry in vane.extension_catalog():
+    print(entry.extension_name, entry.distribution_name)
+
+vane.vane_extensions(connection=connection).show()
+vane.load_installed_extension("iceberg", connection=connection)
+```
+
+`extension_catalog()` makes one bounded HTTPS request to the default versioned
+registry index under a 10-second wall-clock deadline. It rejects redirects,
+malformed metadata, and extension names with ambiguous Python distribution
+normalization, and it has no cache or fallback. A caller may explicitly supply
+another HTTPS catalog URL, or pass a previously fetched tuple to
+`vane_extensions(catalog=...)`.
+
+`vane_extensions()` returns a DuckDB relation modeled after
+`duckdb_extensions()`. It combines the fetched catalog, installed
+`vane.dynamic_extension_providers` entry-point metadata, and the exact dynamic
+descriptor manifest recorded on the supplied connection. `installed` means at
+least one named provider entry point exists, while `loadable` requires exactly
+one. `loaded` means Vane has verified and recorded the descriptor on that
+connection. The relation also exposes the installed distribution version and,
+after loading, the artifact SHA-256 and trust identity. If duplicate provider
+entry points make a name ambiguous, `provider_distributions` identifies every
+conflicting package while `loadable` remains false.
+
+Catalog and status enumeration never import or initialize third-party provider
+code. Workers never query the registry. An uncataloged provider remains visible
+because the installed package is the local trust boundary; `cataloged`
+describes discoverability only. Provider initialization and native artifact
+verification occur only on the explicit `load_installed_extension()` path.
+Install the same exact provider dependency closure in every Ray runtime
+environment before submitting distributed work.
+
 Release tooling binds the wheel tag to inspected ELF or Mach-O requirements,
 records the exact musl build baseline when applicable, and requires publishers
 to explicitly allowlist every unique dependency signer rather than deriving

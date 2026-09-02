@@ -68,6 +68,29 @@ Install the `vane-ai` package from PyPI:
 ```bash
 pip install vane-ai
 ```
+
+Optional DuckDB extensions are separate platform packages. Install a provider
+with pip from the package index configured for your deployment, then load it by
+name on the connection that will plan the query:
+
+```bash
+python -m pip install vane-extension-iceberg
+```
+
+```python
+import vane
+
+connection = vane.connect()
+vane.load_installed_extension("iceberg", connection=connection)
+vane.vane_extensions(connection=connection).show()
+```
+
+`vane.extension_catalog()` reads the live, independent
+[`vane-extensions`](https://github.com/AstroVela/vane-extensions) registry, so
+new provider packages do not require a Vane release. See the
+[distributed extension architecture](DISTRIBUTED_EXTENSIONS.md) for discovery,
+installation, verification, and Ray worker requirements.
+
 For more details, see the [Installation Guide](https://vane.astrovela.ai/docs/data/quickstart/installation).
 
 ### Quick Start

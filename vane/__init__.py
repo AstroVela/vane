@@ -262,15 +262,21 @@ from vane.datasink import (
 from vane.datasink.milvus import MilvusSink
 from vane.datasink.qdrant import QdrantSink
 from vane.extensions import (
+    DEFAULT_EXTENSION_CATALOG_URL,
     DynamicExtensionDependency,
     DynamicExtensionDescriptor,
     DynamicExtensionError,
     DynamicExtensionResolver,
+    ExtensionCatalogEntry,
+    ExtensionStatus,
     LocalExtensionArtifact,
     LocalExtensionProvider,
     ResolvedDynamicExtension,
     create_dynamic_extension_descriptor,
+    extension_catalog,
+    extension_statuses,
     load_installed_extension,
+    vane_extensions,
 )
 from vane.value.constant import (
     BinaryValue,
@@ -377,6 +383,7 @@ def __dir__() -> list[str]:
 
 
 __all__: list[str] = [
+    "DEFAULT_EXTENSION_CATALOG_URL",
     "AudioFile",
     "AudioFileError",
     "AudioFileFormatError",
@@ -422,6 +429,8 @@ __all__: list[str] = [
     "EnvRegistry",
     "EnvironmentSecret",
     "Error",
+    "ExtensionCatalogEntry",
+    "ExtensionStatus",
     "ExpectedResultType",
     "ExplainType",
     "Expression",
@@ -547,6 +556,8 @@ __all__: list[str] = [
     "enum_type",
     "execute",
     "executemany",
+    "extension_catalog",
+    "extension_statuses",
     "extract_statements",
     "fetch_arrow_table",
     "fetch_df",
@@ -638,6 +649,7 @@ __all__: list[str] = [
     "union_type",
     "unregister",
     "unregister_filesystem",
+    "vane_extensions",
     "values",
     "view",
     "version",
