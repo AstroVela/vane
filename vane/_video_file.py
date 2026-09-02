@@ -1344,6 +1344,58 @@ def _seek_video_stream(
         video = None
 
 
+def _seek_video_stream_for_time_window(
+    container: Any,
+    video: Any,
+    requested_timestamp: int,
+    stream_start: int,
+    reader: _VideoReaderProxy,
+    nested_io: _NestedIOBlocker,
+) -> None:
+    """Seek only when the selected random-access point can cover the window.
+
+    FFmpeg's seek index can be ordered by decode timestamps. For streams with
+    reordered frames, seeking to a presentation timestamp may therefore land on
+    a keyframe whose PTS is *after* the requested boundary. Probe the first
+    selected packet without decoding it and keep the optimized seek only when
+    that keyframe is early enough. Otherwise restart at the stream origin, which
+    is the correctness fallback when the container cannot prove safe preroll.
+    """
+
+    packet_and_flush: tuple[Any, bool] | None = None
+    packet: Any = None
+    try:
+        if requested_timestamp <= stream_start:
+            _seek_video_stream(container, video, stream_start, reader, nested_io)
+            return
+
+        _seek_video_stream(container, video, requested_timestamp, reader, nested_io)
+        packet_and_flush = _next_demuxed_packet(container, video, reader, nested_io)
+        seek_is_safe = False
+        if packet_and_flush is not None:
+            packet, is_flush = packet_and_flush
+            packet_and_flush = None
+            if not is_flush:
+                packet_pts = _optional_frame_integer(packet.pts, name="seek packet PTS")
+                try:
+                    is_keyframe = packet.is_keyframe
+                except AttributeError as error:
+                    raise VideoFileFormatError("video demuxer did not report seek packet keyframe state") from error
+                if not isinstance(is_keyframe, bool):
+                    raise VideoFileFormatError("video demuxer reported invalid seek packet keyframe state")
+                seek_is_safe = is_keyframe and packet_pts is not None and packet_pts <= requested_timestamp
+            packet = None
+
+        safe_timestamp = requested_timestamp if seek_is_safe else stream_start
+        _seek_video_stream(container, video, safe_timestamp, reader, nested_io)
+    finally:
+        # Probe failures must not retain native packet/container/codec owners.
+        packet = None
+        packet_and_flush = None
+        container = None
+        video = None
+
+
 def _decode_packet_frames(
     packet: Any,
     reader: _VideoReaderProxy,
@@ -1763,7 +1815,14 @@ def _iter_video_frames(
                 did_seek = options.start_time > 0
                 if did_seek:
                     seek_timestamp = _seek_timestamp(options.start_time, metadata.time_base, stream_start)
-                    _seek_video_stream(container, video, int(seek_timestamp), reader, nested_io)
+                    _seek_video_stream_for_time_window(
+                        container,
+                        video,
+                        int(seek_timestamp),
+                        stream_start,
+                        reader,
+                        nested_io,
+                    )
 
                 next_sample_time = options.start_time if options.sample_interval_seconds is not None else None
                 decoded_batches = _iter_decoded_packet_batches(

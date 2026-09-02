@@ -336,6 +336,25 @@ def test_video_frames_preserve_presentation_order_with_b_frames(duckdb_cursor, t
     assert any(frame.frame_dts != frame.frame_pts for frame in frames)
 
 
+def test_video_frames_time_window_with_b_frames_matches_full_decode(duckdb_cursor, tmp_path):
+    path = tmp_path / "b-frame-window.mp4"
+    path.write_bytes(_encoded_video(frame_count=12, frame_rate=4, gop_size=6, max_b_frames=2))
+    value = vane.VideoFile(str(path), "video/mp4")
+
+    all_frames = list(value.frames(connection=duckdb_cursor))
+    selected = list(value.frames(start_time=0.25, end_time=0.5, connection=duckdb_cursor))
+    expected = [
+        frame
+        for frame in all_frames
+        if frame.frame_pts is not None
+        and frame.frame_time_base is not None
+        and Fraction(1, 4) <= frame.frame_pts * frame.frame_time_base <= Fraction(1, 2)
+    ]
+
+    assert [frame.frame_pts for frame in selected] == [frame.frame_pts for frame in expected]
+    assert [frame.frame_time for frame in selected] == pytest.approx([0.25, 0.5])
+
+
 def test_video_visible_pixel_limit_is_independent_of_coded_alignment(duckdb_cursor, tmp_path):
     path = tmp_path / "aligned.mp4"
     path.write_bytes(_encoded_video(width=18, height=14, frame_count=1))
