@@ -28,6 +28,7 @@ def _encoded_video(
     container_format: str = "mp4",
     *,
     codec_name: str | None = None,
+    muxer_options: dict[str, str] | None = None,
     width: int = 16,
     height: int = 12,
     frame_count: int = 4,
@@ -36,7 +37,7 @@ def _encoded_video(
     max_b_frames: int = 0,
 ) -> bytes:
     buffer = io.BytesIO()
-    with av.open(buffer, mode="w", format=container_format) as container:
+    with av.open(buffer, mode="w", format=container_format, options=muxer_options) as container:
         codec = codec_name or ("libvpx" if container_format == "ogg" else "mpeg4")
         stream = container.add_stream(codec, rate=frame_rate)
         stream.width = width
@@ -396,6 +397,38 @@ def test_video_frames_time_window_with_distinct_pts_dts_origins_matches_full_dec
 
     assert [frame.frame_pts for frame in selected] == [frame.frame_pts for frame in expected]
     assert [frame.frame_time for frame in selected] == pytest.approx([0.125, 0.25, 0.375])
+
+
+def test_video_frames_time_window_scans_across_timestamp_discontinuities(duckdb_cursor, tmp_path):
+    segment = _encoded_video(
+        "mpegts",
+        codec_name="mpeg2video",
+        muxer_options={"mpegts_flags": "resend_headers+initial_discontinuity"},
+        frame_count=8,
+        frame_rate=8,
+        gop_size=3,
+        max_b_frames=1,
+    )
+    path = tmp_path / "timestamp-discontinuity.ts"
+    path.write_bytes(segment + segment)
+    value = vane.VideoFile(str(path), "video/mp2t")
+
+    all_frames = list(value.frames(connection=duckdb_cursor))
+    selected = list(value.frames(start_time=0.125, end_time=0.25, connection=duckdb_cursor))
+    sampled = list(
+        value.frames(
+            start_time=0.125,
+            end_time=0.25,
+            sample_interval_seconds=0.125,
+            connection=duckdb_cursor,
+        )
+    )
+    expected = [frame for frame in all_frames if frame.frame_time is not None and 0.125 <= frame.frame_time <= 0.25]
+
+    assert len(all_frames) == 16
+    assert [frame.frame_index for frame in expected] == [1, 2, 9, 10]
+    assert [frame.frame_index for frame in selected] == [frame.frame_index for frame in expected]
+    assert [frame.frame_index for frame in sampled] == [frame.frame_index for frame in expected]
 
 
 def test_video_visible_pixel_limit_is_independent_of_coded_alignment(duckdb_cursor, tmp_path):
@@ -1801,6 +1834,7 @@ def test_video_packet_conversion_is_atomic(monkeypatch):
             no_error,
             no_error,
             next_sample_time=None,
+            last_frame_time=None,
         )
     gc.collect()
 

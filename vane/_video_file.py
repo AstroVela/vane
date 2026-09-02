@@ -228,7 +228,7 @@ class _DecodedPacketBatch:
 class _PreparedFrameBatch:
     results: list[VideoFrameData | None]
     next_sample_time: Fraction | None
-    reached_end: bool
+    last_frame_time: Fraction | None
 
     def take_result(self, index: int) -> VideoFrameData:
         result = self.results[index]
@@ -1494,6 +1494,7 @@ def _prepare_video_packet_batch(
     nested_io: _NestedIOBlocker,
     *,
     next_sample_time: Fraction | None,
+    last_frame_time: Fraction | None,
 ) -> _PreparedFrameBatch:
     """Detach every selected image before exposing any result from a packet."""
 
@@ -1501,18 +1502,25 @@ def _prepare_video_packet_batch(
     frame: Any = None
     image: Any = None
     result: VideoFrameData | None = None
-    reached_end = False
     try:
         for index, info in enumerate(batch.infos):
             _check_video_io(reader, nested_io)
             frame = batch.take_frame(index)
             try:
                 if info.exact_time is not None:
+                    if last_frame_time is not None and info.exact_time < last_frame_time:
+                        # MPEG-TS and other streaming containers can reset their
+                        # presentation timeline at a discontinuity. Sampling
+                        # targets belong to each monotonic segment rather than a
+                        # previous segment's now-unreachable timestamp range.
+                        next_sample_time = options.start_time if options.sample_interval_seconds is not None else None
+                    last_frame_time = info.exact_time
                     if info.exact_time < options.start_time:
                         continue
                     if options.end_time is not None and info.exact_time > options.end_time:
-                        reached_end = True
-                        break
+                        # Do not stop globally: a later discontinuity can move
+                        # presentation timestamps back into the requested window.
+                        continue
 
                 if options.is_key_frame is not None and info.is_key_frame is not options.is_key_frame:
                     continue
@@ -1568,7 +1576,7 @@ def _prepare_video_packet_batch(
         prepared = _PreparedFrameBatch(
             results=results,
             next_sample_time=next_sample_time,
-            reached_end=reached_end,
+            last_frame_time=last_frame_time,
         )
         results = []
         return prepared
@@ -1693,9 +1701,9 @@ def _iter_video_frames(
                     nested_io,
                     stream_time_origin=stream_time_origin,
                 )
-                reached_end = False
+                last_frame_time: Fraction | None = None
                 try:
-                    while not reached_end:
+                    while True:
                         try:
                             batch = next(decoded_batches)
                         except StopIteration:
@@ -1709,10 +1717,11 @@ def _iter_video_frames(
                             reader,
                             nested_io,
                             next_sample_time=next_sample_time,
+                            last_frame_time=last_frame_time,
                         )
                         del batch
                         next_sample_time = prepared_batch.next_sample_time
-                        reached_end = prepared_batch.reached_end
+                        last_frame_time = prepared_batch.last_frame_time
                         try:
                             for index in range(len(prepared_batch.results)):
                                 _check_video_io(reader, nested_io)
