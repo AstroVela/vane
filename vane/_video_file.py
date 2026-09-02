@@ -1520,36 +1520,40 @@ def _prepare_video_packet_batch(
             _check_video_io(reader, nested_io)
             frame = batch.take_frame(index)
             try:
-                if options.target_frame_index is not None and info.frame_index != options.target_frame_index:
-                    continue
-                if info.exact_time is not None:
-                    if last_frame_time is not None and info.exact_time < last_frame_time:
-                        # MPEG-TS and other streaming containers can reset their
-                        # presentation timeline at a discontinuity. Sampling
-                        # targets belong to each monotonic segment rather than a
-                        # previous segment's now-unreachable timestamp range.
-                        next_sample_time = options.start_time if options.sample_interval_seconds is not None else None
-                    last_frame_time = info.exact_time
-                    if info.exact_time < options.start_time:
+                if options.target_frame_index is not None:
+                    if info.frame_index != options.target_frame_index:
                         continue
-                    if options.end_time is not None and info.exact_time > options.end_time:
-                        # Do not stop globally: a later discontinuity can move
-                        # presentation timestamps back into the requested window.
+                else:
+                    if info.exact_time is not None:
+                        if last_frame_time is not None and info.exact_time < last_frame_time:
+                            # MPEG-TS and other streaming containers can reset their
+                            # presentation timeline at a discontinuity. Sampling
+                            # targets belong to each monotonic segment rather than a
+                            # previous segment's now-unreachable timestamp range.
+                            next_sample_time = (
+                                options.start_time if options.sample_interval_seconds is not None else None
+                            )
+                        last_frame_time = info.exact_time
+                        if info.exact_time < options.start_time:
+                            continue
+                        if options.end_time is not None and info.exact_time > options.end_time:
+                            # Do not stop globally: a later discontinuity can move
+                            # presentation timestamps back into the requested window.
+                            continue
+
+                    if options.is_key_frame is not None and info.is_key_frame is not options.is_key_frame:
                         continue
 
-                if options.is_key_frame is not None and info.is_key_frame is not options.is_key_frame:
-                    continue
-
-                if options.sample_interval_seconds is not None:
-                    assert info.exact_time is not None
-                    assert next_sample_time is not None
-                    if info.exact_time < next_sample_time:
-                        continue
-                    next_sample_time = _advance_sample_target(
-                        next_sample_time,
-                        options.sample_interval_seconds,
-                        info.exact_time,
-                    )
+                    if options.sample_interval_seconds is not None:
+                        assert info.exact_time is not None
+                        assert next_sample_time is not None
+                        if info.exact_time < next_sample_time:
+                            continue
+                        next_sample_time = _advance_sample_target(
+                            next_sample_time,
+                            options.sample_interval_seconds,
+                            info.exact_time,
+                        )
 
                 image = _frame_to_image(
                     frame,

@@ -2057,6 +2057,66 @@ def test_video_packet_conversion_is_atomic(monkeypatch):
     assert raised.value is not None
 
 
+def test_video_index_selection_keeps_preroll_frame_before_stream_origin(monkeypatch):
+    options = _video_file._VideoFrameOptions(
+        start_time=Fraction(0),
+        end_time=None,
+        width=None,
+        height=None,
+        is_key_frame=None,
+        sample_interval_seconds=None,
+        buffer_size=1024,
+        max_input_bytes=1024,
+        max_frames=1,
+        max_pixels=100,
+        target_frame_index=0,
+    )
+    frame = _FakeDecodedVideoFrame(pts=5)
+    video = _fake_decoder_video()
+    info = _video_file._decoded_frame_info(
+        frame,
+        video,
+        options,
+        frame_index=0,
+        stream_time_origin=Fraction(1),
+    )
+    batch = _video_file._DecodedPacketBatch(frames=[frame], infos=(info,))
+    converted_images = []
+
+    def convert_frame(*args, **kwargs):
+        del args, kwargs
+        image = Image.new("RGB", (10, 10))
+        converted_images.append(image)
+        return image
+
+    monkeypatch.setattr(_video_file, "_frame_to_image", convert_frame)
+    no_error = SimpleNamespace(
+        check_interrupted=lambda: None,
+        raise_if_error=lambda: None,
+    )
+    prepared = _video_file._prepare_video_packet_batch(
+        batch,
+        options,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        object(),
+        no_error,
+        no_error,
+        next_sample_time=None,
+        last_frame_time=None,
+    )
+
+    try:
+        result = prepared.take_result(0)
+        assert result.frame_index == 0
+        assert result.frame_time == pytest.approx(-0.5)
+        assert result.data is converted_images[0]
+    finally:
+        prepared.release()
+        for image in converted_images:
+            image.close()
+
+
 def test_video_packet_decode_traceback_releases_container_and_codec_owners():
     options = _video_file._VideoFrameOptions(
         start_time=Fraction(0),
