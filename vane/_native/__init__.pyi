@@ -26,7 +26,6 @@ if typing.TYPE_CHECKING:
     from pydantic import BaseModel as _PydanticModel  # type: ignore[import-not-found, import-untyped, unused-ignore]
 
     import vane.sqltypes as sqltypes
-    import vane.udf as func
     from vane._audio_file import AudioMetadata
     from vane._file import VaneFileReader
     from vane._image_file import ImageMetadata
@@ -1096,6 +1095,7 @@ class VideoFile(File):
 @typing.final
 class _DataSourceExecutionContext:
     def __init__(self, _nonconstructible: Never) -> None: ...
+    def _check_interrupted(self) -> None: ...
 
 @typing.final
 class _VaneFileReaderHandle:

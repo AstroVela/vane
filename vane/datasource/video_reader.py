@@ -18,7 +18,7 @@ import math
 import os
 import threading
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
@@ -83,6 +83,7 @@ _decode_semaphore = threading.Semaphore(_MAX_CONCURRENT_DECODES)
 _MEM_HIGH_WATERMARK = float(os.environ.get("VANE_DECODE_MEM_HIGH_PCT", "80"))
 _MEM_LOW_WATERMARK = float(os.environ.get("VANE_DECODE_MEM_LOW_PCT", "70"))
 _MEM_CHECK_INTERVAL = 2.0
+_ADMISSION_INTERRUPT_CHECK_INTERVAL = 0.1
 try:
     _MEM_MIN_AVAILABLE_MB = max(0, int(os.environ.get("VANE_DECODE_MIN_AVAILABLE_MB", "4096")))
 except Exception:
@@ -90,7 +91,17 @@ except Exception:
 _MEM_MIN_AVAILABLE_BYTES = _MEM_MIN_AVAILABLE_MB * 1024**2
 
 
-def _wait_for_memory() -> None:
+def _wait_interruptibly(seconds: float, check_interrupted: Callable[[], None]) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        check_interrupted()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_ADMISSION_INTERRUPT_CHECK_INTERVAL, remaining))
+
+
+def _wait_for_memory(check_interrupted: Callable[[], None]) -> None:
     """Wait before opening a decoder when the host is above its admission watermark."""
     psutil = _import_video_dependency("psutil", "psutil")
 
@@ -104,13 +115,16 @@ def _wait_for_memory() -> None:
             return True
         return bool(memory.percent < _MEM_LOW_WATERMARK)
 
+    check_interrupted()
     memory = psutil.virtual_memory()
     if has_capacity(memory):
+        check_interrupted()
         return
     while True:
-        time.sleep(_MEM_CHECK_INTERVAL)
+        _wait_interruptibly(_MEM_CHECK_INTERVAL, check_interrupted)
         memory = psutil.virtual_memory()
         if has_recovered(memory):
+            check_interrupted()
             return
 
 
@@ -687,17 +701,20 @@ def _decode_video_guarded(
     *,
     options: _VideoDecodeOptions,
     max_output_frames: int | None,
-    connection: vane.DuckDBPyConnection | None = None,
-    execution_context: _DataSourceExecutionContext | None = None,
+    execution_context: _DataSourceExecutionContext,
 ) -> Iterator[pa.RecordBatch]:
-    _wait_for_memory()
-    _decode_semaphore.acquire()
+    check_interrupted = execution_context._check_interrupted
+    _wait_for_memory(check_interrupted)
+    while True:
+        check_interrupted()
+        if _decode_semaphore.acquire(timeout=_ADMISSION_INTERRUPT_CHECK_INTERVAL):
+            break
     try:
+        check_interrupted()
         yield from _decode_video_with_policy(
             value,
             options=options,
             max_output_frames=max_output_frames,
-            connection=connection,
             execution_context=execution_context,
         )
     finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import pickle
+import threading
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -465,6 +466,81 @@ def test_decode_video_batches_requires_exactly_one_explicit_io_context(duckdb_cu
     assert value.frames_kwargs is None
 
 
+def test_memory_admission_observes_execution_context_interruption(monkeypatch):
+    class AdmissionCancelled(Exception):
+        pass
+
+    checks = 0
+    memory_checks = 0
+
+    def check_interrupted():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise AdmissionCancelled
+
+    def virtual_memory():
+        nonlocal memory_checks
+        memory_checks += 1
+        return SimpleNamespace(available=0, percent=100.0)
+
+    monkeypatch.setattr(
+        video_reader,
+        "_import_video_dependency",
+        lambda _module_name, _package_name: SimpleNamespace(virtual_memory=virtual_memory),
+    )
+
+    with pytest.raises(AdmissionCancelled):
+        video_reader._wait_for_memory(check_interrupted)
+
+    assert checks == 2
+    assert memory_checks == 1
+
+
+def test_decode_admission_observes_execution_context_interruption(monkeypatch):
+    class AdmissionCancelled(Exception):
+        pass
+
+    class ExecutionContext:
+        def __init__(self):
+            self.checks = 0
+
+        def _check_interrupted(self):
+            self.checks += 1
+            if self.checks == 3:
+                raise AdmissionCancelled
+
+    class UnavailableSemaphore:
+        def __init__(self):
+            self.acquire_timeouts = []
+
+        def acquire(self, *, timeout):
+            self.acquire_timeouts.append(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("an unavailable decode slot must not be released")
+
+    execution_context = ExecutionContext()
+    semaphore = UnavailableSemaphore()
+    source = VideoFrameSource(["memory://fake.mp4"], height=2, width=3, max_pixels=100)
+    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda check: check())
+    monkeypatch.setattr(video_reader, "_decode_semaphore", semaphore)
+
+    with pytest.raises(AdmissionCancelled):
+        list(
+            video_reader._decode_video_guarded(
+                vane.VideoFile("memory://fake.mp4", "video/mp4"),
+                options=source.options,
+                max_output_frames=None,
+                execution_context=execution_context,
+            )
+        )
+
+    assert execution_context.checks == 3
+    assert semaphore.acquire_timeouts == [video_reader._ADMISSION_INTERRUPT_CHECK_INTERVAL]
+
+
 def test_flush_frame_batch_compacts_short_tail():
     value = vane.VideoFile("memory://video")
     backing = np.zeros((100, 2, 3, 3), dtype=np.uint8)
@@ -758,6 +834,51 @@ def test_video_frame_source_uses_query_connection_context_without_default_fallba
     assert rows == [(0,)]
 
 
+def test_video_frame_source_interrupts_while_waiting_for_decode_slot(monkeypatch):
+    entered = threading.Event()
+
+    class UnavailableSemaphore:
+        def acquire(self, *, timeout):
+            entered.set()
+            threading.Event().wait(timeout)
+            return False
+
+        def release(self):
+            raise AssertionError("an unavailable decode slot must not be released")
+
+    monkeypatch.setattr(video_reader, "_decode_semaphore", UnavailableSemaphore())
+    connection = vane.connect()
+    errors = []
+    worker = None
+    try:
+        relation = read_datasource(
+            VideoFrameSource(["memory://never-opened.mp4"], height=2, width=3, max_pixels=100),
+            con=connection,
+        )
+
+        def fetch_frames():
+            try:
+                relation.fetchall()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=fetch_frames)
+        worker.start()
+        assert entered.wait(timeout=5)
+        connection.interrupt()
+        worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], vane.InvalidInputException)
+        assert "INTERRUPT Error: Interrupted!" in str(errors[0])
+    finally:
+        connection.interrupt()
+        if worker is not None:
+            worker.join(timeout=5)
+        connection.close()
+
+
 def test_video_frame_source_global_frame_limit_is_ordered(duckdb_cursor, tmp_path):
     first_path = tmp_path / "first.mp4"
     second_path = tmp_path / "second.mp4"
@@ -827,7 +948,7 @@ def test_video_frame_source_skip_continues_after_corrupt_media_but_not_missing_f
     duckdb_cursor,
     tmp_path,
 ):
-    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda: None)
+    monkeypatch.setattr(video_reader, "_wait_for_memory", lambda check: check())
     corrupt_path = tmp_path / "corrupt.mp4"
     valid_path = tmp_path / "valid.mp4"
     corrupt_path.write_bytes(b"not a video")

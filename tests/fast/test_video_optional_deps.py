@@ -19,4 +19,4 @@ def test_video_source_reports_psutil_extra_when_memory_admission_dependency_is_m
     monkeypatch.setattr(video_reader.importlib, "import_module", fail_psutil)
 
     with pytest.raises(ImportError, match=r"psutil.*vane-ai\[video\]"):
-        video_reader._wait_for_memory()
+        video_reader._wait_for_memory(lambda: None)

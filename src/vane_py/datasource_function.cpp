@@ -11,6 +11,8 @@
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/python_dependency.hpp"
 
+#include "duckdb/common/exception.hpp"
+
 #include <algorithm>
 #include <condition_variable>
 #include <unordered_set>
@@ -28,7 +30,14 @@ PythonDataSourceExecutionContext::PythonDataSourceExecutionContext(shared_ptr<Cl
 
 void PythonDataSourceExecutionContext::Initialize(py::module_ &m) {
 	py::class_<PythonDataSourceExecutionContext, shared_ptr<PythonDataSourceExecutionContext>>(
-	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final());
+	    m, "_DataSourceExecutionContext", py::module_local(), py::is_final())
+	    .def("_check_interrupted", &PythonDataSourceExecutionContext::CheckInterrupted);
+}
+
+void PythonDataSourceExecutionContext::CheckInterrupted() const {
+	if (context->IsInterrupted()) {
+		throw InterruptException();
+	}
 }
 
 shared_ptr<ClientContext> PythonDataSourceExecutionContext::GetContext() const {

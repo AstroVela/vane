@@ -20,6 +20,7 @@ public:
 	explicit PythonDataSourceExecutionContext(shared_ptr<ClientContext> context_p);
 
 	static void Initialize(py::module_ &m);
+	void CheckInterrupted() const;
 	shared_ptr<ClientContext> GetContext() const;
 
 private:
