@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/atomic.hpp"
@@ -46,6 +47,11 @@ static atomic<idx_t> distributed_test_create_worker_bind_calls {0};
 static atomic<idx_t> distributed_test_last_target_split_count {0};
 
 struct DistributedTestSourceUnit {
+	DistributedTestSourceUnit() = default;
+	DistributedTestSourceUnit(idx_t unit_id_p, string resource_p, string artifact_p)
+	    : unit_id(unit_id_p), resource(std::move(resource_p)), artifact(std::move(artifact_p)) {
+	}
+
 	idx_t unit_id = 0;
 	string resource;
 	string artifact;
@@ -262,7 +268,7 @@ static DistributedWriteOperatorExtension DistributedTestWriteOperator() {
 	DistributedWriteOperatorExtension result;
 	result.name = DISTRIBUTED_TEST_WRITE_NAME;
 	result.protocol_version = DISTRIBUTED_TEST_WRITE_PROTOCOL;
-	result.mode = DistributedWriteMode::CALLBACK;
+	result.mode = DistributedWriteMode::CALLBACK_SINK;
 	result.fragment_codec = {DISTRIBUTED_TEST_WRITE_CODEC, DISTRIBUTED_TEST_WRITE_CODEC_VERSION};
 	result.callbacks = DistributedTestWriteCallbacks();
 	return result;

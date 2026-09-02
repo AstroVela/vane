@@ -8,11 +8,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
+import sys
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SHARE_DIR = REPOSITORY_ROOT / "vcpkg_installed" / "x64-linux" / "share"
 DEFAULT_OUTPUT = REPOSITORY_ROOT / "LICENSES" / "vcpkg-binary-dependencies.txt"
+
+
+def _default_triplet() -> str:
+    configured = os.environ.get("VCPKG_TARGET_TRIPLET")
+    if configured:
+        return configured
+
+    machine = platform.machine().lower()
+    if sys.platform.startswith("linux"):
+        if machine in {"x86_64", "amd64"}:
+            return "x64-linux-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-linux-release"
+    elif sys.platform == "darwin":
+        if machine in {"x86_64", "amd64"}:
+            return "x64-osx-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-osx-release"
+    elif sys.platform == "win32":
+        if machine in {"x86_64", "amd64"}:
+            return "x64-windows-static-release"
+        if machine in {"aarch64", "arm64"}:
+            return "arm64-windows-static-release"
+    raise RuntimeError(f"no default vcpkg triplet for {sys.platform} on {machine}")
 
 
 def _baseline() -> str:
@@ -57,12 +83,16 @@ def render_bundle(share_dir: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--share-dir", type=Path, default=DEFAULT_SHARE_DIR)
+    parser.add_argument("--share-dir", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true", help="fail instead of rewriting an out-of-date bundle")
     args = parser.parse_args()
 
-    expected = render_bundle(args.share_dir)
+    share_dir = args.share_dir
+    if share_dir is None:
+        share_dir = REPOSITORY_ROOT / "vcpkg_installed" / _default_triplet() / "share"
+
+    expected = render_bundle(share_dir)
     if args.check:
         actual = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
         if actual != expected:

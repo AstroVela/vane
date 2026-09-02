@@ -33,7 +33,7 @@ unique_ptr<QueryNode> OrderRelation::GetQueryNode() {
 		select->select_list.push_back(make_uniq<StarExpression>());
 		result = std::move(select);
 	}
-	if (std::any_of(result->modifiers.begin(), result->modifiers.end(), [](const auto &modifier) {
+	if (std::any_of(result->modifiers.begin(), result->modifiers.end(), [](const unique_ptr<ResultModifier> &modifier) {
 		    return modifier->type == ResultModifierType::ORDER_MODIFIER ||
 		           modifier->type == ResultModifierType::LIMIT_MODIFIER ||
 		           modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
@@ -80,7 +80,7 @@ bool OrderRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
 	}
 	auto serialization_binder = Binder::CreateBinder(binder.context);
 	auto serialization_input = BindRelationInput(*serialization_binder, *child);
-	return std::all_of(orders.begin(), orders.end(), [&](const auto &order) {
+	return std::all_of(orders.begin(), orders.end(), [&](const OrderByNode &order) {
 		return CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input,
 		                                          *order.expression);
 	});

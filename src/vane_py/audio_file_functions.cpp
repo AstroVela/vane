@@ -122,7 +122,7 @@ static AudioMetadataResult ProbeAudioMetadata(ResolvedFile &resolved, const File
 				bytes.resize(NumericCast<idx_t>(size));
 				if (size > 0) {
 					py::gil_scoped_release release;
-					resolved.ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), size, offset);
+					resolved.ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), size, offset);
 				}
 			} catch (...) {
 				read_error = std::current_exception();

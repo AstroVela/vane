@@ -156,7 +156,7 @@ public:
 		PythonGILWrapper gil;
 		SafePythonException stored(error);
 		std::lock_guard<std::mutex> guard(mutex_);
-		errors_.try_emplace(query_id, std::move(stored));
+		errors_.emplace(query_id, std::move(stored));
 	}
 
 	void RethrowAsCause(const std::string &query_id, const std::string &message) {

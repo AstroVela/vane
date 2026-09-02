@@ -21,6 +21,13 @@ struct DistributedWriteOperatorExtension;
 enum class DistributedExtensionCapabilityKind : uint8_t { TABLE_FUNCTION = 0, WRITE_OPERATOR = 1 };
 
 struct DistributedExtensionCapability {
+	DistributedExtensionCapability() = default;
+	DistributedExtensionCapability(DistributedExtensionCapabilityKind kind_p, string name_p, idx_t protocol_version_p,
+	                               string function_signature_p = string())
+	    : kind(kind_p), name(std::move(name_p)), protocol_version(protocol_version_p),
+	      function_signature(std::move(function_signature_p)) {
+	}
+
 	DistributedExtensionCapabilityKind kind = DistributedExtensionCapabilityKind::TABLE_FUNCTION;
 	string name;
 	idx_t protocol_version = 0;
@@ -50,6 +57,10 @@ struct DistributedExtensionCapabilityReference {
 
 //! Stable identity of an extension-owned opaque payload codec.
 struct DistributedPayloadCodec {
+	DistributedPayloadCodec() = default;
+	DistributedPayloadCodec(string name_p, idx_t version_p) : name(std::move(name_p)), version(version_p) {
+	}
+
 	string name;
 	idx_t version = 0;
 

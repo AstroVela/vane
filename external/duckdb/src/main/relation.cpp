@@ -293,6 +293,10 @@ unique_ptr<QueryNode> Relation::TryGetSerializableQueryNode(Binder &binder) {
 	return RestoreDuplicateColumnAliases(GetQueryNode(), GetAlias(), Columns());
 }
 
+unique_ptr<QueryNode> Relation::TryGetSerializableChildQueryNode(Relation &child, Binder &binder) {
+	return child.TryGetSerializableQueryNode(binder);
+}
+
 unique_ptr<QueryNode> Relation::RestoreDuplicateColumnAliases(unique_ptr<QueryNode> query_node, const string &alias,
                                                               const vector<ColumnDefinition> &columns) {
 	case_insensitive_set_t output_names;
@@ -528,7 +532,7 @@ private:
 		if (left.size() != right.size()) {
 			return false;
 		}
-		return std::all_of(left.begin(), left.end(), [&](const auto &binding) {
+		return std::all_of(left.begin(), left.end(), [&](const ResolvedCorrelation &binding) {
 			return std::find(right.begin(), right.end(), binding) != right.end();
 		});
 	}
@@ -653,10 +657,11 @@ private:
 		if (direct_correlations.size() != normalized_correlations.size()) {
 			return false;
 		}
-		return std::all_of(direct_correlations.begin(), direct_correlations.end(), [&](const auto &correlation) {
-			return std::find(normalized_correlations.begin(), normalized_correlations.end(), correlation) !=
-			       normalized_correlations.end();
-		});
+		return std::all_of(direct_correlations.begin(), direct_correlations.end(),
+		                   [&](const ResolvedCorrelation &correlation) {
+			                   return std::find(normalized_correlations.begin(), normalized_correlations.end(),
+			                                    correlation) != normalized_correlations.end();
+		                   });
 	}
 
 	static bool Matches(const string &left, const string &right) {
@@ -782,7 +787,9 @@ private:
 			     !QualifierIsVisible(star.relation_name)) ||
 			    std::any_of(star.exclude_list.begin(), star.exclude_list.end(), references_hidden_table) ||
 			    std::any_of(star.rename_list.begin(), star.rename_list.end(),
-			                [&](const auto &entry) { return references_hidden_table(entry.first); })) {
+			                [&](const qualified_column_map_t<string>::value_type &entry) {
+				                return references_hidden_table(entry.first);
+			                })) {
 				serializable = false;
 				return;
 			}

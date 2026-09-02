@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "catch.hpp"
 #include "test_common.hpp"
 #include "duckdb/execution/distributed/utils/stream.hpp"
 

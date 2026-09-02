@@ -28,15 +28,17 @@ FROM list_files('test/sql/file/list_files/a.txt')
 ----
 6	true	true	true	text/plain	FILE	test/sql/file/list_files/a.txt	0	6	true
 
+# Local paths use the platform separator; normalize only the displayed value
+# so the expected results remain portable.
 # Directory traversal is non-recursive by default and ordered by URL.
 query T
-SELECT url FROM list_files('test/sql/file/list_files')
+SELECT replace(url, '\', '/') AS url FROM list_files('test/sql/file/list_files')
 ----
 test/sql/file/list_files/a.txt
 test/sql/file/list_files/b.csv
 
 query T
-SELECT url FROM list_files('test/sql/file/list_files', recursive => TRUE)
+SELECT replace(url, '\', '/') AS url FROM list_files('test/sql/file/list_files', recursive => TRUE)
 ----
 test/sql/file/list_files/a.txt
 test/sql/file/list_files/b.csv
@@ -45,7 +47,7 @@ test/sql/file/list_files/nested/deeper/d.txt
 
 # Explicit globs define their own recursion and may legally match nothing.
 query T
-SELECT url FROM list_files('test/sql/file/list_files/**/*.txt')
+SELECT replace(url, '\', '/') AS url FROM list_files('test/sql/file/list_files/**/*.txt')
 ----
 test/sql/file/list_files/a.txt
 test/sql/file/list_files/nested/deeper/d.txt
@@ -57,7 +59,7 @@ SELECT count(*) FROM list_files('test/sql/file/list_files/**/*.missing')
 
 # The LIST overload preserves caller path order for Python from_files().
 query T
-SELECT url
+SELECT replace(url, '\', '/') AS url
 FROM list_files([
 	'test/sql/file/list_files/b.csv',
 	'test/sql/file/list_files/a.txt'

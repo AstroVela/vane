@@ -13,12 +13,12 @@
 #include <cstdint>
 #include <unordered_map>
 #include <mutex>
-#include <optional>
 
 #include <duckdb/execution/distributed/common_types.hpp>
 #include <duckdb/execution/distributed/exchange/exchange_handles.hpp>
 #include <duckdb/execution/distributed/scheduling/task.hpp>
 #include <duckdb/execution/distributed/scheduling/worker.hpp>
+#include <duckdb/execution/distributed/utils/optional.hpp>
 #include "safe_pyobject.hpp"
 
 namespace duckdb {
@@ -195,7 +195,7 @@ public:
 private:
 	struct PollResultCache {
 		std::mutex mutex;
-		std::optional<PollResult> result;
+		Optional<PollResult> result;
 	};
 
 	TaskContext task_context_;
@@ -232,7 +232,7 @@ public:
 private:
 	struct PollResultCache {
 		std::mutex mutex;
-		std::optional<PollResult> result;
+		Optional<PollResult> result;
 	};
 
 	TaskContext task_context_;

@@ -20,7 +20,7 @@ class CastFunctionSet;
 struct FunctionLocalState;
 
 enum class FileCastMode : uint8_t {
-	STRICT,
+	STRICT_CAST,
 	//! Value rendering needs FILE values to use the ordinary nested-to-VARCHAR implementation without exposing that
 	//! cast to SQL.
 	INTERNAL_FORMATTING,
@@ -137,7 +137,7 @@ struct BindCastInput {
 	optional_ptr<BindCastInfo> info;
 	optional_ptr<ClientContext> context;
 	optional_idx query_location;
-	FileCastMode file_cast_mode = FileCastMode::STRICT;
+	FileCastMode file_cast_mode = FileCastMode::STRICT_CAST;
 
 public:
 	DUCKDB_API BoundCastInfo GetCastFunction(const LogicalType &source, const LogicalType &target);

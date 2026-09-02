@@ -4,10 +4,11 @@ Vane contains Python, pybind11, and a modified DuckDB C++ engine. A native build
 
 ## Prerequisites
 
-- Linux x86-64 for the currently tested path
+- Linux x86-64 for the complete build and test path
+- macOS arm64 and Windows x86-64 for the native build and distributed-test paths used by CI
 - Python 3.10 through 3.14; Python 3.12 is recommended and is the primary development version
 - Git with `git subtree` support
-- A C++20 compiler, CMake 3.29+, Ninja, and ccache
+- A C++20 compiler and CMake 3.29+; Ninja and ccache on Linux/macOS, or Visual Studio 2022 on Windows
 - vcpkg at the baseline pinned in `vcpkg.json`
 
 The DuckDB engine fork is included directly under `external/duckdb`; a normal
@@ -21,8 +22,15 @@ bash scripts/bootstrap_vcpkg.sh
 
 The helper checks out the exact baseline from `vcpkg.json`, installs into
 `vcpkg_installed`, and verifies the committed native-dependency license bundle.
-When intentionally changing native dependencies, regenerate the bundle with
-`python scripts/sync_vcpkg_licenses.py` and review its diff.
+It selects the host platform's release-only target and host triplets by default,
+including `x64-linux-release` on Linux x86-64, `arm64-osx-release` on Apple
+Silicon, and `x64-windows-static-release` on Windows x86-64. Set
+`VCPKG_TARGET_TRIPLET=x64-linux` when both release and debug target dependency
+builds are needed; `VCPKG_HOST_TRIPLET` independently overrides the host tools
+triplet. When intentionally changing native dependencies, regenerate the bundle
+with `python scripts/sync_vcpkg_licenses.py` and review its diff. Successful port
+builds are cached before their temporary build and package trees are removed,
+keeping bootstrap within hosted-runner disk limits.
 
 ## Incremental package build
 
@@ -360,10 +368,12 @@ release environments contain only the public key.
 
 ## Native C++ tests
 
-The complete native gate builds DuckDB, distributed exchange, and the test
-runner with the same pinned Arrow and C++20 configuration used by CI. The
-script starts from a fresh CMake configuration (`cmake --fresh`) to avoid
-configuration drift, which triggers a clean rebuild in its build directory:
+Vane, DuckDB, and the non-Arrow distributed engine build as C++11, while the
+Arrow Flight exchange and its direct tests use C++20. This matches DuckDB's
+native language mode without leaking Arrow's requirement into the engine or
+its consumers. The script starts from a fresh CMake configuration (`cmake
+--fresh`) to avoid configuration drift, which triggers a clean rebuild in its
+build directory:
 
 ```bash
 scripts/run_native_tests.sh "[distributed]"
@@ -379,6 +389,15 @@ scripts/run_native_tests.sh
 The build uses two parallel compile jobs by default to stay within standard CI
 runner memory. Override that limit with `VANE_NATIVE_BUILD_JOBS` when the local
 machine has more capacity.
+
+The launcher uses Ninja's single Release configuration by default. Windows CI
+follows DuckDB's native MSVC path with
+`VANE_NATIVE_CMAKE_GENERATOR="Visual Studio 17 2022"` and
+`VANE_NATIVE_CMAKE_GENERATOR_PLATFORM=x64`; the launcher restricts the
+multi-config build to Release and runs the corresponding test executable. It
+uses the pinned vcpkg toolchain in classic mode so Windows package wrappers
+resolve release-only static library names without installing dependencies a
+second time.
 
 Statically linked DuckDB extensions participate in Ray execution through the
 explicit scan callback and write provider contracts described in

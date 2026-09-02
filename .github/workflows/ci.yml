@@ -104,7 +104,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Python 3.12 also builds the full DuckDB unit suite and both release
+    # wheels. A cold release-only vcpkg cache can take more than 90 minutes.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -149,7 +151,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-linux-release-${{ hashFiles('vcpkg.json') }}
 
       - name: Install pinned native dependencies
         run: bash scripts/bootstrap_vcpkg.sh
@@ -321,6 +323,111 @@ jobs:
             dist/*.whl
             dist/extension-wheels/*.whl
           if-no-files-found: error
+
+  native-macos:
+    name: Native build and tests (macOS arm64)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    # GitHub Actions maps macos-15 to Apple Silicon; macos-15-intel is x86-64.
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VANE_NATIVE_BUILD_JOBS: "2"
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_MAX_CONCURRENCY: "2"
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          brew install bison ccache ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-arm64-osx-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install pinned Release native dependencies
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Verify the Release-only dependency prefix
+        run: |
+          test "$(uname -m)" = arm64
+          test -f vcpkg_installed/arm64-osx-release/share/arrow/ArrowConfig.cmake
+          test ! -e vcpkg_installed/arm64-osx-release/debug
+
+      - name: Build and run DuckDB unit tests
+        run: scripts/run_native_tests.sh
+
+  native-windows:
+    name: Native build and tests (Windows x64)
+    needs: changes
+    if: needs.changes.outputs.run_full == 'true'
+    # Match DuckDB's native MSVC/Visual Studio build instead of cross-compiling.
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VANE_NATIVE_BUILD_JOBS: "4"
+      VANE_NATIVE_CMAKE_GENERATOR: Visual Studio 17 2022
+      VANE_NATIVE_CMAKE_GENERATOR_PLATFORM: x64
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      VCPKG_MAX_CONCURRENCY: "4"
+      VCPKG_ROOT: ${{ github.workspace }}/.cache/vcpkg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg_cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install pinned Release native dependencies
+        shell: bash
+        run: bash scripts/bootstrap_vcpkg.sh
+
+      - name: Verify the Release-only dependency prefix
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          test -f vcpkg_installed/x64-windows-static-release/share/arrow/ArrowConfig.cmake
+          test ! -e vcpkg_installed/x64-windows-static-release/debug
+
+      # Publish the stable immutable key only after the complete bootstrap and
+      # prefix checks pass. A later configure/test failure must not discard the
+      # successful cold build, while a partial bootstrap must not poison the key.
+      - name: Save vcpkg binary cache
+        if: ${{ steps.vcpkg_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-binary-v1-${{ runner.os }}-${{ runner.arch }}-x64-windows-static-release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Build and run DuckDB unit tests
+        shell: bash
+        run: scripts/run_native_tests.sh
 
   fast-tests:
     name: Fast tests (${{ matrix.label }})
@@ -726,6 +833,8 @@ jobs:
       - changes
       - source-package
       - native-fast-tests
+      - native-macos
+      - native-windows
       - fast-tests
       - milvus-tests
       - qdrant-tests
@@ -742,6 +851,8 @@ jobs:
           RUN_FULL: ${{ needs.changes.outputs.run_full }}
           SOURCE_PACKAGE_RESULT: ${{ needs.source-package.result }}
           NATIVE_TESTS_RESULT: ${{ needs.native-fast-tests.result }}
+          NATIVE_MACOS_RESULT: ${{ needs.native-macos.result }}
+          NATIVE_WINDOWS_RESULT: ${{ needs.native-windows.result }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Change classification did not succeed: $CHANGES_RESULT" >&2
@@ -763,11 +874,13 @@ jobs:
 
           if [[ "$SOURCE_PACKAGE_RESULT" != "$expected_result" ||
                 "$NATIVE_TESTS_RESULT" != "$expected_result" ||
+                "$NATIVE_MACOS_RESULT" != "$expected_result" ||
+                "$NATIVE_WINDOWS_RESULT" != "$expected_result" ||
                 "$FAST_TESTS_RESULT" != "$expected_result" ||
                 "$MILVUS_TESTS_RESULT" != "$expected_result" ||
                 "$QDRANT_TESTS_RESULT" != "$expected_result" ||
                 "$AI_TESTS_RESULT" != "$expected_result" ]]; then
-            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
+            echo "Unexpected CI results: source-package=$SOURCE_PACKAGE_RESULT, native-fast-tests=$NATIVE_TESTS_RESULT, native-macos=$NATIVE_MACOS_RESULT, native-windows=$NATIVE_WINDOWS_RESULT, fast-tests=$FAST_TESTS_RESULT, milvus-tests=$MILVUS_TESTS_RESULT, qdrant-tests=$QDRANT_TESTS_RESULT, ai-tests=$AI_TESTS_RESULT" >&2
             exit 1
           fi
 

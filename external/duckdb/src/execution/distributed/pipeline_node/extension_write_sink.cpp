@@ -37,7 +37,7 @@ ExtensionWriteSinkNode::ExtensionWriteSinkNode(NodeID node_id, PipelineNodeRef c
 		throw InvalidInputException("ExtensionWriteSinkNode requires a child");
 	}
 	info_.Validate();
-	if (info_.mode != DistributedWriteMode::CALLBACK) {
+	if (info_.mode != DistributedWriteMode::CALLBACK_SINK) {
 		throw InvalidInputException("ExtensionWriteSinkNode requires callback write mode");
 	}
 }

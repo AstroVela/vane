@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "duckdb/execution/distributed/exchange/shuffle_cache.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -33,7 +34,6 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
-#include <unistd.h>
 
 namespace duckdb {
 namespace distributed {
@@ -241,7 +241,7 @@ public:
 	DuckDBResult<void> WriteTextFileAtomically(const std::string &path, const std::string &contents) const override {
 		auto tmp_path = path + ".tmp";
 		{
-			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc);
+			std::ofstream output(tmp_path, std::ios::out | std::ios::trunc | std::ios::binary);
 			if (!output) {
 				return DuckDBResult<void>::err(DuckDBError::io_error("failed to open shuffle text file: " + tmp_path));
 			}
@@ -716,7 +716,7 @@ ShuffleCache::ShuffleCache(ShuffleCacheConfig config, std::shared_ptr<ShuffleSto
 	// batch file overwrites from concurrent sink tasks.
 	auto counter = g_shuffle_cache_counter.fetch_add(1);
 	std::ostringstream ss;
-	ss << getpid() << "_" << counter;
+	ss << ResolveVaneProcessId() << "_" << counter;
 	instance_id_ = ss.str();
 	for (auto &entry : next_file_ids_) {
 		entry.store(0);
@@ -877,6 +877,9 @@ DuckDBResult<ShuffleAttemptManifest> ShuffleCache::ReadAttemptManifest(const Shu
 	idx_t line_no = 0;
 	while (std::getline(input, line)) {
 		line_no++;
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
 		if (line.empty()) {
 			continue;
 		}

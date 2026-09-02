@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/execution/executor.hpp"

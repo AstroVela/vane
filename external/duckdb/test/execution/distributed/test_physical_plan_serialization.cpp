@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "catch.hpp"
+#include "test_helpers.hpp"
 
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/binary_deserializer.hpp"
@@ -2218,7 +2219,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle0.flight_host = "flight-node-1.internal";
 	handle0.flight_port = 6123;
 	handle0.flight_server_epoch = "epoch-1";
-	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_0", 0));
+	handle0.files.push_back(distributed::ExchangeSourceFile("exchange__sink_0__attempt_0", 0));
 	source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -2229,7 +2230,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle1.flight_host = "flight-node-2.internal";
 	handle1.flight_port = 6124;
 	handle1.flight_server_epoch = "epoch-2";
-	handle1.files.push_back(ExchangeSourceFile("exchange__sink_1__attempt_0", 0));
+	handle1.files.push_back(distributed::ExchangeSourceFile("exchange__sink_1__attempt_0", 0));
 	source_handles.push_back(handle1);
 
 	distributed::ExchangeSourceHandle handle2;
@@ -2240,7 +2241,7 @@ TEST_CASE("PhysicalRemoteExchangeSource serialization preserves explicit source 
 	handle2.flight_host = "flight-node-1.internal";
 	handle2.flight_port = 6123;
 	handle2.flight_server_epoch = "epoch-1";
-	handle2.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_0", 0));
+	handle2.files.push_back(distributed::ExchangeSourceFile("exchange__sink_0__attempt_0", 0));
 	source_handles.push_back(handle2);
 
 	distributed::FlightExchangeConfig flight_config;
@@ -2444,7 +2445,8 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle0.flight_host = "flight-node-1.internal";
 	handle0.flight_port = 5010;
 	handle0.flight_server_epoch = "epoch-1";
-	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_7", 0, (uint64_t(1) << 40) + 123));
+	handle0.files.push_back(
+	    distributed::ExchangeSourceFile("exchange__sink_0__attempt_7", 0, (uint64_t(1) << 40) + 123));
 	descriptor.source_handles.push_back(handle0);
 
 	distributed::ExchangeSourceHandle handle1;
@@ -2455,7 +2457,7 @@ TEST_CASE("ExchangeSourceTaskDescriptor serialization preserves source handle at
 	handle1.flight_host = "flight-node-2.internal";
 	handle1.flight_port = 5011;
 	handle1.flight_server_epoch = "epoch-2";
-	handle1.files.push_back(ExchangeSourceFile("exchange__sink_1__attempt_2", 0, 17));
+	handle1.files.push_back(distributed::ExchangeSourceFile("exchange__sink_1__attempt_2", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	auto roundtrip = distributed::ExchangeSourceTaskDescriptor::DeserializeFromBytes(descriptor.SerializeToBytes());
@@ -2513,13 +2515,13 @@ TEST_CASE("ApplyExchangeSourceTasksToPlan patches runtime-bound exchange source"
 	handle0.partition_id = 0;
 	handle0.attempt_id = 5;
 	handle0.node_id = "node-1";
-	handle0.files.push_back(ExchangeSourceFile("exchange__sink_0__attempt_0", 0, 11));
+	handle0.files.push_back(distributed::ExchangeSourceFile("exchange__sink_0__attempt_0", 0, 11));
 	descriptor.source_handles.push_back(handle0);
 	distributed::ExchangeSourceHandle handle1;
 	handle1.partition_id = 1;
 	handle1.attempt_id = 6;
 	handle1.node_id = "node-2";
-	handle1.files.push_back(ExchangeSourceFile("exchange__sink_1__attempt_0", 0, 17));
+	handle1.files.push_back(distributed::ExchangeSourceFile("exchange__sink_1__attempt_0", 0, 17));
 	descriptor.source_handles.push_back(handle1);
 
 	std::unordered_map<idx_t, distributed::ExchangeSourceTaskDescriptor> tasks;

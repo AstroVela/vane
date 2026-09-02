@@ -523,7 +523,11 @@ struct PyPhysicalPlanWrapper {
 		struct UDFIdentityRollback {
 			const vector<UDFFunctionData *> &bind_data;
 			vector<Value> &payloads;
-			bool active = true;
+			bool active;
+
+			UDFIdentityRollback(const vector<UDFFunctionData *> &bind_data_p, vector<Value> &payloads_p)
+			    : bind_data(bind_data_p), payloads(payloads_p), active(true) {
+			}
 
 			~UDFIdentityRollback() {
 				if (!active) {
@@ -537,7 +541,7 @@ struct PyPhysicalPlanWrapper {
 			void Commit() {
 				active = false;
 			}
-		} identity_rollback {physical_udfs, unidentified_payloads};
+		} identity_rollback(physical_udfs, unidentified_payloads);
 
 		auto pipeline_root = BuildDistributedPipelineNode(plan_, client_context_.get());
 		vector<duckdb::distributed::DistributedPipelineNodeRef> pipeline_nodes;
@@ -581,7 +585,10 @@ struct PyPhysicalPlanWrapper {
 			}
 		}
 		std::sort(pipeline_nodes.begin(), pipeline_nodes.end(),
-		          [](const auto &left, const auto &right) { return left->node_id() < right->node_id(); });
+		          [](const duckdb::distributed::DistributedPipelineNodeRef &left,
+		             const duckdb::distributed::DistributedPipelineNodeRef &right) {
+			          return left->node_id() < right->node_id();
+		          });
 
 		if (physical_udfs.size() != pipeline_udfs.size()) {
 			throw duckdb::InternalException(
@@ -679,7 +686,10 @@ struct PyPhysicalPlanWrapper {
 			py::list input_node_ids;
 			auto children = node->arc_children();
 			std::sort(children.begin(), children.end(),
-			          [](const auto &left, const auto &right) { return left->node_id() < right->node_id(); });
+			          [](const duckdb::distributed::DistributedPipelineNodeRef &left,
+			             const duckdb::distributed::DistributedPipelineNodeRef &right) {
+				          return left->node_id() < right->node_id();
+			          });
 			for (auto &child : children) {
 				input_node_ids.append(py::str(std::to_string(child->node_id())));
 			}
@@ -1224,17 +1234,17 @@ public:
 				}
 			}
 		});
-		auto clear_handles = [&](const char *phase) -> std::optional<string> {
+		auto clear_handles = [&](const char *phase) -> distributed::Optional<string> {
 			try {
 				ClearAllResultHandles();
-				return std::nullopt;
+				return distributed::nullopt;
 			} catch (const std::exception &ex) {
 				return string(phase) + " result cleanup: " + ex.what();
 			} catch (...) {
 				return string(phase) + " result cleanup: unknown error";
 			}
 		};
-		std::optional<string> backend_shutdown_error;
+		distributed::Optional<string> backend_shutdown_error;
 		try {
 			duckdb::PythonGILWrapper gil;
 			auto backend = backend_.get();
@@ -1246,7 +1256,7 @@ public:
 		}
 		WaitForAllResultHandleOperations();
 		auto initial_cleanup_error = clear_handles("post-quiescence");
-		std::optional<string> final_cleanup_error;
+		distributed::Optional<string> final_cleanup_error;
 		if (initial_cleanup_error) {
 			final_cleanup_error = clear_handles("cleanup retry");
 		}
@@ -1321,8 +1331,9 @@ public:
 				return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 				    "FTE task submission rejected because its resource query is closing: " + submission_error_owner));
 			}
+			const QueryLifecycleCoordinator::Operation active_operation = *active_owner;
 			PyBackendResultOperationGuard operation(
-			    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+			    [this, active_operation]() { query_lifecycles_.EndOperation(active_operation); });
 			try {
 				duckdb::PythonGILWrapper gil;
 				py::list py_tasks;
@@ -1365,8 +1376,9 @@ public:
 				return DuckDBResult<void>::err(
 				    DuckDBError::invalid_state_error("Python backend FTE query input stream is closing: " + query_id));
 			}
+			const QueryLifecycleCoordinator::Operation active_operation = *active_owner;
 			PyBackendResultOperationGuard operation(
-			    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+			    [this, active_operation]() { query_lifecycles_.EndOperation(active_operation); });
 			duckdb::PythonGILWrapper gil;
 			py::list py_source_node_ids;
 			for (auto source_node_id : source_node_ids) {
@@ -1394,8 +1406,9 @@ public:
 				return DuckDBResult<void>::err(DuckDBError::invalid_state_error(
 				    "Python backend FTE query materialization barrier is closing: " + query_id));
 			}
+			const QueryLifecycleCoordinator::Operation active_operation = *active_owner;
 			PyBackendResultOperationGuard operation(
-			    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+			    [this, active_operation]() { query_lifecycles_.EndOperation(active_operation); });
 			duckdb::PythonGILWrapper gil;
 			auto backend = backend_.get();
 			backend.attr("materialization_barrier_completed")(query_id, std::to_string(node_id));
@@ -1449,8 +1462,9 @@ public:
 			return DuckDBResult<std::vector<duckdb::distributed::MaterializedOutput>>::err(
 			    DuckDBError::external_error("Python backend FTE query is closing: " + query_id));
 		}
+		const QueryLifecycleCoordinator::Operation active_operation = *active_owner;
 		PyBackendResultOperationGuard operation(
-		    [this, active = *active_owner]() { query_lifecycles_.EndOperation(active); });
+		    [this, active_operation]() { query_lifecycles_.EndOperation(active_operation); });
 		auto fail_after_result_cleanup = [&](const string &stage, const char *detail) {
 			::vane::BoundedErrorDetails errors;
 			errors.Add(stage, detail);
@@ -1648,7 +1662,7 @@ public:
 			}
 			query_cleanup_(teardown->lifecycle.owner_query_id);
 			submission_errors_.Discard(teardown->lifecycle.owner_query_id);
-			query_lifecycles_.CompleteTeardown(*teardown, std::nullopt);
+			query_lifecycles_.CompleteTeardown(*teardown, distributed::nullopt);
 		} catch (...) {
 			auto failure = ExceptionMessage(std::current_exception());
 			try {
@@ -1710,17 +1724,18 @@ public:
 	}
 
 private:
+	using PythonTaskResultHandle = duckdb::distributed::python::ray::PythonTaskResultHandle;
+	using PythonTaskResultHandles = std::vector<std::unique_ptr<PythonTaskResultHandle>>;
+	using PythonTaskResultHandleMap = std::unordered_map<string, PythonTaskResultHandles>;
+
 	mutable mutex mutex_;
 	duckdb::distributed::python::ray::SafePyObject backend_;
 	QueryCleanup query_cleanup_;
 	QueryLifecycleCoordinator query_lifecycles_;
 	duckdb::distributed::python::ray::PythonExceptionStore submission_errors_;
-	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
-	    result_handles_by_query_;
-	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
-	    retained_result_handles_by_query_;
-	std::unordered_map<string, std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>>>
-	    cleanup_retry_result_handles_by_query_;
+	PythonTaskResultHandleMap result_handles_by_query_;
+	PythonTaskResultHandleMap retained_result_handles_by_query_;
+	PythonTaskResultHandleMap cleanup_retry_result_handles_by_query_;
 	std::unordered_map<string, std::unordered_map<string, size_t>> result_handle_counts_by_query_;
 
 	static string QueryIdFromTaskEvents(const std::vector<duckdb::distributed::WorkerTask> &tasks) {
@@ -1742,7 +1757,7 @@ private:
 		return query_id;
 	}
 
-	std::optional<QueryLifecycleCoordinator::Abort> BeginResultHandleAbort(const string &query_id) {
+	distributed::Optional<QueryLifecycleCoordinator::Abort> BeginResultHandleAbort(const string &query_id) {
 		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 			py::gil_scoped_release release;
 			return query_lifecycles_.BeginAbort(query_id);
@@ -1750,7 +1765,7 @@ private:
 		return query_lifecycles_.BeginAbort(query_id);
 	}
 
-	std::optional<QueryLifecycleCoordinator::Abort>
+	distributed::Optional<QueryLifecycleCoordinator::Abort>
 	BeginResultHandleAbort(const QueryLifecycleCoordinator::Teardown &teardown) {
 		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 			py::gil_scoped_release release;
@@ -1759,7 +1774,7 @@ private:
 		return query_lifecycles_.BeginAbort(teardown);
 	}
 
-	std::optional<QueryLifecycleCoordinator::Operation>
+	distributed::Optional<QueryLifecycleCoordinator::Operation>
 	BeginResultHandleOperation(const string &query_id, const string &requested_owner_query_id = string()) {
 		return query_lifecycles_.BeginOperation(query_id, requested_owner_query_id, false);
 	}
@@ -1782,7 +1797,7 @@ private:
 		query_lifecycles_.WaitForAllOperations();
 	}
 
-	std::optional<QueryLifecycleCoordinator::Teardown> BeginResultHandleTeardown(const string &query_id) {
+	distributed::Optional<QueryLifecycleCoordinator::Teardown> BeginResultHandleTeardown(const string &query_id) {
 		if (Py_IsInitialized() && !duckdb::PythonIsFinalizing() && PyGILState_Check()) {
 			py::gil_scoped_release release;
 			return query_lifecycles_.BeginTeardown(query_id);
@@ -1808,12 +1823,12 @@ private:
 		}
 	}
 
-	DuckDBResult<void> ExecuteResultHandleAbort(std::optional<QueryLifecycleCoordinator::Abort> active_abort) {
+	DuckDBResult<void> ExecuteResultHandleAbort(distributed::Optional<QueryLifecycleCoordinator::Abort> active_abort) {
 		if (!active_abort) {
 			return DuckDBResult<void>::ok();
 		}
 
-		std::optional<string> failure;
+		distributed::Optional<string> failure;
 		try {
 			std::vector<std::pair<string, std::exception_ptr>> backend_drop_errors;
 			auto drop_execution_queries = [&]() {
@@ -2259,7 +2274,7 @@ private:
 		}
 		::vane::BoundedErrorDetails errors;
 		std::vector<std::unique_ptr<duckdb::distributed::python::ray::PythonTaskResultHandle>> retry_handles;
-		auto release_all = [&](auto &owned_handles, const char *kind) {
+		auto release_all = [&](PythonTaskResultHandles &owned_handles, const char *kind) {
 			for (size_t index = 0; index < owned_handles.size(); index++) {
 				try {
 					owned_handles[index]->ReleasePollResult();
@@ -2310,7 +2325,7 @@ private:
 	bool LifecycleHasResultHandles(const QueryLifecycleCoordinator::LifecycleRef &lifecycle) const {
 		const auto query_ids = query_lifecycles_.QueryIds(lifecycle);
 		lock_guard<mutex> guard(mutex_);
-		auto has_handles = [&](const auto &handles_by_query, const string &query_id) {
+		auto has_handles = [&](const PythonTaskResultHandleMap &handles_by_query, const string &query_id) {
 			auto entry = handles_by_query.find(query_id);
 			return entry != handles_by_query.end() && !entry->second.empty();
 		};
@@ -2445,20 +2460,22 @@ private:
 		}
 		const bool discard_unselected_outputs = !selected_only && selected_attempt_task_ids.empty();
 		if (on_output) {
-			std::stable_sort(pending.begin(), pending.end(), [](const auto &lhs, const auto &rhs) {
-				const auto lhs_context = lhs->GetTaskContext();
-				const auto rhs_context = rhs->GetTaskContext();
-				if (lhs_context.query_idx() != rhs_context.query_idx()) {
-					return lhs_context.query_idx() < rhs_context.query_idx();
-				}
-				if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
-					return lhs_context.last_node_id() < rhs_context.last_node_id();
-				}
-				if (lhs_context.task_id() != rhs_context.task_id()) {
-					return lhs_context.task_id() < rhs_context.task_id();
-				}
-				return lhs->GetFteTaskId() < rhs->GetFteTaskId();
-			});
+			std::stable_sort(pending.begin(), pending.end(),
+			                 [](const std::unique_ptr<PythonTaskResultHandle> &lhs,
+			                    const std::unique_ptr<PythonTaskResultHandle> &rhs) {
+				                 const auto lhs_context = lhs->GetTaskContext();
+				                 const auto rhs_context = rhs->GetTaskContext();
+				                 if (lhs_context.query_idx() != rhs_context.query_idx()) {
+					                 return lhs_context.query_idx() < rhs_context.query_idx();
+				                 }
+				                 if (lhs_context.last_node_id() != rhs_context.last_node_id()) {
+					                 return lhs_context.last_node_id() < rhs_context.last_node_id();
+				                 }
+				                 if (lhs_context.task_id() != rhs_context.task_id()) {
+					                 return lhs_context.task_id() < rhs_context.task_id();
+				                 }
+				                 return lhs->GetFteTaskId() < rhs->GetFteTaskId();
+			                 });
 		}
 		// Internal helper convention: negative timeout means no deadline; zero means poll once then time out.
 		const auto deadline = timeout_s >= 0.0 ? std::chrono::steady_clock::now() +

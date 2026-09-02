@@ -142,7 +142,9 @@ struct PreparedPromptMedia {
 		if (error.empty()) {
 			try {
 				string bytes(NumericCast<idx_t>(size), '\0');
-				resolved->ReadExact(reinterpret_cast<data_ptr_t>(bytes.data()), size);
+				if (!bytes.empty()) {
+					resolved->ReadExact(reinterpret_cast<data_ptr_t>(&bytes[0]), size);
+				}
 				data = Value::BLOB_RAW(bytes);
 			} catch (const std::exception &exception) {
 				ErrorData error_data(exception);

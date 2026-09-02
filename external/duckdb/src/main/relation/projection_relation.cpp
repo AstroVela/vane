@@ -73,7 +73,7 @@ bool ProjectionRelation::CanSerializeToQueryNodeInternal(Binder &binder) {
 	}
 	auto serialization_binder = Binder::CreateBinder(binder.context);
 	auto serialization_input = BindRelationInput(*serialization_binder, *child);
-	return std::all_of(expressions.begin(), expressions.end(), [&](const auto &expression) {
+	return std::all_of(expressions.begin(), expressions.end(), [&](const unique_ptr<ParsedExpression> &expression) {
 		return CanSerializeExpressionOnBoundChild(*serialization_binder, *child, *serialization_input, *expression);
 	});
 }

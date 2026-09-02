@@ -17,10 +17,10 @@ class ExtensionLoader;
 class Serializer;
 
 //! Selects the worker-side implementation used by an extension write.
-//! FILE_ARTIFACT consumes DuckDB WRITTEN_FILE_STATISTICS. CALLBACK replaces
+//! FILE_ARTIFACT consumes DuckDB WRITTEN_FILE_STATISTICS. CALLBACK_SINK replaces
 //! the coordinator-only extension root with the registered streaming callback
 //! sink on every worker.
-enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK = 1 };
+enum class DistributedWriteMode : uint8_t { FILE_ARTIFACT = 0, CALLBACK_SINK = 1 };
 
 //! An immutable object created by a worker write. The extension owns the
 //! artifact codec and payload. URI is optional for non-file artifacts. Worker
@@ -152,6 +152,15 @@ using distributed_write_finalize_t = vector<DistributedWriteFragment> (*)(Client
 //! Complete worker-side streaming write implementation registered by a static
 //! extension. Every callback is mandatory; missing callbacks are hard errors.
 struct DistributedExtensionWriteCallbacks {
+	DistributedExtensionWriteCallbacks() = default;
+	DistributedExtensionWriteCallbacks(distributed_write_initialize_global_t initialize_global_p,
+	                                   distributed_write_initialize_local_t initialize_local_p,
+	                                   distributed_write_sink_t sink_p, distributed_write_combine_t combine_p,
+	                                   distributed_write_finalize_t finalize_p)
+	    : initialize_global(initialize_global_p), initialize_local(initialize_local_p), sink(sink_p),
+	      combine(combine_p), finalize(finalize_p) {
+	}
+
 	distributed_write_initialize_global_t initialize_global = nullptr;
 	distributed_write_initialize_local_t initialize_local = nullptr;
 	distributed_write_sink_t sink = nullptr;

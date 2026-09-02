@@ -21,6 +21,8 @@ namespace duckdb {
 class ClientContext;
 namespace distributed {
 
+class JoinTaskBuilderTestAccess;
+
 struct ScanSplit;
 
 struct MaterializeResult;

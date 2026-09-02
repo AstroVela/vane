@@ -10,6 +10,7 @@
 
 #include "duckdb/execution/operator/projection/physical_udf_inout.hpp"
 #include "duckdb/execution/distributed/common_types.hpp"
+#include "duckdb/execution/distributed/process_id.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/limits.hpp"
@@ -39,7 +40,6 @@
 #include <limits>
 #include <thread>
 #include <unordered_map>
-#include <unistd.h>
 
 namespace duckdb {
 
@@ -100,8 +100,8 @@ static void StreamingUDFDebugLog(const string &message) {
 	if (!StreamingUDFDebugEnabled()) {
 		return;
 	}
-	std::cerr << "[vane-streaming-udf pid=" << getpid() << " tid=" << std::this_thread::get_id() << "] " << message
-	          << std::endl;
+	std::cerr << "[vane-streaming-udf pid=" << distributed::ResolveVaneProcessId()
+	          << " tid=" << std::this_thread::get_id() << "] " << message << std::endl;
 }
 
 static bool UDFWorkerSlotDebugEnabled() {
@@ -117,8 +117,8 @@ static void UDFWorkerSlotDebugLog(const string &message) {
 	if (!UDFWorkerSlotDebugEnabled()) {
 		return;
 	}
-	std::cerr << "[vane-udf-worker-slots pid=" << getpid() << " tid=" << std::this_thread::get_id() << "] " << message
-	          << std::endl;
+	std::cerr << "[vane-udf-worker-slots pid=" << distributed::ResolveVaneProcessId()
+	          << " tid=" << std::this_thread::get_id() << "] " << message << std::endl;
 }
 
 static atomic<uint64_t> g_streaming_udf_debug_tick {0};

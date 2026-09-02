@@ -61,7 +61,7 @@ void IcebergExtension::Load(ExtensionLoader &loader) {
     DistributedWriteOperatorExtension write;
     write.name = "iceberg_write_fragments";
     write.protocol_version = 1;
-    write.mode = DistributedWriteMode::CALLBACK;
+    write.mode = DistributedWriteMode::CALLBACK_SINK;
     write.fragment_codec = {"iceberg.commit-fragment", 1};
     write.callbacks = IcebergWriteCallbacks();
     DistributedWriteOperatorExtension::Register(loader, std::move(write));
@@ -435,7 +435,7 @@ artifacts.
 
 ### Callback mode
 
-`CALLBACK` supports extensions whose worker output is a commit fragment rather
+`CALLBACK_SINK` supports extensions whose worker output is a commit fragment rather
 than DuckDB's file-statistics row. `DistributedWriteOperatorExtension::Register`
 registers one complete hook containing its mode, protocol, codec, and five
 mandatory worker callbacks:
