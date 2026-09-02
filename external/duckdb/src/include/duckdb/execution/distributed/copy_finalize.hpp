@@ -1126,9 +1126,12 @@ CleanupDistributedCopyDirectWriteUnselectedFiles(FileSystem &fs, const std::stri
 	std::unordered_set<std::string> selected_paths;
 	for (const auto &info : selected_files) {
 		if (!info.final_path.empty()) {
-			selected_paths.insert(info.final_path);
+			selected_paths.insert(NormalizeDistributedCopyPathForComparison(fs, info.final_path));
 		}
 	}
+	auto path_is_selected = [&](const std::string &path) {
+		return selected_paths.find(NormalizeDistributedCopyPathForComparison(fs, path)) != selected_paths.end();
+	};
 
 	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, direct_write_run_dir);
 	if (files_res.is_err()) {
@@ -1136,7 +1139,7 @@ CleanupDistributedCopyDirectWriteUnselectedFiles(FileSystem &fs, const std::stri
 	}
 	std::vector<std::string> unselected_files;
 	for (const auto &path : files_res.value()) {
-		if (selected_paths.find(path) == selected_paths.end()) {
+		if (!path_is_selected(path)) {
 			unselected_files.push_back(path);
 		}
 	}
@@ -1150,7 +1153,7 @@ CleanupDistributedCopyDirectWriteUnselectedFiles(FileSystem &fs, const std::stri
 		return DuckDBResult<void>::err(remaining_res.error());
 	}
 	for (const auto &path : remaining_res.value()) {
-		if (selected_paths.find(path) == selected_paths.end()) {
+		if (!path_is_selected(path)) {
 			return DuckDBResult<void>::err(DuckDBError::io_error(
 			    "distributed COPY unselected direct-write object still exists after cleanup: " + path));
 		}
@@ -1170,9 +1173,12 @@ CleanupDistributedCopyDirectTargetUnselectedFiles(FileSystem &fs, const std::str
 	std::unordered_set<std::string> selected_paths;
 	for (const auto &info : selected_files) {
 		if (!info.final_path.empty()) {
-			selected_paths.insert(info.final_path);
+			selected_paths.insert(NormalizeDistributedCopyPathForComparison(fs, info.final_path));
 		}
 	}
+	auto path_is_selected = [&](const std::string &path) {
+		return selected_paths.find(NormalizeDistributedCopyPathForComparison(fs, path)) != selected_paths.end();
+	};
 
 	auto files_res = ListDistributedCopyFilesUnderPrefix(fs, base_path);
 	if (files_res.is_err()) {
@@ -1180,7 +1186,7 @@ CleanupDistributedCopyDirectTargetUnselectedFiles(FileSystem &fs, const std::str
 	}
 	std::vector<std::string> unselected_files;
 	for (const auto &path : files_res.value()) {
-		if (selected_paths.find(path) != selected_paths.end()) {
+		if (path_is_selected(path)) {
 			continue;
 		}
 		if (CopyDirectTargetFileNameMatchesRun(StringUtil::GetFileName(path), run_id)) {
@@ -1197,7 +1203,7 @@ CleanupDistributedCopyDirectTargetUnselectedFiles(FileSystem &fs, const std::str
 		return DuckDBResult<void>::err(remaining_res.error());
 	}
 	for (const auto &path : remaining_res.value()) {
-		if (selected_paths.find(path) != selected_paths.end()) {
+		if (path_is_selected(path)) {
 			continue;
 		}
 		if (CopyDirectTargetFileNameMatchesRun(StringUtil::GetFileName(path), run_id)) {

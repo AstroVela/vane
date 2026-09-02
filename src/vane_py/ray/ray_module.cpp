@@ -4861,12 +4861,13 @@ void register_ray_bindings(py::module_ &mod) {
 		    const std::string run_id = "run-visible";
 		    const std::string other_run_id = "other-run";
 		    auto final_root = local_dir + "/copy_direct_target_visible";
-		    auto first_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_0", "part0.parquet");
-		    auto second_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_1", "part1.parquet");
-		    auto loser_file = BuildCopyDirectTargetFilePath(final_root, run_id, "w_loser", "part.parquet");
+		    auto first_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_0", "part0.parquet");
+		    auto second_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_1", "part1.parquet");
+		    auto loser_file = BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_loser", "part.parquet");
 		    auto replay_loser_file =
-		        BuildCopyDirectTargetFilePath(final_root, run_id, "w_replay_loser", "part.parquet");
-		    auto other_run_file = BuildCopyDirectTargetFilePath(final_root, other_run_id, "w_other", "part.parquet");
+		        BuildCopyDirectTargetFilePath(fs, final_root, run_id, "w_replay_loser", "part.parquet");
+		    auto other_run_file =
+		        BuildCopyDirectTargetFilePath(fs, final_root, other_run_id, "w_other", "part.parquet");
 
 		    auto write_file = [&](const std::string &path, const std::string &body) {
 			    auto parent = StringUtil::GetFilePath(path);
