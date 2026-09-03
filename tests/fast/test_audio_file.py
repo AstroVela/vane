@@ -416,6 +416,92 @@ def test_audio_resample_checks_native_output_buffer_before_soxr_call(duckdb_curs
     assert process_calls == []
 
 
+@pytest.mark.parametrize(
+    ("cancel_phase", "expected_native_calls"),
+    [
+        ("constructor", []),
+        ("delay", ["constructor"]),
+        ("resample_chunk", ["constructor", "delay", "delay"]),
+    ],
+)
+def test_audio_resample_checks_cancellation_before_native_soxr_calls(cancel_phase, expected_native_calls):
+    cancelled = False
+    native_calls = []
+
+    class FakeSoundFileError(Exception):
+        pass
+
+    class BufferedSoundFile:
+        samplerate = 8000
+        channels = 1
+        frames = 1
+        format = "WAV"
+        subtype = "FLOAT"
+
+        def __init__(self, stream, *, mode, closefd):
+            assert mode == "r"
+            assert closefd is False
+
+        def buffer_read_into(self, buffer, *, dtype):
+            nonlocal cancelled
+            assert dtype == "float64"
+            if cancel_phase == "constructor":
+                cancelled = True
+            return 1
+
+        def close(self):
+            pass
+
+    class FakeSoundFileModule:
+        SoundFile = BufferedSoundFile
+        SoundFileError = FakeSoundFileError
+
+    class FakeResampleStream:
+        def __init__(self, *args, **kwargs):
+            nonlocal cancelled
+            native_calls.append("constructor")
+            if cancel_phase == "delay":
+                cancelled = True
+
+        def delay(self):
+            nonlocal cancelled
+            native_calls.append("delay")
+            if cancel_phase == "resample_chunk" and native_calls.count("delay") == 2:
+                cancelled = True
+            return 0
+
+        def resample_chunk(self, *args, **kwargs):
+            native_calls.append("resample_chunk")
+            raise AssertionError("cancellation must be observed before native resampling")
+
+    class FakeSoxrModule:
+        ResampleStream = FakeResampleStream
+
+    def check_interrupted():
+        if cancelled:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _audio_file._resample_audio_reader(
+            object(),
+            logical_size=0,
+            content_type="audio/wav",
+            sample_rate=16000,
+            max_input_bytes=1,
+            max_frames=1,
+            max_decoded_bytes=8,
+            max_output_frames=2,
+            max_output_bytes=16,
+            max_batch_output_bytes=None,
+            check_interrupted=check_interrupted,
+            soundfile=FakeSoundFileModule,
+            soxr=FakeSoxrModule,
+            numpy=np,
+        )
+
+    assert native_calls == expected_native_calls
+
+
 def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
     pa = pytest.importorskip("pyarrow")
     payload, _ = _encoded_audio("WAV", "FLOAT", sample_rate=8000, frames=32, channels=2)

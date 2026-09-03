@@ -925,6 +925,8 @@ def _resample_audio_reader(
 
                 def resampler_delay_frames() -> int:
                     assert resampler is not None
+                    if check_interrupted is not None:
+                        check_interrupted()
                     delay = float(resampler.delay())
                     if not math.isfinite(delay) or delay < 0:
                         raise RuntimeError(f"audio resampler returned an invalid delay: {delay!r}")
@@ -963,6 +965,8 @@ def _resample_audio_reader(
                         append_output(decoded_array)
                         return
                     if resampler is None:
+                        if check_interrupted is not None:
+                            check_interrupted()
                         try:
                             resampler = soxr.ResampleStream(
                                 metadata.sample_rate,
