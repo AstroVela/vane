@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import operator
 import re
+import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import time as datetime_time
@@ -945,8 +946,17 @@ def _validate_image_arrow_values(
     data = children["data"]
     is_binary_view = getattr(pa.types, "is_binary_view", None)
     if callable(is_binary_view) and is_binary_view(data.type):
-        # PyArrow has no binary_length kernel for BinaryView yet.
-        data_sizes = [None if value is None else len(value) for value in data.to_pylist()]
+        # PyArrow has no binary_length kernel for BinaryView yet. Each Arrow
+        # BinaryView slot starts with its int32 byte length, followed by 12
+        # bytes of inline data or an out-of-line buffer reference. Read only
+        # that fixed-size metadata instead of materializing pixel payloads.
+        view_buffer = data.buffers()[1]
+        start = data.offset * 16
+        end = start + len(data) * 16
+        if view_buffer is None or view_buffer.size < end:
+            raise RuntimeError("IMAGE validation received malformed Arrow BinaryView storage")
+        view_bytes = memoryview(view_buffer)[start:end]
+        data_sizes = [length for (length,) in struct.iter_unpack("<i12x", view_bytes)]
     else:
         data_sizes = pc.binary_length(data).to_pylist()
     values = {

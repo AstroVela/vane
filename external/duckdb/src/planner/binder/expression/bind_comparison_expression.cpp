@@ -88,7 +88,15 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 	const auto left_is_image = ImageLogicalType::IsImage(left_type);
 	const auto right_is_image = ImageLogicalType::IsImage(right_type);
 	if (left_is_image || right_is_image) {
-		if (comparison_type != ExpressionType::COMPARE_EQUAL && comparison_type != ExpressionType::COMPARE_NOTEQUAL) {
+		switch (comparison_type) {
+		case ExpressionType::COMPARE_EQUAL:
+		case ExpressionType::COMPARE_NOTEQUAL:
+		case ExpressionType::COMPARE_IN:
+		case ExpressionType::COMPARE_NOT_IN:
+		case ExpressionType::COMPARE_DISTINCT_FROM:
+		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+			break;
+		default:
 			return false;
 		}
 		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL) ||

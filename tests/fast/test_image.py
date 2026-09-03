@@ -96,14 +96,34 @@ def test_image_parameter_fetch_and_arrow_storage(duckdb_cursor):
     ]
 
 
+def test_image_sql_constructor_and_constant_rendering(duckdb_cursor):
+    image = vane.Image(b"\x00\x01", 2, 1, "L")
+    expression_sql = str(vane.ConstantExpression(image))
+
+    assert duckdb_cursor.execute(
+        f"SELECT typeof({expression_sql}), ({expression_sql}).width, {expression_sql}"
+    ).fetchone() == ("IMAGE", 2, image)
+    assert duckdb_cursor.execute("SELECT image(NULL::BLOB, 1, 1, 1, 'L')").fetchone() == (None,)
+    assert duckdb_cursor.execute(
+        "SELECT image(data, width, height, channels, mode) FROM (VALUES "
+        "('\\x00\\x01'::BLOB, 2::UINTEGER, 1::UINTEGER, 1::UTINYINT, 'L'), "
+        "(NULL::BLOB, 2::UINTEGER, 1::UINTEGER, 1::UTINYINT, 'L')) "
+        "images(data, width, height, channels, mode)"
+    ).fetchall() == [(image,), (None,)]
+    with pytest.raises(vane.InvalidInputException, match="expected 3"):
+        duckdb_cursor.execute("SELECT image('\\x00'::BLOB, 1, 1, 3, 'RGB')")
+
+
 def test_image_comparison_requires_the_image_logical_type(duckdb_cursor):
     image = vane.Image(b"\x00", 1, 1, "L")
     other = vane.Image(b"\x01", 1, 1, "L")
 
     assert duckdb_cursor.execute(
-        "SELECT $1 = $2, $1 != $3, $1 = NULL::IMAGE",
+        "SELECT $1 = $2, $1 != $3, $1 = NULL::IMAGE, "
+        "$1 IN ($2), $1 NOT IN ($3), $1 IS DISTINCT FROM NULL::IMAGE, "
+        "NULL::IMAGE IS NOT DISTINCT FROM NULL::IMAGE",
         [image, image, other],
-    ).fetchone() == (True, True, None)
+    ).fetchone() == (True, True, None, True, True, True, True)
 
     with pytest.raises(vane.BinderException, match="Cannot compare values of type IMAGE"):
         duckdb_cursor.execute("SELECT $1 = struct_pack(data := $2)", [image, b"\x00"])
@@ -182,6 +202,34 @@ def test_batch_image_udf_validates_physical_contract():
 
     with pytest.raises(vane.InvalidInputException, match="expected 3"):
         invalid_image(pa.array([1], type=pa.int32()))
+
+
+@pytest.mark.skipif(not hasattr(pa, "binary_view"), reason="PyArrow does not expose BinaryView")
+def test_batch_image_udf_validates_sliced_binary_view_metadata():
+    image_type = pa.struct(
+        [
+            pa.field("data", pa.binary_view()),
+            pa.field("width", pa.uint32()),
+            pa.field("height", pa.uint32()),
+            pa.field("channels", pa.uint8()),
+            pa.field("mode", pa.string()),
+        ]
+    )
+    images = pa.array(
+        [
+            {"data": b"unused", "width": 6, "height": 1, "channels": 1, "mode": "L"},
+            {"data": bytes(range(13)), "width": 13, "height": 1, "channels": 1, "mode": "L"},
+        ],
+        type=image_type,
+    ).slice(1)
+
+    @vane.func.batch(return_dtype=vane.image_type())
+    def binary_view_image(_values):
+        return images
+
+    result = binary_view_image(pa.array([1], type=pa.int32()))
+
+    assert result.to_pylist() == [{"data": bytes(range(13)), "width": 13, "height": 1, "channels": 1, "mode": "L"}]
 
 
 def test_registered_batch_image_udf_preserves_type():

@@ -279,9 +279,12 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	}();
 	if ((source_contains_governed || target_contains_governed) && source.id() != LogicalTypeId::SQLNULL &&
 	    target.id() != LogicalTypeId::SQLNULL && !internal_governed_cast_allowed) {
+		auto contains_image = TypeVisitor::Contains(source, ImageLogicalType::IsImage) ||
+		                      TypeVisitor::Contains(target, ImageLogicalType::IsImage);
+		auto boundary_name = contains_image ? "governed values" : "FILE-family casts";
 		throw BinderException(get_input.query_location,
-		                      "Cannot cast from %s to %s: governed values require an exact logical type match",
-		                      source.ToString(), target.ToString());
+		                      "Cannot cast from %s to %s: %s require an exact logical type match", source.ToString(),
+		                      target.ToString(), boundary_name);
 	}
 	// the first function is the default
 	// we iterate the set of bind functions backwards

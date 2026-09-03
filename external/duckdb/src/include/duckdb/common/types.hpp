@@ -551,6 +551,7 @@ struct ImageLogicalType {
 	//! IMAGE is an immutable decoded uint8 image. Its named STRUCT storage stays
 	//! Arrow-compatible while the alias carries the logical contract.
 	static constexpr const char *TYPE_NAME = "IMAGE";
+	static constexpr const char *CONSTRUCTOR_NAME = "image";
 
 	enum FieldIndex : idx_t {
 		DATA = 0,
