@@ -49,6 +49,27 @@ true	true	true	true	false	true
 statement error Cannot compare values of type IMAGE
 SELECT image('\x00'::BLOB, 1, 1, 1, 'L') < image('\x01'::BLOB, 1, 1, 1, 'L')
 
+statement error Cannot compare values of type IMAGE\[\]
+SELECT [image('\x00'::BLOB, 1, 1, 1, 'L')] < [image('\x01'::BLOB, 1, 1, 1, 'L')]
+
+statement error Cannot compare values of type IMAGE\[1\]
+SELECT array_value(image('\x00'::BLOB, 1, 1, 1, 'L')) < array_value(image('\x01'::BLOB, 1, 1, 1, 'L'))
+
+statement error Cannot compare values of type STRUCT
+SELECT {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
+
+statement error Cannot compare values of type MAP
+SELECT MAP {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
+
+statement ok
+PREPARE compare_image AS
+SELECT image('\x00'::BLOB, 1, 1, 1, 'L') = $1
+
+query B
+EXECUTE compare_image(image('\x00'::BLOB, 1, 1, 1, 'L'))
+----
+true
+
 statement error governed values require an exact logical type match
 SELECT struct_pack(
     data := '\x00'::BLOB,

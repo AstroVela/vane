@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/catalog/catalog_entry/collate_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 
 #include "duckdb/function/scalar/string_functions.hpp"
 
@@ -66,6 +67,20 @@ static bool SwitchVarcharComparison(const LogicalType &type) {
 	}
 }
 
+static bool IsEqualityComparison(ExpressionType comparison_type) {
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_NOTEQUAL:
+	case ExpressionType::COMPARE_IN:
+	case ExpressionType::COMPARE_NOT_IN:
+	case ExpressionType::COMPARE_DISTINCT_FROM:
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+		return true;
+	default:
+		return false;
+	}
+}
+
 bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const LogicalType &left_type,
                                                   const LogicalType &right_type, LogicalType &result_type,
                                                   ExpressionType comparison_type) {
@@ -88,40 +103,25 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 	const auto left_is_image = ImageLogicalType::IsImage(left_type);
 	const auto right_is_image = ImageLogicalType::IsImage(right_type);
 	if (left_is_image || right_is_image) {
-		switch (comparison_type) {
-		case ExpressionType::COMPARE_EQUAL:
-		case ExpressionType::COMPARE_NOTEQUAL:
-		case ExpressionType::COMPARE_IN:
-		case ExpressionType::COMPARE_NOT_IN:
-		case ExpressionType::COMPARE_DISTINCT_FROM:
-		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-			break;
-		default:
+		if (!IsEqualityComparison(comparison_type)) {
 			return false;
 		}
-		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL) ||
-		    (!right_is_image && right_type.id() != LogicalTypeId::SQLNULL)) {
+		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL && left_type.id() != LogicalTypeId::UNKNOWN) ||
+		    (!right_is_image && right_type.id() != LogicalTypeId::SQLNULL &&
+		     right_type.id() != LogicalTypeId::UNKNOWN)) {
 			return false;
 		}
 		result_type = left_is_image ? left_type : right_type;
 		return true;
 	}
+	if ((TypeVisitor::Contains(left_type, ImageLogicalType::IsImage) ||
+	     TypeVisitor::Contains(right_type, ImageLogicalType::IsImage)) &&
+	    !IsEqualityComparison(comparison_type)) {
+		return false;
+	}
 
 	LogicalType res;
-	bool is_equality;
-	switch (comparison_type) {
-	case ExpressionType::COMPARE_EQUAL:
-	case ExpressionType::COMPARE_NOTEQUAL:
-	case ExpressionType::COMPARE_IN:
-	case ExpressionType::COMPARE_NOT_IN:
-	case ExpressionType::COMPARE_DISTINCT_FROM:
-	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-		is_equality = true;
-		break;
-	default:
-		is_equality = false;
-		break;
-	}
+	auto is_equality = IsEqualityComparison(comparison_type);
 	if (is_equality) {
 		res = LogicalType::ForceMaxLogicalType(left_type, right_type);
 	} else {

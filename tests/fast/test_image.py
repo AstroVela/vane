@@ -128,6 +128,18 @@ def test_image_comparison_requires_the_image_logical_type(duckdb_cursor):
     with pytest.raises(vane.BinderException, match="Cannot compare values of type IMAGE"):
         duckdb_cursor.execute("SELECT $1 = struct_pack(data := $2)", [image, b"\x00"])
 
+    for expression in (
+        "[image('\\x00'::BLOB, 1, 1, 1, 'L')] < [image('\\x01'::BLOB, 1, 1, 1, 'L')]",
+        "array_value(image('\\x00'::BLOB, 1, 1, 1, 'L')) < array_value(image('\\x01'::BLOB, 1, 1, 1, 'L'))",
+        "{'value': image('\\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\\x01'::BLOB, 1, 1, 1, 'L')}",
+        "MAP {'value': image('\\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\\x01'::BLOB, 1, 1, 1, 'L')}",
+    ):
+        with pytest.raises(vane.BinderException, match="Cannot compare values of type"):
+            duckdb_cursor.execute(f"SELECT {expression}")
+
+    duckdb_cursor.execute("PREPARE compare_image AS SELECT image('\\x00'::BLOB, 1, 1, 1, 'L') = $1")
+    assert duckdb_cursor.execute("EXECUTE compare_image(image('\\x00'::BLOB, 1, 1, 1, 'L'))").fetchone() == (True,)
+
 
 def test_declared_nested_image_type_round_trips(duckdb_cursor):
     image = vane.Image(b"\x00\x01", 2, 1, "L")
