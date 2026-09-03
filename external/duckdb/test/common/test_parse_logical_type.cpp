@@ -151,6 +151,13 @@ TEST_CASE("Test parse logical type", "[parse_logical_type]") {
 		}
 	}
 
+	SECTION("decoded IMAGE alias round trip") {
+		auto image_type = ImageLogicalType::Create();
+		REQUIRE(ImageLogicalType::IsImage(image_type));
+		REQUIRE(DBConfig::ParseLogicalType(image_type.ToString()) == image_type);
+		REQUIRE(DBConfig::ParseLogicalType(LogicalType::LIST(image_type).ToString()) == LogicalType::LIST(image_type));
+	}
+
 	SECTION("tensor enum values with delimiters round trip") {
 		auto enum_type = DBConfig::ParseLogicalType("ENUM(')', '(', ']', '[', 'comma,value')");
 		child_list_t<LogicalType> struct_children;

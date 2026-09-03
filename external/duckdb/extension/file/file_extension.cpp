@@ -16,6 +16,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	for (auto media_type : FileLogicalType::MEDIA_TYPES) {
 		loader.RegisterType(FileLogicalType::GetTypeName(media_type), FileLogicalType::Create(media_type));
 	}
+	loader.RegisterType(ImageLogicalType::TYPE_NAME, ImageLogicalType::Create());
 
 	for (auto &function : FileFunctions::GetFunctions()) {
 		loader.RegisterFunction(std::move(function));

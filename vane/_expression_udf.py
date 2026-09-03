@@ -165,9 +165,9 @@ def _canonicalize_dtype(dtype: Any) -> tuple[Any, Any]:
         raise _invalid_input(
             f"dtype must be a SQL type string, DuckDBPyType, or supported pyarrow.DataType; got {type(dtype).__name__}"
         )
-    from vane.execution.udf_file_contract import contains_file_type
+    from vane.execution.udf_file_contract import contains_governed_type
 
-    if contains_file_type(duckdb_type):
+    if contains_governed_type(duckdb_type):
         from vane.execution.udf_output_schema import _arrow_type_from_duckdb_pytype
 
         try:
@@ -356,10 +356,10 @@ def _normalize_batch_result(
         )
     if len(result) != expected_length:
         raise _invalid_input(f"batch UDF {udf_name!r} returned {len(result)} rows for {expected_length} input rows")
-    from vane.execution.udf_file_contract import contains_file_type, normalize_file_arrow_array
+    from vane.execution.udf_file_contract import contains_governed_type, normalize_file_arrow_array
 
-    file_output = contains_file_type(output_logical_type)
-    if file_output:
+    governed_output = contains_governed_type(output_logical_type)
+    if governed_output:
         result = normalize_file_arrow_array(
             result,
             output_logical_type,
@@ -367,8 +367,8 @@ def _normalize_batch_result(
             allow_untyped_null=True,
         )
     if not result.type.equals(output_arrow_type):
-        if file_output:
-            # Any mismatch left by FILE normalization is an intentional
+        if governed_output:
+            # Any mismatch left by logical-value normalization is an intentional
             # DuckDB-specific cast (for example BLOB -> BIT/VARCHAR). Eager
             # calls expose that storage unchanged; expression calls hand it
             # to the engine's declared return-type boundary.
@@ -442,9 +442,9 @@ def _call_batch_eager(
         udf_name=udf_name,
     )
     result = result_table.column(output_column)
-    from vane.execution.udf_file_contract import contains_file_type, validate_file_arrow_array
+    from vane.execution.udf_file_contract import contains_governed_type, validate_file_arrow_array
 
-    if contains_file_type(output_logical_type):
+    if contains_governed_type(output_logical_type):
         validate_file_arrow_array(result, output_logical_type, boundary=f"batch UDF {udf_name!r} output")
     if result.num_chunks == 1:
         return result.chunk(0)
@@ -969,10 +969,12 @@ class VaneClass:
         if return_dtype is None:
             raise _invalid_input("return_dtype is required for vane.cls")
         normalized_return_dtype, return_arrow_dtype = _canonicalize_dtype(return_dtype)
-        from vane.execution.udf_file_contract import contains_file_type
+        from vane.execution.udf_file_contract import contains_governed_type
 
-        if contains_file_type(normalized_return_dtype):
-            raise _invalid_input("vane.cls row UDFs do not support FILE outputs; use vane.func or vane.cls.batch")
+        if contains_governed_type(normalized_return_dtype):
+            raise _invalid_input(
+                "vane.cls row UDFs do not support governed logical outputs; use vane.func or vane.cls.batch"
+            )
         self._class = class_
         self._actor_number = _validate_positive_actor_number(actor_number)
         self._return_dtype = normalized_return_dtype
@@ -1626,10 +1628,10 @@ def _preflight_vane_class_instance(
         parameters,
         "parameters is required for SQL vane.cls registration",
     )
-    from vane.execution.udf_file_contract import contains_file_type
+    from vane.execution.udf_file_contract import contains_governed_type
 
-    if any(contains_file_type(parameter) for parameter in normalized_parameters):
-        raise _invalid_input("vane.cls row UDFs do not support FILE inputs; use vane.func or vane.cls.batch")
+    if any(contains_governed_type(parameter) for parameter in normalized_parameters):
+        raise _invalid_input("vane.cls row UDFs do not support governed inputs; use vane.func or vane.cls.batch")
     explicit_input_names = None if input_names is None else _normalize_sql_input_names(input_names)
     if explicit_input_names is not None and len(explicit_input_names) != len(normalized_parameters):
         raise _invalid_input("input_names count must match parameters count")

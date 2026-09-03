@@ -281,7 +281,7 @@ struct ArrayConvert {
 	}
 };
 
-struct FileConvert {
+struct LogicalValueConvert {
 	static py::object ConvertValue(Vector &input, idx_t chunk_offset, NumpyAppendData &append_data) {
 		auto &client_properties = append_data.client_properties;
 		auto &type = input.GetType();
@@ -715,8 +715,8 @@ void ArrayWrapper::Append(idx_t current_offset, Vector &input, idx_t source_size
 		may_have_null = ConvertNested<py::object, vane_py_convert::UnionConvert>(append_data);
 		break;
 	case LogicalTypeId::STRUCT:
-		if (FileLogicalType::IsFile(input.GetType())) {
-			may_have_null = ConvertNested<py::object, vane_py_convert::FileConvert>(append_data);
+		if (FileLogicalType::IsFile(input.GetType()) || ImageLogicalType::IsImage(input.GetType())) {
+			may_have_null = ConvertNested<py::object, vane_py_convert::LogicalValueConvert>(append_data);
 		} else {
 			may_have_null = ConvertNested<py::object, vane_py_convert::StructConvert>(append_data);
 		}

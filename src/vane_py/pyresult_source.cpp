@@ -200,8 +200,8 @@ static bool ResultPythonRuntimeUsable() {
 	return distributed::python::ray::SafePyObjectCanDecRef();
 }
 
-//! Arrow transports the FILE family using canonical STRUCT storage. Restore a
-//! Vane-owned FILE alias only when relation metadata declares its exact type.
+//! Arrow transports governed logical values using canonical STRUCT storage.
+//! Restore a Vane-owned alias only when relation metadata declares its exact type.
 static bool IsFileStorageType(const LogicalType &type) {
 	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
 	    StructType::GetChildCount(type) != FileLogicalType::FIELD_COUNT) {
@@ -217,12 +217,30 @@ static bool IsFileStorageType(const LogicalType &type) {
 	return true;
 }
 
+static bool IsImageStorageType(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || type.HasAlias() ||
+	    StructType::GetChildCount(type) != ImageLogicalType::FIELD_COUNT) {
+		return false;
+	}
+	auto image_type = ImageLogicalType::Create();
+	for (idx_t index = 0; index < ImageLogicalType::FIELD_COUNT; index++) {
+		if (StructType::GetChildName(type, index) != StructType::GetChildName(image_type, index) ||
+		    StructType::GetChildType(type, index) != StructType::GetChildType(image_type, index)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool DistributedResultTypeMatches(const LogicalType &actual, const LogicalType &expected) {
 	if (actual == expected) {
 		return true;
 	}
 	if (FileLogicalType::IsFile(expected)) {
 		return IsFileStorageType(actual);
+	}
+	if (ImageLogicalType::IsImage(expected)) {
+		return IsImageStorageType(actual);
 	}
 	if (TensorType::IsTensor(expected)) {
 		return TensorType::IsTensor(actual) && TensorType::GetShape(actual) == TensorType::GetShape(expected) &&

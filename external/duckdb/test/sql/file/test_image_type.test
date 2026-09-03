@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Vane contributors
+# SPDX-License-Identifier: Apache-2.0
+
+require file
+
+query T
+SELECT typeof(NULL::IMAGE)
+----
+IMAGE
+
+query I
+SELECT (NULL::IMAGE).width
+----
+NULL
+
+statement error governed values require an exact logical type match
+SELECT struct_pack(
+    data := '\x00'::BLOB,
+    width := 1::UINTEGER,
+    height := 1::UINTEGER,
+    channels := 1::UTINYINT,
+    mode := 'L'
+)::IMAGE
+
+statement ok
+CREATE TABLE decoded_images(value IMAGE)
+
+statement ok
+INSERT INTO decoded_images VALUES (NULL)
+
+query TT
+SELECT typeof(value), value FROM decoded_images
+----
+IMAGE	NULL

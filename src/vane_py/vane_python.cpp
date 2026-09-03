@@ -17,6 +17,7 @@
 #include "vane_python/dynamic_extension.hpp"
 #include "vane_python/file.hpp"
 #include "vane_python/file_reader.hpp"
+#include "vane_python/image.hpp"
 #include "vane_python/pyconnection/pyconnection.hpp"
 #include "vane_python/pystatement.hpp"
 #include "vane_python/pyrelation.hpp"
@@ -254,6 +255,9 @@ static void InitializeConnectionMethods(py::module_ &m) {
 		    return make_shared_ptr<DuckDBPyType>(FileLogicalType::Create(native_media_type));
 	    },
 	    "Create a logical type in the FILE family", py::arg("media_type") = py::none());
+	m.def(
+	    "image_type", []() { return make_shared_ptr<DuckDBPyType>(ImageLogicalType::Create()); },
+	    "Create the decoded uint8 IMAGE logical type");
 	m.def(
 	    "union_type",
 	    [](const py::object &members, shared_ptr<DuckDBPyConnection> conn = nullptr) {
@@ -1136,6 +1140,7 @@ PYBIND11_MODULE(_native, m) { // NOLINT
 	    .value("COLUMNS", duckdb::RenderMode::COLUMNS)
 	    .export_values();
 
+	PythonImage::Initialize(m);
 	PythonFile::Initialize(m);
 	PythonFileReaderHandle::Initialize(m);
 	DuckDBPyTyping::Initialize(m);

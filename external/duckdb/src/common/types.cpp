@@ -1853,6 +1853,128 @@ void FileLogicalType::ValidateValue(const Value &value, const string &function_n
 	}
 }
 
+LogicalType ImageLogicalType::Create() {
+	child_list_t<LogicalType> children;
+	children.reserve(FIELD_COUNT);
+	children.emplace_back("data", LogicalType::BLOB);
+	children.emplace_back("width", LogicalType::UINTEGER);
+	children.emplace_back("height", LogicalType::UINTEGER);
+	children.emplace_back("channels", LogicalType::UTINYINT);
+	children.emplace_back("mode", LogicalType::VARCHAR);
+
+	auto result = LogicalType::STRUCT(std::move(children));
+	result.SetAlias(TYPE_NAME);
+	return result;
+}
+
+bool ImageLogicalType::IsImage(const LogicalType &type) {
+	if (type.id() != LogicalTypeId::STRUCT || !type.AuxInfo() ||
+	    type.AuxInfo()->type != ExtraTypeInfoType::STRUCT_TYPE_INFO || !type.HasAlias() ||
+	    type.GetAlias() != TYPE_NAME) {
+		return false;
+	}
+	auto &children = StructType::GetChildTypes(type);
+	if (children.size() != FIELD_COUNT) {
+		return false;
+	}
+	return children[DATA].first == "data" && children[DATA].second == LogicalType::BLOB &&
+	       children[WIDTH].first == "width" && children[WIDTH].second == LogicalType::UINTEGER &&
+	       children[HEIGHT].first == "height" && children[HEIGHT].second == LogicalType::UINTEGER &&
+	       children[CHANNELS].first == "channels" && children[CHANNELS].second == LogicalType::UTINYINT &&
+	       children[MODE].first == "mode" && children[MODE].second == LogicalType::VARCHAR;
+}
+
+uint8_t ImageLogicalType::ChannelsForMode(const string &mode) {
+	if (mode == "L") {
+		return 1;
+	}
+	if (mode == "LA") {
+		return 2;
+	}
+	if (mode == "RGB") {
+		return 3;
+	}
+	if (mode == "RGBA") {
+		return 4;
+	}
+	throw InvalidInputException("IMAGE mode must be one of L, LA, RGB, or RGBA, got '%s'", mode);
+}
+
+void ImageLogicalType::ValidateFields(idx_t data_size, uint32_t width, uint32_t height, uint8_t channels,
+                                      const string &mode, const string &function_name) {
+	if (width == 0 || height == 0) {
+		throw InvalidInputException("%s() IMAGE width and height must be positive", function_name);
+	}
+	auto expected_channels = ChannelsForMode(mode);
+	if (channels != expected_channels) {
+		throw InvalidInputException("%s() IMAGE mode %s requires %d channels, got %d", function_name, mode,
+		                            expected_channels, channels);
+	}
+	auto expected_size = static_cast<idx_t>(width);
+	if (expected_size > NumericLimits<idx_t>::Maximum() / static_cast<idx_t>(height)) {
+		throw InvalidInputException("%s() IMAGE dimensions exceed addressable storage", function_name);
+	}
+	expected_size *= static_cast<idx_t>(height);
+	if (expected_size > NumericLimits<idx_t>::Maximum() / channels) {
+		throw InvalidInputException("%s() IMAGE dimensions exceed addressable storage", function_name);
+	}
+	expected_size *= channels;
+	if (data_size != expected_size) {
+		throw InvalidInputException("%s() IMAGE data has %d bytes, expected %d for %dx%d %s", function_name, data_size,
+		                            expected_size, width, height, mode);
+	}
+}
+
+void ImageLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	if (value.IsNull() || !TypeVisitor::Contains(value.type(), IsImage)) {
+		return;
+	}
+	if (IsImage(value.type())) {
+		auto &children = StructValue::GetChildren(value);
+		if (children.size() != FIELD_COUNT) {
+			throw InvalidInputException("%s() received a malformed IMAGE value", function_name);
+		}
+		for (auto &child : children) {
+			if (child.IsNull()) {
+				throw InvalidInputException("%s() non-NULL IMAGE values cannot contain NULL fields", function_name);
+			}
+		}
+		ValidateFields(StringValue::Get(children[DATA]).size(), children[WIDTH].GetValue<uint32_t>(),
+		               children[HEIGHT].GetValue<uint32_t>(), children[CHANNELS].GetValue<uint8_t>(),
+		               children[MODE].GetValue<string>(), function_name);
+		return;
+	}
+
+	switch (value.type().InternalType()) {
+	case PhysicalType::STRUCT:
+		for (auto &child : StructValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::LIST:
+		for (auto &child : ListValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	case PhysicalType::ARRAY:
+		for (auto &child : ArrayValue::GetChildren(value)) {
+			ValidateValue(child, function_name);
+		}
+		break;
+	default:
+		throw InternalException("IMAGE value is nested in unsupported physical type %s", value.type());
+	}
+}
+
+bool GovernedLogicalType::IsGoverned(const LogicalType &type) {
+	return FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type);
+}
+
+void GovernedLogicalType::ValidateValue(const Value &value, const string &function_name) {
+	FileLogicalType::ValidateValue(value, function_name);
+	ImageLogicalType::ValidateValue(value, function_name);
+}
+
 LogicalType LogicalType::AGGREGATE_STATE(aggregate_state_t state_type) { // NOLINT
 	auto info = make_shared_ptr<AggregateStateTypeInfo>(std::move(state_type));
 	return LogicalType(LogicalTypeId::AGGREGATE_STATE, std::move(info));

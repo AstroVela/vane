@@ -7,6 +7,7 @@
 #include "vane_python/python_objects.hpp"
 
 #include "vane_python/file.hpp"
+#include "vane_python/image.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/types/value.hpp"
@@ -423,7 +424,7 @@ py::object PythonObject::FromStruct(const Value &val, const LogicalType &type,
 }
 
 static bool KeyIsHashable(const LogicalType &type) {
-	if (FileLogicalType::IsFile(type)) {
+	if (FileLogicalType::IsFile(type) || ImageLogicalType::IsImage(type)) {
 		return true;
 	}
 	switch (type.id()) {
@@ -486,6 +487,9 @@ py::object PythonObject::FromValue(const Value &val, const LogicalType &type,
 	}
 	if (FileLogicalType::IsFile(type)) {
 		return PythonFile::FromValue(val);
+	}
+	if (ImageLogicalType::IsImage(type)) {
+		return PythonImage::FromValue(val);
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:

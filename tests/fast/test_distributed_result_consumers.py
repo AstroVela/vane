@@ -704,6 +704,41 @@ def test_distributed_result_normalizes_file_tensor_storage(monkeypatch):
     )
 
 
+def test_distributed_result_restores_decoded_image_type(monkeypatch):
+    image_type = pa.struct(
+        [
+            pa.field("data", pa.binary()),
+            pa.field("width", pa.uint32()),
+            pa.field("height", pa.uint32()),
+            pa.field("channels", pa.uint8()),
+            pa.field("mode", pa.string()),
+        ]
+    )
+    pixels = bytes(range(6))
+    images = pa.array(
+        [{"data": pixels, "width": 2, "height": 1, "channels": 3, "mode": "RGB"}],
+        type=image_type,
+    )
+    runner = _FakeRayRunner([pa.table({"c0": images})])
+    _install_fake_ray_runner(monkeypatch, runner)
+
+    def unused(table):
+        return table
+
+    relation = (
+        vane.connect()
+        .sql("SELECT 1 AS value")
+        .map_batches(
+            unused,
+            schema={"image": vane.image_type()},
+            execution_backend="subprocess_task",
+        )
+    )
+
+    assert relation.types[0].is_image()
+    assert relation.fetchone() == (vane.Image(pixels, 2, 1, "RGB"),)
+
+
 def test_distributed_partition_error_is_terminal_and_closes_iterator(monkeypatch):
     runner = _FakeRayRunner(
         [

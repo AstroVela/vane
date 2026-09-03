@@ -54,10 +54,10 @@ CollationBinding &CollationBinding::Get(DatabaseInstance &db) {
 	return DBConfig::GetConfig(db).GetCollationBinding();
 }
 
-using file_child_compatibility_t = bool (*)(const LogicalType &, const LogicalType &);
+using governed_child_compatibility_t = bool (*)(const LogicalType &, const LogicalType &);
 
-static bool StructFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
-                                         file_child_compatibility_t child_compatible) {
+static bool StructGovernedChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                             governed_child_compatibility_t child_compatible) {
 	if (source.id() != LogicalTypeId::STRUCT || !source.AuxInfo()) {
 		return false;
 	}
@@ -86,7 +86,7 @@ static bool StructFileChildrenCompatible(const LogicalType &source, const Logica
 	for (auto &source_child : source_children) {
 		auto target_child = target_children_map.find(source_child.first);
 		if (target_child == target_children_map.end()) {
-			if (TypeVisitor::Contains(source_child.second, FileLogicalType::IsFile)) {
+			if (TypeVisitor::Contains(source_child.second, GovernedLogicalType::IsGoverned)) {
 				return false;
 			}
 			continue;
@@ -99,15 +99,15 @@ static bool StructFileChildrenCompatible(const LogicalType &source, const Logica
 	}
 
 	for (auto &target_child : target_children_map) {
-		if (TypeVisitor::Contains(target_children[target_child.second].second, FileLogicalType::IsFile)) {
+		if (TypeVisitor::Contains(target_children[target_child.second].second, GovernedLogicalType::IsGoverned)) {
 			return false;
 		}
 	}
 	return has_any_match;
 }
 
-static bool UnionFileChildrenCompatible(const LogicalType &source, const LogicalType &target,
-                                        file_child_compatibility_t child_compatible) {
+static bool UnionGovernedChildrenCompatible(const LogicalType &source, const LogicalType &target,
+                                            governed_child_compatibility_t child_compatible) {
 	if (source.id() != LogicalTypeId::UNION || !source.AuxInfo()) {
 		return false;
 	}
@@ -133,116 +133,116 @@ static bool UnionFileChildrenCompatible(const LogicalType &source, const Logical
 	}
 	for (idx_t target_index = 0; target_index < matched_targets.size(); target_index++) {
 		if (!matched_targets[target_index] &&
-		    TypeVisitor::Contains(UnionType::GetMemberType(target, target_index), FileLogicalType::IsFile)) {
+		    TypeVisitor::Contains(UnionType::GetMemberType(target, target_index), GovernedLogicalType::IsGoverned)) {
 			return false;
 		}
 	}
 	return true;
 }
 
-static bool FileAliasRestorationCompatible(const LogicalType &source, const LogicalType &target) {
-	if (FileLogicalType::IsFile(target)) {
-		auto physical_file_type = target.DeepCopy();
-		physical_file_type.SetAlias(string());
-		return source == physical_file_type;
+static bool GovernedAliasRestorationCompatible(const LogicalType &source, const LogicalType &target) {
+	if (GovernedLogicalType::IsGoverned(target)) {
+		auto physical_type = target.DeepCopy();
+		physical_type.SetAlias(string());
+		return source == physical_type;
 	}
-	if (!TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
-		// Non-FILE siblings retain the ordinary DuckDB cast rules. This is
-		// required for validated UDF outputs such as STRUCT(FILE, UUID).
+	if (!TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned)) {
+		// Ordinary siblings retain the normal DuckDB cast rules. This is
+		// required for validated UDF outputs such as STRUCT(IMAGE, UUID).
 		return true;
 	}
 
 	switch (target.id()) {
 	case LogicalTypeId::STRUCT:
-		return StructFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
+		return StructGovernedChildrenCompatible(source, target, GovernedAliasRestorationCompatible);
 	case LogicalTypeId::UNION:
-		return UnionFileChildrenCompatible(source, target, FileAliasRestorationCompatible);
+		return UnionGovernedChildrenCompatible(source, target, GovernedAliasRestorationCompatible);
 	case LogicalTypeId::LIST:
 		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
-			return FileAliasRestorationCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+			return GovernedAliasRestorationCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
 		}
 		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
-			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ListType::GetChildType(target));
+			return GovernedAliasRestorationCompatible(ArrayType::GetChildType(source), ListType::GetChildType(target));
 		}
 		return false;
 	case LogicalTypeId::ARRAY:
 		if (source.id() == LogicalTypeId::ARRAY && source.AuxInfo()) {
-			return FileAliasRestorationCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+			return GovernedAliasRestorationCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
 		}
 		if (source.id() == LogicalTypeId::LIST && source.AuxInfo()) {
-			return FileAliasRestorationCompatible(ListType::GetChildType(source), ArrayType::GetChildType(target));
+			return GovernedAliasRestorationCompatible(ListType::GetChildType(source), ArrayType::GetChildType(target));
 		}
 		return false;
 	case LogicalTypeId::MAP:
 		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
-		       FileAliasRestorationCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
-		       FileAliasRestorationCompatible(MapType::ValueType(source), MapType::ValueType(target));
+		       GovernedAliasRestorationCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       GovernedAliasRestorationCompatible(MapType::ValueType(source), MapType::ValueType(target));
 	default:
 		return false;
 	}
 }
 
-static bool FileLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
+static bool GovernedLeavesPreservedCompatible(const LogicalType &source, const LogicalType &target) {
 	if (source.id() == LogicalTypeId::SQLNULL) {
-		// Untyped NULL leaves carry no value that could bypass FILE
+		// Untyped NULL leaves carry no value that could bypass logical-value
 		// validation. This also permits empty and NULL-only literals such as
-		// []::FILE[] and [NULL]::FILE[].
+		// []::IMAGE[] and [NULL]::IMAGE[].
 		return true;
 	}
-	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
-	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
-	if (!source_contains_file && !target_contains_file) {
-		// Non-FILE siblings retain the ordinary DuckDB cast rules.
+	auto source_contains_governed = TypeVisitor::Contains(source, GovernedLogicalType::IsGoverned);
+	auto target_contains_governed = TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned);
+	if (!source_contains_governed && !target_contains_governed) {
+		// Ordinary siblings retain the normal DuckDB cast rules.
 		return true;
 	}
 	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION && target.AuxInfo()) {
 		// DuckDB promotes a non-UNION value to the best matching UNION member.
 		// Permit that native path only when at least one member preserves every
-		// FILE leaf; the selected member is checked again by its child cast.
+		// governed leaf; the selected member is checked again by its child cast.
 		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
-			if (FileLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
+			if (GovernedLeavesPreservedCompatible(source, UnionType::GetMemberType(target, target_index))) {
 				return true;
 			}
 		}
 		return false;
 	}
-	if (FileLogicalType::IsFile(source) || FileLogicalType::IsFile(target)) {
-		return FileLogicalType::IsFile(source) && FileLogicalType::IsFile(target) && source == target;
+	if (GovernedLogicalType::IsGoverned(source) || GovernedLogicalType::IsGoverned(target)) {
+		return GovernedLogicalType::IsGoverned(source) && GovernedLogicalType::IsGoverned(target) && source == target;
 	}
-	if (!target_contains_file) {
+	if (!target_contains_governed) {
 		return false;
 	}
 
 	switch (target.id()) {
 	case LogicalTypeId::STRUCT:
-		return StructFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
+		return StructGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
 	case LogicalTypeId::UNION:
-		return UnionFileChildrenCompatible(source, target, FileLeavesPreservedCompatible);
+		return UnionGovernedChildrenCompatible(source, target, GovernedLeavesPreservedCompatible);
 	case LogicalTypeId::LIST:
 		return source.id() == LogicalTypeId::LIST && source.AuxInfo() &&
-		       FileLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible(ListType::GetChildType(source), ListType::GetChildType(target));
 	case LogicalTypeId::ARRAY:
 		return source.id() == LogicalTypeId::ARRAY && source.AuxInfo() &&
 		       ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
-		       FileLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
+		       GovernedLeavesPreservedCompatible(ArrayType::GetChildType(source), ArrayType::GetChildType(target));
 	case LogicalTypeId::MAP:
 		return source.id() == LogicalTypeId::MAP && source.AuxInfo() &&
-		       FileLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
-		       FileLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
+		       GovernedLeavesPreservedCompatible(MapType::KeyType(source), MapType::KeyType(target)) &&
+		       GovernedLeavesPreservedCompatible(MapType::ValueType(source), MapType::ValueType(target));
 	default:
 		return false;
 	}
 }
 
-static bool FileImplicitCastCompatible(const LogicalType &source, const LogicalType &target) {
+static bool GovernedImplicitCastCompatible(const LogicalType &source, const LogicalType &target) {
 	if (source.id() == LogicalTypeId::UNKNOWN || source.id() == LogicalTypeId::SQLNULL ||
 	    target.id() == LogicalTypeId::ANY || target.id() == LogicalTypeId::TEMPLATE ||
 	    target.id() == LogicalTypeId::UNKNOWN) {
 		return true;
 	}
-	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
-	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
-	if (!source_contains_file && !target_contains_file) {
+	auto source_contains_governed = TypeVisitor::Contains(source, GovernedLogicalType::IsGoverned);
+	auto target_contains_governed = TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned);
+	if (!source_contains_governed && !target_contains_governed) {
 		return true;
 	}
 	if (!target.IsComplete()) {
@@ -251,7 +251,7 @@ static bool FileImplicitCastCompatible(const LogicalType &source, const LogicalT
 		// placeholder with the concrete input type before any cast is created.
 		return true;
 	}
-	return FileLeavesPreservedCompatible(source, target);
+	return GovernedLeavesPreservedCompatible(source, target);
 }
 
 BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const LogicalType &target,
@@ -259,27 +259,28 @@ BoundCastInfo CastFunctionSet::GetCastFunction(const LogicalType &source, const 
 	if (source == target) {
 		return DefaultCasts::NopCast;
 	}
-	// FILE aliases are semantic types, not presentation aliases. Letting the
+	// Governed aliases are semantic types, not presentation aliases. Letting the
 	// ordinary STRUCT cast path handle them would silently retag values and
 	// bypass their constructors and field validation.
-	auto source_contains_file = TypeVisitor::Contains(source, FileLogicalType::IsFile);
-	auto target_contains_file = TypeVisitor::Contains(target, FileLogicalType::IsFile);
-	auto internal_file_cast_allowed = [&]() {
+	auto source_contains_governed = TypeVisitor::Contains(source, GovernedLogicalType::IsGoverned);
+	auto target_contains_governed = TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned);
+	auto internal_governed_cast_allowed = [&]() {
 		switch (get_input.file_cast_mode) {
 		case FileCastMode::INTERNAL_FORMATTING:
-			return source_contains_file && target == LogicalType::VARCHAR;
+			return source_contains_governed && target == LogicalType::VARCHAR;
 		case FileCastMode::INTERNAL_ALIAS_RESTORATION:
-			return target_contains_file && !source_contains_file && FileAliasRestorationCompatible(source, target);
+			return target_contains_governed && !source_contains_governed &&
+			       GovernedAliasRestorationCompatible(source, target);
 		case FileCastMode::STRICT:
-			return target_contains_file && FileLeavesPreservedCompatible(source, target);
+			return target_contains_governed && GovernedLeavesPreservedCompatible(source, target);
 		default:
 			return false;
 		}
 	}();
-	if ((source_contains_file || target_contains_file) && source.id() != LogicalTypeId::SQLNULL &&
-	    target.id() != LogicalTypeId::SQLNULL && !internal_file_cast_allowed) {
+	if ((source_contains_governed || target_contains_governed) && source.id() != LogicalTypeId::SQLNULL &&
+	    target.id() != LogicalTypeId::SQLNULL && !internal_governed_cast_allowed) {
 		throw BinderException(get_input.query_location,
-		                      "Cannot cast from %s to %s: FILE-family casts require an exact logical type match",
+		                      "Cannot cast from %s to %s: governed values require an exact logical type match",
 		                      source.ToString(), target.ToString());
 	}
 	// the first function is the default
@@ -398,15 +399,15 @@ private:
 
 int64_t CastFunctionSet::ImplicitCastCost(optional_ptr<ClientContext> context, const LogicalType &source,
                                           const LogicalType &target) {
-	if (!FileImplicitCastCompatible(source, target)) {
+	if (!GovernedImplicitCastCompatible(source, target)) {
 		return -1;
 	}
 	if (target.id() == LogicalTypeId::UNION && source.id() != LogicalTypeId::UNION &&
 	    source.id() != LogicalTypeId::UNKNOWN && source.id() != LogicalTypeId::SQLNULL &&
-	    TypeVisitor::Contains(target, FileLogicalType::IsFile)) {
-		// CastRules cannot account for FILE aliases while recursively scoring
+	    TypeVisitor::Contains(target, GovernedLogicalType::IsGoverned)) {
+		// CastRules cannot account for governed aliases while recursively scoring
 		// UNION members. Score each member through this guarded function so
-		// invalid FILE retagging is excluded before DuckDB selects a candidate.
+		// invalid logical retagging is excluded before DuckDB selects a candidate.
 		int64_t best_cost = -1;
 		for (idx_t target_index = 0; target_index < UnionType::GetMemberCount(target); target_index++) {
 			auto member_cost = ImplicitCastCost(context, source, UnionType::GetMemberType(target, target_index));

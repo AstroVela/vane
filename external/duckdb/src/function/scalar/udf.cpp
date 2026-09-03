@@ -40,6 +40,9 @@ LogicalType SerializableContractType(const LogicalType &type) {
 	if (FileLogicalType::IsFile(type)) {
 		return FileLogicalType::Create(FileLogicalType::GetMediaType(type));
 	}
+	if (ImageLogicalType::IsImage(type)) {
+		return ImageLogicalType::Create();
+	}
 	if (type.IsJSONType()) {
 		return LogicalType::JSON();
 	}

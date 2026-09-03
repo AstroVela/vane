@@ -6,6 +6,7 @@
 
 #include "vane_python/python_conversion.hpp"
 #include "vane_python/file.hpp"
+#include "vane_python/image.hpp"
 #include "vane_python/pybind11/pybind_wrapper.hpp"
 
 #include "vane_python/pyrelation.hpp"
@@ -442,6 +443,8 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 		return PythonObjectType::NdArray;
 	} else if (py::isinstance(ele, import_cache.numpy.datetime64())) {
 		return PythonObjectType::NdDatetime;
+	} else if (py::isinstance<PythonImage>(ele)) {
+		return PythonObjectType::Image;
 	} else if (py::isinstance<PythonFile>(ele)) {
 		return PythonObjectType::File;
 	} else if (py::isinstance(ele, import_cache.vane.Value())) {
@@ -452,7 +455,7 @@ PythonObjectType GetPythonObjectType(py::handle &ele) {
 }
 
 static bool UnionMemberAcceptsComposite(PythonObjectType object_type, const LogicalType &member_type) {
-	if (FileLogicalType::IsFile(member_type)) {
+	if (FileLogicalType::IsFile(member_type) || ImageLogicalType::IsImage(member_type)) {
 		return false;
 	}
 	switch (object_type) {
@@ -478,8 +481,9 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 		return TransformPythonValueToUnion(ele.attr("tolist")(), target_type, nan_as_null);
 	}
 
-	if (object_type == PythonObjectType::File) {
-		auto value = py::cast<PythonFile>(ele).ToValue();
+	if (object_type == PythonObjectType::File || object_type == PythonObjectType::Image) {
+		auto value = object_type == PythonObjectType::File ? py::cast<PythonFile>(ele).ToValue()
+		                                                   : py::cast<PythonImage>(ele).ToValue();
 		for (idx_t index = 0; index < UnionType::GetMemberCount(target_type); index++) {
 			auto &member_type = UnionType::GetMemberType(target_type, index);
 			if (member_type != value.type()) {
@@ -487,7 +491,7 @@ static Value TransformPythonValueToUnion(py::handle ele, const LogicalType &targ
 			}
 			return Value::UNION(UnionType::CopyMemberTypes(target_type), NumericCast<uint8_t>(index), std::move(value));
 		}
-		throw InvalidInputException("vane.File value of type %s has no exact member in target type %s", value.type(),
+		throw InvalidInputException("Vane logical value of type %s has no exact member in target type %s", value.type(),
 		                            target_type);
 	}
 
@@ -702,6 +706,14 @@ struct PythonValueConversion {
 			throw InvalidInputException("vane.File value of type %s cannot be converted to %s", converted.type(),
 			                            target_type);
 		}
+		case PythonObjectType::Image: {
+			auto converted = py::cast<PythonImage>(ele).ToValue();
+			if (target_type.id() == LogicalTypeId::UNKNOWN || target_type == converted.type()) {
+				return converted;
+			}
+			throw InvalidInputException("vane.Image value of type %s cannot be converted to %s", converted.type(),
+			                            target_type);
+		}
 		case PythonObjectType::Dict: {
 			PyDictionary dict = PyDictionary(py::reinterpret_borrow<py::object>(ele));
 			switch (target_type.id()) {
@@ -727,8 +739,9 @@ struct PythonValueConversion {
 			if (target_type.id() == LogicalTypeId::UNKNOWN || converted.type() == target_type) {
 				return converted;
 			}
-			if (FileLogicalType::IsFile(target_type) || FileLogicalType::IsFile(converted.type())) {
-				throw InvalidInputException("FILE-family values require an exact matching logical type");
+			if (FileLogicalType::IsFile(target_type) || FileLogicalType::IsFile(converted.type()) ||
+			    ImageLogicalType::IsImage(target_type) || ImageLogicalType::IsImage(converted.type())) {
+				throw InvalidInputException("Governed logical values require an exact matching logical type");
 			}
 			return CastToTarget(std::move(converted), target_type);
 		}
@@ -1046,6 +1059,15 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 			throw InvalidInputException("Only vane.File or NULL values can be converted to FILE");
 		}
 	}
+	if (ImageLogicalType::IsImage(conversion_target)) {
+		auto is_null = object_type == PythonObjectType::None;
+		if (object_type == PythonObjectType::Float && nan_as_null) {
+			is_null = std::isnan(PyFloat_AsDouble(ele.ptr()));
+		}
+		if (!is_null && object_type != PythonObjectType::Image && object_type != PythonObjectType::Value) {
+			throw InvalidInputException("Only vane.Image or NULL values can be converted to IMAGE");
+		}
+	}
 
 	switch (object_type) {
 	case PythonObjectType::None:
@@ -1175,6 +1197,7 @@ void TransformPythonObjectInternal(py::handle ele, A &result, const B &param, bo
 	case PythonObjectType::NdDatetime:
 		TransformPythonObjectInternal<OP>(ele.attr("tolist")(), result, param, nan_as_null);
 		break;
+	case PythonObjectType::Image:
 	case PythonObjectType::File:
 	case PythonObjectType::Uuid:
 	case PythonObjectType::Timedelta:

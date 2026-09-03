@@ -294,15 +294,15 @@ static void AreExtensionsRegistered(const LogicalType &arrow_type, const Logical
 }
 
 static void CastValidatedUDFOutput(ClientContext &context, Vector &source, Vector &result, idx_t count) {
-	if (!TypeVisitor::Contains(result.GetType(), FileLogicalType::IsFile)) {
+	if (!TypeVisitor::Contains(result.GetType(), GovernedLogicalType::IsGoverned)) {
 		VectorOperations::Cast(context, source, result, count);
 		return;
 	}
 
-	// FileUDFContract validates every FILE value and media specialization before exporting the result to Arrow.
-	// Arrow intentionally carries the canonical physical STRUCT, so this boundary is the one trusted place where
-	// that STRUCT may recover the already-declared FILE-family alias. CastFunctionSet still requires an exact
-	// canonical physical shape and rejects FILE-to-FILE retagging.
+	// FileUDFContract validates every governed value before exporting the result to Arrow. Arrow intentionally
+	// carries the canonical physical STRUCT, so this boundary is the one trusted place where that STRUCT may recover
+	// its already-declared logical alias. CastFunctionSet still requires an exact canonical physical shape and rejects
+	// logical retagging.
 	auto &cast_functions = CastFunctionSet::Get(context);
 	GetCastFunctionInput input(context);
 	input.file_cast_mode = FileCastMode::INTERNAL_ALIAS_RESTORATION;

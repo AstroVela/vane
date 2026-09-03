@@ -85,6 +85,19 @@ bool BoundComparisonExpression::TryBindComparison(ClientContext &context, const 
 		result_type = left_is_file ? left_type : right_type;
 		return true;
 	}
+	const auto left_is_image = ImageLogicalType::IsImage(left_type);
+	const auto right_is_image = ImageLogicalType::IsImage(right_type);
+	if (left_is_image || right_is_image) {
+		if (comparison_type != ExpressionType::COMPARE_EQUAL && comparison_type != ExpressionType::COMPARE_NOTEQUAL) {
+			return false;
+		}
+		if ((!left_is_image && left_type.id() != LogicalTypeId::SQLNULL) ||
+		    (!right_is_image && right_type.id() != LogicalTypeId::SQLNULL)) {
+			return false;
+		}
+		result_type = left_is_image ? left_type : right_type;
+		return true;
+	}
 
 	LogicalType res;
 	bool is_equality;
