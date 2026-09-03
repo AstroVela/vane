@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Vane contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Encoded AUDIOFILE metadata and Python waveform decoding helpers."""
+"""Encoded AUDIOFILE metadata, decoding, and resampling helpers."""
 
 from __future__ import annotations
 
@@ -30,7 +30,10 @@ DEFAULT_AUDIO_BUFFER_SIZE = 1024 * 1024
 DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024
 DEFAULT_AUDIO_MAX_FRAMES = 100_000_000
 DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024
+DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100_000_000
+DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024
 MAX_AUDIO_METADATA_BYTES = 64 * 1024 * 1024
+_AUDIO_RESAMPLE_CHUNK_BYTES = 1024 * 1024
 _MAX_AUDIO_METADATA_FETCH_BYTES = 64 * 1024
 _AUDIO_METADATA_FETCHES_PER_BUDGET = 8
 _MAX_AUDIO_METADATA_FETCHES = 1024
@@ -115,18 +118,18 @@ class AudioFileLimitError(AudioFileError):
 
 
 @contextmanager
-def _close_sound_file(audio: Any) -> Iterator[Any]:
-    """Close a decoder without replacing an exception from its operation."""
+def _close_preserving_primary(resource: Any) -> Iterator[Any]:
+    """Close a resource without replacing an exception from its operation."""
     try:
-        yield audio
+        yield resource
     except BaseException:
         try:
-            audio.close()
+            resource.close()
         except BaseException:
             pass
         raise
     else:
-        audio.close()
+        resource.close()
 
 
 class _AudioMetadataView:
@@ -289,6 +292,54 @@ class _AudioMetadataView:
             raise self._error.with_traceback(self._error.__traceback__)
 
 
+class _AudioRandomAccessView:
+    """Expose exact random-access callbacks as a seekable binary stream."""
+
+    def __init__(self, read_at: Callable[[int, int], bytes], logical_size: int) -> None:
+        self._read_at = read_at
+        self._logical_size = logical_size
+        self._position = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if self._position >= self._logical_size or size == 0:
+            return b""
+        if size is None or size < 0:
+            read_size = self._logical_size - self._position
+        else:
+            read_size = min(size, self._logical_size - self._position)
+        data = self._read_at(self._position, read_size)
+        if not isinstance(data, bytes) or len(data) != read_size:
+            raise OSError(
+                f"audio source returned {len(data) if isinstance(data, bytes) else 0} bytes "
+                f"after requesting {read_size}"
+            )
+        self._position += read_size
+        return data
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET, /) -> int:
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._position + offset
+        elif whence == io.SEEK_END:
+            position = self._logical_size + offset
+        else:
+            raise ValueError(f"invalid whence {whence}")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def tell(self) -> int:
+        return self._position
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+
 class _AudioReaderProxy:
     """Keep reader failures from being swallowed by CFFI virtual-I/O callbacks."""
 
@@ -343,6 +394,18 @@ def _load_soundfile() -> Any:
             "Please `pip install 'vane-ai[audio]'`."
         ) from error
     return soundfile
+
+
+def _load_soxr() -> Any:
+    try:
+        soxr = importlib.import_module("soxr")
+        soxr.ResampleStream
+    except (AttributeError, ImportError, OSError) as error:
+        raise ImportError(
+            "AudioFile resampling requires the 'soxr' package and a usable libsoxr library. "
+            "Please `pip install 'vane-ai[audio]'`."
+        ) from error
+    return soxr
 
 
 def _positive_limit(value: object, *, name: str, maximum: int | None = None) -> int:
@@ -501,7 +564,7 @@ def _probe_audio_metadata(
     try:
         # libsndfile owns container parsing. Vane only supplies a bounded,
         # range-aware logical FILE view and classifies the library's result.
-        with _close_sound_file(soundfile.SoundFile(stream, mode="r", closefd=False)) as audio:
+        with _close_preserving_primary(soundfile.SoundFile(stream, mode="r", closefd=False)) as audio:
             stream.raise_if_error()
             metadata = _metadata_from_sound_file(audio, content_type=content_type)
             stream.raise_if_error()
@@ -588,7 +651,7 @@ def _decode_audio_file(
 
         proxy = _AudioReaderProxy(reader)
         try:
-            with _close_sound_file(_AudioDecoder(proxy, mode="r", closefd=False)) as audio:
+            with _close_preserving_primary(_AudioDecoder(proxy, mode="r", closefd=False)) as audio:
                 proxy.raise_if_error()
                 metadata = _metadata_from_sound_file(audio, content_type=value.content_type)
                 if metadata.frames is not None and metadata.frames > normalized_max_frames:
@@ -707,6 +770,293 @@ def _decode_audio_file(
     return samples
 
 
+def _resample_audio_reader(
+    reader: Any,
+    *,
+    logical_size: int,
+    content_type: str | None,
+    sample_rate: int,
+    max_input_bytes: int,
+    max_frames: int,
+    max_decoded_bytes: int,
+    max_output_frames: int,
+    max_output_bytes: int,
+    max_batch_output_bytes: int | None,
+    check_interrupted: Callable[[], None] | None,
+    soundfile: Any,
+    soxr: Any,
+    numpy: Any,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Decode and stream-resample one logical FILE view into bounded output."""
+    if check_interrupted is not None:
+        check_interrupted()
+    if logical_size > max_input_bytes:
+        raise AudioFileLimitError(
+            f"encoded audio contains {logical_size} bytes, exceeding max_input_bytes={max_input_bytes}"
+        )
+
+    class _AudioDecoder(soundfile.SoundFile):  # type: ignore[name-defined]
+        def seekable(self) -> bool:
+            return int(self.frames) != _MAX_BIGINT and super().seekable()
+
+    proxy = _AudioReaderProxy(reader)
+    try:
+        with _close_preserving_primary(_AudioDecoder(proxy, mode="r", closefd=False)) as audio:
+            proxy.raise_if_error()
+            metadata = _metadata_from_sound_file(audio, content_type=content_type)
+            frame_bytes = metadata.channels * 8
+            source_frame_limit: int | None = None
+            if metadata.frames is not None:
+                if metadata.frames > max_frames:
+                    raise AudioFileLimitError(
+                        f"audio contains {metadata.frames} frames, exceeding max_frames={max_frames}"
+                    )
+                decoded_bytes = metadata.frames * frame_bytes
+                if decoded_bytes > max_decoded_bytes:
+                    raise AudioFileLimitError(
+                        f"audio decode requires {decoded_bytes} bytes, exceeding max_decoded_bytes={max_decoded_bytes}"
+                    )
+            else:
+                source_frame_limit = min(max_frames, max_decoded_bytes // frame_bytes)
+
+            source_chunk_by_bytes = max(1, _AUDIO_RESAMPLE_CHUNK_BYTES // frame_bytes)
+            target_chunk_by_bytes = max(1, _AUDIO_RESAMPLE_CHUNK_BYTES // frame_bytes)
+            source_chunk_for_target = max(
+                1,
+                target_chunk_by_bytes * metadata.sample_rate // sample_rate,
+            )
+            chunk_frames = min(64 * 1024, source_chunk_by_bytes, source_chunk_for_target)
+            decoded_frames = 0
+            output_frames = 0
+            resampler: Any | None = None
+
+            output_file = tempfile.TemporaryFile(mode="w+b", buffering=0, prefix="vane_audio_resample_")
+            with _close_preserving_primary(output_file):
+
+                def enforce_output_limits(frames: int) -> None:
+                    if frames > max_output_frames:
+                        raise AudioFileLimitError(
+                            f"resampled audio contains more than max_output_frames={max_output_frames} frames"
+                        )
+                    output_bytes = frames * frame_bytes
+                    if output_bytes > max_output_bytes:
+                        raise AudioFileLimitError(
+                            f"audio resample requires more than max_output_bytes={max_output_bytes}"
+                        )
+                    if max_batch_output_bytes is not None and output_bytes > max_batch_output_bytes:
+                        raise AudioFileLimitError(
+                            "audio_resample() exceeds the remaining "
+                            f"per-batch output budget of {max_batch_output_bytes} bytes"
+                        )
+
+                def append_output(output: Any) -> None:
+                    nonlocal output_frames
+                    if (
+                        not isinstance(output, numpy.ndarray)
+                        or output.dtype != numpy.dtype(numpy.float64)
+                        or output.ndim != 2
+                        or output.shape[1] != metadata.channels
+                        or not output.flags.c_contiguous
+                    ):
+                        raise RuntimeError("audio resampler returned a non-contiguous float64 (frames, channels) array")
+                    next_output_frames = output_frames + int(output.shape[0])
+                    enforce_output_limits(next_output_frames)
+
+                    if output.size:
+                        output_view = memoryview(output).cast("B")
+                        while output_view:
+                            written = output_file.write(output_view)
+                            if written is None or written <= 0:
+                                raise OSError("temporary audio resample spool made no write progress")
+                            output_view = output_view[written:]
+                    output_frames = next_output_frames
+                    if check_interrupted is not None:
+                        check_interrupted()
+
+                def process_input(decoded: bytearray, frames: int) -> None:
+                    nonlocal resampler
+                    if frames == 0:
+                        return
+                    minimum_output_frames = decoded_frames * sample_rate // metadata.sample_rate
+                    enforce_output_limits(minimum_output_frames)
+
+                    decoded_array = numpy.frombuffer(
+                        decoded,
+                        dtype=numpy.float64,
+                        count=frames * metadata.channels,
+                    ).reshape(frames, metadata.channels)
+                    if sample_rate == metadata.sample_rate:
+                        append_output(decoded_array)
+                        return
+                    if resampler is None:
+                        try:
+                            resampler = soxr.ResampleStream(
+                                metadata.sample_rate,
+                                sample_rate,
+                                metadata.channels,
+                                dtype="float64",
+                                quality="HQ",
+                            )
+                        except ValueError as error:
+                            raise AudioFileFormatError(
+                                f"audio cannot be resampled from {metadata.sample_rate} Hz to {sample_rate} Hz "
+                                f"with {metadata.channels} channels"
+                            ) from error
+                    append_output(resampler.resample_chunk(decoded_array, last=False))
+
+                if metadata.frames is not None:
+                    while decoded_frames < metadata.frames:
+                        requested_frames = min(chunk_frames, metadata.frames - decoded_frames)
+                        decoded = bytearray(requested_frames * frame_bytes)
+                        returned_frames = audio.buffer_read_into(decoded, dtype="float64")
+                        proxy.raise_if_error()
+                        if returned_frames < 0 or returned_frames > requested_frames:
+                            raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                        decoded_frames += returned_frames
+                        process_input(decoded, returned_frames)
+                        if returned_frames != requested_frames:
+                            raise AudioFileFormatError(
+                                f"audio decoder returned {decoded_frames} frames after reporting {metadata.frames}"
+                            )
+                else:
+                    assert source_frame_limit is not None
+                    while decoded_frames < source_frame_limit:
+                        requested_frames = min(chunk_frames, source_frame_limit - decoded_frames)
+                        decoded = bytearray(requested_frames * frame_bytes)
+                        returned_frames = audio.buffer_read_into(decoded, dtype="float64")
+                        proxy.raise_if_error()
+                        if returned_frames < 0 or returned_frames > requested_frames:
+                            raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                        decoded_frames += returned_frames
+                        process_input(decoded, returned_frames)
+                        if returned_frames < requested_frames:
+                            break
+
+                    if decoded_frames == source_frame_limit:
+                        extra = bytearray(frame_bytes)
+                        extra_frames = audio.buffer_read_into(extra, dtype="float64")
+                        proxy.raise_if_error()
+                        if extra_frames < 0 or extra_frames > 1:
+                            raise AudioFileFormatError("audio decoder returned an invalid frame count")
+                        if extra_frames:
+                            if max_frames <= max_decoded_bytes // frame_bytes:
+                                raise AudioFileLimitError(f"audio contains more than max_frames={max_frames} frames")
+                            raise AudioFileLimitError(
+                                f"audio decode requires more than max_decoded_bytes={max_decoded_bytes}"
+                            )
+
+                if resampler is not None:
+                    empty = numpy.empty((0, metadata.channels), dtype=numpy.float64)
+                    append_output(resampler.resample_chunk(empty, last=True))
+                proxy.raise_if_error()
+                if check_interrupted is not None:
+                    check_interrupted()
+
+                samples = numpy.empty((output_frames, metadata.channels), dtype=numpy.float64)
+                if samples.size:
+                    output_view = memoryview(samples).cast("B")
+                    output_file.seek(0)
+                    output_offset = 0
+                    while output_offset < len(output_view):
+                        read_end = min(len(output_view), output_offset + _AUDIO_RESAMPLE_CHUNK_BYTES)
+                        read_count = output_file.readinto(output_view[output_offset:read_end])
+                        if read_count is None or read_count <= 0:
+                            raise OSError("temporary audio resample spool ended before the decoded output")
+                        output_offset += read_count
+                        if check_interrupted is not None:
+                            check_interrupted()
+                    del output_view
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        proxy.raise_if_error()
+        if isinstance(error, AudioFileError):
+            raise
+        if isinstance(error, soundfile.SoundFileError):
+            raise AudioFileFormatError("logical FILE view is not a supported encoded audio file") from error
+        raise
+
+    return samples
+
+
+def _resample_audio_file(
+    value: vane.AudioFile,
+    sample_rate: int,
+    buffer_size: int = DEFAULT_AUDIO_BUFFER_SIZE,
+    *,
+    max_input_bytes: int = DEFAULT_AUDIO_MAX_INPUT_BYTES,
+    max_frames: int = DEFAULT_AUDIO_MAX_FRAMES,
+    max_decoded_bytes: int = DEFAULT_AUDIO_MAX_DECODED_BYTES,
+    max_output_frames: int = DEFAULT_AUDIO_MAX_OUTPUT_FRAMES,
+    max_output_bytes: int = DEFAULT_AUDIO_MAX_OUTPUT_BYTES,
+    connection: vane.DuckDBPyConnection | None = None,
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    normalized_sample_rate = _positive_limit(sample_rate, name="sample_rate", maximum=_MAX_BIGINT)
+    normalized_buffer_size = _positive_buffer_size(buffer_size, none_default=None, name="buffer_size")
+    normalized_max_input = _positive_limit(max_input_bytes, name="max_input_bytes", maximum=_MAX_UBIGINT)
+    normalized_max_frames = _positive_limit(max_frames, name="max_frames", maximum=_MAX_BIGINT)
+    normalized_max_decoded = _positive_limit(max_decoded_bytes, name="max_decoded_bytes", maximum=_MAX_UBIGINT)
+    normalized_max_output_frames = _positive_limit(
+        max_output_frames,
+        name="max_output_frames",
+        maximum=_MAX_BIGINT,
+    )
+    normalized_max_output = _positive_limit(max_output_bytes, name="max_output_bytes", maximum=_MAX_UBIGINT)
+    soundfile = _load_soundfile()
+    soxr = _load_soxr()
+    numpy = importlib.import_module("numpy")
+
+    with value.open(buffer_size=normalized_buffer_size, connection=connection) as reader:
+        return _resample_audio_reader(
+            reader,
+            logical_size=reader.size(),
+            content_type=value.content_type,
+            sample_rate=normalized_sample_rate,
+            max_input_bytes=normalized_max_input,
+            max_frames=normalized_max_frames,
+            max_decoded_bytes=normalized_max_decoded,
+            max_output_frames=normalized_max_output_frames,
+            max_output_bytes=normalized_max_output,
+            max_batch_output_bytes=None,
+            check_interrupted=reader._check_interrupted,
+            soundfile=soundfile,
+            soxr=soxr,
+            numpy=numpy,
+        )
+
+
+def _resample_audio_stream(
+    read_at: Callable[[int, int], bytes],
+    logical_size: int,
+    content_type: str | None,
+    sample_rate: int,
+    max_input_bytes: int,
+    max_frames: int,
+    max_decoded_bytes: int,
+    max_output_frames: int,
+    max_output_bytes: int,
+    max_batch_output_bytes: int,
+    check_interrupted: Callable[[], None],
+) -> np.ndarray[Any, np.dtype[np.float64]]:
+    """Native SQL callback entry point over the executing ClientContext."""
+    return _resample_audio_reader(
+        _AudioRandomAccessView(read_at, logical_size),
+        logical_size=logical_size,
+        content_type=content_type,
+        sample_rate=sample_rate,
+        max_input_bytes=max_input_bytes,
+        max_frames=max_frames,
+        max_decoded_bytes=max_decoded_bytes,
+        max_output_frames=max_output_frames,
+        max_output_bytes=max_output_bytes,
+        max_batch_output_bytes=max_batch_output_bytes,
+        check_interrupted=check_interrupted,
+        soundfile=_load_soundfile(),
+        soxr=_load_soxr(),
+        numpy=importlib.import_module("numpy"),
+    )
+
+
 def audio_metadata(
     value: vane.AudioFile | vane.Expression,
     *,
@@ -720,10 +1070,39 @@ def audio_metadata(
     )
 
 
+def audio_resample(
+    value: vane.AudioFile | vane.Expression,
+    sample_rate: int | vane.Expression,
+    *,
+    max_input_bytes: int | vane.Expression = DEFAULT_AUDIO_MAX_INPUT_BYTES,
+    max_frames: int | vane.Expression = DEFAULT_AUDIO_MAX_FRAMES,
+    max_decoded_bytes: int | vane.Expression = DEFAULT_AUDIO_MAX_DECODED_BYTES,
+    max_output_frames: int | vane.Expression = DEFAULT_AUDIO_MAX_OUTPUT_FRAMES,
+    max_output_bytes: int | vane.Expression = DEFAULT_AUDIO_MAX_OUTPUT_BYTES,
+) -> vane.Expression:
+    """Build a bounded SoXR HQ AUDIOFILE resampling expression.
+
+    The result STRUCT stores float64 ``samples`` in frame-major order together
+    with its ``sample_rate``, ``frames``, and ``channels`` dimensions.
+    SQL execution also caps flattened sample storage at 512 MiB per vector batch.
+    """
+    return vane.FunctionExpression(
+        "audio_resample",
+        as_expression(value),
+        _limit_expression(sample_rate, name="sample_rate", maximum=_MAX_BIGINT),
+        _limit_expression(max_input_bytes, name="max_input_bytes", maximum=_MAX_UBIGINT),
+        _limit_expression(max_frames, name="max_frames", maximum=_MAX_BIGINT),
+        _limit_expression(max_decoded_bytes, name="max_decoded_bytes", maximum=_MAX_UBIGINT),
+        _limit_expression(max_output_frames, name="max_output_frames", maximum=_MAX_BIGINT),
+        _limit_expression(max_output_bytes, name="max_output_bytes", maximum=_MAX_UBIGINT),
+    )
+
+
 __all__ = [
     "AudioFileError",
     "AudioFileFormatError",
     "AudioFileLimitError",
     "AudioMetadata",
     "audio_metadata",
+    "audio_resample",
 ]

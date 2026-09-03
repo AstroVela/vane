@@ -21,6 +21,7 @@ from vane._audio_file import (
     AudioFileLimitError,
     AudioMetadata,
     audio_metadata,
+    audio_resample,
 )
 from vane._dbapi_type_object import (
     BINARY,
@@ -533,6 +534,7 @@ __all__: list[str] = [
     "append",
     "audio_file",
     "audio_metadata",
+    "audio_resample",
     "array_type",
     "arrow",
     "begin",

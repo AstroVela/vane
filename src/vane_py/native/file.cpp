@@ -29,6 +29,8 @@ static constexpr uint64_t DEFAULT_AUDIO_BUFFER_SIZE = 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_INPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100000000;
+static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_METADATA_BYTES = 8 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_BUFFER_SIZE = 1024 * 1024;
 static constexpr uint64_t DEFAULT_VIDEO_MAX_INPUT_BYTES = 8ULL * 1024 * 1024 * 1024;
@@ -195,6 +197,27 @@ static void BindMediaFileClass(py::handle &m, const char *class_name) {
 		    py::arg("max_input_bytes") = DEFAULT_AUDIO_MAX_INPUT_BYTES,
 		    py::arg("max_frames") = DEFAULT_AUDIO_MAX_FRAMES,
 		    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES, py::arg("connection") = py::none());
+		file.def(
+		    "resample",
+		    [](const FILE_TYPE &value, const py::object &sample_rate, const py::object &buffer_size,
+		       const py::object &max_input_bytes, const py::object &max_frames, const py::object &max_decoded_bytes,
+		       const py::object &max_output_frames, const py::object &max_output_bytes,
+		       shared_ptr<DuckDBPyConnection> connection) {
+			    return py::module_::import("vane._audio_file")
+			        .attr("_resample_audio_file")(
+			            py::cast(value, py::return_value_policy::copy), sample_rate, buffer_size,
+			            py::arg("max_input_bytes") = max_input_bytes, py::arg("max_frames") = max_frames,
+			            py::arg("max_decoded_bytes") = max_decoded_bytes,
+			            py::arg("max_output_frames") = max_output_frames,
+			            py::arg("max_output_bytes") = max_output_bytes, py::arg("connection") = std::move(connection));
+		    },
+		    "Decode and resample audio with SoXR HQ into a detached float64 (frames, channels) NumPy array",
+		    py::arg("sample_rate"), py::arg("buffer_size") = DEFAULT_AUDIO_BUFFER_SIZE, py::kw_only(),
+		    py::arg("max_input_bytes") = DEFAULT_AUDIO_MAX_INPUT_BYTES,
+		    py::arg("max_frames") = DEFAULT_AUDIO_MAX_FRAMES,
+		    py::arg("max_decoded_bytes") = DEFAULT_AUDIO_MAX_DECODED_BYTES,
+		    py::arg("max_output_frames") = DEFAULT_AUDIO_MAX_OUTPUT_FRAMES,
+		    py::arg("max_output_bytes") = DEFAULT_AUDIO_MAX_OUTPUT_BYTES, py::arg("connection") = py::none());
 	} else if constexpr (std::is_same_v<FILE_TYPE, PythonVideoFile>) {
 		file.def(
 		    "metadata",

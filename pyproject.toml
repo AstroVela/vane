@@ -84,8 +84,9 @@ sglang = [
 image = [ # ImageFile metadata/decoding and ndarray image inputs for AI providers
     "pillow>=10",
 ]
-audio = [ # AudioFile metadata and float64 waveform decoding
+audio = [ # AudioFile metadata, float64 waveform decoding, and sample-rate conversion
     "soundfile>=0.14",
+    "soxr>=1.0,<2",
 ]
 video = [ # VideoFile metadata and distributed frame streaming
     "av>=17.1,<18",
@@ -106,6 +107,7 @@ all = [ # Cloud providers and dataframe/filesystem integrations; local model run
     "pymilvus>=3.0.1,<4", # Milvus DataSink
     "qdrant-client>=1.19.0,<2", # Qdrant DataSink
     "soundfile>=0.14", # AudioFile metadata and waveform decoding
+    "soxr>=1.0,<2", # AudioFile sample-rate conversion
 ]
 
 ######################################################################################################
@@ -458,6 +460,7 @@ test = [ # dependencies used for running the complete test suite
     "pytz",
     "requests",
     "soundfile>=0.14",
+    "soxr>=1.0,<2",
     "av>=17.1,<18",
     "urllib3",
     "fsspec>=2022.11.0; sys_platform != 'win32' or platform_machine != 'ARM64'",

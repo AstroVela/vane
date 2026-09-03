@@ -16,7 +16,7 @@ import vane
 FILE_FIELDS = ("url", "content_type", "position", "size", "checksum")
 FILE_METHODS = ("exists", "mime_type", "open", "stat", "to_tempfile")
 IMAGE_FILE_METHODS = FILE_METHODS + ("decode", "metadata")
-AUDIO_FILE_METHODS = FILE_METHODS + ("metadata", "to_numpy")
+AUDIO_FILE_METHODS = FILE_METHODS + ("metadata", "resample", "to_numpy")
 VIDEO_FILE_METHODS = FILE_METHODS + ("frames", "get_frame_by_idx", "keyframes", "metadata")
 MEDIA_FILE_CASES = (
     ("image", "IMAGEFILE", vane.ImageFile, vane.image_file),
