@@ -22,15 +22,17 @@ FROM (SELECT image('\x00'::BLOB, 1, 1, 1, 'L') AS value)
 ----
 IMAGE	1	1
 
-query TB
+query TI
 SELECT typeof(image(NULL::BLOB, 1, 1, 1, 'L')), image(NULL::BLOB, 1, 1, 1, 'L') IS NULL
 ----
 IMAGE	true
 
-statement error IMAGE data has 1 bytes, expected 3
+statement error
 SELECT image('\x00'::BLOB, 1, 1, 3, 'RGB')
+----
+<REGEX>:.*IMAGE data has 1 bytes, expected 3.*
 
-query BBBBBB
+query IIIIII
 SELECT
 	value IN (value),
 	value NOT IN (other),
@@ -46,31 +48,41 @@ FROM (
 ----
 true	true	true	true	false	true
 
-statement error Cannot compare values of type IMAGE
+statement error
 SELECT image('\x00'::BLOB, 1, 1, 1, 'L') < image('\x01'::BLOB, 1, 1, 1, 'L')
+----
+<REGEX>:.*Cannot compare values of type IMAGE.*
 
-statement error Cannot compare values of type IMAGE\[\]
+statement error
 SELECT [image('\x00'::BLOB, 1, 1, 1, 'L')] < [image('\x01'::BLOB, 1, 1, 1, 'L')]
+----
+<REGEX>:.*Cannot compare values of type IMAGE\[\].*
 
-statement error Cannot compare values of type IMAGE\[1\]
+statement error
 SELECT array_value(image('\x00'::BLOB, 1, 1, 1, 'L')) < array_value(image('\x01'::BLOB, 1, 1, 1, 'L'))
+----
+<REGEX>:.*Cannot compare values of type IMAGE\[1\].*
 
-statement error Cannot compare values of type STRUCT
+statement error
 SELECT {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
+----
+<REGEX>:.*Cannot compare values of type STRUCT.*
 
-statement error Cannot compare values of type MAP
+statement error
 SELECT MAP {'value': image('\x00'::BLOB, 1, 1, 1, 'L')} < MAP {'value': image('\x01'::BLOB, 1, 1, 1, 'L')}
+----
+<REGEX>:.*Cannot compare values of type MAP.*
 
 statement ok
 PREPARE compare_image AS
 SELECT image('\x00'::BLOB, 1, 1, 1, 'L') = $1
 
-query B
+query I
 EXECUTE compare_image(image('\x00'::BLOB, 1, 1, 1, 'L'))
 ----
 true
 
-statement error governed values require an exact logical type match
+statement error
 SELECT struct_pack(
     data := '\x00'::BLOB,
     width := 1::UINTEGER,
@@ -78,6 +90,8 @@ SELECT struct_pack(
     channels := 1::UTINYINT,
     mode := 'L'
 )::IMAGE
+----
+<REGEX>:.*governed values require an exact logical type match.*
 
 statement ok
 CREATE TABLE decoded_images(value IMAGE)
