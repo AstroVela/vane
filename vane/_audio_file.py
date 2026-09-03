@@ -1079,6 +1079,8 @@ def _materialize_audio_spool(
 ) -> np.ndarray[Any, np.dtype[np.float64]]:
     """Materialize an owned spool once for the Python value API."""
     with _close_preserving_primary(spool):
+        if check_interrupted is not None:
+            check_interrupted()
         samples = numpy.empty((spool.frames, spool.channels), dtype=numpy.float64)
         if samples.size:
             output_view = memoryview(samples).cast("B")
@@ -1205,7 +1207,7 @@ def audio_resample(
 
     The result STRUCT stores float64 ``samples`` in frame-major order together
     with its ``sample_rate``, ``frames``, and ``channels`` dimensions.
-    SQL execution also caps flattened sample storage at 512 MiB per vector batch.
+    SQL execution also caps flattened sample storage at 256 MiB per vector batch.
     Ratios above 64:1, non-identity inputs above 1024 channels, and native calls
     that would exceed the fixed SoXR output-buffer bound are rejected before
     native work.

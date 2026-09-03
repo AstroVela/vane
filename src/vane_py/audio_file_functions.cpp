@@ -3,6 +3,7 @@
 
 #include "vane_python/audio_file_functions.hpp"
 
+#include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -27,7 +28,14 @@ static constexpr uint64_t DEFAULT_AUDIO_MAX_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_DECODED_BYTES = 512 * 1024 * 1024;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_FRAMES = 100000000;
 static constexpr uint64_t DEFAULT_AUDIO_MAX_OUTPUT_BYTES = 512 * 1024 * 1024;
-static constexpr uint64_t MAX_AUDIO_BATCH_OUTPUT_BYTES = 512 * 1024 * 1024;
+// ListVector grows to a power of two, and Vector::Resize keeps the old data
+// alive while allocating the replacement. A 256 MiB logical cap therefore
+// has a normal worst-case data-buffer resize peak of 384 MiB. The runtime
+// check below independently enforces the 512 MiB ceiling before every growth.
+static constexpr uint64_t MAX_AUDIO_BATCH_OUTPUT_BYTES = 256 * 1024 * 1024;
+static constexpr uint64_t MAX_AUDIO_BATCH_VECTOR_RESIZE_PEAK_BYTES = 512 * 1024 * 1024;
+static_assert(MAX_AUDIO_BATCH_OUTPUT_BYTES + MAX_AUDIO_BATCH_OUTPUT_BYTES / 2 <=
+              MAX_AUDIO_BATCH_VECTOR_RESIZE_PEAK_BYTES);
 static constexpr idx_t AUDIO_RESULT_COPY_CHUNK_BYTES = 1024 * 1024;
 
 static LogicalType AudioMetadataType() {
@@ -268,6 +276,21 @@ static bool GetAudioResampleArguments(DataChunk &args, idx_t row, int64_t &sampl
 	return true;
 }
 
+static void ReserveAudioSampleVector(ClientContext &context, Vector &samples_result, idx_t required_capacity) {
+	auto current_capacity = ListVector::GetListCapacity(samples_result);
+	if (required_capacity > current_capacity) {
+		auto next_capacity = NumericCast<idx_t>(NextPowerOfTwo(required_capacity));
+		auto peak_capacity = MAX_AUDIO_BATCH_VECTOR_RESIZE_PEAK_BYTES / sizeof(double);
+		if (next_capacity > peak_capacity || current_capacity > peak_capacity - next_capacity) {
+			throw InternalException("audio_resample() exceeded its sample-vector allocation invariant");
+		}
+	}
+	if (context.IsInterrupted()) {
+		throw InterruptException();
+	}
+	ListVector::Reserve(samples_result, required_capacity);
+}
+
 static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, const FileReference &file,
                                int64_t sample_rate, const AudioResampleLimits &limits, idx_t row,
                                Vector &samples_result, Vector &sample_rate_result, Vector &frames_result,
@@ -344,7 +367,7 @@ static void CopyResampledAudio(ClientContext &context, ResolvedFile &resolved, c
 			throw InternalException("Audio resample helper violated its output limit");
 		}
 		auto sample_count = NumericCast<idx_t>(sample_count_u64);
-		ListVector::Reserve(samples_result, existing_samples + sample_count);
+		ReserveAudioSampleVector(context, samples_result, existing_samples + sample_count);
 		auto &sample_child = ListVector::GetEntry(samples_result);
 		auto sample_data = FlatVector::GetData<double>(sample_child);
 		if (sample_count > 0) {

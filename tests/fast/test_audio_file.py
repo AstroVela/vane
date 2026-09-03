@@ -290,8 +290,10 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
     path.write_bytes(b"audio")
     value = vane.AudioFile(str(path))
     spools = []
+    batch_budgets = []
 
     def make_spool(*args):
+        batch_budgets.append(args[-2])
         samples = np.asarray([[1.0, 2.0]], dtype=np.float64)
         spool = _audio_file._AudioResampleSpool(io.BytesIO(samples.tobytes()), 1, 2)
         spools.append(spool)
@@ -312,6 +314,7 @@ def test_audio_resample_materializes_across_vector_chunks(duckdb_cursor, tmp_pat
     assert rows[-1] == rows[0]
     assert len(spools) == 2050
     assert all(spool.closed for spool in spools)
+    assert batch_budgets.count(256 * 1024 * 1024) == 2
 
 
 def test_audio_resample_limits_are_enforced(duckdb_cursor, tmp_path):
@@ -500,6 +503,32 @@ def test_audio_resample_checks_cancellation_before_native_soxr_calls(cancel_phas
         )
 
     assert native_calls == expected_native_calls
+
+
+def test_audio_resample_checks_cancellation_before_python_result_allocation():
+    allocation_calls = []
+    spool = _audio_file._AudioResampleSpool(io.BytesIO(), 64 * 1024 * 1024, 1)
+
+    class ForbiddenNumpy:
+        float64 = np.float64
+
+        @staticmethod
+        def empty(*args, **kwargs):
+            allocation_calls.append((args, kwargs))
+            raise AssertionError("cancellation must be observed before allocating the result")
+
+    def check_interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _audio_file._materialize_audio_spool(
+            spool,
+            numpy=ForbiddenNumpy,
+            check_interrupted=check_interrupted,
+        )
+
+    assert allocation_calls == []
+    assert spool.closed
 
 
 def test_audio_resample_arrow_and_udf_round_trip(duckdb_cursor, tmp_path):
